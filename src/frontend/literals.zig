@@ -16,6 +16,10 @@ const std = @import("std");
 const diagnostics = @import("diagnostics.zig");
 const Code = diagnostics.Code;
 const Span = @import("span.zig").Span;
+// One predicate only: which non-ASCII byte sequences are WHITESPACE rather than
+// identifier constituents. It is the scanner's, so the two cannot disagree about
+// where a token ends.
+const scanner = @import("scanner.zig");
 
 /// One finding, already in absolute file offsets.
 pub const Finding = struct {
@@ -127,8 +131,13 @@ pub fn identifierAfterNumeric(src: []const u8, at: u32) ?Finding {
     if (at >= src.len) return null;
     const c = src[at];
     if (!(isIdentStart(c) or c >= 0x80)) return null;
+    // A non-ASCII byte is an identifier constituent unless it spells WHITESPACE:
+    // `1<NBSP>;` is `1` followed by trivia, and tsc — which asks
+    // `isIdentifierStart` of the decoded character — reports nothing.
+    if (c >= 0x80 and scanner.unicodeTrivia(src, at) != null) return null;
     var end: u32 = at;
-    while (end < src.len and (isIdentPart(src[end]) or src[end] >= 0x80)) end += 1;
+    while (end < src.len and (isIdentPart(src[end]) or
+        (src[end] >= 0x80 and scanner.unicodeTrivia(src, end) == null))) end += 1;
     return .{ .code = .identifier_after_numeric_literal, .span = .{ .start = at, .end = end } };
 }
 

@@ -137,6 +137,32 @@ pub const Code = enum(u16) {
     /// NOT a module body (a function body, a plain block, a method body) — tsc
     /// stops naming the modifier there and blames the position instead.
     modifiers_not_allowed_here,
+    /// A MODULE ELEMENT in a statement list that is not a module body — tsc's
+    /// `checkGrammarModuleElementContext`, which asks only whether the
+    /// statement's parent is a SourceFile, a ModuleBlock or a ModuleDeclaration
+    /// and reports on the statement's first token. See `Parser.module_body`;
+    /// one code per element kind because tsc words each for its own rule.
+    ///
+    /// TS1232: any `import` declaration form (`import x from "m"`, `import a =
+    /// require("m")`, `import a = N.M`, `export import a = N`).
+    import_not_at_top_level,
+    /// TS1233: any `export` declaration form (`export { … }`, `export * from`,
+    /// and their `export type` variants).
+    export_not_at_top_level,
+    /// TS1234: `declare module "spec" { … }` — an AMBIENT module, which unlike a
+    /// namespace is not allowed even at the top level of one.
+    ambient_module_not_at_top_level,
+    /// TS1235: a `namespace`/`module` declaration (including `export namespace`
+    /// and `declare namespace`).
+    namespace_not_at_top_level,
+    /// TS1231: `export = X`.
+    export_assign_not_at_top_level,
+    /// TS1258: `export default <expression>` (the DECLARATION forms — `export
+    /// default class`/`function`/`interface` — are TS1184 instead, because tsc
+    /// models their `export default` as a modifier list on the declaration).
+    export_default_not_at_top_level,
+    /// TS1316: `export as namespace X` — a UMD global export.
+    export_as_namespace_not_at_top_level,
     /// TS1274: an `in` variance annotation outside a class/interface/type
     /// alias type parameter (a function, method, or function/constructor type
     /// has no declaration-site variance).
@@ -228,6 +254,13 @@ pub const Code = enum(u16) {
     enum_member_numeric_name,
     /// TS18024: `enum E { #x }` — a private identifier as an enum member name.
     enum_member_private_name,
+    /// TS1539: `{ 1n: 123 }` — a BigInt literal as a property name. The grammar
+    /// accepts it (a BigInt literal is a NumericLiteral-shaped PropertyName), so
+    /// like TS2452 this is a check on a parsed member; tsc reports it in the
+    /// three positions that DECLARE a member — an object literal, a type member
+    /// and a class member — and NOT in a binding pattern, where `{ 0n: f }`
+    /// parses and earns the semantic TS2538 instead (measured against tsgo).
+    bigint_property_name,
     /// TS18016: `#x` as an OBJECT-LITERAL property name (`{ #x: 1 }`) or a TYPE
     /// member name (`interface I { #x: string }`) — the two property positions
     /// that are never inside a class body. tsc's `checkGrammarObjectLiteral…`
@@ -239,6 +272,12 @@ pub const Code = enum(u16) {
     private_name_in_var_decl,
     /// TS18009: `f(#foo: string)` — the same, in a PARAMETER list.
     private_name_as_param,
+    /// TS1492: `using { a } = d` — an explicit-resource declaration binds one
+    /// name, never a pattern. tsc's `checkGrammarVariableDeclaration`, reported
+    /// on the pattern; two codes because the message names the declaration form
+    /// and `await using` spells it differently.
+    using_binding_pattern,
+    await_using_binding_pattern,
 
     // --- strict-mode reserved words (tsc's binder, `checkStrictModeIdentifier`)
     /// TS1212: a future-reserved word (`yield`, `let`, `static`, `public`,
@@ -333,6 +372,16 @@ pub const Code = enum(u16) {
             .static_not_on_module_element,
             .readonly_not_on_property,
             .modifiers_not_allowed_here,
+            // Same funnel as TS1184: `{ import "m"; }` next to a sibling file's
+            // TS2322 lets the TS2322 through, and `moduleElementsInWrongContext.ts`
+            // reports its whole set with nothing suppressed — tsc's checker.
+            .import_not_at_top_level,
+            .export_not_at_top_level,
+            .ambient_module_not_at_top_level,
+            .namespace_not_at_top_level,
+            .export_assign_not_at_top_level,
+            .export_default_not_at_top_level,
+            .export_as_namespace_not_at_top_level,
             .in_modifier_not_valid_here,
             .out_modifier_not_valid_here,
             .in_must_precede_out,
@@ -349,7 +398,14 @@ pub const Code = enum(u16) {
             .accessibility_modifier_already_seen,
             .enum_member_numeric_name,
             .enum_member_private_name,
+            // `{ 1n: 123 }` reports TS1539 next to the TS2464/TS2538 its
+            // siblings earn in the same file — tsc's checker.
+            .bigint_property_name,
             .private_name_outside_class,
+            // `using {a} = null` reports TS1492 and the TS2339 its pattern
+            // earns in the same run — tsc's checker, not its parser.
+            .using_binding_pattern,
+            .await_using_binding_pattern,
             .strict_reserved_word,
             .strict_reserved_word_in_class,
             .strict_reserved_word_in_module,
@@ -449,9 +505,12 @@ pub const Code = enum(u16) {
             .accessibility_modifier_already_seen => "Accessibility modifier already seen.",
             .enum_member_numeric_name => "An enum member cannot have a numeric name.",
             .enum_member_private_name => "An enum member cannot be named with a private identifier.",
+            .bigint_property_name => "A 'bigint' literal cannot be used as a property name.",
             .private_name_outside_class => "Private identifiers are not allowed outside class bodies.",
             .private_name_in_var_decl => "Private identifiers are not allowed in variable declarations.",
             .private_name_as_param => "Private identifiers cannot be used as parameters.",
+            .using_binding_pattern => "'using' declarations may not have binding patterns.",
+            .await_using_binding_pattern => "'await using' declarations may not have binding patterns.",
             // tsc names the word (`'yield' is a reserved word...`); a Diagnostic
             // is a code plus a span, so the invariant sentence is reported.
             .strict_reserved_word => "Identifier expected. This is a reserved word in strict mode.",
@@ -471,6 +530,13 @@ pub const Code = enum(u16) {
             .static_not_on_module_element => moduleElementModifierMessage("static"),
             .readonly_not_on_property => "'readonly' modifier can only appear on a property declaration or index signature.",
             .modifiers_not_allowed_here => "Modifiers cannot appear here.",
+            .import_not_at_top_level => "An import declaration can only be used at the top level of a namespace or module.",
+            .export_not_at_top_level => "An export declaration can only be used at the top level of a namespace or module.",
+            .ambient_module_not_at_top_level => "An ambient module declaration is only allowed at the top level in a file.",
+            .namespace_not_at_top_level => "A namespace declaration is only allowed at the top level of a namespace or module.",
+            .export_assign_not_at_top_level => "An export assignment must be at the top level of a file or module declaration.",
+            .export_default_not_at_top_level => "A default export must be at the top level of a file or module declaration.",
+            .export_as_namespace_not_at_top_level => "Global module exports may only appear at top level.",
             .in_modifier_not_valid_here => "'in' modifier can only appear on a type parameter of a class, interface or type alias",
             .out_modifier_not_valid_here => "'out' modifier can only appear on a type parameter of a class, interface or type alias",
             .in_must_precede_out => "'in' modifier must precede 'out' modifier.",
@@ -581,9 +647,11 @@ pub const Code = enum(u16) {
             .accessibility_modifier_already_seen => 1028,
             .enum_member_numeric_name => 2452,
             .enum_member_private_name => 18024,
+            .bigint_property_name => 1539,
             .private_name_outside_class => 18016,
             .private_name_in_var_decl => 18029,
             .private_name_as_param => 18009,
+            .using_binding_pattern, .await_using_binding_pattern => 1492,
             .strict_reserved_word => 1212,
             .strict_reserved_word_in_class => 1213,
             .strict_reserved_word_in_module => 1214,
@@ -609,6 +677,13 @@ pub const Code = enum(u16) {
             => 1044,
             .readonly_not_on_property => 1024,
             .modifiers_not_allowed_here => 1184,
+            .import_not_at_top_level => 1232,
+            .export_not_at_top_level => 1233,
+            .ambient_module_not_at_top_level => 1234,
+            .namespace_not_at_top_level => 1235,
+            .export_assign_not_at_top_level => 1231,
+            .export_default_not_at_top_level => 1258,
+            .export_as_namespace_not_at_top_level => 1316,
             .in_modifier_not_valid_here, .out_modifier_not_valid_here => 1274,
             .in_must_precede_out => 1029,
             .const_modifier_not_valid_here => 1277,
