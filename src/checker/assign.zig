@@ -2282,6 +2282,11 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         .symbol => return sk == .unique_symbol,
         .object_keyword => return isNonPrimitiveKind(sk),
         .array => {
+            // tsc's readonly screen (`tuple_zig.readonlyMismatch`): a readonly
+            // list never satisfies a mutable one, whichever spelling each side
+            // uses. Ahead of the element comparison because tsc reports the
+            // readonly failure (TS4104) *instead of* the element story.
+            if (tuple_zig.readonlyMismatch(c, s, t)) return false;
             if (sk == .array) return c.isAssignable(c.ts.arrayElem(s), c.ts.arrayElem(t));
             if (sk == .tuple) {
                 const elem = c.ts.arrayElem(t);
@@ -2295,6 +2300,7 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
             return false;
         },
         .tuple => {
+            if (tuple_zig.readonlyMismatch(c, s, t)) return false;
             if (sk != .tuple) return false;
             if (try c.tupleAssignable(s, t)) return true;
             // tsc's `isGenericTupleType(source) && isTupleType(target) &&
@@ -3639,7 +3645,7 @@ pub fn discriminatedTupleAssignable(c: *Checker, s: TypeId, t: TypeId) Error!boo
                 const e = c.ts.tupleElem(sr, @intCast(j));
                 try elems.append(c.scratch(), if (j == pos) .{ .ty = lv, .flags = e.flags } else e);
             }
-            const one = try c.ts.makeTuple(elems.items);
+            const one = try c.ts.makeTupleLike(sr, elems.items);
             if (one == sr or !try c.isAssignable(one, t)) {
                 all_ok = false;
                 break;

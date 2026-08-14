@@ -919,6 +919,21 @@ pub fn tryReportMissingProps(c: *Checker, src_t: TypeId, target: TypeId, span: S
 }
 
 pub fn reportNotAssignable(c: *Checker, code: u16, src_t: TypeId, target: TypeId, span: Span) Error!void {
+    // Readonly-list headline (tsc TS4104). tsc's `tryElaborateArrayLikeErrors`
+    // runs before the head message is chosen and REPLACES it — in argument
+    // position too, where the diagnostic comes out as 4104 rather than 2345 —
+    // and it discards the element/arity story under it, because the readonly
+    // modifier is the whole reason the pair failed.
+    if (code == 2322 or code == 2345) {
+        const rs = try c.resolveStructural(src_t);
+        const rt = try c.resolveStructural(target);
+        if (tuple_zig.readonlyMismatch(c, rs, rt)) {
+            try c.diagFmt(4104, span, "The type '{s}' is 'readonly' and cannot be assigned to the mutable type '{s}'.", .{
+                try c.typeToString(src_t), try c.typeToString(target),
+            });
+            return;
+        }
+    }
     // Weak-type headline (tsc TS2559). The check that rejected the pair runs
     // at the top of the relation, ahead of the structural walk, so its message
     // REPLACES the assignability headline rather than elaborating under it —

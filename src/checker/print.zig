@@ -107,12 +107,15 @@ fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!voi
             }
         },
         .array => {
+            if (s.arrayIsReadonly(t)) try w.writeAll("readonly ");
             try printTypeParen(c, w, s.arrayElem(t), depth + 1, .operand);
             try w.writeAll("[]");
         },
         .tuple => {
-            // `as const` tuples are readonly (flag on every element).
-            if (s.tupleLen(t) > 0 and s.tupleElem(t, 0).readonly()) try w.writeAll("readonly ");
+            // Either provenance of a readonly tuple: the tuple-level modifier
+            // (`readonly [A, B]`) or an every-element marking (`as const`).
+            if (s.tupleIsReadonly(t) or (s.tupleLen(t) > 0 and s.tupleElem(t, 0).readonly()))
+                try w.writeAll("readonly ");
             try w.writeAll("[");
             for (0..s.tupleLen(t)) |i| {
                 if (i > 0) try w.writeAll(", ");
@@ -339,6 +342,9 @@ fn printTypeParen(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32, pos: Pr
         .function => true,
         .union_type => pos != .union_member,
         .intersection => pos == .operand,
+        // `readonly` binds looser than the `[]` suffix, so an array OF readonly
+        // arrays is `(readonly T[])[]`.
+        .array => pos == .operand and c.ts.arrayIsReadonly(t),
         else => false,
     };
     if (needs) try w.writeAll("(");

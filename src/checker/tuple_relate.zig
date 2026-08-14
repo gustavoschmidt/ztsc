@@ -11,6 +11,14 @@
 //! is the one place that reads that off, and everything downstream speaks in
 //! `ElemKind`.
 //!
+//! The READONLY question also lives here, for both spellings of a list
+//! (`isReadonlyArrayOrTuple` / `isMutableArrayOrTuple` / `readonlyMismatch`,
+//! plus the `instanceof` and write-site variants): tsc gets the same answers
+//! structurally, because its `ReadonlyArray` interface has no `push` and its
+//! tuple target carries the modifier, while ztsc's readonly array shares
+//! `Array`'s member table and its readonly tuple is a flag — so the relation
+//! needs one explicit screen instead.
+//!
 //! Three rules from tsc live here, all of them about variadic elements:
 //!
 //!   * `tupleAssignable` — tsc's `propertiesRelatedTo` tuple branch, which
@@ -174,15 +182,113 @@ fn soleVariadicElem(c: *const Checker, tup: TypeId) ?TypeId {
     return if (elemKind(c, e) == .variadic) e.ty else null;
 }
 
-/// tsc's `isMutableArrayOrTuple`. A readonly TUPLE is not representable in
-/// ztsc (the modifier is dropped — see `typeFromTypeNode`'s `.readonly_type`),
-/// so only the array half of the test can distinguish anything.
-fn isMutableArrayOrTuple(c: *const Checker, t: TypeId) bool {
+/// tsc's `isMutableArrayOrTuple`.
+pub fn isMutableArrayOrTuple(c: *const Checker, t: TypeId) bool {
     return switch (c.ts.kind(t)) {
         .array => !c.ts.arrayIsReadonly(t),
-        .tuple => true,
+        .tuple => !isReadonlyTuple(c, t),
         else => false,
     };
+}
+
+/// A readonly tuple, from either of its two provenances: the tuple-level
+/// `readonly [...]` modifier, or an every-element `elem_flag_readonly` marking
+/// (`as const`, `Readonly<[A, B]>`). An EMPTY tuple is only readonly through
+/// the flag — `[]` has no elements to mark, so the all-elements test would
+/// call it readonly and `const t: [] = readonlyOne` would report TS4104 where
+/// tsc reports the arity mismatch.
+fn isReadonlyTuple(c: *const Checker, t: TypeId) bool {
+    if (c.ts.tupleIsReadonly(t)) return true;
+    const len = c.ts.tupleLen(t);
+    if (len == 0) return false;
+    for (0..len) |i| {
+        if (!c.ts.tupleElem(t, @intCast(i)).readonly()) return false;
+    }
+    return true;
+}
+
+/// tsc's `isReadonlyArrayType(source) || isTupleType(source) &&
+/// source.target.readonly` — the source half of the readonly screen in
+/// `propertiesRelatedTo`.
+pub fn isReadonlyArrayOrTuple(c: *const Checker, t: TypeId) bool {
+    return switch (c.ts.kind(t)) {
+        .array => c.ts.arrayIsReadonly(t),
+        .tuple => isReadonlyTuple(c, t),
+        else => false,
+    };
+}
+
+/// tsc's readonly screen in `propertiesRelatedTo`: *"if (!target.target.readonly
+/// && (isReadonlyArrayType(source) || isTupleType(source) &&
+/// source.target.readonly)) return Ternary.False"*, generalized to a mutable
+/// ARRAY target as well — where tsc gets the same answer structurally, because
+/// its `ReadonlyArray` interface has no `push`/`pop` and ztsc's readonly array
+/// shares Array's member table.
+///
+/// Reported as TS4104 rather than TS2322/TS2345 (`reportNotAssignable`), which
+/// is tsc's `tryElaborateArrayLikeErrors` replacing the head message.
+pub fn readonlyMismatch(c: *const Checker, s: TypeId, t: TypeId) bool {
+    return isReadonlyArrayOrTuple(c, s) and isMutableArrayOrTuple(c, t);
+}
+
+/// What a WRITE through an index (`t[i] = …`, `delete t[i]`) hits when the
+/// receiver is a readonly list.
+pub const ReadonlyWrite = union(enum) {
+    /// A fixed element position, which is a readonly PROPERTY named by its
+    /// index: tsc's TS2540 ("Cannot assign to '0' because it is a read-only
+    /// property.").
+    element: u32,
+    /// The readonly numeric INDEX SIGNATURE — a readonly array, or a position
+    /// inside a readonly tuple's variable part, or a non-literal index: tsc's
+    /// TS2542 ("Index signature in type '…' only permits reading.").
+    index_signature,
+};
+
+/// The write-site verdict for `obj[idx]`, or null when the receiver is not a
+/// readonly list and the write is fine. Mirrors how tsc resolves the write:
+/// a numeric literal index inside the fixed part names a readonly property,
+/// everything else goes through the readonly index signature.
+pub fn readonlyIndexWrite(c: *const Checker, obj: TypeId, idx: TypeId) ?ReadonlyWrite {
+    switch (c.ts.kind(obj)) {
+        .array => return if (c.ts.arrayIsReadonly(obj)) .index_signature else null,
+        .tuple => {
+            if (!isReadonlyTuple(c, obj)) return null;
+            if (c.ts.kind(idx) == .number_literal) {
+                const v = c.ts.numberValue(idx);
+                if (v >= 0 and v == @floor(v) and v < 4096) {
+                    const iv: u32 = @intFromFloat(v);
+                    if (iv < fixedLength(c, obj)) return .{ .element = iv };
+                }
+            }
+            return .index_signature;
+        },
+        else => return null,
+    }
+}
+
+/// The tail of tsc's `isTypeDerivedFrom`: *"isArrayType(target) &&
+/// !isReadonlyArrayType(target) && isTypeDerivedFrom(source,
+/// globalReadonlyArrayType)"* — the NOMINAL `instanceof` test counts a readonly
+/// list as derived from a mutable array, where the assignability relation
+/// (correctly) refuses it. Answers true only for a pair the readonly screen is
+/// the sole objection to.
+pub fn readonlyDerivedFrom(c: *Checker, s: TypeId, t: TypeId) Error!bool {
+    if (!readonlyMismatch(c, s, t)) return false;
+    const mut = switch (c.ts.kind(s)) {
+        .array => try c.ts.makeArray(c.ts.arrayElem(s)),
+        .tuple => blk: {
+            const len = c.ts.tupleLen(s);
+            const elems = try c.scratch().alloc(types.TupleElem, len);
+            defer c.scratch().free(elems);
+            for (elems, 0..) |*e, i| {
+                const src = c.ts.tupleElem(s, @intCast(i));
+                e.* = .{ .ty = src.ty, .flags = src.flags & ~types.elem_flag_readonly };
+            }
+            break :blk try c.ts.makeTupleFlags(elems, c.ts.tupleFlags(s) & ~types.tuple_flag_readonly);
+        },
+        else => return false,
+    };
+    return c.isAssignable(mut, t);
 }
 
 /// tsc's `isSingleElementGenericTupleType` pair in `structuredTypeRelatedTo`.
@@ -192,9 +298,11 @@ fn isMutableArrayOrTuple(c: *const Checker, t: TypeId) bool {
 /// falls through.
 pub fn singleElementBridge(c: *Checker, s: TypeId, t: TypeId) Error!bool {
     if (soleVariadicElem(c, s)) |arg| {
-        // `[...T]` → anything: relate `T` itself. (tsc also requires the
-        // source tuple not be `readonly`; ztsc cannot spell that.)
-        if (try c.isAssignable(arg, t)) return true;
+        // `[...T]` → anything: relate `T` itself, provided the source tuple is
+        // not `readonly` (tsc's `isSingleElementGenericTupleType(source) &&
+        // !source.target.readonly`) — a `readonly [...T]` would hand out `T`'s
+        // mutating members.
+        if (!isReadonlyArrayOrTuple(c, s) and try c.isAssignable(arg, t)) return true;
     }
     if (soleVariadicElem(c, t)) |arg| {
         // anything → `[...T]`: legal only when the source is (constrained to)
@@ -230,7 +338,7 @@ pub fn constrainedGenericTuple(c: *Checker, tup: TypeId) Error!?TypeId {
         try out.append(c.scratch(), .{ .ty = ty, .flags = e.flags });
     }
     if (!changed) return null;
-    return try c.ts.makeTuple(out.items);
+    return try c.ts.makeTupleLike(tup, out.items);
 }
 
 /// tsc's `propertiesRelatedTo` tuple branch (checker.ts, TS 5.9).

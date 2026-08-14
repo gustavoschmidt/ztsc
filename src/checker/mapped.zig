@@ -296,7 +296,14 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
                 // A homomorphic map over an array yields an array; the
                 // element is the value with `K` bound to the number index.
                 const elem = try c.substMappedKey(value, key_id, types.number_type);
-                return s.makeArray(elem);
+                // `+readonly` makes it a `readonly T[]` and `-readonly` a
+                // mutable one, exactly as for the tuple arm below
+                // (`Readonly<number[]>` IS `readonly number[]`, which the
+                // readonly screen then refuses to spend as a `number[]`).
+                var ro = s.arrayIsReadonly(src);
+                if (flags & types.mapped_flag_readonly_add != 0) ro = true;
+                if (flags & types.mapped_flag_readonly_remove != 0) ro = false;
+                return if (ro) s.makeArrayReadonly(elem) else s.makeArray(elem);
             },
             .tuple => {
                 var elems: std.ArrayList(types.TupleElem) = .empty;
@@ -323,7 +330,13 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
                     if (e.rest() and s.kind(e.ty) == .array) et = try s.makeArrayLike(e.ty, et);
                     try elems.append(c.scratch(), .{ .ty = et, .flags = applyElemModifiers(e.flags, flags) });
                 }
-                return s.makeTuple(elems.items);
+                // tsc's `instantiateMappedTupleType` newReadonly: `+readonly`
+                // sets it, `-readonly` clears it, and anything else inherits
+                // the source tuple's own modifier.
+                var tf = s.tupleFlags(src);
+                if (flags & types.mapped_flag_readonly_add != 0) tf |= types.tuple_flag_readonly;
+                if (flags & types.mapped_flag_readonly_remove != 0) tf &= ~types.tuple_flag_readonly;
+                return s.makeTupleFlags(elems.items, tf);
             },
             .union_type => {
                 // A homomorphic map distributes over a union source: tsc's
@@ -1306,7 +1319,7 @@ fn substMappedKeyInner(c: *Checker, t: TypeId, key_id: u32, key_ty: TypeId) Erro
                 const e = s.tupleElem(t, @intCast(i));
                 try elems.append(c.scratch(), .{ .ty = try c.substMappedKey(e.ty, key_id, key_ty), .flags = e.flags });
             }
-            return s.makeTuple(elems.items);
+            return s.makeTupleLike(t, elems.items);
         },
         // The whole shape has to survive, not just the properties: this arm
         // used to rebuild the object from its property list alone, dropping

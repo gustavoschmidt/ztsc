@@ -53,6 +53,7 @@ const resolveStructural = @import("instantiate.zig").resolveStructural;
 const scratch = Checker.scratch;
 const signatureOfProtoCtx = @import("signatures.zig").signatureOfProtoCtx;
 const templateExprType = @import("generics.zig").templateExprType;
+const tuple_relate = @import("tuple_relate.zig");
 const tupleElemTypeAt = @import("assign.zig").tupleElemTypeAt;
 const unassignedVarType = @import("flow.zig").unassignedVarType;
 const uniqueSymAtom = Checker.uniqueSymAtom;
@@ -3071,6 +3072,14 @@ fn checkPrefixUnary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         },
         .keyword_delete => {
             _ = try c.checkExprCached(d.lhs, types.no_type);
+            // `delete t[i]` on a readonly list is the same write-site refusal
+            // as `t[i] = …` (tsc's `checkDeleteExpression` →
+            // `checkReferenceExpression`): TS2540 / TS2542.
+            if (c.nodeTag(d.lhs) == .index_expr) {
+                const id = c.tree.nodeData(d.lhs);
+                const recv = try c.resolveStructural(try c.checkExprCached(id.lhs, types.no_type));
+                _ = try readonlyIndexWriteAt(c, recv, d.lhs, id.rhs);
+            }
             return types.boolean_type;
         },
         .keyword_await => {
@@ -3769,6 +3778,27 @@ fn assignTargetIsEvolving(c: *Checker, target0: Node) bool {
     };
 }
 
+/// A write through `obj[idx]` — an assignment target or a `delete` operand —
+/// where `obj` (already structurally resolved) is a readonly list. Reports
+/// TS2540 on a fixed element and TS2542 on the readonly index signature, and
+/// answers whether it reported, in which case the caller hands back
+/// `error_type` to suppress the cascading TS2322.
+///
+/// The index expression is checked here rather than by the caller so the
+/// literal-index question can be asked; `checkExprCached` makes the second
+/// check on the ordinary path free.
+fn readonlyIndexWriteAt(c: *Checker, obj: TypeId, node: Node, idx_node: Node) Error!bool {
+    if (c.ts.kind(obj) != .tuple and c.ts.kind(obj) != .array) return false;
+    const idx_t = try c.ts.regularLiteral(try c.checkExprCached(idx_node, types.no_type));
+    switch (tuple_relate.readonlyIndexWrite(c, obj, idx_t) orelse return false) {
+        .element => |iv| try c.diagFmt(2540, c.nodeSpan(idx_node), "Cannot assign to '{d}' because it is a read-only property.", .{iv}),
+        .index_signature => try c.diagFmt(2542, c.nodeSpan(node), "Index signature in type '{s}' only permits reading.", .{
+            try c.typeToString(obj),
+        }),
+    }
+    return true;
+}
+
 /// Type of an assignment target; reports TS2588 (const) and TS2540
 /// (readonly property).
 fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
@@ -3841,8 +3871,9 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
             return propertyTypeOf(c, obj_t, name, d.rhs, .{ .dir = .write, .recv_node = d.lhs });
         },
         .index_expr => {
-            // Writing to a readonly tuple element (from `as const`) is
-            // TS2540, like a readonly property.
+            // Writing through a readonly list's index is TS2540 (a fixed
+            // element, which is a readonly property) or TS2542 (the readonly
+            // index signature) — see `readonlyIndexWriteAt`.
             const d = c.tree.nodeData(node);
             const obj_t = try c.checkExprCached(d.lhs, types.no_type);
             // `o["p"] = v` writes at the setter's parameter type when `p` is
@@ -3854,17 +3885,7 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
                 if (try setterWriteType(c, obj_t, key, 0)) |wt| return wt;
             }
             const r = try c.resolveStructural(obj_t);
-            if (c.ts.kind(r) == .tuple) {
-                const idx_t = try c.ts.regularLiteral(try c.checkExprCached(d.rhs, types.no_type));
-                if (c.ts.kind(idx_t) == .number_literal) {
-                    const v = c.ts.numberValue(idx_t);
-                    const iv: u32 = if (v >= 0 and v == @floor(v) and v < 4096) @intFromFloat(v) else 4096;
-                    if (iv < c.ts.tupleLen(r) and c.ts.tupleElem(r, iv).readonly()) {
-                        try c.diagFmt(2540, c.nodeSpan(d.rhs), "Cannot assign to '{d}' because it is a read-only property.", .{iv});
-                        return types.error_type;
-                    }
-                }
-            }
+            if (try readonlyIndexWriteAt(c, r, node, d.rhs)) return types.error_type;
             return checkIndexExpr(c, node, false);
         },
         .array_literal, .object_literal, .array_pattern, .object_pattern => {
