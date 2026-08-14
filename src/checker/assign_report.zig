@@ -1175,6 +1175,35 @@ fn epcReducedUnion(c: *Checker, src_t: TypeId, rt: TypeId) Error!TypeId {
     return c.ts.makeUnion(c.scratch(), keep.items);
 }
 
+/// The excess-property check over an ARRAY literal's elements, against the
+/// element type the target gives each position (`elemTypeAt`, so an array, a
+/// tuple and a numerically-indexed interface all work). A UNION target is
+/// resolved to the constituent the relation would have reported against
+/// (`bestMatchingUnionMember`), which is how `Book | Book[]` reaches `Book`.
+///
+/// A SPREAD element makes the positions unknowable, so the whole literal is left
+/// alone rather than measured against shifted element types.
+fn arrayElemExcessScan(c: *Checker, node: Node, src_t: TypeId, target: TypeId, report: bool) Error!bool {
+    var rt = try c.resolveStructural(target);
+    if (c.ts.kind(rt) == .union_type) {
+        const b = (try c.bestMatchingUnionMember(src_t, rt)) orelse return false;
+        rt = try c.resolveStructural(b);
+    }
+    for (c.tree.nodeRange(node)) |el| {
+        if (el != null_node and c.nodeTag(el) == .spread_element) return false;
+    }
+    var any = false;
+    var i: u32 = 0;
+    for (c.tree.nodeRange(node)) |el| {
+        if (el == null_node) continue;
+        defer i += 1;
+        const et = (try elemTypeAt(c, rt, i)) orelse continue;
+        const en = c.nodeType(el) orelse continue;
+        if (try excessPropertyScan(c, el, en, et, report)) any = true;
+    }
+    return any;
+}
+
 pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: TypeId, report: bool) Error!bool {
     var node = expr_node;
     // Unwrap parens and a JSX expression container (`prop={{ … }}`): the
@@ -1187,6 +1216,12 @@ pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: T
         }
         if (node == null_node) return false;
     }
+    // An ARRAY literal is not excess-checked itself — it has no property names
+    // — but each ELEMENT is: tsc's relation recurses into the elements with each
+    // one still fresh, so `var x: Action[] = [{ id: 2, trueness: false }]` is an
+    // error on `trueness`, and one per offending element (the element walk does
+    // not stop at the first).
+    if (c.nodeTag(node) == .array_literal) return arrayElemExcessScan(c, node, src_t, target, report);
     if (c.nodeTag(node) != .object_literal) return false;
     if (!c.ts.objectIsFresh(src_t)) return false;
     // tsc's `hasExcessProperties` bails outright when the target is the global
@@ -1203,7 +1238,12 @@ pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: T
     if (try targetIsGlobalObjectIface(c, rt)) return false;
     switch (c.ts.kind(rt)) {
         .object => {
-            if (c.ts.objectStringIndex(rt) != 0 or c.ts.objectNumberIndex(rt) != 0) return false;
+            // An INDEX SIGNATURE is not a wholesale bail in tsc: `isKnownProperty`
+            // consults it per name (`getApplicableIndexInfoForName`), which
+            // `targetKnowsProp` already does — and the walk below still has to
+            // descend into a NESTED literal, whose own target is the index type.
+            // `var b: { [n: number]: Cover } = { 0: { colour: "blue" } }` is an
+            // error on `colour` for exactly that reason.
             // The empty object type `{}` accepts any properties: tsc's
             // `hasExcessProperties` bails on `isEmptyObjectType(target)`
             // (e.g. react-i18next's `values?: {}`). No prop is ever excess.
@@ -1441,6 +1481,11 @@ pub fn targetKnowsProp(c: *Checker, rt: TypeId, key: Atom) Error!bool {
             if (assign.isNumericPropName(c.atomText(key))) return true;
             return (try c.propOfType(rt, key)) != null;
         },
+        // A bare signature type is an object type to tsc as well, and one whose
+        // resolved members are empty: it knows no written name at all. Reached as
+        // a union constituent — `NoInfer<T> | NoInfer<() => T>` is the corpus
+        // shape — where the blanket `true` silenced the check for the union.
+        .function, .overloads => return (try c.propOfType(rt, key)) != null,
         // A PRIMITIVE carries no `TypeFlags.Object`, so tsc's `isKnownProperty`
         // is false for it whatever the name — `string`'s apparent `length`
         // included, since the test never looks at an apparent type. Reached as
