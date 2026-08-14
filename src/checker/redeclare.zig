@@ -434,21 +434,19 @@ fn checkMemberRedeclare(c: *Checker, msym: SymbolId) Error!void {
     if (c.symFile(msym) != c.cur_file) return;
     const decls = c.declsOf(msym);
     if (decls.len < 2) return;
-    // A CLASS body has exactly one member table per side, so two declarations
-    // of one name in it are a duplicate the binder has already reported
-    // (TS2300, or TS2804 for a private name). tsc never reaches the
-    // subsequent-declaration comparison for such a pair at all: `declareSymbol`
-    // gives the loser its OWN fresh symbol, so every declaration is its
-    // container's `valueDeclaration` and `checkVariableLikeDeclaration` takes
-    // the initializer branch. Reporting TS2717 on top of the duplicate is
-    // ztsc's declaration-merging model leaking — `privateNameDuplicateField`'s
-    // `#foo() {}` beside `#foo = "foo"` got both. An INTERFACE is the case this
-    // check exists for: its blocks merge legally, so a name really can be
-    // declared twice with two types.
-    switch (c.bind.scope_kinds[c.symScope(msym)]) {
-        .class_members, .class_statics => return,
-        else => {},
-    }
+    // A PRIVATE name declared twice in one class body is a hard duplicate, not
+    // a merge: tsc gives the second declaration its own symbol, so it is its
+    // container's `valueDeclaration` and `checkVariableLikeDeclaration` never
+    // reaches the subsequent-declaration comparison. Reporting TS2717 on top of
+    // the TS2300/TS2804 the pair already earns is ztsc's declaration-merging
+    // model leaking — `privateNameDuplicateField`'s `#foo() {}` beside
+    // `#foo = "foo"` got both.
+    //
+    // An ORDINARY class member is genuinely merged by tsc (`PropertyExcludes`
+    // is `None`, so `c: number; c: string` is ONE symbol with two
+    // declarations), and TS2717 at the later one is the only thing reported —
+    // so the gate has to be this narrow.
+    if (std.mem.startsWith(u8, c.atomText(c.symNameAtom(msym)), "#")) return;
     // A member's annotation is resolved in the MEMBER scope, whose parent chain
     // carries the container's type parameters. Read from the caller's scope
     // instead, `interface I<T> { m(): T; … }` cannot see `T` and every generic

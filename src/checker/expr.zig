@@ -1916,12 +1916,20 @@ fn distributableSpreads(c: *Checker, node: Node, out: *std.ArrayList(DistSpread)
 }
 
 fn checkObjectLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
-    // Duplicate keys — tsc's `checkGrammarObjectLiteralExpression`, run before
-    // the type is built and exactly once per literal (a spread-distributed
-    // literal builds its type once per constituent below). A destructuring
-    // ASSIGNMENT pattern is exempt and never arrives here: it goes through
-    // `checkDestructuringElement`.
+    const t = try objectLiteralWhole(c, node, ctx);
+    // Duplicate keys — tsc's `checkGrammarObjectLiteralExpression`. Run AFTER
+    // the type walk (and exactly once per literal, however many constituents a
+    // spread distributed it into) so that every computed key the walk typed is
+    // already in the node-type memo: the check then needs no evaluation of its
+    // own, and cannot introduce a diagnostic by being the first to read a key
+    // the type walk never reads at all (an object METHOD's computed key).
+    // A destructuring ASSIGNMENT pattern is exempt and never arrives here — it
+    // goes through `checkDestructuringElement`.
     try c.checkObjectLiteralDups(node);
+    return t;
+}
+
+fn objectLiteralWhole(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     // tsc's `getSpreadType` DISTRIBUTES over a union spread source:
     // `{ ...(A | B), x }` is `{ ...A, x } | { ...B, x }`, and each
     // constituent keeps the correlation between the properties that came

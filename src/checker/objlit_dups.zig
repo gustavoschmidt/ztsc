@@ -144,7 +144,11 @@ fn effectiveKey(c: *Checker, prop: Node) Error!?Atom {
     const key_expr = c.tree.nodeData(computed).lhs;
     if (key_expr == null_node) return null;
     if (try signedNumericKey(c, key_expr)) |a| return a;
-    const kt = try c.checkExprCached(key_expr, types.no_type);
+    // The type walk has already run (see the call site), so the key's type is a
+    // memo read here — never a fresh evaluation, which would make this check
+    // the first reader of a key nothing else reads and put its diagnostics on
+    // this walk's account.
+    const kt = c.nodeType(key_expr) orelse return null;
     if (try c.uniqueSymAtom(kt)) |a| return a;
     return try c.literalKeyAtom(kt);
 }
