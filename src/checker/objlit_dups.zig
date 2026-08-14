@@ -67,7 +67,7 @@ pub fn checkObjectLiteralDups(c: *Checker, node: Node) Error!void {
         }
         const existing = gop.value_ptr.*;
         const span = keySpan(c, prop);
-        const text = keyText(c, prop);
+        const text = keyText(c, prop, key);
         if (cur & Meaning.method != 0 and existing & Meaning.method != 0) {
             try c.diagFmt(2300, span, "Duplicate identifier '{s}'.", .{text});
         } else if (cur & Meaning.prop_or_method != 0 and existing & Meaning.prop_or_method != 0) {
@@ -100,7 +100,7 @@ fn reportAccessorDups(c: *Checker, node: Node, key: Atom, last: Node) Error!void
         if (prop == null_node) continue;
         if (meaningOf(c, prop) != null) {
             if ((try effectiveKey(c, prop)) == key) {
-                try c.diagFmt(2300, keySpan(c, prop), "Duplicate identifier '{s}'.", .{keyText(c, prop)});
+                try c.diagFmt(2300, keySpan(c, prop), "Duplicate identifier '{s}'.", .{keyText(c, prop, key)});
             }
         }
         if (prop == last) return;
@@ -181,8 +181,10 @@ fn keySpan(c: *Checker, prop: Node) Span {
     return c.tokSpan(c.tree.nodeMainToken(prop));
 }
 
-/// The key as written, for the one message that names it (TS2300).
-fn keyText(c: *Checker, prop: Node) []const u8 {
-    if (computedNameOf(c, prop) != 0) return "";
+/// The key for the one message that names it (TS2300): as WRITTEN for a plain
+/// name, and the name it late-bound to for a computed one (there is no token to
+/// quote there, and `[k]` says nothing about which property it is).
+fn keyText(c: *Checker, prop: Node, key: Atom) []const u8 {
+    if (computedNameOf(c, prop) != 0) return c.atomText(key);
     return c.tokenText(c.tree.nodeMainToken(prop));
 }
