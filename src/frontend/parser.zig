@@ -832,8 +832,14 @@ const Parser = struct {
             const before = p.curIdx();
             const stmt = try p.parseStatement();
             try p.pushScratch(stmt);
+            // `p.curIdx() > before` is load-bearing, not just an optimization: a
+            // statement that consumed NOTHING leaves `before` one past the end of
+            // the token array, and the report indexes it. (Found by a `.d.ts`
+            // holding nothing but `with (foo) {}`, which ztsc parses to no
+            // tokens at all — it crashed the whole run.)
             if (p.ambient and !reported_ambient_stmt and p.spec == 0 and
-                stmt != null_node and isExecutableStatement(p.nodes.items(.tag)[stmt]))
+                p.curIdx() > before and stmt != null_node and
+                isExecutableStatement(p.nodes.items(.tag)[stmt]))
             {
                 try p.errAtToken(.statement_not_allowed_in_ambient, before);
                 reported_ambient_stmt = true;
@@ -2153,10 +2159,16 @@ const Parser = struct {
     /// ztsc is always-strict, so there is no mode to test; tsc reaches the same
     /// state whenever `alwaysStrict` is on, which `strict` implies.
     ///
+    /// An AMBIENT identifier is exempt — tsc's condition includes
+    /// `!(node.flags & NodeFlags.Ambient)`, so `declare namespace Foo { export
+    /// var static: any; }` and every name in a `.d.ts` are fine. A declaration
+    /// file describes an interface that may well have been written in sloppy
+    /// mode, so the reserved-word rule has nothing to say about it.
+    ///
     /// Skipped while speculating: a construct that only ever gets parsed inside a
     /// lookahead is not committed source, and the real parse reports it.
     fn checkStrictReserved(p: *Parser) Error!void {
-        if (p.spec > 0) return;
+        if (p.spec > 0 or p.ambient) return;
         if (!p.curTag().isStrictReservedKeyword()) return;
         try p.errAtCur(if (p.class_depth > 0)
             .strict_reserved_word_in_class
@@ -5690,6 +5702,18 @@ test "ambient context: TS1036 once per block, TS1183 on a body" {
     try expectDiags("declare class C { m() { } }\n", .{}, &.{.{ 1183, 1, 23 }});
     // A `.d.ts` is ambient throughout.
     try expectDiags("declare var a: number;\na;\n", .{ .dts = true }, &.{.{ 1036, 2, 1 }});
+    // A statement that consumes no tokens must not be blamed on a token that
+    // does not exist. This `.d.ts` — a `with` statement, which ztsc's parser has
+    // no production for — indexed one past the token array and crashed the run,
+    // so the assertion is only that it comes back at all, with every span inside
+    // the file.
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const src = "with (foo) {\n}\n";
+        const tree = try parseOpts(arena.allocator(), src, .{ .dts = true });
+        for (tree.diagnostics) |d| try testing.expect(d.span.end <= src.len + 1);
+    }
 }
 
 test "TS1028: one accessibility modifier per member" {
@@ -5710,6 +5734,10 @@ test "TS1212/1213/1214: a strict-reserved word as an Identifier" {
     });
     // A class body is strict on its own account, a module likewise.
     try expectDiags("class C { m() { var static = 1; } }\n", .{}, &.{.{ 1213, 1, 21 }});
+    // An ambient declaration is exempt (tsc: `!(node.flags & NodeFlags.Ambient)`).
+    try expectDiags("export declare namespace Foo {\n  export var static: any;\n}\n", .{}, &.{});
+    try expectDiags("declare var yield: number;\n", .{}, &.{});
+    try expectDiags("var yield: number;\n", .{ .dts = true }, &.{});
     try expectDiags("export var e = 1;\nvar static = 2;\n", .{}, &.{.{ 1214, 2, 5 }});
     // IdentifierName positions take every reserved word: a property name, a
     // member name, a member access, an export alias, an enum member. And a
