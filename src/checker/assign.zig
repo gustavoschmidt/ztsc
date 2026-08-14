@@ -4099,7 +4099,7 @@ pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode
     // over every column of every table in the schema.
     if (erase == .constraints and sameSigTypeParams(c, s, t)) erase = .any;
     var se = if (erase == .any) try c.eraseParamsToAny(s) else try c.eraseTypeParams(s);
-    const te = if (erase == .any) try c.eraseParamsToAny(t) else try c.eraseTypeParams(t);
+    var te = if (erase == .any) try c.eraseParamsToAny(t) else try c.eraseTypeParams(t);
     // The source may be an arrow contextually typed by the generic target:
     // its param/return types then reference the TARGET's type-param symbols
     // as free params (the arrow itself carries no type params, so
@@ -4107,7 +4107,39 @@ pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode
     // target's constraints too, so both sides collapse the shared params
     // consistently — the `renderHook`/`typeof base` higher-order wrapper.
     if (c.ts.fnTypeParams(s).len == 0 and c.ts.fnTypeParams(t).len > 0) {
-        se = if (erase == .any) try c.eraseParamsToAnyOf(se, t) else try c.eraseParamsOf(se, t);
+        const shared = if (erase == .any) try c.eraseParamsToAnyOf(se, t) else try c.eraseParamsOf(se, t);
+        if (shared != se) {
+            se = shared;
+        } else if (erase == .constraints and try c.containsTypeParam(se)) {
+            // A NON-generic source that does not mention the target's type
+            // parameters at all (the erasure above changed nothing) is tsc's
+            // one un-erased case: `compareSignaturesRelated` instantiates a
+            // generic SOURCE in the target's context and never touches a
+            // generic TARGET, so its parameters stay FREE and only a source
+            // that works for *every* instantiation relates. Erasing them to
+            // their constraints (`any` for an unconstrained `<T>`) instead
+            // made every concrete signature satisfy every generic one:
+            // `interface I<T> extends Base2 { a: () => T }` over `a: <T>() =>
+            // T` was silently accepted, and with it the TS2430 families
+            // `subtypingWithGeneric{Call,Construct}SignaturesWithOptional
+            // Parameters` and `callSignatureAssignabilityInInheritance6`.
+            //
+            // Restricted to a source that mentions some OUTER type parameter,
+            // which is the shape of every case above (`a: () => T` for the
+            // interface's own `T`). A fully CONCRETE source keeps the lenient
+            // erasure, deliberately: tsc reaches those pairs with a source
+            // whose generic-ness came from higher-order inference
+            // (`const f: <A>(x: A) => A[] = wrap(list)`, where tsc infers
+            // `wrap(list): <A>(x: A) => A[]` and then instantiates that
+            // generic SOURCE in the target's context), and ztsc's inference
+            // hands back an already-instantiated signature there — so the
+            // free-parameter comparison would report on code tsc accepts
+            // (`genericContextualTypes1`, `genericFunctionInference1`, and the
+            // `comparisonOperator…OnInstantiatedCallSignature` pair, where both
+            // directions failing turns into TS2365/TS2367). Under-reporting on
+            // the concrete side is the safe half of the same gap.
+            te = t;
+        }
     }
     // The erasure runs `instantiate`, so it is subject to the instantiation
     // budget, and a trip hands back `error_type` in place of the signature —
