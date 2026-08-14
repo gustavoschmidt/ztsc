@@ -3273,6 +3273,10 @@ pub const Checker = struct {
     pub const checkCloduleMemberDups = redeclare_zig.checkCloduleMemberDups;
     pub const checkPrivateNameStaticDups = redeclare_zig.checkPrivateNameStaticDups;
     pub const checkSubsequentMemberDecls = redeclare_zig.checkSubsequentMemberDecls;
+
+    const objlit_dups_zig = @import("checker/objlit_dups.zig");
+    pub const checkObjectLiteralDups = objlit_dups_zig.checkObjectLiteralDups;
+
     pub const setTypeOfSymbol = signatures_zig.setTypeOfSymbol;
     pub const dropSpeculativeSymTypes = signatures_zig.dropSpeculativeSymTypes;
     pub const appendOverloadCandidates = signatures_zig.appendOverloadCandidates;
