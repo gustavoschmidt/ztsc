@@ -374,6 +374,14 @@ pub const elem_flag_rest: u32 = 2;
 /// assignability relation (like readonly object props); enforced at write
 /// sites (indexed writes -> TS2540).
 pub const elem_flag_readonly: u32 = 4;
+/// A `readonly [A, B]` tuple: the modifier belongs to the tuple, not to its
+/// elements (tsc keeps it on the tuple TARGET the same way). The two sit side
+/// by side because they have different provenance — the tuple-level flag comes
+/// from a written `readonly [...]` and from every derivation of one, while
+/// `elem_flag_readonly` comes from `as const` and from `Readonly<T>` over a
+/// tuple, which mark each element. `tuple_relate.isReadonlyArrayOrTuple` is
+/// the one place that asks the combined question.
+pub const tuple_flag_readonly: u32 = 1;
 pub const fn_flag_method: u32 = 1;
 /// The signature carries a type predicate (`x is T` / `asserts x[ is T]`).
 /// When set, the payload has three trailing words after the params:
@@ -701,6 +709,20 @@ pub const Store = struct {
         if (id < s.base_len) return s.base.?.tupleElem(id, i);
         const base = s.dataA(id) + 2 * i;
         return .{ .ty = s.extra.items[base], .flags = s.extra.items[base + 1] };
+    }
+
+    /// The tuple-level flags word (see `tuple_flag_readonly`), stored after the
+    /// element records.
+    pub fn tupleFlags(s: *const Store, id: TypeId) u32 {
+        if (id < s.base_len) return s.base.?.tupleFlags(id);
+        return s.extra.items[s.dataA(id) + 2 * s.dataB(id)];
+    }
+
+    /// Was this tuple WRITTEN (or derived) as `readonly [...]`? See
+    /// `tuple_relate.isReadonlyArrayOrTuple` for the question the relation
+    /// asks, which also covers the per-element provenance (`as const`).
+    pub fn tupleIsReadonly(s: *const Store, id: TypeId) bool {
+        return s.tupleFlags(id) & tuple_flag_readonly != 0;
     }
 
     pub fn objectFlags(s: *const Store, id: TypeId) u32 {
@@ -1083,7 +1105,8 @@ pub const Store = struct {
         const b = s.dataB(id);
         switch (s.kind(id)) {
             .union_type, .intersection, .overloads => return s.extra.items[a..b],
-            .tuple => return s.extra.items[a .. a + 2 * b],
+            // 2 words per element plus the trailing tuple-level flags word.
+            .tuple => return s.extra.items[a .. a + 2 * b + 1],
             .object => {
                 // A callable object has 2 extra header words plus one
                 // TypeId per call/construct signature after the property
@@ -1298,6 +1321,18 @@ pub const Store = struct {
     }
 
     pub fn makeTuple(s: *Store, elems: []const TupleElem) Error!TypeId {
+        return s.makeTupleFlags(elems, 0);
+    }
+
+    /// A tuple with `src`'s own tuple-level flags — the readonly-preserving
+    /// form every DERIVED tuple (instantiation, slice, constraint
+    /// substitution) must use, mirroring tsc's `createTupleType(…,
+    /// target.readonly)`.
+    pub fn makeTupleLike(s: *Store, src: TypeId, elems: []const TupleElem) Error!TypeId {
+        return s.makeTupleFlags(elems, s.tupleFlags(src));
+    }
+
+    pub fn makeTupleFlags(s: *Store, elems: []const TupleElem, flags: u32) Error!TypeId {
         // tsc's `createNormalizedTupleType` union distribution, which runs
         // before any of the expansion below: a VARIADIC element whose type is a
         // UNION spreads the tuple over it, so `[A, ...(X | Y)]` IS
@@ -1326,7 +1361,7 @@ pub const Store = struct {
             @memcpy(buf, elems);
             for (0..n) |k| {
                 buf[ui] = .{ .ty = s.memberAt(e.ty, k), .flags = e.flags };
-                try arms.append(s.alloc, try s.makeTuple(buf));
+                try arms.append(s.alloc, try s.makeTupleFlags(buf, flags));
             }
             return s.makeUnion(s.alloc, arms.items);
         }
@@ -1367,7 +1402,7 @@ pub const Store = struct {
                     }
                 } else try out.append(s.alloc, el);
             }
-            return s.makeTuple(out.items);
+            return s.makeTupleFlags(out.items, flags);
         }
         // tsc's `createNormalizedTupleType` tail: a REST element that is not
         // the LAST variable element — some optional or rest element follows it
@@ -1419,7 +1454,7 @@ pub const Store = struct {
                 .flags = elem_flag_rest | ro,
             });
             try out.appendSlice(s.alloc, elems[lv + 1 ..]);
-            return s.makeTuple(out.items);
+            return s.makeTupleFlags(out.items, flags);
         }
         // tsc's `getTupleTargetType`: "[...X[]] is equivalent to just X[]".
         // A tuple whose ONLY element is a rest element already spelled as an
@@ -1433,6 +1468,12 @@ pub const Store = struct {
         if (elems.len == 1 and (elems[0].flags & elem_flag_rest) != 0 and
             s.kind(elems[0].ty) == .array)
         {
+            // A READONLY `[...X[]]` is `readonly X[]` (tsc's
+            // `getTupleTargetType` hands back `globalReadonlyArrayType` for the
+            // same shape) — losing the modifier here is what let a readonly
+            // rest parameter be spent as a mutable array.
+            if (flags & tuple_flag_readonly != 0 and !s.arrayIsReadonly(elems[0].ty))
+                return s.makeArrayReadonly(s.arrayElem(elems[0].ty));
             return elems[0].ty;
         }
         const start = s.pending.items.len;
@@ -1441,6 +1482,10 @@ pub const Store = struct {
             try s.pending.append(s.alloc, e.ty);
             try s.pending.append(s.alloc, e.flags);
         }
+        // The tuple-level flags word trails the element records; it is part of
+        // the interning shape (`shapeWords`), so `readonly [A]` and `[A]` are
+        // two types, as they are in tsc.
+        try s.pending.append(s.alloc, flags);
         return s.internType(.tuple, s.pending.items[start..], @intCast(elems.len));
     }
 

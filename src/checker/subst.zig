@@ -1159,7 +1159,7 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
                 const e = s.tupleElem(t, @intCast(i));
                 el.* = .{ .ty = try c.instantiateId(e.ty, map, map_id), .flags = e.flags };
             }
-            break :blk try s.makeTuple(elems);
+            break :blk try s.makeTupleLike(t, elems);
         },
         .object => blk: {
             const props = try c.scratch().alloc(types.Prop, s.objectPropCount(t));
@@ -1662,7 +1662,7 @@ fn substThisInner(c: *Checker, t: TypeId, repl: TypeId) Error!TypeId {
                 const e = s.tupleElem(t, @intCast(i));
                 try elems.append(c.scratch(), .{ .ty = try c.substThis(e.ty, repl), .flags = e.flags });
             }
-            return s.makeTuple(elems.items);
+            return s.makeTupleLike(t, elems.items);
         },
         .function => {
             // A `this` marker also hides in the signature's OWN type-param

@@ -290,13 +290,29 @@ fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
             return c.instantiationExprType(base, c.tree.extraRange(r.start, r.end), node);
         },
         .readonly_type => {
-            // `readonly T[]` carries Array's members and relates exactly as
-            // `T[]` does; the flag is only there for tsc's subtype-based
-            // type-predicate narrowing (see `makeArrayReadonly`). Anything
-            // else (`readonly [a, b]`) is unchanged.
+            // tsc's `checkTypeOperator`: the modifier is only permitted on an
+            // array or tuple *literal* type, syntactically — `readonly
+            // Array<string>` and `readonly readonly string[]` are both TS1354,
+            // whatever their operand resolves to.
+            if (c.nodeTag(d.lhs) != .array_type and c.nodeTag(d.lhs) != .tuple_type) {
+                try c.diagFmt(1354, c.nodeSpan(node), "'readonly' type modifier is only permitted on array and tuple literal types.", .{});
+            }
             const inner = try c.typeFromTypeNode(d.lhs);
+            // `readonly T[]` carries Array's members and relates as `T[]` does
+            // except for the readonly screen (`isReadonlyArrayOrTuple`); the
+            // flag also drives the subtype-based type-predicate narrowing (see
+            // `makeArrayReadonly`).
             if (c.ts.kind(inner) == .array and !c.ts.arrayIsReadonly(inner))
                 return c.ts.makeArrayReadonly(c.ts.arrayElem(inner));
+            // `readonly [a, b]`: the modifier is a property of the TUPLE (tsc
+            // keeps it on the tuple target), so it survives interning and
+            // every derivation made with `makeTupleLike`.
+            if (c.ts.kind(inner) == .tuple and !c.ts.tupleIsReadonly(inner)) {
+                const elems = try c.scratch().alloc(types.TupleElem, c.ts.tupleLen(inner));
+                defer c.scratch().free(elems);
+                for (elems, 0..) |*e, i| e.* = c.ts.tupleElem(inner, @intCast(i));
+                return c.ts.makeTupleFlags(elems, c.ts.tupleFlags(inner) | types.tuple_flag_readonly);
+            }
             return inner;
         },
         .unique_symbol_type => {

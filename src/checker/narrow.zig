@@ -24,6 +24,7 @@ const Error = checker_zig.Error;
 
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const isInstantiableKind = @import("expr.zig").isInstantiableKind;
+const tuple_relate = @import("tuple_relate.zig");
 const typeof_names = Checker.typeof_names;
 
 pub fn narrowByLiteralEquality(c: *Checker, t: TypeId, other: Node, strict: bool, sense: bool) Error!TypeId {
@@ -901,6 +902,16 @@ pub fn narrowByInstance(c: *Checker, t: TypeId, instance: TypeId, sense: bool, c
             // guarded branch and every later use reported TS18048.
             if (matches and isNullishKind(c.ts.kind(m)) and !try c.admitsNullish(instance, c.ts.kind(m)))
                 matches = false;
+            // `x instanceof Array` is the NOMINAL test, whose relation
+            // (`isTypeDerivedFrom`) counts a readonly list as derived from a
+            // mutable array even though the assignability relation refuses it
+            // (`tuple_relate.readonlyDerivedFrom`). Without this the `else` of
+            // `x instanceof Array` on `readonly number[] | number` kept the
+            // array constituent (`instanceofNarrowReadonlyArray.ts`). A type
+            // PREDICATE keeps the strict subtype filter, which is what makes
+            // `Array.isArray(x)` on a readonly array narrow to the guard's
+            // `any[]` (see the non-union arm below).
+            if (!matches and check_derived) matches = try tuple_relate.readonlyDerivedFrom(c, m, instance);
             const kept = if (sense) matches else !matches;
             if (kept) try parts.append(c.scratch(), m);
         }

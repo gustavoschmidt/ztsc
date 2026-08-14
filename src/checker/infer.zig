@@ -631,6 +631,19 @@ pub const InferCtx = struct {
     /// and intersections preserve top-level-ness (tsc's
     /// `isTypeParameterAtTopLevel` descends them); everything else does not.
     nontop_depth: u32 = 0,
+    /// tsc's `InferenceInfo.impliedArity`, one entry per type parameter
+    /// (`no_arity` for "not implied"): how many list elements the CALL SITE
+    /// implies for a type parameter that is the signature's own rest parameter.
+    /// Set once per call by `inferTypeArgs`; read only by
+    /// `inferFromTupleTypes`, which needs it to split `[...T, ...U]` — a
+    /// pattern with two adjacent variadic elements has no structural split of
+    /// its own, so without the call's trailing-argument count there is nothing
+    /// to infer either half from.
+    implied_arity: []u32 = &.{},
+
+    /// `implied_arity`'s "unset" marker. Zero is a real arity (`curry(fn)`
+    /// implies `T := []`).
+    pub const no_arity: u32 = std.math.maxInt(u32);
 
     /// tsc's `InferencePriority.HomomorphicMappedType`, one flag per type
     /// parameter: true while the only evidence recorded for it came from
@@ -689,6 +702,10 @@ pub fn inferTypeArgs(
     // tsc's `InferencePriority.HomomorphicMappedType`, registered the same way.
     const rev_flags = try c.scratch().alloc(bool, tp_syms.len);
     for (rev_flags) |*x| x.* = false;
+    // tsc's `InferenceInfo.impliedArity`, read off THIS call's argument list.
+    const arity = try c.scratch().alloc(u32, tp_syms.len);
+    for (arity) |*x| x.* = InferCtx.no_arity;
+    try fillImpliedArity(c, sig, tp_syms, arg_nodes, arity);
     // Publish the whole context at once, and put the enclosing call's back
     // when this one is done.
     const saved_ctx = c.infer_ctx;
@@ -697,6 +714,7 @@ pub fn inferTypeArgs(
         .contra = contra,
         .contra_sup = contra_sup,
         .top_flags = top_flags,
+        .implied_arity = arity,
         .rev = .{ .owner = candidates.ptr, .flags = rev_flags },
     };
     defer c.infer_ctx = saved_ctx;
@@ -2023,6 +2041,60 @@ pub fn noteContraCandidate(c: *Checker, candidates: []TypeId, i: usize, cand: Ty
         try c.ts.makeUnion(c.scratch(), &.{ ctx.contra_sup[i], cand });
 }
 
+/// tsc's `impliedArity` bookkeeping in `inferTypeArguments`:
+///
+/// ```ts
+/// const restType = getNonArrayRestType(signature);
+/// const argCount = restType ? Math.min(getParameterCount(signature) - 1, args.length) : args.length;
+/// if (restType && restType.flags & TypeFlags.TypeParameter) {
+///     const info = find(context.inferences, info => info.typeParameter === restType);
+///     if (info) info.impliedArity = findIndex(args, isSpreadArgument, argCount) < 0 ? args.length - argCount : undefined;
+/// }
+/// ```
+///
+/// The signature's rest parameter must be a BARE type parameter (`...a: T`):
+/// then the arguments past the fixed ones are exactly `T`'s elements, so their
+/// count is `T`'s arity even before anything is inferred. A SPREAD argument in
+/// that tail spends an unknown number of positions and leaves the arity unknown.
+fn fillImpliedArity(
+    c: *Checker,
+    sig: TypeId,
+    tp_syms: []const u32,
+    arg_nodes: []const Node,
+    out: []u32,
+) Error!void {
+    const pc = c.ts.fnParamCount(sig);
+    if (pc == 0) return;
+    const rest = c.ts.fnParam(sig, pc - 1);
+    if (!rest.rest() or c.ts.kind(rest.ty) != .type_param) return;
+    const idx = for (tp_syms, 0..) |sym, i| {
+        if (sym == c.ts.typeParamSymbol(rest.ty)) break i;
+    } else return;
+    var n: u32 = 0;
+    for (arg_nodes) |an| {
+        if (an != null_node) n += 1;
+    }
+    const arg_count = @min(pc - 1, n);
+    var seen: u32 = 0;
+    for (arg_nodes) |an| {
+        if (an == null_node) continue;
+        defer seen += 1;
+        if (seen >= arg_count and c.nodeTag(an) == .spread_element) return;
+    }
+    out[idx] = n - arg_count;
+}
+
+/// The arity the call site implied for type parameter `i` (see
+/// `InferCtx.implied_arity`), or null when there is none — including when
+/// `candidates` is not the accumulator the in-flight call registered.
+fn impliedArity(c: *Checker, candidates: []TypeId, i: usize) ?u32 {
+    const ctx = &c.infer_ctx;
+    if (ctx.owner != candidates.ptr) return null;
+    if (ctx.implied_arity.len != candidates.len) return null;
+    const a = ctx.implied_arity[i];
+    return if (a == InferCtx.no_arity) null else a;
+}
+
 /// The `topLevel` flag for type parameter `i`, when `candidates` is the
 /// accumulator the in-flight call registered (same identity rule as
 /// `contraSlot`).
@@ -2137,6 +2209,49 @@ fn inferFromTupleTypes(
             // A FIXED pattern element cannot absorb a run of argument
             // elements; tsc has no arm for it either.
             .required, .optional => {},
+        }
+    } else if (src_tuple and p_arity - start - end == 2) {
+        // tsc's fourth middle: TWO ADJACENT VARIADIC pattern elements
+        // (`[...T, ...U]`). The pattern offers no split of its own, so the one
+        // the CALL SITE implies is used — `impliedArity(T)` is how many
+        // arguments were passed past the fixed parameters, i.e. how many
+        // elements `T` stands for:
+        //
+        // ```ts
+        // inferFromTypes(sliceTupleType(source, startLength, endLength + sourceArity - impliedArity), elementTypes[startLength]);
+        // inferFromTypes(sliceTupleType(source, startLength + impliedArity, endLength), elementTypes[startLength + 1]);
+        // ```
+        //
+        // `curry<T extends unknown[], U extends unknown[], R>(f: (...args:
+        // [...T, ...U]) => R, ...a: T)` is the shape: `curry(fn1, 1, 'abc')`
+        // implies `T`'s arity 2, so `fn1`'s parameter list splits into
+        // `T := [number, string]` and `U := [boolean, string[]]`. With no
+        // split at all both fell back to their `unknown[]` constraint and
+        // every `curry` call site was a TS2345 (`variadicTuples1`).
+        const e0 = s.tupleElem(param, start);
+        const e1 = s.tupleElem(param, start + 1);
+        if (tuple_relate.elemKind(c, e0) == .variadic and tuple_relate.elemKind(c, e1) == .variadic and
+            s.kind(e0.ty) == .type_param)
+        {
+            const tp_idx = for (tp_syms, 0..) |sym, i| {
+                if (sym == s.typeParamSymbol(e0.ty)) break i;
+            } else tp_syms.len;
+            if (tp_idx < tp_syms.len) {
+                if (impliedArity(c, candidates, tp_idx)) |ia| {
+                    if (ia <= s_arity - start - end) {
+                        // `T` takes the `ia` elements right after the prefix,
+                        // `U` everything from there to the suffix. (tsc spells
+                        // the first skip `endLength + sourceArity -
+                        // impliedArity`, which is this with its own
+                        // `startLength`/`endLength` of zero — the only values
+                        // a bare `[...T, ...U]` pattern can have.)
+                        const head = try typenode.sliceTuple(c, ra, start, s_arity - start - ia);
+                        const tail = try typenode.sliceTuple(c, ra, start + ia, end);
+                        try c.unify(e0.ty, head, tp_syms, candidates, depth + 1);
+                        try c.unify(e1.ty, tail, tp_syms, candidates, depth + 1);
+                    }
+                }
+            }
         }
     }
 
@@ -3911,7 +4026,7 @@ pub fn substElemAccess(c: *Checker, t: TypeId, src_sym: u32, key_id: u32, fp: Ty
                 const e = s.tupleElem(t, @intCast(i));
                 try elems.append(c.scratch(), .{ .ty = try c.substElemAccess(e.ty, src_sym, key_id, fp, depth + 1), .flags = e.flags });
             }
-            return s.makeTuple(elems.items);
+            return s.makeTupleLike(t, elems.items);
         },
         .object => {
             var oprops: std.ArrayList(types.Prop) = .empty;

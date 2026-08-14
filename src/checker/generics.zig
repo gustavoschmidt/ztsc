@@ -2067,7 +2067,7 @@ fn substInfer(c: *Checker, t: TypeId, ids: []const u32, vals: []const TypeId) Er
                 const e = s.tupleElem(t, @intCast(i));
                 try elems.append(c.scratch(), .{ .ty = try substInfer(c, e.ty, ids, vals), .flags = e.flags });
             }
-            return s.makeTuple(elems.items);
+            return s.makeTupleLike(t, elems.items);
         },
         .object => {
             var props: std.ArrayList(types.Prop) = .empty;
