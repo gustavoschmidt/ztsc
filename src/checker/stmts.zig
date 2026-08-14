@@ -745,9 +745,27 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
                 // handed over is irrelevant — nothing re-checks the operands.
                 var rets = try c.collectReturns(c.tree.nodeRange(body), binder.file_scope);
                 defer rets.deinit(c.scratch());
-                const span = if (proto.name_token != 0) c.tokSpan(proto.name_token) else c.tokSpan(c.tree.nodeMainToken(node));
+                // tsc's `checkAllCodePathsInNonVoidFunctionReturnOrThrow`
+                // anchors all three of these on
+                // `getEffectiveReturnTypeNode(func) || func` — the written
+                // RETURN TYPE, not the function's name. Every one of these
+                // reports needs an annotation to fire (`eff_ann` comes from
+                // `proto.return_type` alone), so the node is always there;
+                // the name/keyword fallback only guards the invariant.
+                const span = if (proto.return_type != 0)
+                    c.nodeSpan(proto.return_type)
+                else if (proto.name_token != 0)
+                    c.tokSpan(proto.name_token)
+                else
+                    c.tokSpan(c.tree.nodeMainToken(node));
                 if (!c.stmtListTerminal(c.tree.nodeRange(body))) {
-                    if (rets.exprs.items.len == 0 and !rets.bare) {
+                    if (k == .never) {
+                        // A `never` return is the FIRST arm in tsc, ahead of
+                        // both "must return a value" and the ending-return
+                        // message: reaching the end of the body contradicts
+                        // the annotation whether or not a return was written.
+                        try c.diagFmt(2534, span, "A function returning 'never' cannot have a reachable end point.", .{});
+                    } else if (rets.exprs.items.len == 0 and !rets.bare) {
                         try c.diagFmt(2355, span, "A function whose declared type is neither 'undefined', 'void', nor 'any' must return a value.", .{});
                     } else {
                         try c.diagFmt(2366, span, "Function lacks ending return statement and return type does not include 'undefined'.", .{});
