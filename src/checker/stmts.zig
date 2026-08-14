@@ -26,7 +26,9 @@ const Error = checker_zig.Error;
 const max_instantiation_count = checker_zig.max_instantiation_count;
 
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
+const accessibility = @import("accessibility.zig");
 const baseClassRef = @import("instantiate.zig").baseClassRef;
+const conditions = @import("conditions.zig");
 const checkExprCached = @import("expr.zig").checkExprCached;
 const classStaticType = @import("enums.zig").classStaticType;
 const decorators = @import("decorators.zig");
@@ -84,22 +86,26 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
         .expr_stmt => _ = try c.checkExprCached(d.lhs, types.no_type),
         .empty_stmt, .debugger_stmt, .error_node, .unsupported, .omitted => {},
         .if_stmt => {
-            _ = try c.checkExprCached(d.lhs, types.no_type);
+            const cond_t = try c.checkExprCached(d.lhs, types.no_type);
+            try conditions.checkTruthiness(c, d.lhs, cond_t);
             try c.checkStatement(d.rhs);
         },
         .if_else_stmt => {
             const e = c.tree.extraData(ast.IfElse, d.rhs);
-            _ = try c.checkExprCached(d.lhs, types.no_type);
+            const cond_t = try c.checkExprCached(d.lhs, types.no_type);
+            try conditions.checkTruthiness(c, d.lhs, cond_t);
             try c.checkStatement(e.then_stmt);
             try c.checkStatement(e.else_stmt);
         },
         .while_stmt => {
-            _ = try c.checkExprCached(d.lhs, types.no_type);
+            const cond_t = try c.checkExprCached(d.lhs, types.no_type);
+            try conditions.checkTruthiness(c, d.lhs, cond_t);
             try c.checkStatement(d.rhs);
         },
         .do_stmt => {
             try c.checkStatement(d.lhs);
-            _ = try c.checkExprCached(d.rhs, types.no_type);
+            const cond_t = try c.checkExprCached(d.rhs, types.no_type);
+            try conditions.checkTruthiness(c, d.rhs, cond_t);
         },
         .for_stmt => {
             const e = c.tree.extraData(ast.For, d.lhs);
@@ -112,7 +118,10 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
                     else => _ = try c.checkExprCached(e.init, types.no_type),
                 }
             }
-            if (e.cond != 0) _ = try c.checkExprCached(e.cond, types.no_type);
+            if (e.cond != 0) {
+                const cond_t = try c.checkExprCached(e.cond, types.no_type);
+                try conditions.checkTruthiness(c, e.cond, cond_t);
+            }
             if (e.update != 0) _ = try c.checkExprCached(e.update, types.no_type);
             try c.checkStatement(d.rhs);
         },
@@ -249,7 +258,10 @@ fn checkDeclarator(c: *Checker, decl: Node, is_const: bool) Error!void {
         // an implicit `any` (TS7031). Only a VAR STATEMENT reaches here; a
         // `for…of`/`for…in` head takes its declarator's type from the
         // iterable and is checked elsewhere.
-        .declarator => try implicit_any.reportPatternImplicitAny(c, d.lhs),
+        .declarator => {
+            try implicit_any.reportPatternImplicitAny(c, d.lhs);
+            try implicit_any.reportAmbientVarImplicitAny(c, d.lhs);
+        },
         .declarator_init => {
             _ = try c.checkExprCached(d.rhs, types.no_type);
             // Materialize the symbol's type (infers + caches).
@@ -1068,6 +1080,64 @@ fn initCandidate(c: *Checker, member: Node, e: ast.Field, ann: TypeId) bool {
 /// tsc's `findConstructorDeclaration`: the class's own constructor *with a
 /// body* (an overload signature is not the implementation), or `null_node`.
 /// A base class's constructor does not count — the check is per class.
+/// Does an un-annotated, un-initialized class field really fall to `any` — the
+/// TS7008 precondition — or does tsc have another source for its type?
+///
+/// tsc's `getTypeForVariableLikeDeclaration` answers this for a property
+/// declaration under `noImplicitAny` in three ways, and each one has to be
+/// respected here or the diagnostic is a false positive on ordinary code
+/// (excalidraw's `public code;` / `private _getFiles;` are both assigned in
+/// their constructor and carry no annotation):
+///
+///   * an INSTANCE field takes its type from the control flow of `this.<name>`
+///     assignments in the CONSTRUCTOR (`getFlowTypeInConstructor`);
+///   * a STATIC field takes it from the class's `static { … }` blocks
+///     (`getFlowTypeInStaticBlocks`) — which ztsc parses as `unsupported` and
+///     cannot walk, so a class body holding one silences its static fields;
+///   * an AMBIENT field takes it from the base class's property of the same name
+///     (`getTypeOfPropertyInBaseClass`), so a `declare class D extends B` is
+///     silent about a field `B` might declare.
+///
+/// The constructor scan asks for ANY assignment, not for a definite one
+/// (TS2564's question): tsc infers from whatever the flow offers, so a write on
+/// one branch is enough to make it not-`any`.
+fn fieldTypeIsImplicitAny(c: *Checker, members: []const Node, member: Node, e: ast.Field, extends: Node) Error!bool {
+    const name = try c.memberAtom(c.tree.nodeMainToken(member));
+    if (e.flags & ast.Flags.static != 0) {
+        // A `static { … }` block is parsed as a plain `.block` member (see the
+        // parser's note there) and its statements are not checked, so its writes
+        // cannot be found — any block at all silences the class's static fields.
+        for (members) |m| {
+            if (m == null_node) continue;
+            if (c.nodeTag(m) == .block or c.nodeTag(m) == .unsupported) return false;
+        }
+        return true;
+    }
+    if (extends != 0 and c.ambient_ctx) return false;
+    const ctor = constructorWithBody(c, members);
+    if (ctor == null_node) return true;
+    return !assignsThisProp(c, c.tree.nodeData(ctor).rhs, name);
+}
+
+/// Any syntactic `this.<name> = …` (or `||=` / `??=`) inside `node`. A nested
+/// CLASS body belongs to another `this`; a nested function's body does not run
+/// at construction time for tsc's flow either, but it is deliberately counted
+/// here — over-counting only suppresses a diagnostic, which is the direction a
+/// brand-new check must err in.
+fn assignsThisProp(c: *Checker, node: Node, name: intern.Atom) bool {
+    if (node == null_node) return false;
+    if (c.nodeTag(node) == .class_decl) return false;
+    if (c.nodeTag(node) == .assign) {
+        const d = c.tree.nodeData(node);
+        if (writesThisProp(c, d.lhs, name)) return true;
+    }
+    var it = c.tree.childIterator(node);
+    while (it.next()) |child| {
+        if (assignsThisProp(c, child, name)) return true;
+    }
+    return false;
+}
+
 fn constructorWithBody(c: *Checker, members: []const Node) Node {
     for (members) |m| {
         if (m == null_node or c.nodeTag(m) != .class_method) continue;
@@ -1201,6 +1271,17 @@ fn writesThisProp(c: *Checker, target: Node, name: intern.Atom) bool {
             if (c.nodeTag(d.lhs) != .this_expr) return false;
             var idx = d.rhs;
             while (c.nodeTag(idx) == .paren_expr) idx = c.tree.nodeData(idx).lhs;
+            // A NUMERIC key names the same member the string spelling does —
+            // tsc's `getAccessedPropertyName` renders it with
+            // `isNumericLiteralName`, so `this[0] = v` initializes the member
+            // declared `0;` (`classPropInitializationInferenceWithElementAccess`).
+            if (c.nodeTag(idx) == .number_literal) {
+                var buf: [24]u8 = undefined;
+                const v = c.numberTokenValue(c.tree.nodeMainToken(idx));
+                if (v != @floor(v) or @abs(v) >= 9007199254740992.0) return false;
+                const txt = std.fmt.bufPrint(&buf, "{d}", .{@as(i64, @intFromFloat(v))}) catch return false;
+                return (c.internText(txt) catch return false) == name;
+            }
             if (c.nodeTag(idx) != .string_literal) return false;
             return (c.memberAtom(c.tree.nodeMainToken(idx)) catch return false) == name;
         },
@@ -1481,6 +1562,10 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
 
     // Members.
     const members = c.tree.extraRange(data.members_start, data.members_end);
+    // A `get`/`set` pair whose getter is less accessible than its setter
+    // (TS2808) — a property of the declarations alone, so it runs before any
+    // member's type is resolved.
+    try accessibility.checkAccessorVisibility(c, members);
     for (members, 0..) |member, mi| {
         if (member == null_node) continue;
         const md = c.tree.nodeData(member);
@@ -1499,6 +1584,13 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
                 if (e.type_ann != 0) {
                     const ok = is_static and e.flags & ast.Flags.readonly != 0;
                     ann = try c.annTypeMaybeUnique(e.type_ann, ok, 1331, c.tokSpan(c.tree.nodeMainToken(member)));
+                } else if (e.init == 0 and try fieldTypeIsImplicitAny(c, members, member, e, data.extends)) {
+                    // Neither annotated nor initialized, and nothing else
+                    // supplies a type: the field is `any` (TS7008). Reported
+                    // from the declaration walk rather than from
+                    // `computeMemberType`, so it fires exactly once per
+                    // declaration and for an unreferenced class too.
+                    try implicit_any.reportMemberImplicitAny(c, c.tree.nodeMainToken(member), e.flags);
                 }
                 if (check_prop_init and initCandidate(c, member, e, ann)) {
                     try init_cands.append(c.scratch(), .{ .member = member, .ty = ann });
