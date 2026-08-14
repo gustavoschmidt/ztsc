@@ -67,8 +67,34 @@ pub fn checkAssignable(c: *Checker, src_t: TypeId, target: TypeId, expr_node: No
     if (expr_node != 0 and try c.elaborateLiteralError(expr_node, src_t, target)) {
         return false;
     }
+    if (expr_node != 0 and try c.excessPropertyFailure(expr_node, src_t, target)) return false;
     try c.reportNotAssignable(2322, src_t, target, span);
     return false;
+}
+
+/// The excess-property check on the FAILURE side of the relation.
+///
+/// tsc's `hasExcessProperties` runs at the top of `isRelatedTo`, so it decides
+/// before the structural walk ever reports: a fresh literal carrying a name the
+/// target does not know is diagnosed as TS2353/TS2561 **on the offending
+/// property** and the whole-type TS2322/TS2345 is never filed, even when the
+/// pair would also have failed for a missing or mistyped member. ztsc's
+/// relation cannot see freshness (it is memoized on type pairs, and freshness
+/// belongs to the expression), so the reporting paths ask separately — and
+/// until this existed they only asked on the side where the relation SUCCEEDED,
+/// which is why `var b: Book = { forword: "" }` came out as TS2741 "property
+/// 'foreword' is missing" at the declaration instead of tsc's TS2561 on
+/// `forword`.
+///
+/// Ordered after `elaborateLiteralError` to mirror
+/// `checkTypeRelatedToAndOptionallyElaborate`, which runs `elaborateError`
+/// first and only reaches `checkTypeRelatedTo` — the EPC's home — when the
+/// per-member elaboration found nothing. Returns true when it reported, and
+/// then the caller must not add its own whole-type error.
+pub fn excessPropertyFailure(c: *Checker, expr_node: Node, src_t: TypeId, target: TypeId) Error!bool {
+    const before = c.diags.items.len;
+    try c.excessPropertyCheck(expr_node, src_t, target);
+    return c.diags.items.len != before;
 }
 
 /// The conditional-TARGET leniency ("the source must satisfy whichever
@@ -184,6 +210,7 @@ pub fn checkSatisfies(c: *Checker, src_t: TypeId, target: TypeId, expr_node: Nod
     if (expr_node != 0 and try c.elaborateLiteralError(expr_node, src_t, target)) {
         return false;
     }
+    if (expr_node != 0 and try c.excessPropertyFailure(expr_node, src_t, target)) return false;
     // TS7 surfaces the specific missing-property error (TS2741/2739) in
     // place of the TS1360 wrapper when the operand is an object missing
     // required members; a primitive/non-object mismatch still gets TS1360.
@@ -981,6 +1008,72 @@ fn targetIsGlobalObjectIface(c: *Checker, t: TypeId) Error!bool {
     return false;
 }
 
+/// The names tsc's spelling suggestion for an excess property may propose —
+/// `getPropertiesOfType(errorTarget)`, appended to `out`:
+///
+///   * an object contributes its own property names;
+///   * an INTERSECTION contributes every constituent's, since its property set
+///     is the union of theirs (`collectPropNames`);
+///   * a UNION contributes only names present in EVERY object-ish constituent,
+///     because a union's property list is the INTERSECTION of its members'.
+///     Non-object constituents drop out first, exactly as tsc filters
+///     `reducedTarget` through `isExcessPropertyCheckTarget` before asking.
+///
+/// Getting this pool wrong is not cosmetic: a name found here files TS2561 and
+/// a name not found files TS2353, so over-collecting swaps one code for the
+/// other on the same finding.
+fn targetSuggestionNames(c: *Checker, rt: TypeId, out: *std.ArrayList(Atom)) Error!void {
+    if (c.ts.kind(rt) != .union_type) return c.collectPropNames(rt, out, 0);
+    var first: std.ArrayList(Atom) = .empty;
+    defer first.deinit(c.scratch());
+    var objish: u32 = 0;
+    for (try c.memberList(rt)) |m| {
+        const rm = try c.resolveStructural(m);
+        switch (c.ts.kind(rm)) {
+            .object, .intersection => {},
+            // An ARRAY or TUPLE constituent is an excess-check target for tsc,
+            // so it stays in `errorTarget` and its (Array) members join the
+            // intersection — which for any hand-written name leaves the pool
+            // EMPTY. Offering the object arm's names instead invented a
+            // suggestion, and with it TS2561 where tsc files TS2353
+            // (`Book | Book[]`).
+            .array, .tuple => return,
+            else => continue,
+        }
+        objish += 1;
+        if (objish == 1) {
+            try c.collectPropNames(rm, &first, 0);
+            continue;
+        }
+        var keep: usize = 0;
+        for (first.items) |name| {
+            if ((try c.propOfType(rm, name)) == null) continue;
+            first.items[keep] = name;
+            keep += 1;
+        }
+        first.shrinkRetainingCapacity(keep);
+    }
+    if (objish == 0) return;
+    for (first.items) |name| try out.append(c.scratch(), name);
+}
+
+/// tsc's `getSuggestedSymbolForNonexistentProperty` for an excess property:
+/// the target's own property name closest to the written one, or null when
+/// nothing is close enough. Selects TS2561 over TS2353.
+fn excessPropSuggestion(c: *Checker, rt: TypeId, key: Atom) Error!?Atom {
+    const text = c.atomText(key);
+    if (text.len == 0) return null;
+    var names: std.ArrayList(Atom) = .empty;
+    defer names.deinit(c.scratch());
+    try targetSuggestionNames(c, rt, &names);
+    if (names.items.len == 0) return null;
+    var cand: std.ArrayList([]const u8) = .empty;
+    defer cand.deinit(c.scratch());
+    for (names.items) |a| try cand.append(c.scratch(), c.atomText(a));
+    const idx = intern.spellingSuggestion(c.scratch(), text, cand.items) orelse return null;
+    return names.items[idx];
+}
+
 /// tsc's excess property check: only *fresh* object literals, checked
 /// against object-ish targets; recurses into nested literal properties.
 pub fn excessPropertyCheck(c: *Checker, expr_node: Node, src_t: TypeId, target: TypeId) Error!void {
@@ -994,6 +1087,94 @@ pub fn excessPropertyCheck(c: *Checker, expr_node: Node, src_t: TypeId, target: 
 /// relation itself (`hasExcessProperties` inside `isRelatedTo`), so a
 /// candidate signature that only "fits" by ignoring an excess property is
 /// not applicable there either.
+/// tsc's `findMatchingDiscriminantType`, as `hasExcessProperties` uses it: a
+/// UNION target is first REDUCED to the constituents the source's discriminant
+/// properties select, and only then asked which names it knows. Without the
+/// reduction the check asks the whole union, so a name belonging to a *sibling*
+/// arm counts as known and the error is lost:
+///
+/// ```ts
+/// type ADT = { tag: "A", a1: string } | { tag: "T" };
+/// const x: ADT = { tag: "T", a1: "" };   // TS2353 on `a1`: the `tag` picks
+///                                       // `{ tag: "T" }`, which has no `a1`
+/// ```
+///
+/// A discriminator here is a source property whose own type is a unit (or a
+/// union of units) — the shape a tag actually has, and a strict subset of the
+/// properties tsc's `findDiscriminantProperties` accepts, so the reduction can
+/// only be coarser than tsc's and the check only more forgiving.
+///
+/// Per discriminator, every still-included constituent that does not accept the
+/// source's value drops out; a discriminator NO constituent accepts is discarded
+/// wholesale (tsc's `!matched` restore), which is what keeps a literal with a
+/// wrong tag reported as a plain mismatch rather than measured against an
+/// arbitrary arm. Returns the original union when nothing was reduced away.
+fn epcReducedUnion(c: *Checker, src_t: TypeId, rt: TypeId) Error!TypeId {
+    const ms = try c.memberList(rt);
+    if (ms.len < 2) return rt;
+    const rs = try c.resolveStructural(src_t);
+    if (c.ts.kind(rs) != .object) return rt;
+    const nprops = c.ts.objectPropCount(rs);
+    if (nprops == 0) return rt;
+    // tsc seeds `include` with FALSE for every primitive constituent, so a
+    // reduced target never contains one.
+    const include = try c.scratch().alloc(bool, ms.len);
+    defer c.scratch().free(include);
+    var any_objish = false;
+    for (ms, 0..) |m, i| {
+        const rm = try c.resolveStructural(m);
+        include[i] = switch (c.ts.kind(rm)) {
+            .object, .intersection, .array, .tuple, .ref => true,
+            else => false,
+        };
+        if (include[i]) any_objish = true;
+    }
+    if (!any_objish) return rt;
+    var reduced = false;
+    for (0..nprops) |pi| {
+        const sp = c.ts.objectProp(rs, @intCast(pi));
+        if (!try c.isUnitOrUnitUnion(try c.resolveStructural(sp.ty))) continue;
+        var matched = false;
+        var maybe_out: usize = 0;
+        const maybe = try c.scratch().alloc(bool, ms.len);
+        defer c.scratch().free(maybe);
+        for (ms, 0..) |m, i| {
+            maybe[i] = false;
+            if (!include[i]) continue;
+            const rm = try c.resolveStructural(m);
+            // A constituent that does not HAVE the property is not selected
+            // against: only a constituent that has it and disagrees drops out.
+            // This is tsc's partial-discriminant handling, and it is the whole
+            // reason `{ str: "b", num: 1 }` is legal against
+            // `{ str: "a", num: 0 } | { str: "b" } | { num: 1 }` — `str` keeps
+            // `{ num: 1 }` in the running (it has no `str` to disagree with),
+            // and `num` is then known there (`missingDiscriminants`).
+            const tp = (try c.targetPropType(rm, sp.name)) orelse continue;
+            if (try c.isAssignable(sp.ty, tp)) {
+                matched = true;
+            } else {
+                maybe[i] = true;
+                maybe_out += 1;
+            }
+        }
+        // No arm accepts this value: not a discriminator that selects anything,
+        // so it selects nothing away either.
+        if (!matched or maybe_out == 0) continue;
+        for (ms, 0..) |_, i| {
+            if (maybe[i]) include[i] = false;
+        }
+        reduced = true;
+    }
+    if (!reduced) return rt;
+    var keep: std.ArrayList(TypeId) = .empty;
+    defer keep.deinit(c.scratch());
+    for (ms, 0..) |m, i| {
+        if (include[i]) try keep.append(c.scratch(), m);
+    }
+    if (keep.items.len == 0) return rt;
+    return c.ts.makeUnion(c.scratch(), keep.items);
+}
+
 pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: TypeId, report: bool) Error!bool {
     var node = expr_node;
     // Unwrap parens and a JSX expression container (`prop={{ … }}`): the
@@ -1018,7 +1199,7 @@ pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: T
     // all. Latent until the relation started accepting it: the pair used to
     // fail with TS2740 before the excess check was ever consulted.
     if (try targetIsGlobalObjectIface(c, target)) return false;
-    const rt = try c.resolveStructural(target);
+    var rt = try c.resolveStructural(target);
     if (try targetIsGlobalObjectIface(c, rt)) return false;
     switch (c.ts.kind(rt)) {
         .object => {
@@ -1041,6 +1222,9 @@ pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: T
             for (try c.memberList(rt)) |m| {
                 if (try c.targetIsEmptyish(m)) return false;
             }
+            // …and it is the DISCRIMINANT-REDUCED union the names are looked up
+            // in (`epcReducedUnion`), not the whole one.
+            rt = try epcReducedUnion(c, src_t, rt);
         },
         // An intersection has no properties of its own, so the walk below
         // relies entirely on `targetKnowsProp`'s intersection arm (ANY
@@ -1055,7 +1239,14 @@ pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: T
         const tag = c.nodeTag(prop);
         if (tag != .object_property and tag != .object_shorthand and tag != .object_method) continue;
         const key_tok = c.tree.nodeMainToken(prop);
-        if (tag == .object_property) {
+        // A COMPUTED name has no name to be excess: tsc's
+        // `shouldCheckAsExcessProperty` only ever sees resolved symbols, and a
+        // late-bound one (`[Symbol.toStringTag](n) { … }`) is excluded by
+        // `isLateBoundName`. A method carries its computed name exactly where a
+        // property does (`nodeData(prop).lhs`), and skipping it only for the
+        // property form made the method's key the `[` token — reported as an
+        // excess property named "[" (`symbolProperty20`).
+        if (tag == .object_property or tag == .object_method) {
             const pd = c.tree.nodeData(prop);
             if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) continue;
         }
@@ -1063,9 +1254,20 @@ pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: T
         const known = try c.targetKnowsProp(rt, key);
         if (!known) {
             if (report) {
-                try c.diagFmt(2353, c.tokSpan(key_tok), "Object literal may only specify known properties, and '{s}' does not exist in type '{s}'.", .{
-                    c.atomText(key), try c.typeToString(target),
-                });
+                // tsc's `hasExcessProperties` files the SUGGESTION form
+                // (TS2561) whenever the unknown name is a near-miss of one the
+                // target does have, and the plain TS2353 only otherwise — two
+                // different codes for the same finding, so the choice has to be
+                // made here rather than in a follow-up pass.
+                if (try excessPropSuggestion(c, rt, key)) |sugg| {
+                    try c.diagFmt(2561, c.tokSpan(key_tok), "Object literal may only specify known properties, but '{s}' does not exist in type '{s}'. Did you mean to write '{s}'?", .{
+                        c.atomText(key), try c.typeToString(target), c.atomText(sugg),
+                    });
+                } else {
+                    try c.diagFmt(2353, c.tokSpan(key_tok), "Object literal may only specify known properties, and '{s}' does not exist in type '{s}'.", .{
+                        c.atomText(key), try c.typeToString(target),
+                    });
+                }
             }
             return true; // one excess error per literal, like tsc's early bail
         }
@@ -1158,6 +1360,14 @@ pub fn intersectionExcessCheckable(c: *Checker, rt: TypeId) Error!bool {
                 if (!try c.intersectionExcessCheckable(rm)) return false;
                 all_empty = false;
             },
+            // The `object` keyword qualifies as an excess-check target for tsc
+            // (`isExcessPropertyCheckTarget` accepts `TypeFlags.NonPrimitive`)
+            // and contributes no known name, so `object & { x: string }` is
+            // checked exactly like `{ x: string }` alone — the case the
+            // conformance corpus spells out as "the 'object' type has no effect
+            // on intersections". It stays `isEmptyObjectType`, hence leaves
+            // `all_empty` untouched.
+            .object_keyword => {},
             else => return false,
         }
     }
@@ -1220,6 +1430,42 @@ pub fn targetKnowsProp(c: *Checker, rt: TypeId, key: Atom) Error!bool {
         // conditional/mapped/keyof node, a callable): claiming a name is
         // excess in one of those risks a false TS2353.
         .undefined, .null, .void, .never => return false,
+        // An ARRAY or TUPLE *is* an object type to tsc, so `isKnownProperty`
+        // reads it like any other: its apparent members (`length`, `push`, …)
+        // and, through `Array`'s numeric index signature, a numeric name — and
+        // NOTHING else. The blanket `true` below made a union with an array
+        // constituent unable to refuse any name at all, which is why
+        // `var b: Book | Book[] = { forewarned: "" }` came out as a whole-type
+        // TS2322 instead of tsc's TS2353 on `forewarned`.
+        .array, .tuple => {
+            if (assign.isNumericPropName(c.atomText(key))) return true;
+            return (try c.propOfType(rt, key)) != null;
+        },
+        // A PRIMITIVE carries no `TypeFlags.Object`, so tsc's `isKnownProperty`
+        // is false for it whatever the name — `string`'s apparent `length`
+        // included, since the test never looks at an apparent type. Reached as
+        // a union constituent (`Book | string`), where answering "known"
+        // switched the check off for the whole union. Same for the `object`
+        // keyword, whose `NonPrimitive` flag has no members either (and which,
+        // being `isEmptyObjectType`, bails the check out wholesale one level up
+        // when it stands in a union — see `targetIsEmptyish`).
+        .string,
+        .number,
+        .boolean,
+        .bigint,
+        .symbol,
+        .object_keyword,
+        .bool_true,
+        .bool_false,
+        .string_literal,
+        .number_literal,
+        .number_literal_fresh,
+        .bigint_literal,
+        .unique_symbol,
+        .enum_type,
+        .template_literal_type,
+        .string_mapping,
+        => return false,
         else => return true, // non-object targets: not our business here
     }
 }

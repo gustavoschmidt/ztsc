@@ -1549,7 +1549,13 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
             if (reported_arg) continue;
             const before = c.diags.items.len;
             if (!try c.elaborateCallbackError(an, at, pt) and
-                !try c.elaborateLiteralError(an, at, pt))
+                !try c.elaborateLiteralError(an, at, pt) and
+                // A fresh object-literal argument with an unknown property is
+                // tsc's TS2353/TS2561 on that property, not a TS2345 on the
+                // argument — `hasExcessProperties` decides inside the relation,
+                // so it wins over the whole-argument report here too
+                // (`excessPropertyFailure`).
+                !try c.excessPropertyFailure(an, at, pt))
             {
                 // `reportNotAssignable` owns the TS2741/2739/2740
                 // missing-property refinement, which tsc applies in argument
