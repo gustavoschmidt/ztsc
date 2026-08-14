@@ -2690,6 +2690,14 @@ fn numericIndexHit(c: *Checker, r: TypeId, rk: types.Kind, v: f64) Error!?TypeId
     }
 }
 
+/// `numericIndexHit` for a key given as TEXT: the numeric-name test and the
+/// numeric resolution together, so the caller pays neither unless a
+/// string-literal key actually misses as a property name.
+fn numericNameIndexHit(c: *Checker, r: TypeId, rk: types.Kind, text: []const u8) Error!?TypeId {
+    const v = numericLiteralNameValue(text) orelse return null;
+    return numericIndexHit(c, r, rk, v);
+}
+
 fn checkIndexExpr(c: *Checker, node: Node, narrow: bool) Error!TypeId {
     const link = try indexChainInner(c, node, narrow);
     if (link.chained) return c.makeUnion2(link.ty, types.undefined_type);
@@ -2811,10 +2819,9 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool) Error!ChainLink {
             // Without this, `[string, number]["0"]`, `{ [x: number]: string
             // }["3"]` and every `c['1']` on a numerically-keyed class were
             // TS7053 false positives.
-            const num_name = numericLiteralNameValue(c.atomText(key));
             if (try c.propOfType(r, key)) |p| {
                 result = if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
-            } else if (if (num_name) |v| try numericIndexHit(c, r, rk, v) else null) |nt| {
+            } else if (try numericNameIndexHit(c, r, rk, c.atomText(key))) |nt| {
                 result = nt;
             } else if (rk == .object and c.ts.objectStringIndex(r) != 0) {
                 result = c.ts.objectStringIndex(r);
@@ -3611,6 +3618,34 @@ pub fn reportIndexImplicitAny(c: *Checker, node: Node, recv: Node, idx_t: TypeId
             try c.diagFmt(7052, c.nodeSpan(node), "Element implicitly has an 'any' type because type '{s}' has no index signature. Did you mean to call 'get'?", .{try c.typeToString(obj_t)});
         }
         return;
+    }
+    // A FRESH OBJECT-LITERAL receiver indexed by a string/number LITERAL is
+    // the missing-property TS2339, not an implicit-any report at all: tsc's
+    // `getPropertyTypeForIndexType` object-literal arm
+    // (`isObjectLiteralType(objectType) && noImplicitAny && indexType.flags &
+    // (StringLiteral | NumberLiteral)`). It is placed AFTER the `get`/`set`
+    // suggestion above, which is where the oracle puts it: an object carrying
+    // a matching accessor keeps TS7052 in both read and write position
+    // (`({ get, set }).foo['k']`), and only a receiver with no suggestion to
+    // make reaches this. Freshness is the other half of the discriminator: a literal held in a
+    // variable — whose type is WIDENED, dropping the literal origin exactly as tsc's
+    // `getWidenedTypeOfObjectLiteral` drops `ObjectFlags.ObjectLiteral` — is
+    // TS7052/TS7053.
+    if (c.ts.objectIsLiteralOrigin(r)) {
+        const lit = try c.ts.regularLiteral(idx_t);
+        // The property NAME, unquoted — `typeToString` of a string literal
+        // carries its quotes, which this message must not.
+        const name: ?[]const u8 = switch (c.ts.kind(lit)) {
+            .string_literal => c.atomText(c.ts.literalAtom(lit)),
+            .number_literal => try c.typeToString(lit),
+            else => null,
+        };
+        if (name) |n| {
+            try c.diagFmt(2339, c.nodeSpan(node), "Property '{s}' does not exist on type '{s}'.", .{
+                n, try c.typeToString(obj_t),
+            });
+            return;
+        }
     }
     try c.diagFmt(7053, c.nodeSpan(node), "Element implicitly has an 'any' type because expression of type '{s}' can't be used to index type '{s}'.", .{
         try c.typeToString(idx_t), try c.typeToString(obj_t),

@@ -21,6 +21,7 @@ const TpMap = @import("subst.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
 const isCtorName = @import("instantiate.zig").isCtorName;
+const classIndexInfos = @import("classes.zig").classIndexInfos;
 
 /// One own static member of `cls`, resolved WITHOUT materializing its
 /// siblings — tsc's `getPropertyOfType` on the static side, which reaches
@@ -186,7 +187,11 @@ pub fn classStaticType(c: *Checker, sym: SymbolId) Error!TypeId {
         // body scope, so the member index above does not carry them.
         try c.nsReexportProps(sym, &props);
     }
-    var result = try c.ts.makeObject(props.items, 0, 0, 0);
+    // `static [k: string]: T` belongs to the class VALUE's type — the half
+    // `classIndexInfos` reads with `statics` set. Inherited signatures arrive
+    // through the base merge below.
+    const own_index = try classIndexInfos(c, sym, true);
+    var result = try c.ts.makeObject(props.items, own_index.str, own_index.num, 0);
     // Static members are inherited: `typeof D` includes `typeof Base`'s
     // statics (own members win over inherited). This is how leaflet's
     // `Map.include`/`GridLayer.extend` reach the static `extend`/`include`

@@ -392,6 +392,51 @@ pub fn unionCallableSigs(c: *Checker, a: TypeId, b: TypeId) Error!?TypeId {
 /// a single combined overload set (`derived`'s first) rather than the
 /// earlier declaration hiding the later's overloads — mirroring tsc's
 /// declaration-order overload concatenation across merged interface
+/// The `string`/`number` index signatures one half of a class body declares.
+/// 0 = none.
+pub const ClassIndexInfos = struct { str: TypeId = 0, num: TypeId = 0 };
+
+/// The index signatures written in a class BODY. tsc resolves
+/// `[k: string]: T` onto the INSTANCE side and `static [k: string]: T` onto
+/// the class value's own type (`resolveClassOrInterfaceMembers` reads the
+/// declarations of whichever half it is building), so `statics` picks the
+/// half. Only this class's own declarations are read: an inherited signature
+/// arrives through the heritage merge, which already prefers the derived
+/// one (`mergeBaseObjectPlain`).
+///
+/// Without this a class body's index signature was dropped entirely — every
+/// `C['f']` on a class declaring `[s: string]: number` was a false TS7053,
+/// and `D[42]` through a base's `static [s: number]:` answered `any`.
+pub fn classIndexInfos(c: *Checker, sym: SymbolId, statics: bool) Error!ClassIndexInfos {
+    var out: ClassIndexInfos = .{};
+    const saved_ctx = c.enterSymFile(sym);
+    defer c.restoreCtx(saved_ctx);
+    const saved_scope = c.cur_scope;
+    defer c.cur_scope = saved_scope;
+    // The member scope's parent chain carries the class's type parameters,
+    // which an instance-side value type may name (`[k: string]: T`).
+    if (c.bind.membersScopeOf(c.localOf(sym))) |ms| c.cur_scope = ms;
+    for (c.declsOf(sym)) |decl| {
+        // `.class_decl` covers class expressions too (one tag).
+        if (c.nodeTag(decl) != .class_decl) continue;
+        const data = c.tree.extraData(ast.ClassData, c.tree.nodeData(decl).lhs);
+        for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
+            if (m == null_node or c.nodeTag(m) != .index_signature) continue;
+            const md = c.tree.nodeData(m);
+            if ((md.rhs & ast.Flags.static != 0) != statics) continue;
+            const e = c.tree.extraData(ast.IndexSig, md.lhs);
+            const key = try c.typeFromTypeNode(e.key_type);
+            const val = try c.typeFromTypeNode(e.value_type);
+            if (key == types.number_type) {
+                out.num = val;
+            } else if (key == types.string_type) {
+                out.str = val;
+            }
+        }
+    }
+    return out;
+}
+
 /// declarations, and the within-file reopened-block behavior already
 /// implemented in `objectTypeFromMembers`. Base/heritage merging keeps
 /// `union_overloads` false: an inherited member is shadowed, not unioned.
@@ -521,8 +566,10 @@ pub fn classInstanceGeneric(c: *Checker, sym0: SymbolId) Error!TypeId {
     var provisional = false;
     // A class instance is a nominal shape without the implied string index
     // that an object/type literal carries (an empty `class C {}` must still
-    // fail assignment to `{[k:string]:T}`).
-    var result: TypeId = try c.ts.makeObject(&.{}, 0, 0, types.obj_flag_not_inferable);
+    // fail assignment to `{[k:string]:T}`) — but a body that WRITES one has
+    // it (`class C { [k: string]: number }`).
+    const own_index = try classIndexInfos(c, sym, false);
+    var result: TypeId = try c.ts.makeObject(&.{}, own_index.str, own_index.num, types.obj_flag_not_inferable);
     if (c.bind.membersScopeOf(c.localOf(sym))) |ms| {
         const kscope = c.symScope(sym);
         const lo = c.bind.scope_members_start[ms];
@@ -544,7 +591,7 @@ pub fn classInstanceGeneric(c: *Checker, sym0: SymbolId) Error!TypeId {
                 .flags = flags,
             });
         }
-        result = try c.ts.makeObject(props.items, 0, 0, types.obj_flag_not_inferable);
+        result = try c.ts.makeObject(props.items, own_index.str, own_index.num, types.obj_flag_not_inferable);
     }
     // Same-file class+interface declaration merge. tsc binds the pair to ONE
     // symbol whose declarations share a single member table, and whose base
