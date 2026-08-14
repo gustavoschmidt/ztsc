@@ -7,9 +7,10 @@
 //!     member (`isNodeWithinClass`). Otherwise TS2341.
 //!   * `protected`: legal only inside the declaring class or a class derived
 //!     from it (`forEachEnclosingClass` + `isClassDerivedFromDeclaringClasses`).
-//!     Otherwise TS2445. tsc has a second, narrower rule for a protected
-//!     member reached through an unrelated instance (TS2446); ztsc does not
-//!     implement it, which under-reports and never invents a diagnostic.
+//!     Otherwise TS2445. An INSTANCE member has a second rule on top: the
+//!     receiver must be an instance of that enclosing class, not merely of the
+//!     declaring one (`hasBaseType`), or it is TS2446 — which is what stops one
+//!     subclass from reading a sibling subclass's protected state.
 //!
 //! WHICH declaration supplies the modifier is a function of the access
 //! DIRECTION (`getDeclarationModifierFlagsFromSymbol(prop, isWrite)`): a write
@@ -123,18 +124,33 @@ pub fn check(c: *Checker, recv: TypeId, name: Atom, name_tok: TokenIndex, site: 
         });
         return;
     }
-    if (try withinClass(c, found.cls, true)) return;
-    // tsc's "allow accessibility if the context is a function with a `this`
-    // parameter" arm, which no lexical class covers: `function f(this: Foo) {
-    // foo.protectedMember }` is legal, and so is the same body under a
-    // CONTEXTUAL `this` (`const f: (this: Foo) => void = function () {…}`).
-    // Both are exactly "the `this` type in effect derives from the declaring
-    // class". Static members are excluded — tsc tests `flags &
-    // ModifierFlags.Static` before it looks for the parameter at all — and so
-    // is `private`, which admits no such relaxation.
-    if (!found.statics and c.this_type != 0 and try derivesFrom(c, c.this_type, found.cls)) return;
-    try c.diagFmt(2445, c.tokSpan(name_tok), "Property '{s}' is protected and only accessible within class '{s}' and its subclasses.", .{
-        c.atomText(name), try declaringClassName(c, found.cls),
+    const enclosing = try enclosingDerived(c, found.cls) orelse {
+        // tsc's "allow accessibility if the context is a function with a `this`
+        // parameter" arm, which no lexical class covers: `function f(this: Foo) {
+        // foo.protectedMember }` is legal, and so is the same body under a
+        // CONTEXTUAL `this` (`const f: (this: Foo) => void = function () {…}`).
+        // Both are exactly "the `this` type in effect derives from the declaring
+        // class". Static members are excluded — tsc tests `flags &
+        // ModifierFlags.Static` before it looks for the parameter at all — and so
+        // is `private`, which admits no such relaxation. (tsc then runs the
+        // instance test below against that `this` type; leaving it out here only
+        // under-reports.)
+        if (!found.statics and c.this_type != 0 and try derivesFrom(c, c.this_type, found.cls)) return;
+        try c.diagFmt(2445, c.tokSpan(name_tok), "Property '{s}' is protected and only accessible within class '{s}' and its subclasses.", .{
+            c.atomText(name), try declaringClassName(c, found.cls),
+        });
+        return;
+    };
+    // An INSTANCE member additionally has to be reached through an instance of
+    // the enclosing class, not merely of the declaring one: inside `B extends A`,
+    // `this.x` and `b.x` are legal while `a.x` and `c.x` are not, because the
+    // protection is what stops one subclass from reading a sibling's state
+    // (tsc's `hasBaseType(type, enclosingClass)`). "No further restrictions for
+    // static properties" is tsc's own comment on the line above it.
+    if (found.statics) return;
+    if (try derivesFrom(c, found.recv, enclosing)) return;
+    try c.diagFmt(2446, c.tokSpan(name_tok), "Property '{s}' is protected and only accessible through an instance of class '{s}'. This is an instance of class '{s}'.", .{
+        c.atomText(name), try declaringClassName(c, enclosing), try c.typeToString(found.recv),
     });
 }
 
@@ -156,7 +172,10 @@ fn declaringClassName(c: *Checker, cls: SymbolId) Error![]const u8 {
 /// `getParentOfSymbol(prop)` — which it has for free because a symbol knows
 /// its table; ztsc rediscovers it by walking the receiver's `extends` chain,
 /// the same walk `heritage.baseClassMember` makes for TS2612.
-const Declaring = struct { cls: SymbolId, msym: SymbolId, statics: bool };
+/// `recv` is the receiver type after the `this`/class-value/type-parameter hops
+/// below — tsc's `getApparentType`ed `type`, which is what the TS2446 instance
+/// test and its message both name.
+const Declaring = struct { cls: SymbolId, msym: SymbolId, statics: bool, recv: TypeId };
 
 fn declaringClass(c: *Checker, recv: TypeId, name: Atom, site: Site) Error!?Declaring {
     var t = recv;
@@ -183,14 +202,29 @@ fn declaringClass(c: *Checker, recv: TypeId, name: Atom, site: Site) Error!?Decl
             else => break,
         }
     }
-    // Cycle-detection stack, bounded like every other `extends` walk here.
+    const recv_norm = t;
+    if (c.ts.kind(t) != .ref) return null;
+    // Breadth-first over the DECLARED heritage, because an INTERFACE may extend
+    // a class (and several bases at once): `interface I extends Foo {}` inherits
+    // `Foo`'s `private x`, and `i.x` is TS2341 naming `Foo`. A class-only
+    // `extends` walk stops at the interface and reports nothing.
+    //
+    // Bounded and cycle-checked like every other heritage walk here.
+    var queue: [32]SymbolId = undefined;
     var seen: [32]SymbolId = undefined;
+    var qn: usize = 1;
+    var head: usize = 0;
     var n: usize = 0;
-    while (n < seen.len) {
-        if (c.ts.kind(t) != .ref) return null;
-        const sym = c.ts.refSymbol(t);
-        if (!c.symFlags(sym).class) return null;
-        for (seen[0..n]) |s| if (s == sym) return null;
+    queue[0] = c.ts.refSymbol(t);
+    while (head < qn) {
+        const sym = queue[head];
+        head += 1;
+        if (n == seen.len) return null;
+        var dup = false;
+        for (seen[0..n]) |s| if (s == sym) {
+            dup = true;
+        };
+        if (dup) continue;
         seen[n] = sym;
         n += 1;
         {
@@ -203,11 +237,18 @@ fn declaringClass(c: *Checker, recv: TypeId, name: Atom, site: Site) Error!?Decl
                 const hi = c.bind.scope_members_start[ms + 1];
                 for (lo..hi) |i| {
                     if (c.bind.member_atoms[i] != name) continue;
-                    return .{ .cls = sym, .msym = c.toGlobal(c.bind.member_syms[i]), .statics = statics };
+                    return .{ .cls = sym, .msym = c.toGlobal(c.bind.member_syms[i]), .statics = statics, .recv = recv_norm };
                 }
             }
         }
-        t = try c.baseClassRef(sym) orelse return null;
+        // Statics are not inherited through an interface, and an interface has
+        // no static side at all, so the static search stays on the class chain.
+        if (statics and !c.symFlags(sym).class) continue;
+        for (try c.declaredBaseRefs(sym)) |b| {
+            if (c.ts.kind(b) != .ref or qn == queue.len) continue;
+            queue[qn] = c.ts.refSymbol(b);
+            qn += 1;
+        }
     }
     return null;
 }
@@ -247,6 +288,19 @@ fn withinClass(c: *Checker, cls: SymbolId, derived_ok: bool) Error!bool {
         if (derived_ok and try derivesFromSym(c, sym, cls)) return true;
     }
     return false;
+}
+
+/// tsc's `forEachEnclosingClass(node, ec => isClassDerivedFromDeclaringClasses(ec, prop) ? ec : undefined)`:
+/// the INNERMOST lexically enclosing class that derives from `cls`. It is the
+/// class an instance has to be an instance OF for the protected access to be
+/// legal (TS2446), which is why the identity of the match matters and not just
+/// its existence.
+fn enclosingDerived(c: *Checker, cls: SymbolId) Error!?SymbolId {
+    var it = EnclosingClasses.init(c);
+    while (it.next(c)) |sym| {
+        if (sym == cls or try derivesFromSym(c, sym, cls)) return sym;
+    }
+    return null;
 }
 
 /// `hasBaseType(t, base)`: does the class `t` names extend `base` (transitively,

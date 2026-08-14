@@ -86,30 +86,30 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
         .expr_stmt => _ = try c.checkExprCached(d.lhs, types.no_type),
         .empty_stmt, .debugger_stmt, .error_node, .unsupported, .omitted => {},
         .if_stmt => {
-            const cond_t = try c.checkExprCached(d.lhs, types.no_type);
-            try conditions.checkTruthiness(c, d.lhs, cond_t);
-            try conditions.checkUncalledFunction(c, d.lhs, cond_t, d.rhs);
+            const cond_t = try checkIfCondition(c, d.lhs, d.rhs);
+            try conditions.checkUncalledFunction(c, d.lhs, cond_t, d.rhs, false);
             try c.checkStatement(d.rhs);
         },
         .if_else_stmt => {
             const e = c.tree.extraData(ast.IfElse, d.rhs);
-            const cond_t = try c.checkExprCached(d.lhs, types.no_type);
-            try conditions.checkTruthiness(c, d.lhs, cond_t);
-            try conditions.checkUncalledFunction(c, d.lhs, cond_t, e.then_stmt);
+            const cond_t = try checkIfCondition(c, d.lhs, e.then_stmt);
+            try conditions.checkUncalledFunction(c, d.lhs, cond_t, e.then_stmt, false);
             try c.checkStatement(e.then_stmt);
             try c.checkStatement(e.else_stmt);
         },
+        // A `while`/`do`/`for` condition is tested for truthiness but NOT for
+        // the always-defined mistakes (TS2774/TS2845): tsc routes only `if` and
+        // `?:` conditions through `checkTestingKnownTruthyCallableOrAwaitableOr
+        // EnumMemberType`, and tsgo reports nothing for `while (isFoo)`.
         .while_stmt => {
             const cond_t = try c.checkExprCached(d.lhs, types.no_type);
             try conditions.checkTruthiness(c, d.lhs, cond_t);
-            try conditions.checkUncalledFunction(c, d.lhs, cond_t, d.rhs);
             try c.checkStatement(d.rhs);
         },
         .do_stmt => {
             try c.checkStatement(d.lhs);
             const cond_t = try c.checkExprCached(d.rhs, types.no_type);
             try conditions.checkTruthiness(c, d.rhs, cond_t);
-            try conditions.checkUncalledFunction(c, d.rhs, cond_t, d.lhs);
         },
         .for_stmt => {
             const e = c.tree.extraData(ast.For, d.lhs);
@@ -125,7 +125,6 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
             if (e.cond != 0) {
                 const cond_t = try c.checkExprCached(e.cond, types.no_type);
                 try conditions.checkTruthiness(c, e.cond, cond_t);
-                try conditions.checkUncalledFunction(c, e.cond, cond_t, d.rhs);
             }
             if (e.update != 0) _ = try c.checkExprCached(e.update, types.no_type);
             try c.checkStatement(d.rhs);
@@ -218,18 +217,30 @@ fn precededByDeclare(c: *Checker, node: Node) bool {
     return mt > 0 and c.tree.tokens.tag(mt - 1) == .keyword_declare;
 }
 
+/// An `if` condition, checked with `body` published as the branch its logical
+/// operands may be excused by (`conditions.CondWalk.body`). The publication has
+/// to happen BEFORE the condition is walked, because it is `checkBinary`'s `&&`
+/// arm — not this statement — that judges a left operand.
+fn checkIfCondition(c: *Checker, cond: Node, body: Node) Error!types.TypeId {
+    const saved = conditions.enterCondition(c, cond, body);
+    defer conditions.leaveCondition(c, saved);
+    const cond_t = try c.checkExprCached(cond, types.no_type);
+    try conditions.checkTruthiness(c, cond, cond_t);
+    return cond_t;
+}
+
 fn checkVarDeclStatement(c: *Checker, node: Node) Error!void {
     const d = c.tree.nodeData(node);
     const is_const = c.tree.tokens.tag(c.tree.nodeMainToken(node)) == .keyword_const;
     const ambient = c.ambient_ctx or precededByDeclare(c, node);
     if (c.nodeTag(node) == .var_decl_one) {
         if (ambient) try checkAmbientInitializer(c, d.lhs, is_const);
-        try checkDeclarator(c, d.lhs, is_const);
+        try checkDeclarator(c, d.lhs, is_const, ambient);
     } else {
         for (c.tree.nodeRange(node)) |decl| {
             if (decl == null_node) continue;
             if (ambient) try checkAmbientInitializer(c, decl, is_const);
-            try checkDeclarator(c, decl, is_const);
+            try checkDeclarator(c, decl, is_const, ambient);
         }
     }
 }
@@ -255,7 +266,7 @@ fn checkAmbientInitializer(c: *Checker, decl: Node, is_const: bool) Error!void {
     try c.diagFmt(1039, c.nodeSpan(init), "Initializers are not allowed in ambient contexts.", .{});
 }
 
-fn checkDeclarator(c: *Checker, decl: Node, is_const: bool) Error!void {
+fn checkDeclarator(c: *Checker, decl: Node, is_const: bool, ambient: bool) Error!void {
     // TS2403 — every declaration of a name after the first must have an
     // identical type. Runs before the initializer checks so the type demand
     // is the same one `typeOfSymbol` would make on its own.
@@ -269,7 +280,7 @@ fn checkDeclarator(c: *Checker, decl: Node, is_const: bool) Error!void {
         // iterable and is checked elsewhere.
         .declarator => {
             try implicit_any.reportPatternImplicitAny(c, d.lhs);
-            try implicit_any.reportAmbientVarImplicitAny(c, d.lhs);
+            try implicit_any.reportVarImplicitAny(c, d.lhs, ambient);
         },
         .declarator_init => {
             _ = try c.checkExprCached(d.rhs, types.no_type);
@@ -1608,6 +1619,9 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
     // (TS2808) — a property of the declarations alone, so it runs before any
     // member's type is resolved.
     try accessibility.checkAccessorVisibility(c, members);
+    // The same pairing, for the other question the two halves answer together:
+    // whose annotation supplies the property's type (TS7032/TS7033).
+    try implicit_any.reportAccessorImplicitAny(c, members);
     for (members, 0..) |member, mi| {
         if (member == null_node) continue;
         const md = c.tree.nodeData(member);

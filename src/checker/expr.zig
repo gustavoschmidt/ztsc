@@ -265,9 +265,14 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         .assign => return checkAssignExpr(c, node),
         .cond_expr => {
             const e = c.tree.extraData(ast.CondExpr, d.rhs);
+            // `enterCondition` before the condition is walked: a `&&` inside it
+            // is judged by `checkBinary`, which needs to know it guards
+            // `then_expr` (see `conditions.CondWalk`).
+            const saved = conditions.enterCondition(c, d.lhs, e.then_expr);
             const cond_t = try c.checkExprCached(d.lhs, types.no_type);
+            conditions.leaveCondition(c, saved);
             try conditions.checkTruthiness(c, d.lhs, cond_t);
-            try conditions.checkUncalledFunction(c, d.lhs, cond_t, e.then_expr);
+            try conditions.checkUncalledFunction(c, d.lhs, cond_t, e.then_expr, false);
             const then_t = try c.checkExprCached(e.then_expr, ctx);
             const else_t = try c.checkExprCached(e.else_expr, ctx);
             // The arms are subtype-reduced, exactly as `||`/`??` are
@@ -557,6 +562,7 @@ fn checkIdentifier(c: *Checker, node: Node) Error!TypeId {
                 }
                 if ((f.let_decl or f.var_decl) and !f.param and !f.const_decl) {
                     try checkUseBeforeAssigned(c, sym, node, tok, declared);
+                    try checkEvolvingVarRead(c, sym, node, tok);
                 }
             }
             // Flow narrowing. A binding destructured out of a discriminated
@@ -677,6 +683,81 @@ fn isAmbientDeclarator(c: *Checker, decl: Node) bool {
     if (c.nodeTag(decl) != .declarator_full) return false;
     const e = c.tree.extraData(ast.DeclaratorFull, c.tree.nodeData(decl).rhs);
     return e.flags & ast.Flags.declare != 0;
+}
+
+/// tsc's auto-type arm of `checkIdentifier`:
+///
+/// ```ts
+/// if (!isEvolvingArrayOperationTarget(node) && (type === autoType || type === autoArrayType)) {
+///     if (flowType === autoType || flowType === autoArrayType) {
+///         if (noImplicitAny) { error(nameOfDeclaration, TS7034); error(node, TS7005); }
+/// ```
+///
+/// An evolving (`auto`-typed) variable is one tsc control-flow types instead of
+/// giving it a declared type: `var x;` / `let x = null;`, no annotation, not
+/// `const`, not exported and not ambient. Inside its OWN flow container that
+/// always resolves — the initial type there is `undefined`, so a read before any
+/// assignment is TS2454's business and not this one. Read from a CLOSURE it does
+/// not: tsc re-runs the flow from the closure's start with the auto type as the
+/// initial type, so no assignment anywhere else can help, and a read that no
+/// assignment inside the closure precedes really is an implicit `any`
+/// (`var x; x = 1; function g() { x }` reports — oracle-verified against tsgo).
+///
+/// Both diagnostics are reported: TS7034 on the DECLARATION's name (once, by
+/// `diagFmt`'s span dedupe, however many reads there are) and TS7005 on the read.
+/// Evolving ARRAYS (`let x = []` -> `any[]`) are out of ztsc's subset, so only
+/// the `'any'` half of the pair is spelled here.
+fn checkEvolvingVarRead(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex) Error!void {
+    if (!c.isEvolvingVar(sym)) return;
+    const f = c.symFlags(sym);
+    // tsc's `!(getCombinedModifierFlags(declaration) & Export) && !(declaration.flags & Ambient)`:
+    // neither shape gets the auto type at all (an ambient `declare var x;` is
+    // plain `any`, and reports its implicit `any` at the declaration instead).
+    if (f.exported) return;
+    const decls = c.declsOf(sym);
+    if (decls.len == 0) return;
+    if (c.ambient_ctx or isAmbientDeclarator(c, decls[0])) return;
+    // A `for..in`/`for..of` HEAD declarator takes its type from the iterable, not
+    // from the control flow — tsc's auto-type branch is reached only for a
+    // declarator whose type has no other source. Recognized on the token after
+    // the name, which is the whole of what distinguishes the two shapes
+    // (`for (var v of xs)` vs `var v;`), and `isEvolvingVar` has already
+    // restricted the declarator to a plain identifier binding.
+    switch (c.tree.tokens.tag(c.tree.nodeMainToken(decls[0]) + 1)) {
+        .keyword_of, .keyword_in => return,
+        else => {},
+    }
+    // tsc's `isParameterOrMutableLocalVariable(symbol) && isPastLastAssignment(…)`
+    // arm of the flow-container walk that precedes the check: for a MUTABLE LOCAL
+    // `let` the analysis is hoisted back out to the declaration's own container,
+    // which makes the initial type `undefined` instead of the auto type — so the
+    // pair is never reported for one. `isMutableLocalVariableDeclaration` reads
+    // `NodeFlags.Let` (a `var` is not one, however local) and excludes an
+    // exported binding and the top level of a SCRIPT, whose top level IS the
+    // global scope. Oracle-verified in both directions: a module-level or
+    // function-local `let` read from a closure is silent, while the same shapes
+    // spelled `var`, and a script-global `let`, report.
+    //
+    // Leaving the `isPastLastAssignment` half out costs a `let` that IS assigned
+    // somewhere (tsgo reports `let v; v = 1; function f() { v }`); reproducing it
+    // needs tsc's per-container last-assignment scan, and under-reporting is the
+    // safe half to keep.
+    if (f.let_decl and !f.var_decl) {
+        // tsc's exclusion is narrow: `declaration.parent.parent.kind ===
+        // VariableStatement && isGlobalSourceFile(declaration.parent.parent.parent)`
+        // — a `let` STATEMENT at the top level of a script, and nothing else. A
+        // `let` in a `for` head or inside a block is a mutable local even there,
+        // so the declaration's own SCOPE has to be the file scope, not merely its
+        // function container (`for (let x;;) { () => x }` reports nothing).
+        if (!(c.bind.scope_kinds[c.symScope(sym)] == .file and !c.bind.is_module)) return;
+    }
+    // Only a read from another flow container — see above.
+    if (flowContainerOf(c, c.cur_scope) == flowContainerOf(c, c.symScope(sym))) return;
+    const flow = c.bind.flowAt(node) orelse return;
+    if (try c.someAssignmentReaches(flow, sym)) return;
+    const name = c.tokenText(tok);
+    try c.diagFmt(7034, c.tokSpan(c.tree.nodeMainToken(decls[0])), "Variable '{s}' implicitly has type 'any' in some locations where its type cannot be determined.", .{name});
+    try c.diagFmt(7005, c.tokSpan(tok), "Variable '{s}' implicitly has an 'any' type.", .{name});
 }
 
 fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex, declared: TypeId) Error!void {
@@ -3364,8 +3445,19 @@ fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         // fallback written for a nullable case that no longer exists ends
         // up in the type of every use of the result.
         .amp_amp => {
+            // The right operand joins the enclosing `&&` chain for the whole of
+            // the left operand's walk: it is what excuses `f && f()` and, one
+            // level up, `f && 1 && f()` (see `conditions.CondWalk`).
+            const body = conditions.bodyFor(c, node);
+            const saved = try conditions.enterLogical(c, node, true);
+            defer conditions.leaveLogical(c, saved);
             const lt = try c.checkExprCached(d.lhs, types.no_type);
             try conditions.checkTruthiness(c, d.lhs, lt);
+            // tsc checks the LEFT operand of every `&&` for the always-defined
+            // mistakes, wherever the expression sits — `f && log()` as a bare
+            // statement is the shape the check was written for.
+            try conditions.checkUncalledFunction(c, d.lhs, lt, body, true);
+            conditions.leaveLeftOperand(c, node, saved);
             const rt = try c.checkExprCached(d.rhs, ctx);
             const falsy = try c.getFalsyPart(lt, false);
             if (try c.getTruthyPart(lt) == types.never_type) return lt;
@@ -3383,16 +3475,26 @@ fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         // property the left operand had. `&&` is asymmetric here (tsc
         // forwards only an outer contextual type to its right operand)
         // because its right operand is not a stand-in for its left.
+        // `||` and `??` do not judge their own operands (tsc hooks only `&&`),
+        // but they still take part in the bookkeeping: a chain BARRIER for the
+        // left operand's subtree, and a link in the guarded body's closure.
         .pipe_pipe => {
+            const saved = try conditions.enterLogical(c, node, false);
+            defer conditions.leaveLogical(c, saved);
             const lt = try c.checkExprCached(d.lhs, types.no_type);
             try conditions.checkTruthiness(c, d.lhs, lt);
+            conditions.leaveLeftOperand(c, node, saved);
             const rt = try c.checkExprCached(d.rhs, if (ctx == types.no_type) lt else ctx);
             const truthy = try c.getTruthyPart(lt);
             if (!try c.canBeFalsy(lt, 0)) return lt;
             return c.logicalUnion(truthy, rt);
         },
         .question_question => {
+            const saved = try conditions.enterLogical(c, node, false);
+            defer conditions.leaveLogical(c, saved);
             const lt = try c.checkExprCached(d.lhs, types.no_type);
+            try conditions.checkNeverNullish(c, d.lhs);
+            conditions.leaveLeftOperand(c, node, saved);
             const rt = try c.checkExprCached(d.rhs, if (ctx == types.no_type) lt else ctx);
             if (!try c.canBeNullish(lt, 0)) return lt;
             return c.logicalUnion(try c.nonNullableNullish(lt), rt);
@@ -3452,6 +3554,7 @@ fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         .eq_eq, .bang_eq, .eq_eq_eq, .bang_eq_eq => {
             const lt = try c.checkExprCached(d.lhs, types.no_type);
             const rt = try c.checkExprCached(d.rhs, types.no_type);
+            try conditions.checkNaNEquality(c, node, d.lhs, d.rhs);
             // TS2367: no overlap (any union constituents comparable).
             if (!try c.typesHaveOverlap(lt, rt)) {
                 try c.diagFmt(2367, c.nodeSpan(node), "This comparison appears to be unintentional because the types '{s}' and '{s}' have no overlap.", .{

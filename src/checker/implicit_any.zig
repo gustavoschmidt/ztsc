@@ -30,6 +30,7 @@ const Node = ast.Node;
 const null_node = ast.null_node;
 const TokenIndex = ast.TokenIndex;
 const TypeId = types.TypeId;
+const Atom = @import("../intern.zig").Atom;
 
 const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
@@ -231,6 +232,102 @@ pub fn reportMissingReturnType(c: *Checker, node: Node, proto: ast.FnProto) Erro
     try c.diagFmt(7010, c.tokSpan(proto.name_token), "'{s}', which lacks return-type annotation, implicitly has an 'any' return type.", .{c.tokenText(proto.name_token)});
 }
 
+/// The ACCESSOR-PAIR member of the family — tsc's `resolveTypeOfAccessors`,
+/// which resolves the PROPERTY's type from, in order:
+///
+///   1. the `get` accessor's return annotation,
+///   2. the `set` accessor's parameter annotation,
+///   3. the `get` accessor's body, inferred.
+///
+/// With all three missing the property is `any`, and tsc names whichever half
+/// could have said so: TS7032 at the SET accessor when there is one (a setter's
+/// parameter can never be inferred), TS7033 at the GET accessor otherwise. Both
+/// are reported at the accessor's NAME.
+///
+/// Purely syntactic — one pass to find whether the body has both halves, then a
+/// pairing pass, exactly as `checkAccessorVisibility` is shaped and for the same
+/// reason: a class body with no accessor at all walks its members once and stops.
+pub fn reportAccessorImplicitAny(c: *Checker, members: []const Node) Error!void {
+    if (!c.prog.no_implicit_any) return;
+    var any_accessor = false;
+    for (members) |m| {
+        if (m == null_node or c.nodeTag(m) != .class_method) continue;
+        const f = c.tree.extraData(ast.FnProto, c.tree.nodeData(m).lhs).flags;
+        if (f & (ast.Flags.get | ast.Flags.set) != 0) any_accessor = true;
+    }
+    if (!any_accessor) return;
+    for (members) |m| {
+        if (m == null_node or c.nodeTag(m) != .class_method) continue;
+        const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(m).lhs);
+        // Anchored on the GETTER when there is one, so the pair is judged once.
+        if (proto.flags & ast.Flags.get == 0) continue;
+        if (proto.return_type != 0) continue;
+        if (c.tree.nodeData(m).rhs != 0) continue; // a body infers the type
+        const name = try c.memberAtom(proto.name_token);
+        if (try accessorPartner(c, members, m, name, proto.flags, ast.Flags.set)) |setter| {
+            const sp = c.tree.extraData(ast.FnProto, c.tree.nodeData(setter).lhs);
+            if (paramIsAnnotated(c, sp)) continue;
+            if (!try reportAccessorAny(c, 7032, sp.name_token, sp.flags, "set accessor lacks a parameter type annotation")) continue;
+        } else {
+            _ = try reportAccessorAny(c, 7033, proto.name_token, proto.flags, "get accessor lacks a return type annotation");
+        }
+    }
+    // A SET accessor with no getter at all: nothing can supply the type either.
+    for (members) |m| {
+        if (m == null_node or c.nodeTag(m) != .class_method) continue;
+        const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(m).lhs);
+        if (proto.flags & ast.Flags.set == 0) continue;
+        if (paramIsAnnotated(c, proto)) continue;
+        const name = try c.memberAtom(proto.name_token);
+        if ((try accessorPartner(c, members, m, name, proto.flags, ast.Flags.get)) != null) continue;
+        _ = try reportAccessorAny(c, 7032, proto.name_token, proto.flags, "set accessor lacks a parameter type annotation");
+    }
+}
+
+fn reportAccessorAny(c: *Checker, code: u16, name_tok: TokenIndex, flags: u32, why: []const u8) Error!bool {
+    if (name_tok == 0) return false;
+    if (nameIsRecoveredModifier(c, name_tok)) return false;
+    // `isPrivateWithinAmbient`, as everywhere else in this file.
+    const private = flags & ast.Flags.private != 0 or
+        c.tree.tokens.tag(name_tok) == .private_identifier;
+    if (private and inAmbientContext(c)) return false;
+    try c.diagFmt(code, c.tokSpan(name_tok), "Property '{s}' implicitly has type 'any', because its {s}.", .{
+        c.tokenText(name_tok), why,
+    });
+    return true;
+}
+
+/// The other half of `m`'s accessor pair — the member with the same name and the
+/// same static-ness carrying `want` (`Flags.get` / `Flags.set`).
+fn accessorPartner(c: *Checker, members: []const Node, m: Node, name: Atom, flags: u32, want: u32) Error!?Node {
+    for (members) |o| {
+        if (o == m or o == null_node or c.nodeTag(o) != .class_method) continue;
+        const op = c.tree.extraData(ast.FnProto, c.tree.nodeData(o).lhs);
+        if (op.flags & want == 0) continue;
+        if (op.flags & ast.Flags.static != flags & ast.Flags.static) continue;
+        if ((try c.memberAtom(op.name_token)) != name) continue;
+        return o;
+    }
+    return null;
+}
+
+/// Does this accessor's first parameter carry a type annotation?
+fn paramIsAnnotated(c: *Checker, proto: ast.FnProto) bool {
+    for (c.tree.extraRange(proto.params_start, proto.params_end)) |p| {
+        if (p == null_node) continue;
+        return switch (c.nodeTag(p)) {
+            // `.param` carries its annotation in `rhs` directly; `.param_full`
+            // is the form with `?`/`...`/an initializer/modifiers.
+            .param => c.tree.nodeData(p).rhs != 0,
+            .param_full => c.tree.extraData(ast.ParamFull, c.tree.nodeData(p).rhs).type_ann != 0,
+            else => false,
+        };
+    }
+    // No parameter at all — a grammar error tsc reports on its own; the property
+    // type question never arises.
+    return true;
+}
+
 /// The MEMBER member of the family: a property with neither a type annotation
 /// nor an initializer to infer from falls to `any`, and tsc reports TS7008 at
 /// its name (`reportImplicitAny`'s `PropertyDeclaration`/`PropertySignature`
@@ -282,20 +379,34 @@ fn nameIsRecoveredModifier(c: *Checker, name_tok: TokenIndex) bool {
     };
 }
 
-/// The VARIABLE member of the family, for the one shape that has no flow to
-/// fall back on: an AMBIENT `declare var x;` (or any un-annotated, un-initialized
-/// `var` in a `.d.ts`) is `any` outright, and tsc reports TS7005 at its name.
+/// The VARIABLE member of the family, for the two shapes that have no flow to
+/// fall back on. tsc gives an un-annotated, un-initialized `var`/`let` the
+/// control-flow-tracked `autoType` — but only when it is neither AMBIENT nor
+/// EXPORTED (`!(getCombinedModifierFlags(declaration) & Export) &&
+/// !(declaration.flags & Ambient)`), because neither can be flow-analyzed: one
+/// describes something the runtime already provides, the other something another
+/// file may write. Both are plain `any`, reported at the name.
 ///
-/// A non-ambient `var x;` is deliberately silent here: tsc gives it `autoType`
-/// and lets the control flow supply a type, reporting only where a READ cannot
-/// be resolved (TS7034 at the declaration + TS7005 at that read) — a different
-/// diagnostic pair, and one ztsc does not produce yet.
-pub fn reportAmbientVarImplicitAny(c: *Checker, name_node: Node) Error!void {
+/// Everything else stays silent here: `var x;` in a function or at a module's
+/// top level IS auto-typed, and tsc reports only where a READ cannot be resolved
+/// (TS7034 at the declaration + TS7005 at that read — see
+/// `expr.checkEvolvingVarRead`).
+pub fn reportVarImplicitAny(c: *Checker, name_node: Node, ambient: bool) Error!void {
     if (!c.prog.no_implicit_any) return;
     if (name_node == null_node or c.nodeTag(name_node) != .identifier) return;
-    if (!inAmbientContext(c)) return;
     const tok = c.tree.nodeMainToken(name_node);
+    if (!ambient and !inAmbientContext(c) and !isExportedName(c, tok)) return;
     try c.diagFmt(7005, c.tokSpan(tok), "Variable '{s}' implicitly has an 'any' type.", .{c.tokenText(tok)});
+}
+
+/// Does the name declared at `tok` carry `export`? Asked of the SYMBOL, because
+/// the modifier sits on the statement and the declarator does not see it.
+fn isExportedName(c: *Checker, tok: TokenIndex) bool {
+    const a = c.atomOfToken(tok) catch return false;
+    return switch (c.resolveSpace(a, c.cur_scope, true)) {
+        .sym => |sym| c.symFlags(sym).exported,
+        else => false,
+    };
 }
 
 /// One TS7031, named and located by the binding's own name token.
