@@ -375,10 +375,78 @@ pub fn checkSubsequentMemberDecls(c: *Checker, sym: SymbolId, decl: Node) Error!
     }
 }
 
+/// TS2804 — a PRIVATE name (`#foo`) declared on both the static and the
+/// instance side of one class.
+///
+/// A private name is not a property name: it is a lexically scoped slot on the
+/// class, and the static and instance sides do not get one each. tsc's
+/// `checkClassLikeDeclaration` runs
+/// `checkClassNameCollisionWithObject`-adjacent bookkeeping over the private
+/// identifiers of the class body and reports
+/// "Static and instance elements cannot share the same private name" at EVERY
+/// declaration of the clashing name, on both sides — so `#foo` beside
+/// `static #foo` is two diagnostics, not one.
+///
+/// The binder files the two under separate scopes (`class_members` /
+/// `class_statics`), which is right for every ORDINARY name — `x` and
+/// `static x` are unrelated members — so the clash is only visible by
+/// intersecting the two scopes, which is what this does. Same-side duplicates
+/// are already the binder's ordinary TS2300.
+///
+/// Same file only, for the reason on `checkSubsequentMemberDecls`.
+pub fn checkPrivateNameStaticDups(c: *Checker, sym: SymbolId, decl: Node) Error!void {
+    const decls = c.declsOf(sym);
+    if (decls.len == 0 or decls[0] != decl) return;
+    const local = c.localOf(sym);
+    const ms = c.bind.membersScopeOf(local) orelse return;
+    const ss = c.bind.staticsScopeOf(local) orelse return;
+    const lo = c.bind.scope_members_start[ms];
+    const hi = c.bind.scope_members_start[ms + 1];
+    for (lo..hi) |i| {
+        const name = c.bind.member_atoms[i];
+        if (!std.mem.startsWith(u8, c.atomText(name), "#")) continue;
+        const static_local = c.bind.lookupInScope(ss, name) orelse continue;
+        try reportPrivateNameClash(c, c.toGlobal(c.bind.member_syms[i]));
+        try reportPrivateNameClash(c, c.toGlobal(static_local));
+    }
+}
+
+/// Every declaration of `msym` gets the TS2804 (see
+/// `checkPrivateNameStaticDups`), anchored at its name token.
+fn reportPrivateNameClash(c: *Checker, msym: SymbolId) Error!void {
+    if (c.symFile(msym) != c.cur_file) return;
+    for (c.declsOf(msym)) |dn| {
+        switch (c.nodeTag(dn)) {
+            .class_field, .class_method => {},
+            else => continue,
+        }
+        const tok = c.tree.nodeMainToken(dn);
+        try c.diagFmt(
+            2804,
+            c.tokSpan(tok),
+            "Duplicate identifier '{s}'. Static and instance elements cannot share the same private name.",
+            .{c.tokenText(tok)},
+        );
+    }
+}
+
 fn checkMemberRedeclare(c: *Checker, msym: SymbolId) Error!void {
     if (c.symFile(msym) != c.cur_file) return;
     const decls = c.declsOf(msym);
     if (decls.len < 2) return;
+    // A PRIVATE name declared twice in one class body is a hard duplicate, not
+    // a merge: tsc gives the second declaration its own symbol, so it is its
+    // container's `valueDeclaration` and `checkVariableLikeDeclaration` never
+    // reaches the subsequent-declaration comparison. Reporting TS2717 on top of
+    // the TS2300/TS2804 the pair already earns is ztsc's declaration-merging
+    // model leaking — `privateNameDuplicateField`'s `#foo() {}` beside
+    // `#foo = "foo"` got both.
+    //
+    // An ORDINARY class member is genuinely merged by tsc (`PropertyExcludes`
+    // is `None`, so `c: number; c: string` is ONE symbol with two
+    // declarations), and TS2717 at the later one is the only thing reported —
+    // so the gate has to be this narrow.
+    if (std.mem.startsWith(u8, c.atomText(c.symNameAtom(msym)), "#")) return;
     // A member's annotation is resolved in the MEMBER scope, whose parent chain
     // carries the container's type parameters. Read from the caller's scope
     // instead, `interface I<T> { m(): T; … }` cannot see `T` and every generic

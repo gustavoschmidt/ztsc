@@ -22,6 +22,7 @@ const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
+const accessibility = @import("accessibility.zig");
 const PathElem = @import("flow.zig").PathElem;
 const RefKey = @import("flow.zig").RefKey;
 const containsAtom = @import("expr.zig").containsAtom;
@@ -408,7 +409,12 @@ fn checkObjectPatternProps(c: *Checker, pat: Node, whole: TypeId) Error!void {
     const r = try c.resolveStructural(whole);
     if (patternSourceOpaque(c, r)) return;
     for (c.tree.nodeRange(pat)) |el| {
-        if (el == null_node or c.nodeTag(el) != .binding_property) continue;
+        if (el == null_node) continue;
+        if (c.nodeTag(el) == .binding_property_computed) {
+            try checkComputedPatternProp(c, el, whole, r);
+            continue;
+        }
+        if (c.nodeTag(el) != .binding_property) continue;
         const key_tok = c.tree.nodeMainToken(el);
         const key = try c.memberAtom(key_tok);
         const p = (try c.propOfType(r, key)) orelse {
@@ -441,6 +447,15 @@ fn checkObjectPatternProps(c: *Checker, pat: Node, whole: TypeId) Error!void {
             }
             continue;
         };
+        // Reading a property through a pattern is an ACCESS, so the
+        // accessibility rules apply exactly as they do to `o.p`: tsc types
+        // every binding element through `getIndexedAccessType(parentType, …,
+        // name)`, whose `checkPropertyAccessibility` is the same one a dotted
+        // read takes. Without it `const { p } = new C()` read a `private p`
+        // silently.
+        if (p.nonPublic()) {
+            try accessibility.check(c, whole, key, key_tok, .{ .dir = .read });
+        }
         // A nested pattern destructures the property's own type — with nullish
         // stripped first, because a possibly-undefined intermediate is tsc's
         // TS2532 (the access's own diagnostic), not a missing property, and
@@ -452,6 +467,28 @@ fn checkObjectPatternProps(c: *Checker, pat: Node, whole: TypeId) Error!void {
         if (c.ts.kind(pt) == .never) continue;
         try checkPatternProps(c, sub, pt);
     }
+}
+
+/// A `{ [k]: v }` binding element: the accessibility of the property its key
+/// LATE-BINDS to. `const { ["p"]: v } = new C()` reads `C`'s `private p` just
+/// as `const { p: v }` does, and tsc reports it from the same
+/// `getIndexedAccessType` — the key node is the anchor (`main_token` is its
+/// `[`).
+///
+/// Only the accessibility half: a computed key that names nothing static
+/// legitimately lands on an index signature (`Record<string, T>`
+/// destructuring), so there is no missing-property verdict to make here.
+/// `whole` is the source type AS WRITTEN and `r` its resolved structure: the
+/// first is what names the declaring class for `accessibility.check`, the
+/// second is what carries the property.
+fn checkComputedPatternProp(c: *Checker, el: Node, whole: TypeId, r: TypeId) Error!void {
+    const key_expr = c.tree.nodeData(el).lhs;
+    if (key_expr == null_node) return;
+    const kt = try c.checkExprCached(key_expr, types.no_type);
+    const key = (try c.uniqueSymAtom(kt)) orelse (try c.literalKeyAtom(kt)) orelse return;
+    const p = (try c.propOfType(r, key)) orelse return;
+    if (!p.nonPublic()) return;
+    try accessibility.check(c, whole, key, c.tree.nodeMainToken(el), .{ .dir = .read });
 }
 
 /// Does a union constituent that was written as an OBJECT LITERAL lack `name`?

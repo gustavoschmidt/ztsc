@@ -551,7 +551,7 @@ fn checkIdentifier(c: *Checker, node: Node) Error!TypeId {
             // report, and the only state they touch is `da_cache`, a pure
             // (flow, sym) memo that every reader re-derives on miss.
             if (c.owned_mask[c.cur_file]) {
-                if ((f.let_decl or f.const_decl or f.class) and !f.function and !f.var_decl and !f.param) {
+                if ((f.let_decl or f.const_decl or f.class or f.enum_decl) and !f.function and !f.var_decl and !f.param) {
                     try checkTdz(c, sym, node, tok);
                 }
                 if ((f.let_decl or f.var_decl) and !f.param and !f.const_decl) {
@@ -623,8 +623,35 @@ fn checkTdz(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex) Error!void 
     const use_container = c.containerOf(c.cur_scope);
     const decl_container = c.containerOf(c.symScope(sym));
     if (use_container != decl_container) return;
-    const kindname = if (c.symFlags(sym).class) "Class" else "Block-scoped variable";
-    try c.diagFmt(2448, c.tokSpan(tok), "{s} '{s}' used before its declaration.", .{ kindname, c.tokenText(tok) });
+    // tsc's `checkResolvedBlockScopedVariable` picks a DIFFERENT code per
+    // symbol kind, not just a different noun: a block-scoped variable is
+    // TS2448, a class TS2449, a (non-const) enum TS2450. A `const enum` is
+    // exempt unless `preserveConstEnums` — nothing is emitted for it, so
+    // there is no runtime binding to be in a temporal dead zone.
+    const f = c.symFlags(sym);
+    var code: u16 = 2448;
+    var kindname: []const u8 = "Block-scoped variable";
+    if (f.class) {
+        code = 2449;
+        kindname = "Class";
+    } else if (f.enum_decl) {
+        if (constEnumOnly(c, decls)) return;
+        code = 2450;
+        kindname = "Enum";
+    }
+    try c.diagFmt(code, c.tokSpan(tok), "{s} '{s}' used before its declaration.", .{ kindname, c.tokenText(tok) });
+}
+
+/// Every enum declaration of the symbol is `const enum` — a declaration merge
+/// may mix them, and one non-const block gives the whole enum a runtime
+/// binding. See `checkTdz`.
+fn constEnumOnly(c: *Checker, decls: []const Node) bool {
+    for (decls) |decl| {
+        if (c.nodeTag(decl) != .enum_decl) continue;
+        const e = c.tree.extraData(ast.EnumData, c.tree.nodeData(decl).lhs);
+        if (e.flags & ast.Flags.const_enum == 0) return false;
+    }
+    return true;
 }
 
 /// tsc's `symbol.valueDeclaration` for a variable symbol: the FIRST
@@ -1889,6 +1916,20 @@ fn distributableSpreads(c: *Checker, node: Node, out: *std.ArrayList(DistSpread)
 }
 
 fn checkObjectLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
+    const t = try objectLiteralWhole(c, node, ctx);
+    // Duplicate keys — tsc's `checkGrammarObjectLiteralExpression`. Run AFTER
+    // the type walk (and exactly once per literal, however many constituents a
+    // spread distributed it into) so that every computed key the walk typed is
+    // already in the node-type memo: the check then needs no evaluation of its
+    // own, and cannot introduce a diagnostic by being the first to read a key
+    // the type walk never reads at all (an object METHOD's computed key).
+    // A destructuring ASSIGNMENT pattern is exempt and never arrives here — it
+    // goes through `checkDestructuringElement`.
+    try c.checkObjectLiteralDups(node);
+    return t;
+}
+
+fn objectLiteralWhole(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     // tsc's `getSpreadType` DISTRIBUTES over a union spread source:
     // `{ ...(A | B), x }` is `{ ...A, x } | { ...B, x }`, and each
     // constituent keeps the correlation between the properties that came
