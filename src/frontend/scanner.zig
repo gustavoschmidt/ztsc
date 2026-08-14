@@ -554,9 +554,20 @@ pub const Scanner = struct {
                     const c1 = s.at(s.index + 1);
                     if (c1 == '/') {
                         s.index += 2;
-                        while (s.index < s.src.len and
-                            s.src[s.index] != '\n' and s.src[s.index] != '\r')
-                        {
+                        // A line comment ends at any LineTerminator, U+2028 and
+                        // U+2029 included — reading past one swallows the rest
+                        // of the file. ASCII keeps its two compares; only a byte
+                        // >= 0x80 pays for the question.
+                        while (s.index < s.src.len) {
+                            const c = s.src[s.index];
+                            if (c == '\n' or c == '\r') break;
+                            if (c >= 0x80) {
+                                if (unicodeTrivia(s.src, s.index)) |t| {
+                                    if (t.line_break) break;
+                                    s.index += t.len;
+                                    continue;
+                                }
+                            }
                             s.index += 1;
                         }
                     } else if (c1 == '*') {
@@ -581,7 +592,15 @@ pub const Scanner = struct {
                         };
                     } else break;
                 },
-                else => break,
+                else => {
+                    // Non-ASCII trivia: NBSP, the EN/EM space family, U+3000, a
+                    // stray BOM (horizontal space), U+2028/U+2029 (line
+                    // terminators). Every other byte >= 0x80 starts a token.
+                    if (s.src[s.index] < 0x80) break;
+                    const t = unicodeTrivia(s.src, s.index) orelse break;
+                    if (t.line_break) nl = true;
+                    s.index += t.len;
+                },
             }
         }
         const start = s.index;
@@ -827,8 +846,10 @@ pub const Scanner = struct {
                 // Any well-formed non-ASCII sequence continues the name (ztsc
                 // does not table ID_Continue); binary content ends it, so the
                 // next `next()` reaches the `binary_content` arm and the file
-                // gets tsc's single "appears to be binary" answer.
+                // gets tsc's single "appears to be binary" answer. Trivia ends
+                // it too — otherwise `x<NBSP>= 1` is one identifier.
                 if (isBinaryContent(s.src, s.index)) break;
+                if (unicodeTrivia(s.src, s.index) != null) break;
                 s.index += utf8SeqLen(s.src, s.index);
             } else if (isIdentCont(c)) {
                 s.index += 1;
@@ -1195,6 +1216,59 @@ inline fn isHexDigit(c: u8) bool {
     return isDigit(c) or (c | 0x20) >= 'a' and (c | 0x20) <= 'f';
 }
 
+/// One non-ASCII TRIVIA character: how many bytes it spans, and whether it is a
+/// LINE TERMINATOR (which ends a line comment and arms ASI) rather than
+/// horizontal space.
+const UnicodeTrivia = struct { len: u3, line_break: bool };
+
+/// The non-ASCII trivia character at `i` (a byte >= 0x80), or null when the
+/// bytes there are part of a token. tsc's `isWhiteSpaceSingleLine` and
+/// `isLineBreak` operate on a decoded UTF-16 file; ztsc scans bytes, so the two
+/// sets are spelled out here as UTF-8 sequences:
+///
+///   - U+0085 NEL and U+00A0 NBSP                     `C2 85` / `C2 A0`
+///   - U+1680 OGHAM SPACE MARK                        `E1 9A 80`
+///   - U+2000..U+200A the EN/EM/THIN space family     `E2 80 80..8A`
+///   - U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEP    `E2 80 A8` / `E2 80 A9`
+///   - U+202F NARROW NBSP, U+205F MEDIUM MATH SPACE   `E2 80 AF` / `E2 81 9F`
+///   - U+3000 IDEOGRAPHIC SPACE                       `E3 80 80`
+///   - U+FEFF ZWNBSP (a BOM anywhere, not just first) `EF BB BF`
+///
+/// Only U+2028/U+2029 are line terminators — NEL is horizontal space to tsc, so
+/// `return<NEL>0` is NOT subject to ASI (`compiler/fileWithNextLine3.ts`).
+///
+/// Without this the scanner read every one of these as an identifier byte, which
+/// glued `<NBSP>var x<NBSP>= 1` into one name and answered TS1434/TS1351 where
+/// tsc answers nothing at all. Called only for bytes >= 0x80, so ASCII scanning
+/// pays a single compare that the existing `c >= 0x80` test already made.
+pub fn unicodeTrivia(src: []const u8, i: u32) ?UnicodeTrivia {
+    const rest = src[i..];
+    if (rest.len < 2) return null;
+    switch (rest[0]) {
+        0xC2 => if (rest[1] == 0x85 or rest[1] == 0xA0) return .{ .len = 2, .line_break = false },
+        0xE1 => if (rest.len >= 3 and rest[1] == 0x9A and rest[2] == 0x80) {
+            return .{ .len = 3, .line_break = false };
+        },
+        0xE2 => {
+            if (rest.len < 3) return null;
+            if (rest[1] == 0x80) switch (rest[2]) {
+                0x80...0x8A, 0xAF => return .{ .len = 3, .line_break = false },
+                0xA8, 0xA9 => return .{ .len = 3, .line_break = true },
+                else => {},
+            };
+            if (rest[1] == 0x81 and rest[2] == 0x9F) return .{ .len = 3, .line_break = false };
+        },
+        0xE3 => if (rest.len >= 3 and rest[1] == 0x80 and rest[2] == 0x80) {
+            return .{ .len = 3, .line_break = false };
+        },
+        0xEF => if (rest.len >= 3 and rest[1] == 0xBB and rest[2] == 0xBF) {
+            return .{ .len = 3, .line_break = false };
+        },
+        else => {},
+    }
+    return null;
+}
+
 inline fn isIdentStart(c: u8) bool {
     return ((c | 0x20) >= 'a' and (c | 0x20) <= 'z') or c == '_' or c == '$';
 }
@@ -1511,6 +1585,37 @@ test "golden: unicode and escaped identifiers" {
     try expectTokens("\\u{74}ype", &.{ .identifier, .eof });
     // Malformed escape: `\` alone is an error token.
     try expectTokens("\\zx", &.{ .unknown, .identifier, .eof });
+}
+
+test "golden: non-ASCII whitespace and line terminators are trivia" {
+    // U+00A0 NBSP separates tokens; it does NOT extend the identifier.
+    try expectTokens("\xC2\xA0var x\xC2\xA0= 1\xC2\xA0;", &.{
+        .keyword_var, .identifier, .eq, .numeric_literal, .semicolon, .eof,
+    });
+    // U+0085 NEL, U+1680, U+2000, U+202F, U+205F, U+3000 and a stray U+FEFF.
+    try expectTokens("a\xC2\x85b\xE1\x9A\x80c\xE2\x80\x80d\xE2\x80\xAFe\xE2\x81\x9Ff\xE3\x80\x80g\xEF\xBB\xBFh", &.{
+        .identifier, .identifier, .identifier, .identifier,
+        .identifier, .identifier, .identifier, .identifier,
+        .eof,
+    });
+    // U+2028 / U+2029 are LINE TERMINATORS; NEL is horizontal space, so the
+    // token after it is not preceded by a newline (`fileWithNextLine3.ts`).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const toks = try tokenizeForTest(arena.allocator(), "a\xE2\x80\xA8b\xE2\x80\xA9c\xC2\x85d");
+    try testing.expectEqualSlices(Tag, &.{
+        .identifier, .identifier, .identifier, .identifier, .eof,
+    }, toks.tags);
+    try testing.expect(toks.precededByNewline(1)); // after U+2028
+    try testing.expect(toks.precededByNewline(2)); // after U+2029
+    try testing.expect(!toks.precededByNewline(3)); // after U+0085
+    // A line comment ends at U+2028, so the code after it is scanned.
+    try expectTokens("//c\xE2\x80\xA8x", &.{ .identifier, .eof });
+    // A neighbour of NBSP in the same lead byte is NOT trivia: U+00A1 continues
+    // the identifier, so the table is read to the last byte and not guessed from
+    // the lead one. (A truncated `C2` is invalid UTF-8 and keeps its own
+    // pre-existing answer, `binary_content`.)
+    try expectTokens("a\xC2\xA1b", &.{ .identifier, .eof });
 }
 
 test "errors: unterminated string" {
