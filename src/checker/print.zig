@@ -108,7 +108,7 @@ fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!voi
         },
         .array => {
             if (s.arrayIsReadonly(t)) try w.writeAll("readonly ");
-            try printTypeParen(c, w, s.arrayElem(t), depth + 1, .operand);
+            try printTypeParen(c, w, s.arrayElem(t), depth + 1, .array_elem);
             try w.writeAll("[]");
         },
         .tuple => {
@@ -335,16 +335,17 @@ fn printSigMember(c: *Checker, w: *std.Io.Writer, sig: TypeId, is_construct: boo
 /// `&` binds tighter than `|`, so an intersection needs no parens inside a
 /// union but a union DOES need them inside an intersection (`(B | C) & A`,
 /// not `B | C & A`, which reads as `B | (C & A)`).
-const PrintPos = enum { union_member, isect_member, operand };
+const PrintPos = enum { union_member, isect_member, operand, array_elem };
 
 fn printTypeParen(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32, pos: PrintPos) PrintErr!void {
     const needs = switch (c.ts.kind(t)) {
         .function => true,
         .union_type => pos != .union_member,
-        .intersection => pos == .operand,
+        .intersection => pos == .operand or pos == .array_elem,
         // `readonly` binds looser than the `[]` suffix, so an array OF readonly
-        // arrays is `(readonly T[])[]`.
-        .array => pos == .operand and c.ts.arrayIsReadonly(t),
+        // arrays is `(readonly T[])[]`. Only there: `keyof readonly T[]` and
+        // `readonly T[] extends X ? …` need no parentheses and tsc prints none.
+        .array => pos == .array_elem and c.ts.arrayIsReadonly(t),
         else => false,
     };
     if (needs) try w.writeAll("(");
