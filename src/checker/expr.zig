@@ -680,11 +680,13 @@ fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: TokenInde
         if (c.tree.tokens.start(tok) < c.nodeSpanStart(decls[0])) before_decl = true;
     }
     if ((has_init or has_definite) and !before_decl) return;
-    // `for (x of xs)` / `for ({ a: x } of xs)`: the head's target is a WRITE.
-    if (try inForHeadWriteTarget(c, node, sym)) return;
     const dk = c.ts.kind(declared);
     if (dk == .any or dk == .err or dk == .unknown or dk == .void or dk == .none) return;
     if (c.containsUndefinedish(declared)) return;
+    // `for (x of xs)` / `for ({ a: x } of xs)`: the head's target is a WRITE.
+    // After the type guards above, which are array reads — this one walks the
+    // scope chain (and, on a name hit, one node span).
+    if (try inForHeadWriteTarget(c, node, sym)) return;
     // tsc's `isOuterVariable`: a reference whose control-flow container is not
     // the declaration's is assumed initialized — the enclosing function's flow
     // says nothing about when the closure runs. TS 5.0 carved one hole in

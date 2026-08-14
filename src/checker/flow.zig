@@ -1944,6 +1944,11 @@ fn narrowByTypeofChainContainment(c: *Checker, t: TypeId, value: Node, sense: bo
 /// `<ref>.constructor` (or its element spelling `<ref>["constructor"]`) where
 /// `<ref>` is exactly `key`'s reference? Optional forms are excluded, as they
 /// are in tsc.
+///
+/// The name test is a text compare rather than `atom("constructor")`: every
+/// `===` narrowing over a member access reaches here, and comparing the
+/// already-interned atom's bytes costs a length check where interning the
+/// literal costs a string hash.
 fn constructorRefOf(c: *Checker, node: Node, key: RefKey) Error!bool {
     if (node == null_node) return false;
     switch (c.nodeTag(node)) {
@@ -1952,7 +1957,7 @@ fn constructorRefOf(c: *Checker, node: Node, key: RefKey) Error!bool {
     }
     const pe = (try pathElemOfAccess(c, node)) orelse return false;
     if (pe.isIndex()) return false;
-    if (pe.atom() != try c.atom("constructor")) return false;
+    if (!std.mem.eql(u8, c.atomText(pe.atom()), "constructor")) return false;
     return refMatches(c, c.tree.nodeData(node).lhs, key);
 }
 
