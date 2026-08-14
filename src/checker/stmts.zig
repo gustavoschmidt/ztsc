@@ -86,30 +86,30 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
         .expr_stmt => _ = try c.checkExprCached(d.lhs, types.no_type),
         .empty_stmt, .debugger_stmt, .error_node, .unsupported, .omitted => {},
         .if_stmt => {
-            const cond_t = try c.checkExprCached(d.lhs, types.no_type);
-            try conditions.checkTruthiness(c, d.lhs, cond_t);
-            try conditions.checkUncalledFunction(c, d.lhs, cond_t, d.rhs);
+            const cond_t = try checkIfCondition(c, d.lhs, d.rhs);
+            try conditions.checkUncalledFunction(c, d.lhs, cond_t, d.rhs, false);
             try c.checkStatement(d.rhs);
         },
         .if_else_stmt => {
             const e = c.tree.extraData(ast.IfElse, d.rhs);
-            const cond_t = try c.checkExprCached(d.lhs, types.no_type);
-            try conditions.checkTruthiness(c, d.lhs, cond_t);
-            try conditions.checkUncalledFunction(c, d.lhs, cond_t, e.then_stmt);
+            const cond_t = try checkIfCondition(c, d.lhs, e.then_stmt);
+            try conditions.checkUncalledFunction(c, d.lhs, cond_t, e.then_stmt, false);
             try c.checkStatement(e.then_stmt);
             try c.checkStatement(e.else_stmt);
         },
+        // A `while`/`do`/`for` condition is tested for truthiness but NOT for
+        // the always-defined mistakes (TS2774/TS2845): tsc routes only `if` and
+        // `?:` conditions through `checkTestingKnownTruthyCallableOrAwaitableOr
+        // EnumMemberType`, and tsgo reports nothing for `while (isFoo)`.
         .while_stmt => {
             const cond_t = try c.checkExprCached(d.lhs, types.no_type);
             try conditions.checkTruthiness(c, d.lhs, cond_t);
-            try conditions.checkUncalledFunction(c, d.lhs, cond_t, d.rhs);
             try c.checkStatement(d.rhs);
         },
         .do_stmt => {
             try c.checkStatement(d.lhs);
             const cond_t = try c.checkExprCached(d.rhs, types.no_type);
             try conditions.checkTruthiness(c, d.rhs, cond_t);
-            try conditions.checkUncalledFunction(c, d.rhs, cond_t, d.lhs);
         },
         .for_stmt => {
             const e = c.tree.extraData(ast.For, d.lhs);
@@ -125,7 +125,6 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
             if (e.cond != 0) {
                 const cond_t = try c.checkExprCached(e.cond, types.no_type);
                 try conditions.checkTruthiness(c, e.cond, cond_t);
-                try conditions.checkUncalledFunction(c, e.cond, cond_t, d.rhs);
             }
             if (e.update != 0) _ = try c.checkExprCached(e.update, types.no_type);
             try c.checkStatement(d.rhs);
@@ -216,6 +215,18 @@ fn declFlagSet(c: *Checker, comptime T: type, node: Node) bool {
 fn precededByDeclare(c: *Checker, node: Node) bool {
     const mt = c.tree.nodeMainToken(node);
     return mt > 0 and c.tree.tokens.tag(mt - 1) == .keyword_declare;
+}
+
+/// An `if` condition, checked with `body` published as the branch its logical
+/// operands may be excused by (`conditions.CondWalk.body`). The publication has
+/// to happen BEFORE the condition is walked, because it is `checkBinary`'s `&&`
+/// arm — not this statement — that judges a left operand.
+fn checkIfCondition(c: *Checker, cond: Node, body: Node) Error!types.TypeId {
+    const saved = conditions.enterCondition(c, cond, body);
+    defer conditions.leaveCondition(c, saved);
+    const cond_t = try c.checkExprCached(cond, types.no_type);
+    try conditions.checkTruthiness(c, cond, cond_t);
+    return cond_t;
 }
 
 fn checkVarDeclStatement(c: *Checker, node: Node) Error!void {

@@ -264,9 +264,14 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         .assign => return checkAssignExpr(c, node),
         .cond_expr => {
             const e = c.tree.extraData(ast.CondExpr, d.rhs);
+            // `enterCondition` before the condition is walked: a `&&` inside it
+            // is judged by `checkBinary`, which needs to know it guards
+            // `then_expr` (see `conditions.CondWalk`).
+            const saved = conditions.enterCondition(c, d.lhs, e.then_expr);
             const cond_t = try c.checkExprCached(d.lhs, types.no_type);
+            conditions.leaveCondition(c, saved);
             try conditions.checkTruthiness(c, d.lhs, cond_t);
-            try conditions.checkUncalledFunction(c, d.lhs, cond_t, e.then_expr);
+            try conditions.checkUncalledFunction(c, d.lhs, cond_t, e.then_expr, false);
             const then_t = try c.checkExprCached(e.then_expr, ctx);
             const else_t = try c.checkExprCached(e.else_expr, ctx);
             // The arms are subtype-reduced, exactly as `||`/`??` are
@@ -3314,8 +3319,19 @@ fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         // fallback written for a nullable case that no longer exists ends
         // up in the type of every use of the result.
         .amp_amp => {
+            // The right operand joins the enclosing `&&` chain for the whole of
+            // the left operand's walk: it is what excuses `f && f()` and, one
+            // level up, `f && 1 && f()` (see `conditions.CondWalk`).
+            const body = conditions.bodyFor(c, node);
+            const saved = try conditions.enterLogical(c, node, true);
+            defer conditions.leaveLogical(c, saved);
             const lt = try c.checkExprCached(d.lhs, types.no_type);
             try conditions.checkTruthiness(c, d.lhs, lt);
+            // tsc checks the LEFT operand of every `&&` for the always-defined
+            // mistakes, wherever the expression sits — `f && log()` as a bare
+            // statement is the shape the check was written for.
+            try conditions.checkUncalledFunction(c, d.lhs, lt, body, true);
+            conditions.leaveLeftOperand(c, node, saved);
             const rt = try c.checkExprCached(d.rhs, ctx);
             const falsy = try c.getFalsyPart(lt, false);
             if (try c.getTruthyPart(lt) == types.never_type) return lt;
@@ -3333,16 +3349,25 @@ fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         // property the left operand had. `&&` is asymmetric here (tsc
         // forwards only an outer contextual type to its right operand)
         // because its right operand is not a stand-in for its left.
+        // `||` and `??` do not judge their own operands (tsc hooks only `&&`),
+        // but they still take part in the bookkeeping: a chain BARRIER for the
+        // left operand's subtree, and a link in the guarded body's closure.
         .pipe_pipe => {
+            const saved = try conditions.enterLogical(c, node, false);
+            defer conditions.leaveLogical(c, saved);
             const lt = try c.checkExprCached(d.lhs, types.no_type);
             try conditions.checkTruthiness(c, d.lhs, lt);
+            conditions.leaveLeftOperand(c, node, saved);
             const rt = try c.checkExprCached(d.rhs, if (ctx == types.no_type) lt else ctx);
             const truthy = try c.getTruthyPart(lt);
             if (!try c.canBeFalsy(lt, 0)) return lt;
             return c.logicalUnion(truthy, rt);
         },
         .question_question => {
+            const saved = try conditions.enterLogical(c, node, false);
+            defer conditions.leaveLogical(c, saved);
             const lt = try c.checkExprCached(d.lhs, types.no_type);
+            conditions.leaveLeftOperand(c, node, saved);
             const rt = try c.checkExprCached(d.rhs, if (ctx == types.no_type) lt else ctx);
             if (!try c.canBeNullish(lt, 0)) return lt;
             return c.logicalUnion(try c.nonNullableNullish(lt), rt);
@@ -3402,6 +3427,7 @@ fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         .eq_eq, .bang_eq, .eq_eq_eq, .bang_eq_eq => {
             const lt = try c.checkExprCached(d.lhs, types.no_type);
             const rt = try c.checkExprCached(d.rhs, types.no_type);
+            try conditions.checkNaNEquality(c, node, d.lhs, d.rhs);
             // TS2367: no overlap (any union constituents comparable).
             if (!try c.typesHaveOverlap(lt, rt)) {
                 try c.diagFmt(2367, c.nodeSpan(node), "This comparison appears to be unintentional because the types '{s}' and '{s}' have no overlap.", .{

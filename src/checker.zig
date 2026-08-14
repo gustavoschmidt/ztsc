@@ -1174,6 +1174,11 @@ pub const Checker = struct {
     /// A decorator statement precedes its class in the same statement list;
     /// checkStatement pushes here and checkClass consumes them.
     pending_class_decos: std.ArrayListUnmanaged(Node) = .empty,
+    /// TS2774's walk context: the enclosing `&&` chain and the guarded body,
+    /// both of which tsc reads through parent pointers. See
+    /// `conditions.CondWalk` — pure walk state, scoped to the subtree it
+    /// describes.
+    cond_walk: conditions_zig.CondWalk = .{},
     /// Are we inside an ambient context (tsc's `NodeFlags.Ambient`)? Seeded
     /// per file from the `.d.ts` extension and pushed by every `declare`
     /// namespace / ambient module / `declare global` body. Drives the ambient
@@ -3824,6 +3829,8 @@ pub const Checker = struct {
     pub const globalSymNamed = stmts_zig.globalSymNamed;
     pub const propAssignedInCtor = stmts_zig.propAssignedInCtor;
     pub const DecoPos = stmts_zig.DecoPos;
+
+    const conditions_zig = @import("checker/conditions.zig");
 };
 
 test {
