@@ -107,6 +107,8 @@ pub const Bind = bind_result.Bind;
 const Error = error{OutOfMemory};
 
 const fbits = bind_result.fbits;
+const effectiveBits = bind_result.effectiveBits;
+const excludesOfFlags = bind_result.excludesOfFlags;
 const mask_let_const_class = bind_result.mask_let_const_class;
 const mask_value = bind_result.mask_value;
 const mask_type = bind_result.mask_type;
@@ -182,59 +184,12 @@ const DeclKind = enum {
     }
 
     /// Existing-symbol flag bits this declaration kind cannot merge with.
-    /// One symbol spans value and type space, so e.g. `var` excludes other
-    /// value declarations but not `interface`.
+    ///
+    /// Every kind's mask is a pure function of the FLAGS it contributes, so the
+    /// rule has one definition (`bind_result.excludesOfFlags`) shared with the
+    /// linker's cross-file global merge, which only ever sees folded flags.
     fn excludes(k: DeclKind) u32 {
-        return switch (k) {
-            // var+var and var+param merge; everything else valueish clashes.
-            // A namespace merges with function/class/enum/interface, so those
-            // kinds whitelist the namespace bit here (and vice-versa below).
-            .var_decl => mask_value & ~(fbits(.{ .var_decl = true }) | fbits(.{ .param = true })),
-            .let_decl, .const_decl => mask_value,
-            // A function also merges with a *class* — tsc's `FunctionExcludes`
-            // omits `Class` and `ClassExcludes` omits `Function`, so a `.d.ts`
-            // can model a callable class (`function UAParser(…): IResult` next
-            // to `class UAParser`). The pair is only legal when every class
-            // declaration is ambient; `checkFunctionClassMerge` reports
-            // TS2813/TS2814 otherwise.
-            .function => mask_value & ~(fbits(.{ .function = true }) |
-                fbits(.{ .namespace_decl = true }) | fbits(.{ .class = true })),
-            .class => (mask_value & ~(fbits(.{ .class = true }) |
-                fbits(.{ .namespace_decl = true }) | fbits(.{ .function = true }))) |
-                (mask_type & ~(fbits(.{ .interface = true }) | fbits(.{ .namespace_decl = true }))),
-            .interface => mask_type & ~(fbits(.{ .interface = true }) | fbits(.{ .class = true }) |
-                fbits(.{ .namespace_decl = true })),
-            // A type alias also merges with a namespace (the alias carries the
-            // type meaning; the namespace the value + container meaning).
-            .type_alias => mask_type & ~fbits(.{ .namespace_decl = true }),
-            // Two enum blocks (incl. const enum) with the same name merge;
-            // everything else in value or type space clashes (bar namespace).
-            .enum_decl => (mask_value | mask_type) & ~(fbits(.{ .enum_decl = true }) | fbits(.{ .namespace_decl = true })),
-            // tsc's `EnumMemberExcludes = EnumMember`: members share a table
-            // with nothing else, so only another member of the same name
-            // clashes (`enum E { A, A }` — TS2300 at both spellings).
-            .enum_member => fbits(.{ .enum_member = true }),
-            // A namespace merges with another namespace, function, class,
-            // enum, interface, and type alias; it clashes with var/let/const.
-            .namespace => (mask_value & ~(fbits(.{ .namespace_decl = true }) |
-                fbits(.{ .function = true }) | fbits(.{ .class = true }) | fbits(.{ .enum_decl = true }))) |
-                (mask_type & ~(fbits(.{ .namespace_decl = true }) | fbits(.{ .interface = true }) |
-                    fbits(.{ .class = true }) | fbits(.{ .enum_decl = true }) | fbits(.{ .type_alias = true }))),
-            // tsc's `NamespaceModuleExcludes = 0`.
-            .namespace_type => 0,
-            .type_param => mask_type & ~fbits(.{ .class = true }),
-            .param => mask_value & ~fbits(.{ .var_decl = true }),
-            .catch_param => mask_value,
-            .import_value => mask_value | mask_type,
-            .import_type => mask_type | fbits(.{ .import_binding = true }),
-            .property => mask_member,
-            .method => mask_member & ~fbits(.{ .method = true }),
-            .getter => mask_member & ~fbits(.{ .setter = true }),
-            .setter => mask_member & ~fbits(.{ .getter = true }),
-            // Repeated `fn.prop = …` statements are all declarations of the
-            // same property; they merge (the member type unions them).
-            .expando_member => 0,
-        };
+        return excludesOfFlags(k.flags());
     }
 
     fn isBlockScoped(k: DeclKind) bool {
@@ -672,24 +627,6 @@ const Binder = struct {
 
     fn memberKey(scope: ScopeId, atom: Atom) u64 {
         return (@as(u64, scope) << 32) | atom;
-    }
-
-    /// Flag bits used for the excludes check. A type-only import occupies
-    /// the *type* space only, so `import type { T } ...; let T;` merges
-    /// without error while `type T = ...` still clashes with it.
-    fn effectiveBits(f: SymbolFlags) u32 {
-        var bits = f.bits();
-        if (f.import_binding and f.type_only) {
-            bits &= ~fbits(.{ .import_binding = true });
-            bits |= fbits(.{ .type_alias = true });
-        }
-        // A non-instantiated namespace occupies no exclusion space at all
-        // (tsc's `NamespaceModule`), so it merges with anything — including a
-        // `var`/`let`/`const` of the same name. The bit stays on the symbol:
-        // only the excludes check ignores it, so name resolution and the
-        // `N.member` container meaning are untouched.
-        if (f.ns_uninstantiated) bits &= ~fbits(.{ .namespace_decl = true });
-        return bits;
     }
 
     /// Pick the diagnostic code for a declaration that failed the excludes
