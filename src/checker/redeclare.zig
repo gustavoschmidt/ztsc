@@ -93,7 +93,12 @@ pub fn typesIdentical(c: *Checker, a: TypeId, b: TypeId) Error!bool {
     // that against the `{ x: number; y: number }` it should have been is a
     // report about ztsc, not about the two declarations.
     if (isEmptyObject(c, ea) or isEmptyObject(c, eb)) return true;
-    return identity.identical(c, ea, eb);
+    // The relation is handed the UNRESOLVED pair: it resolves references
+    // itself, and it has a rule that only applies to two materializations of
+    // the same generic reference (an `any` type argument is ztsc's inference
+    // giving up, not a difference the program wrote). `ea`/`eb` above exist
+    // only for the screens that read a materialized shape.
+    return identity.identical(c, a, b);
 }
 
 fn isEmptyObject(c: *Checker, t: TypeId) bool {

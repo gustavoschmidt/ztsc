@@ -52,6 +52,34 @@ fn identicalAt(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!bool {
     if (depth >= max_depth) return true;
     if (undecidable(c, a0) or undecidable(c, b0)) return true;
 
+    // Two materializations of the SAME generic reference are identical when
+    // their type ARGUMENTS are, and an `any` argument is not evidence of a
+    // difference: it is where ztsc's inference gave up. `var p2 =
+    // shouldBeIdentity(p1)` infers `MyPromise<any, any>` here where tsc infers
+    // `MyPromise<boolean, any>`, and reading that as the program declaring two
+    // different types is a report about ztsc. Falls through to the structural
+    // comparison when the arguments genuinely differ.
+    if (c.ts.kind(a0) == .ref and c.ts.kind(b0) == .ref and
+        c.ts.refSymbol(a0) == c.ts.refSymbol(b0))
+    {
+        const aa = c.ts.refArgs(a0);
+        const ba = c.ts.refArgs(b0);
+        if (aa.len == ba.len) {
+            const args_a = try c.scratch().dupe(TypeId, aa);
+            defer c.scratch().free(args_a);
+            const args_b = try c.scratch().dupe(TypeId, ba);
+            defer c.scratch().free(args_b);
+            var all = true;
+            for (args_a, args_b) |x, y| {
+                if (c.ts.kind(x) == .any or c.ts.kind(y) == .any) continue;
+                if (!try identicalAt(c, x, y, depth + 1)) {
+                    all = false;
+                    break;
+                }
+            }
+            if (all) return true;
+        }
+    }
     // A named reference and the structure it names are identical in tsc: an
     // `interface Point` IS the object type `{ x: number; y: number }`, and both
     // carry `TypeFlags.Object`. Resolving puts them on one footing, and a pair
@@ -148,7 +176,13 @@ fn tupleIdentical(c: *Checker, a: TypeId, b: TypeId, depth: u32) Error!bool {
         const ea = c.ts.tupleElem(a, @intCast(i));
         const eb = c.ts.tupleElem(b, @intCast(i));
         if (tuple_relate.elemKind(c, ea) != tuple_relate.elemKind(c, eb)) return false;
-        if (!try identicalAt(c, ea.ty, eb.ty, depth + 1)) return false;
+        // An OPTIONAL element's type has `| undefined` baked into it in tsc
+        // (`addOptionality`), where ztsc keeps the bare type beside the flag —
+        // so `[1, 2?]` and `[1, (2 | undefined)?]` are one type there and two
+        // ids here. `optionalTupleElementsAndUndefined.ts` says so in a comment.
+        const ta = if (ea.optional()) try c.makeUnion2(ea.ty, types.undefined_type) else ea.ty;
+        const tb = if (eb.optional()) try c.makeUnion2(eb.ty, types.undefined_type) else eb.ty;
+        if (!try identicalAt(c, ta, tb, depth + 1)) return false;
     }
     return true;
 }
@@ -157,19 +191,18 @@ fn tupleIdentical(c: *Checker, a: TypeId, b: TypeId, depth: u32) Error!bool {
 /// `indexSignaturesIdenticalTo`. Properties are name-sorted by the store, so
 /// the pairing is positional.
 fn objectIdentical(c: *Checker, a: TypeId, b: TypeId, depth: u32) Error!bool {
-    const n = c.ts.objectPropCount(a);
-    if (n != c.ts.objectPropCount(b)) return false;
+    // An optional property typed exactly `undefined` is an ABSENCE MARKER, not
+    // a member: `getSpreadType` over a union writes `b?: undefined` into the arm
+    // that has no `b`, and whether ztsc materializes those markers where tsc
+    // does is a fact about the two spread implementations, not about the two
+    // declarations being compared. So they are skipped on both sides —
+    // `{ a: number } | { b: string }` beside `{ a: number; b?: undefined } |
+    // { a?: undefined; b: string }` is one declaration written twice.
+    if (!try propsIdentical(c, a, b, depth)) return false;
     const ncall = c.ts.objectCallSigCount(a);
     if (ncall != c.ts.objectCallSigCount(b)) return false;
     const nctor = c.ts.objectConstructSigCount(a);
     if (nctor != c.ts.objectConstructSigCount(b)) return false;
-    for (0..n) |i| {
-        const pa = c.ts.objectProp(a, @intCast(i));
-        const pb = c.ts.objectProp(b, @intCast(i));
-        if (pa.name != pb.name) return false;
-        if (pa.optional() != pb.optional()) return false;
-        if (!try identicalAt(c, pa.ty, pb.ty, depth + 1)) return false;
-    }
     for (0..ncall) |i| {
         if (!try sigIdentical(c, c.ts.objectCallSig(a, @intCast(i)), c.ts.objectCallSig(b, @intCast(i)), depth + 1)) return false;
     }
@@ -179,6 +212,34 @@ fn objectIdentical(c: *Checker, a: TypeId, b: TypeId, depth: u32) Error!bool {
     if (!try indexIdentical(c, c.ts.objectStringIndex(a), c.ts.objectStringIndex(b), depth)) return false;
     if (!try indexIdentical(c, c.ts.objectNumberIndex(a), c.ts.objectNumberIndex(b), depth)) return false;
     return true;
+}
+
+/// Is `p` an absence MARKER rather than a member — an optional property whose
+/// type is exactly `undefined`?
+fn isAbsenceMarker(c: *const Checker, p: types.Prop) bool {
+    return p.optional() and c.ts.kind(p.ty) == .undefined;
+}
+
+/// tsc's `propertiesIdenticalTo`, minus the absence markers (see
+/// `objectIdentical`). Both sides are name-sorted by the store, so the surviving
+/// properties pair up in order.
+fn propsIdentical(c: *Checker, a: TypeId, b: TypeId, depth: u32) Error!bool {
+    var ia: u32 = 0;
+    var ib: u32 = 0;
+    const na = c.ts.objectPropCount(a);
+    const nb = c.ts.objectPropCount(b);
+    while (true) {
+        while (ia < na and isAbsenceMarker(c, c.ts.objectProp(a, ia))) ia += 1;
+        while (ib < nb and isAbsenceMarker(c, c.ts.objectProp(b, ib))) ib += 1;
+        if (ia == na or ib == nb) return ia == na and ib == nb;
+        const pa = c.ts.objectProp(a, ia);
+        const pb = c.ts.objectProp(b, ib);
+        if (pa.name != pb.name) return false;
+        if (pa.optional() != pb.optional()) return false;
+        if (!try identicalAt(c, pa.ty, pb.ty, depth + 1)) return false;
+        ia += 1;
+        ib += 1;
+    }
 }
 
 fn indexIdentical(c: *Checker, a: TypeId, b: TypeId, depth: u32) Error!bool {
