@@ -1087,6 +1087,30 @@ pub fn excessPropertyCheck(c: *Checker, expr_node: Node, src_t: TypeId, target: 
 /// relation itself (`hasExcessProperties` inside `isRelatedTo`), so a
 /// candidate signature that only "fits" by ignoring an excess property is
 /// not applicable there either.
+/// Does the UNION `rt` have a constituent tsc's `isExcessPropertyCheckTarget`
+/// accepts — an object type (an array, a tuple and a signature type are object
+/// types there), the `object` keyword, or an intersection of them? A union of
+/// nothing but primitives, nullish types and type VARIABLES has none, and the
+/// excess-property error then has no target to name.
+fn unionHasExcessCheckTarget(c: *Checker, rt: TypeId) Error!bool {
+    for (try c.memberList(rt)) |m| {
+        switch (c.ts.kind(try c.resolveStructural(m))) {
+            .object,
+            .array,
+            .tuple,
+            .function,
+            .overloads,
+            .class_value,
+            .object_keyword,
+            .mapped,
+            .intersection,
+            => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
 /// tsc's `findMatchingDiscriminantType`, as `hasExcessProperties` uses it: a
 /// UNION target is first REDUCED to the constituents the source's discriminant
 /// properties select, and only then asked which names it knows. Without the
@@ -1279,6 +1303,14 @@ pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: T
             for (try c.memberList(rt)) |m| {
                 if (try c.targetIsEmptyish(m)) return false;
             }
+            // A union with NO object-ish constituent has nothing to name in the
+            // message, and tsc declines to file the excess-property error at all
+            // there: `errorTarget = filterType(reducedTarget,
+            // isExcessPropertyCheckTarget)` comes back `never`, so the pair falls
+            // through to the ordinary relation error instead —
+            // `BigInt({ e: 1, m: 1 })` against `string | number | bigint |
+            // boolean` is TS2345 on the ARGUMENT, not TS2353 on `e`.
+            if (!try unionHasExcessCheckTarget(c, rt)) return false;
             // …and it is the DISCRIMINANT-REDUCED union the names are looked up
             // in (`epcReducedUnion`), not the whole one. Resolved again after
             // the reduction: a reduction down to ONE constituent yields that
