@@ -244,8 +244,17 @@ pub fn tupleAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
         const se = c.ts.tupleElem(s, sp);
         const sf = elemKind(c, se);
         const sp_from_end = s_len - 1 - sp;
+        const back = @min(sp_from_end, t_end);
+        // A target whose EVERY element is non-rest (all fixed, or fixed around
+        // a variadic) has `t_end == t_len`, and a source longer than the target
+        // then walks past position 0 counting back from the end. tsc computes
+        // the same negative index and reads `undefined` off the flags array;
+        // there is no position for those source elements, so the pair is not
+        // related. (`[...T, a, b]` against `[...T]` is the shape: position 0
+        // pairs variadic-to-variadic, and `a` has nowhere left to go.)
+        if (t_variable and sp >= t_start and back + 1 > t_len) return false;
         const tp = if (t_variable and sp >= t_start)
-            t_len - 1 - @min(sp_from_end, t_end)
+            t_len - 1 - back
         else
             sp;
         const te = c.ts.tupleElem(t, tp);
