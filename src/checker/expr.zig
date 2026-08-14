@@ -2408,7 +2408,7 @@ fn memberChainInner(c: *Checker, node: Node) Error!ChainLink {
     // second one in the opposite direction (`accessibility.Dir`).
     const site: accessibility.Site = .{
         .dir = if (c.write_target_node != 0 and c.nodeKey(node) == c.write_target_node) .none else .read,
-        .via_this = receiverIsThis(c, d.lhs),
+        .recv_node = d.lhs,
     };
     var pt = try propertyTypeOf(c, obj_t, name, name_tok, site);
     // Property-path narrowing: peel the whole access spine into a member
@@ -2537,22 +2537,6 @@ fn entityNameOf(c: *Checker, node: Node) ?[]const u8 {
         .this_expr => return "this",
         else => return null,
     }
-}
-
-/// Whether a member access's receiver is spelled `this` or `super` — tsc's
-/// `left.kind === SyntaxKind.ThisKeyword / SuperKeyword`. See
-/// `accessibility.Site.via_this`.
-fn receiverIsThis(c: *Checker, recv: Node) bool {
-    var n = recv;
-    while (c.nodeTag(n) == .paren_expr) {
-        const inner = c.tree.nodeData(n).lhs;
-        if (inner == null_node) break;
-        n = inner;
-    }
-    return switch (c.nodeTag(n)) {
-        .this_expr, .super_expr => true,
-        else => false,
-    };
 }
 
 /// Property `name` on `t`, with TS2339/TS2551 on failure.
@@ -3832,7 +3816,7 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
             const name = try c.memberAtom(d.rhs);
             const r = try c.resolveStructural(obj_t);
             if (try c.propOfType(r, name)) |p| {
-                if (p.nonPublic()) try accessibility.check(c, obj_t, name, d.rhs, .{ .dir = .write, .via_this = receiverIsThis(c, d.lhs) });
+                if (p.nonPublic()) try accessibility.check(c, obj_t, name, d.rhs, .{ .dir = .write, .recv_node = d.lhs });
                 // A readonly property may be assigned via `this.x` inside the
                 // constructor of the class that OWNS the declaration (tsc:
                 // `checkReferenceExpression`). An inherited readonly still
@@ -3854,7 +3838,7 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
                 if (p.optional()) return c.makeUnion2(wt, types.undefined_type);
                 return wt;
             }
-            return propertyTypeOf(c, obj_t, name, d.rhs, .{ .dir = .write, .via_this = receiverIsThis(c, d.lhs) });
+            return propertyTypeOf(c, obj_t, name, d.rhs, .{ .dir = .write, .recv_node = d.lhs });
         },
         .index_expr => {
             // Writing to a readonly tuple element (from `as const`) is

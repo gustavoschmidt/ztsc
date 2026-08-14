@@ -114,6 +114,39 @@ pub fn checkUncalledFunction(c: *Checker, node: Node, ty: types.TypeId, body: No
 /// implemented.
 fn isAlwaysDefinedFunction(c: *Checker, ty: types.TypeId) Error!bool {
     if (ty == types.no_type or ty == types.error_type) return false;
+    // `if (someIdentifier)` is everywhere, so the kinds that CANNOT carry a call
+    // signature are screened out on one already-loaded tag before anything walks
+    // a union or resolves a reference.
+    switch (c.ts.kind(ty)) {
+        .any,
+        .err,
+        .none,
+        .never,
+        .void,
+        .null,
+        .undefined,
+        .unknown,
+        .boolean,
+        .bool_true,
+        .bool_false,
+        .number,
+        .number_literal,
+        .number_literal_fresh,
+        .string,
+        .string_literal,
+        .template_literal_type,
+        .string_mapping,
+        .bigint,
+        .bigint_literal,
+        .symbol,
+        .unique_symbol,
+        .enum_type,
+        .array,
+        .tuple,
+        .object_keyword,
+        => return false,
+        else => {},
+    }
     if (try c.canBeFalsy(ty, 0)) return false;
     const r = try c.resolveStructural(ty);
     return switch (c.ts.kind(r)) {

@@ -72,16 +72,35 @@ pub const Dir = enum { read, write, none };
 /// keyword.
 pub const Site = struct {
     dir: Dir,
-    /// Receiver spelled `this` or `super`. Only consulted to decide whether a
-    /// TYPE-PARAMETER receiver may be followed to its constraint: that is
-    /// tsc's `getApparentType`, and it earns `this.privateMember` inside
-    /// `function f<T extends C>(this: T)` — but ztsc also lands on a type
-    /// parameter where tsc has a computed `Omit<T, …>` (the rest type of a
-    /// generic destructure, `destructuringUnspreadableIntoRest`), and there the
-    /// member is one tsc says does not exist at all. Requiring the `this`
-    /// receiver keeps the first and leaves the second to the TS2339 it should
-    /// have been.
-    via_this: bool = false,
+    /// The receiver EXPRESSION, or `null_node` when the caller has none. Read
+    /// only to ask whether it is spelled `this`/`super`, and only once the
+    /// non-public screen has already passed — so the hot member-access path
+    /// stores a node index and inspects nothing.
+    ///
+    /// That question decides whether a TYPE-PARAMETER receiver may be followed
+    /// to its constraint: doing so is tsc's `getApparentType`, and it earns
+    /// `this.privateMember` inside `function f<T extends C>(this: T)` — but ztsc
+    /// also lands on a type parameter where tsc has a computed `Omit<T, …>` (the
+    /// rest type of a generic destructure, `destructuringUnspreadableIntoRest`),
+    /// and there the member is one tsc says does not exist at all. Requiring the
+    /// `this` receiver keeps the first and leaves the second to the TS2339 it
+    /// should have been.
+    recv_node: Node = ast.null_node,
+
+    /// tsc's `left.kind === SyntaxKind.ThisKeyword / SuperKeyword`.
+    fn viaThis(site: Site, c: *Checker) bool {
+        var n = site.recv_node;
+        if (n == ast.null_node) return false;
+        while (c.nodeTag(n) == .paren_expr) {
+            const inner = c.tree.nodeData(n).lhs;
+            if (inner == ast.null_node) break;
+            n = inner;
+        }
+        return switch (c.nodeTag(n)) {
+            .this_expr, .super_expr => true,
+            else => false,
+        };
+    }
 };
 
 /// Report TS2341/TS2445 when `name` — already known to be non-public, via
@@ -156,7 +175,7 @@ fn declaringClass(c: *Checker, recv: TypeId, name: Atom, site: Site) Error!?Decl
                 t = try c.ts.makeRef(c.ts.classSymbol(t), &.{});
             },
             .type_param => {
-                if (!site.via_this) return null;
+                if (!site.viaThis(c)) return null;
                 const con = try c.typeParamConstraint(c.ts.typeParamSymbol(t));
                 if (con == types.no_type or con == t) return null;
                 t = con;
