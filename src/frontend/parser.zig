@@ -167,6 +167,18 @@ const Parser = struct {
     /// declarator has no link back to the statement that carries `declare`.
     ambient: bool = false,
 
+    /// MODULE BODY: true while parsing the statement list of a source file, a
+    /// namespace/module block, or a `declare global` block; false inside any
+    /// other statement list. Saved/restored around each body exactly like
+    /// `ambient`, and read by one rule: a class-member modifier in statement
+    /// position is TS1044 ("cannot appear on a module or namespace element")
+    /// here and TS1184 ("Modifiers cannot appear here.") anywhere else, which is
+    /// tsc's `checkGrammarModifiers` testing the declaration's parent for
+    /// SourceFile-or-ModuleBlock. A SUBSTATEMENT position (`if (x) public var y
+    /// = 1;`) inherits its enclosing list's answer rather than getting its own —
+    /// tsc would say TS1184 there; no corpus case writes it.
+    module_body: bool = true,
+
     /// Lookahead queue of scanned-but-not-consumed tokens; la[0] is current.
     la: [max_la]Token = undefined,
     la_len: u8 = 0,
@@ -360,6 +372,16 @@ const Parser = struct {
                 const text = p.tokenText(t);
                 if (literals.checkNumeric(text, t.start)) |f| {
                     try p.addDiag(f.code, .{ .code = f.code, .span = f.span });
+                }
+                // TS1352/TS1353, in tsc's order: its scanner reports the empty
+                // exponent (above) before the suffix, and the two land on
+                // different characters so both survive the one-per-position
+                // rule. Only a NUMERIC-tagged token can carry a misplaced
+                // suffix; a well-formed BigInt is its own tag.
+                if (t.tag == .numeric_literal) {
+                    if (literals.bigintSuffixMisuse(text, t.start)) |f| {
+                        try p.addDiag(f.code, .{ .code = f.code, .span = f.span });
+                    }
                 }
                 // TS1351: `3a`. Reported at the identifier, which is exactly
                 // where the parser's own "';' expected" would land, so the
@@ -1089,8 +1111,105 @@ const Parser = struct {
         }
     }
 
+    /// The TS1044/TS1024 code a CLASS-MEMBER modifier earns in statement
+    /// position, or null when the word is not one. tsc's `checkGrammarModifiers`
+    /// words the accessibility trio and `static` as "cannot appear on a module
+    /// or namespace element" and `readonly` as "can only appear on a property
+    /// declaration or index signature"; the message names the modifier, which a
+    /// code-plus-span Diagnostic cannot interpolate, so there is one code each.
+    fn statementModifierCode(tag: TokTag) ?Code {
+        return switch (tag) {
+            .keyword_public => .public_not_on_module_element,
+            .keyword_private => .private_not_on_module_element,
+            .keyword_protected => .protected_not_on_module_element,
+            .keyword_static => .static_not_on_module_element,
+            .keyword_readonly => .readonly_not_on_property,
+            else => null,
+        };
+    }
+
+    /// Consume a run of class-member modifiers standing in front of a
+    /// DECLARATION (`public var x`, `static class C`, `export public import …`)
+    /// and report the FIRST one — tsc's grammar pass returns out of its modifier
+    /// walk on the first hit, which is why `public private var x` answers once
+    /// (the same rule TS1028 already follows). Consuming the whole run lets the
+    /// declaration itself parse cleanly, so there is no cascade: measured
+    /// against tsgo, every one of these positions is where ztsc used to answer
+    /// TS1434 or TS1005 instead.
+    ///
+    /// A modifier only when a declaration actually follows: these are all
+    /// contextual keywords, and `readonly = 1` or a bare `public` is an ordinary
+    /// expression. A line break ends the run, because tsc's `isDeclaration`
+    /// lookahead applies ASI to each modifier — `public` alone on its line is
+    /// the expression `public` (TS1212), not a modifier for the next line's
+    /// `var`.
+    fn eatStatementModifiers(p: *Parser) PE!void {
+        const n = p.statementModifierRunLen();
+        if (n == 0) return;
+        const first = p.curIdx();
+        // Outside a module body tsc words the same condition as TS1184 rather
+        // than naming the modifier — see `Parser.module_body`.
+        const code: Code = if (p.module_body)
+            statementModifierCode(p.curTag()).?
+        else
+            .modifiers_not_allowed_here;
+        for (0..n) |_| _ = try p.bump();
+        try p.errAtToken(code, first);
+    }
+
+    /// How many leading tokens are class-member modifiers in front of a
+    /// declaration, or 0 when this is not that shape. Bounded by the lookahead
+    /// window: a run longer than three keeps ztsc's existing answer rather than
+    /// reading past `max_la` (no real code writes even two).
+    fn statementModifierRunLen(p: *Parser) u32 {
+        var n: u32 = 0;
+        while (n < max_la - 2 and statementModifierCode(p.peekTag(n)) != null) {
+            n += 1;
+            if (p.peekNewline(n)) return 0;
+        }
+        if (n == 0 or !p.startsDeclarationAt(n)) return 0;
+        return n;
+    }
+
+    /// Does a DECLARATION begin `n` tokens ahead? tsc's `isDeclaration`
+    /// lookahead, minus the modifier loop `statementModifierRunLen` runs itself.
+    /// Conservative where tsc looks further (`interface`/`type` want an
+    /// identifier on the same line, `let` wants a binding): answering true only
+    /// ever moves a modifier word out of expression position, and the modifier
+    /// diagnostic that follows is tsc's own answer for every such shape.
+    fn startsDeclarationAt(p: *Parser, n: u32) bool {
+        return switch (p.peekTag(n)) {
+            .keyword_var,
+            .keyword_let,
+            .keyword_const,
+            .keyword_function,
+            .keyword_class,
+            .keyword_enum,
+            .keyword_interface,
+            .keyword_type,
+            .keyword_namespace,
+            .keyword_module,
+            .keyword_import,
+            .keyword_declare,
+            .keyword_abstract,
+            .keyword_async,
+            => true,
+            else => false,
+        };
+    }
+
     fn parseStatement(p: *Parser) PE!Node {
         switch (p.curTag()) {
+            .keyword_public,
+            .keyword_private,
+            .keyword_protected,
+            .keyword_static,
+            .keyword_readonly,
+            => {
+                if (p.statementModifierRunLen() == 0) return p.parseExpressionStatement();
+                try p.eatStatementModifiers();
+                return p.parseStatement();
+            },
             .l_brace => return p.parseBlock(),
             .semicolon => {
                 const tok = try p.bump();
@@ -1247,12 +1366,7 @@ const Parser = struct {
                 // when directly followed by `{`; otherwise `global` is an
                 // ordinary contextual-keyword identifier (`global.foo`, a label).
                 if (p.peekTag(1) == .l_brace) return p.parseGlobalAugmentation();
-                if (p.peekTag(1) == .colon) {
-                    const label = try p.bump();
-                    _ = try p.bump(); // ':'
-                    const body = try p.parseStatement();
-                    return p.addNode(.{ .tag = .labeled_stmt, .main_token = label, .data = .{ .lhs = body, .rhs = 0 } });
-                }
+                if (p.peekTag(1) == .colon) return p.parseLabeledStatement();
                 return p.parseExpressionStatement();
             },
             .keyword_enum => return p.parseEnumDecl(0),
@@ -1284,15 +1398,57 @@ const Parser = struct {
             },
             else => {
                 // Labeled statement?
-                if (isIdentLike(p.curTag()) and p.peekTag(1) == .colon) {
-                    const label = try p.bump();
-                    _ = try p.bump(); // ':'
-                    const body = try p.parseStatement();
-                    return p.addNode(.{ .tag = .labeled_stmt, .main_token = label, .data = .{ .lhs = body, .rhs = 0 } });
-                }
+                if (isIdentLike(p.curTag()) and p.peekTag(1) == .colon) return p.parseLabeledStatement();
                 return p.parseExpressionStatement();
             },
         }
+    }
+
+    /// `label: stmt`. Current token is the label, the next one its `:`.
+    ///
+    /// tsc reports TS1344 on the LABEL when what it labels is a DECLARATION
+    /// rather than a statement. Measured against tsgo: `var`/`let`/`const`,
+    /// `function` (plain, `async`, generator), `class`, `interface`, `enum`,
+    /// `type`, `namespace`, `import` and anything carrying a modifier all answer
+    /// it; `if`/`for`/`while`/`do`/`switch`/`try`/`throw`/`debugger`/`;`/a
+    /// block/an expression/a nested LABEL do not (`a: b: var v = 1` reports on
+    /// `b`, the label whose statement is the declaration, and not on `a`, whose
+    /// statement is a labeled statement).
+    ///
+    /// Decided on the parsed NODE rather than on a lookahead, so the questions
+    /// of whether `let` and `async` are keywords here are already answered.
+    fn parseLabeledStatement(p: *Parser) PE!Node {
+        const label = try p.bump();
+        _ = try p.bump(); // ':'
+        const body = try p.parseStatement();
+        if (isDeclarationTag(p.nodes.items(.tag)[body])) {
+            try p.errAtToken(.label_not_allowed, label);
+        }
+        return p.addNode(.{ .tag = .labeled_stmt, .main_token = label, .data = .{ .lhs = body, .rhs = 0 } });
+    }
+
+    /// Statement tags that are DECLARATIONS — the set a label may not carry.
+    /// `.unsupported` is excluded: it stands for a construct ztsc does not
+    /// model, and guessing which side of this line it falls on would invent a
+    /// diagnostic over a parser gap.
+    fn isDeclarationTag(tag: ast.Tag) bool {
+        return switch (tag) {
+            .var_decl,
+            .var_decl_one,
+            .function_decl,
+            .class_decl,
+            .interface_decl,
+            .type_alias,
+            .enum_decl,
+            .namespace_decl,
+            .import_decl,
+            .import_equals,
+            .export_decl,
+            .export_default,
+            .export_assign,
+            => true,
+            else => false,
+        };
     }
 
     fn parseBlock(p: *Parser) PE!Node {
@@ -1322,6 +1478,11 @@ const Parser = struct {
         if (ambient_body) try p.errAtToken(.implementation_not_allowed_in_ambient, l_brace);
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
+        // A block is the one statement list that is NOT a module body — see
+        // `Parser.module_body`.
+        const was_module_body = p.module_body;
+        p.module_body = false;
+        defer p.module_body = was_module_body;
         try p.parseStatementList(top, .r_brace, ambient_body);
         _ = try p.expect(.r_brace, .expected_r_brace);
         const range = try p.scratchToSpan(top);
@@ -1422,7 +1583,7 @@ const Parser = struct {
 
     fn parseDeclarator(p: *Parser, no_in: bool) PE!Node {
         const name_tok = p.curIdx();
-        const name = try p.parseBindingName();
+        const name = try p.parseBindingName(.private_name_in_var_decl);
         var flags: u32 = 0;
         if (p.curTag() == .bang and !p.nlBefore()) {
             _ = try p.bump();
@@ -1928,7 +2089,7 @@ const Parser = struct {
             const tok = try p.bump();
             name = try p.addNode(.{ .tag = .this_expr, .main_token = tok, .data = .{ .lhs = 0, .rhs = 0 } });
         } else {
-            name = try p.parseBindingName();
+            name = try p.parseBindingName(.private_name_as_param);
         }
         if (p.curTag() == .question) {
             _ = try p.bump();
@@ -1961,10 +2122,24 @@ const Parser = struct {
 
     // --- binding patterns ---------------------------------------------------
 
-    fn parseBindingName(p: *Parser) PE!Node {
+    /// A binding name: an identifier or a destructuring pattern.
+    ///
+    /// `private_code` is what a `#name` here earns — tsc's
+    /// `parseIdentifierOrPattern(privateIdentifierDiagnosticMessage)`, whose
+    /// caller picks the wording: TS18029 in a variable declaration, TS18009 in a
+    /// parameter list, TS18016 anywhere else. tsc reports it and then reads the
+    /// token as the name anyway (its `createIdentifier` recurses with
+    /// `isIdentifier: true`), so a `#foo` binding produces exactly one
+    /// diagnostic rather than that one plus a "Variable declaration expected."
+    fn parseBindingName(p: *Parser, private_code: Code) PE!Node {
         switch (p.curTag()) {
             .l_bracket => return p.parseArrayPattern(),
             .l_brace => return p.parseObjectPattern(),
+            .private_identifier => {
+                try p.errAtCur(private_code);
+                const tok = try p.bump();
+                return p.addNode(.{ .tag = .identifier, .main_token = tok, .data = .{ .lhs = 0, .rhs = 0 } });
+            },
             else => {
                 if (isIdentLike(p.curTag())) {
                     try p.checkStrictReserved();
@@ -1991,7 +2166,7 @@ const Parser = struct {
             }
             if (p.curTag() == .dot_dot_dot) {
                 const dots = try p.bump();
-                const target = try p.parseBindingName();
+                const target = try p.parseBindingName(.private_name_outside_class);
                 try p.pushScratch(try p.addNode(.{ .tag = .rest_element, .main_token = dots, .data = .{ .lhs = target, .rhs = 0 } }));
                 if (p.curTag() == .comma) try p.errAtCur(.rest_must_be_last);
             } else {
@@ -2010,7 +2185,7 @@ const Parser = struct {
 
     /// Pattern with optional default: `x`, `[a]`, `{a}`, each `= init`.
     fn parseBindingElement(p: *Parser) PE!Node {
-        const target = try p.parseBindingName();
+        const target = try p.parseBindingName(.private_name_outside_class);
         if (p.curTag() == .eq) {
             const eq_tok = try p.bump();
             const init = try p.parseAssignExpr(.{});
@@ -2027,13 +2202,13 @@ const Parser = struct {
             const before = p.curIdx();
             if (p.curTag() == .dot_dot_dot) {
                 const dots = try p.bump();
-                const target = try p.parseBindingName();
+                const target = try p.parseBindingName(.private_name_outside_class);
                 try p.pushScratch(try p.addNode(.{ .tag = .rest_element, .main_token = dots, .data = .{ .lhs = target, .rhs = 0 } }));
                 if (p.curTag() == .comma) try p.errAtCur(.rest_must_be_last);
             } else if (isNameLike(p.curTag()) or p.curTag() == .string_literal or p.curTag() == .numeric_literal) {
                 const key = try p.bump();
                 var value: Node = null_node;
-                if (try p.eat(.colon) != null) value = try p.parseBindingName();
+                if (try p.eat(.colon) != null) value = try p.parseBindingName(.private_name_outside_class);
                 var init: Node = null_node;
                 if (try p.eat(.eq) != null) init = try p.parseAssignExpr(.{});
                 try p.pushScratch(try p.addNode(.{ .tag = .binding_property, .main_token = key, .data = .{ .lhs = value, .rhs = init } }));
@@ -2046,7 +2221,7 @@ const Parser = struct {
                 const key_expr = try p.parseAssignExpr(.{});
                 _ = try p.expect(.r_bracket, .expected_r_bracket);
                 var target: Node = null_node;
-                if (try p.eat(.colon) != null) target = try p.parseBindingName();
+                if (try p.eat(.colon) != null) target = try p.parseBindingName(.private_name_outside_class);
                 if (try p.eat(.eq)) |eq_tok| {
                     const init = try p.parseAssignExpr(.{});
                     target = try p.addNode(.{ .tag = .binding_default, .main_token = eq_tok, .data = .{ .lhs = target, .rhs = init } });
@@ -2578,6 +2753,10 @@ const Parser = struct {
         const was_ambient = p.ambient;
         p.ambient = was_ambient or flags & ast.Flags.declare != 0;
         defer p.ambient = was_ambient;
+        // A namespace block IS a module body however deeply it is nested.
+        const was_module_body = p.module_body;
+        p.module_body = true;
+        defer p.module_body = was_module_body;
         try p.parseStatementList(top, .r_brace, false);
         _ = try p.expect(.r_brace, .expected_r_brace);
         const body = try p.scratchToSpan(top);
@@ -2603,6 +2782,10 @@ const Parser = struct {
         const was_ambient = p.ambient;
         p.ambient = true;
         defer p.ambient = was_ambient;
+        // A module block IS a module body however deeply it is nested.
+        const was_module_body = p.module_body;
+        p.module_body = true;
+        defer p.module_body = was_module_body;
         try p.parseStatementList(top, .r_brace, false);
         _ = try p.expect(.r_brace, .expected_r_brace);
         const body = try p.scratchToSpan(top);
@@ -2650,6 +2833,10 @@ const Parser = struct {
         const was_ambient = p.ambient;
         p.ambient = true;
         defer p.ambient = was_ambient;
+        // A module block IS a module body however deeply it is nested.
+        const was_module_body = p.module_body;
+        p.module_body = true;
+        defer p.module_body = was_module_body;
         try p.parseStatementList(top, .r_brace, false);
         _ = try p.expect(.r_brace, .expected_r_brace);
         const body = try p.scratchToSpan(top);
@@ -2820,6 +3007,9 @@ const Parser = struct {
     fn parseExportStatement(p: *Parser) PE!Node {
         const kw = try p.bump(); // `export`
         p.saw_module_syntax = true;
+        // `export public import a = x.c;` — a member modifier between `export`
+        // and the declaration, which tsc parses into the same modifier list.
+        try p.eatStatementModifiers();
         switch (p.curTag()) {
             .keyword_default => {
                 _ = try p.bump();
@@ -4120,6 +4310,11 @@ const Parser = struct {
             },
             else => {
                 if (isNameLike(p.curTag())) {
+                    // `{ #x: 1 }` / `{ #m() {} }` / `{ get #p() {} }` — an
+                    // object literal is never a class body, so a private name
+                    // here is always TS18016 (tsc's parser reads it as the
+                    // PropertyName and its grammar pass reports).
+                    if (p.curTag() == .private_identifier) try p.errAtCur(.private_name_outside_class);
                     key_tok = p.curIdx();
                     key = try p.leaf(.identifier);
                 } else {
@@ -4929,6 +5124,9 @@ const Parser = struct {
         if (name_tok != 0) {
             // already set by the well-known-symbol path above
         } else if (isNameLike(p.curTag()) or p.curTag() == .string_literal or p.curTag() == .numeric_literal) {
+            // `interface I { #x: string }` / `type A = { #m(): string }` — a
+            // TYPE member list is never a class body either, so TS18016.
+            if (p.curTag() == .private_identifier) try p.errAtCur(.private_name_outside_class);
             name_tok = try p.bump();
         } else {
             try p.fail(.expected_type_member);

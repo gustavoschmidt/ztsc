@@ -23,69 +23,125 @@ pub const Finding = struct {
     span: Span,
 };
 
-/// The leading-zero and empty-radix rules for a numeric literal. `text` is the
-/// token's exact source text and `start` its file offset.
+/// The leading-zero, empty-radix and empty-exponent rules for a numeric
+/// literal. `text` is the token's exact source text and `start` its file offset.
 ///
 /// tsc's scanner:
 ///   - `0` + an octal digit is a legacy octal literal — TS1121, at the literal.
 ///   - `0` + `8`/`9` is a decimal with a leading zero — TS1489, at the literal.
 ///   - `0x` / `0b` / `0o` with no digit after it is TS1125 / TS1177 / TS1178, at
 ///     the first character that should have been a digit.
+///   - an `e`/`E` (with optional sign) and no digit after it is TS1124, at the
+///     same place.
 /// At most one applies, so this returns an optional rather than a list.
 pub fn checkNumeric(text: []const u8, start: u32) ?Finding {
-    // `0` is the only prefix any of these rules cares about, and a numeric
+    if (text.len < 2) return null;
+    // `0` is the only prefix the first three rules care about, and a numeric
     // literal that does not start with one is the overwhelming majority.
-    if (text.len < 2 or text[0] != '0') return null;
-    const radix: ?Code = switch (text[1]) {
-        'x', 'X' => .hex_digit_expected,
-        'b', 'B' => .binary_digit_expected,
-        'o', 'O' => .octal_digit_expected,
-        else => null,
+    if (text[0] == '0') {
+        const radix: ?Code = switch (text[1]) {
+            'x', 'X' => .hex_digit_expected,
+            'b', 'B' => .binary_digit_expected,
+            'o', 'O' => .octal_digit_expected,
+            else => null,
+        };
+        if (radix) |code| {
+            // `0x` alone, or `0xn` (the BigInt suffix is not a digit).
+            const digits = text[2..];
+            const empty = digits.len == 0 or (digits.len == 1 and (digits[0] == 'n' or digits[0] == 'N'));
+            // No prefixed radix has an exponent form, so this is the only rule
+            // that can apply to one — and `0xe` ends in an `e` that IS a digit.
+            if (!empty) return null;
+            return .{ .code = code, .span = .{ .start = start + 2, .end = start + 3 } };
+        }
+        // A leading zero followed by a digit. Which of the two rules applies is
+        // decided by the FIRST digit only: tsc scans `0` + octal digits as a
+        // legacy octal literal and stops at the first 8 or 9, and reaches the
+        // leading-zero rule only when the very first digit is already out of
+        // range.
+        switch (text[1]) {
+            '0'...'7' => return .{
+                .code = .octal_literal_not_allowed,
+                .span = .{ .start = start, .end = start + @as(u32, @intCast(text.len)) },
+            },
+            '8', '9' => return .{
+                .code = .decimal_with_leading_zero,
+                .span = .{ .start = start, .end = start + @as(u32, @intCast(text.len)) },
+            },
+            // `0e`, `0.5e` — fall through to the exponent rule.
+            else => {},
+        }
+    }
+    if (danglingExponentAt(text)) |off| {
+        const at = start + off;
+        return .{ .code = .digit_expected, .span = .{ .start = at, .end = at + 1 } };
+    }
+    return null;
+}
+
+/// Where an exponent digit should have been (`1e` → 2, `1e-` → 3), or null when
+/// the exponent is well-formed or absent. The scanner consumes the marker and
+/// its sign and then stops, folding a lone BigInt suffix in after that, so a
+/// dangling exponent always sits at the end of the token modulo that `n` — a
+/// test on the last byte or three, which for every well-formed literal is a
+/// digit (or `n`, or the `.` of `1.`).
+fn danglingExponentAt(text: []const u8) ?u32 {
+    var i = text.len;
+    if (text[i - 1] == 'n') {
+        if (i < 2) return null;
+        i -= 1;
+    }
+    const at = i;
+    if (text[i - 1] == '+' or text[i - 1] == '-') {
+        if (i < 2) return null;
+        i -= 1;
+    }
+    if ((text[i - 1] | 0x20) != 'e') return null;
+    return @intCast(at);
+}
+
+/// TS1352/TS1353: a BigInt suffix on a literal that cannot carry one. Only ever
+/// asked of a token the scanner tagged NUMERIC — a well-formed BigInt is
+/// `.bigint_literal` and never reaches here — so a trailing `n` is always this
+/// error, and tsc words it by why: exponential notation, or simply not an
+/// integer. tsc blames the literal together with its suffix.
+pub fn bigintSuffixMisuse(lit: []const u8, lit_start: u32) ?Finding {
+    if (lit.len < 2 or lit[lit.len - 1] != 'n') return null;
+    return .{
+        .code = if (isScientific(lit)) .bigint_exponential else .bigint_not_integer,
+        .span = .{ .start = lit_start, .end = lit_start + @as(u32, @intCast(lit.len)) },
     };
-    if (radix) |code| {
-        // `0x` alone, or `0xn` (the BigInt suffix is not a digit).
-        const digits = text[2..];
-        const empty = digits.len == 0 or (digits.len == 1 and (digits[0] == 'n' or digits[0] == 'N'));
-        if (!empty) return null;
-        return .{ .code = code, .span = .{ .start = start + 2, .end = start + 3 } };
-    }
-    // A leading zero followed by a digit. Which of the two rules applies is
-    // decided by the FIRST digit only: tsc scans `0` + octal digits as a legacy
-    // octal literal and stops at the first 8 or 9, and reaches the
-    // leading-zero rule only when the very first digit is already out of range.
-    switch (text[1]) {
-        '0'...'7' => return .{
-            .code = .octal_literal_not_allowed,
-            .span = .{ .start = start, .end = start + @as(u32, @intCast(text.len)) },
-        },
-        '8', '9' => return .{
-            .code = .decimal_with_leading_zero,
-            .span = .{ .start = start, .end = start + @as(u32, @intCast(text.len)) },
-        },
-        else => return null,
-    }
 }
 
 /// TS1351, tsc's `checkForIdentifierStartAfterNumericLiteral`: an identifier or
 /// keyword directly abutting a numeric literal (`3a`, `123abc`, `3in[x]`). No
-/// valid program has one, so an identifier-start byte at `at` — the offset just
-/// past the literal — is always this error; the span covers the whole
-/// identifier run, and tsc then rescans that run as its own token, which is
-/// what ztsc's scanner already does.
+/// valid program has one, so an identifier-start byte just past the literal is
+/// always an error; the span covers the whole identifier run, and tsc then
+/// rescans that run as its own token, which is what ztsc's scanner already does.
 ///
-/// A run of exactly `n` is the BigInt suffix, which tsc words as one of two
-/// other diagnostics (`A_bigint_literal_must_be_an_integer` /
-/// `_cannot_use_exponential_notation`). ztsc's scanner consumes a well-formed
-/// suffix into the token, so the only way to get here with `n` is one of those
-/// two cases, and reporting TS1351 for them would be a wrong code: skipped.
+/// A LONE `n` never reaches here: the scanner folds a BigInt suffix into the
+/// token even where the literal cannot carry one, and `bigintSuffixMisuse`
+/// answers that case with TS1352/TS1353. A longer run starting with `n`
+/// (`1.5nfoo`) is an ordinary abutting identifier and does.
 pub fn identifierAfterNumeric(src: []const u8, at: u32) ?Finding {
     if (at >= src.len) return null;
     const c = src[at];
     if (!(isIdentStart(c) or c >= 0x80)) return null;
     var end: u32 = at;
     while (end < src.len and (isIdentPart(src[end]) or src[end] >= 0x80)) end += 1;
-    if (end == at + 1 and (c == 'n' or c == 'N')) return null;
     return .{ .code = .identifier_after_numeric_literal, .span = .{ .start = at, .end = end } };
+}
+
+/// True when a decimal literal carries an exponent marker. Only ever asked of a
+/// literal the scanner already refused a BigInt suffix, so a prefixed radix
+/// (whose `e` would be a hex digit) cannot reach it — but the `0x` screen is
+/// kept so the predicate is right on its own terms.
+fn isScientific(lit: []const u8) bool {
+    if (lit.len > 1 and lit[0] == '0' and (lit[1] | 0x20) == 'x') return false;
+    for (lit) |ch| {
+        if ((ch | 0x20) == 'e') return true;
+    }
+    return false;
 }
 
 fn isIdentStart(c: u8) bool {
@@ -276,6 +332,64 @@ test "numeric: a radix prefix with no digits blames the character after it" {
     try expectNumeric("0o", .octal_digit_expected, 2);
     // The BigInt suffix is not a digit.
     try expectNumeric("0xn", .hex_digit_expected, 2);
+}
+
+test "numeric: an exponent with no digits blames the character after it" {
+    // The scanner consumes the marker and the sign, so the blamed position is
+    // one past the token — tsgo answers column 3 for `1e` and 4 for `1e+`.
+    try expectNumeric("1e", .digit_expected, 2);
+    try expectNumeric("1E", .digit_expected, 2);
+    try expectNumeric("1e+", .digit_expected, 3);
+    try expectNumeric("1e-", .digit_expected, 3);
+    try expectNumeric("123e", .digit_expected, 4);
+    try expectNumeric("0e", .digit_expected, 2);
+    try expectNumeric("0.5e", .digit_expected, 4);
+    try expectNumeric(".5e", .digit_expected, 3);
+    // Well-formed exponents, and the `e` that is a HEX DIGIT rather than a
+    // marker.
+    try expectNumeric("1e9", null, 0);
+    try expectNumeric("1e+9", null, 0);
+    try expectNumeric("0xe", null, 0);
+    try expectNumeric("0xE", null, 0);
+    try expectNumeric("0x1e", null, 0);
+    try expectNumeric("1.", null, 0);
+    try expectNumeric("1n", null, 0);
+}
+
+test "numeric: a BigInt suffix on a literal that cannot carry one" {
+    // `3e` is scientific, so the folded `n` is TS1352, blamed over the literal
+    // AND its suffix. `1.5` is merely non-integer: TS1353.
+    {
+        const f = bigintSuffixMisuse("3en", 100).?;
+        try testing.expectEqual(Code.bigint_exponential, f.code);
+        try testing.expectEqual(@as(u32, 100), f.span.start);
+        try testing.expectEqual(@as(u32, 103), f.span.end);
+    }
+    {
+        const f = bigintSuffixMisuse("1.5n", 100).?;
+        try testing.expectEqual(Code.bigint_not_integer, f.code);
+        try testing.expectEqual(@as(u32, 100), f.span.start);
+    }
+    try testing.expect(bigintSuffixMisuse("1.5", 0) == null);
+    try testing.expect(bigintSuffixMisuse("1e9", 0) == null);
+    // An empty exponent is still reported alongside the suffix, at the
+    // character that should have been a digit.
+    try expectNumeric("3en", .digit_expected, 2);
+    try expectNumeric("3e+n", .digit_expected, 3);
+    try expectNumeric("1.5n", null, 0);
+}
+
+test "numeric: an abutting identifier" {
+    const src = "3a 1e9 ";
+    {
+        const f = identifierAfterNumeric(src, 1).?;
+        try testing.expectEqual(Code.identifier_after_numeric_literal, f.code);
+        try testing.expectEqual(@as(u32, 1), f.span.start);
+        try testing.expectEqual(@as(u32, 2), f.span.end);
+    }
+    // Nothing abuts a literal followed by a space, or one at end of input.
+    try testing.expect(identifierAfterNumeric(src, 6) == null);
+    try testing.expect(identifierAfterNumeric("1", 1) == null);
 }
 
 fn collect(text: []const u8, buf: []Finding) []Finding {
