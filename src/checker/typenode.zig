@@ -419,9 +419,10 @@ pub fn restTupleOf(c: *Checker, p: types.Param) Error!?TypeId {
     // A *variadic* tuple whose spread is not last — rxjs's
     // `[...ObservableInputTuple<T>, SchedulerLike]` — has no positional
     // expansion: the elements after the spread sit at an arity nobody
-    // knows yet. Leave those signatures unexpanded (unbounded rest, the
-    // pre-existing behaviour) rather than mis-assigning position 1 to the
-    // trailing element.
+    // knows yet. Leave those signatures unexpanded rather than mis-assigning
+    // position 1 to the trailing element; `sigNonArrayRest` picks exactly
+    // those up and has the argument list satisfy the tuple as a WHOLE, which
+    // is the only form of the question that has an answer.
     const len = c.ts.tupleLen(r);
     for (0..len) |i| {
         if (c.ts.tupleElem(r, @intCast(i)).rest() and i != len - 1) return null;

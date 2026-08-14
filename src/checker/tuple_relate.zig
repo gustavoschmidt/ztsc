@@ -114,6 +114,58 @@ pub fn fixedLength(c: *const Checker, tup: TypeId) u32 {
     return len;
 }
 
+/// tsc's `getEndElementCount(t, ElementFlags.Fixed)`: how many TRAILING
+/// elements occupy exactly one position each.
+pub fn endFixedCount(c: *const Checker, tup: TypeId) u32 {
+    const len = c.ts.tupleLen(tup);
+    var n: u32 = 0;
+    while (n < len) : (n += 1) {
+        if (elemKindAt(c, tup, len - 1 - n).variable()) break;
+    }
+    return n;
+}
+
+/// tsc's `getContextualTypeForElementExpression`: which element of `tup`
+/// contextually types the expression at position `index` of a list `length`
+/// long.
+///
+/// This is the question `tupleElemTypeAt` cannot answer, and it needs the
+/// LENGTH to answer it: once a variable element precedes `index`, the position
+/// is decided by counting back from the END. `[...((a: number) => void)[],
+/// (a: string) => void]` gives position 0 of a ONE-element list the
+/// `(a: string) => void`, position 0 of a THREE-element list the
+/// `(a: number) => void`, and anything in the middle the union of the two. Read
+/// from the start instead, every such callback got the union — so `f1(x =>
+/// str(x))` typed `x` as `number | string` and reported inside its own body.
+///
+/// A spread in the list makes the positions unknowable; callers must not use
+/// this then (tsc threads the spread indices through and gives up the same way).
+pub fn contextualElemType(c: *Checker, tup: TypeId, index: u32, length: u32) Error!?TypeId {
+    const arity = c.ts.tupleLen(tup);
+    const fixed = fixedLength(c, tup);
+    if (index < fixed) {
+        const e = c.ts.tupleElem(tup, index);
+        return if (e.optional()) try c.makeUnion2(e.ty, types.undefined_type) else e.ty;
+    }
+    // Positions from the end, 1-based: the last element of the list is 1.
+    const offset = if (length > index) length - index else 0;
+    const end_fixed = if (offset > 0 and fixed < arity) endFixedCount(c, tup) else 0;
+    if (offset > 0 and offset <= end_fixed) return c.ts.tupleElem(tup, arity - offset).ty;
+    // The middle: the union of everything the variable element could stand for.
+    if (fixed + end_fixed >= arity) return null;
+    var parts: std.ArrayList(TypeId) = .empty;
+    defer parts.deinit(c.scratch());
+    for (fixed..arity - end_fixed) |i| {
+        const e = c.ts.tupleElem(tup, @intCast(i));
+        try parts.append(c.scratch(), if (elemKind(c, e) == .required or elemKind(c, e) == .optional)
+            e.ty
+        else
+            try c.elemOfArrayish(e.ty));
+    }
+    if (parts.items.len == 0) return null;
+    return try c.ts.makeUnion(c.scratch(), parts.items);
+}
+
 /// The lone variadic element's type, for a `[...T]` (tsc's
 /// `isSingleElementGenericTupleType`).
 fn soleVariadicElem(c: *const Checker, tup: TypeId) ?TypeId {
@@ -195,9 +247,10 @@ pub fn tupleAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
     const s_len = c.ts.tupleLen(s);
     const t_len = c.ts.tupleLen(t);
 
-    // tsc's `combinedFlags & Rest` / `minLength` (which counts Required AND
-    // Variadic elements — a variadic element contributes at least nothing,
-    // but the position must be matched by one).
+    // tsc's `combinedFlags & Rest` and `minLength`. `minLength` counts Required
+    // AND Variadic elements: a variadic element may stand for zero positions,
+    // but the POSITION itself still has to be matched by another variadic, so
+    // it costs one against the other side's arity.
     var s_rest = false;
     var s_min: u32 = 0;
     for (0..s_len) |i| switch (elemKindAt(c, s, @intCast(i))) {
