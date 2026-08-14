@@ -695,7 +695,15 @@ fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: TokenInde
     // file, then no execution order can have written it, so the capture is
     // reported after all. A compound write inside the closure (`i++`,
     // `flags |= f`) does not rescue it; a plain `x = v` does, wherever it sits.
+    //
+    // The initializer test is tsc's `!declaration.initializer &&
+    // !declaration.exclamationToken`, and it is asked HERE rather than at the
+    // early return above because a use *before* the declaration still has to
+    // reach the flow walk (TS2448 + TS2454 together) when it is in the same
+    // container. `export function f(g = () => foo) { let foo = "in"; }` is the
+    // shape that needs the difference.
     if (flowContainerOf(c, c.cur_scope) != flowContainerOf(c, c.symScope(sym))) {
+        if (has_init or has_definite) return;
         if (!try neverInitializedLocal(c, sym)) return;
     }
     const flow = c.bind.flowAt(node) orelse return;

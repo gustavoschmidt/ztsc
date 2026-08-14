@@ -70,17 +70,27 @@ pub fn ensureReassignScan(c: *Checker) Error!void {
             // declarator_init / declarator_full / for-in-of bindings are
             // the variable's *initialization*, not a reassignment.
             //
-            // `for (x of xs)` over an ALREADY-declared `x` IS an assignment
-            // to tsc's `markNodeAssignments`, and is deliberately still left
-            // out of `reassigned_syms`: adding it there would mark `x` "not
-            // effectively const" for four other consumers
+            // A for-in/for-of HEAD, in either form, is a definite write of
+            // everything it binds — the loop assigns it on every iteration.
+            // The only `.assign` flow node whose node is a `var_decl`/
+            // `var_decl_one` is that head (`bindForInOf`); a plain `var x = 1`
+            // records the DECLARATOR instead, and is handled above.
+            //
+            // `for (x of xs)` over an ALREADY-declared `x` is deliberately
+            // still left out of `reassigned_syms`: adding it there would mark
+            // `x` "not effectively const" for four other consumers
             // (`stableIndexSymbol`, the loop-label shortcut,
             // `narrowedPatternBinding`) — a tightening well outside the 5.4
-            // rule. It is recorded as a DEFINITE write, which only that rule
-            // reads (`markForHeadDefinite`).
-            .identifier, .array_literal, .object_literal, .array_pattern, .object_pattern => {
-                try markForHeadDefinite(c, node, scope);
-            },
+            // rule. Both forms are recorded as a DEFINITE write, which only
+            // TS 5.0's captured-variable rule reads.
+            .identifier,
+            .array_literal,
+            .object_literal,
+            .array_pattern,
+            .object_pattern,
+            .var_decl_one,
+            .var_decl,
+            => try markForHeadDefinite(c, node, scope),
             else => {},
         }
     }
@@ -174,19 +184,25 @@ fn markWrittenSym(c: *Checker, sym: SymbolId, scope: ScopeId, at: Node, definite
     if (definite) try c.definitely_assigned_syms.put(c.cm(), sym, {});
 }
 
-/// The `for (x of xs)` / `for (k in o)` ASSIGNMENT head (no declaration): a
-/// definite write in tsc's `markNodeAssignments`, recorded into
-/// `definitely_assigned_syms` ONLY.
+/// Everything a `for (… of xs)` / `for (… in o)` head binds or assigns,
+/// recorded into `definitely_assigned_syms` ONLY (never `reassigned_syms` —
+/// see `ensureReassignScan`).
 ///
-/// It is deliberately kept out of `reassigned_syms` — four other consumers
-/// (`stableIndexSymbol`, the loop-label shortcut, `narrowedPatternBinding`)
-/// read that set as "not effectively const", and widening it there is a
-/// tightening well outside this rule. See `ensureReassignScan`.
+/// Both head forms count. The assignment form (`for (x of xs)`) is a definite
+/// write in tsc's `markNodeAssignments`; the DECLARATION form
+/// (`for (let x of xs)`) is one too, and has to be, or every closure over a
+/// loop variable would be reported unassigned — `for (let o of xs) { cb(() =>
+/// o) }` is silent in tsc (`compiler/nestedLoops`).
 fn markForHeadDefinite(c: *Checker, target: Node, scope: ScopeId) Error!void {
     if (target == null_node) return;
     var n = target;
     while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
     switch (c.nodeTag(n)) {
+        .var_decl_one => try markForHeadDefinite(c, c.tree.nodeData(n).lhs, scope),
+        .var_decl => for (c.tree.nodeRange(n)) |dn| {
+            if (dn != null_node) try markForHeadDefinite(c, dn, scope);
+        },
+        .declarator, .declarator_init, .declarator_full => try markForHeadDefinite(c, c.tree.nodeData(n).lhs, scope),
         .identifier => {
             const a = try c.atomOfToken(c.tree.nodeMainToken(n));
             switch (c.resolveSpace(a, scope, true)) {
