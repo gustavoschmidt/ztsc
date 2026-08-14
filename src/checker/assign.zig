@@ -48,6 +48,59 @@ pub fn isComparable(c: *Checker, a: TypeId, b: TypeId) Error!bool {
     return (try c.isAssignable(a, b)) or (try c.isAssignable(b, a));
 }
 
+/// The relational operators' legality test (`<`, `>`, `<=`, `>=`), which tsc
+/// spells `isTypeComparableTo(l, r) || isTypeComparableTo(r, l)`. Mutual
+/// assignability answers that for every concrete pair; the one place the
+/// *comparable* relation is observably different here is a TYPE PARAMETER:
+///
+///   * a parameter source is related THROUGH ITS CONSTRAINT, and an
+///     unconstrained one (tsc reads its constraint as `unknown`) is
+///     comparable to every target — because for the comparable relation
+///     `isSimpleTypeRelatedTo` is tried in REVERSE first, and every type is
+///     related to `unknown`. So `t < someBoolean` is legal for a bare `T`;
+///   * except against ANOTHER type parameter, where tsc carves the leniency
+///     back out on purpose ("forbid comparing a type parameter with another
+///     type parameter unless one extends the other") by walking the source's
+///     constraint chain and requiring a hit. So `t < u` IS an error.
+///
+/// Oracle-verified against tsgo 7.0.2 on the whole
+/// `comparisonOperatorWithNoRelationship*` family: `T < boolean|string|void|
+/// {a:string}|any[]|Date|{}|object|T` legal, `T < U` and `T < number|bigint|E`
+/// (the numeric screen at the call site) rejected, `V extends U < U` legal.
+pub fn relationalComparable(c: *Checker, a: TypeId, b: TypeId) Error!bool {
+    return (try comparableOneWay(c, a, b, 0)) or (try comparableOneWay(c, b, a, 0));
+}
+
+fn comparableOneWay(c: *Checker, s0: TypeId, t0: TypeId, depth: u32) Error!bool {
+    if (depth > 8) return true; // under-report over false-reject, per policy
+    const s = try c.resolveStructural(s0);
+    if (c.ts.kind(s) != .type_param) return c.isAssignable(s0, t0);
+    const t = try c.resolveStructural(t0);
+    if (c.ts.kind(t) == .type_param) return constraintChainReaches(c, s, t);
+    const con = try c.typeParamConstraint(c.ts.typeParamSymbol(s));
+    if (con == types.no_type or con == s or c.ts.kind(con) == .unknown or c.ts.kind(con) == .any) return true;
+    return comparableOneWay(c, con, t0, depth + 1);
+}
+
+/// tsc's type-parameter-vs-type-parameter carve-out: walk `s`'s constraint
+/// chain while it still mentions a parameter and ask assignability at each
+/// step. `V extends U` reaches `U`; two siblings reach nothing. The SAME
+/// parameter is related to itself before the carve-out is ever consulted
+/// (`isTypeRelatedTo`'s `source === target`), which is what keeps `t < t`
+/// legal for a bare `T`.
+fn constraintChainReaches(c: *Checker, s: TypeId, t: TypeId) Error!bool {
+    if (s == t) return true;
+    var cur = s;
+    var steps: u32 = 0;
+    while (c.ts.kind(cur) == .type_param and steps < 8) : (steps += 1) {
+        const con = try c.typeParamConstraint(c.ts.typeParamSymbol(cur));
+        if (con == types.no_type or con == cur) return false;
+        if (try c.isAssignable(con, t)) return true;
+        cur = try c.resolveStructural(con);
+    }
+    return false;
+}
+
 /// tsc's `typeMaybeAssignableTo`: like `isAssignable`, except a UNION
 /// source only has to have SOME constituent assignable to the target. Used
 /// where the question is "could this value have come from that slot" rather
@@ -2675,6 +2728,24 @@ pub fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
         return if (try c.isAssignable(sv, c.ts.mappedValue(t))) true else null;
     }
     if (tk == .mapped) {
+        // tsc `structuredTypeRelatedTo`, verbatim: a homomorphic map whose
+        // TEMPLATE is the source indexed by the map's OWN key parameter —
+        // `{ [P in keyof S]: S[P] }` — is the identity on `S`, and the
+        // relation says so on the syntax alone ("if the mapped type has shape
+        // `{ [P in Q]: T[P] }` and `T` is the source, they are related").
+        // Reached before the general `keyof S`-vs-key-set walk below, which
+        // has to reduce `S[P]` and compare it against itself and does not
+        // always get there for a still-generic `S`.
+        // Gated exactly as tsc gates it: on the map not REMOVING `?`
+        // (`!(modifiers & ExcludeOptional)`) and not remapping keys. ADDING
+        // `?` is fine — every member the map produces is still `S`'s own,
+        // merely optional, which is what makes `T` a `Partial<T>`.
+        if (c.ts.mappedFlags(t) & types.mapped_flag_optional_remove == 0 and c.ts.mappedAs(t) == 0) {
+            const val = c.ts.mappedValue(t);
+            if (c.ts.kind(val) == .index_access and
+                c.ts.indexAccessObj(val) == s and
+                c.ts.indexAccessIndex(val) == c.ts.mappedKeyParam(t)) return true;
+        }
         // tsc `structuredTypeRelatedTo`, verbatim: "An empty object type is
         // related to any mapped type that includes a '?' modifier." Every
         // key such a map produces is optional, so a source with no members

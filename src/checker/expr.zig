@@ -3212,20 +3212,20 @@ fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // is both the classification tsc applies and the type it NAMES:
             // `"a" > 1` reads "types 'string' and 'number'", never
             // "types '\"a\"' and 'number'".
-            // `nonNullable` runs BEHIND the reporting screen because it does
-            // more than drop constituents: a bare type parameter comes back
-            // as `T & {}`, which is what makes `t < a` against `{}`
-            // comparable (`checkNonNullType` leaves a non-nullish `T`
-            // untouched, and a bare `T` is comparable to nothing).
-            const ls = try baseOfLiteralType(c, try c.nonNullable(try checkNonNullType(c, lt, d.lhs)));
-            const rs = try baseOfLiteralType(c, try c.nonNullable(try checkNonNullType(c, rt, d.rhs)));
+            // A bare type parameter is left EXACTLY as it is: tsc names it
+            // `T` in the message (never `{} & T`) and `relationalComparable`
+            // relates it through its constraint the way tsc's comparable
+            // relation does, so nothing here has to synthesize an apparent
+            // type for it.
+            const ls = try baseOfLiteralType(c, try checkNonNullType(c, lt, d.lhs));
+            const rs = try baseOfLiteralType(c, try checkNonNullType(c, rt, d.rhs));
             const lk = c.ts.kind(ls);
             const rk = c.ts.kind(rs);
             const ok = lk == .any or rk == .any or lk == .err or rk == .err or blk: {
                 const lnum = try isNumberish(c, ls) or try isBigintish(c, ls);
                 const rnum = try isNumberish(c, rs) or try isBigintish(c, rs);
                 if (lnum and rnum) break :blk true;
-                if (!lnum and !rnum) break :blk (try c.isComparable(ls, rs));
+                if (!lnum and !rnum) break :blk (try c.relationalComparable(ls, rs));
                 break :blk false;
             };
             if (!ok) {
