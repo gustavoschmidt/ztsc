@@ -842,7 +842,7 @@ pub const map_containers = [_][]const u8{
     "key_name_types",         "enum_members",           "keyof_obj_cache",
     "trunc_expansions",       "inst_map_bytes",         "tp_mentions",
     "smk_cache",              "rel_maybe",              "spec_sym_types",
-    "spec_tainted",           "last_assign_pos",
+    "spec_tainted",           "last_assign_pos",        "definitely_assigned_syms",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -1016,6 +1016,15 @@ pub const Checker = struct {
     /// (see the `.start`/closure-capture gate in `flowTypeInner`). Order-
     /// invariant: a pure function of the file's assignment AST nodes.
     reassigned_syms: IntMap(SymbolId, void) = .empty,
+    /// The DEFINITE subset of `reassigned_syms`: symbols with at least one
+    /// `=` / `||=` / `&&=` / `??=` / destructuring / `for..of` head write
+    /// anywhere in their file — tsc's `isSymbolAssignedDefinitely`, the
+    /// negative-`lastAssignmentPos` half of `markNodeAssignments`. A compound
+    /// write (`i++`, `n |= f`) is in `reassigned_syms` but NOT here, which is
+    /// exactly the distinction TS 5.0's captured-variable definite-assignment
+    /// rule turns on (see `checkUseBeforeAssigned`). Populated alongside
+    /// `reassigned_syms` in `ensureReassignScan`.
+    definitely_assigned_syms: IntMap(SymbolId, void) = .empty,
     /// tsc's `Symbol.lastAssignmentPos` (TS 5.4's "preserved narrowing in
     /// closures following the last assignment"): for every symbol in
     /// `reassigned_syms`, the source offset a reference must start *after* for

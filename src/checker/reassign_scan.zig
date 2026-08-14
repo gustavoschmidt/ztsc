@@ -53,7 +53,8 @@ pub fn ensureReassignScan(c: *Checker) Error!void {
         const scope = b.flowScope(flow);
         switch (c.nodeTag(node)) {
             .assign => {
-                try c.markReassignTarget(c.tree.nodeData(node).lhs, scope, node);
+                const definite = definiteTargetKind(c.tree.tokens.tag(c.tree.nodeMainToken(node)));
+                try markReassignTargetKind(c, c.tree.nodeData(node).lhs, scope, node, definite);
                 try c.markMemberWriteRoot(c.tree.nodeData(node).lhs, scope);
             },
             .prefix_unary, .postfix_unary => {
@@ -70,11 +71,15 @@ pub fn ensureReassignScan(c: *Checker) Error!void {
             //
             // `for (x of xs)` over an ALREADY-declared `x` IS an assignment
             // to tsc's `markNodeAssignments`, and is deliberately still left
-            // out: adding it would put `x` into `reassigned_syms`, which four
-            // other consumers (`stableIndexSymbol`, the loop-label shortcut,
-            // `narrowedPatternBinding`) read as "not effectively const" — a
-            // tightening well outside the 5.4 rule. Leaving it out only ever
-            // preserves MORE narrowing, which is the pre-existing answer.
+            // out of `reassigned_syms`: adding it there would mark `x` "not
+            // effectively const" for four other consumers
+            // (`stableIndexSymbol`, the loop-label shortcut,
+            // `narrowedPatternBinding`) — a tightening well outside the 5.4
+            // rule. It is recorded as a DEFINITE write, which only that rule
+            // reads (`markForHeadDefinite`).
+            .identifier, .array_literal, .object_literal, .array_pattern, .object_pattern => {
+                try markForHeadDefinite(c, node, scope);
+            },
             else => {},
         }
     }
@@ -98,6 +103,28 @@ pub fn recordReassign(c: *Checker, sym: SymbolId, scope: ScopeId) Error!void {
 }
 
 pub fn markReassignTarget(c: *Checker, target: Node, scope: ScopeId, at: Node) Error!void {
+    return markReassignTargetKind(c, target, scope, at, false);
+}
+
+/// tsc's `getAssignmentTargetKind` for the operator of an assignment
+/// expression: `=` and the three logical assignments are *definite* writes,
+/// everything else is compound (it reads before it writes).
+///
+/// Note this is `getAssignmentTargetKind`'s classification, not
+/// `flow.definiteAssignOp`'s: the two disagree on `&&=`, whose skipping branch
+/// keeps `undefined` and so cannot INITIALIZE anything. Here the question is
+/// only "does this symbol have a plain assignment somewhere", which is what
+/// tsc records with a negative `lastAssignmentPos`, and there `&&=` counts.
+fn definiteTargetKind(op: @import("../frontend/scanner.zig").Tag) bool {
+    return switch (op) {
+        .eq, .pipe_pipe_eq, .amp_amp_eq, .question_question_eq => true,
+        else => false,
+    };
+}
+
+/// Walk an assignment target, recording each variable it writes. `definite`
+/// additionally records the symbol in `definitely_assigned_syms`.
+fn markReassignTargetKind(c: *Checker, target: Node, scope: ScopeId, at: Node, definite: bool) Error!void {
     if (target == null_node) return;
     var n = target;
     while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
@@ -105,42 +132,86 @@ pub fn markReassignTarget(c: *Checker, target: Node, scope: ScopeId, at: Node) E
         .identifier => {
             const a = try c.atomOfToken(c.tree.nodeMainToken(n));
             switch (c.resolveSpace(a, scope, true)) {
-                .sym => |s| {
-                    try c.recordReassign(s, scope);
-                    try recordLastAssign(c, s, scope, at);
-                },
+                .sym => |s| try markWrittenSym(c, s, scope, at, definite),
                 else => {},
             }
         },
-        // Destructuring-assignment target: `[a] = …` / `({a} = …)`.
+        // Destructuring-assignment target: `[a] = …` / `({a} = …)`. Every
+        // element of one is a definite write in tsc's classification.
         .array_literal, .object_literal, .array_pattern, .object_pattern => {
             for (c.tree.nodeRange(n)) |el| {
-                if (el != null_node) try c.markReassignTarget(el, scope, at);
+                if (el != null_node) try markReassignTargetKind(c, el, scope, at, true);
             }
         },
         // Cover grammar: `object_property`'s target is rhs (lhs is the key).
-        .object_property => try c.markReassignTarget(c.tree.nodeData(n).rhs, scope, at),
+        .object_property => try markReassignTargetKind(c, c.tree.nodeData(n).rhs, scope, at, definite),
         // `{[k]: target}` — lhs is the key expression, rhs the target.
-        .binding_property_computed => try c.markReassignTarget(c.tree.nodeData(n).rhs, scope, at),
+        .binding_property_computed => try markReassignTargetKind(c, c.tree.nodeData(n).rhs, scope, at, definite),
         .binding_property, .object_shorthand => {
             const d = c.tree.nodeData(n);
             if (d.lhs != 0) {
-                try c.markReassignTarget(d.lhs, scope, at);
+                try markReassignTargetKind(c, d.lhs, scope, at, definite);
             } else {
                 const a = try c.memberAtom(c.tree.nodeMainToken(n));
                 switch (c.resolveSpace(a, scope, true)) {
-                    .sym => |s| {
-                        try c.recordReassign(s, scope);
-                        try recordLastAssign(c, s, scope, at);
-                    },
+                    .sym => |s| try markWrittenSym(c, s, scope, at, definite),
                     else => {},
                 }
             }
         },
         .binding_default, .rest_element, .spread_element => {
-            try c.markReassignTarget(c.tree.nodeData(n).lhs, scope, at);
+            try markReassignTargetKind(c, c.tree.nodeData(n).lhs, scope, at, definite);
         },
         // member_expr (`o.p = v`) reassigns a property, not a variable.
+        else => {},
+    }
+}
+
+fn markWrittenSym(c: *Checker, sym: SymbolId, scope: ScopeId, at: Node, definite: bool) Error!void {
+    try c.recordReassign(sym, scope);
+    try recordLastAssign(c, sym, scope, at);
+    if (definite) try c.definitely_assigned_syms.put(c.cm(), sym, {});
+}
+
+/// The `for (x of xs)` / `for (k in o)` ASSIGNMENT head (no declaration): a
+/// definite write in tsc's `markNodeAssignments`, recorded into
+/// `definitely_assigned_syms` ONLY.
+///
+/// It is deliberately kept out of `reassigned_syms` — four other consumers
+/// (`stableIndexSymbol`, the loop-label shortcut, `narrowedPatternBinding`)
+/// read that set as "not effectively const", and widening it there is a
+/// tightening well outside this rule. See `ensureReassignScan`.
+fn markForHeadDefinite(c: *Checker, target: Node, scope: ScopeId) Error!void {
+    if (target == null_node) return;
+    var n = target;
+    while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+    switch (c.nodeTag(n)) {
+        .identifier => {
+            const a = try c.atomOfToken(c.tree.nodeMainToken(n));
+            switch (c.resolveSpace(a, scope, true)) {
+                .sym => |s| try c.definitely_assigned_syms.put(c.cm(), s, {}),
+                else => {},
+            }
+        },
+        .array_literal, .object_literal, .array_pattern, .object_pattern => {
+            for (c.tree.nodeRange(n)) |el| {
+                if (el != null_node) try markForHeadDefinite(c, el, scope);
+            }
+        },
+        .object_property, .binding_property_computed => try markForHeadDefinite(c, c.tree.nodeData(n).rhs, scope),
+        .binding_property, .object_shorthand => {
+            const d = c.tree.nodeData(n);
+            if (d.lhs != 0) {
+                try markForHeadDefinite(c, d.lhs, scope);
+            } else {
+                const a = try c.memberAtom(c.tree.nodeMainToken(n));
+                switch (c.resolveSpace(a, scope, true)) {
+                    .sym => |s| try c.definitely_assigned_syms.put(c.cm(), s, {}),
+                    else => {},
+                }
+            }
+        },
+        .binding_default, .rest_element, .spread_element => try markForHeadDefinite(c, c.tree.nodeData(n).lhs, scope),
         else => {},
     }
 }

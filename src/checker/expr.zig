@@ -31,6 +31,8 @@ const ctxWantsTemplate = @import("generics.zig").ctxWantsTemplate;
 const diagFmt = Checker.diagFmt;
 const flowTypeOfReference = @import("flow.zig").flowTypeOfReference;
 const gatherSpreadProps = @import("typenode.zig").gatherSpreadProps;
+const inForHeadWriteTarget = @import("flow.zig").inForHeadWriteTarget;
+const unassignedVarType = @import("flow.zig").unassignedVarType;
 const globalThisType = @import("instantiate.zig").globalThisType;
 const names_zig = @import("names.zig");
 const hasTypeMeaning = @import("names.zig").hasTypeMeaning;
@@ -677,10 +679,22 @@ fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: TokenInde
         if (c.tree.tokens.start(tok) < c.nodeSpanStart(decls[0])) before_decl = true;
     }
     if ((has_init or has_definite) and !before_decl) return;
+    // `for (x of xs)` / `for ({ a: x } of xs)`: the head's target is a WRITE.
+    if (try inForHeadWriteTarget(c, node, sym)) return;
     const dk = c.ts.kind(declared);
     if (dk == .any or dk == .err or dk == .unknown or dk == .void or dk == .none) return;
     if (c.containsUndefinedish(declared)) return;
-    if (c.containerOf(c.cur_scope) != c.containerOf(c.symScope(sym))) return;
+    // tsc's `isOuterVariable`: a reference whose control-flow container is not
+    // the declaration's is assumed initialized — the enclosing function's flow
+    // says nothing about when the closure runs. TS 5.0 carved one hole in
+    // that (`isNeverInitialized`): if the variable is a mutable local `let`
+    // with no initializer that is never DEFINITELY assigned anywhere in the
+    // file, then no execution order can have written it, so the capture is
+    // reported after all. A compound write inside the closure (`i++`,
+    // `flags |= f`) does not rescue it; a plain `x = v` does, wherever it sits.
+    if (c.containerOf(c.cur_scope) != c.containerOf(c.symScope(sym))) {
+        if (!try neverInitializedLocal(c, sym)) return;
+    }
     const flow = c.bind.flowAt(node) orelse return;
     if (try c.definitelyAssigned(flow, sym)) return;
     // The assignment walk alone is not tsc's answer. tsc runs the ordinary
@@ -693,9 +707,27 @@ fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: TokenInde
     // directly, and it is asked only once the cheap walk has decided to
     // report — every clean reference still costs one boolean walk.
     const optional = try c.makeUnion2(declared, types.undefined_type);
-    const narrowed = try c.flowTypeOfReference(node, sym, optional);
+    const narrowed = try unassignedVarType(c, node, sym, optional);
     if (!c.containsUndefinedish(narrowed)) return;
     try c.diagFmt(2454, c.tokSpan(tok), "Variable '{s}' is used before being assigned.", .{c.tokenText(tok)});
+}
+
+/// tsc's `isMutableLocalVariableDeclaration && !isSymbolAssignedDefinitely`:
+/// is `sym` a `let` local that NOTHING in its file ever plainly assigns?
+///
+/// `let` only — tsc's predicate reads `NodeFlags.Let`, so a `var` captured by
+/// a closure is never reported however it is written (the `x10` of
+/// `unusedLocalsInMethod4`). An EXPORTED variable, and a top-level variable of
+/// a SCRIPT (whose top level is the global scope), are out for the same reason
+/// the closure-crossing narrowing gate leaves them out: another file may
+/// assign them.
+fn neverInitializedLocal(c: *Checker, sym: SymbolId) Error!bool {
+    const sf = c.symFlags(sym);
+    if (!sf.let_decl or sf.const_decl or sf.param or sf.catch_param) return false;
+    if (sf.exported) return false;
+    if (c.bind.scope_kinds[containerOf(c, c.symScope(sym))] == .file and !c.bind.is_module) return false;
+    try c.ensureReassignScan();
+    return !c.definitely_assigned_syms.contains(sym);
 }
 
 /// ``tag`a${x}b` `` — a CALL of `tag` with the template's cooked-strings
