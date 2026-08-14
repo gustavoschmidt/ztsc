@@ -31,6 +31,7 @@ const ctxWantsTemplate = @import("generics.zig").ctxWantsTemplate;
 const diagFmt = Checker.diagFmt;
 const flowTypeOfReference = @import("flow.zig").flowTypeOfReference;
 const gatherSpreadProps = @import("typenode.zig").gatherSpreadProps;
+const flowContainerOf = @import("flow.zig").flowContainerOf;
 const inForHeadWriteTarget = @import("flow.zig").inForHeadWriteTarget;
 const unassignedVarType = @import("flow.zig").unassignedVarType;
 const globalThisType = @import("instantiate.zig").globalThisType;
@@ -692,7 +693,7 @@ fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: TokenInde
     // file, then no execution order can have written it, so the capture is
     // reported after all. A compound write inside the closure (`i++`,
     // `flags |= f`) does not rescue it; a plain `x = v` does, wherever it sits.
-    if (c.containerOf(c.cur_scope) != c.containerOf(c.symScope(sym))) {
+    if (flowContainerOf(c, c.cur_scope) != flowContainerOf(c, c.symScope(sym))) {
         if (!try neverInitializedLocal(c, sym)) return;
     }
     const flow = c.bind.flowAt(node) orelse return;
