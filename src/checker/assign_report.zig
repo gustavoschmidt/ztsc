@@ -1280,8 +1280,12 @@ pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: T
                 if (try c.targetIsEmptyish(m)) return false;
             }
             // …and it is the DISCRIMINANT-REDUCED union the names are looked up
-            // in (`epcReducedUnion`), not the whole one.
-            rt = try epcReducedUnion(c, src_t, rt);
+            // in (`epcReducedUnion`), not the whole one. Resolved again after
+            // the reduction: a reduction down to ONE constituent yields that
+            // constituent itself, and a named one (`Float`, a `.ref`) is a shape
+            // `targetKnowsProp` cannot read — it would answer "knows every name"
+            // and throw the reduction away.
+            rt = try c.resolveStructural(try epcReducedUnion(c, src_t, rt));
         },
         // An intersection has no properties of its own, so the walk below
         // relies entirely on `targetKnowsProp`'s intersection arm (ANY
