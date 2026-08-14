@@ -1924,22 +1924,6 @@ fn narrowByTypeofChainContainment(c: *Checker, t: TypeId, value: Node, sense: bo
     return t;
 }
 
-/// `<ref>.k` where `<ref>` is exactly `key`'s reference: returns the
-/// discriminant property NAME `k`. Handles any tracked reference — a root
-/// symbol (`x.k`) *or* a depth-1 member path (`f.geometry.k`) — by reusing
-/// `refMatches` on the access base.
-///
-/// Both a plain `.k` and an optional `?.k` access count, and so does the
-/// ELEMENT spelling `["k"]`: tsc's `getDiscriminantPropertyAccess` asks
-/// `getAccessedPropertyName`, which reads a string-literal element access as
-/// the same property name (`switch (s['kind'])` discriminates exactly as
-/// `switch (s.kind)` does). An optional read short-circuits to `undefined`
-/// when the base is nullish, which is what the discriminant filter then
-/// removes on the asserting branch (the caller finishes the job with
-/// `narrowByOptChainContainment`, since a member with no `k` at all is kept
-/// by the filter). The reference's depth is likewise irrelevant: the union
-/// being filtered is the reference's own type whether it is a root symbol
-/// (`x?.k`) or a member path (`s.openDialog?.k`).
 /// tsc's `isMatchingConstructorReference`: is `node` the access
 /// `<ref>.constructor` (or its element spelling `<ref>["constructor"]`) where
 /// `<ref>` is exactly `key`'s reference? Optional forms are excluded, as they
@@ -1961,6 +1945,22 @@ fn constructorRefOf(c: *Checker, node: Node, key: RefKey) Error!bool {
     return refMatches(c, c.tree.nodeData(node).lhs, key);
 }
 
+/// `<ref>.k` where `<ref>` is exactly `key`'s reference: returns the
+/// discriminant property NAME `k`. Handles any tracked reference — a root
+/// symbol (`x.k`) *or* a depth-1 member path (`f.geometry.k`) — by reusing
+/// `refMatches` on the access base.
+///
+/// Both a plain `.k` and an optional `?.k` access count, and so does the
+/// ELEMENT spelling `["k"]`: tsc's `getDiscriminantPropertyAccess` asks
+/// `getAccessedPropertyName`, which reads a string-literal element access as
+/// the same property name (`switch (s['kind'])` discriminates exactly as
+/// `switch (s.kind)` does). An optional read short-circuits to `undefined`
+/// when the base is nullish, which is what the discriminant filter then
+/// removes on the asserting branch (the caller finishes the job with
+/// `narrowByOptChainContainment`, since a member with no `k` at all is kept
+/// by the filter). The reference's depth is likewise irrelevant: the union
+/// being filtered is the reference's own type whether it is a root symbol
+/// (`x?.k`) or a member path (`s.openDialog?.k`).
 fn discriminantOfRef(c: *Checker, node: Node, key: RefKey) Error!?Atom {
     if (node == null_node) return null;
     // A binding-pattern pseudo-reference reads its discriminant through a
