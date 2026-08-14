@@ -61,6 +61,14 @@ pub fn mergeClash(flags: []const SymbolFlags) ?Code {
     var acc = flags[0];
     for (flags[1..]) |f| {
         if (bind_result.effectiveBits(acc) & bind_result.excludesOfFlags(f) != 0) {
+            // tsc's `mergeSymbol` takes a DIFFERENT arm before the duplicate
+            // one when the target carries `SymbolFlags.NamespaceModule` — a
+            // namespace whose every block is type-only. That arm reports
+            // TS2649 ("cannot augment module 'A' … non-module entity") on the
+            // source, or nothing at all for `globalThis`; either way the name
+            // is not a duplicate. `interface A {} namespace A {}` in one file
+            // beside `type A = {}` in another is exactly that shape.
+            if (acc.ns_uninstantiated) return null;
             // tsc's `mergeSymbol` message order, which reads BOTH sides (unlike
             // `declareSymbol`, which reads the existing symbol alone): an `enum`
             // anywhere in the failing pair, then a block-scoped variable
@@ -73,6 +81,50 @@ pub fn mergeClash(flags: []const SymbolFlags) ?Code {
         acc = acc.merge(f);
     }
     return null;
+}
+
+/// The member-space bits of a symbol: which KIND of interface/class member it
+/// declares.
+fn memberBits(f: SymbolFlags) u32 {
+    return f.bits() & bind_result.mask_member;
+}
+
+/// The clash among the same-named MEMBERS contributed by the blocks of one
+/// cross-file merged interface, or null when they all merge.
+///
+/// This is NOT `excludesOfFlags`: tsc's `PropertyExcludes` is empty, so two
+/// property signatures of one name MERGE and their disagreement, if any, is
+/// TS2717 ("subsequent property declarations must have the same type") rather
+/// than a duplicate — verified against the oracle in both orders. What tsc calls
+/// a duplicate is a clash of member KINDS, and that is what this decides:
+///
+///   * two properties merge (TS2717's business),
+///   * two methods merge (they are overload signatures),
+///   * a getter and a setter merge (they are one accessor pair),
+///   * anything else — a property beside a method, two getters — is TS2300 at
+///     every declaration, whichever block came first.
+pub fn memberClash(flags: []const SymbolFlags) ?Code {
+    if (flags.len < 2) return null;
+    var acc = memberBits(flags[0]);
+    for (flags[1..]) |f| {
+        const m = memberBits(f);
+        if (!membersMerge(acc, m)) return .duplicate_identifier;
+        acc |= m;
+    }
+    return null;
+}
+
+fn membersMerge(a: u32, b: u32) bool {
+    const prop = bind_result.fbits(.{ .property = true });
+    const meth = bind_result.fbits(.{ .method = true });
+    const accessors = bind_result.fbits(.{ .getter = true }) | bind_result.fbits(.{ .setter = true });
+    if (a == prop and b == prop) return true;
+    if (a == meth and b == meth) return true;
+    // A get/set pair, and only a pair: a second getter overlaps the first.
+    if (a != 0 and b != 0 and a & ~accessors == 0 and b & ~accessors == 0 and a & b == 0) return true;
+    // A member ztsc gave no member kind at all (an index/call signature, or a
+    // shape this walk does not model) is not judged.
+    return a == 0 or b == 0;
 }
 
 /// Where one contributor's declarations are: the file that declared it and the
@@ -113,6 +165,34 @@ pub fn reportAll(
     }
 }
 
+test "memberClash: two interface blocks' same-named members" {
+    const t = std.testing;
+    const clash = memberClash;
+    // Merge: the pairs tsc lets share one member symbol.
+    try t.expectEqual(@as(?Code, null), clash(&.{ .{ .property = true }, .{ .property = true } }));
+    try t.expectEqual(@as(?Code, null), clash(&.{ .{ .method = true }, .{ .method = true } }));
+    try t.expectEqual(@as(?Code, null), clash(&.{ .{ .getter = true }, .{ .setter = true } }));
+    try t.expectEqual(@as(?Code, null), clash(&.{ .{ .setter = true }, .{ .getter = true } }));
+    // An optional/readonly property is still a property.
+    try t.expectEqual(@as(?Code, null), clash(&.{
+        .{ .property = true, .optional_member = true },
+        .{ .property = true, .readonly_member = true },
+    }));
+    // Clash: a KIND disagreement, in either order.
+    try t.expectEqual(@as(?Code, .duplicate_identifier), clash(&.{ .{ .property = true }, .{ .method = true } }));
+    try t.expectEqual(@as(?Code, .duplicate_identifier), clash(&.{ .{ .method = true }, .{ .property = true } }));
+    try t.expectEqual(@as(?Code, .duplicate_identifier), clash(&.{ .{ .getter = true }, .{ .getter = true } }));
+    try t.expectEqual(@as(?Code, .duplicate_identifier), clash(&.{ .{ .property = true }, .{ .getter = true } }));
+    // A third block overlapping an already-complete accessor pair.
+    try t.expectEqual(@as(?Code, .duplicate_identifier), clash(&.{
+        .{ .getter = true },
+        .{ .setter = true },
+        .{ .setter = true },
+    }));
+    // A symbol with no member kind at all is not judged.
+    try t.expectEqual(@as(?Code, null), clash(&.{ .{}, .{ .method = true } }));
+}
+
 test "mergeClash: the pairs tsc merges across files, and the codes it picks" {
     const t = std.testing;
     const clash = mergeClash;
@@ -132,6 +212,13 @@ test "mergeClash: the pairs tsc merges across files, and the codes it picks" {
     }));
     // Single contributor: never a duplicate, whatever it is.
     try t.expectEqual(@as(?Code, null), clash(&.{.{ .let_decl = true }}));
+    // A target carrying tsc's `NamespaceModule` takes its own `mergeSymbol` arm
+    // (TS2649), never the duplicate one: `interface A {} namespace A {}` in one
+    // file beside `type A = {}` in another.
+    try t.expectEqual(@as(?Code, null), clash(&.{
+        .{ .interface = true, .namespace_decl = true, .ns_uninstantiated = true },
+        .{ .type_alias = true },
+    }));
     // The three messages.
     try t.expectEqual(@as(?Code, .duplicate_identifier), clash(&.{ .{ .class = true }, .{ .class = true } }));
     try t.expectEqual(@as(?Code, .duplicate_identifier), clash(&.{ .{ .type_alias = true }, .{ .type_alias = true } }));

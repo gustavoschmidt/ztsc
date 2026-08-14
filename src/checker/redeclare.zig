@@ -20,9 +20,12 @@ const std = @import("std");
 
 const ast = @import("../frontend/ast.zig");
 const binder = @import("../frontend/binder.zig");
+const global_dup = @import("../link/global_dup.zig");
+const intern = @import("../intern.zig");
 const modules = @import("../link/modules.zig");
 const types = @import("../types.zig");
 
+const Atom = intern.Atom;
 const Node = ast.Node;
 const null_node = ast.null_node;
 const SymbolId = binder.SymbolId;
@@ -236,9 +239,20 @@ fn firstValueDeclOf(c: *Checker, sym: SymbolId) Error!?ValueDecl {
         const decl = firstValueDecl(c, sym) orelse return null;
         return .{ .sym = sym, .own = sym, .file = c.cur_file, .decl = decl };
     }
+    const parts = c.prog.mergedSym(sym).parts;
+    // A merge tsc REJECTED is not a set of subsequent declarations of one
+    // variable: `mergeSymbol` reports the duplicate (`declare const a: number`
+    // beside `declare const a: string` is TS2451 at both) and never goes on to
+    // compare the second declaration's type against the first's.
+    {
+        const flags = try c.scratch().alloc(binder.SymbolFlags, parts.len);
+        defer c.scratch().free(flags);
+        for (parts, 0..) |p, i| flags[i] = c.symFlags(p);
+        if (global_dup.mergeClash(flags) != null) return null;
+    }
     var found: ?ValueDecl = null;
     var own: SymbolId = 0;
-    for (c.prog.mergedSym(sym).parts) |p| {
+    for (parts) |p| {
         if (c.symScope(p) != binder.file_scope) return null;
         const pf = c.symFlags(p);
         if (pf.function or pf.class or pf.enum_decl or pf.namespace_decl or
@@ -353,13 +367,7 @@ pub fn checkTypeParamListsIdentical(c: *Checker, sym: SymbolId, name_tok: ast.To
     if (blocks.items.len < 2) return;
     if (namespaceLocalAcrossBlocks(c, sym)) return;
 
-    // The merged list is the window tsc measures arity against, and it is
-    // already built for every generic declaration this run touches.
-    var target: std.ArrayList(TypeParamInfo) = .empty;
-    defer target.deinit(c.scratch());
-    try c.typeParamsOf(sym, &target);
-
-    if (try listsIdentical(c, target.items, blocks.items)) return;
+    if (try listsIdentical(c, blocks.items)) return;
     try c.diagFmt(
         2428,
         c.tokSpan(name_tok),
@@ -418,57 +426,94 @@ fn declarationBlocks(c: *Checker, sym: SymbolId, out: *std.ArrayList(Block)) Err
     }
 }
 
-/// Does every block's list fall inside the merged list's arity window and agree
+/// One position of the UNION list every block is measured against: the name it
+/// must spell there, and the first constraint/default any block declares for it
+/// (each with the type-parameter symbol whose file and scope the node is read
+/// against).
+const Slot = struct {
+    name: Atom,
+    constraint: Node = null_node,
+    constraint_sym: SymbolId = 0,
+    default: Node = null_node,
+    default_sym: SymbolId = 0,
+};
+
+/// Does every block's list fall inside the union list's arity window and agree
 /// with every other block on names, constraints and defaults?
-fn listsIdentical(c: *Checker, target: []const TypeParamInfo, blocks: []const Block) Error!bool {
-    const max_n = target.len;
-    // tsc's `getMinTypeArgumentCount`: the count up to and including the last
-    // parameter that has no default.
-    var min_n: usize = 0;
-    for (target, 0..) |tp, i| {
-        if (tp.default == null_node) min_n = i + 1;
-    }
-
-    // The first constraint/default seen at each position, with the type
-    // parameter symbol whose file and scope it must be read against.
-    const cons = try c.scratch().alloc(Node, max_n);
-    const cons_sym = try c.scratch().alloc(SymbolId, max_n);
-    const defs = try c.scratch().alloc(Node, max_n);
-    const defs_sym = try c.scratch().alloc(SymbolId, max_n);
-    @memset(cons, null_node);
-    @memset(defs, null_node);
-
+///
+/// The window is measured against the UNION of the blocks' lists, not against any
+/// one block: tsc reads each position's default off the type parameter's whole
+/// declaration set, so a default declared by ANY block makes that position
+/// optional for EVERY block. That is what makes
+///
+///     interface i04 {}                            // 0 arguments
+///     interface i04<T> {}                         // 1, no default here
+///     interface i04<T = number> {}                // the default for position 0
+///     interface i04<T = number, U = string> {}    // and for position 1
+///
+/// legal: the union is `<T = number, U = string>`, whose minimum argument count
+/// is 0 and maximum 2, and every block sits inside that.
+fn listsIdentical(c: *Checker, blocks: []const Block) Error!bool {
+    var slots: std.ArrayList(Slot) = .empty;
+    defer slots.deinit(c.scratch());
     var list: std.ArrayList(TypeParamInfo) = .empty;
     defer list.deinit(c.scratch());
+
+    // Pass 1: the union. A position's name comes from the first block that
+    // declares it, its constraint/default from the first block that declares one.
     for (blocks) |b| {
-        list.clearRetainingCapacity();
-        {
-            const saved = c.enterSymFile(b.sym);
-            defer c.restoreCtx(saved);
-            try c.declTypeParams(b.node, &list);
+        try blockTypeParams(c, b, &list);
+        for (list.items, 0..) |tp, i| {
+            if (i == slots.items.len) {
+                try slots.append(c.scratch(), .{ .name = c.symNameAtom(tp.sym) });
+            }
+            const slot = &slots.items[i];
+            if (slot.constraint == null_node and tp.constraint != null_node) {
+                slot.constraint = tp.constraint;
+                slot.constraint_sym = tp.sym;
+            }
+            if (slot.default == null_node and tp.default != null_node) {
+                slot.default = tp.default;
+                slot.default_sym = tp.sym;
+            }
         }
+    }
+    const max_n = slots.items.len;
+    // tsc's `getMinTypeArgumentCount`: the count up to and including the last
+    // position with no default.
+    var min_n: usize = 0;
+    for (slots.items, 0..) |slot, i| {
+        if (slot.default == null_node) min_n = i + 1;
+    }
+
+    // Pass 2: every block against the union.
+    for (blocks) |b| {
+        try blockTypeParams(c, b, &list);
         if (list.items.len < min_n or list.items.len > max_n) return false;
         for (list.items, 0..) |tp, i| {
-            if (c.symNameAtom(tp.sym) != c.symNameAtom(target[i].sym)) return false;
-            if (tp.constraint != null_node) {
-                if (cons[i] == null_node) {
-                    cons[i] = tp.constraint;
-                    cons_sym[i] = tp.sym;
-                } else if (!try annotationsAgree(c, cons[i], cons_sym[i], tp.constraint, tp.sym)) {
-                    return false;
-                }
+            const slot = slots.items[i];
+            if (c.symNameAtom(tp.sym) != slot.name) return false;
+            if (tp.constraint != null_node and tp.constraint != slot.constraint and
+                !try annotationsAgree(c, slot.constraint, slot.constraint_sym, tp.constraint, tp.sym))
+            {
+                return false;
             }
-            if (tp.default != null_node) {
-                if (defs[i] == null_node) {
-                    defs[i] = tp.default;
-                    defs_sym[i] = tp.sym;
-                } else if (!try annotationsAgree(c, defs[i], defs_sym[i], tp.default, tp.sym)) {
-                    return false;
-                }
+            if (tp.default != null_node and tp.default != slot.default and
+                !try annotationsAgree(c, slot.default, slot.default_sym, tp.default, tp.sym))
+            {
+                return false;
             }
         }
     }
     return true;
+}
+
+/// One block's type-parameter list, read in that block's own file context.
+fn blockTypeParams(c: *Checker, b: Block, out: *std.ArrayList(TypeParamInfo)) Error!void {
+    out.clearRetainingCapacity();
+    const saved = c.enterSymFile(b.sym);
+    defer c.restoreCtx(saved);
+    try c.declTypeParams(b.node, out);
 }
 
 /// Do two type-parameter annotations (two constraints, or two defaults) from

@@ -1200,7 +1200,7 @@ pub const Ast = struct {
             .namespace_decl => a.extraData(NamespaceData, d.lhs).name_token,
             .function_decl, .class_method, .method_signature => a.extraData(FnProto, d.lhs).name_token,
             .import_equals => a.extraData(ImportEquals, d.lhs).name_token,
-            .enum_member, .type_param => a.nodeMainToken(node),
+            .enum_member, .type_param, .property_signature, .class_field => a.nodeMainToken(node),
             // A name NODE: an identifier (reportable) or a binding pattern (not).
             .declarator, .declarator_init, .declarator_full, .param, .param_full => {
                 if (d.lhs == null_node or a.nodeTag(d.lhs) != .identifier) return null;
