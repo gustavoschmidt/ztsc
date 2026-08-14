@@ -2530,6 +2530,45 @@ const Parser = struct {
         return bit & access != 0 and already & access != 0;
     }
 
+    /// How many class-member modifiers stand in front of a `static { … }` block,
+    /// or null when this member is not a static block at all. Bounded by the
+    /// lookahead window (`max_la`), so a run longer than three keeps ztsc's
+    /// existing answer rather than reading past it — no real code writes even
+    /// two, and `classStaticBlock20.ts`'s worst case is `readonly private
+    /// static {`.
+    fn staticBlockRunLen(p: *Parser) ?u32 {
+        var n: u32 = 0;
+        while (n < max_la - 2) : (n += 1) {
+            switch (p.peekTag(n)) {
+                .keyword_static => if (p.peekTag(n + 1) == .l_brace) return n,
+                else => {},
+            }
+            if (classMemberModifierBit(p.peekTag(n)) == 0) return null;
+        }
+        return null;
+    }
+
+    /// The `ast.Flags` bit a class-member modifier keyword carries, or 0 when the
+    /// token is not one. Shared by the modifier loop and `staticBlockRunLen` so
+    /// the two cannot disagree about what a modifier is.
+    fn classMemberModifierBit(tag: TokTag) u32 {
+        return switch (tag) {
+            .keyword_static => ast.Flags.static,
+            .keyword_public => ast.Flags.public,
+            .keyword_private => ast.Flags.private,
+            .keyword_protected => ast.Flags.protected,
+            .keyword_readonly => ast.Flags.readonly,
+            .keyword_abstract => ast.Flags.abstract,
+            .keyword_override => ast.Flags.override,
+            .keyword_declare => ast.Flags.declare,
+            .keyword_async => ast.Flags.async,
+            .keyword_accessor => ast.Flags.accessor,
+            .keyword_get => ast.Flags.get,
+            .keyword_set => ast.Flags.set,
+            else => 0,
+        };
+    }
+
     fn parseClassMember(p: *Parser) PE!Node {
         const start_tok = p.curIdx();
 
@@ -2544,7 +2583,18 @@ const Parser = struct {
         // single largest source of ztsc's excess TS1005). The binder ignores a
         // `.block` member, so the body is not checked yet — an under-report,
         // never a wrong answer.
-        if (p.curTag() == .keyword_static and p.peekTag(1) == .l_brace) {
+        //
+        // A modifier RUN may precede it (`async static {`, `public static {`,
+        // `readonly private static {`): tsc parses all of them as one modifier
+        // list on the static block and reports a single TS1184 on the FIRST one
+        // (`checkGrammarModifiers` returns on its first hit). Without the run
+        // the modifier loop below broke on the `{` after `static`, read `static`
+        // as the member NAME and answered a TS1005/TS1434 cascade.
+        if (p.staticBlockRunLen()) |n| {
+            if (n > 0) {
+                if (p.spec == 0) try p.errAtCur(.modifiers_not_allowed_here);
+                for (0..n) |_| _ = try p.bump();
+            }
             _ = try p.bump(); // `static`
             return p.parseBlock();
         }
@@ -2552,21 +2602,7 @@ const Parser = struct {
         var flags: u32 = 0;
         var access_reported = false;
         while (true) {
-            const bit: u32 = switch (p.curTag()) {
-                .keyword_static => ast.Flags.static,
-                .keyword_public => ast.Flags.public,
-                .keyword_private => ast.Flags.private,
-                .keyword_protected => ast.Flags.protected,
-                .keyword_readonly => ast.Flags.readonly,
-                .keyword_abstract => ast.Flags.abstract,
-                .keyword_override => ast.Flags.override,
-                .keyword_declare => ast.Flags.declare,
-                .keyword_async => ast.Flags.async,
-                .keyword_accessor => ast.Flags.accessor,
-                .keyword_get => ast.Flags.get,
-                .keyword_set => ast.Flags.set,
-                else => 0,
-            };
+            const bit = classMemberModifierBit(p.curTag());
             if (bit == 0) break;
             // A modifier only if a member name (or `*`/`[`) follows on any
             // line (get/set/async additionally require same-line names).
