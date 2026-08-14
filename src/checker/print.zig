@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const binder = @import("../frontend/binder.zig");
+const numeric_lit = @import("../numeric_lit.zig");
 const types = @import("../types.zig");
 
 const Io = std.Io;
@@ -434,11 +435,7 @@ fn propDisplayOrder(c: *Checker, t: TypeId, n: usize) Error![]u32 {
 }
 
 pub fn printNumber(w: *std.Io.Writer, v: f64) PrintErr!void {
-    if (v == @floor(v) and @abs(v) < 1e15) {
-        try w.print("{d}", .{@as(i64, @intFromFloat(v))});
-    } else {
-        try w.print("{d}", .{v});
-    }
+    try numeric_lit.write(w, v);
 }
 
 pub fn symbolName(c: *Checker, sym: u32) []const u8 {
