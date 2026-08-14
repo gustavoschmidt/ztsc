@@ -208,7 +208,15 @@ const Parser = struct {
         // is strict for a reason of its own and tsc prefers to say that.
         if (p.saw_module_syntax) {
             for (p.diags.items) |*d| {
-                if (d.code == .strict_reserved_word) d.code = .strict_reserved_word_in_module;
+                d.code = switch (d.code) {
+                    .strict_reserved_word => .strict_reserved_word_in_module,
+                    // TS1100 -> TS1215, the same relabel for the
+                    // `eval`/`arguments` family (tsc picks both wordings with
+                    // one `getStrictMode…Message` helper).
+                    .eval_in_strict => .eval_in_module,
+                    .arguments_in_strict => .arguments_in_module,
+                    else => d.code,
+                };
             }
         }
         const tags = try out.dupe(TokTag, p.tok_tags.items);
@@ -353,6 +361,12 @@ const Parser = struct {
                 if (literals.checkNumeric(text, t.start)) |f| {
                     try p.addDiag(f.code, .{ .code = f.code, .span = f.span });
                 }
+                // TS1351: `3a`. Reported at the identifier, which is exactly
+                // where the parser's own "';' expected" would land, so the
+                // one-per-position rule keeps tsc's answer and drops ours.
+                if (literals.identifierAfterNumeric(p.src, t.end)) |f| {
+                    try p.addDiag(f.code, .{ .code = f.code, .span = f.span });
+                }
             },
             .string_literal => {
                 const text = p.tokenText(t);
@@ -369,6 +383,13 @@ const Parser = struct {
     fn tokenText(p: *const Parser, t: Token) []const u8 {
         const end = @min(if (t.end > t.start) t.end else t.start, @as(u32, @intCast(p.src.len)));
         return p.src[@min(t.start, end)..end];
+    }
+
+    /// Source text of an already-consumed token, by index.
+    fn tokenTextAt(p: *const Parser, tok: u32) []const u8 {
+        const start = p.tok_starts.items[tok] & scanner.Tokens.start_mask;
+        const end = @min(scanner.tokenEnd(p.src, p.tok_tags.items[tok], start), @as(u32, @intCast(p.src.len)));
+        return p.src[@min(start, end)..end];
     }
 
     fn eat(p: *Parser, tag: TokTag) Error!?u32 {
@@ -424,6 +445,39 @@ const Parser = struct {
         });
     }
 
+    /// Report the current no-token-starts-here token. tsc's scanner separates
+    /// three answers here, and so does ztsc's:
+    ///
+    ///   - `#!` outside the first line: TS18026, reported over the two bytes;
+    ///   - a byte that begins no UTF-8 sequence: TS1490, reported ONCE at the
+    ///     start of the FILE (not at the byte), because tsc decodes up front
+    ///     and its scanner blames the file, then stops — which is why the token
+    ///     covers the whole remainder and the next token is `eof`;
+    ///   - anything else: TS1127 over the one byte.
+    fn errAtJunkToken(p: *Parser) Error!void {
+        switch (p.curTag()) {
+            .hash_bang => try p.errAtCur(.shebang_not_at_start),
+            .binary_content => try p.addDiag(.file_appears_binary, .{
+                .code = .file_appears_binary,
+                .span = .{ .start = 0, .end = 0 },
+            }),
+            else => try p.errAtCur(.unexpected_character),
+        }
+    }
+
+    /// Report at the END of the current token, zero-width. tsc's scanner calls
+    /// `error(message)` with no position for the unterminated STRING, TEMPLATE
+    /// and block-COMMENT cases, and that defaults to the scanner's `pos` — one
+    /// past the last byte consumed, not the opening quote. Measured against
+    /// tsgo: `var a = "abc` answers at column 13, `` `abc<nl>zz<nl> `` at the
+    /// end of the file. The unterminated REGEX diagnostic passes `tokenStart`
+    /// explicitly and so stays on the opening `/`; it keeps using `errAtCur`.
+    fn errAtCurEnd(p: *Parser, code: Code) Error!void {
+        const t = p.cur();
+        const at = @min(@max(t.end, t.start), @as(u32, @intCast(p.src.len)));
+        try p.addDiag(code, .{ .code = code, .span = .{ .start = at, .end = at } });
+    }
+
     fn errAtToken(p: *Parser, code: Code, tok: u32) Error!void {
         const start = p.tok_starts.items[tok] & scanner.Tokens.start_mask;
         const end = scanner.tokenEnd(p.src, p.tok_tags.items[tok], start);
@@ -477,7 +531,9 @@ const Parser = struct {
         const t = p.la[0];
         if (!isNameLike(t.tag)) return;
         const norm_end = scanner.tokenEnd(p.src, t.tag, t.start);
-        if (norm_end >= p.src.len or p.src[norm_end] != '-') return;
+        // Only a `-` (`data-foo`) or a `:` (`svg:path`) can extend a JSX name;
+        // anything else means the ordinary token already covers it.
+        if (norm_end >= p.src.len or (p.src[norm_end] != '-' and p.src[norm_end] != ':')) return;
         const end = scanner.scanJsxName(p.src, t.start);
         // A merge may only ever EXTEND the token. Anything else rewinds
         // `p.scn.index` to at or before where this token already started, and
@@ -797,6 +853,93 @@ const Parser = struct {
         };
     }
 
+    /// tsc's `isStartOfStatement`, the gate on its statement-list loops: a
+    /// token that answers false is NOT handed to `parseStatement` at all —
+    /// `parseList` reports one "Declaration or statement expected." (TS1128)
+    /// and skips exactly that token. Without the gate a recovering parser
+    /// instead tries to read an expression statement out of a `}` or a `,` and
+    /// answers with a cascade of "Expression expected"/"';' expected" that tsc
+    /// never produces.
+    ///
+    /// Deliberately CONSERVATIVE where tsc looks ahead: `const`, `export`,
+    /// `import` and the modifier words go through tsc's `isStartOfDeclaration`
+    /// lookahead, and are answered `true` here unconditionally. A false `true`
+    /// only keeps ztsc's existing recovery for that token; a false `false`
+    /// would manufacture a TS1128 tsc does not report.
+    fn atStartOfStatement(p: *Parser) bool {
+        return switch (p.curTag()) {
+            .at,
+            .semicolon,
+            .l_brace,
+            .keyword_var,
+            .keyword_let,
+            .keyword_using,
+            .keyword_function,
+            .keyword_class,
+            .keyword_enum,
+            .keyword_if,
+            .keyword_do,
+            .keyword_while,
+            .keyword_for,
+            .keyword_continue,
+            .keyword_break,
+            .keyword_return,
+            .keyword_with,
+            .keyword_switch,
+            .keyword_throw,
+            .keyword_try,
+            .keyword_debugger,
+            // `catch`/`finally` do not start a statement, but tsc says they do
+            // here so that a stray one is parsed and complained about later.
+            .keyword_catch,
+            .keyword_finally,
+            // The lookahead group (see the doc comment).
+            .keyword_const,
+            .keyword_export,
+            .keyword_import,
+            .keyword_async,
+            .keyword_declare,
+            .keyword_interface,
+            .keyword_module,
+            .keyword_namespace,
+            .keyword_type,
+            .keyword_global,
+            .keyword_accessor,
+            .keyword_public,
+            .keyword_private,
+            .keyword_protected,
+            .keyword_static,
+            .keyword_readonly,
+            .keyword_abstract,
+            // An unterminated block comment is TRIVIA to tsc: its scanner
+            // reports TS1010 and hands the parser EOF, so nothing lands here.
+            // ztsc keeps it as a token that spans to end of file; letting
+            // `parseStatement` own it reproduces tsc's single TS1010, whereas
+            // treating it as junk would add a TS1128 tsc never reports.
+            .unterminated_comment,
+            => true,
+            // tsc's `isStartOfExpression`, including its error tolerance: the
+            // start of a BINARY operator counts, so `* x;` is parsed as an
+            // expression statement with a missing left operand (TS1109) rather
+            // than skipped.
+            else => |tag| canStartExpression(tag) or binaryPrec(tag, false) != 0,
+        };
+    }
+
+    /// The diagnostic tsc's `parseList` reports for a token that starts no list
+    /// element, for the statement-list contexts. A junk token gets its scanner
+    /// diagnostic FIRST, so that the one-per-position rule in `addDiag` drops
+    /// the TS1128 that would otherwise land on the same character — which is
+    /// exactly what tsc's `parseErrorAtPosition` does.
+    fn errNotAStatement(p: *Parser, code: Code) PE!void {
+        if (p.spec > 0) return error.Backtrack;
+        switch (p.curTag()) {
+            .unknown, .hash_bang, .binary_content => try p.errAtJunkToken(),
+            else => {},
+        }
+        try p.errAtCur(code);
+    }
+
     // =====================================================================
     // statements
     // =====================================================================
@@ -829,6 +972,16 @@ const Parser = struct {
         // function — every block, module block and source file gets its own.
         var reported_ambient_stmt = ambient_reported;
         while (p.curTag() != terminator and p.curTag() != .eof) {
+            // tsc's `parseList` gate: a token that starts no statement is
+            // reported and skipped, never parsed.
+            if (!p.atStartOfStatement()) {
+                try p.errNotAStatement(if (terminator == .eof and p.curTag() == .keyword_default)
+                    .expected_export
+                else
+                    .expected_declaration_or_statement);
+                _ = try p.bump();
+                continue;
+            }
             const before = p.curIdx();
             const stmt = try p.parseStatement();
             try p.pushScratch(stmt);
@@ -1098,12 +1251,12 @@ const Parser = struct {
             },
             .at => return p.parseDecorator(),
             .unterminated_comment => {
-                try p.errAtCur(.unterminated_comment);
+                try p.errAtCurEnd(.unterminated_comment);
                 const tok = try p.bump();
                 return p.addNode(.{ .tag = .error_node, .main_token = tok, .data = .{ .lhs = 0, .rhs = 0 } });
             },
-            .unknown => {
-                try p.errAtCur(.unexpected_character);
+            .unknown, .hash_bang, .binary_content => {
+                try p.errAtJunkToken();
                 const tok = try p.bump();
                 return p.addNode(.{ .tag = .error_node, .main_token = tok, .data = .{ .lhs = 0, .rhs = 0 } });
             },
@@ -1155,8 +1308,53 @@ const Parser = struct {
 
     fn parseExpressionStatement(p: *Parser) PE!Node {
         const expr = try p.parseExpression(.{});
-        try p.expectSemicolon();
+        try p.expectSemicolonAfterExpression(expr);
         return p.addNode(.{ .tag = .expr_stmt, .main_token = p.nodes.items(.main_token)[expr], .data = .{ .lhs = expr, .rhs = 0 } });
+    }
+
+    /// `expectSemicolon` for an EXPRESSION STATEMENT, which tsc words
+    /// differently: `parseErrorForMissingSemicolonAfter` blames the expression
+    /// rather than the token after it when the whole expression is a bare
+    /// identifier, because `foo bar` is much more likely a misspelled keyword
+    /// than a forgotten semicolon. Measured against tsgo: `zzz qqq;` answers
+    /// TS1434 over `zzz`, while `"a" b;` and `f() g;` answer TS1005 at the
+    /// second token. `declare` is silent (a `declare` that failed to parse has
+    /// already reported), and a token the scanner already complained about is
+    /// left to that complaint.
+    ///
+    /// tsc additionally offers a spelling suggestion (TS1435) when the word is
+    /// close to a keyword; ztsc reports the plain TS1434 there, which is the
+    /// same one-wrong-key cost as the TS1005 it replaces.
+    fn expectSemicolonAfterExpression(p: *Parser, expr: Node) PE!void {
+        switch (p.curTag()) {
+            .semicolon => _ = try p.bump(),
+            .r_brace, .eof => {},
+            else => {
+                if (p.nlBefore()) return;
+                if (p.spec > 0) return error.Backtrack;
+                if (expr != null_node and p.nodes.items(.tag)[expr] == .identifier and
+                    p.curTag() != .unknown and p.curTag() != .binary_content)
+                {
+                    const tok = p.nodes.items(.main_token)[expr];
+                    const at = p.tok_starts.items[tok] & scanner.Tokens.start_mask;
+                    // Only when the word's own position is still free. If a
+                    // diagnostic already sits there, the one-per-position rule
+                    // would drop the TS1434 and this statement would go
+                    // unreported — while tsc, which reached that state through a
+                    // different recovery (a missing `,` in a declarator list, an
+                    // `import X` it turns into `import X =`), still answers at
+                    // the NEXT token. Keeping ztsc's "';' expected" there is the
+                    // closer answer of the two.
+                    if (p.last_syntactic_start != at) {
+                        if (p.tokTagAt(tok) != .keyword_declare) {
+                            try p.errAtToken(.unexpected_keyword_or_identifier, tok);
+                        }
+                        return;
+                    }
+                }
+                try p.errAtCur(.expected_semicolon);
+            },
+        }
     }
 
     /// ASI: `;` is consumed; `}`, EOF, or a preceding line break also
@@ -1364,6 +1562,11 @@ const Parser = struct {
                 .keyword_case, .keyword_default, .r_brace, .eof => break,
                 else => {},
             }
+            if (!p.atStartOfStatement()) {
+                try p.errNotAStatement(.expected_statement);
+                _ = try p.bump();
+                continue;
+            }
             const before = p.curIdx();
             try p.pushScratch(try p.parseStatement());
             if (p.curIdx() == before) {
@@ -1461,6 +1664,7 @@ const Parser = struct {
         if (isIdentLike(p.curTag())) {
             try p.checkStrictReserved();
             name_tok = try p.bump();
+            try p.checkEvalOrArguments(name_tok);
         } else if (!anon_ok) {
             try p.fail(.expected_identifier);
         }
@@ -1617,18 +1821,37 @@ const Parser = struct {
     }
 
     fn parseParams(p: *Parser) PE!ast.SubRange {
-        _ = try p.expect(.l_paren, .expected_l_paren);
+        // tsc's `parseParameterList` returns a MISSING list the moment the `(`
+        // is not there — it neither reads parameters nor goes on to expect a
+        // `)`. Reading the list anyway made `function =>` answer with a second
+        // "')' expected" at end of file that tsc never has.
+        if (p.curTag() != .l_paren) {
+            try p.fail(.expected_l_paren);
+            return .{ .start = 0, .end = 0 };
+        }
+        _ = try p.bump();
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
         while (p.curTag() != .r_paren and p.curTag() != .eof) {
             const before = p.curIdx();
             const param = try p.parseParam();
+            if (p.curIdx() == before) {
+                // tsc's `abortParsingListOrMoveToNextToken`: a token that starts
+                // no parameter is reported (already done, inside `parseParam`)
+                // and SKIPPED, and the list keeps going. Ending the list here
+                // instead left the rest of the header to be re-read as
+                // statements, which invented diagnostics tsc never has:
+                // `function* f(a = yield => yield) {}` is one "',' expected"
+                // for tsc, because it skips the `=>` and takes `yield` as a
+                // second parameter, closing the list at the real `)`.
+                if (p.spec > 0) break; // speculating: let the caller decide
+                _ = try p.bump();
+                continue;
+            }
             try p.pushScratch(param);
             if (try p.eat(.comma) == null and p.curTag() != .r_paren) {
                 try p.fail(.expected_comma);
-                if (p.curIdx() == before) break;
             }
-            if (p.curIdx() == before) break; // no progress: bail out
         }
         _ = try p.expect(.r_paren, .expected_r_paren);
         return p.scratchToSpan(top);
@@ -1724,6 +1947,7 @@ const Parser = struct {
                 if (isIdentLike(p.curTag())) {
                     try p.checkStrictReserved();
                     const tok = try p.bump();
+                    try p.checkEvalOrArguments(tok);
                     return p.addNode(.{ .tag = .identifier, .main_token = tok, .data = .{ .lhs = 0, .rhs = 0 } });
                 }
                 try p.fail(.expected_binding);
@@ -1938,6 +2162,18 @@ const Parser = struct {
         // member (the body loop re-enters for the member itself).
         if (p.curTag() == .at) return p.parseDecorator();
 
+        // `static { … }` — a class static initialization block. Parsed as a
+        // plain `.block` member so the statements inside land in the tree with
+        // real spans instead of derailing the member loop (which read `static`
+        // as a FIELD name and then answered "';' expected" at the `{`, the
+        // single largest source of ztsc's excess TS1005). The binder ignores a
+        // `.block` member, so the body is not checked yet — an under-report,
+        // never a wrong answer.
+        if (p.curTag() == .keyword_static and p.peekTag(1) == .l_brace) {
+            _ = try p.bump(); // `static`
+            return p.parseBlock();
+        }
+
         var flags: u32 = 0;
         var access_reported = false;
         while (true) {
@@ -1970,11 +2206,6 @@ const Parser = struct {
             }
             _ = try p.bump();
             flags |= bit;
-            // `static { ... }` initialization block: out of subset.
-            if (bit == ast.Flags.static and p.curTag() == .l_brace) {
-                p.skipBalancedBraces();
-                return p.unsupportedFrom(start_tok);
-            }
         }
 
         if (try p.eat(.asterisk) != null) flags |= ast.Flags.generator;
@@ -2147,6 +2378,15 @@ const Parser = struct {
         return p.lastIdx();
     }
 
+    /// The EXPORT name of `export * as X from "m"` / `export * as "s" from "m"`
+    /// — a ModuleExportName, so a string literal is legal there (ES2022
+    /// arbitrary module namespace identifiers). Only the export side: a LOCAL
+    /// binding (`import { "s" as x }`) still has to be an identifier.
+    fn expectModuleExportName(p: *Parser) PE!u32 {
+        if (p.curTag() == .string_literal) return p.bump();
+        return p.expectIdentLike();
+    }
+
     /// TS1212/TS1213/TS1214, tsc's `checkStrictModeIdentifier`: a future-reserved
     /// word standing where an *Identifier* is required. Call sites are the three
     /// funnels that turn a token into an Identifier — a declaration name
@@ -2174,6 +2414,39 @@ const Parser = struct {
             .strict_reserved_word_in_class
         else
             .strict_reserved_word);
+    }
+
+    /// TS1100/TS1210/TS1215, tsc's `checkStrictModeEvalOrArguments`: `eval` and
+    /// `arguments` may be READ in strict mode but not DECLARED or ASSIGNED to.
+    /// Called from the declaring funnels (binding name, function name) and the
+    /// assignment/update targets — never from a plain reference, which is legal
+    /// (`f(eval)` is fine; measured).
+    ///
+    /// The class/module/plain choice is TS1212's, so the wording is picked the
+    /// same way: a containing class wins outright, and "module" is only settled
+    /// at EOF, so `sealInto` relabels. Ambient contexts are exempt — tsc exempts
+    /// PARAMETERS explicitly (`declare function h(eval: any)` is silent) and
+    /// not variables, but a single rule that never fires in a `.d.ts` can only
+    /// under-report, while the split rule risks inventing keys inside `lib`.
+    fn checkEvalOrArguments(p: *Parser, tok: u32) Error!void {
+        if (p.spec > 0 or p.ambient) return;
+        if (p.tokTagAt(tok) != .identifier) return;
+        const text = p.tokenTextAt(tok);
+        const is_eval = std.mem.eql(u8, text, "eval");
+        if (!is_eval and !std.mem.eql(u8, text, "arguments")) return;
+        const code: Code = if (p.class_depth > 0)
+            (if (is_eval) .eval_in_class else .arguments_in_class)
+        else
+            (if (is_eval) .eval_in_strict else .arguments_in_strict);
+        try p.errAtToken(code, tok);
+    }
+
+    /// `checkEvalOrArguments` on an already-parsed expression, when that
+    /// expression is the TARGET of an assignment or of `++`/`--`.
+    fn checkEvalOrArgumentsTarget(p: *Parser, expr: Node) Error!void {
+        if (expr == null_node) return;
+        if (p.nodes.items(.tag)[expr] != .identifier) return;
+        try p.checkEvalOrArguments(p.nodes.items(.main_token)[expr]);
     }
 
     /// A JSX tag or attribute name: `JsxIdentifier` is an *IdentifierName*, so
@@ -2240,10 +2513,22 @@ const Parser = struct {
     }
 
     fn parseEnumMember(p: *Parser) PE!Node {
-        // Member name: identifier(-like) or string literal.
-        if (!isIdentLike(p.curTag()) and p.curTag() != .string_literal) {
+        // Member name: an enum member name is a PropertyName, so a numeric or
+        // private one PARSES and is then rejected by name (TS2452 / TS18024) —
+        // rejecting it here instead cost a false TS1003 and, with it, the whole
+        // file's semantic pass.
+        const name_code: ?Code = switch (p.curTag()) {
+            .numeric_literal => .enum_member_numeric_name,
+            .private_identifier => .enum_member_private_name,
+            else => null,
+        };
+        if (name_code == null and !isIdentLike(p.curTag()) and p.curTag() != .string_literal) {
             try p.fail(.expected_identifier);
             return p.errorNode();
+        }
+        if (name_code) |code| {
+            if (p.spec > 0) return error.Backtrack;
+            try p.errAtCur(code);
         }
         const name_tok = try p.bump();
         var init: Node = null_node;
@@ -2420,11 +2705,7 @@ const Parser = struct {
         } else if (default_name != 0 or ns_name != 0 or specs.start != specs.end) {
             try p.fail(.expected_from);
         }
-        // Import attributes (`assert { ... }`) — consumed, not modeled.
-        if (p.curTag() == .keyword_assert and p.peekTag(1) == .l_brace) {
-            _ = try p.bump();
-            p.skipBalancedBraces();
-        }
+        try p.skipImportAttributes();
         try p.expectSemicolon();
 
         const extra = try p.addExtra(ast.ImportData{
@@ -2499,6 +2780,21 @@ const Parser = struct {
         return p.scratchToSpan(top);
     }
 
+    /// Import attributes — `with { type: "json" }` (ES2025) or the deprecated
+    /// `assert { ... }` — on an `import`, `export * from` or `export { } from`
+    /// declaration. Consumed, not modeled: the module resolver ztsc has does
+    /// not vary by attribute, and a construct the parser rejects costs a false
+    /// syntax error (which suppresses the file's whole semantic pass). Must be
+    /// on the same line as the module specifier, as in tsc's
+    /// `tryParseImportAttributes`.
+    fn skipImportAttributes(p: *Parser) Error!void {
+        const tag = p.curTag();
+        if (tag != .keyword_with and tag != .keyword_assert) return;
+        if (p.nlBefore() or p.peekTag(1) != .l_brace) return;
+        _ = try p.bump();
+        p.skipBalancedBraces();
+    }
+
     fn parseExportStatement(p: *Parser) PE!Node {
         const kw = try p.bump(); // `export`
         p.saw_module_syntax = true;
@@ -2518,6 +2814,9 @@ const Parser = struct {
                         break :blk e;
                     },
                     .keyword_class => try p.parseClassDecl(0),
+                    // `export default interface I { … }` — legal, and the only
+                    // TYPE-side default export form.
+                    .keyword_interface => try p.parseStatement(),
                     .keyword_abstract => blk: {
                         if (p.peekTag(1) == .keyword_class) {
                             _ = try p.bump();
@@ -2555,9 +2854,10 @@ const Parser = struct {
             .asterisk => {
                 _ = try p.bump();
                 var ns_name: u32 = 0;
-                if (try p.eat(.keyword_as) != null) ns_name = try p.expectIdentLike();
+                if (try p.eat(.keyword_as) != null) ns_name = try p.expectModuleExportName();
                 _ = try p.expect(.keyword_from, .expected_from);
                 const mod = try p.expect(.string_literal, .expected_string_literal);
+                try p.skipImportAttributes();
                 try p.expectSemicolon();
                 const extra = try p.addExtra(ast.ExportAll{ .flags = 0, .name_token = ns_name });
                 return p.addNode(.{ .tag = .export_all, .main_token = kw, .data = .{ .lhs = extra, .rhs = mod } });
@@ -2586,9 +2886,10 @@ const Parser = struct {
                     _ = try p.bump();
                     _ = try p.bump();
                     var ns_name: u32 = 0;
-                    if (try p.eat(.keyword_as) != null) ns_name = try p.expectIdentLike();
+                    if (try p.eat(.keyword_as) != null) ns_name = try p.expectModuleExportName();
                     _ = try p.expect(.keyword_from, .expected_from);
                     const mod = try p.expect(.string_literal, .expected_string_literal);
+                    try p.skipImportAttributes();
                     try p.expectSemicolon();
                     const extra = try p.addExtra(ast.ExportAll{ .flags = ast.Flags.type_only, .name_token = ns_name });
                     return p.addNode(.{ .tag = .export_all, .main_token = kw, .data = .{ .lhs = extra, .rhs = mod } });
@@ -2665,6 +2966,7 @@ const Parser = struct {
         if (try p.eat(.keyword_from) != null) {
             mod = try p.expect(.string_literal, .expected_string_literal);
         }
+        try p.skipImportAttributes();
         try p.expectSemicolon();
         const extra = try p.addExtra(ast.ExportNamed{ .flags = flags, .spec_start = specs.start, .spec_end = specs.end });
         return p.addNode(.{ .tag = .export_named, .main_token = kw, .data = .{ .lhs = extra, .rhs = mod } });
@@ -2776,6 +3078,7 @@ const Parser = struct {
         }
         if (isAssignOp(p.curTag())) {
             const op = try p.bump();
+            try p.checkEvalOrArgumentsTarget(lhs);
             const rhs = try p.parseAssignExpr(ctx);
             return p.addNode(.{ .tag = .assign, .main_token = op, .data = .{ .lhs = lhs, .rhs = rhs } });
         }
@@ -3026,6 +3329,9 @@ const Parser = struct {
             .bang, .tilde, .plus, .minus, .plus_plus, .minus_minus, .keyword_typeof, .keyword_void, .keyword_delete => {
                 const op = try p.bump();
                 const operand = try p.parseSimpleUnaryExpr(ctx);
+                // `++eval` / `--arguments` assign to their operand.
+                const tag = p.tokTagAt(op);
+                if (tag == .plus_plus or tag == .minus_minus) try p.checkEvalOrArgumentsTarget(operand);
                 return p.addNode(.{ .tag = .prefix_unary, .main_token = op, .data = .{ .lhs = operand, .rhs = 0 } });
             },
             .keyword_await => {
@@ -3063,6 +3369,7 @@ const Parser = struct {
         const lhs = try p.parseLhsExpression(ctx);
         if ((p.curTag() == .plus_plus or p.curTag() == .minus_minus) and !p.nlBefore()) {
             const op = try p.bump();
+            try p.checkEvalOrArgumentsTarget(lhs); // `eval++` assigns to `eval`
             return p.addNode(.{ .tag = .postfix_unary, .main_token = op, .data = .{ .lhs = lhs, .rhs = 0 } });
         }
         return lhs;
@@ -3455,7 +3762,11 @@ const Parser = struct {
             .string_literal, .jsx_string => return p.leaf(.string_literal),
             .l_brace => {
                 const lb = try p.bump();
-                const expr = try p.parseAssignExpr(.{});
+                // `a={}` — an EMPTY container is legal JSX (tsc's JsxExpression
+                // has an optional expression); the type error it earns is the
+                // checker's, not a syntax error. Same shape as a child `{}`.
+                var expr: Node = null_node;
+                if (p.curTag() != .r_brace) expr = try p.parseAssignExpr(.{});
                 _ = try p.expect(.r_brace, .expected_r_brace);
                 return p.addNode(.{ .tag = .jsx_expr_container, .main_token = lb, .data = .{ .lhs = expr, .rhs = 0 } });
             },
@@ -3490,6 +3801,10 @@ const Parser = struct {
                 .l_brace => {
                     p.jsxResync(tok.start);
                     const lb = try p.bump(); // '{'
+                    // `{...items}` — a spread CHILD, the same `...` the
+                    // attribute list already accepts. The spread is not
+                    // modelled; the expression inside is what gets checked.
+                    _ = try p.eat(.dot_dot_dot);
                     var expr: Node = null_node;
                     if (p.curTag() != .r_brace) expr = try p.parseAssignExpr(.{});
                     _ = try p.expect(.r_brace, .expected_r_brace);
@@ -3525,7 +3840,7 @@ const Parser = struct {
             .bigint_literal => return p.leaf(.bigint_literal),
             .string_literal => return p.leaf(.string_literal),
             .unterminated_string_literal => {
-                try p.errAtCur(.unterminated_string);
+                try p.errAtCurEnd(.unterminated_string);
                 return p.leaf(.string_literal);
             },
             .regexp_literal => return p.leaf(.regex_literal),
@@ -3542,7 +3857,7 @@ const Parser = struct {
             },
             .no_substitution_template_literal, .template_head => return p.parseTemplateExpr(),
             .unterminated_template => {
-                try p.errAtCur(.unterminated_template);
+                try p.errAtCurEnd(.unterminated_template);
                 return p.leaf(.template_literal);
             },
             .keyword_true => return p.leaf(.true_literal),
@@ -3574,13 +3889,15 @@ const Parser = struct {
                 // an identifier-shaped leaf either way.
                 return p.leaf(.identifier);
             },
-            .unknown => {
-                try p.fail(.unexpected_character);
+            .unknown, .hash_bang, .binary_content => {
+                if (p.spec > 0) return error.Backtrack;
+                try p.errAtJunkToken();
                 _ = try p.bump();
                 return p.errorNode();
             },
             .unterminated_comment => {
-                try p.fail(.unterminated_comment);
+                if (p.spec > 0) return error.Backtrack;
+                try p.errAtCurEnd(.unterminated_comment);
                 _ = try p.bump();
                 return p.errorNode();
             },
@@ -3626,7 +3943,7 @@ const Parser = struct {
                     break;
                 },
                 .unterminated_template => {
-                    try p.errAtCur(.unterminated_template);
+                    try p.errAtCurEnd(.unterminated_template);
                     _ = try p.bump();
                     break;
                 },
@@ -4033,8 +4350,9 @@ const Parser = struct {
             },
             .template_head, .no_substitution_template_literal => return p.parseTemplateLiteralType(),
             .keyword_import => return p.parseImportType(),
-            .unknown => {
-                try p.fail(.unexpected_character);
+            .unknown, .hash_bang, .binary_content => {
+                if (p.spec > 0) return error.Backtrack;
+                try p.errAtJunkToken();
                 _ = try p.bump();
                 return p.errorNode();
             },
@@ -4236,7 +4554,7 @@ const Parser = struct {
                     break;
                 },
                 .unterminated_template => {
-                    try p.errAtCur(.unterminated_template);
+                    try p.errAtCurEnd(.unterminated_template);
                     _ = try p.bump();
                     break;
                 },
@@ -4441,7 +4759,12 @@ const Parser = struct {
         _ = try p.expect(.r_bracket, .expected_r_bracket);
         _ = try p.expect(.colon, .expected_colon);
         const value_type = try p.parseType();
-        try p.expectSemicolon();
+        // A type-literal member list separates with `;` OR `,`
+        // (`{ [k: string]: E, [k: number]: E }` is legal and common); the
+        // member loop eats the separator, so a `,` here is not a missing
+        // semicolon. Without this, that shape reported a false TS1005 — and a
+        // false parse error suppresses the whole file's semantic pass.
+        if (p.curTag() != .comma) try p.expectSemicolon();
         const extra = try p.addExtra(ast.IndexSig{ .name_token = name_tok, .key_type = key_type, .value_type = value_type });
         return p.addNode(.{ .tag = .index_signature, .main_token = lb, .data = .{ .lhs = extra, .rhs = flags } });
     }
@@ -5483,8 +5806,18 @@ test "type predicates parse cleanly" {
 }
 
 test "unsupported: class oddities" {
-    try expectDiagCount("class A { static { init(); } }", 1);
     try expectDiagCount("class B { [computeKey()]() {} }", 1); // computed member name (non-symbol)
+}
+
+test "class static initialization block parses as a member block" {
+    // The statements land in the tree with real spans (the body is not checked
+    // yet — see `parseClassMember`). What must NOT happen is the old reading of
+    // `static` as a FIELD name, which answered "';' expected" at the `{`.
+    try expectDiagCount("class A { static { init(); } }", 0);
+    try expectDiagCount("class A { static { const a = 1; a; } x = 2; }", 0);
+    try expectSExpr("class A { static { f(); } }",
+        \\(class_decl A (block (expr_stmt (call_expr (identifier f)))))
+    );
 }
 
 test "new.target is a meta-property expression" {

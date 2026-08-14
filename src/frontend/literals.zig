@@ -66,6 +66,36 @@ pub fn checkNumeric(text: []const u8, start: u32) ?Finding {
     }
 }
 
+/// TS1351, tsc's `checkForIdentifierStartAfterNumericLiteral`: an identifier or
+/// keyword directly abutting a numeric literal (`3a`, `123abc`, `3in[x]`). No
+/// valid program has one, so an identifier-start byte at `at` — the offset just
+/// past the literal — is always this error; the span covers the whole
+/// identifier run, and tsc then rescans that run as its own token, which is
+/// what ztsc's scanner already does.
+///
+/// A run of exactly `n` is the BigInt suffix, which tsc words as one of two
+/// other diagnostics (`A_bigint_literal_must_be_an_integer` /
+/// `_cannot_use_exponential_notation`). ztsc's scanner consumes a well-formed
+/// suffix into the token, so the only way to get here with `n` is one of those
+/// two cases, and reporting TS1351 for them would be a wrong code: skipped.
+pub fn identifierAfterNumeric(src: []const u8, at: u32) ?Finding {
+    if (at >= src.len) return null;
+    const c = src[at];
+    if (!(isIdentStart(c) or c >= 0x80)) return null;
+    var end: u32 = at;
+    while (end < src.len and (isIdentPart(src[end]) or src[end] >= 0x80)) end += 1;
+    if (end == at + 1 and (c == 'n' or c == 'N')) return null;
+    return .{ .code = .identifier_after_numeric_literal, .span = .{ .start = at, .end = end } };
+}
+
+fn isIdentStart(c: u8) bool {
+    return ((c | 0x20) >= 'a' and (c | 0x20) <= 'z') or c == '_' or c == '$';
+}
+
+fn isIdentPart(c: u8) bool {
+    return isIdentStart(c) or (c >= '0' and c <= '9');
+}
+
 /// Walks a string literal's escape sequences, yielding tsc's scanner errors.
 ///
 /// Only the escapes tsc validates are checked — a `\p` or `\n` is a perfectly

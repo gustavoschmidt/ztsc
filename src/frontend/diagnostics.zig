@@ -18,6 +18,11 @@ pub const Code = enum(u16) {
     unterminated_regexp,
     unterminated_comment,
     unexpected_character,
+    /// TS18026: `#!` anywhere but the first line of the file.
+    shebang_not_at_start,
+    /// TS1490: the file holds a byte sequence that is not text at all. tsc
+    /// reports it once, at the start of the file, and stops scanning there.
+    file_appears_binary,
 
     // --- literal grammar (src/frontend/literals.zig) -----------------------
     /// TS1121: `010` — a legacy octal literal.
@@ -38,6 +43,8 @@ pub const Code = enum(u16) {
     unicode_escape_out_of_range,
     /// TS1199: `"\u{12"` — no closing brace.
     unterminated_unicode_escape,
+    /// TS1351: `3a` — an identifier or keyword abutting a numeric literal.
+    identifier_after_numeric_literal,
 
     // --- parse errors ------------------------------------------------------
     expected_expression,
@@ -70,9 +77,25 @@ pub const Code = enum(u16) {
     expected_case_or_default,
     expected_catch_or_finally,
     expected_declaration,
+    /// TS1128: the token starts no statement AND no declaration, in a
+    /// statement list. tsc's `parsingContextErrors(SourceElements)` /
+    /// `(BlockStatements)`.
+    expected_declaration_or_statement,
+    /// TS1129: the same, in the statement list of a `case`/`default` clause —
+    /// tsc's `parsingContextErrors(SwitchClauseStatements)`.
+    expected_statement,
+    /// TS1005 with `export` as the token: tsc's answer for a top-level
+    /// `default`, which is only ever `export default`.
+    expected_export,
     expected_eq,
     expected_of_or_in,
     unexpected_token,
+    /// TS1434: a missing `;` after an expression statement that is nothing but
+    /// a bare identifier — tsc's `parseErrorForMissingSemicolonAfter` blames
+    /// the WORD (over its whole span) instead of answering "';' expected" at
+    /// the token after it, on the theory that `foo bar` is a misspelled keyword
+    /// rather than a forgotten semicolon.
+    unexpected_keyword_or_identifier,
     /// `a ?? b || c` without parentheses (TS(5076)-style grammar error).
     nullish_mixed_with_logical,
     /// Tagged template in an optional chain: `a?.b`c`` is a syntax error.
@@ -161,6 +184,13 @@ pub const Code = enum(u16) {
     /// TS1028: a second accessibility modifier on one member or parameter
     /// (`public private x`), reported on the second one.
     accessibility_modifier_already_seen,
+    /// TS2452: `enum E { 1, 2 }` — a numeric literal as an enum member name.
+    /// The grammar ACCEPTS it (it is a PropertyName), so this is a check on a
+    /// parsed member, not a parse failure; rejecting it in the parser instead
+    /// cost a false TS1003 plus the file's whole semantic pass.
+    enum_member_numeric_name,
+    /// TS18024: `enum E { #x }` — a private identifier as an enum member name.
+    enum_member_private_name,
 
     // --- strict-mode reserved words (tsc's binder, `checkStrictModeIdentifier`)
     /// TS1212: a future-reserved word (`yield`, `let`, `static`, `public`,
@@ -174,6 +204,21 @@ pub const Code = enum(u16) {
     /// TS1214: the same, in a file that is an external module — likewise strict
     /// for a reason the reader may not have chosen.
     strict_reserved_word_in_module,
+
+    // --- `eval`/`arguments` as a declared name (tsc's `checkStrictModeEvalOrArguments`)
+    /// TS1100/TS1210/TS1215: `eval` or `arguments` DECLARED — a variable, a
+    /// binding element, a parameter, a function name, a catch parameter — or
+    /// ASSIGNED to (`eval = 1`, `eval++`). A plain read is fine, which is why
+    /// this is a different funnel from `strict_reserved_word`. The three codes
+    /// are the same condition worded for its reason: plain strict mode, a class
+    /// body, or an external module (chosen exactly as TS1212/1213/1214 are).
+    /// Two words × three reasons, spelled out so every message is tsc's own.
+    eval_in_strict,
+    arguments_in_strict,
+    eval_in_class,
+    arguments_in_class,
+    eval_in_module,
+    arguments_in_module,
 
     // --- subset boundary (explicit, never a wrong answer) ------------------------
     unsupported_syntax,
@@ -247,9 +292,18 @@ pub const Code = enum(u16) {
             .statement_not_allowed_in_ambient,
             .implementation_not_allowed_in_ambient,
             .accessibility_modifier_already_seen,
+            .enum_member_numeric_name,
+            .enum_member_private_name,
             .strict_reserved_word,
             .strict_reserved_word_in_class,
             .strict_reserved_word_in_module,
+            // Same pass as the TS1212 family: tsc's binder, so semantic.
+            .eval_in_strict,
+            .arguments_in_strict,
+            .eval_in_class,
+            .arguments_in_class,
+            .eval_in_module,
+            .arguments_in_module,
             => .grammar,
 
             else => .syntactic,
@@ -267,6 +321,8 @@ pub const Code = enum(u16) {
             .unterminated_regexp => "Unterminated regular expression literal.",
             .unterminated_comment => "'*/' expected.",
             .unexpected_character => "Invalid character.",
+            .shebang_not_at_start => "'#!' can only be used at the start of a file.",
+            .file_appears_binary => "File appears to be binary.",
             // tsc appends the corrected spelling (`Use the syntax '0o10'.`) to
             // the first two; a Diagnostic here is a code plus a span with no
             // room to interpolate, so the invariant half of the sentence is what
@@ -280,6 +336,7 @@ pub const Code = enum(u16) {
             .octal_digit_expected => "Octal digit expected.",
             .unicode_escape_out_of_range => "An extended Unicode escape value must be between 0x0 and 0x10FFFF inclusive.",
             .unterminated_unicode_escape => "Unterminated Unicode escape sequence.",
+            .identifier_after_numeric_literal => "An identifier or keyword cannot immediately follow a numeric literal.",
             .expected_expression => "Expression expected.",
             .expected_identifier => "Identifier expected.",
             .expected_semicolon => "';' expected.",
@@ -307,9 +364,13 @@ pub const Code = enum(u16) {
             .expected_case_or_default => "'case' or 'default' expected.",
             .expected_catch_or_finally => "'catch' or 'finally' expected.",
             .expected_declaration => "Declaration expected.",
+            .expected_declaration_or_statement => "Declaration or statement expected.",
+            .expected_statement => "Statement expected.",
+            .expected_export => "'export' expected.",
             .expected_eq => "'=' expected.",
             .expected_of_or_in => "expected 'of' or 'in'",
             .unexpected_token => "unexpected token",
+            .unexpected_keyword_or_identifier => "Unexpected keyword or identifier.",
             .nullish_mixed_with_logical => "'??' and '||' operations cannot be mixed without parentheses.",
             .tagged_template_in_optional_chain => "Tagged template expressions are not permitted in an optional chain.",
             .newline_before_arrow => "Line terminator not permitted before arrow.",
@@ -320,11 +381,19 @@ pub const Code = enum(u16) {
             .statement_not_allowed_in_ambient => "Statements are not allowed in ambient contexts.",
             .implementation_not_allowed_in_ambient => "An implementation cannot be declared in ambient contexts.",
             .accessibility_modifier_already_seen => "Accessibility modifier already seen.",
+            .enum_member_numeric_name => "An enum member cannot have a numeric name.",
+            .enum_member_private_name => "An enum member cannot be named with a private identifier.",
             // tsc names the word (`'yield' is a reserved word...`); a Diagnostic
             // is a code plus a span, so the invariant sentence is reported.
             .strict_reserved_word => "Identifier expected. This is a reserved word in strict mode.",
             .strict_reserved_word_in_class => "Identifier expected. This is a reserved word in strict mode. Class definitions are automatically in strict mode.",
             .strict_reserved_word_in_module => "Identifier expected. This is a reserved word in strict mode. Modules are automatically in strict mode.",
+            .eval_in_strict => evalStrictMessage("eval"),
+            .arguments_in_strict => evalStrictMessage("arguments"),
+            .eval_in_class => evalClassMessage("eval"),
+            .arguments_in_class => evalClassMessage("arguments"),
+            .eval_in_module => evalModuleMessage("eval"),
+            .arguments_in_module => evalModuleMessage("arguments"),
             .decorator_not_valid_here => "Decorators are not valid here.",
             .in_modifier_not_valid_here => "'in' modifier can only appear on a type parameter of a class, interface or type alias",
             .out_modifier_not_valid_here => "'out' modifier can only appear on a type parameter of a class, interface or type alias",
@@ -384,7 +453,11 @@ pub const Code = enum(u16) {
             .expected_from,
             .expected_while,
             .expected_eq,
+            .expected_export,
             => 1005,
+            .expected_declaration_or_statement => 1128,
+            .unexpected_keyword_or_identifier => 1434,
+            .expected_statement => 1129,
             .expected_expression => 1109,
             .expected_identifier => 1003,
             .expected_type => 1110,
@@ -403,6 +476,8 @@ pub const Code = enum(u16) {
             .unterminated_regexp => 1161,
             .unterminated_comment => 1010,
             .unexpected_character => 1127,
+            .shebang_not_at_start => 18026,
+            .file_appears_binary => 1490,
             .octal_literal_not_allowed => 1121,
             .decimal_with_leading_zero => 1489,
             .octal_escape_not_allowed => 1487,
@@ -411,6 +486,7 @@ pub const Code = enum(u16) {
             .binary_digit_expected => 1177,
             .octal_digit_expected => 1178,
             .unicode_escape_out_of_range => 1198,
+            .identifier_after_numeric_literal => 1351,
             .unterminated_unicode_escape => 1199,
             .nullish_mixed_with_logical => 5076,
             .tagged_template_in_optional_chain => 1358,
@@ -420,9 +496,14 @@ pub const Code = enum(u16) {
             .statement_not_allowed_in_ambient => 1036,
             .implementation_not_allowed_in_ambient => 1183,
             .accessibility_modifier_already_seen => 1028,
+            .enum_member_numeric_name => 2452,
+            .enum_member_private_name => 18024,
             .strict_reserved_word => 1212,
             .strict_reserved_word_in_class => 1213,
             .strict_reserved_word_in_module => 1214,
+            .eval_in_strict, .arguments_in_strict => 1100,
+            .eval_in_class, .arguments_in_class => 1210,
+            .eval_in_module, .arguments_in_module => 1215,
 
             .duplicate_identifier => 2300,
             .block_scoped_redeclare => 2451,
@@ -455,6 +536,20 @@ pub const Code = enum(u16) {
 /// TS17006's text differs between operators only in the quoted operator, so
 /// the nine `exp_lhs_*` arms share one comptime template instead of nine
 /// hand-copied sentences that would drift.
+/// The three `checkStrictModeEvalOrArguments` sentences, parameterized on the
+/// word so that `eval` and `arguments` share one copy of each.
+fn evalStrictMessage(comptime word: []const u8) []const u8 {
+    return "Invalid use of '" ++ word ++ "' in strict mode.";
+}
+
+fn evalClassMessage(comptime word: []const u8) []const u8 {
+    return "Code contained in a class is evaluated in JavaScript's strict mode which does not allow this use of '" ++ word ++ "'. For more information, see https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Strict_mode.";
+}
+
+fn evalModuleMessage(comptime word: []const u8) []const u8 {
+    return "Invalid use of '" ++ word ++ "'. Modules are automatically in strict mode.";
+}
+
 fn expLhsMessage(comptime op: []const u8) []const u8 {
     return "An unary expression with the '" ++ op ++ "' operator is not allowed in the left-hand side of an exponentiation expression. Consider enclosing the expression in parentheses.";
 }
