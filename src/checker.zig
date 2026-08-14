@@ -3622,6 +3622,7 @@ pub const Checker = struct {
     pub const isSourceObjecty = assign_zig.isSourceObjecty;
     pub const excessPropertyCheck = assign_zig.excessPropertyCheck;
     pub const excessPropertyScan = assign_zig.excessPropertyScan;
+    pub const excessPropertyFailure = assign_zig.excessPropertyFailure;
     pub const freshLiteralRejects = assign_zig.freshLiteralRejects;
     pub const targetIsEmptyish = assign_zig.targetIsEmptyish;
     pub const intersectionExcessCheckable = assign_zig.intersectionExcessCheckable;

@@ -4701,6 +4701,7 @@ pub const stringLiteralSuggestion = report_zig.stringLiteralSuggestion;
 pub const isSourceObjecty = report_zig.isSourceObjecty;
 pub const excessPropertyCheck = report_zig.excessPropertyCheck;
 pub const excessPropertyScan = report_zig.excessPropertyScan;
+pub const excessPropertyFailure = report_zig.excessPropertyFailure;
 pub const freshLiteralRejects = report_zig.freshLiteralRejects;
 pub const intersectionExcessCheckable = report_zig.intersectionExcessCheckable;
 pub const targetIsEmptyish = report_zig.targetIsEmptyish;
