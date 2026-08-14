@@ -1643,7 +1643,15 @@ fn resolvePackageLegacy(
         defer alloc.free(idx);
         if (try resolveStemOrJs(f, alloc, idx, allow_js)) |p| return p;
     }
-    return null;
+    // The package name may be a FILE, not a directory: `node_modules/foo.d.ts`
+    // answers `import … from "foo"` (`cachedModuleResolution1`). tsc's
+    // `loadModuleFromSpecificNodeModulesDirectory` runs `loadModuleFromFile` on
+    // the candidate BEFORE `loadNodeModuleFromDirectoryWorker`; probing it last
+    // instead keeps the precedence of every specifier that already resolves —
+    // this leg only ever converts a "module not found" into a resolution, since a
+    // directory and a same-named declaration file beside it is a shape no real
+    // package ships.
+    return resolveStemFs(f, alloc, nm);
 }
 
 /// The file half of `resolveStem`: the extension-substitution candidates for

@@ -8,6 +8,7 @@ const scanner = @import("../frontend/scanner.zig");
 const intern = @import("../intern.zig");
 const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
+const numeric_lit = @import("../numeric_lit.zig");
 const modules = @import("../link/modules.zig");
 
 const Node = ast.Node;
@@ -41,7 +42,8 @@ const indexableConstituent = @import("typenode.zig").indexableConstituent;
 const init = Checker.init;
 const instantiate = @import("enums.zig").instantiate;
 const isNonPrimitiveKind = @import("assign.zig").isNonPrimitiveKind;
-const propOfType = @import("props.zig").propOfType;
+const props_zig = @import("props.zig");
+const propOfType = props_zig.propOfType;
 const pushChainGuards = @import("flow.zig").pushChainGuards;
 const reduceSubtypes = @import("typenode.zig").reduceSubtypes;
 const resolveStructural = @import("instantiate.zig").resolveStructural;
@@ -2543,6 +2545,10 @@ fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex) Erro
         .union_type => {
             var parts: std.ArrayList(TypeId) = .empty;
             defer parts.deinit(c.scratch());
+            // The constituents' own answers, kept so the ACCESSIBILITY rule can
+            // judge the set as a whole — see `props.unionPropertyDropped`.
+            var found: std.ArrayList(types.Prop) = .empty;
+            defer found.deinit(c.scratch());
             for (try c.memberList(t)) |m| {
                 const rm = try c.resolveStructural(m);
                 if (c.ts.kind(rm) == .any or c.ts.kind(rm) == .err) {
@@ -2555,9 +2561,16 @@ fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex) Erro
                     });
                     return types.error_type;
                 };
+                try found.append(c.scratch(), p);
                 var pt = try c.substThis(p.ty, m);
                 if (p.optional()) pt = try c.makeUnion2(pt, types.undefined_type);
                 try parts.append(c.scratch(), pt);
+            }
+            if (props_zig.unionPropertyDropped(found.items)) {
+                try c.diagFmt(2339, c.tokSpan(name_tok), "Property '{s}' does not exist on type '{s}'.", .{
+                    c.atomText(name), try c.typeToString(t),
+                });
+                return types.error_type;
             }
             return c.ts.makeUnion(c.scratch(), parts.items);
         },
@@ -4359,27 +4372,5 @@ pub fn templateAtom(c: *Checker, tok: TokenIndex) Error!Atom {
 }
 
 pub fn numberTokenValue(c: *const Checker, tok: TokenIndex) f64 {
-    const raw = c.tokenText(tok);
-    var buf: [64]u8 = undefined;
-    var n: usize = 0;
-    for (raw) |ch| {
-        if (ch == '_') continue;
-        if (n >= buf.len) break;
-        buf[n] = ch;
-        n += 1;
-    }
-    const text = buf[0..n];
-    if (text.len > 2 and text[0] == '0') {
-        const radix: ?u8 = switch (text[1]) {
-            'x', 'X' => 16,
-            'o', 'O' => 8,
-            'b', 'B' => 2,
-            else => null,
-        };
-        if (radix) |r| {
-            const v = std.fmt.parseInt(u64, text[2..], r) catch return 0;
-            return @floatFromInt(v);
-        }
-    }
-    return std.fmt.parseFloat(f64, text) catch 0;
+    return numeric_lit.value(c.tokenText(tok));
 }

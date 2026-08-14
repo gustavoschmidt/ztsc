@@ -69,6 +69,7 @@ const Io = std.Io;
 const ast = @import("ast.zig");
 const scanner = @import("scanner.zig");
 const intern = @import("../intern.zig");
+const numeric_lit = @import("../numeric_lit.zig");
 const diagnostics = @import("diagnostics.zig");
 const source = @import("source.zig");
 
@@ -289,6 +290,11 @@ const Ctx = struct {
 
 const CondFlows = struct { t: FlowId, f: FlowId };
 
+/// The first `export = <entity>` of one container: where to point the duplicate
+/// diagnostic, and whether it has already been pointed at (a THIRD export
+/// assignment must not name the first one twice).
+const ExportEqNote = struct { tok: TokenIndex, reported: bool = false };
+
 /// One `?.` of an optional chain being bound: the flow the short-circuit test
 /// is made in, the expression tested (the link's receiver), and the flow the
 /// chain continues in when it did *not* short-circuit.
@@ -347,6 +353,14 @@ const Binder = struct {
     /// Expando-function symbol -> the scope its `fn.prop = …` properties are
     /// declared in (created on the first such assignment).
     expando_scopes: std.AutoHashMapUnmanaged(SymbolId, ScopeId) = .empty,
+    /// Export-assignment container -> the first `export = <entity>` seen in it.
+    /// tsc's binder declares `export=` as an ALIAS in the container's export
+    /// table, where a second one is an ordinary duplicate (`AliasExcludes`
+    /// covers `Alias`) reported at every declaration; ztsc keeps export
+    /// assignments out of the symbol table (the linker reads the records
+    /// directly), so this two-field note stands in for that table entry. See
+    /// `bindExportAssign`. Scratch-only bookkeeping, never sealed.
+    export_eq_first: std.AutoHashMapUnmanaged(ScopeId, ExportEqNote) = .empty,
 
     // flow under construction
     flow_tags: std.ArrayList(FlowTag) = .empty,
@@ -477,11 +491,25 @@ const Binder = struct {
     /// escapes are decoded (`o.a` is `o.a`); a STRING key's are not —
     /// string escapes are a different grammar, and `memberAtom`'s job is the
     /// syntactic key.
+    ///
+    /// A NUMERIC key is keyed by the string JavaScript names it by, not by how
+    /// it was spelled: `{ 0: x }`, `{ 0.0: x }` and `{ "0": x }` all declare the
+    /// member `0`, and `{ 0b11010: x }` declares `26`. Mirrors the checker's
+    /// `memberAtom`, which must agree key for key.
     fn memberAtom(b: *Binder, tok: TokenIndex) Error!Atom {
         const text = b.tokenText(tok);
         switch (b.tree.tokens.tag(tok)) {
             // `.jsx_string` is a JSX attribute's quoted value.
             .string_literal, .jsx_string => return b.atomOf(stripQuotes(text)),
+            .numeric_literal => {
+                var buf: [numeric_lit.max_name]u8 = undefined;
+                // Stack buffer: `atomOf` copies into the interner, but the
+                // per-file `atom_cache` would keep the slice as a key, so probe
+                // it and dupe on a miss (the same dance as `atomOfIdent`).
+                const canon = numeric_lit.name(&buf, text);
+                if (b.atom_cache.get(canon)) |a| return a;
+                return b.atomOf(try b.scratch.dupe(u8, canon));
+            },
             else => return b.atomOfIdent(text),
         }
     }
@@ -685,6 +713,25 @@ const Binder = struct {
     fn mergesAcrossBlocks(b: *Binder, scope: ScopeId, sym: SymbolId) bool {
         switch (b.scope_kinds.items[scope]) {
             .class_members, .class_statics, .interface_members => {},
+            // Two blocks of one namespace share ztsc's body scope, but tsc gives
+            // each `ModuleDeclaration` its own `locals` and merges only the
+            // EXPORTED members (into the namespace symbol's `exports`). So two
+            // NON-EXPORTED locals of the same name in different blocks are two
+            // unrelated symbols to tsc and no duplicate at all:
+            //
+            //     namespace F { class Helper {} }
+            //     namespace F { class Helper {} }   // legal
+            //
+            // (`duplicateAnonymousModuleClasses`). It takes BOTH sides in the
+            // shared `exports` table to clash, so a non-exported block-local
+            // beside an `export`ed one is legal too (`moduleMerge`) — while every
+            // member of a `declare namespace` is implicitly exported
+            // (`exporting_node` is pinned to the block) and still reported.
+            .namespace => {
+                const new_exported = b.exporting_node != 0;
+                const old_exported = b.sym_flags.items[sym].exported;
+                if (new_exported and old_exported) return false;
+            },
             else => return false,
         }
         return b.sym_block.items[sym] != b.cur_block;
@@ -1912,6 +1959,11 @@ const Binder = struct {
         }
 
         const saved = b.saveState();
+        // Which BLOCK of the namespace this is, so a name declared in two blocks
+        // can be told from one declared twice in one (`mergesAcrossBlocks`).
+        const saved_block = b.cur_block;
+        b.cur_block = node;
+        defer b.cur_block = saved_block;
         // In an ambient namespace (`declare namespace`, or one nested inside
         // an ambient namespace) every member is implicitly exported: bind the
         // body with `exporting_node` pinned to the namespace so each member's
@@ -2262,10 +2314,29 @@ const Binder = struct {
     fn bindExportAssign(b: *Binder, node: Node) Error!void {
         const entity = b.tree.nodeData(node).lhs;
         var local: Atom = 0;
+        var name_tok: TokenIndex = 0;
         if (entity != 0) {
             try b.bindExpr(entity);
             if (b.nodeTag(entity) == .identifier) {
-                local = try b.atomOfToken(b.tree.nodeMainToken(entity));
+                name_tok = b.tree.nodeMainToken(entity);
+                local = try b.atomOfToken(name_tok);
+            }
+        }
+        // A container may have only ONE export assignment: tsc reports TS2300
+        // ("Duplicate identifier 'export='") at the ENTITY of every one of them
+        // when there are two or more (`duplicateExportAssignments`). Only the
+        // identifier form is named — for any other expression there is no single
+        // token to point at, and an under-report is the safe direction.
+        if (name_tok != 0) {
+            const gop = try b.export_eq_first.getOrPut(b.scratch, b.cur_scope);
+            if (gop.found_existing) {
+                if (!gop.value_ptr.reported) {
+                    try b.diag(.duplicate_identifier, gop.value_ptr.tok);
+                    gop.value_ptr.reported = true;
+                }
+                try b.diag(.duplicate_identifier, name_tok);
+            } else {
+                gop.value_ptr.* = .{ .tok = name_tok };
             }
         }
         try b.export_recs.append(b.scratch, .{
@@ -2387,7 +2458,11 @@ const Binder = struct {
     /// this function's, is narrow on purpose:
     ///
     ///   - a plain (non-compound) `=` in an expression statement,
-    ///   - the target is `<identifier>.<name>` — not computed, not nested,
+    ///   - the target is `<identifier>.<name>`, or `<identifier>["name"]` /
+    ///     `<identifier>[42]` — tsc's `isBindableStaticElementAccessExpression`,
+    ///     whose `isLiteralLikeElementAccess` accepts exactly a string or
+    ///     numeric literal argument. `decl["B"] = 'foo'` declares `B`, and
+    ///     `decl3[77] = 0` declares `77` (`declarationEmitLateBoundAssignments2`).
     ///   - the identifier resolves *in the current scope* (tsc's same-scope
     ///     rule) to a symbol whose declaration is a `function` or a variable
     ///     initialized with a function expression / arrow.
@@ -2396,15 +2471,18 @@ const Binder = struct {
     /// = {}; obj.x = 1` stays the TS2339 tsc reports. Repeated assignments to
     /// one name merge into a single property whose declarations are all the
     /// assignments.
+    ///
+    /// Still open: `decl[k] = 0` for a `const k` of literal type. tsc late-binds
+    /// that one too, but the NAME is the const's type, which no binder can see;
+    /// it needs the computed-key placeholder route (`computedSymPlaceholder`) and
+    /// a rekey on the checker side.
     fn bindExpandoAssignment(b: *Binder, node: Node) Error!void {
         if (b.nodeTag(node) != .assign) return;
         if (b.tree.tokens.tag(b.tree.nodeMainToken(node)) != .eq) return;
         const d = b.tree.nodeData(node);
-        if (b.nodeTag(d.lhs) != .member_expr) return;
+        const name_tok = expandoTargetName(b, d.lhs) orelse return;
         const td = b.tree.nodeData(d.lhs);
         if (b.nodeTag(td.lhs) != .identifier) return;
-        const name_tok = td.rhs;
-        if (name_tok == 0) return;
 
         const obj_atom = try b.atomOfToken(b.tree.nodeMainToken(td.lhs));
         const sym = b.expandoTargetSym(obj_atom) orelse return;
@@ -2418,6 +2496,26 @@ const Binder = struct {
         const atom = try b.memberAtom(name_tok);
         _ = try b.declare(xs, atom, .expando_member, node, name_tok, .{});
         b.sym_flags.items[sym].expando = true;
+    }
+
+    /// The property-name TOKEN an expando assignment target names, or null when
+    /// the target is not one of the two bindable shapes: `obj.name` (the name
+    /// token) and `obj["name"]` / `obj[42]` (the literal's token). A computed key
+    /// that is not a literal — `obj[k]`, `obj[Symbol()]` — has no syntactic name
+    /// and is not one.
+    fn expandoTargetName(b: *Binder, target: Node) ?TokenIndex {
+        const d = b.tree.nodeData(target);
+        switch (b.nodeTag(target)) {
+            .member_expr => return if (d.rhs == 0) null else d.rhs,
+            .index_expr => {
+                if (d.rhs == null_node) return null;
+                return switch (b.nodeTag(d.rhs)) {
+                    .string_literal, .number_literal => b.tree.nodeMainToken(d.rhs),
+                    else => null,
+                };
+            },
+            else => return null,
+        }
     }
 
     /// The function value an expando assignment's target names. tsc's

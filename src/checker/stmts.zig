@@ -1374,6 +1374,9 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
         // A class merged with a same-named `interface` (or reopened in another
         // file) is the same TS2428 check as the interface arm's.
         try c.checkTypeParamListsIdentical(mergedOrSelf(c, class_sym), data.name_token);
+        // …and a class merged with a same-named `namespace` shares ONE export
+        // table with it, where a static and an exported member of one name clash.
+        try c.checkCloduleMemberDups(class_sym);
     }
 
     // Class-position decorators (`@deco class C {}`): evaluated in the

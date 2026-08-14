@@ -20,6 +20,7 @@ pub const ast = @import("frontend/ast.zig");
 pub const parser = @import("frontend/parser.zig");
 pub const binder = @import("frontend/binder.zig");
 pub const types = @import("types.zig");
+pub const numeric_lit = @import("numeric_lit.zig");
 pub const libs = @import("libs.zig");
 pub const paths = @import("link/paths.zig");
 pub const resolve = @import("link/resolve.zig");

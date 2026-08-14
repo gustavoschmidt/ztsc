@@ -317,10 +317,12 @@ pub fn suggestName(c: *Checker, a: Atom, from: ScopeId, want_value: bool) ?Atom 
 }
 
 /// Report a name that resolved to nothing at `tok`, choosing tsc's code the
-/// way `getCannotFindNameDiagnosticForName` does: the five globals `@types/node`
-/// would have declared get the node-flavoured TS2591 (TS2580 when
-/// `compilerOptions.types` holds the `"*"` wildcard, tsc's "no explicit types
-/// list to add 'node' to" phrasing), everything else the generic TS2304.
+/// way `getCannotFindNameDiagnosticForName` does: a name some well-known typings
+/// package would have declared gets that package's flavoured message instead of
+/// the generic TS2304 — the five `@types/node` globals (TS2591/TS2580), `$`
+/// (TS2592/TS2581) and a test runner's `describe`/`suite`/`it`/`test`
+/// (TS2593/TS2582). Each pair differs only by whether `compilerOptions.types`
+/// named an explicit list to add the package to.
 ///
 /// Callers keep ownership of the spelling-suggestion arm (TS2552), which wins
 /// over both — tsc tries `getSuggestedSymbolForNonexistentSymbol` before it
@@ -342,12 +344,31 @@ pub fn primitiveTypeNameUsedAsValue(text: []const u8) bool {
 
 pub fn reportNameNotFound(c: *Checker, tok: ast.TokenIndex) Error!void {
     const text = c.tokenText(tok);
-    if (!paths.isNodeGlobalName(text)) {
-        try c.diagFmt(2304, c.tokSpan(tok), "Cannot find name '{s}'.", .{text});
-    } else if (c.prog.types_wildcard) {
-        try c.diagFmt(2580, c.tokSpan(tok), "Cannot find name '{s}'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node`.", .{text});
+    // `types_wildcard` is "the program named no explicit `types` list", which is
+    // the half of each pair tsc phrases without the "and then add … to the types
+    // field" tail.
+    const no_types_list = c.prog.types_wildcard;
+    if (paths.isNodeGlobalName(text)) {
+        if (no_types_list) {
+            try c.diagFmt(2580, c.tokSpan(tok), "Cannot find name '{s}'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node`.", .{text});
+        } else {
+            try c.diagFmt(2591, c.tokSpan(tok), "Cannot find name '{s}'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node` and then add 'node' to the types field in your tsconfig.", .{text});
+        }
+    } else if (std.mem.eql(u8, text, "$")) {
+        // tsc's arm is the bare `$` alone; `jQuery` gets the generic message.
+        if (no_types_list) {
+            try c.diagFmt(2581, c.tokSpan(tok), "Cannot find name '{s}'. Do you need to install type definitions for jQuery? Try `npm i --save-dev @types/jquery`.", .{text});
+        } else {
+            try c.diagFmt(2592, c.tokSpan(tok), "Cannot find name '{s}'. Do you need to install type definitions for jQuery? Try `npm i --save-dev @types/jquery` and then add 'jquery' to the types field in your tsconfig.", .{text});
+        }
+    } else if (paths.isTestRunnerGlobalName(text)) {
+        if (no_types_list) {
+            try c.diagFmt(2582, c.tokSpan(tok), "Cannot find name '{s}'. Do you need to install type definitions for a test runner? Try `npm i --save-dev @types/jest` or `npm i --save-dev @types/mocha`.", .{text});
+        } else {
+            try c.diagFmt(2593, c.tokSpan(tok), "Cannot find name '{s}'. Do you need to install type definitions for a test runner? Try `npm i --save-dev @types/jest` or `npm i --save-dev @types/mocha` and then add 'jest' or 'mocha' to the types field in your tsconfig.", .{text});
+        }
     } else {
-        try c.diagFmt(2591, c.tokSpan(tok), "Cannot find name '{s}'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node` and then add 'node' to the types field in your tsconfig.", .{text});
+        try c.diagFmt(2304, c.tokSpan(tok), "Cannot find name '{s}'.", .{text});
     }
 }
 

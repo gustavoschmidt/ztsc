@@ -656,28 +656,57 @@ fn reportContributors(
     try global_dup.reportAll(arena, diags, contributors, code);
 }
 
-/// The same-named members contributed by the blocks of one cross-file merged
-/// interface, checked for a member-KIND clash (`global_dup.memberClash`).
+/// One atom-SORTED member segment of a merged container (an interface block's
+/// member table, a `declare module "spec" { … }` block's top level).
+const MemberSeg = struct { file: FileId, atoms: []const Atom, syms: []const u32, at: usize = 0 };
+
+/// Every name declared by 2+ of `segs`, as a k-way merge over the atom-sorted
+/// segments rather than a gather into a map: no allocation proportional to the
+/// member count, and a name declared by a single segment is skipped after two
+/// comparisons. That matters because the lib's big merged interfaces (`Array`,
+/// `Window`) are exactly this shape and the walk runs in the serial linker.
 ///
-/// Each contributor's member table is one atom-SORTED segment, so the names are
-/// walked by a k-way merge over the segments rather than gathered into a map: no
-/// allocation proportional to the member count, and a name declared by a single
-/// block is skipped after two comparisons. That matters because the lib's big
-/// merged interfaces (`Array`, `Window`) are exactly this shape and the walk
-/// runs in the serial linker.
-///
-/// Two blocks in the SAME file share one member table, so this only ever sees
-/// cross-FILE pairs; the binder already decided the within-file ones.
-fn reportMergedMemberDups(
-    arena: Allocator,
+/// `f` receives the name and its contributors' GLOBAL symbol ids, in segment
+/// order. `segs` is consumed (each cursor advances to its end).
+fn eachSharedMember(
     scratch: Allocator,
-    diags: []std.ArrayList(LinkDiag),
+    sym_base: []const u32,
+    segs: []MemberSeg,
+    ctx: anytype,
+    comptime f: fn (@TypeOf(ctx), Atom, []const u32) Error!void,
+) Error!void {
+    if (segs.len < 2) return;
+    const hits = try scratch.alloc(u32, segs.len);
+    while (true) {
+        var min_atom: Atom = 0;
+        var live = false;
+        for (segs) |*s| {
+            if (s.at == s.atoms.len) continue;
+            if (!live or s.atoms[s.at] < min_atom) min_atom = s.atoms[s.at];
+            live = true;
+        }
+        if (!live) return;
+        var k: usize = 0;
+        for (segs) |*s| {
+            if (s.at == s.atoms.len or s.atoms[s.at] != min_atom) continue;
+            hits[k] = sym_base[s.file] + s.syms[s.at];
+            k += 1;
+            s.at += 1;
+        }
+        if (k < 2) continue;
+        try f(ctx, min_atom, hits[0..k]);
+    }
+}
+
+/// The member tables of `parts`, as segments for `eachSharedMember`. A part with
+/// no members (or an empty one) contributes nothing.
+fn memberSegs(
+    scratch: Allocator,
     files: []const ProgFile,
     sym_base: []const u32,
     parts: []const u32,
-) Error!void {
-    const Seg = struct { file: FileId, atoms: []const Atom, syms: []const u32, at: usize = 0 };
-    const segs = try scratch.alloc(Seg, parts.len);
+) Error![]MemberSeg {
+    const segs = try scratch.alloc(MemberSeg, parts.len);
     var n: usize = 0;
     for (parts) |p| {
         const fid = fileOfGlobal(sym_base, files.len, p);
@@ -689,31 +718,133 @@ fn reportMergedMemberDups(
         segs[n] = .{ .file = fid, .atoms = b.member_atoms[lo..hi], .syms = b.member_syms[lo..hi] };
         n += 1;
     }
-    if (n < 2) return;
+    return segs[0..n];
+}
 
-    const hits = try scratch.alloc(u32, n);
-    const hit_flags = try scratch.alloc(binder.SymbolFlags, n);
-    while (true) {
-        var min_atom: Atom = 0;
-        var live = false;
-        for (segs[0..n]) |*s| {
-            if (s.at == s.atoms.len) continue;
-            if (!live or s.atoms[s.at] < min_atom) min_atom = s.atoms[s.at];
-            live = true;
+/// The reporting half of the cross-file member walk: one shared name's
+/// contributors, checked for a member-KIND clash (`global_dup.memberClash`) and
+/// reported at every declaration of every one of them.
+const MemberDupReporter = struct {
+    arena: Allocator,
+    scratch: Allocator,
+    diags: []std.ArrayList(LinkDiag),
+    files: []const ProgFile,
+    sym_base: []const u32,
+
+    fn visit(r: *const MemberDupReporter, _: Atom, hits: []const u32) Error!void {
+        const flags = try r.scratch.alloc(binder.SymbolFlags, hits.len);
+        for (hits, 0..) |h, i| flags[i] = globalSymFlags(r.files, r.sym_base, h);
+        const code = global_dup.memberClash(flags) orelse return;
+        try reportContributors(r.arena, r.scratch, r.diags, r.files, r.sym_base, hits, code);
+    }
+};
+
+/// The same-named members contributed by the blocks of one cross-file merged
+/// interface, checked for a member-KIND clash.
+///
+/// Two blocks in the SAME file share one member table, so this only ever sees
+/// cross-FILE pairs; the binder already decided the within-file ones.
+fn reportMergedMemberDups(
+    arena: Allocator,
+    scratch: Allocator,
+    diags: []std.ArrayList(LinkDiag),
+    files: []const ProgFile,
+    sym_base: []const u32,
+    parts: []const u32,
+) Error!void {
+    const segs = try memberSegs(scratch, files, sym_base, parts);
+    const r: MemberDupReporter = .{
+        .arena = arena,
+        .scratch = scratch,
+        .diags = diags,
+        .files = files,
+        .sym_base = sym_base,
+    };
+    try eachSharedMember(scratch, sym_base, segs, &r, MemberDupReporter.visit);
+}
+
+/// The same treatment for the blocks of one AMBIENT MODULE / module
+/// augmentation: `declare module "someMod" { export interface TopLevel { … } }`
+/// in two files declares ONE interface `TopLevel`, whose member tables tsc
+/// merges exactly as it merges a global interface's — and a member-KIND clash
+/// across them is TS2300 at every declaration
+/// (`duplicateIdentifierRelatedSpans6`/`7`).
+///
+/// The registry that would answer "which blocks share a specifier" is the
+/// linker's, built much later, so the grouping is done here off sealed bind data
+/// alone: specifier atom -> the blocks declaring it, in FileId order. Only a
+/// specifier with 2+ blocks pays anything beyond one hash insert, and only a
+/// name declared by 2+ of those blocks reaches the member walk — so the usual
+/// program (whose every `declare module` names a distinct package) pays one map
+/// build over its ambient blocks and stops.
+///
+/// Deliberately narrower than `mergeClash`: only an interface-vs-interface pair
+/// is judged, matching the `folded.interface` gate on the global side. A block
+/// member that clashes by KIND (`class A` in one block, `function A` in another)
+/// is a different rule and stays an under-report.
+fn reportAmbientMemberDups(
+    arena: Allocator,
+    scratch: Allocator,
+    diags: []std.ArrayList(LinkDiag),
+    files: []const ProgFile,
+    sym_base: []const u32,
+) Error!void {
+    // specifier -> the (file, block scope) pairs declaring it, in FileId order.
+    const Block = struct { file: FileId, scope: u32 };
+    var by_spec: std.AutoArrayHashMapUnmanaged(Atom, std.ArrayListUnmanaged(Block)) = .empty;
+    var any = false;
+    for (files, 0..) |*f, fi| {
+        for (f.bind.ambient_modules) |am| {
+            if (am.spec == 0) continue;
+            const gop = try by_spec.getOrPut(scratch, am.spec);
+            if (!gop.found_existing) gop.value_ptr.* = .empty else any = true;
+            try gop.value_ptr.append(scratch, .{ .file = @intCast(fi), .scope = am.scope });
         }
-        if (!live) return;
-        var k: usize = 0;
-        for (segs[0..n]) |*s| {
-            if (s.at == s.atoms.len or s.atoms[s.at] != min_atom) continue;
-            const local = s.syms[s.at];
-            hits[k] = sym_base[s.file] + local;
-            hit_flags[k] = files[s.file].bind.symbol_flags[local];
-            k += 1;
-            s.at += 1;
+    }
+    if (!any) return;
+
+    const InterfaceGroups = struct {
+        arena: Allocator,
+        scratch: Allocator,
+        diags: []std.ArrayList(LinkDiag),
+        files: []const ProgFile,
+        sym_base: []const u32,
+
+        /// One name declared by several blocks of the same specifier: keep the
+        /// INTERFACE contributors and hand their member tables on.
+        fn visit(g: *const @This(), _: Atom, hits: []const u32) Error!void {
+            const ifaces = try g.scratch.alloc(u32, hits.len);
+            var n: usize = 0;
+            for (hits) |h| {
+                if (!globalSymFlags(g.files, g.sym_base, h).interface) continue;
+                ifaces[n] = h;
+                n += 1;
+            }
+            if (n < 2) return;
+            try reportMergedMemberDups(g.arena, g.scratch, g.diags, g.files, g.sym_base, ifaces[0..n]);
         }
-        if (k < 2) continue;
-        const code = global_dup.memberClash(hit_flags[0..k]) orelse continue;
-        try reportContributors(arena, scratch, diags, files, sym_base, hits[0..k], code);
+    };
+    const groups: InterfaceGroups = .{
+        .arena = arena,
+        .scratch = scratch,
+        .diags = diags,
+        .files = files,
+        .sym_base = sym_base,
+    };
+
+    for (by_spec.values()) |blocks| {
+        if (blocks.items.len < 2) continue;
+        const segs = try scratch.alloc(MemberSeg, blocks.items.len);
+        var n: usize = 0;
+        for (blocks.items) |blk| {
+            const b = files[blk.file].bind;
+            const lo = b.scope_members_start[blk.scope];
+            const hi = b.scope_members_start[blk.scope + 1];
+            if (hi == lo) continue;
+            segs[n] = .{ .file = blk.file, .atoms = b.member_atoms[lo..hi], .syms = b.member_syms[lo..hi] };
+            n += 1;
+        }
+        try eachSharedMember(scratch, sym_base, segs[0..n], &groups, InterfaceGroups.visit);
     }
 }
 
@@ -818,6 +949,11 @@ fn mergeGlobals(
         }
         globals = .{ .atoms = g_atoms, .syms = g_syms };
     }
+
+    // The same member-kind duplicate check for the blocks of one ambient module
+    // (or one module augmentation), which never pass through the global name
+    // merge above: they live in their own block scopes.
+    if (dup_diags) |ds| try reportAmbientMemberDups(arena, scratch, ds, files, sym_base);
 
     // Cross-file module augmentation merge: fold a `declare module
     // "spec" { interface I { … } }` block (in a MODULE-context file) into the

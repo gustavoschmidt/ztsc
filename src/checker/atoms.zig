@@ -33,6 +33,7 @@ const scanner = @import("../frontend/scanner.zig");
 const intern = @import("../intern.zig");
 const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
+const numeric_lit = @import("../numeric_lit.zig");
 const print_zig = @import("print.zig");
 
 const Atom = intern.Atom;
@@ -85,12 +86,18 @@ pub fn atomOfToken(c: *Checker, tok: TokenIndex) Error!Atom {
 }
 
 /// Property-name atom: string keys lose quotes; an identifier key's `\uXXXX`
-/// escapes are decoded (a string key's are not — see `Binder.memberAtom`).
+/// escapes are decoded (a string key's are not — see `Binder.memberAtom`); a
+/// NUMERIC key is canonicalized to the string JavaScript names it by, so `0`,
+/// `0.0` and `"0"` are one member and `0b11010` is `26`.
 pub fn memberAtom(c: *Checker, tok: TokenIndex) Error!Atom {
     const text = c.tokenText(tok);
     switch (c.tree.tokens.tag(tok)) {
         // `.jsx_string` is a JSX attribute's quoted value.
         .string_literal, .jsx_string => return c.atom(stripQuotes(text)),
+        .numeric_literal => {
+            var buf: [numeric_lit.max_name]u8 = undefined;
+            return c.internText(numeric_lit.name(&buf, text));
+        },
         else => return atomOfIdentText(c, text),
     }
 }

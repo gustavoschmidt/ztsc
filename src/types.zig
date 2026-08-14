@@ -354,6 +354,20 @@ pub const prop_flag_readonly: u32 = 2;
 /// `Pick<C, keyof C>` (and every `{ [K in keyof C]: … }` over a class) to the
 /// public surface. The structural relation still sees the member.
 pub const prop_flag_non_public: u32 = 4;
+/// A method or accessor DECLARED IN A CLASS BODY (tsc's `isSpreadableProperty`:
+/// `prop.flags & (Method | GetAccessor | SetAccessor)` and some declaration's
+/// parent `isClassLike`). Such a member is *unspreadable*: it lives on the
+/// prototype, not on the instance, so `{ ...c }` and `const { ...rest } = c`
+/// both leave it out and a later read of it off the result is TS2339
+/// (`destructuringUnspreadableIntoRest`). The same member declared on an
+/// INTERFACE or an object type literal is an ordinary property and spreads
+/// normally, which is why this is a provenance flag and not derivable from the
+/// member's type.
+///
+/// Deliberately NOT propagated by a mapped type: tsc's `resolveMappedTypeMembers`
+/// creates a fresh `SymbolFlags.Property` symbol, so `{ [K in keyof C]: C[K] }`
+/// has spreadable properties even where `C` did not (see `applyPropModifiers`).
+pub const prop_flag_class_fn: u32 = 8;
 pub const elem_flag_optional: u32 = 1;
 pub const elem_flag_rest: u32 = 2;
 /// A `readonly` tuple element (produced by `as const`). Ignored by the
@@ -388,6 +402,12 @@ pub const Prop = struct {
     }
     pub fn nonPublic(p: Prop) bool {
         return p.flags & prop_flag_non_public != 0;
+    }
+    /// tsc's `getRestType`/`getSpreadType` filter: a `private`/`protected`
+    /// member is skipped outright, and so is a class-declared method or
+    /// accessor (`isSpreadableProperty`). Everything else copies.
+    pub fn spreadable(p: Prop) bool {
+        return p.flags & (prop_flag_non_public | prop_flag_class_fn) == 0;
     }
 };
 
