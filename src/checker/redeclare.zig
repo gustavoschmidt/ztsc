@@ -416,12 +416,12 @@ fn memberDeclOwnType(c: *Checker, decl: Node) Error!?TypeId {
     switch (c.nodeTag(decl)) {
         .class_field => {
             const f = c.tree.extraData(ast.Field, d.lhs);
-            if (f.type_ann != 0) return try c.typeFromTypeNode(f.type_ann);
+            if (f.type_ann != 0) return annOwnType(c, f.type_ann);
             if (f.init != 0) return try c.widenInitializer(try c.checkExprCached(f.init, types.no_type), false);
             return types.any_type;
         },
         .property_signature => {
-            if (d.lhs != 0) return try c.typeFromTypeNode(d.lhs);
+            if (d.lhs != 0) return annOwnType(c, d.lhs);
             return types.any_type;
         },
         .class_method, .method_signature => {
@@ -433,10 +433,24 @@ fn memberDeclOwnType(c: *Checker, decl: Node) Error!?TypeId {
             const saved_scope = c.cur_scope;
             defer c.cur_scope = saved_scope;
             if (try c.scopeOf(decl)) |s| c.cur_scope = s;
-            return try c.typeFromTypeNode(proto.return_type);
+            return annOwnType(c, proto.return_type);
         },
         else => return null,
     }
+}
+
+/// The annotation's type, or null when the member is one this check declines to
+/// judge.
+///
+/// `unique symbol` is the only such annotation. Its type is NOMINAL — keyed by
+/// the declaration, and legal only in the positions `annTypeMaybeUnique` gates
+/// — so two declarations of one member spelling it are two different types by
+/// construction while tsc accepts the merge (`interface SymbolConstructor {
+/// readonly observer: symbol }` beside `readonly observer: unique symbol`), and
+/// reading the node through the plain `typeFromTypeNode` files TS1335 on top.
+fn annOwnType(c: *Checker, ann: Node) Error!?TypeId {
+    if (c.nodeTag(ann) == .unique_symbol_type) return null;
+    return try c.typeFromTypeNode(ann);
 }
 
 // ===========================================================================
