@@ -3261,6 +3261,7 @@ pub const Checker = struct {
     pub const checkSubsequentVarDecl = redeclare_zig.checkSubsequentVarDecl;
     pub const checkTypeParamListsIdentical = redeclare_zig.checkTypeParamListsIdentical;
     pub const checkCloduleMemberDups = redeclare_zig.checkCloduleMemberDups;
+    pub const checkSubsequentMemberDecls = redeclare_zig.checkSubsequentMemberDecls;
     pub const setTypeOfSymbol = signatures_zig.setTypeOfSymbol;
     pub const dropSpeculativeSymTypes = signatures_zig.dropSpeculativeSymTypes;
     pub const appendOverloadCandidates = signatures_zig.appendOverloadCandidates;

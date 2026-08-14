@@ -1386,6 +1386,9 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
         // …and a class merged with a same-named `namespace` shares ONE export
         // table with it, where a static and an exported member of one name clash.
         try c.checkCloduleMemberDups(class_sym);
+        // …and a member declared twice with two different types is TS2717 at
+        // the later declaration.
+        try c.checkSubsequentMemberDecls(class_sym, node);
     }
 
     // Class-position decorators (`@deco class C {}`): evaluated in the
@@ -1634,6 +1637,7 @@ fn checkInterfaceDecl(c: *Checker, node: Node) Error!void {
             _ = try c.interfaceGeneric(c.toGlobal(sym));
             try evalTypeParamDecls(c, c.toGlobal(sym));
             try c.checkTypeParamListsIdentical(mergedOrSelf(c, c.toGlobal(sym)), data.name_token);
+            try c.checkSubsequentMemberDecls(c.toGlobal(sym), node);
             try heritage.checkInterfaceExtends(c, c.toGlobal(sym), node, data.name_token);
         }
     }
