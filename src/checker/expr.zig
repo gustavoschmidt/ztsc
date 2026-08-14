@@ -2632,6 +2632,72 @@ pub fn numericKeyProp(c: *Checker, r: TypeId, lit: TypeId) Error!?types.Prop {
     return c.propOfType(r, try c.internText(txt));
 }
 
+/// tsc's `isNumericLiteralName`: a property name that is *exactly* how
+/// JavaScript renders a number (`(+name).toString() === name`). Such a name
+/// reaches the same member — and the same NUMBER index signature — as the
+/// numeric key does, which is `isApplicableIndexType`'s third disjunct:
+///
+///     target === numberType && source.flags & StringLiteral &&
+///         isNumericLiteralName(source.value)
+///
+/// Only the integral spellings are recognised. A fractional or exponential
+/// one (`"1.5"`, `"1e+21"`) is a numeric name for tsc too, but no test in
+/// the corpus needs it and the round-trip rule is subtle, so those keep the
+/// plain string-key behaviour (an under-report, never a false positive).
+fn numericLiteralNameValue(text: []const u8) ?f64 {
+    // 15 digits is the widest decimal integer f64 renders back exactly.
+    if (text.len == 0 or text.len > 16) return null;
+    const neg = text[0] == '-';
+    const digits = if (neg) text[1..] else text;
+    if (digits.len == 0) return null;
+    // `"01"` renders as `"1"` and `"-0"` as `"0"`, so neither is a numeric name.
+    if (digits[0] == '0' and (digits.len > 1 or neg)) return null;
+    if (digits.len > 15) return null;
+    var v: f64 = 0;
+    for (digits) |ch| {
+        if (ch < '0' or ch > '9') return null;
+        v = v * 10 + @as(f64, @floatFromInt(ch - '0'));
+    }
+    return if (neg) -v else v;
+}
+
+/// The type a NUMERIC index resolves to when the receiver really carries a
+/// numeric domain: a tuple element, an array element, or a declared `number`
+/// index signature. `null` when none applies, so a string-literal key that
+/// merely *looks* numeric keeps the TS7053 it reports today.
+fn numericIndexHit(c: *Checker, r: TypeId, rk: types.Kind, v: f64) Error!?TypeId {
+    // A branded tuple/array (`[X, Y] & { _brand }`) indexes through its
+    // indexable constituent — see `indexableConstituent`.
+    const rt = if (rk == .intersection) (try c.indexableConstituent(r)) orelse r else r;
+    switch (c.ts.kind(rt)) {
+        .tuple => {
+            // Out of the addressable domain (negative, fractional, huge) is
+            // the same "past the end" answer a too-large index gets: the
+            // tuple's REST element if it has one, else `null` (TS2493).
+            const iv: u32 = if (v >= 0 and v == @floor(v) and v < 4096) @intFromFloat(v) else 4096;
+            if (iv < c.ts.tupleLen(rt)) {
+                const e = c.ts.tupleElem(rt, iv);
+                return if (e.optional()) try c.makeUnion2(e.ty, types.undefined_type) else e.ty;
+            }
+            return c.tupleElemTypeAt(rt, iv);
+        },
+        .array => return c.ts.arrayElem(rt),
+        .object => {
+            const ni = c.ts.objectNumberIndex(rt);
+            return if (ni != 0) ni else null;
+        },
+        else => return null,
+    }
+}
+
+/// `numericIndexHit` for a key given as TEXT: the numeric-name test and the
+/// numeric resolution together, so the caller pays neither unless a
+/// string-literal key actually misses as a property name.
+fn numericNameIndexHit(c: *Checker, r: TypeId, rk: types.Kind, text: []const u8) Error!?TypeId {
+    const v = numericLiteralNameValue(text) orelse return null;
+    return numericIndexHit(c, r, rk, v);
+}
+
 fn checkIndexExpr(c: *Checker, node: Node, narrow: bool) Error!TypeId {
     const link = try indexChainInner(c, node, narrow);
     if (link.chained) return c.makeUnion2(link.ty, types.undefined_type);
@@ -2746,8 +2812,17 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool) Error!ChainLink {
     } else switch (ik) {
         .string_literal => {
             const key = c.ts.literalAtom(try c.ts.regularLiteral(idx_t));
+            // A key that is a NUMERIC NAME (`o["0"]`, `t["1"]`) reaches the
+            // receiver's numeric domain, and reaches it *before* a `string`
+            // index signature: tsc's `findApplicableIndexInfo` considers the
+            // string signature "only when no other index signatures apply".
+            // Without this, `[string, number]["0"]`, `{ [x: number]: string
+            // }["3"]` and every `c['1']` on a numerically-keyed class were
+            // TS7053 false positives.
             if (try c.propOfType(r, key)) |p| {
                 result = if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
+            } else if (try numericNameIndexHit(c, r, rk, c.atomText(key))) |nt| {
+                result = nt;
             } else if (rk == .object and c.ts.objectStringIndex(r) != 0) {
                 result = c.ts.objectStringIndex(r);
             } else {
@@ -2771,13 +2846,10 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool) Error!ChainLink {
                 r;
             if (c.ts.kind(rt) == .tuple) {
                 const v = c.ts.numberValue(rl);
-                const iv: u32 = if (v >= 0 and v == @floor(v) and v < 4096) @intFromFloat(v) else 4096;
-                if (iv < c.ts.tupleLen(rt)) {
-                    const e = c.ts.tupleElem(rt, iv);
-                    result = if (e.optional()) try c.makeUnion2(e.ty, types.undefined_type) else e.ty;
-                } else if (try c.tupleElemTypeAt(rt, iv)) |et| {
+                if (try numericIndexHit(c, r, rk, v)) |et| {
                     result = et;
                 } else {
+                    const iv: u32 = if (v >= 0 and v == @floor(v) and v < 4096) @intFromFloat(v) else 4096;
                     try c.diagFmt(2493, c.nodeSpan(d.rhs), "Tuple type '{s}' of length '{d}' has no element at index '{d}'.", .{
                         try c.typeToString(rt), c.ts.tupleLen(rt), iv,
                     });
@@ -3546,6 +3618,34 @@ pub fn reportIndexImplicitAny(c: *Checker, node: Node, recv: Node, idx_t: TypeId
             try c.diagFmt(7052, c.nodeSpan(node), "Element implicitly has an 'any' type because type '{s}' has no index signature. Did you mean to call 'get'?", .{try c.typeToString(obj_t)});
         }
         return;
+    }
+    // A FRESH OBJECT-LITERAL receiver indexed by a string/number LITERAL is
+    // the missing-property TS2339, not an implicit-any report at all: tsc's
+    // `getPropertyTypeForIndexType` object-literal arm
+    // (`isObjectLiteralType(objectType) && noImplicitAny && indexType.flags &
+    // (StringLiteral | NumberLiteral)`). It is placed AFTER the `get`/`set`
+    // suggestion above, which is where the oracle puts it: an object carrying
+    // a matching accessor keeps TS7052 in both read and write position
+    // (`({ get, set }).foo['k']`), and only a receiver with no suggestion to
+    // make reaches this. Freshness is the other half of the discriminator: a literal held in a
+    // variable — whose type is WIDENED, dropping the literal origin exactly as tsc's
+    // `getWidenedTypeOfObjectLiteral` drops `ObjectFlags.ObjectLiteral` — is
+    // TS7052/TS7053.
+    if (c.ts.objectIsLiteralOrigin(r)) {
+        const lit = try c.ts.regularLiteral(idx_t);
+        // The property NAME, unquoted — `typeToString` of a string literal
+        // carries its quotes, which this message must not.
+        const name: ?[]const u8 = switch (c.ts.kind(lit)) {
+            .string_literal => c.atomText(c.ts.literalAtom(lit)),
+            .number_literal => try c.typeToString(lit),
+            else => null,
+        };
+        if (name) |n| {
+            try c.diagFmt(2339, c.nodeSpan(node), "Property '{s}' does not exist on type '{s}'.", .{
+                n, try c.typeToString(obj_t),
+            });
+            return;
+        }
     }
     try c.diagFmt(7053, c.nodeSpan(node), "Element implicitly has an 'any' type because expression of type '{s}' can't be used to index type '{s}'.", .{
         try c.typeToString(idx_t), try c.typeToString(obj_t),

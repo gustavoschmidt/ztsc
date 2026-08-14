@@ -1028,17 +1028,23 @@ const Binder = struct {
     /// than that predicate (no range/sign test): an index the checker rejects
     /// simply leaves an unused flow entry.
     /// The syntactic half of tsc's `isNarrowableReference` element-access arm:
-    /// an index that *could* denote a stable reference — a numeric literal
-    /// (`arr[0]`) or a bare identifier (`map[key]`). The semantic half — is the
-    /// identifier a `const` or a never-assigned local? — needs symbol
-    /// resolution, which is not available here; the checker applies it in
-    /// `stableIndexSymbol` and simply does not build a key when it fails, so an
-    /// index that turns out to be unstable costs one unused flow entry.
+    /// an index that *could* denote a stable reference — a literal
+    /// (`arr[0]`, `s["kind"]`, `` s[`kind`] ``) or a bare identifier
+    /// (`map[key]`). The semantic half — is the identifier a `const` or a
+    /// never-assigned local? — needs symbol resolution, which is not available
+    /// here; the checker applies it in `stableIndexSymbol` and simply does not
+    /// build a key when it fails, so an index that turns out to be unstable
+    /// costs one unused flow entry.
+    ///
+    /// A STRING-literal index has to be here for the same reason a numeric one
+    /// does: it names a property (`Checker.pathElemOfAccess` folds it to the
+    /// same member link `s.kind` gets), so without a flow node attached the
+    /// checker has nothing to query and `s["kind"]` never narrowed at all.
     fn isNarrowableIndex(b: *const Binder, node: Node) bool {
         var n = node;
         while (b.nodeTag(n) == .paren_expr) n = b.tree.nodeData(n).lhs;
         return switch (b.nodeTag(n)) {
-            .number_literal, .identifier => true,
+            .number_literal, .identifier, .string_literal, .template_literal => true,
             else => false,
         };
     }
@@ -2464,7 +2470,7 @@ const Binder = struct {
         if (name_tok == 0) return;
 
         const obj_atom = try b.atomOfToken(b.tree.nodeMainToken(td.lhs));
-        const sym = b.members.get(memberKey(b.cur_scope, obj_atom)) orelse return;
+        const sym = b.expandoTargetSym(obj_atom) orelse return;
         if (!b.isFunctionValueSymbol(sym)) return;
 
         var xs = b.expando_scopes.get(sym) orelse 0;
@@ -2475,6 +2481,44 @@ const Binder = struct {
         const atom = try b.memberAtom(name_tok);
         _ = try b.declare(xs, atom, .expando_member, node, name_tok, .{});
         b.sym_flags.items[sym].expando = true;
+    }
+
+    /// The function value an expando assignment's target names. tsc's
+    /// `bindPropertyAssignment` looks the name up in *two* scopes —
+    /// `blockScopeContainer` and `container` — so an assignment written inside
+    /// an `if` block still finds the `function d() {}` declared in the
+    /// enclosing function or module:
+    ///
+    ///     function d() {}
+    ///     if (b) { d.q = false }      // declares `q` on `d`
+    ///     d.q
+    ///
+    /// Looking only at the innermost scope left every conditionally-assigned
+    /// expando property off the function's type (a TS2339 on each read).
+    /// Intermediate blocks are walked through but never *matched* on, which is
+    /// tsc's shape exactly: it consults the innermost block and the function
+    /// container, nothing in between.
+    fn expandoTargetSym(b: *Binder, obj_atom: Atom) ?SymbolId {
+        if (b.members.get(memberKey(b.cur_scope, obj_atom))) |s| return s;
+        var s = b.cur_scope;
+        while (s != 0) {
+            switch (b.scope_kinds.items[s]) {
+                // The innermost scope IS the container: already tried.
+                .function, .file, .namespace => return null,
+                .block, .for_head, .catch_clause => {},
+                // Any other scope (class body, enum, …) is not a statement
+                // container an expando assignment can sit directly in.
+                else => return null,
+            }
+            const p = b.scope_parents.items[s];
+            if (p == s) return null;
+            s = p;
+            switch (b.scope_kinds.items[s]) {
+                .function, .file, .namespace => return b.members.get(memberKey(s, obj_atom)),
+                else => {},
+            }
+        }
+        return null;
     }
 
     /// Whether `sym` is expando-eligible: a function declaration, or a

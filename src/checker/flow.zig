@@ -67,6 +67,7 @@ pub const stableIndexSymbol = refkey.stableIndexSymbol;
 pub const buildRefKey = refkey.buildRefKey;
 pub const referenceCandidate = refkey.referenceCandidate;
 const refMatches = refkey.refMatches;
+const pathElemOfAccess = refkey.pathElemOfAccess;
 pub const refMatchesPath = refkey.refMatchesPath;
 const refPrefixWritten = refkey.refPrefixWritten;
 pub const isNarrowable = refkey.isNarrowable;
@@ -284,7 +285,7 @@ pub fn narrowedPatternBinding(c: *Checker, node: Node, sym: SymbolId) Error!?Typ
 /// Is `node` a bare identifier bound by the object pattern behind the
 /// pseudo-root `key`, and if so which property does it read? (tsc's
 /// `getCandidateDiscriminantPropertyAccess`, binding-pattern arm.)
-fn patternDiscriminantTok(c: *Checker, node: Node, key: RefKey) Error!?TokenIndex {
+fn patternDiscriminantAtom(c: *Checker, node: Node, key: RefKey) Error!?Atom {
     if (key.len != 0) return null;
     if (c.nodeTag(node) != .identifier) return null;
     const dk = patternRootDecl(c, key.sym);
@@ -307,7 +308,7 @@ fn patternDiscriminantTok(c: *Checker, node: Node, key: RefKey) Error!?TokenInde
     const el = (try bindingPropertyFor(c, pat, a)) orelse return null;
     // `binding_property`'s main token is the PROPERTY name in both the
     // shorthand (`{ kind }`) and the renamed (`{ kind: k }`) form.
-    return c.tree.nodeMainToken(el);
+    return try c.memberAtom(c.tree.nodeMainToken(el));
 }
 
 /// tsc's `isPastLastAssignment` (TS 5.4). `sym` is known to be assigned
@@ -1446,8 +1447,8 @@ pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: R
             // `switch` forms narrowed the siblings, and the boolean
             // discriminant — the form that has no comparand to write — did
             // not narrow at all.
-            if (try discriminantOfRef(c, cond, key)) |prop_tok| {
-                return narrowByPropTruthiness(c, t, try c.memberAtom(prop_tok), sense, decl);
+            if (try discriminantOfRef(c, cond, key)) |prop| {
+                return narrowByPropTruthiness(c, t, prop, sense, decl);
             }
             // Aliased-condition narrowing (tsc TS4.4 "control flow analysis
             // of aliased conditions and discriminants"): the condition is a
@@ -1501,6 +1502,16 @@ pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: R
         .index_expr, .optional_index_expr => {
             if (try refMatches(c, cond, key)) {
                 return if (sense) c.getTruthyPart(t) else c.getFalsyPart(t, true);
+            }
+            // `if (<ref>["p"])` — the element spelling of the member arm's
+            // discriminant-truthiness rule (`getAccessedPropertyName` reads
+            // both spellings as the same property).
+            if (try discriminantOfRef(c, cond, key)) |prop| {
+                var base = t;
+                if (c.nodeTag(cond) == .optional_index_expr and sense) {
+                    base = try c.nonNullable(base);
+                }
+                return narrowByPropTruthiness(c, base, prop, sense, decl);
             }
             if (sense and try optionalChainContainsRef(c, cond, key)) {
                 return c.nonNullable(t);
@@ -1647,23 +1658,23 @@ fn narrowByEqualityCond(c: *Checker, t: TypeId, lhs: Node, rhs: Node, strict: bo
     // member path (`f.geometry.k`, narrowing the union stored at the
     // tracked `f.geometry`). The union `t` is `<ref>`'s type, so the same
     // discriminant filter applies regardless of the reference's depth.
-    if (try discriminantOfRef(c, lhs, key)) |prop_tok| {
+    if (try discriminantOfRef(c, lhs, key)) |prop| {
         const other = try c.ts.regularLiteral(try c.checkExprCached(rhs, types.no_type));
-        const narrowed = try narrowByDiscriminant(c, t, try c.memberAtom(prop_tok), other, sense, decl);
+        const narrowed = try narrowByDiscriminant(c, t, prop, other, sense, decl);
         // An OPTIONAL discriminant read (`x?.k === lit`) short-circuits to
         // `undefined` when the receiver is nullish, so the equality also
         // forces the receiver non-nullish on the asserting branch (tsc's
         // optional-chain containment). The discriminant filter alone keeps
         // `undefined` (no `k` prop → conservatively kept), so strip it too.
-        if (c.nodeTag(lhs) == .optional_member_expr) {
+        if (c.nodeTag(lhs) == .optional_member_expr or c.nodeTag(lhs) == .optional_index_expr) {
             return narrowByOptChainContainment(c, narrowed, rhs, strict, sense);
         }
         return narrowed;
     }
-    if (try discriminantOfRef(c, rhs, key)) |prop_tok| {
+    if (try discriminantOfRef(c, rhs, key)) |prop| {
         const other = try c.ts.regularLiteral(try c.checkExprCached(lhs, types.no_type));
-        const narrowed = try narrowByDiscriminant(c, t, try c.memberAtom(prop_tok), other, sense, decl);
-        if (c.nodeTag(rhs) == .optional_member_expr) {
+        const narrowed = try narrowByDiscriminant(c, t, prop, other, sense, decl);
+        if (c.nodeTag(rhs) == .optional_member_expr or c.nodeTag(rhs) == .optional_index_expr) {
             return narrowByOptChainContainment(c, narrowed, lhs, strict, sense);
         }
         return narrowed;
@@ -1764,31 +1775,93 @@ fn narrowByTypeofChainContainment(c: *Checker, t: TypeId, value: Node, sense: bo
 }
 
 /// `<ref>.k` where `<ref>` is exactly `key`'s reference: returns the
-/// discriminant property token `k`. Handles any tracked reference — a root
+/// discriminant property NAME `k`. Handles any tracked reference — a root
 /// symbol (`x.k`) *or* a depth-1 member path (`f.geometry.k`) — by reusing
 /// `refMatches` on the access base.
 ///
-/// Both a plain `.k` and an optional `?.k` access count. tsc's
-/// `getDiscriminantPropertyAccess` accepts either — an optional read
-/// short-circuits to `undefined` when the base is nullish, which is exactly
-/// what the discriminant filter then removes on the asserting branch (the
-/// caller finishes the job with `narrowByOptChainContainment`, since a
-/// member with no `k` at all is kept by the filter). The reference's depth
-/// is likewise irrelevant: the union being filtered is the reference's own
-/// type whether it is a root symbol (`x?.k`) or a member path
-/// (`s.openDialog?.k`).
-fn discriminantOfRef(c: *Checker, node: Node, key: RefKey) Error!?TokenIndex {
+/// Both a plain `.k` and an optional `?.k` access count, and so does the
+/// ELEMENT spelling `["k"]`: tsc's `getDiscriminantPropertyAccess` asks
+/// `getAccessedPropertyName`, which reads a string-literal element access as
+/// the same property name (`switch (s['kind'])` discriminates exactly as
+/// `switch (s.kind)` does). An optional read short-circuits to `undefined`
+/// when the base is nullish, which is what the discriminant filter then
+/// removes on the asserting branch (the caller finishes the job with
+/// `narrowByOptChainContainment`, since a member with no `k` at all is kept
+/// by the filter). The reference's depth is likewise irrelevant: the union
+/// being filtered is the reference's own type whether it is a root symbol
+/// (`x?.k`) or a member path (`s.openDialog?.k`).
+fn discriminantOfRef(c: *Checker, node: Node, key: RefKey) Error!?Atom {
     if (node == null_node) return null;
     // A binding-pattern pseudo-reference reads its discriminant through a
     // sibling BINDING, not a member access (see `narrowedPatternBinding`).
-    if (isPatternRoot(key.sym)) return patternDiscriminantTok(c, node, key);
+    if (isPatternRoot(key.sym)) return patternDiscriminantAtom(c, node, key);
     switch (c.nodeTag(node)) {
-        .member_expr, .optional_member_expr => {},
+        .member_expr, .optional_member_expr, .index_expr, .optional_index_expr => {},
+        .identifier => return aliasedDiscriminantAtom(c, node, key),
         else => return null,
     }
-    const d = c.tree.nodeData(node);
-    if (!try refMatches(c, d.lhs, key)) return null;
-    return d.rhs;
+    const pe = (try pathElemOfAccess(c, node)) orelse return null;
+    // A numeric or identifier-keyed element access names no property.
+    if (pe.isIndex()) return null;
+    if (!try refMatches(c, c.tree.nodeData(node).lhs, key)) return null;
+    return pe.atom();
+}
+
+/// tsc's `getCandidateDiscriminantPropertyAccess`, IDENTIFIER arm: a `const`
+/// that reads the reference's discriminant stands in for that read, so
+///
+///     const kind = obj.kind;      // or: const { kind } = obj;
+///     if (kind === 'foo') obj.foo;
+///
+/// narrows `obj` exactly as `if (obj.kind === 'foo')` does. Both spellings
+/// tsc accepts are here: an initializer that is an access expression on the
+/// reference, and a default-less object-binding property of a pattern whose
+/// initializer *is* the reference.
+///
+/// The alias must be a same-file `const` with a single declaration — the same
+/// staleness rule `constAliasInit` documents, since the alias snapshots the
+/// discriminant at its declaration point.
+fn aliasedDiscriminantAtom(c: *Checker, node: Node, key: RefKey) Error!?Atom {
+    const a = try c.atomOfToken(c.tree.nodeMainToken(node));
+    const sym = switch (c.resolveSpace(a, c.cur_scope, true)) {
+        .sym => |s| s,
+        else => return null,
+    };
+    if (sym == key.sym or isPseudoRoot(sym) or c.isFreshTp(sym)) return null;
+    const sf = c.symFlags(sym);
+    if (!sf.const_decl or sf.exported) return null;
+    if (c.symFile(sym) != c.cur_file) return null;
+    const decls = c.declsOf(sym);
+    if (decls.len != 1) return null;
+    const decl = decls[0];
+    const d = c.tree.nodeData(decl);
+    const init_expr: Node = switch (c.nodeTag(decl)) {
+        .declarator_init => d.rhs,
+        .declarator_full => blk: {
+            const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
+            // An explicit annotation replaces the alias's snapshot with a
+            // written type, which carries no discriminant information.
+            if (e.type_ann != 0) return null;
+            break :blk e.init;
+        },
+        else => return null,
+    };
+    if (init_expr == null_node) return null;
+    // `const { kind } = obj` — the pattern's property name is the discriminant.
+    if (objectPatternOf(c, decl)) |pat| {
+        if (!try refMatches(c, init_expr, key)) return null;
+        const el = (try bindingPropertyFor(c, pat, a)) orelse return null;
+        return try c.memberAtom(c.tree.nodeMainToken(el));
+    }
+    // `const kind = obj.kind` — the initializer is the discriminant read.
+    // Parenthesized to any depth: Angular's generated type-check blocks write
+    // `const _t1 = (((((this).test)).type));`.
+    if (c.nodeTag(d.lhs) != .identifier) return null;
+    const access = c.referenceCandidate(init_expr);
+    const pe = (try pathElemOfAccess(c, access)) orelse return null;
+    if (pe.isIndex()) return null;
+    if (!try refMatches(c, c.tree.nodeData(access).lhs, key)) return null;
+    return pe.atom();
 }
 
 pub fn identIsSym(c: *Checker, node: Node, sym: SymbolId) Error!bool {
@@ -2564,8 +2637,8 @@ fn narrowBySwitchClause(c: *Checker, t: TypeId, clause: Node, key: RefKey, decl:
     var direct = false;
     if (try refMatches(c, disc, key)) {
         direct = true;
-    } else if (try discriminantOfRef(c, disc, key)) |prop_tok| {
-        prop = try c.memberAtom(prop_tok);
+    } else if (try discriminantOfRef(c, disc, key)) |disc_prop| {
+        prop = disc_prop;
     }
     if (!direct and prop == 0 and c.nodeTag(disc) == .prefix_unary and try typeofTargetOf(c, disc, key)) {
         // switch (typeof x)
