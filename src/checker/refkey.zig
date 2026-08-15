@@ -411,7 +411,7 @@ pub fn buildRefKey(c: *Checker, node: Node) Error!?RefKey {
     var count: usize = 0;
     var n = node;
     while (true) {
-        while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+        n = peelTransparent(c, n);
         const tag = c.nodeTag(n);
         if (tag != .member_expr and tag != .optional_member_expr and
             tag != .index_expr and tag != .optional_index_expr) break;
@@ -448,11 +448,40 @@ pub fn buildRefKey(c: *Checker, node: Node) Error!?RefKey {
 /// expression stands in for its right operand. Without this the whole
 /// assign-in-a-condition idiom narrowed nothing and every use inside the
 /// body kept the nullable declared type.
+/// The wrappers a reference is the same reference THROUGH: parentheses, a
+/// non-null assertion, and a `satisfies`. tsc peels all three in
+/// `isMatchingReference` and in `getFlowCacheKey`, so `working.thing!.name` is
+/// the same flow reference as `working.thing.name` and a guard written on one
+/// narrows the other. Without the `!` the spine walk stopped at the assertion
+/// and the whole reference went untracked, so `if (working.thing!.name !==
+/// "Correct")` discriminated nothing and both branches read the full union
+/// (`narrowingUnionWithBang`).
+///
+/// `as` is deliberately NOT here: an `as` changes the type a read answers, and
+/// tsc does not treat it as the same reference either.
+fn peelTransparent(c: *Checker, node: Node) Node {
+    var n = node;
+    while (true) {
+        switch (c.nodeTag(n)) {
+            .paren_expr, .non_null, .satisfies_expr => {
+                const inner = c.tree.nodeData(n).lhs;
+                if (inner == null_node) return n;
+                n = inner;
+            },
+            else => return n,
+        }
+    }
+}
+
 pub fn referenceCandidate(c: *Checker, node0: Node) Node {
     var n = node0;
     while (n != null_node) {
         switch (c.nodeTag(n)) {
-            .paren_expr => n = c.tree.nodeData(n).lhs,
+            .paren_expr, .non_null, .satisfies_expr => {
+                const inner = c.tree.nodeData(n).lhs;
+                if (inner == null_node) return n;
+                n = inner;
+            },
             .assign => switch (c.tree.tokens.tag(c.tree.nodeMainToken(n))) {
                 .eq, .pipe_pipe_eq, .amp_amp_eq, .question_question_eq => n = c.tree.nodeData(n).lhs,
                 else => return n,
