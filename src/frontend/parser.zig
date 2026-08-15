@@ -58,6 +58,7 @@ const ast = @import("ast.zig");
 const diagnostics = @import("diagnostics.zig");
 const directives = @import("directives.zig");
 const literals = @import("literals.zig");
+const modifier_order = @import("modifier_order.zig");
 
 const TokTag = scanner.Tag;
 const Token = scanner.Token;
@@ -222,6 +223,14 @@ const Parser = struct {
     /// A class body is strict whatever the file is, and tsc says so in its own
     /// wording, so the choice between TS1212 and TS1213 is this counter.
     class_depth: u32 = 0,
+
+    /// Is the class whose body is being parsed `abstract`? Read only by
+    /// `modifier_order.check`, whose two `abstract` PAIRS sit behind tsc's
+    /// TS1244 ("abstract methods can only appear within an abstract class") and
+    /// so must stay silent on a plain class's member. A flag rather than a
+    /// counter because it describes the INNERMOST class body, and a nested class
+    /// declaration restores the enclosing one's answer on the way out.
+    abstract_class: bool = false,
 
     /// The innermost function-like boundary being parsed. tsc keeps the same
     /// information in two context bits (`NodeFlags.AwaitContext` plus the
@@ -594,6 +603,17 @@ const Parser = struct {
         const start = p.tok_starts.items[from] & scanner.Tokens.start_mask;
         const to_start = p.tok_starts.items[to] & scanner.Tokens.start_mask;
         const end = scanner.tokenEnd(p.src, p.tok_tags.items[to], to_start);
+        try p.addDiag(code, .{
+            .code = code,
+            .span = .{ .start = start, .end = if (end > start) end else start + 1 },
+        });
+    }
+
+    /// A diagnostic over an explicit byte range, for the rule whose start is not
+    /// a token START: tsgo's `parseErrorAtRange(typeNode, …)` blames a type
+    /// constituent from its FULL start — the offset just past the previous
+    /// token, leading trivia included — so no token index names it.
+    fn errAtBytes(p: *Parser, code: Code, start: u32, end: u32) Error!void {
         try p.addDiag(code, .{
             .code = code,
             .span = .{ .start = start, .end = if (end > start) end else start + 1 },
@@ -1551,7 +1571,25 @@ const Parser = struct {
                         // still parsing both as one modifier list. Reading
                         // `declare` as an expression instead cost a false
                         // TS2304 and lost the TS1183 the body earns.
+                        // TS1029, but only where tsc's `checkGrammarModifiers`
+                        // actually reaches the pair. Three earlier arms
+                        // short-circuit its walk and each is tsgo's whole answer
+                        // for that shape (measured), so reporting here as well
+                        // would be a second, wrong key:
+                        //   * `declare export = x` -> TS1120 `An export
+                        //     assignment cannot have modifiers.`, on the
+                        //     statement;
+                        //   * a statement list that is not a module body ->
+                        //     TS1184 `Modifiers cannot appear here.`, which
+                        //     ztsc already reports;
+                        //   * an ALREADY ambient context (inside `declare module
+                        //     "m" { … }`) -> TS1038 `A 'declare' modifier cannot
+                        //     be used in an already ambient context.`
+                        // ztsc reports neither TS1120 nor TS1038 yet, so those
+                        // two stay under-reports.
+                        const pair_reaches = p.module_body and !p.ambient and p.peekTag(2) != .eq;
                         _ = try p.bump(); // `declare`
+                        if (pair_reaches) try p.errAtCur(.mod_order_export_declare);
                         const was_ambient = p.ambient;
                         p.ambient = true;
                         defer p.ambient = was_ambient;
@@ -1689,6 +1727,15 @@ const Parser = struct {
         defer p.module_body = was_module_body;
         try p.parseStatementList(top, .r_brace, ambient_body);
         _ = try p.expect(.r_brace, .expected_r_brace);
+        // `{ a, b } = fn()` — a destructuring assignment whose parentheses were
+        // forgotten reaches here as a BLOCK followed by `=`. tsc's `parseBlock`
+        // ends with exactly this check and consumes the `=` so the right-hand
+        // side becomes its own statement instead of a second cascade; without
+        // it the `=` fell through to the statement list as a plain TS1128.
+        if (p.curTag() == .eq) {
+            try p.errAtCur(.destructuring_assignment_needs_parens);
+            _ = try p.bump();
+        }
         const range = try p.scratchToSpan(top);
         return p.addNode(.{ .tag = .block, .main_token = l_brace, .data = .{ .lhs = range.start, .rhs = range.end } });
     }
@@ -2326,7 +2373,7 @@ const Parser = struct {
         }
         const start_tok = p.curIdx();
         var flags: u32 = 0;
-        var access_reported = false;
+        var mod_reported = false;
         // Constructor parameter properties: visibility/readonly/override.
         while (true) {
             const bit: u32 = switch (p.curTag()) {
@@ -2341,9 +2388,15 @@ const Parser = struct {
             // Only a modifier if a binding follows (else it's the name).
             const t1 = p.peekTag(1);
             if (!(isIdentLike(t1) or t1 == .l_bracket or t1 == .l_brace or t1 == .dot_dot_dot or t1 == .keyword_this)) break;
-            if (!access_reported and p.spec == 0 and accessibilityRepeat(flags, bit)) {
-                try p.errAtCur(.accessibility_modifier_already_seen);
-                access_reported = true;
+            // Same walk as a class member's: `constructor(readonly readonly y)`
+            // is TS1030 and `constructor(override public foo)` is TS1029. A
+            // parameter is never in an abstract-member position, so the abstract
+            // pairs are unreachable here whatever the class is.
+            if (!mod_reported and p.spec == 0) {
+                if (modifier_order.check(flags, bit, false)) |code| {
+                    try p.errAtCur(code);
+                    mod_reported = true;
+                }
             }
             _ = try p.bump();
             flags |= bit;
@@ -2468,7 +2521,19 @@ const Parser = struct {
             const before = p.curIdx();
             if (p.curTag() == .dot_dot_dot) {
                 const dots = try p.bump();
-                const target = try p.parseBindingName(.private_name_outside_class);
+                var target = try p.parseBindingName(.private_name_outside_class);
+                // `{ ...a: b }` — tsc's `parseObjectBindingElement` reads a
+                // PropertyName before it can know whether a `:` follows, so a
+                // rest element WITH one parses and
+                // `checkGrammarBindingElement` reports TS2566 on the bound
+                // name. Refusing the `:` here answered "',' expected" and threw
+                // away the rest of the declaration with it.
+                if (p.curTag() == .colon) {
+                    _ = try p.bump();
+                    const bound = try p.parseBindingName(.private_name_outside_class);
+                    try p.errAtToken(.rest_element_property_name, p.nodes.items(.main_token)[bound]);
+                    target = bound;
+                }
                 try p.pushScratch(try p.addNode(.{ .tag = .rest_element, .main_token = dots, .data = .{ .lhs = target, .rhs = 0 } }));
                 if (p.curTag() == .comma) try p.errAtCur(.rest_must_be_last);
             } else if (isNameLike(p.curTag()) or p.curTag() == .string_literal or
@@ -2561,6 +2626,9 @@ const Parser = struct {
         // nested classes — hence a depth counter rather than a flag.
         p.class_depth += 1;
         defer p.class_depth -= 1;
+        const was_abstract_class = p.abstract_class;
+        p.abstract_class = flags_in & ast.Flags.abstract != 0;
+        defer p.abstract_class = was_abstract_class;
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
         while (p.curTag() != .r_brace and p.curTag() != .eof) {
@@ -2654,11 +2722,6 @@ const Parser = struct {
     /// tsc `return`s out of its whole modifier walk on the first hit, so
     /// `public protected private x` is ONE diagnostic, not two — callers stop
     /// asking once it has answered true.
-    fn accessibilityRepeat(already: u32, bit: u32) bool {
-        const access = ast.Flags.public | ast.Flags.private | ast.Flags.protected;
-        return bit & access != 0 and already & access != 0;
-    }
-
     /// How many class-member modifiers stand in front of a `static { … }` block,
     /// or null when this member is not a static block at all. Bounded by the
     /// lookahead window (`max_la`), so a run longer than three keeps ztsc's
@@ -2734,7 +2797,7 @@ const Parser = struct {
         }
 
         var flags: u32 = 0;
-        var access_reported = false;
+        var mod_reported = false;
         while (true) {
             const bit = classMemberModifierBit(p.curTag());
             if (bit == 0) break;
@@ -2745,9 +2808,14 @@ const Parser = struct {
                 t1 == .numeric_literal or t1 == .l_bracket or t1 == .asterisk;
             if (!name_follows) break;
             if ((bit == ast.Flags.get or bit == ast.Flags.set or bit == ast.Flags.async) and p.peekNewline(1)) break;
-            if (!access_reported and p.spec == 0 and accessibilityRepeat(flags, bit)) {
-                try p.errAtCur(.accessibility_modifier_already_seen);
-                access_reported = true;
+            // Repeated or out-of-order modifiers: tsc's `checkGrammarModifiers`
+            // returns on its FIRST hit, so `public private static x` answers
+            // once, for `private`, and never mentions `static`.
+            if (!mod_reported and p.spec == 0) {
+                if (modifier_order.check(flags, bit, p.abstract_class)) |code| {
+                    try p.errAtCur(code);
+                    mod_reported = true;
+                }
             }
             _ = try p.bump();
             flags |= bit;
@@ -3077,6 +3145,13 @@ const Parser = struct {
     /// already been consumed by the caller.
     fn parseEnumDeclFrom(p: *Parser, kw: u32, flags: u32) PE!Node {
         const name_tok = try p.expectIdentLike();
+        // `enum void {}` — a RESERVED word as the enum's name. tsc's
+        // `parseIdentifier` consumes the word (its answer is TS1359, on the word)
+        // and carries on with the body, so the `{` is still the `{`. Leaving the
+        // keyword unconsumed sent it into `parseEnumMember` instead — legal now
+        // that a member name is any PropertyName — and the `{` behind it became a
+        // second, false "',' expected".
+        if (p.curTag() != .l_brace and p.curTag().isKeyword()) _ = try p.bump();
         _ = try p.expect(.l_brace, .expected_l_brace);
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
@@ -3150,7 +3225,13 @@ const Parser = struct {
             .private_identifier => .enum_member_private_name,
             else => null,
         };
-        if (name_code == null and !isIdentLike(p.curTag()) and p.curTag() != .string_literal and
+        // `isNameLike`, not `isIdentLike`: a PropertyName admits every reserved
+        // word, so `enum Bool { false }` and `enum E { new, default }` are legal
+        // enums whose members are named after keywords (measured — tsgo answers
+        // nothing for either, nor for the `Bool.false` type reference they make
+        // possible). Rejecting them here cost a false TS1003 plus the TS1128
+        // cascade behind it.
+        if (name_code == null and !isNameLike(p.curTag()) and p.curTag() != .string_literal and
             p.curTag() != .no_substitution_template_literal)
         {
             try p.fail(.expected_identifier);
@@ -3447,6 +3528,20 @@ const Parser = struct {
     fn parseExportStatement(p: *Parser) PE!Node {
         const kw = try p.bump(); // `export`
         p.saw_module_syntax = true;
+        // `export export class Foo {}` — tsc collects both into one modifier
+        // list and reports TS1030 on the second, then declares the class as
+        // usual. Refusing the second `export` here answered "an export clause
+        // expected" and cost the file its whole semantic pass.
+        while (p.curTag() == .keyword_export) {
+            // `export export = x` is TS1120 (`An export assignment cannot have
+            // modifiers.`) in tsc, reported on the statement — an earlier arm
+            // than the repeat, and tsgo's whole answer for that shape. Same for
+            // a statement list that is not a module body, where TS1233 has
+            // already been reported. Neither is a repeat diagnostic, so the
+            // repeat must stay quiet rather than add a second, wrong key.
+            if (p.module_body and p.peekTag(1) != .eq) try p.errAtCur(.mod_seen_export);
+            _ = try p.bump();
+        }
         // `export public import a = x.c;` — a member modifier between `export`
         // and the declaration, which tsc parses into the same modifier list.
         try p.eatStatementModifiers();
@@ -4476,6 +4571,22 @@ const Parser = struct {
         return p.scratchToSpan(top);
     }
 
+    /// The expression inside a `{ … }` JSX container, attribute value or child
+    /// alike. The JSX grammar allows only an AssignmentExpression there, but
+    /// tsc's `parseJsxExpression` reads a full comma SEQUENCE anyway ("we can
+    /// unambiguously parse a comma sequence and provide a better error message
+    /// in grammar checking") and its `checkGrammarJsxExpression` answers TS18007
+    /// for one. Stopping at the comma instead cost a false "'}' expected" plus
+    /// the file's whole semantic pass.
+    fn parseJsxContainerExpr(p: *Parser) PE!Node {
+        const start_tok = p.curIdx();
+        const expr = try p.parseExpression(.{});
+        if (p.nodes.items(.tag)[expr] == .seq_expr) {
+            try p.errAtRange(.jsx_comma_operator, start_tok, p.lastIdx());
+        }
+        return expr;
+    }
+
     fn parseJsxAttributeValue(p: *Parser) PE!Node {
         p.rescanJsxAttributeString();
         switch (p.curTag()) {
@@ -4486,7 +4597,7 @@ const Parser = struct {
                 // has an optional expression); the type error it earns is the
                 // checker's, not a syntax error. Same shape as a child `{}`.
                 var expr: Node = null_node;
-                if (p.curTag() != .r_brace) expr = try p.parseAssignExpr(.{});
+                if (p.curTag() != .r_brace) expr = try p.parseJsxContainerExpr();
                 _ = try p.expect(.r_brace, .expected_r_brace);
                 return p.addNode(.{ .tag = .jsx_expr_container, .main_token = lb, .data = .{ .lhs = expr, .rhs = 0 } });
             },
@@ -4526,7 +4637,7 @@ const Parser = struct {
                     // modelled; the expression inside is what gets checked.
                     _ = try p.eat(.dot_dot_dot);
                     var expr: Node = null_node;
-                    if (p.curTag() != .r_brace) expr = try p.parseAssignExpr(.{});
+                    if (p.curTag() != .r_brace) expr = try p.parseJsxContainerExpr();
                     _ = try p.expect(.r_brace, .expected_r_brace);
                     try p.pushScratch(try p.addNode(.{ .tag = .jsx_expr_container, .main_token = lb, .data = .{ .lhs = expr, .rhs = 0 } }));
                     pos = p.lastTokEnd();
@@ -4553,8 +4664,51 @@ const Parser = struct {
         return .{ .range = try p.scratchToSpan(top), .close_lt = close_lt };
     }
 
+    /// A JSX element in EXPRESSION position, with tsc's adjacent-element
+    /// recovery: `<a/><b/>` is not a `<` comparison but a forgotten wrapper, so
+    /// `parseJsxElementOrSelfClosingElementOrFragment` speculatively parses the
+    /// second element whenever a `<` follows the first, joins the two with a
+    /// synthetic comma and reports TS2657 over the whole run.
+    ///
+    /// tsc's speculation is `tryParse`, which keeps the nested parse's
+    /// diagnostics because the nested call always returns a node — so it never
+    /// actually rolls back, and parsing straight through is the same thing.
+    /// tsc recurses (threading the run's start through `topInvalidNodePosition`)
+    /// and so records one TS2657 per pair, all at that same start; the
+    /// one-per-position rule keeps the innermost, which spans the whole run.
+    /// The loop below reports that surviving diagnostic directly, which is also
+    /// what keeps a long run from recursing once per element.
+    ///
+    /// Only expression position: an element in a CHILD or ATTRIBUTE-VALUE
+    /// position is `inExpressionContext: false`, where a following `<` is the
+    /// next child or the closing tag.
+    fn parseJsxElementInExpr(p: *Parser) PE!Node {
+        const run_start = p.curIdx();
+        // A FRAGMENT is excluded, and it is the one exclusion this rule needs.
+        // tsc's guard is the bare `token() === LessThanToken`, but its fragment
+        // recovery gets there first: `tsxFragmentErrors.tsx` writes `<>hi</div>`
+        // and then `<>eof` on a later line, and tsgo answers TS17015/TS17014 for
+        // the unmatched fragment and NO TS2657 — the `</div>` is not accepted as
+        // the fragment's closing tag, so everything after it, the second
+        // fragment included, is read as a CHILD and no `<` is ever left standing
+        // where this recovery could see it. ztsc does not model that closing-tag
+        // check, so a fragment's trailing `<` cannot be told from an adjacent
+        // element's and the recovery declines to guess. `<div></div>` runs, which
+        // is every corpus case that wants a TS2657, are unaffected.
+        const opens_fragment = p.peekTag(1) == .gt;
+        var node = try p.parseJsxElement();
+        if (p.curTag() != .lt or opens_fragment) return node;
+        while (p.curTag() == .lt) {
+            const lt = p.curIdx();
+            const next = try p.parseJsxElement();
+            node = try p.addNode(.{ .tag = .seq_expr, .main_token = lt, .data = .{ .lhs = node, .rhs = next } });
+        }
+        try p.errAtRange(.jsx_needs_one_parent, run_start, p.lastIdx());
+        return node;
+    }
+
     fn parsePrimaryExpr(p: *Parser, ctx: ExprCtx) PE!Node {
-        if (p.jsx and p.curTag() == .lt) return p.parseJsxElement();
+        if (p.jsx and p.curTag() == .lt) return p.parseJsxElementInExpr();
         switch (p.curTag()) {
             .numeric_literal => return p.leaf(.number_literal),
             .bigint_literal => return p.leaf(.bigint_literal),
@@ -4584,7 +4738,28 @@ const Parser = struct {
             .keyword_false => return p.leaf(.false_literal),
             .keyword_null => return p.leaf(.null_literal),
             .keyword_this => return p.leaf(.this_expr),
-            .keyword_super => return p.leaf(.super_expr),
+            .keyword_super => {
+                const node = try p.leaf(.super_expr);
+                // tsc's `parseSuperExpression`: after `super` the grammar wants
+                // `(`, `.` or `[`; anything else is TS1034, reported on the
+                // token that should have been the dot (tsc reaches it through
+                // `parseExpectedToken(DotToken, …)`, which blames the CURRENT
+                // token). tsc then synthesizes `super.<missing>`; the node is
+                // left as the bare `super` here because TS1034 is a parse
+                // diagnostic and so the program's semantic pass never runs.
+                switch (p.curTag()) {
+                    .l_paren, .dot, .l_bracket => {},
+                    // `super<T>()` — tsc looks for a type-argument list BEFORE
+                    // this check (its own answer there is TS2754, `'super' may
+                    // not use type arguments`, which ztsc does not report yet),
+                    // and only a `<` that fails to parse as one reaches TS1034.
+                    // Staying silent keeps the under-report instead of turning
+                    // it into a wrong key.
+                    .lt, .lt_lt => {},
+                    else => try p.errAtCur(.super_needs_call_or_member),
+                }
+                return node;
+            },
             .keyword_import => return p.leaf(.import_expr),
             .keyword_function => return p.parseFunctionDecl(0, true),
             .keyword_async => {
@@ -4735,6 +4910,28 @@ const Parser = struct {
         defer p.scratch.shrinkRetainingCapacity(top);
         while (p.curTag() != .r_brace and p.curTag() != .eof) {
             const before = p.curIdx();
+            // A stray `;` — `var tt = { aa; }`, `var v = { foo(); }`. tsc passes
+            // `considerSemicolonAsDelimiter: true` for an object literal alone
+            // among its delimited lists, and CONSUMES the `;` rather than giving
+            // up on the list ("this can happen when people do things like use a
+            // semicolon to delimit object literal members"). Breaking out here
+            // instead left the `}` to be re-read as a statement, which answered a
+            // second, false TS1128. The TS1136 is usually suppressed by the
+            // one-per-position rule, the missing comma having already been
+            // reported at this very token.
+            //
+            // tsc's condition includes `!scanner.hasPrecedingLineBreak()`, and it
+            // is load-bearing: `var v = {\n  a\n;` (no closing brace) answers ONE
+            // key in tsgo, because the `;` on its own line is NOT consumed and the
+            // "'}' expected" that follows lands on it and is suppressed as a
+            // repeat position. Consuming it moved that diagnostic to EOF, where
+            // nothing suppressed it.
+            if (p.curTag() == .semicolon and !p.nlBefore()) {
+                if (p.spec > 0) return error.Backtrack;
+                try p.errAtCur(.expected_property_name);
+                _ = try p.bump();
+                continue;
+            }
             try p.pushScratch(try p.parseObjectMember());
             if (try p.eat(.comma) == null and p.curTag() != .r_brace) {
                 try p.fail(.expected_comma);
@@ -4993,10 +5190,56 @@ const Parser = struct {
         return p.addNode(.{ .tag = .function_type, .main_token = start_tok, .data = .{ .lhs = proto, .rhs = 0 } });
     }
 
+    /// A function or constructor type written BARE as a union or intersection
+    /// constituent — `type U = string | () => void`. The grammar wants
+    /// parentheses, but tsc's `parseFunctionOrConstructorTypeToError` parses the
+    /// shorthand anyway ("we'll try to parse them gracefully and issue a helpful
+    /// message") and answers one TS1385/TS1386/TS1387/TS1388. Refusing it
+    /// instead produced a TS1110/TS1005/TS1109/TS1128 cascade — 134 excess keys
+    /// across the corpus's two cases for this rule.
+    ///
+    /// Only a constituent that FOLLOWS an operator can be one, which is why
+    /// `type F = () => void` is legal and `type U = A | () => void` is not; the
+    /// caller passes `from`, the offset just past that operator, because tsgo
+    /// blames the constituent from its FULL start (leading trivia included, so
+    /// the space after the `|` is where the squiggle begins — measured on all 16
+    /// keys of `unparenthesizedFunctionTypeInUnionOrIntersection.ts`).
+    ///
+    /// Returns null when this constituent is not one of the two shapes, leaving
+    /// the caller to parse it normally. The `(`-led shape is decided by trying
+    /// the function type, which is what tsc's `isUnambiguouslyStartOfFunctionType`
+    /// lookahead decides: `A | (B)` is a parenthesized type, `A | (b: B) => C`
+    /// is a function type.
+    fn parseBareFnTypeConstituent(p: *Parser, from: u32, is_union: bool) PE!?Node {
+        const node, const is_ctor = switch (p.curTag()) {
+            .lt, .lt_lt => .{ try p.parseFunctionType(), false },
+            .l_paren => blk: {
+                const ft = try p.tryParseFunctionType() orelse return null;
+                break :blk .{ ft, false };
+            },
+            .keyword_new => .{ try p.parseConstructorType(false), true },
+            .keyword_abstract => blk: {
+                if (p.peekTag(1) != .keyword_new) return null;
+                break :blk .{ try p.parseConstructorType(true), true };
+            },
+            else => return null,
+        };
+        const code: Code = if (is_ctor)
+            (if (is_union) .ctor_type_in_union else .ctor_type_in_intersection)
+        else
+            (if (is_union) .fn_type_in_union else .fn_type_in_intersection);
+        try p.errAtBytes(code, from, p.lastTokEnd());
+        return node;
+    }
+
     fn parseUnionType(p: *Parser, tq: TrailingQuestion) PE!Node {
         var first_pipe: u32 = 0;
-        if (p.curTag() == .pipe) first_pipe = try p.bump(); // leading `|`
-        const first = try p.parseIntersectionType(tq);
+        var leading_bare: ?Node = null;
+        if (p.curTag() == .pipe) {
+            first_pipe = try p.bump(); // leading `|`
+            leading_bare = try p.parseBareFnTypeConstituent(p.lastTokEnd(), true);
+        }
+        const first = leading_bare orelse try p.parseIntersectionType(tq);
         if (p.curTag() != .pipe and first_pipe == 0) return first;
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
@@ -5005,7 +5248,9 @@ const Parser = struct {
         while (p.curTag() == .pipe) {
             const tok = try p.bump();
             if (main_tok == 0) main_tok = tok;
-            try p.pushScratch(try p.parseIntersectionType(.nullable_marker));
+            const from = p.lastTokEnd();
+            const bare = try p.parseBareFnTypeConstituent(from, true);
+            try p.pushScratch(bare orelse try p.parseIntersectionType(.nullable_marker));
         }
         if (main_tok == 0) main_tok = p.nodes.items(.main_token)[first];
         const range = try p.scratchToSpan(top);
@@ -5014,8 +5259,12 @@ const Parser = struct {
 
     fn parseIntersectionType(p: *Parser, tq: TrailingQuestion) PE!Node {
         var first_amp: u32 = 0;
-        if (p.curTag() == .amp) first_amp = try p.bump();
-        const first = try p.parseTypeOperator(tq);
+        var leading_bare: ?Node = null;
+        if (p.curTag() == .amp) {
+            first_amp = try p.bump();
+            leading_bare = try p.parseBareFnTypeConstituent(p.lastTokEnd(), false);
+        }
+        const first = leading_bare orelse try p.parseTypeOperator(tq);
         if (p.curTag() != .amp and first_amp == 0) return first;
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
@@ -5024,7 +5273,9 @@ const Parser = struct {
         while (p.curTag() == .amp) {
             const tok = try p.bump();
             if (main_tok == 0) main_tok = tok;
-            try p.pushScratch(try p.parseTypeOperator(.nullable_marker));
+            const from = p.lastTokEnd();
+            const bare = try p.parseBareFnTypeConstituent(from, false);
+            try p.pushScratch(bare orelse try p.parseTypeOperator(.nullable_marker));
         }
         if (main_tok == 0) main_tok = p.nodes.items(.main_token)[first];
         const range = try p.scratchToSpan(top);
@@ -5678,6 +5929,21 @@ const Parser = struct {
 
         if (p.curTag() == .l_paren or p.atLt()) {
             const proto = try p.parseFnProtoRest(flags, name_tok);
+            // `type A = { get foo() { return 0 } }` — tsc's `parseTypeMember`
+            // ends every method and accessor with `parseFunctionBlockOrSemicolon`,
+            // so a BODY here parses and the grammar pass answers TS1183: a type
+            // member list is an ambient context, and that is the one diagnostic
+            // tsgo gives the whole shape. Refusing the `{` answered TS1131 and
+            // then re-read the closing `}` as a statement — two false keys per
+            // accessor. The body is parsed for its own diagnostics and dropped:
+            // a signature has no implementation to hang it off, and the ambient
+            // flag keeps its statements from each earning a TS1036 of their own.
+            if (p.curTag() == .l_brace) {
+                const was_ambient = p.ambient;
+                p.ambient = true;
+                defer p.ambient = was_ambient;
+                _ = try p.parseFunctionBody();
+            }
             return p.addNode(.{ .tag = .method_signature, .main_token = name_tok, .data = .{ .lhs = proto, .rhs = flags } });
         }
         var type_ann: Node = null_node;
