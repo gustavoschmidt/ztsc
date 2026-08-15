@@ -1715,6 +1715,10 @@ pub const Checker = struct {
     /// two answers differ, which is exactly when the second report would be
     /// spurious. See `accessibility.Dir`.
     write_target_node: u64 = 0,
+    /// The reference the enclosing expression has put in a CONSTRAINT POSITION
+    /// (tsc's `isConstraintPosition`), announced downward because the AST has
+    /// no parent links. See `checker/narrowable.zig`.
+    constraint_pos: narrowable_zig.ConstraintPos = .{},
     /// Set once any method declares a polymorphic `this` return; gates the
     /// per-property-access `this`-substitution walk so codebases without
     /// `this` types pay nothing.
@@ -3786,6 +3790,9 @@ pub const Checker = struct {
     pub const argumentsMatch = calls_zig.argumentsMatch;
     pub const CallShape = calls_zig.CallShape;
     pub const InferCtx = calls_zig.InferCtx;
+
+    const narrowable_zig = @import("checker/narrowable.zig");
+    pub const narrowableRefType = narrowable_zig.narrowableRefType;
 
     const flow_zig = @import("checker/flow.zig");
     pub const makeRefKey = flow_zig.makeRefKey;
