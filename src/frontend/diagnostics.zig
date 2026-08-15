@@ -116,6 +116,11 @@ pub const Code = enum(u16) {
     line_break_not_allowed,
     /// Trailing comma or elision where the grammar forbids it.
     argument_expected,
+    /// TS1185: a `git`-style merge conflict marker (`<<<<<<< HEAD`, `=======`,
+    /// `|||||||`, `>>>>>>> branch`). Reported by the scanner over the seven
+    /// marker bytes; the marker and the losing side of the conflict are trivia,
+    /// so the file otherwise parses as the winning side alone.
+    merge_conflict_marker,
     /// TS1206: a decorator in a position the grammar forbids (parameter
     /// decorator under TC39 standard decorators).
     decorator_not_valid_here,
@@ -397,6 +402,34 @@ pub const Code = enum(u16) {
     /// TS1028: a second accessibility modifier on one member or parameter
     /// (`public private x`), reported on the second one.
     accessibility_modifier_already_seen,
+    /// TS1191: a modifier on an ES6 import declaration — `export import d from
+    /// "m"`, which tsc parses as an ImportDeclaration carrying an `export` and
+    /// then rejects in `checkGrammarModifiers`. Reported on the modifier.
+    /// `export import A = B.C;` is a different declaration (an
+    /// ImportEqualsDeclaration) and is legal.
+    import_cannot_have_modifiers,
+
+    /// tsc's `checkGrammarIndexSignatureParameters`, in its own order — see
+    /// `src/frontend/index_signature.zig`, which decides which one fires. The
+    /// brackets PARSE as a parameter list, so all of these sit next to whatever
+    /// the file's semantic pass has to say.
+    /// TS1096: `[a, b]: T` (or `[]: T`).
+    index_sig_one_parameter,
+    /// TS1025: `[key: string,]: T`.
+    index_sig_trailing_comma,
+    /// TS1017: `[...rest: any[]]: T`.
+    index_sig_rest_parameter,
+    /// TS1018: `[public k: string]: T`.
+    index_sig_accessibility_modifier,
+    /// TS1019: `[k?: string]: T`.
+    index_sig_question_mark,
+    /// TS1020: `[k: string = "a"]: T`.
+    index_sig_initializer,
+    /// TS1022: `[k]: T` reached as an index signature — only via a shape tsc's
+    /// lookahead claims for one, e.g. `[k,]`.
+    index_sig_parameter_type_annotation,
+    /// TS1021: `[k: string]` with no value type. Reported on the whole node.
+    index_sig_type_annotation,
     /// TS2452: `enum E { 1, 2 }` — a numeric literal as an enum member name.
     /// The grammar ACCEPTS it (it is a PropertyName), so this is a check on a
     /// parsed member, not a parse failure; rejecting it in the parser instead
@@ -589,6 +622,20 @@ pub const Code = enum(u16) {
             .statement_not_allowed_in_ambient,
             .implementation_not_allowed_in_ambient,
             .accessibility_modifier_already_seen,
+            // Same funnel as TS1184/TS1044 — `checkGrammarModifiers`.
+            .import_cannot_have_modifiers,
+            // `checkGrammarIndexSignatureParameters`, likewise the checker's:
+            // `[public x: string]: string` answers TS1018 next to the TS2369 its
+            // parameter property earns, and `[a: number = 1]: number` answers
+            // TS1020 next to a TS2371 (measured).
+            .index_sig_one_parameter,
+            .index_sig_trailing_comma,
+            .index_sig_rest_parameter,
+            .index_sig_accessibility_modifier,
+            .index_sig_question_mark,
+            .index_sig_initializer,
+            .index_sig_parameter_type_annotation,
+            .index_sig_type_annotation,
             .enum_member_numeric_name,
             .enum_member_private_name,
             .computed_name_in_enum,
@@ -702,6 +749,8 @@ pub const Code = enum(u16) {
             .unterminated_regexp => "Unterminated regular expression literal.",
             .unterminated_comment => "'*/' expected.",
             .unexpected_character => "Invalid character.",
+            // Also the scanner's, and reported from the same place tsc does.
+            .merge_conflict_marker => "Merge conflict marker encountered.",
             .shebang_not_at_start => "'#!' can only be used at the start of a file.",
             .file_appears_binary => "File appears to be binary.",
             // tsc appends the corrected spelling (`Use the syntax '0o10'.`) to
@@ -765,6 +814,15 @@ pub const Code = enum(u16) {
             .statement_not_allowed_in_ambient => "Statements are not allowed in ambient contexts.",
             .implementation_not_allowed_in_ambient => "An implementation cannot be declared in ambient contexts.",
             .accessibility_modifier_already_seen => "Accessibility modifier already seen.",
+            .import_cannot_have_modifiers => "An import declaration cannot have modifiers.",
+            .index_sig_one_parameter => "An index signature must have exactly one parameter.",
+            .index_sig_trailing_comma => "An index signature cannot have a trailing comma.",
+            .index_sig_rest_parameter => "An index signature cannot have a rest parameter.",
+            .index_sig_accessibility_modifier => "An index signature parameter cannot have an accessibility modifier.",
+            .index_sig_question_mark => "An index signature parameter cannot have a question mark.",
+            .index_sig_initializer => "An index signature parameter cannot have an initializer.",
+            .index_sig_parameter_type_annotation => "An index signature parameter must have a type annotation.",
+            .index_sig_type_annotation => "An index signature must have a type annotation.",
             .enum_member_numeric_name => "An enum member cannot have a numeric name.",
             .enum_member_private_name => "An enum member cannot be named with a private identifier.",
             .computed_name_in_enum => "Computed property names are not allowed in enums.",
@@ -942,6 +1000,7 @@ pub const Code = enum(u16) {
             .expected_catch_or_finally => 1472,
             .expected_string_literal => 1141,
             .argument_expected => 1135,
+            .merge_conflict_marker => 1185,
             .unterminated_string => 1002,
             .unterminated_template => 1160,
             .unterminated_regexp => 1161,
@@ -970,6 +1029,15 @@ pub const Code = enum(u16) {
             .statement_not_allowed_in_ambient => 1036,
             .implementation_not_allowed_in_ambient => 1183,
             .accessibility_modifier_already_seen => 1028,
+            .import_cannot_have_modifiers => 1191,
+            .index_sig_one_parameter => 1096,
+            .index_sig_trailing_comma => 1025,
+            .index_sig_rest_parameter => 1017,
+            .index_sig_accessibility_modifier => 1018,
+            .index_sig_question_mark => 1019,
+            .index_sig_initializer => 1020,
+            .index_sig_parameter_type_annotation => 1022,
+            .index_sig_type_annotation => 1021,
             .enum_member_numeric_name => 2452,
             .enum_member_private_name => 18024,
             .computed_name_in_enum => 1164,

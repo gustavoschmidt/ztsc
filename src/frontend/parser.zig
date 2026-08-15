@@ -59,6 +59,7 @@ const diagnostics = @import("diagnostics.zig");
 const directives = @import("directives.zig");
 const literals = @import("literals.zig");
 const modifier_order = @import("modifier_order.zig");
+const index_signature = @import("index_signature.zig");
 
 const TokTag = scanner.Tag;
 const Token = scanner.Token;
@@ -204,6 +205,15 @@ const Parser = struct {
     la: [max_la]Token = undefined,
     la_len: u8 = 0,
 
+    /// Merge-conflict marker offsets seen so far, for the TS1185 batch
+    /// `flushConflictMarkers` appends. An accumulator because `fill` — where a
+    /// marker is skipped — is infallible and so cannot allocate a diagnostic;
+    /// a fixed buffer keeps it that way. A file with more than this many
+    /// markers under-reports the rest, which no real file and no corpus case
+    /// comes near (the largest writes four).
+    conflict_markers: [16]u32 = undefined,
+    conflict_marker_len: u8 = 0,
+
     tok_tags: std.ArrayList(TokTag) = .empty,
     tok_starts: std.ArrayList(u32) = .empty,
     nodes: std.MultiArrayList(ast.NodeItem) = .empty,
@@ -331,8 +341,60 @@ const Parser = struct {
 
     fn fill(p: *Parser, n: usize) void {
         while (p.la_len <= n) {
-            p.la[p.la_len] = p.scn.next();
+            var t = p.scn.next();
+            // A merge-conflict marker is TRIVIA (tsc's scanner `continue`s past
+            // it whenever `skipTrivia` is set, which it is for a parser), so the
+            // grammar never sees one. It carries a diagnostic, though, and this
+            // path cannot allocate — hence the fixed side buffer.
+            while (t.tag == .conflict_marker) {
+                p.noteConflictMarker(t);
+                const nl = t.newline_before;
+                t = p.scn.next();
+                t.newline_before = t.newline_before or nl;
+            }
+            p.la[p.la_len] = t;
             p.la_len += 1;
+        }
+    }
+
+    /// Record the marker inside a `.conflict_marker` token for the TS1185 that
+    /// `flushConflictMarkers` appends once the parse is over.
+    fn noteConflictMarker(p: *Parser, t: Token) void {
+        // The marker is the first line-start run of seven WITHIN the token: the
+        // token's own start on the ordinary path, and past the whitespace text
+        // on the JSX-children one (see `scanJsxChild`).
+        var at = t.start;
+        while (at < t.end and !scanner.isConflictMarker(p.src, at)) at += 1;
+        if (at >= t.end) return;
+        // Set semantics, not a high-water mark: a speculative parse can scan
+        // two markers and then backtrack to before the FIRST, so "later than
+        // the last one seen" would drop it when the re-scan reaches it again.
+        for (p.conflict_markers[0..p.conflict_marker_len]) |m| {
+            if (m == at) return;
+        }
+        if (p.conflict_marker_len == p.conflict_markers.len) return;
+        p.conflict_markers[p.conflict_marker_len] = at;
+        p.conflict_marker_len += 1;
+    }
+
+    /// Append one TS1185 per marker seen. Deferred to the end of the parse
+    /// because `fill` is infallible; the driver sorts diagnostics by position
+    /// before emitting them, so the deferral is invisible. The one-per-position
+    /// rule is honoured by declining a position a syntactic diagnostic already
+    /// holds — tsc, which pushes the marker at scan time, would instead have
+    /// suppressed the later parse error, but no token can start at a marker
+    /// (it is trivia), so nothing reaches that position from the parser side.
+    fn flushConflictMarkers(p: *Parser) Error!void {
+        for (p.conflict_markers[0..p.conflict_marker_len]) |at| {
+            var taken = false;
+            for (p.diags.items) |d| {
+                if (d.span.start == at and d.code.class() == .syntactic) taken = true;
+            }
+            if (taken) continue;
+            try p.diags.append(p.gpa, .{
+                .code = .merge_conflict_marker,
+                .span = .{ .start = at, .end = at + 7 },
+            });
         }
     }
 
@@ -545,8 +607,43 @@ const Parser = struct {
         try p.diags.append(p.gpa, span);
     }
 
+    /// The three messages tsc gives a MISSING NAME NODE — `createIdentifier`'s
+    /// own "Identifier expected", and the two its callers pass in,
+    /// `parsePrimaryExpression`'s "Expression expected" and
+    /// `parseEntityNameOfTypeReference`'s "Type expected". They are the only
+    /// diagnostics that move at end of file (see `errAtCur`).
+    fn missingNameNode(code: Code) bool {
+        return switch (code) {
+            .expected_expression, .expected_identifier, .expected_type => true,
+            else => false,
+        };
+    }
+
+    /// Where the eof token's leading trivia BEGAN — just past the last real
+    /// token, or the start of the file when there is none. tsc's
+    /// `scanner.getTokenFullStart()`, which is `fullStartPos`, set at the top of
+    /// `scan()` before the trivia loop runs.
+    fn eofFullStart(p: *Parser) u32 {
+        if (p.tok_tags.items.len == 0) return 0;
+        return p.lastTokEnd();
+    }
+
     fn errAtCur(p: *Parser, code: Code) Error!void {
         const t = p.cur();
+        // tsc's `createMissingNode(reportAtCurrentPosition: token() ===
+        // EndOfFileToken)`: when the parse ran out of FILE, a missing name node
+        // is blamed on the position where the eof token's trivia began — just
+        // past the last real token — and not on the eof token itself. tsc's own
+        // comment is "Only for end of file because the error gets reported
+        // incorrectly on embedded script tags". Measured against tsgo: `const y
+        // =` followed by a comment line answers TS1109 at the end of the FIRST
+        // line, and `const c = foo.` answers TS1003 there, while `const a = {`
+        // and `class D { m(` keep their TS1005 on the eof token — `parseExpected`
+        // has no such rule.
+        if (t.tag == .eof and missingNameNode(code)) {
+            const at = p.eofFullStart();
+            return p.addDiag(code, .{ .code = code, .span = .{ .start = at, .end = at } });
+        }
         const end = if (t.end > t.start) t.end else t.start + 1;
         try p.addDiag(code, .{
             .code = code,
@@ -1079,6 +1176,8 @@ const Parser = struct {
         const t = p.cur();
         std.debug.assert(t.tag == .eof);
         try p.appendTok(t);
+
+        try p.flushConflictMarkers();
     }
 
     /// Parse statements until `terminator` (or eof), pushing them on
@@ -1599,7 +1698,7 @@ const Parser = struct {
                 };
                 return p.parseExpressionStatement();
             },
-            .keyword_import => return p.parseImportStatement(),
+            .keyword_import => return p.parseImportStatement(null),
             .keyword_export => return p.parseExportStatement(),
             .keyword_global => {
                 // Bare `global { ... }` augmentation (no leading `declare`), as
@@ -2828,7 +2927,7 @@ const Parser = struct {
         switch (p.curTag()) {
             .l_bracket => {
                 // Computed member name / index signature in class.
-                if (isIdentLike(p.peekTag(1)) and p.peekTag(2) == .colon) {
+                if (p.atIndexSignature()) {
                     return p.parseIndexSignatureAsClassMember(flags);
                 }
                 // Well-known-symbol key `[Symbol.iterator]`: keyed by a
@@ -3368,13 +3467,27 @@ const Parser = struct {
 
     // --- modules --------------------------------------------------------------
 
-    fn parseImportStatement(p: *Parser) PE!Node {
+    /// `import …;` in all its spellings. `export_kw` is the token index of a
+    /// preceding `export` modifier, or null (an optional, not a 0 sentinel: the
+    /// `export` of a file's FIRST statement IS token 0) — tsc parses
+    /// `export import` as one
+    /// statement with a modifier list and lets `checkGrammarModifiers` judge it:
+    /// an ImportEqualsDeclaration (`export import A = B.C;`, the exported
+    /// namespace alias) accepts `export`, while an ES6 ImportDeclaration
+    /// (`export import d from "m"`) earns TS1191 and nothing else — the file
+    /// still parses, so its semantic pass runs (the `es6Import*WithExport`
+    /// family is 8 corpus cases whose real keys are all downstream of that).
+    fn parseImportStatement(p: *Parser, export_kw: ?u32) PE!Node {
         // `import(` / `import.` are expressions, not declarations.
         if (p.peekTag(1) == .l_paren or p.peekTag(1) == .dot) {
             return p.parseExpressionStatement();
         }
         const kw = try p.bump(); // `import`
         p.saw_module_syntax = true;
+        // `Flags.exported` deliberately NOT set on the ES6 form: the binder reads
+        // only `type_only` out of `ImportData.flags`, and whether tsc's
+        // `export import { a } from "m"` really re-exports `a` (the family's
+        // remaining TS2323/TS2614 keys) is a binder question, not a parse one.
         var flags: u32 = 0;
 
         // `import "module";` — a side-effect-only import, which carries import
@@ -3385,6 +3498,7 @@ const Parser = struct {
             const mod = try p.bump();
             try p.skipImportAttributes();
             try p.expectSemicolon();
+            if (export_kw) |m| try p.errAtToken(.import_cannot_have_modifiers, m);
             const extra = try p.addExtra(ast.ImportData{
                 .flags = 0,
                 .default_name_token = 0,
@@ -3415,7 +3529,8 @@ const Parser = struct {
             // `import d ...` — but `import x = require(...)` is out of subset.
             default_name = try p.bump();
             if (p.curTag() == .eq) {
-                return p.finishImportEquals(kw, default_name, 0);
+                // The ImportEqualsDeclaration arm — `export` belongs here.
+                return p.finishImportEquals(kw, default_name, if (export_kw != null) ast.Flags.exported else 0);
             }
             _ = try p.eat(.comma);
         }
@@ -3437,6 +3552,7 @@ const Parser = struct {
         }
         try p.skipImportAttributes();
         try p.expectSemicolon();
+        if (export_kw) |m| try p.errAtToken(.import_cannot_have_modifiers, m);
 
         const extra = try p.addExtra(ast.ImportData{
             .flags = flags,
@@ -3591,16 +3707,12 @@ const Parser = struct {
                 try p.expectSemicolon();
                 return p.addNode(.{ .tag = .export_assign, .main_token = kw, .data = .{ .lhs = entity, .rhs = 0 } });
             },
-            .keyword_import => {
-                // `export import A = B.C;` inside a namespace (exported alias).
-                const imp_kw = try p.bump();
-                const name_tok = try p.expectIdentLike();
-                if (p.curTag() != .eq) {
-                    try p.fail(.expected_eq);
-                    return p.addNode(.{ .tag = .export_assign, .main_token = kw, .data = .{ .lhs = 0, .rhs = 0 } });
-                }
-                return p.finishImportEquals(imp_kw, name_tok, ast.Flags.exported);
-            },
+            // `export import A = B.C;` is an exported namespace alias and legal;
+            // `export import d from "m"` is an ES6 import declaration with a
+            // modifier, which tsc PARSES and then answers TS1191 for. Both
+            // spellings start the same way, so the one statement parser decides,
+            // and the `export` token it is handed is what TS1191 is blamed on.
+            .keyword_import => return p.parseImportStatement(kw),
             .asterisk => {
                 _ = try p.bump();
                 var ns_name: u32 = 0;
@@ -4641,6 +4753,17 @@ const Parser = struct {
                     _ = try p.expect(.r_brace, .expected_r_brace);
                     try p.pushScratch(try p.addNode(.{ .tag = .jsx_expr_container, .main_token = lb, .data = .{ .lhs = expr, .rhs = 0 } }));
                     pos = p.lastTokEnd();
+                },
+                .conflict_marker => {
+                    // tsc's `parseJsxChild` ENDS the child list on a marker, and
+                    // the "'</' expected" that follows lands on the marker
+                    // token's start — the end of the opening tag's line, because
+                    // `scanJsxToken` fixed `tokenStart` before it went looking
+                    // (`conflictMarkerTrivia3.tsx`).
+                    p.noteConflictMarker(tok);
+                    p.jsxResync(tok.end);
+                    try p.errAtBytes(.expected_gt, tok.start, tok.end);
+                    break;
                 },
                 .lt => {
                     p.jsxResync(tok.start);
@@ -5858,7 +5981,7 @@ const Parser = struct {
         // Index signature `[k: K]: V`.
         var name_tok: u32 = 0;
         if (p.curTag() == .l_bracket) {
-            if (isIdentLike(p.peekTag(1)) and p.peekTag(2) == .colon) {
+            if (p.atIndexSignature()) {
                 return p.parseIndexSignature(flags);
             }
             // `['data-state']: string` / `[0]: T`. A computed key whose
@@ -5951,21 +6074,124 @@ const Parser = struct {
         return p.addNode(.{ .tag = .property_signature, .main_token = name_tok, .data = .{ .lhs = type_ann, .rhs = flags } });
     }
 
+    /// tsc's `isUnambiguouslyIndexSignature`, run as a lookahead from the `[`.
+    /// The sequence an index signature is SPELLED with is `[ id :`, but tsc
+    /// claims five more for error recovery, each of which then answers one
+    /// grammar diagnostic instead of a cascade of parse errors: `[...`, `[]`,
+    /// `[id,`, `[id?,`, `[id?:`, `[id?]`, and `[<modifier> id`. Plain `[id]`,
+    /// `[id.b]`, `[id =` and a literal key are NOT claimed — they are computed
+    /// property names, which is why `[Symbol.iterator]` and `[Kind]` still
+    /// parse as members.
+    fn atIndexSignature(p: *Parser) bool {
+        std.debug.assert(p.curTag() == .l_bracket);
+        const t1 = p.peekTag(1);
+        if (t1 == .dot_dot_dot or t1 == .r_bracket) return true;
+        if (index_signature.isModifierKind(t1)) return isIdentLike(p.peekTag(2));
+        if (!isIdentLike(t1)) return false;
+        const t2 = p.peekTag(2);
+        // A `,` cannot appear in a computed property name (no comma expression
+        // there), so tsc reads it as a badly formed indexer to give the better
+        // error.
+        if (t2 == .colon or t2 == .comma) return true;
+        if (t2 != .question) return false;
+        const t3 = p.peekTag(3);
+        return t3 == .colon or t3 == .comma or t3 == .r_bracket;
+    }
+
+    /// `[k: K]: V` and every shape `atIndexSignature` claims. tsc parses the
+    /// brackets as a PARAMETER LIST and leaves the judging to
+    /// `checkGrammarIndexSignatureParameters`; `index_signature.check` is that
+    /// function, and this collects the shape it needs.
     fn parseIndexSignature(p: *Parser, flags: u32) PE!Node {
         const lb = try p.bump(); // '['
-        const name_tok = try p.expectIdentLike();
-        _ = try p.expect(.colon, .expected_colon);
-        const key_type = try p.parseType();
+        var shape: index_signature.Shape = .{
+            .bracket_token = lb,
+            .parameters = 0,
+            .name_token = null,
+            .trailing_comma = null,
+            .rest = null,
+            .modifier = null,
+            .question = null,
+            .initializer = false,
+            .parameter_type = false,
+            .parameter_type_indexable = false,
+            .value_type = false,
+        };
+        // Only the FIRST parameter is described: every rule past the count
+        // check reads `parameters[0]`, and the count check outranks them all.
+        var key_type: Node = null_node;
+        while (p.curTag() != .r_bracket and p.curTag() != .eof) {
+            const first = shape.parameters == 0;
+            const rest = try p.eat(.dot_dot_dot);
+            var modifier: ?u32 = null;
+            while (index_signature.isModifierKind(p.curTag()) and isIdentLike(p.peekTag(1))) {
+                const m = try p.bump();
+                if (modifier == null) modifier = m;
+            }
+            const name_tok = try p.expectIdentLike();
+            const question = try p.eat(.question);
+            var ty: Node = null_node;
+            // Whether the annotation is the bare `string`, `number` or `symbol`
+            // keyword — the only spellings that provably clear tsc's TS1337 and
+            // TS1268, which sit ahead of the value-type check and need the type
+            // resolved. One token exactly, so `string[]` and `string | number`
+            // do not qualify.
+            var indexable = false;
+            if (try p.eat(.colon) != null) {
+                const key_kw = p.curTag();
+                const before = p.curIdx();
+                ty = try p.parseType();
+                indexable = p.curIdx() == before + 1 and
+                    (key_kw == .keyword_string or key_kw == .keyword_number or key_kw == .keyword_symbol);
+            }
+            var initializer = false;
+            if (try p.eat(.eq) != null) {
+                _ = try p.parseAssignExpr(.{});
+                initializer = true;
+            }
+            if (first) {
+                shape.name_token = name_tok;
+                shape.rest = rest;
+                shape.modifier = modifier;
+                shape.question = question;
+                shape.initializer = initializer;
+                shape.parameter_type = ty != null_node;
+                shape.parameter_type_indexable = indexable;
+                key_type = ty;
+            }
+            shape.parameters += 1;
+            // A `,` that is the last thing in the brackets is tsc's
+            // `hasTrailingComma` on the parameter list.
+            const comma = try p.eat(.comma) orelse break;
+            shape.trailing_comma = if (p.curTag() == .r_bracket) comma else null;
+            // `expectIdentLike` does not consume on failure, so a token that is
+            // neither a name nor `]` would spin here forever without this.
+            if (!isIdentLike(p.curTag()) and p.curTag() != .dot_dot_dot and
+                !index_signature.isModifierKind(p.curTag())) break;
+        }
         _ = try p.expect(.r_bracket, .expected_r_bracket);
-        _ = try p.expect(.colon, .expected_colon);
-        const value_type = try p.parseType();
+        var value_type: Node = null_node;
+        if (try p.eat(.colon) != null) {
+            value_type = try p.parseType();
+            shape.value_type = true;
+        }
         // A type-literal member list separates with `;` OR `,`
         // (`{ [k: string]: E, [k: number]: E }` is legal and common); the
         // member loop eats the separator, so a `,` here is not a missing
         // semicolon. Without this, that shape reported a false TS1005 — and a
         // false parse error suppresses the whole file's semantic pass.
         if (p.curTag() != .comma) try p.expectSemicolon();
-        const extra = try p.addExtra(ast.IndexSig{ .name_token = name_tok, .key_type = key_type, .value_type = value_type });
+        const reports = index_signature.check(shape);
+        if (reports.trailing_comma) |r| try p.errAtToken(r.code, r.token);
+        if (reports.chain) |r| try p.errAtToken(r.code, r.token);
+        // The checker wants a key and a value type; a missing one becomes an
+        // error node rather than 0, which is what every other recovery path in
+        // this parser hands it.
+        const extra = try p.addExtra(ast.IndexSig{
+            .name_token = shape.name_token orelse lb,
+            .key_type = if (key_type != null_node) key_type else try p.errorNode(),
+            .value_type = if (value_type != null_node) value_type else try p.errorNode(),
+        });
         return p.addNode(.{ .tag = .index_signature, .main_token = lb, .data = .{ .lhs = extra, .rhs = flags } });
     }
 };
