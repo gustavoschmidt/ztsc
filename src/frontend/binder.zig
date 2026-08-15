@@ -4421,6 +4421,72 @@ test "dup: an enum on either side of a failed merge is TS2567" {
     try testing.expectEqual(@as(u16, 2567), Code.enum_merge_conflict.tsCode());
 }
 
+test "merged declarations must agree on visibility (TS2395)" {
+    const both: []const Code = &.{ .merged_decl_export_mismatch, .merged_decl_export_mismatch };
+    // One space claimed twice with disagreeing visibility, in a namespace body
+    // and at the top level of a module.
+    try expectBindCodes("namespace N { interface I {} export interface I {} }", both);
+    try expectBindCodes("namespace N { export interface I {} interface I {} }", both);
+    try expectBindCodes("interface c {} export interface c {}", both);
+    try expectBindCodes("interface d {} export class d {}", both);
+    try expectBindCodes("namespace M {} export namespace M {}", both);
+    try expectBindCodes("namespace M { var v: string; export var v: string; }", both);
+    // An `export`ed declaration leaves nothing in `locals` for a later local one
+    // to collide with, so this pair is TS2395 and NOT a duplicate identifier —
+    // while the reverse order stays a duplicate and earns no TS2395.
+    try expectBindCodes("export type A = {}; type A = {}", both);
+    try expectBindCodes("type A = {}; export type A = {}", &.{ .duplicate_identifier, .duplicate_identifier });
+    // No space in common: a type, a namespace and a value can share a name.
+    try expectBindCodes("type t = 0; namespace t { interface I {} } export const t = 0;", &.{});
+    try expectBindCodes("interface b {} export const b = 1;", &.{});
+    // Each block of a reopened namespace has its own `locals`, so a local in one
+    // block beside an `export`ed one in another is legal.
+    try expectBindCodes(
+        "namespace M { export interface E {} interface I {} } namespace M { interface E {} export interface I {} }",
+        &.{},
+    );
+    // A script's top level has no export table to disagree with.
+    try expectBindCodes("interface c {} interface c {}", &.{});
+    try testing.expectEqual(@as(u16, 2395), Code.merged_decl_export_mismatch.tsCode());
+}
+
+test "an overload set needs an implementation (TS2391, TS2390)" {
+    try expectBindCodes("function f();", &.{.missing_function_implementation});
+    try expectBindCodes("function f(): void; function f() {}", &.{});
+    // The LAST non-ambient declaration is the one named, whether or not an
+    // earlier one had a body.
+    try expectBindCodes(
+        "class C { m(n: number): string; m(x: any) { return \"\"; } m(s: string): string; }",
+        &.{.missing_function_implementation},
+    );
+    try expectBindCodes("class C { static s(): void; }", &.{.missing_function_implementation});
+    try expectBindCodes("class C { constructor(); }", &.{.missing_constructor_implementation});
+    try expectBindCodes("namespace N { function f(): void; }", &.{.missing_function_implementation});
+    // Ambient, `abstract`, optional, accessor, and interface/type-literal
+    // members are all legally bodyless.
+    try expectBindCodes("declare function f(): void;", &.{});
+    try expectBindCodes("declare class C { m(): void; }", &.{});
+    try expectBindCodes("declare namespace N { function f(): void; }", &.{});
+    try expectBindCodes("abstract class C { abstract m(): void; }", &.{});
+    try expectBindCodes("class C { m?(): void; }", &.{});
+    try expectBindCodes("interface I { m(): void; }", &.{});
+    try expectBindCodes("type T = { m(): void };", &.{});
+    try testing.expectEqual(@as(u16, 2391), Code.missing_function_implementation.tsCode());
+    try testing.expectEqual(@as(u16, 2390), Code.missing_constructor_implementation.tsCode());
+}
+
+test "a namespace may not precede the class or function it merges with (TS2434)" {
+    try expectBindCodes("namespace m { var y = 2; } function m() {}", &.{.namespace_prior_to_merge});
+    try expectBindCodes("namespace m { export var y = 2; } class m {}", &.{.namespace_prior_to_merge});
+    // Legal: the namespace comes second, is type-only, or the merge partner is
+    // ambient / an overload signature with no body.
+    try expectBindCodes("function m() {} namespace m { export var y = 2; }", &.{});
+    try expectBindCodes("namespace m {} function m() {}", &.{});
+    try expectBindCodes("namespace m { export var y = 2; } declare function m(): void;", &.{});
+    try expectBindCodes("namespace m { export interface I { a: number } } function m() {}", &.{});
+    try testing.expectEqual(@as(u16, 2434), Code.namespace_prior_to_merge.tsCode());
+}
+
 test "dup: a type-only namespace merges with a variable, an instantiated one does not" {
     // tsc's `NamespaceModuleExcludes = 0`: a namespace whose body declares only
     // types emits no runtime object, so it neither displaces nor is displaced
