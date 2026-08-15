@@ -1571,8 +1571,25 @@ const Parser = struct {
                         // still parsing both as one modifier list. Reading
                         // `declare` as an expression instead cost a false
                         // TS2304 and lost the TS1183 the body earns.
+                        // TS1029, but only where tsc's `checkGrammarModifiers`
+                        // actually reaches the pair. Three earlier arms
+                        // short-circuit its walk and each is tsgo's whole answer
+                        // for that shape (measured), so reporting here as well
+                        // would be a second, wrong key:
+                        //   * `declare export = x` -> TS1120 `An export
+                        //     assignment cannot have modifiers.`, on the
+                        //     statement;
+                        //   * a statement list that is not a module body ->
+                        //     TS1184 `Modifiers cannot appear here.`, which
+                        //     ztsc already reports;
+                        //   * an ALREADY ambient context (inside `declare module
+                        //     "m" { … }`) -> TS1038 `A 'declare' modifier cannot
+                        //     be used in an already ambient context.`
+                        // ztsc reports neither TS1120 nor TS1038 yet, so those
+                        // two stay under-reports.
+                        const pair_reaches = p.module_body and !p.ambient and p.peekTag(2) != .eq;
                         _ = try p.bump(); // `declare`
-                        try p.errAtCur(.mod_order_export_declare);
+                        if (pair_reaches) try p.errAtCur(.mod_order_export_declare);
                         const was_ambient = p.ambient;
                         p.ambient = true;
                         defer p.ambient = was_ambient;
@@ -3516,7 +3533,13 @@ const Parser = struct {
         // usual. Refusing the second `export` here answered "an export clause
         // expected" and cost the file its whole semantic pass.
         while (p.curTag() == .keyword_export) {
-            try p.errAtCur(.mod_seen_export);
+            // `export export = x` is TS1120 (`An export assignment cannot have
+            // modifiers.`) in tsc, reported on the statement — an earlier arm
+            // than the repeat, and tsgo's whole answer for that shape. Same for
+            // a statement list that is not a module body, where TS1233 has
+            // already been reported. Neither is a repeat diagnostic, so the
+            // repeat must stay quiet rather than add a second, wrong key.
+            if (p.module_body and p.peekTag(1) != .eq) try p.errAtCur(.mod_seen_export);
             _ = try p.bump();
         }
         // `export public import a = x.c;` — a member modifier between `export`
@@ -4661,17 +4684,20 @@ const Parser = struct {
     /// next child or the closing tag.
     fn parseJsxElementInExpr(p: *Parser) PE!Node {
         const run_start = p.curIdx();
-        const diags_before = p.diags.items.len;
+        // A FRAGMENT is excluded, and it is the one exclusion this rule needs.
+        // tsc's guard is the bare `token() === LessThanToken`, but its fragment
+        // recovery gets there first: `tsxFragmentErrors.tsx` writes `<>hi</div>`
+        // and then `<>eof` on a later line, and tsgo answers TS17015/TS17014 for
+        // the unmatched fragment and NO TS2657 — the `</div>` is not accepted as
+        // the fragment's closing tag, so everything after it, the second
+        // fragment included, is read as a CHILD and no `<` is ever left standing
+        // where this recovery could see it. ztsc does not model that closing-tag
+        // check, so a fragment's trailing `<` cannot be told from an adjacent
+        // element's and the recovery declines to guess. `<div></div>` runs, which
+        // is every corpus case that wants a TS2657, are unaffected.
+        const opens_fragment = p.peekTag(1) == .gt;
         var node = try p.parseJsxElement();
-        if (p.curTag() != .lt) return node;
-        // Only when the element just parsed was WELL FORMED. tsc's guard is the
-        // bare `token() === LessThanToken`, but a malformed first element leaves
-        // tsgo's scanner somewhere this recovery is not reached from:
-        // `tsxFragmentErrors.tsx` writes `<>hi</div>` and then `<>eof` on a later
-        // line and tsgo answers its two fragment diagnostics with NO TS2657,
-        // while `tsxErrorRecovery2.tsx`'s two clean `<div></div>` lines DO earn
-        // one. Requiring a clean first element is what separates the two.
-        if (p.diags.items.len != diags_before) return node;
+        if (p.curTag() != .lt or opens_fragment) return node;
         while (p.curTag() == .lt) {
             const lt = p.curIdx();
             const next = try p.parseJsxElement();
@@ -4884,19 +4910,23 @@ const Parser = struct {
         defer p.scratch.shrinkRetainingCapacity(top);
         while (p.curTag() != .r_brace and p.curTag() != .eof) {
             const before = p.curIdx();
-            // A stray `;` — `var tt = { aa; }`, `var v = { foo(); }`. It starts
-            // no object-literal member and does not end the literal either, and
-            // tsc's `abortParsingListOrMoveToNextToken` CONSUMES it rather than
-            // giving up on the list: `isInSomeParsingContext` asks every
-            // enclosing list whether the token could start an element, and every
-            // statement list answers no for a `;` while in error recovery ("if
-            // we see one and assume it's a statement, then we may bail out
-            // inappropriately from whatever we're parsing"). Breaking out here
-            // instead left the `}` to be re-read as a statement, which answered
-            // a second, false TS1128. The TS1136 is usually suppressed by the
+            // A stray `;` — `var tt = { aa; }`, `var v = { foo(); }`. tsc passes
+            // `considerSemicolonAsDelimiter: true` for an object literal alone
+            // among its delimited lists, and CONSUMES the `;` rather than giving
+            // up on the list ("this can happen when people do things like use a
+            // semicolon to delimit object literal members"). Breaking out here
+            // instead left the `}` to be re-read as a statement, which answered a
+            // second, false TS1128. The TS1136 is usually suppressed by the
             // one-per-position rule, the missing comma having already been
             // reported at this very token.
-            if (p.curTag() == .semicolon) {
+            //
+            // tsc's condition includes `!scanner.hasPrecedingLineBreak()`, and it
+            // is load-bearing: `var v = {\n  a\n;` (no closing brace) answers ONE
+            // key in tsgo, because the `;` on its own line is NOT consumed and the
+            // "'}' expected" that follows lands on it and is suppressed as a
+            // repeat position. Consuming it moved that diagnostic to EOF, where
+            // nothing suppressed it.
+            if (p.curTag() == .semicolon and !p.nlBefore()) {
                 if (p.spec > 0) return error.Backtrack;
                 try p.errAtCur(.expected_property_name);
                 _ = try p.bump();
