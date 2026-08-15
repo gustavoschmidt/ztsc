@@ -5,6 +5,7 @@
 //! Functions take the `Checker` context as their first parameter.
 
 const std = @import("std");
+const ast = @import("../frontend/ast.zig");
 const binder = @import("../frontend/binder.zig");
 const intern = @import("../intern.zig");
 const types = @import("../types.zig");
@@ -87,6 +88,78 @@ fn staticBaseCycle(c: *Checker, sym: SymbolId) bool {
     return false;
 }
 
+/// TS2506 for every class ON the `extends` cycle `sym` just closed. The gray
+/// frames from `sym` to the top of `class_static_stack` are exactly its members
+/// (that is what `staticBaseCycle` established), so a class that merely REACHES
+/// the cycle from outside stays silent — it sits below `sym` on the stack.
+///
+/// This is tsc's `getBaseConstructorTypeOfClass` failing to pop its own
+/// resolution, which is why the message talks about the base EXPRESSION and why
+/// the static side is where it belongs: the base of a class value is an
+/// expression, and resolving it is what re-enters. Reported at each class's
+/// name, in that class's own file, so `diagFmt`'s per-(file, code, span) dedup
+/// keeps one report per class however often the cycle is re-entered — and the
+/// emitted set is a function of the extends graph, not of which class the
+/// traversal happened to start from.
+fn emitStaticBaseCycle(c: *Checker, sym: SymbolId) Error!void {
+    const stack = c.class_static_stack.items;
+    var start = stack.len;
+    while (start > 0) : (start -= 1) {
+        if (stack[start - 1].sym == sym) break;
+    }
+    if (start == 0) return; // `staticBaseCycle` just found it; defensive
+    for (stack[start - 1 ..]) |fr| {
+        const saved = c.enterSymFile(fr.sym);
+        defer c.restoreCtx(saved);
+        for (c.declsOf(fr.sym)) |decl| {
+            if (c.nodeTag(decl) != .class_decl) continue;
+            const data = c.tree.extraData(ast.ClassData, c.tree.nodeData(decl).lhs);
+            if (data.name_token == 0) continue;
+            try c.diagFmt(
+                2506,
+                c.tokSpan(data.name_token),
+                "'{s}' is referenced directly or indirectly in its own base expression.",
+                .{c.symbolName(fr.sym)},
+            );
+            break;
+        }
+    }
+}
+
+/// A class whose `extends` names ITSELF — an `extends` cycle of length one. The
+/// static fold never re-enters on it (`baseClassSym` answers "no base" for a
+/// self-extends, since there are no statics to inherit), so `staticBaseCycle`
+/// cannot see it and it has to be recognized directly.
+///
+/// Screened syntactically first: only a clause whose last identifier repeats the
+/// class's own name can be one, and that is a token comparison, so the base
+/// resolution below runs for essentially no real class.
+fn selfExtendingClass(c: *Checker, sym: SymbolId) Error!bool {
+    var suspect = false;
+    {
+        const saved_ctx = c.enterSymFile(sym);
+        defer c.restoreCtx(saved_ctx);
+        for (c.declsOf(sym)) |decl| {
+            if (c.nodeTag(decl) != .class_decl) continue;
+            const data = c.tree.extraData(ast.ClassData, c.tree.nodeData(decl).lhs);
+            if (data.extends == 0 or data.name_token == 0) continue;
+            const entity = c.tree.nodeData(data.extends).lhs;
+            const last_tok = switch (c.nodeTag(entity)) {
+                .identifier => c.tree.nodeMainToken(entity),
+                // A dotted base (`Module.C`): the member half is the name.
+                .member_expr, .qualified_name => c.tree.nodeData(entity).rhs,
+                else => continue,
+            };
+            if (last_tok == 0) continue;
+            if (std.mem.eql(u8, c.tokenText(last_tok), c.tokenText(data.name_token))) suspect = true;
+            break;
+        }
+    }
+    if (!suspect) return false;
+    const base_ref = (try c.baseClassRef(sym)) orelse return false;
+    return c.ts.kind(base_ref) == .ref and c.ts.refSymbol(base_ref) == sym;
+}
+
 /// Static side of a class (statics as object props; construct handled
 /// separately by `new` resolution).
 pub fn classStaticType(c: *Checker, sym: SymbolId) Error!TypeId {
@@ -98,7 +171,20 @@ pub fn classStaticType(c: *Checker, sym: SymbolId) Error!TypeId {
     // Is this re-entry an `extends` cycle (or past the depth backstop)? Both
     // answers are properties of the heritage graph alone, so both are the same
     // whoever asks first. See `Checker.class_static_stack`.
-    const cycle = staticBaseCycle(c, sym) or
+    const base_cycle = staticBaseCycle(c, sym);
+    // The cycle is a malformed program, not just something the fold has to cut:
+    // report it. Only a real `extends` cycle does — the depth backstop below is a
+    // resource bound, and a deep-but-legal chain must stay silent.
+    if (base_cycle) {
+        try emitStaticBaseCycle(c, sym);
+    } else if (try selfExtendingClass(c, sym)) {
+        // The one-class cycle: `sym` is not on the stack yet, so push its frame
+        // first and let the same emitter name it.
+        try c.class_static_stack.append(c.cm(), .{ .sym = sym });
+        defer _ = c.class_static_stack.pop();
+        try emitStaticBaseCycle(c, sym);
+    }
+    const cycle = base_cycle or
         c.class_static_stack.items.len >= checker_zig.max_class_static_depth;
     try c.class_static_stack.append(c.cm(), .{ .sym = sym });
     const my_frame = c.class_static_stack.items.len - 1;
