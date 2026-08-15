@@ -37,6 +37,7 @@ const propOfType = @import("props.zig").propOfType;
 const lazy_zig = @import("instantiate.zig");
 const resolveStructural = @import("instantiate.zig").resolveStructural;
 const restUnionOptionalAt = @import("typenode.zig").restUnionOptionalAt;
+const sliceTuple = @import("typenode.zig").sliceTuple;
 const tuple_zig = @import("tuple_relate.zig");
 const variance_zig = @import("variance.zig");
 const report_zig = @import("assign_report.zig");
@@ -3814,62 +3815,232 @@ pub fn isNumericPropName(text: []const u8) bool {
     return true;
 }
 
-/// Attempt to relate a generic *source* signature to a concrete target by
-/// inferring the source's own type params from the target signature and
-/// relating the instantiation. Returns true only when a legal instantiation
-/// (inferred args satisfy their constraints) relates in full; false
-/// otherwise, so the caller falls through to the erase-to-constraint path.
+/// Relate a generic *source* signature to a target by inferring the source's
+/// own type params from the target signature and relating the instantiation.
+/// `null` — no verdict — when there is no instantiation to relate: a
+/// non-generic source, a non-function on either side, a pair that shares its
+/// type parameters, or an inferred argument that violates its constraint. The
+/// caller then falls through to the erase-to-constraint path.
+///
 /// Mirrors tsc's `compareSignaturesRelated`, which instantiates rather than
-/// erases a generic source. Only fires for a generic function source against
-/// a concrete (non-generic) function target.
-pub fn genericSourceRelatesByInference(c: *Checker, s: TypeId, t: TypeId) Error!bool {
-    if (c.ts.fnTypeParams(t).len != 0) return false; // target still generic
-    const inst = (try c.instantiateSigInContextOf(s, t)) orelse return false;
-    return c.signatureAssignable(inst, t);
+/// erases a generic source:
+///
+/// ```ts
+/// if (source.typeParameters && source.typeParameters !== target.typeParameters) {
+///     target = getCanonicalSignature(target);
+///     source = instantiateSignatureInContextOf(source, target, /*inferenceContext*/ undefined, compareTypes);
+/// }
+/// ```
+///
+/// The TARGET is never erased there — its own type parameters stay FREE, and
+/// the instantiated source references whichever of them the inference bound.
+/// That is why the comparison runs in `.free` mode: erasing both sides to
+/// their constraints instead collapses `(x: T_target) => …` against
+/// `(x: T_outer) => …` into `any` versus `any` and accepts every such pair
+/// (`subtypingWithConstructSignatures6`'s `I4`/`I5`/`I7`, where the derived
+/// member's `<U>` is bound to the base member's own `U` and the two
+/// interfaces' `T`s are then unrelated).
+pub fn genericSourceRelatesByInference(c: *Checker, s: TypeId, t: TypeId) Error!?bool {
+    // tsc's `source.typeParameters !== target.typeParameters` half of the guard:
+    // two instantiations of the SAME generic declaration are compared as they
+    // are (and, in ztsc, erased to `any` below — see `sameSigTypeParams`).
+    // Inferring one side's parameters from the other's would only rediscover
+    // the identity, and it is not free: this is the kysely/drizzle builder
+    // shape, whose constraints span every column of every table.
+    if (sameSigTypeParams(c, s, t)) return null;
+    const inst = (try c.instantiateSigInContextOf(s, t)) orelse return null;
+    return try c.signatureAssignableModeInnerErase(inst, t, .none, .free);
 }
 
 /// tsc's `instantiateSignatureInContextOf`: infer `s`'s OWN type parameters
-/// from `t`'s parameters and return type and hand back the instantiation, or
-/// `null` when `s` is not a generic signature or an inferred argument would
-/// violate its constraint (tsc rejects such a pair). `t`'s own type
-/// parameters, if any, stay free and are legitimate inference results — that
-/// is how `<TE>(from: TE) => X<TE>` relates to `<TE2>(from: TE2) => X<TE2>`
-/// without either side being collapsed.
+/// from `t`'s parameters and return type and hand back the instantiation.
+/// `null` when `s` is not a generic function signature — there is then no
+/// instantiation to relate. `t`'s own type parameters, if any, stay free and
+/// are legitimate inference results: that is how `<TE>(from: TE) => X<TE>`
+/// relates to `<TE2>(from: TE2) => X<TE2>` without either side being collapsed.
 pub fn instantiateSigInContextOf(c: *Checker, s: TypeId, t: TypeId) Error!?TypeId {
     if (c.ts.kind(s) != .function or c.ts.kind(t) != .function) return null;
     const tps = c.ts.fnTypeParams(s);
     if (tps.len == 0) return null; // source not generic
     const tp_syms = try c.scratch().dupe(u32, tps);
+    // tsc instantiates a generic method's own type parameters with a fresh
+    // CLONE whenever the type that declares it is instantiated
+    // (`createCanonicalSignature`: "when a generic class or interface is
+    // instantiated, each generic method in the class or interface is
+    // instantiated with a fresh set of cloned type parameters"), so a
+    // signature's own parameter can never also occur free in the pair being
+    // related. ztsc keys a type parameter by its DECLARATION symbol and does
+    // not clone, so `new Cons<U>()` written inside `Cons.map<U>` hands back a
+    // member whose own `U` IS the enclosing method's: the inference variable
+    // and the concrete type it must not capture are one symbol. Inferring
+    // through that capture solved `U := D` against `Nil<U>.map<D>` and then
+    // rejected a pair tsc accepts (`typeInferenceReturnTypeCallback`).
+    //
+    // Detected by substituting the source's own parameters in the TARGET — a
+    // target that CHANGES mentions one of them, so the capture is real and
+    // there is no trustworthy instantiation to relate. (`instantiate` is the
+    // occurs-check ztsc already has; a truncated substitution also answers
+    // "changed", which lands on the same safe side.)
+    {
+        const probe = try c.scratch().alloc(TpMap, tp_syms.len);
+        for (tp_syms, 0..) |tp, k| probe[k] = .{ .sym = tp, .ty = types.unknown_type };
+        if ((try c.instantiate(t, probe)) != t) return null;
+    }
     const cand = try c.scratch().alloc(TypeId, tp_syms.len);
     for (cand) |*x| x.* = types.no_type;
-    // Infer the source's params from the aligned target params (and the
-    // returns), pinning each type param to the concrete shape the target
-    // demands.
-    const n = @min(c.ts.fnParamCount(s), c.ts.fnParamCount(t));
-    var i: u32 = 0;
-    while (i < n) : (i += 1) {
-        try c.unify(c.ts.fnParam(s, i).ty, c.ts.fnParam(t, i).ty, tp_syms, cand, 0);
-    }
+    try applyToParameterTypes(c, s, t, tp_syms, cand);
     try c.unify(c.ts.fnReturn(s), c.ts.fnReturn(t), tp_syms, cand, 0);
-    // Build the substitution: an inferred arg must satisfy its constraint
-    // (else the instantiation is illegal — tsc rejects); an unbound param
-    // falls back to its constraint (or `unknown`).
+    // Build the substitution. tsc's `getInferredType` closes with
+    //
+    //     const constraint = getConstraintOfTypeParameter(inference.typeParameter);
+    //     if (constraint) {
+    //         const instantiatedConstraint = instantiateType(constraint, context.nonFixingMapper);
+    //         if (!inferredType || context.compareTypes(inferredType, …) === Ternary.False) {
+    //             inference.inferredType = inferredType = instantiatedConstraint;
+    //         }
+    //     }
+    //
+    // so a parameter with NO candidate comes out as its CONSTRAINT.
+    // `callSignatureAssignabilityInInheritance3`'s `I3` rests on exactly that
+    // ("no inferences for `V` so it defaults to `Derived2`", its declared
+    // constraint). What ztsc does differently for a candidate that FAILS its
+    // constraint is measured, not deduced — see the loop below.
     const map = try c.scratch().alloc(TpMap, tp_syms.len);
     for (tp_syms, 0..) |tp, k| {
         const con = try c.typeParamConstraint(tp);
-        var val = cand[k];
-        if (val == types.no_type) {
-            val = if (con != types.no_type) con else types.unknown_type;
-        } else if (con != types.no_type and !try c.isAssignable(val, con)) {
-            return null;
+        map[k] = .{
+            .sym = tp,
+            .ty = if (cand[k] != types.no_type)
+                cand[k]
+            else if (con != types.no_type)
+                con
+            else
+                types.unknown_type,
+        };
+    }
+    // `nonFixingMapper` is the whole context's mapper, so a constraint standing
+    // in for an unbound parameter is read with every OTHER parameter already
+    // substituted. `Ret extends (TOpt['returnObjects'] extends true ? object :
+    // string)` needs it twice over: `TOpt` has to become `Opts` before the
+    // indexed access resolves, and only then does the conditional reduce to
+    // `string`. Driven to a fixed point for the same reason `eraseParamsOf` is
+    // (`test/conformance/assignability/043_generic_sig_nested_constraint_erase`,
+    // react-i18next's `TFunction` against `(key: string) => string`).
+    var iter: usize = 0;
+    while (iter + 1 < map.len) : (iter += 1) {
+        var changed = false;
+        for (map) |*m| {
+            const ni = try c.instantiate(m.ty, map);
+            if (ni != m.ty) {
+                changed = true;
+                m.ty = ni;
+            }
         }
-        map[k] = .{ .sym = tp, .ty = val };
+        if (!changed) break;
+    }
+    // Now the constraint check, against the RESOLVED constraint. tsc replaces
+    // an offending candidate with the constraint
+    // (`inference.inferredType = inferredType = instantiatedConstraint`); ztsc
+    // DECLINES the whole instantiation instead, and the reason is
+    // oracle-measured rather than deduced. In tsgo 7.0.2
+    //
+    //     declare var s1: <T extends string>() => T;
+    //     var q: <T extends string>() => T | Promise<T> = s1;   // accepted
+    //
+    // is legal, and the candidate the return position infers for the source's
+    // `T` is the target's `T2 | Promise<T2>` — which plainly fails the `string`
+    // constraint. So whatever tsc does with such a candidate, it is not "use
+    // the constraint and then reject": substituting `string` yields
+    // `() => string`, which does not relate to `() => T2 | Promise<T2>` with
+    // `T2` free (`inferenceContextualReturnTypeUnion4`, and the abstract
+    // `Storage.get` override it comes from).
+    //
+    // Declining hands the pair to the erase-to-constraints path below, and
+    // tsgo agrees with that path in both directions: it accepts the pair above
+    // (both sides erase to a `string`-returning signature) and still rejects
+    // `043`'s negative control, whose `Ret` constraint collapses to `object`.
+    for (tp_syms, 0..) |tp, k| {
+        if (cand[k] == types.no_type) continue; // already the constraint
+        const con = try c.typeParamConstraint(tp);
+        if (con == types.no_type) continue;
+        if (!try c.isAssignable(cand[k], try c.instantiate(con, map))) return null;
     }
     const inst = try c.instantiate(s, map);
     // A full map over the source's own params yields a non-generic sig; if
     // anything remains generic, bail rather than risk recursion.
     if (c.ts.kind(inst) != .function or c.ts.fnTypeParams(inst).len != 0) return null;
     return inst;
+}
+
+/// tsc's `applyToParameterTypes`, which pairs the CONTEXTUAL signature's
+/// parameter positions with the signature being instantiated:
+///
+/// ```ts
+/// const sourceRestType = getEffectiveRestType(source);   // the contextual sig
+/// const targetRestType = getEffectiveRestType(target);   // the sig being instantiated
+/// const targetNonRestCount = targetRestType ? targetCount - 1 : targetCount;
+/// const paramCount = sourceRestType ? targetNonRestCount : Math.min(sourceCount, targetNonRestCount);
+/// if (sourceThisType) { const targetThisType = getThisTypeOfSignature(target); if (targetThisType) callback(sourceThisType, targetThisType); }
+/// for (let i = 0; i < paramCount; i++) callback(getTypeAtPosition(source, i), getTypeAtPosition(target, i));
+/// if (targetRestType) callback(getRestTypeAtPosition(source, paramCount), targetRestType);
+/// ```
+///
+/// Positions, not stored parameters: a contextual `(...s: string[])` supplies
+/// `string` to EVERY position the instantiated signature has, and its rest
+/// count does not cap the pairing. Walking the two stored lists instead unified
+/// the source's first type parameter against the whole `string[]`, so
+/// `var sig: typeof contextual = toInstantiate` — `<A, B>(a?: A, b?: B) => B`
+/// against `(...s: string[]) => string` — solved `A := string[]` and rejected a
+/// pair tsc accepts (`contextualSigInstantiationRestParams`).
+///
+/// The `this` pairing is tsc's too, and it is what makes a `this`-parameter
+/// overload like `CallableFunction.call<T, A extends any[], R>(this: (this: T,
+/// ...args: A) => R, …)` infer anything at all.
+fn applyToParameterTypes(c: *Checker, s: TypeId, t: TypeId, tp_syms: []const u32, cand: []TypeId) Error!void {
+    const s_rest = try effectiveRestType(c, s);
+    const t_rest = try effectiveRestType(c, t);
+    const s_count = try c.effParamCount(s);
+    const s_non_rest = if (s_rest != null) s_count - 1 else s_count;
+    const pair_count = if (t_rest != null) s_non_rest else @min(try c.effParamCount(t), s_non_rest);
+
+    const s_this = c.ts.fnThisType(s);
+    const t_this = c.ts.fnThisType(t);
+    if (t_this != 0 and s_this != 0) try c.unify(s_this, t_this, tp_syms, cand, 0);
+
+    var i: u32 = 0;
+    while (i < pair_count) : (i += 1) {
+        const sp = (try c.paramTypeAt(s, i)) orelse break;
+        const tp = (try c.paramTypeAt(t, i)) orelse break;
+        try c.unify(sp, tp, tp_syms, cand, 0);
+    }
+    if (s_rest) |sr| try c.unify(sr, try c.restTupleAtPosition(t, pair_count), tp_syms, cand, 0);
+}
+
+/// tsc's `getEffectiveRestType`: what a signature's rest parameter types the
+/// positions from its own index onward, collectively. `null` when there is no
+/// rest parameter, or when its type is a fully FIXED tuple — such a rest has a
+/// positional expansion, so every position is an ordinary parameter.
+///
+/// ```ts
+/// if (signatureHasRestParameter(signature)) {
+///     const restType = getTypeOfSymbol(signature.parameters[signature.parameters.length - 1]);
+///     if (!isTupleType(restType)) return isTypeAny(restType) ? anyArrayType : restType;
+///     if (restType.target.hasRestElement) return sliceTupleType(restType, restType.target.fixedLength);
+/// }
+/// return undefined;
+/// ```
+fn effectiveRestType(c: *Checker, sig: TypeId) Error!?TypeId {
+    const count = c.ts.fnParamCount(sig);
+    if (count == 0) return null;
+    const p = c.ts.fnParam(sig, count - 1);
+    if (!p.rest()) return null;
+    const r = try c.resolveStructural(p.ty);
+    if (c.ts.kind(r) != .tuple) {
+        return if (c.ts.kind(r) == .any) try c.ts.makeArray(types.any_type) else p.ty;
+    }
+    const fixed = tuple_zig.fixedLength(c, r);
+    if (fixed >= c.ts.tupleLen(r)) return null;
+    return try sliceTuple(c, r, fixed, 0);
 }
 
 /// tsc's `SignatureCheckMode` (the subset ztsc models). A signature-valued
@@ -3914,7 +4085,20 @@ pub fn signatureAssignableMode(c: *Checker, s: TypeId, t: TypeId, mode: SigMode)
 
 /// How a generic signature's own type parameters are collapsed before the
 /// pair is compared — see `signatureAssignableErased`.
-pub const Erase = enum { constraints, any };
+pub const Erase = enum {
+    /// tsc's `getBaseSignature`: each own type parameter → its constraint.
+    /// ztsc's stand-in for the 1-vs-1 case tsc handles by instantiating the
+    /// source in the target's context.
+    constraints,
+    /// tsc's `getErasedSignature`: each own type parameter → `any`.
+    any,
+    /// Neither side is collapsed. tsc's *actual* 1-vs-1 comparison, reached
+    /// once the source has been instantiated in the target's context: the
+    /// target's own type parameters stay free, so only a source that works for
+    /// every instantiation of them relates. See
+    /// `genericSourceRelatesByInference`, its only caller.
+    free,
+};
 
 pub fn signatureAssignableModeErase(c: *Checker, s: TypeId, t: TypeId, mode: SigMode, erase: Erase) Error!bool {
     if (try c.signatureAssignableModeInnerErase(s, t, mode, erase)) return true;
@@ -4052,17 +4236,32 @@ pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode
     // other generic-signature relation relies on untouched (a general
     // abstract-param relation here regresses jest/mock generic sigs).
     if (try c.identityProbeRelated(s, t)) |res| return res;
-    // A generic *source* signature may relate to a concrete target by
-    // instantiating its own type params — inferred from the target's
-    // parameters/return — instead of erasing them to their (possibly far
-    // wider) constraints. `<T extends AllGeoJSON>(f: T) => T` relates to
-    // `(v: Feature) => Feature` by inferring T = Feature; the erase-to-
-    // constraint path below instead over-widens the covariant return
-    // (`=> AllGeoJSON` ⊄ `=> Feature`) and wrongly rejects. Purely additive:
-    // only returns true, and only after verifying the inferred args satisfy
-    // their constraints and the instantiated (non-generic) source relates in
-    // full — so it never accepts what the erasure path would soundly reject.
-    if (try c.genericSourceRelatesByInference(s, t)) return true;
+    // A generic *source* signature relates by instantiating its own type
+    // params — inferred from the target's parameters/return — instead of
+    // erasing them to their (possibly far wider) constraints.
+    // `<T extends AllGeoJSON>(f: T) => T` relates to `(v: Feature) => Feature`
+    // by inferring T = Feature; the erase-to-constraint path below instead
+    // over-widens the covariant return (`=> AllGeoJSON` ⊄ `=> Feature`) and
+    // wrongly rejects.
+    //
+    // Where an instantiation EXISTS its verdict is final, exactly as tsc's
+    // `compareSignaturesRelated` has no fallback once it has replaced the
+    // source. Falling through to the erasure on a negative answer is what let
+    // `interface I4<T> extends A { a4: new <U>(x: T, y: U) => string }` past
+    // `a4: new <T, U>(x: T, y: U) => string`: erasing the TARGET's
+    // unconstrained `T` to `any` made it assignable to `I4`'s own `T`, so the
+    // whole `subtypingWith{Call,Construct}Signatures` "class type parameter
+    // instead of a generic signature" family stayed silent.
+    //
+    // Only in the un-erased (`.constraints`) position. tsc's `erase = true`
+    // callers run `getErasedSignature` on BOTH sides *before*
+    // `compareSignaturesRelated`, so a source reaching those has no type
+    // parameters left to instantiate and the question never arises; ztsc
+    // erases inside this function instead, so the inference stays purely
+    // additive there.
+    if (try c.genericSourceRelatesByInference(s, t)) |ok| {
+        if (ok or erase_in == .constraints) return ok;
+    }
     // tsc decides bivariance from the TARGET's declaration kind ALONE:
     // `compareSignaturesRelated` reads `strictVariance` off
     // `target.declaration.kind` (`MethodDeclaration` / `MethodSignature` /
@@ -4098,15 +4297,23 @@ pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode
     // against `SelectQueryBuilder<B>.where`, whose constraints are unions
     // over every column of every table in the schema.
     if (erase == .constraints and sameSigTypeParams(c, s, t)) erase = .any;
-    var se = if (erase == .any) try c.eraseParamsToAny(s) else try c.eraseTypeParams(s);
-    var te = if (erase == .any) try c.eraseParamsToAny(t) else try c.eraseTypeParams(t);
+    var se = switch (erase) {
+        .any => try c.eraseParamsToAny(s),
+        .constraints => try c.eraseTypeParams(s),
+        .free => s,
+    };
+    var te = switch (erase) {
+        .any => try c.eraseParamsToAny(t),
+        .constraints => try c.eraseTypeParams(t),
+        .free => t,
+    };
     // The source may be an arrow contextually typed by the generic target:
     // its param/return types then reference the TARGET's type-param symbols
     // as free params (the arrow itself carries no type params, so
     // `eraseTypeParams(s)` left them intact). Erase those against the
     // target's constraints too, so both sides collapse the shared params
     // consistently — the `renderHook`/`typeof base` higher-order wrapper.
-    if (c.ts.fnTypeParams(s).len == 0 and c.ts.fnTypeParams(t).len > 0) {
+    if (erase != .free and c.ts.fnTypeParams(s).len == 0 and c.ts.fnTypeParams(t).len > 0) {
         const shared = if (erase == .any) try c.eraseParamsToAnyOf(se, t) else try c.eraseParamsOf(se, t);
         if (shared != se) {
             se = shared;
