@@ -998,8 +998,8 @@ fn checkInstanceSideExtends(c: *Checker, class_sym: SymbolId, members: []const N
         };
         // tsc's `if (isStatic(member)) continue;` — this is the INSTANCE side.
         if (flags & ast.Flags.static != 0) continue;
+        if (c.isCtorMember(member, flags)) continue;
         const name_atom = try c.memberKey(c.tree.nodeMainToken(member), flags);
-        if (c.isCtorName(name_atom)) continue;
         const prop = (try c.propOfTypeEx(derived, name_atom, false)) orelse continue;
         const base_prop = (try c.propOfTypeEx(base, name_atom, false)) orelse continue;
         if (prop.ty == base_prop.ty) continue;
@@ -1732,7 +1732,7 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
                     this_t;
                 const sig = try c.signatureOfProto(member, md.lhs, true, true);
                 if (md.rhs != 0) {
-                    const is_ctor = !is_static and c.isCtorName(try c.memberAtom(c.tree.nodeMainToken(member)));
+                    const is_ctor = c.isCtorMember(member, proto.flags);
                     const saved_ctor = c.ctor_class_sym;
                     if (is_ctor) c.ctor_class_sym = class_sym;
                     defer c.ctor_class_sym = saved_ctor;

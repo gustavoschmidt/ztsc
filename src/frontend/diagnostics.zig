@@ -380,6 +380,20 @@ pub const Code = enum(u16) {
     /// constructor whose body would do the assigning (tsc's `checkParameter`).
     /// Reported over the parameter's first token, which is the modifier.
     param_property_outside_ctor_impl,
+    /// TS2398: a parameter property named `constructor`. The modifier turns the
+    /// parameter into a class member, and `constructor` is the one member name
+    /// a class cannot have — the constructor itself already owns that slot in
+    /// the prototype (tsc keys it under the reserved `__constructor`, so the
+    /// two never collide and the name is rejected outright instead). Reported
+    /// on the parameter's NAME, not on its modifier.
+    ctor_as_param_property_name,
+    /// TS1341: `get constructor()` / `set constructor(v)` in a class. tsc's
+    /// parser makes a method named `constructor` a ConstructorDeclaration but an
+    /// ACCESSOR of that name an ordinary accessor, and then rejects it: the
+    /// prototype's `constructor` slot is not a place an accessor can go.
+    /// Reported on the name token, and NOT gated on `static` (`static get
+    /// constructor` reports too — verified against tsgo 7.0.2).
+    ctor_may_not_be_accessor,
     /// TS17009: `this` reached in a derived class's constructor on a path that
     /// has not run `super(...)` yet — the base constructor is what brings the
     /// instance into existence. Reported on the `this` keyword. Flow-sensitive
@@ -588,6 +602,7 @@ pub const Code = enum(u16) {
             .overload_must_be_static,
             .overload_must_not_be_static,
             .param_property_outside_ctor_impl,
+            .ctor_as_param_property_name,
             .super_before_this,
             .super_before_super_property,
             .decorator_not_valid_here,
@@ -732,6 +747,7 @@ pub const Code = enum(u16) {
             .mod_order_abstract_override,
             .mod_order_abstract_accessor,
             .mod_order_export_declare,
+            .ctor_may_not_be_accessor,
             => .grammar,
 
             else => .syntactic,
@@ -944,6 +960,8 @@ pub const Code = enum(u16) {
             .overload_must_be_static => "Function overload must be static.",
             .overload_must_not_be_static => "Function overload must not be static.",
             .param_property_outside_ctor_impl => "A parameter property is only allowed in a constructor implementation.",
+            .ctor_as_param_property_name => "'constructor' cannot be used as a parameter property name.",
+            .ctor_may_not_be_accessor => "Class constructor may not be an accessor.",
             .super_before_this => "'super' must be called before accessing 'this' in the constructor of a derived class.",
             .super_before_super_property => "'super' must be called before accessing a property of 'super' in the constructor of a derived class.",
             .unsupported_syntax => "syntax not yet supported by ztsc",
@@ -1078,6 +1096,8 @@ pub const Code = enum(u16) {
             .overload_must_be_static => 2387,
             .overload_must_not_be_static => 2388,
             .param_property_outside_ctor_impl => 2369,
+            .ctor_as_param_property_name => 2398,
+            .ctor_may_not_be_accessor => 1341,
             .super_before_this => 17009,
             .super_before_super_property => 17011,
             .decorator_not_valid_here => 1206,

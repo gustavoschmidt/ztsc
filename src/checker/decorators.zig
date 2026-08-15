@@ -174,7 +174,7 @@ fn checkLegacyMemberDeco(c: *Checker, deco: Node, dt: TypeId, target: Node, this
             const proto = c.tree.extraData(ast.FnProto, md.lhs);
             // A constructor takes no decorator (the grammar rejects it) and
             // tsc has no head message for that position.
-            if (c.isCtorName(try c.memberAtom(c.tree.nodeMainToken(target)))) return;
+            if (c.isCtorMember(target, proto.flags)) return;
             const is_get = proto.flags & ast.Flags.get != 0;
             const is_set = proto.flags & ast.Flags.set != 0;
             pos = if (is_get) .getter else if (is_set) .setter else .method;

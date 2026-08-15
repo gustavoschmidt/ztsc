@@ -29,6 +29,7 @@ const std = @import("std");
 const ast = @import("../frontend/ast.zig");
 const intern = @import("../intern.zig");
 const binder = @import("../frontend/binder.zig");
+const member_names = @import("../frontend/member_names.zig");
 const types = @import("../types.zig");
 const modules = @import("../link/modules.zig");
 
@@ -755,8 +756,23 @@ pub fn classInterfaceHalfBases(c: *Checker, sym: SymbolId, acc: TypeId) Error!Ha
     return .{ .ty = own, .provisional = provisional };
 }
 
+/// Is this member-table key the class's constructor? The constructor is keyed
+/// under a reserved name (`member_names.ctor_member_name`) precisely so that no
+/// source-spelled member can answer yes — `constructor(public constructor: T)`
+/// declares a parameter property whose key IS the text `constructor`, and it is
+/// an ordinary member.
 pub fn isCtorName(c: *Checker, name: Atom) bool {
-    return std.mem.eql(u8, c.atomText(name), "constructor");
+    return std.mem.eql(u8, c.atomText(name), member_names.ctor_member_name);
+}
+
+/// The same question asked of a member DECLARATION rather than of a key — for
+/// the sites that have the `.class_method` node in hand and no member table
+/// (`checkMemberOverrides`, the method-body walk, the decorator target). Before
+/// the reserved key existed these compared the name atom's text, which now
+/// answers no for the constructor and yes for a parameter property of that
+/// name — exactly backwards.
+pub fn isCtorMember(c: *Checker, member: ast.Node, flags: u32) bool {
+    return member_names.isCtorMethod(c.tree, member, flags);
 }
 
 /// Ceiling on the `extends` walk in `lazyRefProp`. A base chain is already

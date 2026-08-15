@@ -72,6 +72,7 @@ const intern = @import("../intern.zig");
 const numeric_lit = @import("../numeric_lit.zig");
 const diagnostics = @import("diagnostics.zig");
 const literals = @import("literals.zig");
+const member_names = @import("member_names.zig");
 const decl_spaces = @import("decl_spaces.zig");
 const impl_expected = @import("impl_expected.zig");
 const source = @import("source.zig");
@@ -2548,6 +2549,15 @@ const Binder = struct {
                     const class_scope = b.scope_parents.items[b.cur_scope];
                     if (b.memberScopeOfClassScope(class_scope)) |ms| {
                         const tok = b.tree.nodeMainToken(d.lhs);
+                        // TS2398: the modifier makes this a class member, and
+                        // `constructor` is the one member name a class cannot
+                        // have. Still DECLARED (under the literal text — the
+                        // constructor itself sits under a reserved key), so two
+                        // ctor signatures that both spell it are still the
+                        // duplicate identifier tsc reports.
+                        if (b.tree.tokens.tag(tok) == .keyword_constructor) {
+                            try b.diag(.ctor_as_param_property_name, tok);
+                        }
                         _ = try b.declare(ms, try b.atomOfToken(tok), .property, node, tok, .{
                             .readonly_member = e.flags & ast.Flags.readonly != 0,
                             .non_public = e.flags & nonpublic_mask != 0,
@@ -2666,7 +2676,26 @@ const Binder = struct {
                     const is_get = proto.flags & ast.Flags.get != 0;
                     const is_set = proto.flags & ast.Flags.set != 0;
                     const tok = b.tree.nodeMainToken(member);
-                    const atom = try b.memberNameKey(tok, proto.flags);
+                    // The constructor goes in the member table under a RESERVED
+                    // key, tsc's `InternalSymbolName.Constructor`: `constructor`
+                    // is a name a parameter property can be spelled with
+                    // (`constructor(public constructor: string)`), and keying
+                    // both under the literal text made every such class a
+                    // duplicate-identifier pair. Nothing looks the constructor
+                    // up by text — `isCtorMember`/`isCtorName` are the only two
+                    // ways to ask, and both know the reserved spelling.
+                    const atom = if (member_names.isCtorMethod(b.tree, member, proto.flags))
+                        try b.atomOf(member_names.ctor_member_name)
+                    else
+                        try b.memberNameKey(tok, proto.flags);
+                    // TS1341: an ACCESSOR named `constructor` is not the
+                    // constructor (tsc's parser only makes a METHOD of that name
+                    // a `ConstructorDeclaration`) — it is an ordinary accessor
+                    // occupying a slot the prototype reserves, which tsc rejects
+                    // outright. Not gated on `static`.
+                    if ((is_get or is_set) and b.tree.tokens.tag(tok) == .keyword_constructor) {
+                        try b.diag(.ctor_may_not_be_accessor, tok);
+                    }
                     const kind: DeclKind = if (is_get) .getter else if (is_set) .setter else .method;
                     _ = try b.declare(if (is_static) ss else ms, atom, kind, member, tok, .{
                         .static_member = is_static,
@@ -4733,7 +4762,7 @@ test "golden: class members vs statics, parameter properties" {
         \\    scope 2: class_members C
         \\      x: property
         \\      m: method impl
-        \\      constructor: method impl
+        \\      __@ctor: method impl
         \\      z: property
         \\    scope 3: class_statics C
         \\      y: property static
