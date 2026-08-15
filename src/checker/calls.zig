@@ -436,7 +436,15 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
     var isect_sigs: std.ArrayList(TypeId) = .empty;
     defer isect_sigs.deinit(c.scratch());
     var isect_any = false;
-    if (rk == .intersection) {
+    // Whether `isect_sigs` already holds the intersection's construct signatures
+    // under tsc's MIXIN rule (see `mixinCtorSigs`), in which case the pick-one
+    // gather below is skipped and the `is_new` dispatch resolves against them.
+    var mixin_new = false;
+    var mixin_abstract = false;
+    if (rk == .intersection and is_new) {
+        mixin_new = try mixinCtorSigs(c, r, &isect_sigs, &mixin_abstract);
+    }
+    if (rk == .intersection and !mixin_new) {
         for (try c.memberList(r)) |m| {
             const rm = try c.resolveStructural(m);
             const mk = c.ts.kind(rm);
@@ -504,7 +512,14 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
     var instance_ret: TypeId = types.no_type; // for `new C(...)`
 
     if (is_new) {
-        if (rk == .class_value) {
+        if (mixin_new) {
+            // The mixin-resolved overload set, whose returns are already the
+            // intersections tsc computes — so no `instance_ret` override.
+            if (mixin_abstract) {
+                try c.diagFmt(2511, c.nodeSpan(node), "Cannot create an instance of an abstract class.", .{});
+            }
+            try sigs.appendSlice(c.scratch(), isect_sigs.items);
+        } else if (rk == .class_value) {
             const cls = c.ts.classSymbol(r);
             if (try c.classIsAbstract(cls)) {
                 try c.diagFmt(2511, c.nodeSpan(node), "Cannot create an instance of an abstract class.", .{});
@@ -1256,6 +1271,147 @@ fn unionCtorSigs(
         }
     }
     return .{ .ok = .{ .abstract = abstract, .any = any } };
+}
+
+/// Beyond this an intersection is not a mixin stack and the per-constituent
+/// bookkeeping below is not worth its quadratic term. tsc has no bound; every
+/// real mixin expression is two or three constituents deep.
+const max_mixin_constituents = 8;
+
+/// tsc's `resolveIntersectionTypeMembers` for CONSTRUCT signatures — the rule
+/// that makes `new (typeof M & typeof C)(…)` an `M & C`.
+///
+/// A MIXIN constructor type is one whose whole construct surface is
+/// `new (...args: any[])` — `isMixinConstructorType`: exactly one construct
+/// signature, no type parameters, exactly one parameter, that parameter a REST
+/// whose type is `any` or `any[]`. Such a constituent contributes NO signatures
+/// of its own; instead its instance type is intersected into every OTHER
+/// constituent's construct return:
+///
+///     const mixinFlags = findMixins(types);
+///     if (!mixinFlags[i]) {
+///         let signatures = getSignaturesOfType(t, SignatureKind.Construct);
+///         if (signatures.length && mixinCount > 0)
+///             signatures = map(signatures, s => { … clone.resolvedReturnType =
+///                 includeMixinType(getReturnTypeOfSignature(s), types, mixinFlags, i); … });
+///         constructSignatures = appendSignatures(constructSignatures, signatures);
+///     }
+///
+/// So `{ new(...args: any[]): A } & { new(s: string): B }` has the single
+/// signature `new (s: string) => A & B` — the mixin's `(...args: any[])` is
+/// discarded and its `A` survives only in the return.
+///
+/// `findMixins` has one wrinkle that is load-bearing: when EVERY constructable
+/// constituent is a mixin (`typeof M1 & typeof M2`), the FIRST one is un-flagged
+/// so that some signature survives at all.
+///
+/// Answers `false` for every shape it does not model, and the caller then keeps
+/// the pick-the-first-constructable-constituent rule it had. Two shapes are
+/// deliberately declined: an intersection with no mixin constituent (nothing to
+/// do, and today's rule is already right for it) and a GENERIC class value,
+/// whose construct signatures would have to carry the class's own type
+/// parameters — the same limit `unionCtorSigs` draws, and for the same reason.
+fn mixinCtorSigs(c: *Checker, r: TypeId, sigs: *std.ArrayList(TypeId), abstract: *bool) Error!bool {
+    const members = try c.memberList(r);
+    if (members.len < 2 or members.len > max_mixin_constituents) return false;
+    // Per constituent: where its construct signatures start/end in `own`, its
+    // single signature's return when it is a mixin, and the mixin flag itself.
+    var own: std.ArrayList(TypeId) = .empty;
+    defer own.deinit(c.scratch());
+    var start: [max_mixin_constituents]u32 = undefined;
+    var len: [max_mixin_constituents]u32 = undefined;
+    var is_mixin: [max_mixin_constituents]bool = undefined;
+    var ctor_types: u32 = 0;
+    var mixin_count: u32 = 0;
+    for (members, 0..) |m, i| {
+        start[i] = @intCast(own.items.len);
+        const rm = try c.resolveStructural(m);
+        switch (c.ts.kind(rm)) {
+            .class_value => {
+                const cls = c.ts.classSymbol(rm);
+                var tps: std.ArrayList(TypeParamInfo) = .empty;
+                defer tps.deinit(c.scratch());
+                try c.typeParamsOf(cls, &tps);
+                if (tps.items.len != 0) return false;
+                // tsc's `resolveNewExpression` reports TS2511 when ANY selected
+                // construct signature is abstract; an intersection carries no
+                // `symbol` of its own, so the flag has to come from the
+                // constituents — exactly as the union path does it.
+                if (try c.classIsAbstract(cls)) abstract.* = true;
+                // The construct return of a class VALUE is its instance type;
+                // a constructor's own declared return is not it.
+                const inst = try c.ts.makeRef(cls, &.{});
+                var cs: std.ArrayList(TypeId) = .empty;
+                defer cs.deinit(c.scratch());
+                try c.ctorSignatures(cls, &cs);
+                if (cs.items.len == 0) {
+                    try own.append(c.scratch(), try c.ts.makeFunction(&.{}, inst, &.{}, 0));
+                } else for (cs.items) |sig| {
+                    try own.append(c.scratch(), try c.sigWithReturn(sig, inst));
+                }
+            },
+            .object => {
+                for (0..c.ts.objectConstructSigCount(rm)) |k| {
+                    try own.append(c.scratch(), c.ts.objectConstructSig(rm, @intCast(k)));
+                }
+            },
+            // A constituent with no construct surface at all — a plain object
+            // literal intersected onto a class value, a primitive brand — is
+            // simply not part of this rule. tsc's loop appends nothing for it.
+            else => {},
+        }
+        len[i] = @as(u32, @intCast(own.items.len)) - start[i];
+        if (len[i] > 0) ctor_types += 1;
+        is_mixin[i] = len[i] == 1 and isMixinCtorSig(c, own.items[start[i]]);
+        if (is_mixin[i]) mixin_count += 1;
+    }
+    if (ctor_types == 0) return false;
+    // `findMixins`: keep one signature alive when every constructable
+    // constituent is a mixin.
+    if (mixin_count == ctor_types) {
+        for (members, 0..) |_, i| {
+            if (!is_mixin[i]) continue;
+            is_mixin[i] = false;
+            mixin_count -= 1;
+            break;
+        }
+    }
+    if (mixin_count == 0) return false;
+    for (members, 0..) |_, i| {
+        if (is_mixin[i] or len[i] == 0) continue;
+        for (own.items[start[i]..][0..len[i]]) |sig| {
+            // `includeMixinType`: this signature's own return, intersected with
+            // every MIXIN constituent's instance type, in constituent order.
+            var mixed: std.ArrayList(TypeId) = .empty;
+            defer mixed.deinit(c.scratch());
+            for (members, 0..) |_, j| {
+                if (j == i) {
+                    try mixed.append(c.scratch(), c.ts.fnReturn(sig));
+                } else if (is_mixin[j]) {
+                    try mixed.append(c.scratch(), c.ts.fnReturn(own.items[start[j]]));
+                }
+            }
+            try sigs.append(c.scratch(), try c.sigWithReturn(sig, try c.ts.makeIntersection(c.scratch(), mixed.items)));
+        }
+    }
+    return sigs.items.len > 0;
+}
+
+/// `isMixinConstructorType`, on one already-materialized construct signature:
+/// no type parameters, exactly one parameter, that parameter a REST whose type
+/// is `any` or `any[]`.
+fn isMixinCtorSig(c: *Checker, sig: TypeId) bool {
+    const s = &c.ts;
+    if (s.kind(sig) != .function) return false;
+    if (s.fnTypeParamCount(sig) != 0) return false;
+    if (s.fnParamCount(sig) != 1) return false;
+    const p = s.fnParam(sig, 0);
+    if (!p.rest()) return false;
+    return switch (s.kind(p.ty)) {
+        .any => true,
+        .array => s.kind(s.arrayElem(p.ty)) == .any,
+        else => false,
+    };
 }
 
 fn combinedUnionSignature(c: *Checker, sigs: []const TypeId, starts: []const u32) Error!?TypeId {
