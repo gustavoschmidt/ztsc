@@ -28,6 +28,7 @@ pub const paths = @import("link/paths.zig");
 pub const resolve = @import("link/resolve.zig");
 pub const modules = @import("link/modules.zig");
 pub const global_dup = @import("link/global_dup.zig");
+pub const package_id = @import("link/package_id.zig");
 pub const checker = @import("checker.zig");
 pub const driver = @import("driver.zig");
 pub const schedule = @import("schedule.zig");

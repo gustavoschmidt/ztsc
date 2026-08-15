@@ -347,6 +347,27 @@ pub const ResolveCache = struct {
         return rc.canonicalize(io, scratch, dir, raw);
     }
 
+    /// The `package.json` text at `path`, or null when it is absent/unreadable
+    /// — the same memoized read resolution itself does, exposed for the
+    /// package-identity pass (package_id.zig), which needs the `name`/`version`
+    /// of the package a resolved file came out of. Almost always a memo hit:
+    /// resolving into a package reads its `package.json` first.
+    ///
+    /// The result belongs to the cache arena on the cached leg and to `scratch`
+    /// on the uncached one, so it is only valid until the caller's next scratch
+    /// reset.
+    pub fn packageJsonText(
+        rc: *ResolveCache,
+        io: Io,
+        dir: Io.Dir,
+        scratch: Allocator,
+        path: []const u8,
+    ) Error!?[]const u8 {
+        const f: Fs = .{ .io = io, .dir = dir, .cache = if (rc.enabled) &rc.fs else null, .opts = rc.opts };
+        const pj = (try f.packageJson(scratch, path)) orelse return null;
+        return pj.text;
+    }
+
     /// The realpath of `dir` (cached, arena-owned) for re-relativizing canonical
     /// paths, or null if the OS call failed (then canonical paths stay absolute).
     ///

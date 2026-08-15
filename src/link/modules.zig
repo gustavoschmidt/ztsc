@@ -57,6 +57,7 @@ const source = @import("../frontend/source.zig");
 const libs = @import("../libs.zig");
 const alias_cycle = @import("alias_cycle.zig");
 const global_dup = @import("global_dup.zig");
+const package_id = @import("package_id.zig");
 const paths = @import("paths.zig");
 const resolve = @import("resolve.zig");
 // Only for `Discovery.paths_map` (the tsconfig `paths` table). tsconfig.zig
@@ -148,6 +149,9 @@ pub fn buildProgram(
     var path_ids: std.StringHashMapUnmanaged(FileId) = .empty;
     var pending: std.ArrayList([]const u8) = .empty;
     var failures: std.ArrayList(BuildDiag) = .empty;
+    // The same slices the `ProgFile`s point at, kept mutable for the
+    // package-identity rewrite after discovery (see the end of this function).
+    var spec_file_slices: std.ArrayList([]FileId) = .empty;
 
     // Discovery, shared verbatim with the parallel driver: the lib/root
     // seeding, the per-file specifier resolution, and the auto-injections.
@@ -231,6 +235,10 @@ pub fn buildProgram(
         if (node_types_fid == null) node_types_fid = try disco.discoverNodeTypes(path, bound);
         sortSpecPairs(spec_atoms.items, spec_files.items);
 
+        // Kept as a mutable slice as well: the package-identity pass below
+        // rewrites the resolved targets in place once every file is known.
+        const resolved_specs = try arena.dupe(FileId, spec_files.items);
+        try spec_file_slices.append(scratch, resolved_specs);
         try files.append(arena, .{
             .path = path,
             .src = bytes,
@@ -238,7 +246,7 @@ pub fn buildProgram(
             .bind = bound,
             .specs = .{
                 .atoms = try arena.dupe(Atom, spec_atoms.items),
-                .files = try arena.dupe(FileId, spec_files.items),
+                .files = resolved_specs,
             },
             .type_ref_misses = try type_ref_misses.toOwnedSlice(arena),
         });
@@ -248,6 +256,14 @@ pub fn buildProgram(
     }
 
     const file_slice = try arena.dupe(ProgFile, files.items);
+    // Package-identity dedup, shared with the driver: two on-disk copies of one
+    // package version are ONE module, so every specifier that resolved to a
+    // later copy is re-pointed at the first (package_id.zig). `pending` is the
+    // final file order here — this builder assigns ids in discovery order and
+    // never renumbers — so the winner is settled before any specifier is read.
+    if (try package_id.redirects(arena, scratch, &rcache, io, dir, pending.items)) |map| {
+        for (spec_file_slices.items) |sf| package_id.applyTo(map, sf);
+    }
     const lr = try link(arena, gpa, io, interner, file_slice, link_opts);
     return .{
         .program = .{
