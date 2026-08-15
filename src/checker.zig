@@ -3074,6 +3074,14 @@ pub const Checker = struct {
                 // modifiers in an `FnProto` at `lhs`.
                 const flags = switch (c.tree.nodeTag(owner)) {
                     .arrow_fn, .function_expr, .function_decl, .class_method, .function_type => c.tree.extraData(ast.FnProto, c.tree.nodeData(owner).lhs).flags,
+                    // A class `static { … }` block is the one `.function` scope
+                    // owned by a `.block` (see `bindClass`). `await` there is
+                    // legal SYNTAX — the block is an await context — and
+                    // illegal code for a reason of its own, TS18037, which the
+                    // parser reports. Answering "async" is how this walk says
+                    // "not my rule": neither TS1308 nor the top-level TS1375
+                    // applies inside one.
+                    .block => return true,
                     else => return null,
                 };
                 return flags & ast.Flags.async != 0;
@@ -3090,7 +3098,17 @@ pub const Checker = struct {
     /// `function`/method body is enough). Null at the top level, or when the
     /// lib declares no `IArguments` (`--noLib`), so the reference still
     /// reports TS2304 there.
-    pub fn implicitArgumentsType(c: *Checker) Error!?TypeId {
+    ///
+    /// One boundary answers with a diagnostic instead of a type: a class static
+    /// block has no `arguments` of its own AND may not borrow the enclosing
+    /// function's, which tsc says as TS2815 (`checkIdentifier`'s
+    /// `isInPropertyInitializerOrClassStaticBlock` arm). Reported here because
+    /// this walk is what establishes the boundary; the caller then gets a type
+    /// so the reference does not also earn a TS2304. tsc words the same rule for
+    /// a property INITIALIZER, which ztsc does not yet detect (an under-report:
+    /// the initializer has no scope of its own, so this walk sees only the
+    /// enclosing function).
+    pub fn implicitArgumentsType(c: *Checker, at: Span) Error!?TypeId {
         var cur = c.cur_scope;
         var in_fn = false;
         while (cur != binder.file_scope) : (cur = c.bind.scope_parents[cur]) {
@@ -3100,6 +3118,12 @@ pub const Checker = struct {
             switch (c.tree.nodeTag(owner)) {
                 .arrow_fn => continue, // transparent: inherits the outer one
                 .function_expr, .function_decl, .class_method => in_fn = true,
+                // A class static block (the one `.function` scope owned by a
+                // `.block` — see `bindClass`).
+                .block => {
+                    try c.diagFmt(2815, at, "'arguments' cannot be referenced in property initializers or class static initialization blocks.", .{});
+                    return types.any_type;
+                },
                 else => {},
             }
             break;

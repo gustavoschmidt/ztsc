@@ -39,6 +39,8 @@ const isNonPrimitiveKind = @import("assign.zig").isNonPrimitiveKind;
 const isNullishUnion = @import("flow.zig").isNullishUnion;
 const iteration = @import("iteration.zig");
 const reachability = @import("reachability.zig");
+const reserved_names = @import("reserved_names.zig");
+const static_block = @import("static_block.zig");
 const typeOfSymbol = @import("signatures.zig").typeOfSymbol;
 
 // =====================================================================
@@ -60,6 +62,10 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
         prof_zig.noteStatement(c, f, sp.start, c.inst_count);
     }
     c.anchorInst(node);
+    // A declaration may not take a predefined TYPE name (TS2414/2427/2431/2457,
+    // and TS2397 for a namespace named `undefined`). One call for all five
+    // forms; a no-op for every other statement (wave-7 A: `reserved_names.zig`).
+    try reserved_names.checkDeclName(c, node);
     c.inst_count = 0;
     c.inst_budget = max_instantiation_count;
     c.newBudgetWindow();
@@ -1615,6 +1621,9 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
 
     // Members.
     const members = c.tree.extraRange(data.members_start, data.members_end);
+    // The class's own name, for the static-initialization-order rule: `C.x`
+    // inside `class C` reaches the class being defined (`static_block.zig`).
+    const class_name = if (data.name_token != 0) c.tokenText(data.name_token) else "";
     // A `get`/`set` pair whose getter is less accessible than its setter
     // (TS2808) — a property of the declarations alone, so it runs before any
     // member's type is resolved.
@@ -1659,6 +1668,9 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
                 }
                 if (e.init != 0) {
                     if (!is_static) try checkFieldInitSelfRefs(c, members, member, e.init);
+                    // …and the static half of the same rule, which a static
+                    // block shares (`static_block.zig`).
+                    if (is_static) try static_block.checkStaticSelfRefs(c, members, member, e.init, class_name);
                     // See `instance_field_init_depth`: an instance field's
                     // initializer runs at construction time, so a forward
                     // reference in it is not a TDZ use.
@@ -1712,6 +1724,10 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
                 }
                 if (target != null_node) try checkMemberDecoratorSig(c, member, dt, target, this_t, class_sym);
             },
+            // `static { … }` — the parser's only `.block` class member. The
+            // block's statements run with `this` = the static side, in the
+            // block's own scope (wave-7 A: `static_block.zig`).
+            .block => try static_block.checkStaticBlock(c, members, member, class_sym, class_name, this_t),
             else => {},
         }
     }
