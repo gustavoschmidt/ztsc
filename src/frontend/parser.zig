@@ -58,6 +58,7 @@ const ast = @import("ast.zig");
 const diagnostics = @import("diagnostics.zig");
 const directives = @import("directives.zig");
 const literals = @import("literals.zig");
+const modifier_order = @import("modifier_order.zig");
 
 const TokTag = scanner.Tag;
 const Token = scanner.Token;
@@ -222,6 +223,14 @@ const Parser = struct {
     /// A class body is strict whatever the file is, and tsc says so in its own
     /// wording, so the choice between TS1212 and TS1213 is this counter.
     class_depth: u32 = 0,
+
+    /// Is the class whose body is being parsed `abstract`? Read only by
+    /// `modifier_order.check`, whose two `abstract` PAIRS sit behind tsc's
+    /// TS1244 ("abstract methods can only appear within an abstract class") and
+    /// so must stay silent on a plain class's member. A flag rather than a
+    /// counter because it describes the INNERMOST class body, and a nested class
+    /// declaration restores the enclosing one's answer on the way out.
+    abstract_class: bool = false,
 
     /// The innermost function-like boundary being parsed. tsc keeps the same
     /// information in two context bits (`NodeFlags.AwaitContext` plus the
@@ -1552,6 +1561,7 @@ const Parser = struct {
                         // `declare` as an expression instead cost a false
                         // TS2304 and lost the TS1183 the body earns.
                         _ = try p.bump(); // `declare`
+                        try p.errAtCur(.mod_order_export_declare);
                         const was_ambient = p.ambient;
                         p.ambient = true;
                         defer p.ambient = was_ambient;
@@ -2326,7 +2336,7 @@ const Parser = struct {
         }
         const start_tok = p.curIdx();
         var flags: u32 = 0;
-        var access_reported = false;
+        var mod_reported = false;
         // Constructor parameter properties: visibility/readonly/override.
         while (true) {
             const bit: u32 = switch (p.curTag()) {
@@ -2341,9 +2351,15 @@ const Parser = struct {
             // Only a modifier if a binding follows (else it's the name).
             const t1 = p.peekTag(1);
             if (!(isIdentLike(t1) or t1 == .l_bracket or t1 == .l_brace or t1 == .dot_dot_dot or t1 == .keyword_this)) break;
-            if (!access_reported and p.spec == 0 and accessibilityRepeat(flags, bit)) {
-                try p.errAtCur(.accessibility_modifier_already_seen);
-                access_reported = true;
+            // Same walk as a class member's: `constructor(readonly readonly y)`
+            // is TS1030 and `constructor(override public foo)` is TS1029. A
+            // parameter is never in an abstract-member position, so the abstract
+            // pairs are unreachable here whatever the class is.
+            if (!mod_reported and p.spec == 0) {
+                if (modifier_order.check(flags, bit, false)) |code| {
+                    try p.errAtCur(code);
+                    mod_reported = true;
+                }
             }
             _ = try p.bump();
             flags |= bit;
@@ -2561,6 +2577,9 @@ const Parser = struct {
         // nested classes — hence a depth counter rather than a flag.
         p.class_depth += 1;
         defer p.class_depth -= 1;
+        const was_abstract_class = p.abstract_class;
+        p.abstract_class = flags_in & ast.Flags.abstract != 0;
+        defer p.abstract_class = was_abstract_class;
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
         while (p.curTag() != .r_brace and p.curTag() != .eof) {
@@ -2654,11 +2673,6 @@ const Parser = struct {
     /// tsc `return`s out of its whole modifier walk on the first hit, so
     /// `public protected private x` is ONE diagnostic, not two — callers stop
     /// asking once it has answered true.
-    fn accessibilityRepeat(already: u32, bit: u32) bool {
-        const access = ast.Flags.public | ast.Flags.private | ast.Flags.protected;
-        return bit & access != 0 and already & access != 0;
-    }
-
     /// How many class-member modifiers stand in front of a `static { … }` block,
     /// or null when this member is not a static block at all. Bounded by the
     /// lookahead window (`max_la`), so a run longer than three keeps ztsc's
@@ -2734,7 +2748,7 @@ const Parser = struct {
         }
 
         var flags: u32 = 0;
-        var access_reported = false;
+        var mod_reported = false;
         while (true) {
             const bit = classMemberModifierBit(p.curTag());
             if (bit == 0) break;
@@ -2745,9 +2759,14 @@ const Parser = struct {
                 t1 == .numeric_literal or t1 == .l_bracket or t1 == .asterisk;
             if (!name_follows) break;
             if ((bit == ast.Flags.get or bit == ast.Flags.set or bit == ast.Flags.async) and p.peekNewline(1)) break;
-            if (!access_reported and p.spec == 0 and accessibilityRepeat(flags, bit)) {
-                try p.errAtCur(.accessibility_modifier_already_seen);
-                access_reported = true;
+            // Repeated or out-of-order modifiers: tsc's `checkGrammarModifiers`
+            // returns on its FIRST hit, so `public private static x` answers
+            // once, for `private`, and never mentions `static`.
+            if (!mod_reported and p.spec == 0) {
+                if (modifier_order.check(flags, bit, p.abstract_class)) |code| {
+                    try p.errAtCur(code);
+                    mod_reported = true;
+                }
             }
             _ = try p.bump();
             flags |= bit;
@@ -3447,6 +3466,14 @@ const Parser = struct {
     fn parseExportStatement(p: *Parser) PE!Node {
         const kw = try p.bump(); // `export`
         p.saw_module_syntax = true;
+        // `export export class Foo {}` — tsc collects both into one modifier
+        // list and reports TS1030 on the second, then declares the class as
+        // usual. Refusing the second `export` here answered "an export clause
+        // expected" and cost the file its whole semantic pass.
+        while (p.curTag() == .keyword_export) {
+            try p.errAtCur(.mod_seen_export);
+            _ = try p.bump();
+        }
         // `export public import a = x.c;` — a member modifier between `export`
         // and the declaration, which tsc parses into the same modifier list.
         try p.eatStatementModifiers();

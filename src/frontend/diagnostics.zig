@@ -207,6 +207,101 @@ pub const Code = enum(u16) {
     non_nullable_type_postfix,
     non_nullable_type_prefix,
 
+    /// TS1034: `var x = super` — `super` with no `(`, `.` or `[` after it.
+    /// tsc's `parseSuperExpression` reports at the token FOLLOWING `super`
+    /// (`parseExpectedToken(DotToken, …)` blames the token that should have
+    /// been the dot) and then builds `super.<missing>`.
+    super_needs_call_or_member,
+    /// TS2809: a `{ … }` read as a BLOCK with a `=` right after it — the
+    /// destructuring assignment `{ a, b } = fn()` that needed parentheses. tsc
+    /// reports it in `parseBlock`, right after the closing brace, and consumes
+    /// the `=`; a 2xxx number on a PARSE diagnostic, so it is syntactic.
+    destructuring_assignment_needs_parens,
+    /// TS2657: `<a/><b/>` in expression position — tsc's
+    /// `parseJsxElementOrSelfClosingElementOrFragment` speculatively parses the
+    /// second element, reports over the whole run, and joins the two with a
+    /// synthetic comma. A parse diagnostic, so syntactic.
+    jsx_needs_one_parent,
+    /// TS18007: `<div a={x, y}/>` — a JSX expression container holds an
+    /// AssignmentExpression per the JSX grammar, but tsc's parser reads a full
+    /// comma sequence so its `checkGrammarJsxExpression` can say this instead
+    /// of "'}' expected". Reported on the expression; grammar-class.
+    jsx_comma_operator,
+    /// TS2566: `const { ...a: b } = o` — tsc's `parseObjectBindingElement`
+    /// reads a PropertyName before it knows whether a `:` follows, so a rest
+    /// element with one PARSES and `checkGrammarBindingElement` reports on the
+    /// bound NAME. Grammar-class.
+    rest_element_property_name,
+
+    // --- modifier order and repetition (tsc's `checkGrammarModifiers`) -------
+    /// TS1030 `'{0}' modifier already seen.` — the same modifier twice on one
+    /// declaration. One code per modifier because tsc's message NAMES it and a
+    /// Diagnostic is a code plus a span; `see modifier_order.zig` for the walk
+    /// that picks between these and the TS1029 pairs below. The accessibility
+    /// trio is NOT here: tsc words a repeat of `public`/`private`/`protected`
+    /// as TS1028 without naming which one, which is
+    /// `accessibility_modifier_already_seen`.
+    mod_seen_static,
+    mod_seen_readonly,
+    mod_seen_accessor,
+    mod_seen_override,
+    mod_seen_async,
+    mod_seen_abstract,
+    mod_seen_declare,
+    /// `export export class C {}` — the one repeat a STATEMENT-level modifier
+    /// run can spell. Reported by `parseExportStatement`, not by the class-member
+    /// walk, because `export` is not a class-member modifier at all.
+    mod_seen_export,
+    /// TS1029 `'{0}' modifier must precede '{1}' modifier.` — two modifiers in
+    /// the wrong order. tsc's walk reports the SECOND one and names both, so
+    /// there is one code per ordered pair it can reach; the pairs below are the
+    /// ones a class member or a parameter property can reach (the statement-level
+    /// `export`/`declare`/`default` trio is a separate walk and still an
+    /// under-report). `in_must_precede_out` is TS1029 too — the type-parameter
+    /// pair, named for its own rule because it predates this table.
+    mod_order_public_static,
+    mod_order_private_static,
+    mod_order_protected_static,
+    mod_order_public_override,
+    mod_order_private_override,
+    mod_order_protected_override,
+    mod_order_public_accessor,
+    mod_order_private_accessor,
+    mod_order_protected_accessor,
+    mod_order_public_readonly,
+    mod_order_private_readonly,
+    mod_order_protected_readonly,
+    mod_order_public_async,
+    mod_order_private_async,
+    mod_order_protected_async,
+    mod_order_public_abstract,
+    mod_order_protected_abstract,
+    mod_order_static_readonly,
+    mod_order_static_async,
+    mod_order_static_accessor,
+    mod_order_static_override,
+    mod_order_override_readonly,
+    mod_order_override_accessor,
+    mod_order_override_async,
+    mod_order_abstract_override,
+    mod_order_abstract_accessor,
+    /// `declare export const x` — the statement-level pair, reported by the
+    /// `declare export` arm of `parseStatementUnchecked` on the `export`.
+    mod_order_export_declare,
+
+    /// TS1385/TS1386/TS1387/TS1388: `type U = string | () => void` — a function
+    /// or constructor type written bare as a union or intersection CONSTITUENT,
+    /// where the grammar wants parentheses. tsc's
+    /// `parseFunctionOrConstructorTypeToError` parses it anyway ("we'll try to
+    /// parse them gracefully and issue a helpful message") and reports over the
+    /// whole constituent, which is why this is one diagnostic rather than the
+    /// TS1110/TS1005/TS1109 cascade a refusal produces. Four codes because the
+    /// message names both the notation and the operator.
+    fn_type_in_union,
+    ctor_type_in_union,
+    fn_type_in_intersection,
+    ctor_type_in_intersection,
+
     // --- bind errors, tsc-compatible codes via tsCode() ---------------
     /// TS2300: two declarations of the same name that cannot merge
     /// (class+class, function+var, duplicate params, type+interface, ...).
@@ -500,6 +595,54 @@ pub const Code = enum(u16) {
             .nullable_type_prefix,
             .non_nullable_type_postfix,
             .non_nullable_type_prefix,
+            // `<div a={x, y}/>` answers TS18007 *and* the TS2695 the comma
+            // expression earns in the same run, and `const { ...a: b } = o`
+            // answers TS2566 with nothing suppressed — both are
+            // `checkGrammar*` in tsc's CHECKER. Their three siblings above
+            // (TS1034/TS2809/TS2657) are `parseDiagnostics` and so stay
+            // syntactic, which is why the same batch splits across the two
+            // classes.
+            .jsx_comma_operator,
+            .rest_element_property_name,
+            // `checkGrammarModifiers` is the same checker pass that already
+            // owns TS1028 and TS1274 above: the m6 probe answers its whole
+            // TS1030/TS1029 set next to a TS2515 and a TS4112 in the same file,
+            // with nothing suppressed either way.
+            .mod_seen_static,
+            .mod_seen_readonly,
+            .mod_seen_accessor,
+            .mod_seen_override,
+            .mod_seen_async,
+            .mod_seen_abstract,
+            .mod_seen_declare,
+            .mod_seen_export,
+            .mod_order_public_static,
+            .mod_order_private_static,
+            .mod_order_protected_static,
+            .mod_order_public_override,
+            .mod_order_private_override,
+            .mod_order_protected_override,
+            .mod_order_public_accessor,
+            .mod_order_private_accessor,
+            .mod_order_protected_accessor,
+            .mod_order_public_readonly,
+            .mod_order_private_readonly,
+            .mod_order_protected_readonly,
+            .mod_order_public_async,
+            .mod_order_private_async,
+            .mod_order_protected_async,
+            .mod_order_public_abstract,
+            .mod_order_protected_abstract,
+            .mod_order_static_readonly,
+            .mod_order_static_async,
+            .mod_order_static_accessor,
+            .mod_order_static_override,
+            .mod_order_override_readonly,
+            .mod_order_override_accessor,
+            .mod_order_override_async,
+            .mod_order_abstract_override,
+            .mod_order_abstract_accessor,
+            .mod_order_export_declare,
             => .grammar,
 
             else => .syntactic,
@@ -638,6 +781,50 @@ pub const Code = enum(u16) {
             .nullable_type_prefix => jsdocMarkerMessage("?", "start"),
             .non_nullable_type_postfix => jsdocMarkerMessage("!", "end"),
             .non_nullable_type_prefix => jsdocMarkerMessage("!", "start"),
+            .super_needs_call_or_member => "'super' must be followed by an argument list or member access.",
+            .destructuring_assignment_needs_parens => "Declaration or statement expected. This '=' follows a block of statements, so if you intended to write a destructuring assignment, you might need to wrap the whole assignment in parentheses.",
+            .jsx_needs_one_parent => "JSX expressions must have one parent element.",
+            .jsx_comma_operator => "JSX expressions may not use the comma operator. Did you mean to write an array?",
+            .rest_element_property_name => "A rest element cannot have a property name.",
+            .mod_seen_static => modSeenMessage("static"),
+            .mod_seen_readonly => modSeenMessage("readonly"),
+            .mod_seen_accessor => modSeenMessage("accessor"),
+            .mod_seen_override => modSeenMessage("override"),
+            .mod_seen_async => modSeenMessage("async"),
+            .mod_seen_abstract => modSeenMessage("abstract"),
+            .mod_seen_declare => modSeenMessage("declare"),
+            .mod_seen_export => modSeenMessage("export"),
+            .mod_order_public_static => modOrderMessage("public", "static"),
+            .mod_order_private_static => modOrderMessage("private", "static"),
+            .mod_order_protected_static => modOrderMessage("protected", "static"),
+            .mod_order_public_override => modOrderMessage("public", "override"),
+            .mod_order_private_override => modOrderMessage("private", "override"),
+            .mod_order_protected_override => modOrderMessage("protected", "override"),
+            .mod_order_public_accessor => modOrderMessage("public", "accessor"),
+            .mod_order_private_accessor => modOrderMessage("private", "accessor"),
+            .mod_order_protected_accessor => modOrderMessage("protected", "accessor"),
+            .mod_order_public_readonly => modOrderMessage("public", "readonly"),
+            .mod_order_private_readonly => modOrderMessage("private", "readonly"),
+            .mod_order_protected_readonly => modOrderMessage("protected", "readonly"),
+            .mod_order_public_async => modOrderMessage("public", "async"),
+            .mod_order_private_async => modOrderMessage("private", "async"),
+            .mod_order_protected_async => modOrderMessage("protected", "async"),
+            .mod_order_public_abstract => modOrderMessage("public", "abstract"),
+            .mod_order_protected_abstract => modOrderMessage("protected", "abstract"),
+            .mod_order_static_readonly => modOrderMessage("static", "readonly"),
+            .mod_order_static_async => modOrderMessage("static", "async"),
+            .mod_order_static_accessor => modOrderMessage("static", "accessor"),
+            .mod_order_static_override => modOrderMessage("static", "override"),
+            .mod_order_override_readonly => modOrderMessage("override", "readonly"),
+            .mod_order_override_accessor => modOrderMessage("override", "accessor"),
+            .mod_order_override_async => modOrderMessage("override", "async"),
+            .mod_order_abstract_override => modOrderMessage("abstract", "override"),
+            .mod_order_abstract_accessor => modOrderMessage("abstract", "accessor"),
+            .mod_order_export_declare => modOrderMessage("export", "declare"),
+            .fn_type_in_union => "Function type notation must be parenthesized when used in a union type.",
+            .ctor_type_in_union => "Constructor type notation must be parenthesized when used in a union type.",
+            .fn_type_in_intersection => "Function type notation must be parenthesized when used in an intersection type.",
+            .ctor_type_in_intersection => "Constructor type notation must be parenthesized when used in an intersection type.",
             .duplicate_identifier => "duplicate identifier",
             .block_scoped_redeclare => "cannot redeclare block-scoped variable",
             .enum_merge_conflict => "Enum declarations can only merge with namespace or other enum declarations.",
@@ -800,6 +987,52 @@ pub const Code = enum(u16) {
             .exp_lhs_type_assertion => 17007,
             .nullable_type_postfix, .non_nullable_type_postfix => 17019,
             .nullable_type_prefix, .non_nullable_type_prefix => 17020,
+            .super_needs_call_or_member => 1034,
+            .destructuring_assignment_needs_parens => 2809,
+            .jsx_needs_one_parent => 2657,
+            .jsx_comma_operator => 18007,
+            .rest_element_property_name => 2566,
+            .mod_seen_static,
+            .mod_seen_readonly,
+            .mod_seen_accessor,
+            .mod_seen_override,
+            .mod_seen_async,
+            .mod_seen_abstract,
+            .mod_seen_declare,
+            .mod_seen_export,
+            => 1030,
+            .mod_order_public_static,
+            .mod_order_private_static,
+            .mod_order_protected_static,
+            .mod_order_public_override,
+            .mod_order_private_override,
+            .mod_order_protected_override,
+            .mod_order_public_accessor,
+            .mod_order_private_accessor,
+            .mod_order_protected_accessor,
+            .mod_order_public_readonly,
+            .mod_order_private_readonly,
+            .mod_order_protected_readonly,
+            .mod_order_public_async,
+            .mod_order_private_async,
+            .mod_order_protected_async,
+            .mod_order_public_abstract,
+            .mod_order_protected_abstract,
+            .mod_order_static_readonly,
+            .mod_order_static_async,
+            .mod_order_static_accessor,
+            .mod_order_static_override,
+            .mod_order_override_readonly,
+            .mod_order_override_accessor,
+            .mod_order_override_async,
+            .mod_order_abstract_override,
+            .mod_order_abstract_accessor,
+            .mod_order_export_declare,
+            => 1029,
+            .fn_type_in_union => 1385,
+            .ctor_type_in_union => 1386,
+            .fn_type_in_intersection => 1387,
+            .ctor_type_in_intersection => 1388,
             else => 0,
         };
     }
@@ -826,6 +1059,17 @@ fn evalModuleMessage(comptime word: []const u8) []const u8 {
 /// it sat on, so the four arms share one comptime template.
 fn jsdocMarkerMessage(comptime mark: []const u8, comptime end: []const u8) []const u8 {
     return "'" ++ mark ++ "' at the " ++ end ++ " of a type is not valid TypeScript syntax.";
+}
+
+/// TS1030 and TS1029 each have one sentence with the modifier word(s)
+/// interpolated, so all 33 arms share these two comptime templates rather than
+/// 33 hand-copied sentences that would drift.
+fn modSeenMessage(comptime word: []const u8) []const u8 {
+    return "'" ++ word ++ "' modifier already seen.";
+}
+
+fn modOrderMessage(comptime first: []const u8, comptime second: []const u8) []const u8 {
+    return "'" ++ first ++ "' modifier must precede '" ++ second ++ "' modifier.";
 }
 
 /// TS1044's four modifiers share one sentence, differing only in the word.
