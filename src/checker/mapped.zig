@@ -440,10 +440,32 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
                 defer arrayish.deinit(c.scratch());
                 if (s.kind(src) == .intersection) {
                     const imembers = try c.scratch().dupe(TypeId, try c.memberList(src));
+                    // The map's own `+readonly`/`-readonly` does NOT reach the
+                    // array-ish half: it applies to the mapped PROPERTIES, and
+                    // tsc's result here is an anonymous object whose member set
+                    // is `keyof src` — computed on the source constituent as
+                    // written. A `readonly` list in ztsc is a list whose member
+                    // table is `ReadonlyArray`'s (no `push`), which is exactly
+                    // what the relation reads, so the modifier that decides it
+                    // is the CONSTITUENT's own, not the map's:
+                    //   * `Readonly<[number, number] & Brand>` keeps `keyof
+                    //     [number, number]` — `push` and friends included — so
+                    //     tsc still spends it as a `[number, number]`
+                    //     (excalidraw's `Readonly<GlobalPoint>` parameters,
+                    //     5 false TS2345/TS2352 when the map made it readonly);
+                    //   * `Mutable<readonly [number, number] & Brand>` keeps
+                    //     `keyof readonly [number, number]` — no `push` — so
+                    //     tsc refuses it as a `[number, number]`, which
+                    //     honouring `-readonly` here would have accepted.
+                    // The write site pays for the approximation: tsc reports
+                    // TS2540 for `p[0] = …` through a `Readonly<Tup & Brand>`
+                    // and ztsc does not (it did not before readonly lists
+                    // existed either) — an under-report, not a false positive.
+                    const arr_flags = flags & ~(types.mapped_flag_readonly_add | types.mapped_flag_readonly_remove);
                     for (imembers) |m| {
                         const rm = try c.resolveStructural(m);
                         if (s.kind(rm) != .array and s.kind(rm) != .tuple) continue;
-                        try arrayish.append(c.scratch(), try c.materializeMapped(key_param, constraint, value, as_clause, rm, flags));
+                        try arrayish.append(c.scratch(), try c.materializeMapped(key_param, constraint, value, as_clause, rm, arr_flags));
                     }
                 }
                 var srcprops: std.ArrayList(types.Prop) = .empty;
