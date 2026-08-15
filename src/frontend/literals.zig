@@ -20,6 +20,9 @@ const Span = @import("span.zig").Span;
 // identifier constituents. It is the scanner's, so the two cannot disagree about
 // where a token ends.
 const scanner = @import("scanner.zig");
+// The canonical spelling of a numeric name, shared with the member-atom path so
+// `isNumericName` and the atom a numeric name interns to cannot disagree.
+const numeric_lit = @import("../numeric_lit.zig");
 
 /// One finding, already in absolute file offsets.
 pub const Finding = struct {
@@ -115,6 +118,44 @@ pub fn bigintSuffixMisuse(lit: []const u8, lit_start: u32) ?Finding {
         .code = if (isScientific(lit)) .bigint_exponential else .bigint_not_integer,
         .span = .{ .start = lit_start, .end = lit_start + @as(u32, @intCast(lit.len)) },
     };
+}
+
+/// The text between a quoted literal's quotes — a string literal, or a
+/// no-substitution template. Tolerant of an UNTERMINATED literal (the scanner
+/// still produced a token, and the parser has already reported it), and escapes
+/// are left exactly as written: every caller keys or matches a NAME, and a name
+/// spelled with an escape is a name spelled with an escape.
+pub fn stripQuotes(text: []const u8) []const u8 {
+    if (text.len == 0) return text;
+    const q = text[0];
+    if (q != '"' and q != '\'' and q != '`') return text;
+    if (text.len >= 2 and text[text.len - 1] == q) return text[1 .. text.len - 1];
+    return text[1..];
+}
+
+/// tsc's `isNumericLiteralName`: is this property NAME a number's canonical
+/// spelling — `(+name).toString() === name`? The question a rule about numeric
+/// names has to ask about a name that arrived as a STRING (`"3"`), where the
+/// token tag says nothing: `"3"` and `"1.5"` and `"-1"` are numeric names,
+/// `"0x10"` and `"1e3"` and `"bar"` are not (their values spell themselves
+/// differently), and `"NaN"`/`"Infinity"` are — all four verified against tsgo.
+///
+/// The canonical spelling comes from `numeric_lit`, so this predicate cannot
+/// disagree with the member atom a numeric name is keyed by.
+pub fn isNumericName(text: []const u8) bool {
+    if (text.len == 0 or text.len > numeric_lit.max_name) return false;
+    var buf: [numeric_lit.max_name]u8 = undefined;
+    return std.mem.eql(u8, numeric_lit.name(&buf, text), text);
+}
+
+test "numeric property names are the ones that spell themselves" {
+    const t = std.testing;
+    for ([_][]const u8{ "0", "3", "1.5", "-1", "NaN", "Infinity", "1000" }) |s| {
+        try t.expect(isNumericName(s));
+    }
+    for ([_][]const u8{ "", "bar", "0x10", "1e3", "1_000", "0.0", " 1", "3n" }) |s| {
+        try t.expect(!isNumericName(s));
+    }
 }
 
 /// TS1351, tsc's `checkForIdentifierStartAfterNumericLiteral`: an identifier or

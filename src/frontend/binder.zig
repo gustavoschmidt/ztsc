@@ -71,6 +71,7 @@ const scanner = @import("scanner.zig");
 const intern = @import("../intern.zig");
 const numeric_lit = @import("../numeric_lit.zig");
 const diagnostics = @import("diagnostics.zig");
+const literals = @import("literals.zig");
 const source = @import("source.zig");
 
 const Ast = ast.Ast;
@@ -556,15 +557,9 @@ const Binder = struct {
     /// Strips the delimiters off a literal module specifier. Backticks are
     /// included because a no-substitution template literal is a legal
     /// specifier for `import()` (`` import(`./m`) ``).
-    fn stripQuotes(text: []const u8) []const u8 {
-        if (text.len >= 2 and (text[0] == '"' or text[0] == '\'' or text[0] == '`')) {
-            const last = text[text.len - 1];
-            if (last == text[0]) return text[1 .. text.len - 1];
-            return text[1..];
-        }
-        if (text.len >= 1 and (text[0] == '"' or text[0] == '\'' or text[0] == '`')) return text[1..];
-        return text;
-    }
+    /// One copy of the rule, in `literals.zig`, so the parser's numeric-name
+    /// check and the member atom a quoted name interns to cannot disagree.
+    const stripQuotes = literals.stripQuotes;
 
     fn tokSpan(b: *Binder, tok: TokenIndex) Span {
         const start = b.tree.tokens.start(tok);
