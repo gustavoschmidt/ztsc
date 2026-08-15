@@ -554,11 +554,27 @@ pub fn sigNonArrayRest(c: *Checker, sig: TypeId) Error!?NonArrayRest {
 }
 
 /// tsc's `sliceTupleType`: `tup`'s elements from `index` through
-/// `arity - end_skip`, as a tuple. A slice that starts inside a variable
-/// element has no positional form, and answers with that element's array type
-/// (which is what `makeTuple` collapses a lone rest element to).
+/// `arity - end_skip`, as a tuple.
+///
+/// ```ts
+/// return index > target.fixedLength ? getRestArrayTypeOfTupleType(type) || createTupleType(emptyArray) :
+///     createTupleType(getTypeArguments(type).slice(index, endIndex), target.elementFlags.slice(index, endIndex), …);
+/// ```
+///
+/// The cut is at the FIXED length, not the arity: a slice that starts PAST the
+/// last fixed position has no positional form left and answers with the rest
+/// ARRAY the variable tail spans. A slice starting exactly AT the variable part
+/// lands on the same answer through `makeTuple`, which collapses a lone rest
+/// element to its array — which is why only `index > fixedLength` needed the
+/// explicit arm. It is what splits `[number, boolean, ...string[]]` for
+/// `curry(fn2, 1, true, 'abc', 'def')`, whose implied arity of 4 runs past the
+/// source's 3 positions: `U := string[]`, not the empty tuple
+/// (`variadicTuples1`).
 pub fn sliceTuple(c: *Checker, tup: TypeId, index: u32, end_skip: u32) Error!TypeId {
     const len = c.ts.tupleLen(tup);
+    if (index > tuple_relate.fixedLength(c, tup)) {
+        return (try restArrayOfTuple(c, tup)) orelse c.ts.makeTuple(&.{});
+    }
     if (index > len or index + end_skip > len) return c.ts.makeTuple(&.{});
     var elems: std.ArrayList(types.TupleElem) = .empty;
     defer elems.deinit(c.scratch());
@@ -566,6 +582,35 @@ pub fn sliceTuple(c: *Checker, tup: TypeId, index: u32, end_skip: u32) Error!Typ
         try elems.append(c.scratch(), c.ts.tupleElem(tup, @intCast(i)));
     }
     return c.ts.makeTuple(elems.items);
+}
+
+/// tsc's `getRestArrayTypeOfTupleType`: the array `tup`'s variable tail spans.
+/// `null` when the tuple has no variable tail.
+pub fn restArrayOfTuple(c: *Checker, tup: TypeId) Error!?TypeId {
+    return tupleSliceElemArray(c, tup, tuple_relate.fixedLength(c, tup), 0);
+}
+
+/// `createArrayType(getElementTypeOfSliceOfTupleType(tup, index, end_skip))`:
+/// the array that ONE variable position spanning `tup`'s elements from `index`
+/// through `arity - end_skip` would have. `null` for an empty slice.
+///
+/// A variable element contributes its ELEMENT type — tsc reads it as
+/// `getIndexedAccessType(t, numberType)`, and ztsc stores the array itself on
+/// such an element, so `elemOfArrayish` is that read:
+///
+/// ```ts
+/// elementTypes.push(type.target.elementFlags[i] & ElementFlags.Variadic ? getIndexedAccessType(t, numberType) : t);
+/// ```
+pub fn tupleSliceElemArray(c: *Checker, tup: TypeId, index: u32, end_skip: u32) Error!?TypeId {
+    const len = c.ts.tupleLen(tup);
+    if (index + end_skip >= len) return null;
+    const mid = try c.scratch().alloc(TypeId, len - end_skip - index);
+    defer c.scratch().free(mid);
+    for (mid, index..) |*m, i| {
+        const e = c.ts.tupleElem(tup, @intCast(i));
+        m.* = if (tuple_relate.elemKind(c, e).variable()) try c.elemOfArrayish(e.ty) else e.ty;
+    }
+    return try c.ts.makeArray(try c.ts.makeUnion(c.scratch(), mid));
 }
 
 /// Is `index` an OPTIONAL position of a rest parameter typed by a union of

@@ -2196,15 +2196,13 @@ fn inferFromTupleTypes(
         const pe = s.tupleElem(param, start);
         switch (tuple_relate.elemKind(c, pe)) {
             .variadic => try c.unify(pe.ty, try typenode.sliceTuple(c, ra, start, end), tp_syms, candidates, depth + 1),
+            // The run the pattern's single rest element spans, as one array —
+            // tsc's `getElementTypeOfSliceOfTupleType` + `createArrayType`,
+            // which `typenode.tupleSliceElemArray` is.
             .rest => {
-                const mid = try c.scratch().alloc(TypeId, mid_src);
-                defer c.scratch().free(mid);
-                for (mid, 0..) |*m, k| {
-                    const e = s.tupleElem(ra, @intCast(start + k));
-                    m.* = if (e.rest()) try c.elemOfArrayish(e.ty) else e.ty;
+                if (try typenode.tupleSliceElemArray(c, ra, start, end)) |arr| {
+                    try c.unify(pe.ty, arr, tp_syms, candidates, depth + 1);
                 }
-                const u = try s.makeUnion(c.scratch(), mid);
-                try c.unify(pe.ty, try s.makeArray(u), tp_syms, candidates, depth + 1);
             },
             // A FIXED pattern element cannot absorb a run of argument
             // elements; tsc has no arm for it either.
@@ -2238,18 +2236,26 @@ fn inferFromTupleTypes(
             } else tp_syms.len;
             if (tp_idx < tp_syms.len) {
                 if (impliedArity(c, candidates, tp_idx)) |ia| {
-                    if (ia <= s_arity - start - end) {
-                        // `T` takes the `ia` elements right after the prefix,
-                        // `U` everything from there to the suffix. (tsc spells
-                        // the first skip `endLength + sourceArity -
-                        // impliedArity`, which is this with its own
-                        // `startLength`/`endLength` of zero — the only values
-                        // a bare `[...T, ...U]` pattern can have.)
-                        const head = try typenode.sliceTuple(c, ra, start, s_arity - start - ia);
-                        const tail = try typenode.sliceTuple(c, ra, start + ia, end);
-                        try c.unify(e0.ty, head, tp_syms, candidates, depth + 1);
-                        try c.unify(e1.ty, tail, tp_syms, candidates, depth + 1);
-                    }
+                    // `T` takes the `ia` elements right after the prefix, `U`
+                    // everything from there to the suffix. (tsc spells the
+                    // first skip `endLength + sourceArity - impliedArity`,
+                    // which is this with its own `startLength`/`endLength` of
+                    // zero — the only values a bare `[...T, ...U]` pattern can
+                    // have.)
+                    //
+                    // An implied arity PAST the source's own positions is not a
+                    // dead end: tsc has no guard here, and both slices stay
+                    // meaningful because `sliceTupleType` answers the rest
+                    // ARRAY once the index runs past the fixed part. That is
+                    // `curry(fn2, 1, true, 'abc', 'def')` — implied arity 4
+                    // over `[number, boolean, ...string[]]`'s 3 positions —
+                    // where the head saturates to the whole tuple and the tail
+                    // is `string[]`.
+                    const head_skip = (s_arity - start) -| ia;
+                    const head = try typenode.sliceTuple(c, ra, start, head_skip);
+                    const tail = try typenode.sliceTuple(c, ra, start + ia, end);
+                    try c.unify(e0.ty, head, tp_syms, candidates, depth + 1);
+                    try c.unify(e1.ty, tail, tp_syms, candidates, depth + 1);
                 }
             }
         }
