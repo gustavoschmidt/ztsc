@@ -1999,6 +1999,23 @@ fn distributableSpreads(c: *Checker, node: Node, out: *std.ArrayList(DistSpread)
     }
 }
 
+/// The NOMINAL member atom an object literal's computed key `[expr]` declares,
+/// or null when the key names no static property (tsc's `isLateBindableName`
+/// answering false).
+///
+/// The two spellings are asked in the same order every other side of the
+/// checker asks them: a WELL-KNOWN symbol is keyed syntactically as
+/// `__@iterator` (the binder's `memberKey` and the element access in
+/// `indexChainInner` both do it that way), and only then does a general
+/// `unique symbol` key take its nominal `__@u<id>`. Order is load-bearing
+/// because in the real lib `Symbol.iterator` IS a `unique symbol`: keyed by
+/// the nominal id, `{ [Symbol.iterator]: 0 }` declared a member that no reader
+/// of `o[Symbol.iterator]` could ever find (`symbolProperty18`).
+fn symbolKeyAtom(c: *Checker, key_expr: Node, key_type: TypeId) Error!?Atom {
+    if (c.wellKnownKeyOfExpr(key_expr)) |wk| return try c.atom(wk);
+    return c.uniqueSymAtom(key_type);
+}
+
 fn checkObjectLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     const t = try objectLiteralWhole(c, node, ctx);
     // Duplicate keys — tsc's `checkGrammarObjectLiteralExpression`. Run AFTER
@@ -2107,7 +2124,7 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                     // A `unique symbol` key names a real, nominally-keyed
                     // property (`{ [k]: v }`); any other computed key stays
                     // dynamic (no static member).
-                    if (try c.uniqueSymAtom(kt)) |key| {
+                    if (try symbolKeyAtom(c, key_expr, kt)) |key| {
                         const pctx = try c.ctxPropType(rctx, ctx, key);
                         var vt = try c.checkExprCached(pd.rhs, pctx);
                         if (c.const_ctx) {
@@ -2198,11 +2215,35 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                 const saved_this = c.this_type;
                 defer c.this_type = saved_this;
                 c.this_type = if (rctx != types.no_type) rctx else 0;
+                // A SYMBOL-keyed method or accessor shorthand
+                // (`{ [Symbol.toStringTag]() {…} }`,
+                // `{ set [Symbol.toPrimitive](p) {…} }`) declares a real,
+                // nominally-keyed member — the same one the `key: value` form
+                // above declares, so it takes the same key and then the same
+                // accessor/method path. Contributing nothing at all left
+                // `i[Symbol.toStringTag]()` reading a property the literal
+                // was known to have (`symbolProperty18`).
+                //
+                // Only the SYNTACTIC recognizer runs here. A method's computed
+                // key is not an expression tsc checks — `var s: symbol; ({ [s]:
+                // 0, [s]() {} })` is "used before being assigned" at the first
+                // key and not at the second (`symbolProperty1`) — so asking for
+                // the key's TYPE, which is what the general `unique symbol`
+                // path needs, would report where tsc is silent. A
+                // const-`unique symbol`-keyed method therefore still declares
+                // no member, exactly as before: an under-report, not a new one.
+                var key: Atom = undefined;
                 if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) {
-                    _ = try c.checkExprCached(pd.rhs, types.no_type);
-                    continue;
+                    const wk = c.wellKnownKeyOfExpr(c.tree.nodeData(pd.lhs).lhs) orelse {
+                        // Any other computed key stays dynamic: the body is
+                        // still checked, and no static member is declared.
+                        _ = try c.checkExprCached(pd.rhs, types.no_type);
+                        continue;
+                    };
+                    key = try c.atom(wk);
+                } else {
+                    key = try c.memberAtom(c.tree.nodeMainToken(prop));
                 }
-                const key = try c.memberAtom(c.tree.nodeMainToken(prop));
                 // Accessor shorthand (`get x() {}` / `set x(v) {}`): the
                 // property type is the getter's return type (or the
                 // setter's parameter type when there's no getter). A
