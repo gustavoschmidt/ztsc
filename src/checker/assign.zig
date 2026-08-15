@@ -38,6 +38,7 @@ const lazy_zig = @import("instantiate.zig");
 const resolveStructural = @import("instantiate.zig").resolveStructural;
 const restUnionOptionalAt = @import("typenode.zig").restUnionOptionalAt;
 const sliceTuple = @import("typenode.zig").sliceTuple;
+const generics_zig = @import("generics.zig");
 const tuple_zig = @import("tuple_relate.zig");
 const variance_zig = @import("variance.zig");
 const report_zig = @import("assign_report.zig");
@@ -1752,6 +1753,147 @@ fn condTrueOverExtends(c: *Checker, cond: TypeId) Error!TypeId {
     return c.instantiate(tru, &map);
 }
 
+/// The general form of the same reading, and the one tsc actually implements.
+/// Every reference to the check type inside a conditional's TRUE branch is
+/// wrapped in a *substitution type* whose constraint is the extends type
+/// (`getConditionalFlowTypeOfType` → `getImpliedConstraint`), and a
+/// substitution type READ — a source position — is its intersection:
+///
+/// ```ts
+/// type.flags & TypeFlags.Substitution ? writing ? (type as SubstitutionType).baseType
+///                                              : getSubstitutionIntersection(type)
+/// // getSubstitutionIntersection = getIntersectionType([constraint, baseType])
+/// ```
+///
+/// So `V extends { a: 1 } ? V : …` reads its true branch as `V & { a: 1 }`, not
+/// as the bare `V`. That is what makes a generic signature relate to ITSELF
+/// through such a branch: `<V>(v: V) => V extends {a: 1} ? V : V & {a: 1}` is
+/// assignable to `<V>(v: V) => V & {a: 1}` in tsgo 7.0.2, and once the source
+/// has been instantiated in the target's context the two `V`s are ONE, so the
+/// return relation is exactly `(V extends {a: 1} ? V : V & {a: 1}) → V & {a: 1}`
+/// — the true branch's bare `V` is the only half that does not relate.
+///
+/// The INTERSECTION is load-bearing, which is why this is not
+/// `condTrueOverExtends`: substituting the extends type ALONE loses the check
+/// type, and tsgo accepts the same conditional against a bare `V` target
+/// (`{a: 1}` does not relate to `V`, `V & {a: 1}` does). Both readings are
+/// sound only in a SOURCE position — on the true branch every instantiation
+/// has `check <: extends`, so `check` and `check & extends` have the same
+/// inhabitants there.
+///
+/// An `infer` binder used as a check type gets the same treatment — tsc's
+/// `getImpliedConstraint` reads the check type through `getActualTypeVariable`,
+/// which unwraps an infer binder to the type variable it declares. That is not
+/// an exotic shape: a CONSTRAINED `infer T extends C` desugars into exactly one
+/// nested conditional per binder (`inferConstraintFallback` in `generics.zig`
+/// walks the same wrappers), so `V extends {p?: infer T extends "x"} ? V & {p:
+/// T} : never` carries `T extends "x" ? V & {p: T} : never` as its true branch
+/// and needs `T` there to read as `T & "x"`. atproto's `$TypedObject<V, Id,
+/// Hash>` — the social-app's 51 false positives — bottoms out in that binder.
+///
+/// Returns the branch unchanged where tsc's `getSubstitutionType` declines to
+/// build one at all: a check type that is no type variable (no reference to
+/// substitute), a constraint that IS the base type, and an `any`/`unknown`
+/// constraint — which intersects to nothing new. And in one place tsc does not
+/// need to decline, because a substitution type is a WRAPPER it can strip
+/// (`getRestrictiveInstantiation`) while ztsc has to instantiate eagerly: a
+/// true branch that carries deferred machinery of its own. See
+/// `substitutableBranch`.
+fn condTrueSubstituted(c: *Checker, cond: TypeId) Error!TypeId {
+    const s = &c.ts;
+    const chk = s.condCheck(cond);
+    const tru = s.condTrue(cond);
+    const chk_kind = s.kind(chk);
+    if (chk_kind != .type_param and chk_kind != .infer_var) return tru;
+    const ext = s.condExtends(cond);
+    if (ext == chk) return tru;
+    switch (s.kind(ext)) {
+        .any, .unknown => return tru,
+        else => {},
+    }
+    if (!try substitutableBranch(c, tru, 0)) return tru;
+    const sub = try s.makeIntersection(c.scratch(), &.{ chk, ext });
+    if (sub == chk) return tru;
+    if (chk_kind == .infer_var) {
+        return generics_zig.substInfer(c, tru, &.{s.inferVarId(chk)}, &.{sub});
+    }
+    const map = [_]TpMap{.{ .sym = s.typeParamSymbol(chk), .ty = sub }};
+    return c.instantiate(tru, &map);
+}
+
+/// Whether a true branch is cheap to rewrite: an ALLOWLIST of type shapes that
+/// an `instantiate` finishes in one pass over what is already materialized.
+///
+/// tsc pays nothing to substitute, because its substitution type is a wrapper
+/// around the check type that every consumer can strip; ztsc has no such node
+/// and must build the rewritten branch. Rewriting a branch that re-enters
+/// DEFERRED machinery is where that stops being a constant: TypeBox's
+/// accumulator conditionals are all
+///
+///     T extends [infer L extends S, ...infer R extends S[]]
+///         ? TFilterNever<R, [...Acc, L]>
+///         : Acc
+///
+/// so the branch is a recursive alias applied to the very binder being
+/// substituted. `TFilterNever<R & S[], …>` is a type the memos have never seen,
+/// its expansion re-enters with another fresh argument, and the recursion
+/// re-runs from scratch at every level — measured at 0.19s/17MB -> 5.6s/222MB on
+/// `@sinclair/typebox` with a TS2589 at the end of it.
+///
+/// The shapes the substitution is FOR are all on this list: a bare check type
+/// (`V extends X ? V : …`), and an intersection of one with an object literal
+/// (`V & {$type: T}`, atproto's `$TypedObject` after its constrained `infer`
+/// desugars). A branch that is itself a conditional does not need substituting
+/// — its own check type gets the treatment when the relation reaches it.
+fn substitutableBranch(c: *Checker, t: TypeId, depth: u32) Error!bool {
+    if (depth > 3) return false;
+    const s = &c.ts;
+    return switch (s.kind(t)) {
+        .type_param, .infer_var => true,
+        .union_type, .intersection => blk: {
+            for (try c.memberList(t)) |m| {
+                if (!try substitutableBranch(c, m, depth + 1)) break :blk false;
+            }
+            break :blk true;
+        },
+        .object => blk: {
+            if (s.objectHasSigs(t)) break :blk false;
+            if (s.objectStringIndex(t) != types.no_type) break :blk false;
+            if (s.objectNumberIndex(t) != types.no_type) break :blk false;
+            for (0..s.objectPropCount(t)) |i| {
+                const p = s.objectProp(t, @intCast(i));
+                if (!try substitutableBranch(c, p.ty, depth + 1)) break :blk false;
+            }
+            break :blk true;
+        },
+        .array => substitutableBranch(c, s.arrayElem(t), depth + 1),
+        // Primitives and literals carry nothing to substitute, so a branch
+        // built only out of them (with the check type somewhere among them)
+        // rewrites in one pass.
+        .string,
+        .number,
+        .boolean,
+        .bigint,
+        .symbol,
+        .bool_true,
+        .bool_false,
+        .string_literal,
+        .number_literal,
+        .number_literal_fresh,
+        .bigint_literal,
+        .unique_symbol,
+        .null,
+        .undefined,
+        .void,
+        .never,
+        .any,
+        .unknown,
+        .object_keyword,
+        => true,
+        else => false,
+    };
+}
+
 /// tsc's `structuredTypeRelatedTo`, conditional source against conditional
 /// target: the two `extends` types have to be identical, but the two CHECK
 /// types need only be related in EITHER direction
@@ -1849,8 +1991,13 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
                 if (try condBranchwiseRelated(c, s, rm)) return true;
             }
         }
-        return (try c.isAssignable(try c.condTrueUnderExtends(s), t)) and
-            (try c.isAssignable(c.ts.condFalse(s), t));
+        // Both readings of the true branch under the extends assumption, the
+        // cheap special case first (`condTrueUnderExtends` rewrites one index
+        // without instantiating anything). Additive: the substitution can only
+        // make a branch relate that the bare branch did not.
+        const tru_ok = (try c.isAssignable(try c.condTrueUnderExtends(s), t)) or
+            (try c.isAssignable(try condTrueSubstituted(c, s), t));
+        return tru_ok and (try c.isAssignable(c.ts.condFalse(s), t));
     }
     // A deferred `keyof T` source relates through its apparent
     // constraint `string | number | symbol`; handled before union-target
@@ -3889,7 +4036,33 @@ pub fn instantiateSigInContextOf(c: *Checker, s: TypeId, t: TypeId) Error!?TypeI
     const cand = try c.scratch().alloc(TypeId, tp_syms.len);
     for (cand) |*x| x.* = types.no_type;
     try applyToParameterTypes(c, s, t, tp_syms, cand);
-    try c.unify(c.ts.fnReturn(s), c.ts.fnReturn(t), tp_syms, cand, 0);
+    // The return position infers at tsc's `InferencePriority.ReturnType`, and a
+    // priority is a *filter*, not a weight: `inferFromTypes` DISCARDS every
+    // candidate of a worse priority than the best one seen
+    //
+    //     if (inference.priority === undefined || priority < inference.priority) {
+    //         inference.candidates = undefined;          // ← the return's are dropped
+    //         inference.priority = priority;
+    //     }
+    //     if (priority === inference.priority) inference.candidates.push(candidate);
+    //
+    // so a type parameter a PARAMETER position already bound keeps that binding
+    // alone. Unioning the two positions' candidates instead — which is what a
+    // single `unify` accumulator does — makes a signature reject ITSELF:
+    // `<V>(v: V) => V extends {a: 1} ? V : V & {a: 1}` against
+    // `<V>(v: V) => V & {a: 1}` bound the source's `V` to `V_t | V_t & {a: 1}`
+    // (the parameter's `V_t` unioned with the candidate the return's two
+    // branches contribute), and the instantiated source then had a WIDER
+    // parameter and a distributed return that no longer related. 51 such
+    // false positives on the social-app, all of atproto's
+    // `dangerousIsType(record, isRecord)`, whose `<V>(v: V) => v is
+    // $TypedObject<V, …>` predicate is exactly this shape.
+    const ret_cand = try c.scratch().alloc(TypeId, tp_syms.len);
+    for (ret_cand) |*x| x.* = types.no_type;
+    try c.unify(c.ts.fnReturn(s), c.ts.fnReturn(t), tp_syms, ret_cand, 0);
+    for (cand, ret_cand) |*x, r| {
+        if (x.* == types.no_type) x.* = r;
+    }
     // Build the substitution. tsc's `getInferredType` closes with
     //
     //     const constraint = getConstraintOfTypeParameter(inference.typeParameter);

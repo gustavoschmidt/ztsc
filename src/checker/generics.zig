@@ -2033,7 +2033,11 @@ fn containsInferInner(c: *Checker, t: TypeId) Error!bool {
 }
 
 /// Replace `infer` binders (`ids[i]`) with their inferred `vals[i]`.
-fn substInfer(c: *Checker, t: TypeId, ids: []const u32, vals: []const TypeId) Error!TypeId {
+///
+/// `pub` for `assign.zig`'s `condTrueSubstituted`, which needs the same
+/// replacement over an `infer` binder used as a CHECK type — the shape a
+/// constrained `infer T extends C` desugars into.
+pub fn substInfer(c: *Checker, t: TypeId, ids: []const u32, vals: []const TypeId) Error!TypeId {
     if (ids.len == 0 or !try c.containsInfer(t)) return t;
     const s = &c.ts;
     switch (s.kind(t)) {
