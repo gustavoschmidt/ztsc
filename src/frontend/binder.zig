@@ -610,6 +610,31 @@ const Binder = struct {
         return b.memberAtom(tok);
     }
 
+    /// Does this member's flag word say its computed name names NOTHING?
+    ///
+    /// tsc's `bindPropertyOrMethodOrAccessor` routes a member with a dynamic
+    /// name through `bindAnonymousDeclaration(node, …, InternalSymbolName.Computed)`
+    /// instead of `declareSymbolAndAddToSymbolTable`, so the member never enters
+    /// its container's symbol table; only the *late-binding* pass, which handles
+    /// the string-literal / numeric-literal / `unique symbol` keys, puts one
+    /// back. `ast.Flags.computed_expr` marks exactly the residue, and the
+    /// member's `main_token` is its `[` — an atom nothing should ever be keyed
+    /// by, which is why declaring one made every such member in a body collide
+    /// with the next under a TS2300.
+    fn nameless(flags: u32) bool {
+        return flags & ast.Flags.computed_expr != 0;
+    }
+
+    /// Bind a member's retained computed-key EXPRESSION (`ast.Ast.computedKey`).
+    /// The key is evaluated where the member is written, so it binds in the
+    /// enclosing scope like any other expression there; without this the
+    /// checker's `computed_key.zig` walk would find unresolved names in it.
+    fn bindComputedKey(b: *Binder, member: Node, flags: u32) Error!void {
+        if (flags & (ast.Flags.computed | ast.Flags.computed_sym | ast.Flags.computed_expr) == 0) return;
+        const key = b.tree.computedKey(member) orelse return;
+        try b.bindExpr(b.tree.nodeData(key).lhs);
+    }
+
     /// Placeholder member atom for a computed const-`unique symbol` key,
     /// carrying the key identifier's text so the checker can resolve it. The
     /// `__@k$` prefix cannot appear in a real identifier, so it never collides.
@@ -2651,12 +2676,15 @@ const Binder = struct {
                     const f = b.tree.extraData(ast.Field, md.lhs);
                     const is_static = f.flags & ast.Flags.static != 0;
                     const tok = b.tree.nodeMainToken(member);
-                    _ = try b.declare(if (is_static) ss else ms, try b.memberNameKey(tok, f.flags), .property, member, tok, .{
-                        .static_member = is_static,
-                        .optional_member = f.flags & ast.Flags.optional != 0,
-                        .readonly_member = f.flags & ast.Flags.readonly != 0,
-                        .non_public = f.flags & nonpublic_mask != 0,
-                    });
+                    try b.bindComputedKey(member, f.flags);
+                    if (!nameless(f.flags)) {
+                        _ = try b.declare(if (is_static) ss else ms, try b.memberNameKey(tok, f.flags), .property, member, tok, .{
+                            .static_member = is_static,
+                            .optional_member = f.flags & ast.Flags.optional != 0,
+                            .readonly_member = f.flags & ast.Flags.readonly != 0,
+                            .non_public = f.flags & nonpublic_mask != 0,
+                        });
+                    }
                     try b.bindType(f.type_ann);
                     try b.bindExpr(f.init);
                 },
@@ -2666,13 +2694,16 @@ const Binder = struct {
                     const is_get = proto.flags & ast.Flags.get != 0;
                     const is_set = proto.flags & ast.Flags.set != 0;
                     const tok = b.tree.nodeMainToken(member);
-                    const atom = try b.memberNameKey(tok, proto.flags);
+                    try b.bindComputedKey(member, proto.flags);
                     const kind: DeclKind = if (is_get) .getter else if (is_set) .setter else .method;
-                    _ = try b.declare(if (is_static) ss else ms, atom, kind, member, tok, .{
-                        .static_member = is_static,
-                        .has_impl = md.rhs != 0 and !is_get and !is_set,
-                        .non_public = proto.flags & nonpublic_mask != 0,
-                    });
+                    if (!nameless(proto.flags)) {
+                        const atom = try b.memberNameKey(tok, proto.flags);
+                        _ = try b.declare(if (is_static) ss else ms, atom, kind, member, tok, .{
+                            .static_member = is_static,
+                            .has_impl = md.rhs != 0 and !is_get and !is_set,
+                            .non_public = proto.flags & nonpublic_mask != 0,
+                        });
+                    }
                     const is_ctor = b.tree.tokens.tag(tok) == .keyword_constructor and !is_static;
                     const ctor: CtorKind = if (!is_ctor)
                         .not_ctor
@@ -3050,10 +3081,13 @@ const Binder = struct {
         switch (b.nodeTag(member)) {
             .property_signature => {
                 const tok = b.tree.nodeMainToken(member);
-                _ = try b.declare(ms, try b.memberNameKey(tok, md.rhs), .property, member, tok, .{
-                    .optional_member = md.rhs & ast.Flags.optional != 0,
-                    .readonly_member = md.rhs & ast.Flags.readonly != 0,
-                });
+                try b.bindComputedKey(member, md.rhs);
+                if (!nameless(md.rhs)) {
+                    _ = try b.declare(ms, try b.memberNameKey(tok, md.rhs), .property, member, tok, .{
+                        .optional_member = md.rhs & ast.Flags.optional != 0,
+                        .readonly_member = md.rhs & ast.Flags.readonly != 0,
+                    });
+                }
                 try b.bindType(md.lhs);
             },
             .method_signature => {
@@ -3061,7 +3095,10 @@ const Binder = struct {
                 const is_get = md.rhs & ast.Flags.get != 0;
                 const is_set = md.rhs & ast.Flags.set != 0;
                 const kind: DeclKind = if (is_get) .getter else if (is_set) .setter else .method;
-                _ = try b.declare(ms, try b.memberNameKey(tok, md.rhs), kind, member, tok, .{});
+                try b.bindComputedKey(member, md.rhs);
+                if (!nameless(md.rhs)) {
+                    _ = try b.declare(ms, try b.memberNameKey(tok, md.rhs), kind, member, tok, .{});
+                }
                 try b.bindFunctionType(member, md.lhs);
             },
             .index_signature => {

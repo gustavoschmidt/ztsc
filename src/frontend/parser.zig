@@ -60,6 +60,7 @@ const directives = @import("directives.zig");
 const literals = @import("literals.zig");
 const modifier_order = @import("modifier_order.zig");
 const index_signature = @import("index_signature.zig");
+const computed_member = @import("computed_member.zig");
 
 const TokTag = scanner.Tag;
 const Token = scanner.Token;
@@ -220,6 +221,18 @@ const Parser = struct {
     extra: std.ArrayList(u32) = .empty,
     scratch: std.ArrayList(u32) = .empty,
     diags: std.ArrayList(ast.Diagnostic) = .empty,
+    /// Retained computed member names, appended as each member is finished.
+    /// Accumulator: node indices grow with creation order, so appending here
+    /// keeps `ast.Ast.computed_keys` sorted by member node for the binary
+    /// search `Ast.computedKey` does. Empty for almost every file.
+    computed_keys: std.ArrayList(ast.ComputedKey) = .empty,
+
+    /// Is the type-member list being parsed an INTERFACE body rather than an
+    /// object type literal? The two share `parseTypeMember` and differ in one
+    /// rule: which wording a non-late-bindable computed name gets (TS1169 vs
+    /// TS1170, `computed_member.zig`). Saved/restored around each member list,
+    /// so a type literal nested in an interface member answers for itself.
+    in_interface_body: bool = false,
 
     /// Speculation depth; > 0 makes expectation failures raise Backtrack.
     spec: u32 = 0,
@@ -332,6 +345,7 @@ const Parser = struct {
             // sweep for a file without directives, and it runs on the same
             // (parallel) worker as the parse itself.
             .comment_directives = try directives.scan(out, p.src),
+            .computed_keys = try out.dupe(ast.ComputedKey, p.computed_keys.items),
         };
     }
 
@@ -858,6 +872,7 @@ const Parser = struct {
         n_extra: usize,
         n_scratch: usize,
         n_diags: usize,
+        n_computed_keys: usize,
         last_syntactic_start: ?u32,
     };
 
@@ -871,6 +886,7 @@ const Parser = struct {
             .n_extra = p.extra.items.len,
             .n_scratch = p.scratch.items.len,
             .n_diags = p.diags.items.len,
+            .n_computed_keys = p.computed_keys.items.len,
             .last_syntactic_start = p.last_syntactic_start,
         };
     }
@@ -885,6 +901,7 @@ const Parser = struct {
         p.extra.shrinkRetainingCapacity(s.n_extra);
         p.scratch.shrinkRetainingCapacity(s.n_scratch);
         p.diags.shrinkRetainingCapacity(s.n_diags);
+        p.computed_keys.shrinkRetainingCapacity(s.n_computed_keys);
         p.last_syntactic_start = s.last_syntactic_start;
     }
 
@@ -894,6 +911,18 @@ const Parser = struct {
         const i: Node = @intCast(p.nodes.len);
         try p.nodes.append(p.gpa, item);
         return i;
+    }
+
+    fn nodeTagAt(p: *const Parser, node: Node) ast.Tag {
+        return p.nodes.items(.tag)[node];
+    }
+
+    fn nodeMainTokenAt(p: *const Parser, node: Node) u32 {
+        return p.nodes.items(.main_token)[node];
+    }
+
+    fn nodeDataAt(p: *const Parser, node: Node) ast.Data {
+        return p.nodes.items(.data)[node];
     }
 
     fn addExtra(p: *Parser, extra: anytype) Error!u32 {
@@ -2860,9 +2889,181 @@ const Parser = struct {
         };
     }
 
-    fn parseClassMember(p: *Parser) PE!Node {
-        const start_tok = p.curIdx();
+    // --- computed member names ---------------------------------------------
 
+    /// A parsed computed member name `[expr]`, in the protocol the binder and
+    /// checker read off the member's `ast.Flags` word.
+    const ComputedName = struct {
+        /// The `[` — the token tsc anchors a member diagnostic on, because
+        /// `member.name` IS the whole computed-name node.
+        l_bracket: u32,
+        /// The token the member's `main_token` becomes: the key's own literal
+        /// for a literal key, the last identifier of a late-bindable one, and
+        /// the `[` itself for a key that names nothing.
+        name_tok: u32,
+        /// The `computed*` bits to OR into the member's flag word.
+        flags: u32,
+        /// The retained `.computed_name` node, or `null_node` when nothing
+        /// downstream needs the expression back.
+        key: Node,
+        /// Does the key earn a TS116x? (`computed_member.zig`.) The code also
+        /// depends on the member's shape, which is only known once the rest of
+        /// the member has been parsed, so the caller emits it.
+        non_bindable: bool,
+    };
+
+    /// Parse a computed member name `[expr]` — the one place class members and
+    /// type members agree, so the one place the classification lives.
+    ///
+    /// tsc has no special cases here: the name is a ComputedPropertyName holding
+    /// an expression, and the member it names is decided later, from the
+    /// expression's TYPE (`isLateBindableName`). ztsc keys members by an atom
+    /// derived from a token, so the classification picks the token — and the
+    /// four answers are the four `computed*` flag combinations:
+    ///
+    ///   * a string or numeric literal key names exactly what the literal
+    ///     spells, so it is keyed by the literal token and carries no computed
+    ///     flag at all — `["data-state"]: string` is indistinguishable from
+    ///     writing the name;
+    ///   * `[Symbol.iterator]` and its well-known siblings are keyed by the
+    ///     synthetic `__@iterator` atom (`ast.wellKnownSymbolKey`);
+    ///   * `[k]` and `[a.b]` name a const `unique symbol` (or a literal
+    ///     constant): keyed by a placeholder the checker rekeys nominally;
+    ///   * everything else names NOTHING, which is exactly tsc's answer for a
+    ///     non-late-bindable name (`bindPropertyOrMethodOrAccessor` binds it
+    ///     anonymously and no late-binding pass ever finds it). The member is
+    ///     still PARSED and checked — only its name is absent.
+    ///
+    /// The key expression is retained (`ast.Ast.computedKey`) for the two
+    /// classes whose expression the checker must evaluate: the placeholder ones,
+    /// whose identifier may not resolve at all (TS2304) or may have a type that
+    /// cannot name a property (TS2464), and the nameless ones. A literal needs
+    /// no evaluation, and `[Symbol.<known>]` cannot fail — which matters,
+    /// because the vendored lib writes hundreds of those and re-checking each
+    /// one buys nothing.
+    fn parseComputedMemberName(p: *Parser) PE!ComputedName {
+        const lb = try p.bump(); // `[`
+        const expr = try p.parseAssignExpr(.{});
+        _ = try p.eat(.r_bracket); // best-effort; recovery handles malformed
+        const tag = p.nodeTagAt(expr);
+        if (tag == .string_literal or tag == .number_literal) {
+            return .{
+                .l_bracket = lb,
+                .name_tok = p.nodeMainTokenAt(expr),
+                .flags = 0,
+                .key = null_node,
+                .non_bindable = false,
+            };
+        }
+        if (tag == .member_expr) {
+            // `member_expr` stores its property NAME as a token, not a node.
+            const d = p.nodeDataAt(expr);
+            if (p.nodeTagAt(d.lhs) == .identifier and p.memberNameIsIdent(d.rhs)) {
+                const obj_tok = p.nodeMainTokenAt(d.lhs);
+                const name_tok = d.rhs;
+                if (std.mem.eql(u8, p.tokenTextAt(obj_tok), "Symbol") and
+                    ast.wellKnownSymbolKey(p.tokenTextAt(name_tok)) != null)
+                {
+                    return .{
+                        .l_bracket = lb,
+                        .name_tok = name_tok,
+                        .flags = ast.Flags.computed,
+                        .key = null_node,
+                        .non_bindable = false,
+                    };
+                }
+                // `[a.b]`: the placeholder atom is built from the two
+                // identifiers' text, and `memberNameKey` finds the object one at
+                // `name_tok - 2` — which holds because `[`, `a`, `.`, `b` are
+                // adjacent in the token stream (comments are trivia).
+                return .{
+                    .l_bracket = lb,
+                    .name_tok = name_tok,
+                    .flags = ast.Flags.computed | ast.Flags.computed_sym | ast.Flags.computed_sym_qual,
+                    .key = try p.addComputedNameNode(lb, expr),
+                    .non_bindable = false,
+                };
+            }
+        }
+        if (tag == .identifier) {
+            return .{
+                .l_bracket = lb,
+                .name_tok = p.nodeMainTokenAt(expr),
+                .flags = ast.Flags.computed | ast.Flags.computed_sym,
+                .key = try p.addComputedNameNode(lb, expr),
+                .non_bindable = false,
+            };
+        }
+        return .{
+            .l_bracket = lb,
+            .name_tok = lb,
+            .flags = ast.Flags.computed_expr,
+            .key = try p.addComputedNameNode(lb, expr),
+            .non_bindable = p.computedNameIsNonBindable(expr),
+        };
+    }
+
+    fn addComputedNameNode(p: *Parser, lb: u32, expr: Node) Error!Node {
+        return p.addNode(.{ .tag = .computed_name, .main_token = lb, .data = .{ .lhs = expr, .rhs = 0 } });
+    }
+
+    /// tsc's `isNonBindableDynamicName`, as tsgo answers it — purely
+    /// syntactically. See `computed_member.zig` for the measurements.
+    fn computedNameIsNonBindable(p: *Parser, expr: Node) bool {
+        return switch (p.nodeTagAt(expr)) {
+            // `isStringOrNumericLiteralLike`: a NO-SUBSTITUTION template
+            // literal names a property just as a string literal does
+            // (`` [`tpl`] `` is silent, measured).
+            .string_literal, .number_literal, .template_literal => false,
+            // `isSignedNumericLiteral`: `[-1]` / `[+1]` name `-1` / `1`.
+            .prefix_unary => switch (p.tokTagAt(p.nodeMainTokenAt(expr))) {
+                .plus, .minus => p.nodeTagAt(p.nodeDataAt(expr).lhs) != .number_literal,
+                else => true,
+            },
+            else => !p.isEntityNameExpr(expr),
+        };
+    }
+
+    /// tsc's `isEntityNameExpression`: an identifier, or a dotted chain of
+    /// them. `this.x`, `a?.b` and `(a)` are all NOT one — which is why
+    /// `[(s)]` reports where `[s]` does not.
+    fn isEntityNameExpr(p: *Parser, expr: Node) bool {
+        return switch (p.nodeTagAt(expr)) {
+            .identifier => true,
+            .member_expr => blk: {
+                const d = p.nodeDataAt(expr);
+                break :blk p.memberNameIsIdent(d.rhs) and p.isEntityNameExpr(d.lhs);
+            },
+            else => false,
+        };
+    }
+
+    /// Is a `member_expr`'s property-name TOKEN an Identifier in tsc's sense? A
+    /// keyword in that position is one (`a.default`); a private name (`a.#b`) is
+    /// not, which is what keeps it out of an entity-name chain.
+    fn memberNameIsIdent(p: *Parser, tok: u32) bool {
+        const t = p.tokTagAt(tok);
+        return isNameLike(t) and t != .private_identifier;
+    }
+
+    /// Finish a member whose name was computed: report the TS116x its home and
+    /// shape earn, and retain the key expression against the member node.
+    fn finishComputedName(
+        p: *Parser,
+        cn: ComputedName,
+        member: Node,
+        home: computed_member.Home,
+        kind: computed_member.MemberKind,
+    ) Error!void {
+        if (cn.non_bindable) {
+            if (computed_member.grammarCode(home, kind, p.ambient)) |code| {
+                try p.errAtToken(code, cn.l_bracket);
+            }
+        }
+        if (cn.key != null_node) try p.computed_keys.append(p.gpa, .{ .member = member, .key = cn.key });
+    }
+
+    fn parseClassMember(p: *Parser) PE!Node {
         // Decorators on members: a `.decorator` node preceding the decorated
         // member (the body loop re-enters for the member itself).
         if (p.curTag() == .at) return p.parseDecorator();
@@ -2924,47 +3125,17 @@ const Parser = struct {
 
         // Member name.
         var name_tok: u32 = 0;
+        var computed: ?ComputedName = null;
         switch (p.curTag()) {
             .l_bracket => {
                 // Computed member name / index signature in class.
                 if (p.atIndexSignature()) {
                     return p.parseIndexSignatureAsClassMember(flags);
                 }
-                // Well-known-symbol key `[Symbol.iterator]`: keyed by a
-                // synthetic atom, then parsed as an ordinary method/field.
-                if (try p.eatWellKnownSymbolName()) |ntok| {
-                    name_tok = ntok;
-                    flags |= ast.Flags.computed;
-                } else if (isIdentLike(p.peekTag(1)) and p.peekTag(2) == .r_bracket) {
-                    // `[k]` where `k` is a plain identifier: a computed key
-                    // naming a const `unique symbol` (drizzle's
-                    // `static readonly [entityKind]`, typebox's `[Kind]`). The
-                    // checker resolves the identifier to its nominal symbol id.
-                    _ = try p.bump(); // `[`
-                    name_tok = try p.bump(); // identifier
-                    _ = try p.eat(.r_bracket);
-                    flags |= ast.Flags.computed | ast.Flags.computed_sym;
-                } else if (isIdentLike(p.peekTag(1)) and p.peekTag(2) == .dot and
-                    isIdentLike(p.peekTag(3)) and p.peekTag(4) == .r_bracket)
-                {
-                    // `[a.b]` member-expression computed key (node's
-                    // `[EventEmitter.captureRejectionSymbol]`): keyed by the
-                    // member's nominal symbol id, resolved by the checker.
-                    // The object identifier sits at `name_tok - 2`.
-                    _ = try p.bump(); // `[`
-                    _ = try p.bump(); // object identifier
-                    _ = try p.bump(); // `.`
-                    name_tok = try p.bump(); // member identifier
-                    _ = try p.eat(.r_bracket);
-                    flags |= ast.Flags.computed | ast.Flags.computed_sym | ast.Flags.computed_sym_qual;
-                } else {
-                    _ = try p.bump();
-                    _ = try p.parseAssignExpr(.{});
-                    _ = try p.eat(.r_bracket);
-                    // Other computed names are out of subset; skip the member.
-                    p.skipToMemberEnd();
-                    return p.unsupportedFrom(start_tok);
-                }
+                const cn = try p.parseComputedMemberName();
+                name_tok = cn.name_tok;
+                flags |= cn.flags;
+                computed = cn;
             },
             .string_literal, .numeric_literal, .private_identifier => name_tok = try p.bump(),
             // `class K { 4n = 0 }` — TS1539, exactly as in an object literal.
@@ -3006,7 +3177,20 @@ const Parser = struct {
             } else {
                 try p.expectSemicolon(); // overload signature / abstract
             }
-            return p.addNode(.{ .tag = .class_method, .main_token = name_tok, .data = .{ .lhs = proto, .rhs = body } });
+            const member = try p.addNode(.{ .tag = .class_method, .main_token = name_tok, .data = .{ .lhs = proto, .rhs = body } });
+            if (computed) |cn| {
+                // An accessor is judged by neither `checkGrammarProperty` nor
+                // `checkGrammarMethod`; a method is, and what it earns turns on
+                // whether it has a BODY.
+                const kind: computed_member.MemberKind = if (flags & (ast.Flags.get | ast.Flags.set) != 0)
+                    .accessor
+                else if (body != null_node)
+                    .method_impl
+                else
+                    .method_signature;
+                try p.finishComputedName(cn, member, .class_body, kind);
+            }
+            return member;
         }
 
         // Field.
@@ -3031,7 +3215,9 @@ const Parser = struct {
         }
         try p.expectSemicolon();
         const extra = try p.addExtra(ast.Field{ .flags = flags, .type_ann = type_ann, .init = init });
-        return p.addNode(.{ .tag = .class_field, .main_token = name_tok, .data = .{ .lhs = extra, .rhs = 0 } });
+        const member = try p.addNode(.{ .tag = .class_field, .main_token = name_tok, .data = .{ .lhs = extra, .rhs = 0 } });
+        if (computed) |cn| try p.finishComputedName(cn, member, .class_body, .property);
+        return member;
     }
 
     fn parseIndexSignatureAsClassMember(p: *Parser, flags: u32) PE!Node {
@@ -3083,7 +3269,12 @@ const Parser = struct {
             }
             ext = try p.scratchToSpan(top);
         }
-        const members = try p.parseTypeMemberList();
+        const members = blk: {
+            const saved = p.in_interface_body;
+            defer p.in_interface_body = saved;
+            p.in_interface_body = true;
+            break :blk try p.parseTypeMemberList();
+        };
         const extra = try p.addExtra(ast.InterfaceData{
             .flags = flags,
             .name_token = name_tok,
@@ -5808,7 +5999,13 @@ const Parser = struct {
             is_mapped = true;
         }
         if (is_mapped) return p.parseMappedType(lb, flags);
-        const members = try p.parseTypeMembersRest();
+        const members = blk: {
+            // A type literal nested in an interface member answers for itself.
+            const saved = p.in_interface_body;
+            defer p.in_interface_body = saved;
+            p.in_interface_body = false;
+            break :blk try p.parseTypeMembersRest();
+        };
         return p.addNode(.{ .tag = .object_type, .main_token = lb, .data = .{ .lhs = members.start, .rhs = members.end } });
     }
 
@@ -5980,56 +6177,15 @@ const Parser = struct {
 
         // Index signature `[k: K]: V`.
         var name_tok: u32 = 0;
+        var computed: ?ComputedName = null;
         if (p.curTag() == .l_bracket) {
             if (p.atIndexSignature()) {
                 return p.parseIndexSignature(flags);
             }
-            // `['data-state']: string` / `[0]: T`. A computed key whose
-            // expression is a literal is late-bound to exactly that literal's
-            // own name, so it is indistinguishable from writing the name
-            // directly (bluesky's `RadixPassThroughTriggerProps`).
-            if ((p.peekTag(1) == .string_literal or p.peekTag(1) == .numeric_literal) and
-                p.peekTag(2) == .r_bracket)
-            {
-                _ = try p.bump(); // `[`
-                name_tok = try p.bump(); // literal
-                _ = try p.eat(.r_bracket);
-            }
-            // Well-known-symbol key `[Symbol.iterator](): T` — keyed by a
-            // synthetic atom, then parsed as an ordinary member below.
-            else if (try p.eatWellKnownSymbolName()) |ntok| {
-                name_tok = ntok;
-                flags |= ast.Flags.computed;
-            } else if (isIdentLike(p.peekTag(1)) and p.peekTag(2) == .r_bracket) {
-                // `[k]` naming a const `unique symbol` (typebox's `[Kind]: 'X'`,
-                // drizzle's interface `[entityKind]: string`). Keyed by the
-                // symbol's nominal id, resolved by the checker.
-                _ = try p.bump(); // `[`
-                name_tok = try p.bump(); // identifier
-                _ = try p.eat(.r_bracket);
-                flags |= ast.Flags.computed | ast.Flags.computed_sym;
-            } else if (isIdentLike(p.peekTag(1)) and p.peekTag(2) == .dot and
-                isIdentLike(p.peekTag(3)) and p.peekTag(4) == .r_bracket)
-            {
-                // `[a.b]` member-expression computed key (util's
-                // `[promisify.custom]: TCustom`, rxjs's `[Symbol.observable]`
-                // for a non-well-known `Symbol` member). Keyed by the member's
-                // nominal symbol id, resolved by the checker; the object
-                // identifier sits at `name_tok - 2`.
-                _ = try p.bump(); // `[`
-                _ = try p.bump(); // object identifier
-                _ = try p.bump(); // `.`
-                name_tok = try p.bump(); // member identifier
-                _ = try p.eat(.r_bracket);
-                flags |= ast.Flags.computed | ast.Flags.computed_sym | ast.Flags.computed_sym_qual;
-            } else {
-                // Other computed properties in a type are out of subset.
-                _ = try p.bump();
-                _ = try p.parseAssignExpr(.{});
-                _ = try p.eat(.r_bracket);
-                if (try p.eat(.colon) != null) _ = try p.parseType();
-                return p.unsupportedFrom(start_tok);
-            }
+            const cn = try p.parseComputedMemberName();
+            name_tok = cn.name_tok;
+            flags |= cn.flags;
+            computed = cn;
         }
 
         // Property / method name.
@@ -6067,11 +6223,22 @@ const Parser = struct {
                 defer p.ambient = was_ambient;
                 _ = try p.parseFunctionBody();
             }
-            return p.addNode(.{ .tag = .method_signature, .main_token = name_tok, .data = .{ .lhs = proto, .rhs = flags } });
+            const member = try p.addNode(.{ .tag = .method_signature, .main_token = name_tok, .data = .{ .lhs = proto, .rhs = flags } });
+            if (computed) |cn| try p.finishComputedName(cn, member, p.typeMemberHome(), .method_signature);
+            return member;
         }
         var type_ann: Node = null_node;
         if (try p.eat(.colon) != null) type_ann = try p.parseType();
-        return p.addNode(.{ .tag = .property_signature, .main_token = name_tok, .data = .{ .lhs = type_ann, .rhs = flags } });
+        const member = try p.addNode(.{ .tag = .property_signature, .main_token = name_tok, .data = .{ .lhs = type_ann, .rhs = flags } });
+        if (computed) |cn| try p.finishComputedName(cn, member, p.typeMemberHome(), .property);
+        return member;
+    }
+
+    /// Which of tsc's two type-member wordings this member list gets. An
+    /// interface and an object type literal are the same grammar and differ only
+    /// here (TS1169 vs TS1170).
+    fn typeMemberHome(p: *const Parser) computed_member.Home {
+        return if (p.in_interface_body) .interface_body else .type_literal;
     }
 
     /// tsc's `isUnambiguouslyIndexSignature`, run as a lookahead from the `[`.
@@ -7231,8 +7398,23 @@ test "type predicates parse cleanly" {
     try expectDiagCount("const f = (x: unknown): x is string => true;", 0);
 }
 
-test "unsupported: class oddities" {
-    try expectDiagCount("class B { [computeKey()]() {} }", 1); // computed member name (non-symbol)
+test "a computed member name is parsed, whatever the key" {
+    // A method with a BODY is silent whatever its computed key says (tsc's
+    // `checkGrammarMethod` judges only a method with no body); the member is
+    // parsed and its name is simply absent. Measured against tsgo, `t/k8.ts`.
+    try expectDiagCount("class B { [computeKey()]() {} }", 0);
+    // The same key on a PROPERTY and on an overload signature does earn a
+    // TS116x — see `computed_member.zig` for which wording goes where.
+    try expectDiagCount("class B { [computeKey()]: number; }", 1);
+    try expectDiagCount("class B { [computeKey()](): void; }", 1);
+    try expectDiagCount("interface B { [computeKey()]: number }", 1);
+    try expectDiagCount("type B = { [computeKey()]: number }", 1);
+    // …and a literal, a template literal, a signed number and an entity name
+    // are all late-bindable in principle, so none of them does.
+    try expectDiagCount("class B { [\"lit\"]: number; }", 0);
+    try expectDiagCount("class B { [`tpl`]: number; }", 0);
+    try expectDiagCount("class B { [-1]: number; }", 0);
+    try expectDiagCount("class B { [a.b.c]: number; }", 0);
 }
 
 test "class static initialization block parses as a member block" {
@@ -7267,9 +7449,10 @@ test "member-expression computed keys are in subset" {
     try expectDiagCount("declare class C { [EventEmitter.captureRejectionSymbol]?<K>(error: Error): void; }", 0);
     try expectDiagCount("interface I { [promisify.custom]: number; }", 0);
     try expectDiagCount("interface O { [Symbol.observable]: () => number; }", 0);
-    // Deeper qualification and non-name keys stay out of subset.
-    try expectDiagCount("class B { [a.b.c]() {} }", 1);
-    try expectDiagCount("interface J { [a.b.c]: number; }", 1);
+    // Deeper qualification is an entity name too, so it parses and reports
+    // nothing — the member just has no name (tsgo agrees, `t/k8.ts`).
+    try expectDiagCount("class B { [a.b.c]() {} }", 0);
+    try expectDiagCount("interface J { [a.b.c]: number; }", 0);
 }
 
 test "jsx parses cleanly in tsx mode" {
