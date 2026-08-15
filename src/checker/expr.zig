@@ -4315,10 +4315,44 @@ fn destructuringKey(c: *Checker, prop: Node, key_node: Node) Error!?DestructKey 
 /// `getIndexedAccessType(source, key, AccessFlags.ExpressionPosition)` plus a
 /// `checkPropertyAccessibility(…, /*writing*/ true)` on the resolved symbol,
 /// which is what `propertyTypeOf` with a `.write` site already does.
-fn destructuringMemberType(c: *Checker, src: TypeId, key: ?DestructKey) Error!TypeId {
+///
+/// `has_default` is tsc's `AccessFlags.AllowMissing`, which it sets for
+/// exactly the elements that carry `= init`: a missing property is then no
+/// error, because the default is the value the target takes. The declaration
+/// side has the same rule (`getBindingElementTypeFromParentType`, which ztsc
+/// already matches — `var { x = 1 } = {}` reports nothing), and without it
+/// every `({ x = 1 } = {})` in the corpus reported a property tsc is silent
+/// about. The ACCESSIBILITY check is not suppressed: tsc gates it on the
+/// lookup succeeding, not on the flag.
+/// A NUMERIC key is the other divergence: tsc indexes with the key TYPE, so
+/// `({ [1]: b } = [9, 8] as const)` reads tuple element 1 — a name lookup
+/// finds nothing there and would report a property the tuple has.
+fn destructuringMemberType(c: *Checker, src: TypeId, key: ?DestructKey, has_default: bool) Error!TypeId {
     if (src == types.no_type) return types.no_type;
     const k = key orelse return types.no_type;
+    // Only the MISS is intercepted; a property that resolves keeps every rule
+    // `propertyTypeOf` runs on it (the intersection-private reduction, the
+    // per-constituent union accessibility, the lazy single-member paths).
+    const r = try c.resolveStructural(src);
+    const rk = c.ts.kind(r);
+    if (rk != .any and rk != .err and (try c.propOfType(r, k.name)) == null) {
+        if (try numericNameIndexHit(c, r, rk, c.atomText(k.name))) |t| return t;
+        if (has_default) return types.no_type;
+    }
     return propertyTypeOf(c, src, k.name, k.tok, .{ .dir = .write });
+}
+
+/// tsc's `hasDefaultValue`, over the shapes the expression cover grammar
+/// produces for a pattern element's target: `[a = 1]` parses as a plain
+/// assignment, a declaration-shaped pattern as a `binding_default`.
+fn destructuringHasDefault(c: *Checker, el0: Node) bool {
+    const el = skipParens(c, el0);
+    if (el == null_node) return false;
+    return switch (c.nodeTag(el)) {
+        .binding_default => true,
+        .assign => c.tree.tokens.tag(c.tree.nodeMainToken(el)) == .eq,
+        else => false,
+    };
 }
 
 /// The element a NUMERIC destructuring position names. `no_type` when the
@@ -4344,14 +4378,16 @@ fn checkObjectDestructuringProperty(c: *Checker, prop: Node, src: TypeId) Error!
         // `{ key: target }` / `{ [key]: target }` — only a computed key is
         // evaluated, and `destructuringKey` is what evaluates it.
         .object_property => {
-            const elem = try destructuringMemberType(c, src, try destructuringKey(c, prop, d.lhs));
+            const key = try destructuringKey(c, prop, d.lhs);
+            const elem = try destructuringMemberType(c, src, key, destructuringHasDefault(c, d.rhs));
             try checkDestructuringTarget(c, d.rhs, elem);
         },
         // `{ a }` / `{ a = init }` — the name is both key and target; lhs is
         // the target identifier, rhs the default.
         .object_shorthand => {
             if (d.rhs != null_node) _ = try c.checkExprCached(d.rhs, types.no_type);
-            const elem = try destructuringMemberType(c, src, try destructuringKey(c, prop, null_node));
+            const key = try destructuringKey(c, prop, null_node);
+            const elem = try destructuringMemberType(c, src, key, d.rhs != null_node);
             try checkDestructuringTarget(c, d.lhs, elem);
         },
         // Declaration-shaped pattern nodes (a `for (…of…)` head can carry
