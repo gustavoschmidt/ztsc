@@ -1219,22 +1219,35 @@ const Binder = struct {
     /// One pass over the file's symbols after everything is bound, for the same
     /// reason `checkMergedExports` is: the verdict is a property of the whole
     /// declaration set, and "the last one" is only known once there are no more.
-    /// Remember which declaration immediately follows each bodyless function or
-    /// method in `list` (see `overload_next`). Cheap by construction: the map
-    /// gains an entry only for a declaration with no body, and a file with no
-    /// overload signatures never touches it.
+    /// Remember which declaration immediately follows each function or method in
+    /// `list` (see `overload_next`). Two jobs: it names the sibling
+    /// `overloadSiblingDiag` inspects, and its presence for a given pair IS
+    /// tsc's `previousDeclaration.end === node.pos` — a pair with a node between
+    /// them never gets an entry, which is exactly "not consecutive". A
+    /// body-carrying declaration needs an entry for the same reason a bodyless
+    /// one does: `function m() {} function f() {} function m();` blames `f`.
+    /// One entry per function-like declaration in the file, in per-file scratch.
     fn recordOverloadSiblings(b: *Binder, list: []const Node) Error!void {
         if (list.len < 2) return;
         for (list[0 .. list.len - 1], list[1..]) |n, next| {
             if (n == null_node or next == null_node) continue;
-            switch (b.nodeTag(n)) {
-                // `.rhs` is the body for both tags.
-                .function_decl, .class_method => if (b.tree.nodeData(n).rhs == 0) {
-                    try b.overload_next.put(b.scratch, n, next);
-                },
+            const decl = b.exportedDecl(n);
+            switch (b.nodeTag(decl)) {
+                .function_decl, .class_method => try b.overload_next.put(b.scratch, decl, b.exportedDecl(next)),
                 else => {},
             }
         }
+    }
+
+    /// The declaration a statement DECLARES, looking through the `export`
+    /// wrappers the parser puts around it. A declaration list holds the
+    /// wrapper, while a symbol's declaration list holds what is inside it, so
+    /// anything that pairs the two has to agree on which node it means.
+    fn exportedDecl(b: *Binder, node: Node) Node {
+        return switch (b.nodeTag(node)) {
+            .export_decl, .export_default => b.tree.nodeData(node).lhs,
+            else => node,
+        };
     }
 
     /// What KIND of function-like a declaration is, in tsc's terms — the axis
@@ -1325,11 +1338,107 @@ const Binder = struct {
         return .{ .report = .{ .code = .overload_impl_name_mismatch, .tok = next_tok } };
     }
 
+    /// tsc's `reportImplementationExpectedError`, whole: the sharper sibling arms
+    /// first (which can also silence the report outright), then the generic
+    /// "implementation is missing" / "constructor implementation is missing" /
+    /// "abstract declarations must be consecutive".
+    ///
+    /// Its two call sites differ ONLY in what they screen out first. The
+    /// `lastSeenNonAmbientDeclaration` arm reaches here for a declaration that
+    /// legitimately wants a body (`impl_expected.expected`); the non-consecutive
+    /// pair arm reaches here for whatever the previous declaration happened to
+    /// be — `declare`, optional and body-carrying alike, since tsc applies none
+    /// of those exclusions on that path (all three verified against tsgo 7.0.2).
+    fn reportImplExpected(b: *Binder, sym: SymbolId, link: u32) Error!void {
+        const node = b.decl_links.items[link].value;
+        const name_tok = b.decl_name_toks.items[link];
+        // tsc's `nodeIsMissing(node.name)` bail: a recovered declaration with no
+        // name to report at.
+        if (name_tok == 0) return;
+        // What immediately follows can give a sharper answer than the generic
+        // "implementation is missing" — or explain the missing body without a
+        // diagnostic at all.
+        switch (b.overloadSiblingDiag(node)) {
+            .fall_through => {},
+            .silent => return,
+            .report => |r| return b.diag(r.code, r.tok),
+        }
+        if (b.scope_kinds.items[b.sym_scopes.items[sym]] == .class_members and
+            b.tree.tokens.tag(name_tok) == .keyword_constructor)
+        {
+            return b.diag(.missing_constructor_implementation, name_tok);
+        }
+        const proto = b.tree.extraData(ast.FnProto, b.tree.nodeData(node).lhs);
+        // An `abstract` method is legally bodyless, so the only thing wrong with
+        // it is the gap: tsc words that as its own diagnostic.
+        if (proto.flags & ast.Flags.abstract != 0) {
+            return b.diag(.abstract_decls_not_consecutive, name_tok);
+        }
+        // A computed method name (`[Symbol.iterator](x: string): string;`) is
+        // reported at the `[`, as every duplicate-name diagnostic is.
+        return b.diag(.missing_function_implementation, b.dupDiagTok(node, name_tok));
+    }
+
+    /// tsc's OTHER `reportImplementationExpectedError` call site: inside
+    /// `checkFunctionOrConstructorSymbol`'s walk, `previousDeclaration.end !==
+    /// node.pos` — two declarations of one overload set with a NODE between
+    /// them. The report lands on the EARLIER of the pair.
+    ///
+    ///     function m(): void;
+    ///     const x = 1;          // ← the gap
+    ///     function m(): void {} // TS2391 lands on line 1's `m`
+    ///
+    /// The byte test is `recordOverloadSiblings`' map: a pair with something
+    /// between them has no entry, which is precisely non-consecutive (leading
+    /// trivia is not a node, so a blank line or a comment keeps them adjacent).
+    ///
+    /// Not reached for an INTERFACE or type-literal member — tsc's
+    /// `inAmbientContextOrInterface` clears `previousDeclaration` for every one
+    /// of those, and their signatures are legally bodyless anyway.
+    fn checkConsecutiveDecls(b: *Binder, sym: SymbolId) Error!void {
+        var prev: u32 = 0;
+        var body_seen = false;
+        var link = b.sym_decl_head.items[sym];
+        while (link != 0) : (link = b.decl_links.items[link].next) {
+            // An AMBIENT declaration drops whatever came before it, then becomes
+            // the previous declaration itself — so `declare function f();
+            // declare const x; declare function f();` is silent while
+            // `declare function f(); const x = 1; function f() {}` reports.
+            if (b.decl_origins.items[link].ambient) prev = 0;
+            const node = b.decl_links.items[link].value;
+            switch (b.nodeTag(node)) {
+                .function_decl, .class_method => {},
+                // A non-function-like declaration of the same name (a merged
+                // `namespace`, a `class`) is not part of the overload set; tsc's
+                // walk passes over it without disturbing the pairing.
+                else => continue,
+            }
+            // tsc's walk collects functions, methods, method signatures and
+            // constructors — never ACCESSORS, which ztsc spells with the same
+            // node tag and which are legally bodyless.
+            if (b.fnKindOf(node) == .accessor) continue;
+            const has_body = b.tree.nodeData(node).rhs != 0;
+            if (has_body and body_seen) {
+                // A SECOND implementation is TS2393/TS2392's business, and tsc
+                // takes that branch instead of this one.
+            } else if (prev != 0 and
+                (b.overload_next.get(b.decl_links.items[prev].value) orelse null_node) != node)
+            {
+                try b.reportImplExpected(sym, prev);
+            }
+            if (has_body) body_seen = true;
+            prev = link;
+        }
+    }
+
     fn checkMissingImplementations(b: *Binder) Error!void {
         for (1..b.sym_names.items.len) |i| {
             const sym: SymbolId = @intCast(i);
             const f = b.sym_flags.items[sym];
             if (!f.function and !f.method) continue;
+            if (b.scope_kinds.items[b.sym_scopes.items[sym]] != .interface_members) {
+                try b.checkConsecutiveDecls(sym);
+            }
 
             // tsc's `lastSeenNonAmbientDeclaration`.
             var last: u32 = 0;
@@ -1345,36 +1454,16 @@ const Binder = struct {
 
             const node = b.decl_links.items[last].value;
             const name_tok = b.decl_name_toks.items[last];
-            // tsc's `nodeIsMissing(node.name)` bail: a recovered declaration
-            // with no name to report at.
             if (name_tok == 0) continue;
             const d = b.tree.nodeData(node);
             const proto = b.tree.extraData(ast.FnProto, d.lhs);
             const scope = b.scope_kinds.items[b.sym_scopes.items[sym]];
             const is_ctor = scope == .class_members and
                 b.tree.tokens.tag(name_tok) == .keyword_constructor;
-            const want = impl_expected.expected(scope, b.nodeTag(node), proto.flags, is_ctor, d.rhs != 0);
-            // tsc looks at what immediately follows before settling for the
-            // generic "implementation is missing": a sharper answer there
-            // replaces this diagnostic outright, and sometimes silences it.
-            if (want != .none) switch (b.overloadSiblingDiag(node)) {
-                .fall_through => {},
-                .silent => continue,
-                .report => |r| {
-                    try b.diag(r.code, r.tok);
-                    continue;
-                },
-            };
-            switch (want) {
-                .none => {},
-                // A computed method name (`[Symbol.iterator](x: string): string;`)
-                // is reported at the `[`, as every duplicate-name diagnostic is.
-                .function => try b.diag(
-                    .missing_function_implementation,
-                    b.dupDiagTok(node, name_tok),
-                ),
-                .constructor => try b.diag(.missing_constructor_implementation, name_tok),
-            }
+            // THIS call site's screen: only a declaration that legitimately wants
+            // a body gets the report (`impl_expected.zig` holds every exclusion).
+            if (impl_expected.expected(scope, b.nodeTag(node), proto.flags, is_ctor, d.rhs != 0) == .none) continue;
+            try b.reportImplExpected(sym, last);
         }
     }
 
