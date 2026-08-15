@@ -3640,6 +3640,18 @@ fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
 fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
     const d = c.tree.nodeData(node);
     const op = c.tree.tokens.tag(c.tree.nodeMainToken(node));
+    // A destructuring assignment is not an ordinary one: tsc's
+    // `checkBinaryLikeExpression` diverts `=` with a pattern on the left to
+    // `checkDestructuringAssignment`, which checks the RIGHT side first and
+    // with NO contextual type (the pattern is not a type), resolves every
+    // element against that source type, and answers the source type as the
+    // expression's own. No whole-pattern assignability check runs — the
+    // per-element lookups are the check.
+    if (op == .eq and isDestructuringPattern(c, d.lhs)) {
+        const src = try c.checkExprCached(d.rhs, types.no_type);
+        try checkDestructuringPattern(c, d.lhs, src);
+        return src;
+    }
     const target_t = try checkAssignmentTarget(c, d.lhs);
     // Writing an evolving (`auto`-typed) variable is unchecked: its
     // `null`/`undefined` declared type is where the flow type starts, not
@@ -3964,6 +3976,16 @@ fn readonlyIndexWriteAt(c: *Checker, obj: TypeId, node: Node, idx_node: Node) Er
     return true;
 }
 
+/// tsc's `left.kind === ObjectLiteralExpression || ArrayLiteralExpression`
+/// test on the left of `=`. The pattern-shaped tags are in the set too: a
+/// `for (…of…)` head can hand one to the expression walker.
+fn isDestructuringPattern(c: *Checker, node: Node) bool {
+    return switch (c.nodeTag(node)) {
+        .array_literal, .object_literal, .array_pattern, .object_pattern => true,
+        else => false,
+    };
+}
+
 /// Type of an assignment target; reports TS2588 (const) and TS2540
 /// (readonly property).
 fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
@@ -4059,12 +4081,12 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
         },
         .array_literal, .object_literal, .array_pattern, .object_pattern => {
             // Destructuring-assignment pattern in the expression cover
-            // grammar (`[a, b] = …`, `({ p: a } = …)`). Every element is a
-            // WRITE, so it goes through `checkDestructuringElement`, not
-            // `checkExprCached`: an element identifier must resolve as an
-            // assignment target (no TDZ / definite-assignment read check)
-            // and a property KEY is a name, not a reference.
-            for (c.tree.nodeRange(node)) |el| try checkDestructuringElement(c, el);
+            // grammar (`[a, b] = …`, `({ p: a } = …)`). Reached here only
+            // where no SOURCE type is available — an operator other than
+            // `=`, which is not a legal destructuring assignment anyway;
+            // `checkAssignExpr` takes the `=` case straight to
+            // `checkDestructuringPattern` with the source in hand.
+            try checkDestructuringPattern(c, node, types.no_type);
             return types.any_type;
         },
         else => return c.checkExprCached(node, types.no_type),
@@ -4238,59 +4260,161 @@ fn setterParamOfProto(c: *Checker, decl: Node, proto_idx: u32) Error!?TypeId {
     return c.ts.fnParam(sig, 0).ty;
 }
 
-/// One element of a destructuring-assignment pattern, in the expression
-/// cover grammar the parser keeps (`{ p: a }` is an `object_literal` of
-/// `object_property`, not an `object_pattern`). Peels the element to its
-/// assignment target and hands that to `checkAssignmentTarget`; default
-/// initializers and computed keys are ordinary reads. Without the peel the
-/// generic expression walker checked the property KEY as a reference
-/// (TS2304 on `({ width: dx } = …)`) and the target identifier as a *read*,
-/// so writing a not-yet-assigned `let` through a destructuring assignment
-/// reported TS2454 at the write site itself.
-fn checkDestructuringElement(c: *Checker, el0: Node) Error!void {
-    const el = skipParens(c, el0);
-    if (el == null_node) return;
-    const d = c.tree.nodeData(el);
-    switch (c.nodeTag(el)) {
-        // `{ key: target }` — `key` names a property, it is not a
-        // reference; only a computed key is evaluated.
-        .object_property => {
-            if (d.lhs != null_node and c.nodeTag(d.lhs) == .computed_name)
-                _ = try c.checkExprCached(c.tree.nodeData(d.lhs).lhs, types.no_type);
-            try checkDestructuringElement(c, d.rhs);
+/// A destructuring-assignment pattern in the expression cover grammar the
+/// parser keeps (`{ p: a }` is an `object_literal` of `object_property`, not
+/// an `object_pattern`), resolved against the type of the value being
+/// destructured.
+///
+/// tsc's `checkObjectLiteralAssignment` / `checkArrayLiteralAssignment`: a
+/// pattern element is not a value to be typed, it is a WRITE whose target is
+/// reached THROUGH the source — the property its key names, or the element
+/// its index names. That lookup is where the accessibility rules and TS2339
+/// live, so a pattern walked with no source at all (as this was) reported
+/// neither: `([{ a: { x } }] = [{ a: new C() }])` on a `private x` said
+/// nothing where tsc says TS2341 (`destructuringAssignment_private`).
+///
+/// `src` is `no_type` where the source is unknown — an operator other than
+/// `=`, a rest element, an index the source carries no numeric domain for.
+/// Every lookup below is a no-op on `no_type` (`propertyTypeOf` answers
+/// `any` for kind `.none`), so an unknown source degrades to exactly the
+/// element walk this used to be.
+fn checkDestructuringPattern(c: *Checker, node: Node, src: TypeId) Error!void {
+    switch (c.nodeTag(node)) {
+        .object_literal, .object_pattern => {
+            for (c.tree.nodeRange(node)) |el| try checkObjectDestructuringProperty(c, el, src);
         },
-        // `{ a }` / `{ a = init }` — lhs is the target identifier, rhs the
-        // default.
+        else => {
+            var index: u32 = 0;
+            for (c.tree.nodeRange(node)) |el| {
+                defer index += 1;
+                try checkArrayDestructuringElement(c, el, src, index);
+            }
+        },
+    }
+}
+
+/// The property an object-destructuring element names, and the token tsc
+/// reports its accessibility/TS2339 diagnostic at (`property.name`, which
+/// for a computed key starts at the `[`). Null when the element names no
+/// static property: a computed key whose type is not usable as one (tsc's
+/// `isTypeUsableAsPropertyName`).
+const DestructKey = struct { name: Atom, tok: TokenIndex };
+
+fn destructuringKey(c: *Checker, prop: Node, key_node: Node) Error!?DestructKey {
+    if (key_node != null_node and c.nodeTag(key_node) == .computed_name) {
+        const kt = try c.checkExprCached(c.tree.nodeData(key_node).lhs, types.no_type);
+        const name = (try c.uniqueSymAtom(kt)) orelse (try c.literalKeyAtom(kt)) orelse return null;
+        return .{ .name = name, .tok = c.tree.nodeMainToken(key_node) };
+    }
+    const tok = c.tree.nodeMainToken(prop);
+    return .{ .name = try c.memberAtom(tok), .tok = tok };
+}
+
+/// The type a named destructuring position receives, with the member rules
+/// of an ordinary property access run at the key: tsc reaches it through
+/// `getIndexedAccessType(source, key, AccessFlags.ExpressionPosition)` plus a
+/// `checkPropertyAccessibility(…, /*writing*/ true)` on the resolved symbol,
+/// which is what `propertyTypeOf` with a `.write` site already does.
+fn destructuringMemberType(c: *Checker, src: TypeId, key: ?DestructKey) Error!TypeId {
+    if (src == types.no_type) return types.no_type;
+    const k = key orelse return types.no_type;
+    return propertyTypeOf(c, src, k.name, k.tok, .{ .dir = .write });
+}
+
+/// The element a NUMERIC destructuring position names. `no_type` when the
+/// source carries no numeric domain that can be read here: tsc falls back to
+/// the source's ITERATED type in that case, and reports TS2461/TS2488 when
+/// there is none — neither of which is done here, so an unreadable source
+/// only under-reports.
+fn destructuringElementType(c: *Checker, src: TypeId, index: u32) Error!TypeId {
+    if (src == types.no_type) return types.no_type;
+    const r = try c.resolveStructural(src);
+    const rk = c.ts.kind(r);
+    if (rk == .any or rk == .err) return types.any_type;
+    return (try numericIndexHit(c, r, rk, @floatFromInt(index))) orelse types.no_type;
+}
+
+/// One property of an object destructuring pattern. A property KEY is a
+/// name, not a reference — without this peel the generic expression walker
+/// checked it as one (TS2304 on `({ width: dx } = …)`).
+fn checkObjectDestructuringProperty(c: *Checker, prop: Node, src: TypeId) Error!void {
+    if (prop == null_node) return;
+    const d = c.tree.nodeData(prop);
+    switch (c.nodeTag(prop)) {
+        // `{ key: target }` / `{ [key]: target }` — only a computed key is
+        // evaluated, and `destructuringKey` is what evaluates it.
+        .object_property => {
+            const elem = try destructuringMemberType(c, src, try destructuringKey(c, prop, d.lhs));
+            try checkDestructuringTarget(c, d.rhs, elem);
+        },
+        // `{ a }` / `{ a = init }` — the name is both key and target; lhs is
+        // the target identifier, rhs the default.
         .object_shorthand => {
             if (d.rhs != null_node) _ = try c.checkExprCached(d.rhs, types.no_type);
-            try checkDestructuringElement(c, d.lhs);
+            const elem = try destructuringMemberType(c, src, try destructuringKey(c, prop, null_node));
+            try checkDestructuringTarget(c, d.lhs, elem);
         },
         // Declaration-shaped pattern nodes (a `for (…of…)` head can carry
         // one): main_token is the key, lhs the target (0 when shorthand).
+        // A real binding pattern's types come from the declaration path
+        // (`destructure.zig`), so no source lookup runs here.
         .binding_property => {
             if (d.rhs != null_node) _ = try c.checkExprCached(d.rhs, types.no_type);
-            if (d.lhs != null_node) try checkDestructuringElement(c, d.lhs);
+            if (d.lhs != null_node) try checkDestructuringTarget(c, d.lhs, types.no_type);
         },
         // `{[k]: target}` — the key IS evaluated; lhs is it, rhs the target.
         .binding_property_computed => {
             if (d.lhs != null_node) _ = try c.checkExprCached(d.lhs, types.no_type);
-            if (d.rhs != null_node) try checkDestructuringElement(c, d.rhs);
+            if (d.rhs != null_node) try checkDestructuringTarget(c, d.rhs, types.no_type);
         },
+        // `{ ...rest } = src`: the rest object is `src` minus the names its
+        // siblings take (tsc's `getRestType`), which is not computed here.
+        .spread_element, .rest_element => try checkDestructuringTarget(c, d.lhs, types.no_type),
+        .omitted, .error_node, .unsupported => {},
+        else => _ = try checkAssignmentTarget(c, prop),
+    }
+}
+
+/// One element of an array destructuring pattern, at position `index`.
+fn checkArrayDestructuringElement(c: *Checker, el: Node, src: TypeId, index: u32) Error!void {
+    if (el == null_node) return;
+    switch (c.nodeTag(el)) {
+        .omitted, .error_node, .unsupported => {},
+        // `[a, ...rest] = src`: the rest is an array of the remaining
+        // elements, not the element at `index`.
+        .spread_element, .rest_element => try checkDestructuringTarget(c, c.tree.nodeData(el).lhs, types.no_type),
+        else => try checkDestructuringTarget(c, el, try destructuringElementType(c, src, index)),
+    }
+}
+
+/// The assignment target of one pattern element, peeled through its default
+/// initializer: a nested pattern recurses with the element type, anything
+/// else is an ordinary assignment target. Without the peel the generic
+/// expression walker checked the target identifier as a *read*, so writing a
+/// not-yet-assigned `let` through a destructuring assignment reported TS2454
+/// at the write site itself.
+fn checkDestructuringTarget(c: *Checker, el0: Node, src: TypeId) Error!void {
+    const el = skipParens(c, el0);
+    if (el == null_node) return;
+    const d = c.tree.nodeData(el);
+    switch (c.nodeTag(el)) {
         .binding_default => {
             if (d.rhs != null_node) _ = try c.checkExprCached(d.rhs, types.no_type);
-            try checkDestructuringElement(c, d.lhs);
+            try checkDestructuringTarget(c, d.lhs, src);
         },
         // `[a = init] = …`: the cover grammar parses the default as a plain
         // assignment expression.
         .assign => {
             if (c.tree.tokens.tag(c.tree.nodeMainToken(el)) == .eq) {
                 _ = try c.checkExprCached(d.rhs, types.no_type);
-                try checkDestructuringElement(c, d.lhs);
+                try checkDestructuringTarget(c, d.lhs, src);
             } else {
                 _ = try c.checkExprCached(el, types.no_type);
             }
         },
-        .spread_element, .rest_element => try checkDestructuringElement(c, d.lhs),
+        .array_literal, .object_literal, .array_pattern, .object_pattern => {
+            try checkDestructuringPattern(c, el, src);
+        },
         .omitted, .error_node, .unsupported => {},
         else => _ = try checkAssignmentTarget(c, el),
     }
