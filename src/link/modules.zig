@@ -55,6 +55,7 @@ const diagnostics = @import("../frontend/diagnostics.zig");
 const intern = @import("../intern.zig");
 const source = @import("../frontend/source.zig");
 const libs = @import("../libs.zig");
+const alias_cycle = @import("alias_cycle.zig");
 const global_dup = @import("global_dup.zig");
 const paths = @import("paths.zig");
 const resolve = @import("resolve.zig");
@@ -338,6 +339,10 @@ pub fn link(
     // With every export table final, the re-exports that could not find their
     // name in a still-growing one get their answer — and their diagnostic.
     try l.resolvePendingReexports();
+    // TS2303: alias declarations that define each other. A pure diagnostic pass
+    // over the sealed bind data — the export tables above are cycle-SAFE, which
+    // keeps every name bound but erases the evidence this needs.
+    try alias_cycle.report(arena, scratch, gpa, io, interner, files, l.diags);
 
     const out = try arena.alloc(FileLinks, files.len);
     for (0..files.len) |i| {
