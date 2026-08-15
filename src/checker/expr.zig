@@ -3320,6 +3320,92 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
     return .{ .ty = result, .chained = chained };
 }
 
+/// tsc's `checkDeleteExpression` (plus `checkGrammarDeleteExpression`) on an
+/// already-checked operand:
+///
+///   * a bare identifier operand → TS1102, "'delete' cannot be called on an
+///     identifier in strict mode". Unconditional here: ztsc is a strict-only
+///     checker, so `alwaysStrict` is always in force and tsc's
+///     `isEffectiveStrictModeSourceFile` test has one answer. Judged on the
+///     operand as WRITTEN, before parentheses are skipped — `delete (x)` is not
+///     an identifier operand for tsc either.
+///   * anything but a property or element access → TS2703, "must be a property
+///     reference", and no further check (tsc returns right there).
+///   * a READONLY property → TS2704, "cannot be a read-only property", and not
+///     also TS2790: an enum member, `Function.name` and `Symbol.iterator` are
+///     each one diagnostic in tsc.
+///   * an access whose property is not optional → TS2790, "must be optional".
+///     tsc reads the DECLARED type of the resolved property symbol, not the
+///     access's narrowed type, so the property is looked up on the receiver
+///     rather than taken from the operand's own type. A receiver whose type is
+///     not in the node memo is skipped rather than re-checked: re-checking would
+///     re-report every diagnostic in its subtree (a `?.` spine's links are typed
+///     through `chainObjType`, which does not publish). Sound under-report.
+///
+/// Both property checks need a property SYMBOL, which is what tsc keys them off
+/// (`links.resolvedSymbol`): an index signature standing in for the name is not
+/// one, so `delete a.anything` on `{ [s: string]: number }` is silent.
+fn checkDeleteOperand(c: *Checker, operand: Node) Error!void {
+    if (c.nodeTag(operand) == .identifier) {
+        try c.diagFmt(1102, c.nodeSpan(operand), "'delete' cannot be called on an identifier in strict mode.", .{});
+    }
+    var expr = operand;
+    while (c.nodeTag(expr) == .paren_expr) expr = c.tree.nodeData(expr).lhs;
+    const tag = c.nodeTag(expr);
+    switch (tag) {
+        .member_expr, .optional_member_expr, .index_expr, .optional_index_expr => {},
+        else => {
+            try c.diagFmt(2703, c.nodeSpan(expr), "The operand of a 'delete' operator must be a property reference.", .{});
+            return;
+        },
+    }
+    const ed = c.tree.nodeData(expr);
+    // `delete t[i]` on a readonly list is the same write-site refusal as
+    // `t[i] = …` (tsc's `checkDeleteExpression` → `checkReferenceExpression`):
+    // TS2540 / TS2542.
+    if (tag == .index_expr) {
+        const recv = try c.resolveStructural(try c.checkExprCached(ed.lhs, types.no_type));
+        _ = try readonlyIndexWriteAt(c, recv, expr, ed.rhs);
+    }
+    const name = (try deleteTargetName(c, expr, tag)) orelse return;
+    const recv0 = c.nodeType(ed.lhs) orelse return;
+    const recv = try c.resolveStructural(try c.nonNullableChain(recv0));
+    // `allow_index = false`: a string INDEX SIGNATURE standing in for the name is
+    // not a property symbol, and tsc's checks here are all keyed off
+    // `links.resolvedSymbol` — `delete a.anything` on a `{ [s: string]: number }`
+    // is silent.
+    const p = (try c.propOfTypeEx(recv, name, false)) orelse return;
+    // A readonly property is TS2704 INSTEAD of TS2790, not as well as: an enum
+    // member, `Function.name`, `Symbol.iterator` are each one diagnostic in tsc.
+    if (p.readonly()) {
+        try c.diagFmt(2704, c.nodeSpan(expr), "The operand of a 'delete' operator cannot be a read-only property.", .{});
+        return;
+    }
+    if (p.optional()) return;
+    // tsc exempts `any`/`unknown`/`never` — nothing is known about whether the
+    // property is there to remove.
+    switch (c.ts.kind(try c.resolveStructural(p.ty))) {
+        .any, .unknown, .never, .err => return,
+        else => {},
+    }
+    if (c.hasUndefinedMember(p.ty)) return;
+    try c.diagFmt(2790, c.nodeSpan(expr), "The operand of a 'delete' operator must be optional.", .{});
+}
+
+/// The property name a `delete` operand names, or null when it names none tsc
+/// resolves a symbol for (a computed or numeric element access — `delete a[i]`
+/// carries no property symbol, so tsc runs neither the readonly nor the
+/// optionality check on it).
+fn deleteTargetName(c: *Checker, expr: Node, tag: ast.Tag) Error!?Atom {
+    const ed = c.tree.nodeData(expr);
+    if (tag == .member_expr or tag == .optional_member_expr) {
+        if (c.tree.tokens.tag(ed.rhs) == .private_identifier) return null;
+        return try c.memberAtom(ed.rhs);
+    }
+    if (c.nodeTag(ed.rhs) != .string_literal) return null;
+    return try c.memberAtom(c.tree.nodeMainToken(ed.rhs));
+}
+
 fn checkPrefixUnary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     const d = c.tree.nodeData(node);
     const op = c.tree.tokens.tag(c.tree.nodeMainToken(node));
@@ -3339,14 +3425,7 @@ fn checkPrefixUnary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         },
         .keyword_delete => {
             _ = try c.checkExprCached(d.lhs, types.no_type);
-            // `delete t[i]` on a readonly list is the same write-site refusal
-            // as `t[i] = …` (tsc's `checkDeleteExpression` →
-            // `checkReferenceExpression`): TS2540 / TS2542.
-            if (c.nodeTag(d.lhs) == .index_expr) {
-                const id = c.tree.nodeData(d.lhs);
-                const recv = try c.resolveStructural(try c.checkExprCached(id.lhs, types.no_type));
-                _ = try readonlyIndexWriteAt(c, recv, d.lhs, id.rhs);
-            }
+            try checkDeleteOperand(c, d.lhs);
             return types.boolean_type;
         },
         .keyword_await => {
