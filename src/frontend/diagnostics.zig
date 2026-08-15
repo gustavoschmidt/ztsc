@@ -350,6 +350,37 @@ pub const Code = enum(u16) {
     namespace_prior_to_merge,
     /// TS2492: redeclaring a catch-clause parameter in the catch block.
     catch_redeclare,
+    /// TS2389: the declaration immediately after an overload signature HAS a
+    /// body but a different name, so the set never got its implementation and
+    /// the body belongs to something else. tsc's message names the expected
+    /// name; a Diagnostic here is a code plus a span, so the invariant half of
+    /// the sentence is what is reported (the policy TS2300 already follows).
+    /// Blamed on the misnamed implementation, not on the signature.
+    overload_impl_name_mismatch,
+    /// TS2387/TS2388: a mixed static/instance overload set — two same-named
+    /// methods of one class, one `static` and one not, so neither side has an
+    /// implementation. tsc words it as an instruction to the SECOND declaration
+    /// and reports on its name.
+    overload_must_be_static,
+    overload_must_not_be_static,
+    /// TS2369: an accessibility/`readonly`/`override` modifier on a parameter
+    /// of anything other than a constructor WITH A BODY — an overload
+    /// signature, an ambient `declare class` constructor, a method, an
+    /// accessor, an arrow, or a bare function type. A parameter property
+    /// declares a class member, so the one position that can honour it is the
+    /// constructor whose body would do the assigning (tsc's `checkParameter`).
+    /// Reported over the parameter's first token, which is the modifier.
+    param_property_outside_ctor_impl,
+    /// TS17009: `this` reached in a derived class's constructor on a path that
+    /// has not run `super(...)` yet — the base constructor is what brings the
+    /// instance into existence. Reported on the `this` keyword. Flow-sensitive
+    /// (tsc's `isPostSuperFlowNode`), so `if (c) { super() } this.x` reports
+    /// even though the `super` call comes first in the text.
+    super_before_this,
+    /// TS17011: the same rule for `super.x` (or `super["x"]`) — a property of
+    /// the base prototype reached before the base constructor has run. tsc's
+    /// `checkSuperExpression`, which exempts the `super` that IS the call.
+    super_before_super_property,
 
     // --- ambient-context and modifier grammar (checked in the parser) ------
     /// TS1036: an executable statement in an ambient context (`declare
@@ -515,6 +546,12 @@ pub const Code = enum(u16) {
             .enum_first_member_needs_initializer,
             .namespace_prior_to_merge,
             .catch_redeclare,
+            .overload_impl_name_mismatch,
+            .overload_must_be_static,
+            .overload_must_not_be_static,
+            .param_property_outside_ctor_impl,
+            .super_before_this,
+            .super_before_super_property,
             .decorator_not_valid_here,
             .label_not_allowed,
             .public_not_on_module_element,
@@ -839,6 +876,12 @@ pub const Code = enum(u16) {
             .enum_first_member_needs_initializer => "In an enum with multiple declarations, only one declaration can omit an initializer for its first enum element.",
             .namespace_prior_to_merge => "A namespace declaration cannot be located prior to a class or function with which it is merged.",
             .catch_redeclare => "cannot redeclare identifier in catch clause",
+            .overload_impl_name_mismatch => "function implementation name must match the overload it follows",
+            .overload_must_be_static => "Function overload must be static.",
+            .overload_must_not_be_static => "Function overload must not be static.",
+            .param_property_outside_ctor_impl => "A parameter property is only allowed in a constructor implementation.",
+            .super_before_this => "'super' must be called before accessing 'this' in the constructor of a derived class.",
+            .super_before_super_property => "'super' must be called before accessing a property of 'super' in the constructor of a derived class.",
             .unsupported_syntax => "syntax not yet supported by ztsc",
             .unsupported_satisfies => "'satisfies' is not yet supported by ztsc",
         };
@@ -956,6 +999,12 @@ pub const Code = enum(u16) {
             .enum_first_member_needs_initializer => 2432,
             .namespace_prior_to_merge => 2434,
             .catch_redeclare => 2492,
+            .overload_impl_name_mismatch => 2389,
+            .overload_must_be_static => 2387,
+            .overload_must_not_be_static => 2388,
+            .param_property_outside_ctor_impl => 2369,
+            .super_before_this => 17009,
+            .super_before_super_property => 17011,
             .decorator_not_valid_here => 1206,
             .label_not_allowed => 1344,
             .public_not_on_module_element,

@@ -20,8 +20,23 @@ const Error = Allocator.Error;
 /// never emit and — under `skipLibCheck` — have all their diagnostics
 /// suppressed. The `.d.mts`/`.d.cts` variants matter for ESM/CJS-dual packages
 /// (redux-toolkit, zod, typebox) whose published types live in those files.
+///
+/// tsc's `getDeclarationFileExtension` also accepts the OPEN form: any `.ts`
+/// file whose base name carries a `.d.` segment anywhere — `foo.d.v1.ts`,
+/// `index.d.node.ts` — which is how a package ships per-condition declaration
+/// files under one extension. Only `.ts` qualifies for that arm in tsc; the
+/// `.mts`/`.cts` spellings have to be exact.
 pub fn isDeclarationPath(path: []const u8) bool {
-    return endsWithAny(path, &.{ ".d.ts", ".d.mts", ".d.cts" });
+    if (endsWithAny(path, &.{ ".d.ts", ".d.mts", ".d.cts" })) return true;
+    if (!std.mem.endsWith(u8, path, ".ts")) return false;
+    return std.mem.indexOf(u8, basenamePart(path), ".d.") != null;
+}
+
+/// File-name part of a path (the whole path when it has no separator).
+/// Forward slashes only, matching the rest of this module.
+fn basenamePart(path: []const u8) []const u8 {
+    const i = std.mem.lastIndexOfScalar(u8, path, '/') orelse return path;
+    return path[i + 1 ..];
 }
 
 /// Directory part of a path ("" for none). Forward slashes only.

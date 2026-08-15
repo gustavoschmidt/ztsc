@@ -272,6 +272,7 @@ pub fn bind(
     b.cur_flow = try b.addFlow(.start, no_flow, 0); // file entry
 
     // Bind all top-level statements of the root.
+    try b.recordOverloadSiblings(tree.nodeRange(0));
     for (tree.nodeRange(0)) |stmt| {
         if (stmt != null_node) try b.bindStatement(stmt);
     }
@@ -283,6 +284,7 @@ pub fn bind(
     try b.checkMissingImplementations();
     try b.checkEnumFirstMembers();
     try b.checkNamespacePriorToMerge();
+    try b.checkThisBeforeSuper();
     return b.seal();
 }
 
@@ -435,6 +437,36 @@ const Binder = struct {
     /// `saveState`, so a `return` inside a callback declared in the constructor
     /// does not join the constructor's exit.
     ctor_return: ?PendingId = null,
+    /// True while binding the parameter list or body of a constructor whose
+    /// class has an `extends` clause that is not `null` — the one region tsc's
+    /// `checkThisBeforeSuper` covers. `getThisContainer` is asked with
+    /// `includeArrowFunctions`, so a `this` inside ANY nested function-like
+    /// (arrow included) has a different container and is exempt; every
+    /// `bindFunctionLike` therefore overwrites this, and `saveState` restores
+    /// it. Measured: `constructor() { const f = () => this.a; super(); }` is
+    /// clean, `constructor() { const o = { p: this }; super(); }` is not.
+    in_derived_ctor: bool = false,
+    /// The `this` expressions — and the `super`s that are not a call's callee,
+    /// which earn the same rule under a different code — collected by that
+    /// flag, each with the flow node in effect where it was written (tsc's
+    /// `node.flowNode`). Answered once the whole file is bound
+    /// (`checkThisBeforeSuper`), because a loop's back edges do not exist until
+    /// its body has been walked. Accumulator, never sealed; empty for every
+    /// file with no derived constructor.
+    this_in_derived_ctor: std.ArrayList(Link) = .empty, // value = this_expr/super_expr node, next = flow
+    /// For each BODYLESS function or method declaration, the declaration that
+    /// immediately follows it in the same sibling list — tsc's
+    /// `subsequentNode.pos === node.end`, which decides whether a missing
+    /// implementation is TS2391 or one of the three sharper diagnostics
+    /// (`overloadSiblingDiag`). Only a sibling list can answer the question and
+    /// only a bodyless declaration can ask it, so it is recorded as the lists
+    /// are walked and read once the file is bound. Accumulator, never sealed.
+    overload_next: std.AutoHashMapUnmanaged(Node, Node) = .empty,
+    /// The `.call_stmt` flow nodes that stand for a `super(...)` call. The tag
+    /// is shared with assertion-call flows, so the walk needs the binder's own
+    /// record of which is which; a file has a handful of super calls at most,
+    /// so a linear scan is the whole data structure.
+    super_call_flows: std.ArrayList(FlowId) = .empty,
     ctxs: std.ArrayList(Ctx) = .empty,
     /// Contexts below this index belong to enclosing functions.
     ctx_base: usize = 0,
@@ -647,6 +679,7 @@ const Binder = struct {
         ctx_len: usize,
         stack_len: usize,
         ctor_return: ?PendingId,
+        in_derived_ctor: bool,
     };
 
     fn saveState(b: *Binder) SavedState {
@@ -658,6 +691,7 @@ const Binder = struct {
             .ctx_len = b.ctxs.items.len,
             .stack_len = b.scope_stack.items.len,
             .ctor_return = b.ctor_return,
+            .in_derived_ctor = b.in_derived_ctor,
         };
     }
 
@@ -669,6 +703,7 @@ const Binder = struct {
         b.ctxs.items.len = s.ctx_len;
         b.scope_stack.items.len = s.stack_len;
         b.ctor_return = s.ctor_return;
+        b.in_derived_ctor = s.in_derived_ctor;
     }
 
     // --- symbols ------------------------------------------------------------
@@ -1184,6 +1219,112 @@ const Binder = struct {
     /// One pass over the file's symbols after everything is bound, for the same
     /// reason `checkMergedExports` is: the verdict is a property of the whole
     /// declaration set, and "the last one" is only known once there are no more.
+    /// Remember which declaration immediately follows each bodyless function or
+    /// method in `list` (see `overload_next`). Cheap by construction: the map
+    /// gains an entry only for a declaration with no body, and a file with no
+    /// overload signatures never touches it.
+    fn recordOverloadSiblings(b: *Binder, list: []const Node) Error!void {
+        if (list.len < 2) return;
+        for (list[0 .. list.len - 1], list[1..]) |n, next| {
+            if (n == null_node or next == null_node) continue;
+            switch (b.nodeTag(n)) {
+                // `.rhs` is the body for both tags.
+                .function_decl, .class_method => if (b.tree.nodeData(n).rhs == 0) {
+                    try b.overload_next.put(b.scratch, n, next);
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// What KIND of function-like a declaration is, in tsc's terms — the axis
+    /// `reportImplementationExpectedError` compares before it will call two
+    /// declarations two halves of one overload set. ztsc spells constructors,
+    /// accessors and ordinary methods with a single `.class_method` tag, so the
+    /// distinction tsc gets from `SyntaxKind` is reconstructed here.
+    const FnKind = enum { function, method, ctor, accessor, other };
+
+    fn fnKindOf(b: *Binder, node: Node) FnKind {
+        switch (b.nodeTag(node)) {
+            .function_decl => return .function,
+            .class_method => {
+                const proto = b.tree.extraData(ast.FnProto, b.tree.nodeData(node).lhs);
+                if (proto.flags & (ast.Flags.get | ast.Flags.set) != 0) return .accessor;
+                const tok = b.tree.nodeMainToken(node);
+                if (b.tree.tokens.tag(tok) == .keyword_constructor and
+                    proto.flags & ast.Flags.static == 0) return .ctor;
+                return .method;
+            },
+            else => return .other,
+        }
+    }
+
+    /// The name token of a function-like declaration (0 = none). A method's name
+    /// is its `main_token`; a `function` statement carries it in the prototype.
+    fn fnNameTok(b: *Binder, node: Node) TokenIndex {
+        return switch (b.nodeTag(node)) {
+            .function_decl => b.tree.extraData(ast.FnProto, b.tree.nodeData(node).lhs).name_token,
+            .class_method => b.tree.nodeMainToken(node),
+            else => 0,
+        };
+    }
+
+    /// What the declaration IMMEDIATELY FOLLOWING a bodyless `node` turns the
+    /// missing implementation into, per tsc's `reportImplementationExpectedError`:
+    ///
+    ///   * a sibling of a DIFFERENT kind, or none at all → nothing here; the
+    ///     caller falls through to TS2391/TS2390;
+    ///   * the same kind and the same name, differing only in `static` → the
+    ///     pair is a mixed static/instance overload set (TS2387/TS2388), blamed
+    ///     on the SIBLING's name;
+    ///   * the same kind and the same name otherwise → nothing at all: the two
+    ///     declarations failed to merge for a reason the binder has already
+    ///     reported (a duplicate identifier), and tsc deliberately stays quiet;
+    ///   * the same kind, a DIFFERENT name, and a body → the implementation is
+    ///     there but misnamed (TS2389), again on the sibling's name.
+    const SiblingVerdict = union(enum) {
+        /// No usable sibling: the caller reports TS2391/TS2390 as before.
+        fall_through,
+        /// A sibling that explains the missing body without a diagnostic of its
+        /// own — tsc's "we should already report error in binder" arm.
+        silent,
+        report: struct { code: Code, tok: TokenIndex },
+    };
+
+    fn overloadSiblingDiag(b: *Binder, node: Node) SiblingVerdict {
+        const next = b.overload_next.get(node) orelse return .fall_through;
+        const kind = b.fnKindOf(node);
+        if (kind != b.fnKindOf(next)) return .fall_through;
+        const name_tok = b.fnNameTok(node);
+        const next_tok = b.fnNameTok(next);
+        if (name_tok == 0 or next_tok == 0) return .fall_through;
+
+        const proto = b.tree.extraData(ast.FnProto, b.tree.nodeData(node).lhs);
+        const next_proto = b.tree.extraData(ast.FnProto, b.tree.nodeData(next).lhs);
+        // tsc matches two computed names on being computed at all, and two
+        // literal (or private) names on their text.
+        const both_computed = proto.flags & ast.Flags.computed != 0 and
+            next_proto.flags & ast.Flags.computed != 0;
+        const same_name = both_computed or
+            std.mem.eql(u8, b.tokenText(name_tok), b.tokenText(next_tok));
+
+        if (same_name) {
+            if (kind != .method) return .silent;
+            const a_static = proto.flags & ast.Flags.static != 0;
+            const b_static = next_proto.flags & ast.Flags.static != 0;
+            if (a_static == b_static) return .silent;
+            return .{ .report = .{
+                .code = if (a_static) .overload_must_be_static else .overload_must_not_be_static,
+                .tok = next_tok,
+            } };
+        }
+        // A misnamed IMPLEMENTATION only: a second bodyless signature of another
+        // name is simply an unrelated declaration, and tsc keeps looking (which
+        // for ztsc means falling through to TS2391).
+        if (b.tree.nodeData(next).rhs == 0) return .fall_through;
+        return .{ .report = .{ .code = .overload_impl_name_mismatch, .tok = next_tok } };
+    }
+
     fn checkMissingImplementations(b: *Binder) Error!void {
         for (1..b.sym_names.items.len) |i| {
             const sym: SymbolId = @intCast(i);
@@ -1212,7 +1353,19 @@ const Binder = struct {
             const scope = b.scope_kinds.items[b.sym_scopes.items[sym]];
             const is_ctor = scope == .class_members and
                 b.tree.tokens.tag(name_tok) == .keyword_constructor;
-            switch (impl_expected.expected(scope, b.nodeTag(node), proto.flags, is_ctor, d.rhs != 0)) {
+            const want = impl_expected.expected(scope, b.nodeTag(node), proto.flags, is_ctor, d.rhs != 0);
+            // tsc looks at what immediately follows before settling for the
+            // generic "implementation is missing": a sharper answer there
+            // replaces this diagnostic outright, and sometimes silences it.
+            if (want != .none) switch (b.overloadSiblingDiag(node)) {
+                .fall_through => {},
+                .silent => continue,
+                .report => |r| {
+                    try b.diag(r.code, r.tok);
+                    continue;
+                },
+            };
+            switch (want) {
                 .none => {},
                 // A computed method name (`[Symbol.iterator](x: string): string;`)
                 // is reported at the `[`, as every duplicate-name diagnostic is.
@@ -1312,6 +1465,104 @@ const Binder = struct {
             }
         }
     }
+
+    /// TS17009/TS17011, tsc's `checkThisBeforeSuper`: a derived class's
+    /// constructor may not touch `this` — nor reach for a property of `super` —
+    /// on any path that has not yet run `super(...)`, because the base
+    /// constructor is what brings the instance into existence. Two codes for one
+    /// rule, exactly as tsc words them at its two call sites
+    /// (`checkThisExpression` and `checkSuperExpression`).
+    ///
+    /// A post-bind check because the answer is a property of the finished flow
+    /// GRAPH: `super(); while (x) { this.a }` is clean only once the loop's back
+    /// edge is in place, and that edge does not exist while the body is being
+    /// walked. Nothing to do for a file with no derived constructor, which is
+    /// most of them.
+    fn checkThisBeforeSuper(b: *Binder) Error!void {
+        if (b.this_in_derived_ctor.items.len == 0) return;
+        const memo = try b.scratch.alloc(PostSuper.State, b.flow_tags.items.len);
+        defer b.scratch.free(memo);
+        @memset(memo, .unknown);
+        const ps: PostSuper = .{
+            .tags = b.flow_tags.items,
+            .a = b.flow_a.items,
+            .pendings = b.pendings.items,
+            .ante_links = b.ante_links.items,
+            .super_flows = b.super_call_flows.items,
+            .memo = memo,
+        };
+        for (b.this_in_derived_ctor.items) |t| {
+            if (ps.ask(t.next)) continue;
+            const code: Code = if (b.nodeTag(t.value) == .super_expr)
+                .super_before_super_property
+            else
+                .super_before_this;
+            try b.diag(code, b.tree.nodeMainToken(t.value));
+        }
+    }
+
+    /// tsc's `isPostSuperFlowNode`, over the binder's UNSEALED flow arrays: has
+    /// every path reaching `flow` already run a `super(...)` call?
+    ///
+    /// A join answers yes only when all of its antecedents do (tsc's `every`).
+    /// An unreachable edge answers YES — nothing reaches it, so there is no path
+    /// to blame, which is why `constructor() { throw 1; this.a = 1 }` is clean.
+    /// A cycle answers yes for the same reason in the other direction: a loop's
+    /// back edge re-enters a label the walk is already inside, and the only way
+    /// around that label is the entry edge the walk is already testing. Both
+    /// arms are measured against tsgo (`super(); while (x) { this.a }` clean,
+    /// `while (x) { super() } this.a` reported).
+    const PostSuper = struct {
+        tags: []const FlowTag,
+        a: []const u32,
+        pendings: []const Pending,
+        ante_links: []const Link,
+        super_flows: []const FlowId,
+        /// One entry per flow node. A fixpoint cache, not just a speed-up: the
+        /// `in_progress` state is what terminates a loop's back edge.
+        memo: []State,
+
+        const State = enum(u8) { unknown, in_progress, yes, no };
+
+        fn ask(ps: PostSuper, flow: FlowId) bool {
+            switch (ps.memo[flow]) {
+                .yes => return true,
+                .no => return false,
+                .in_progress => return true,
+                .unknown => {},
+            }
+            ps.memo[flow] = .in_progress;
+            const answer = ps.compute(flow);
+            ps.memo[flow] = if (answer) .yes else .no;
+            return answer;
+        }
+
+        fn compute(ps: PostSuper, flow: FlowId) bool {
+            var f = flow;
+            while (true) {
+                switch (ps.tags[f]) {
+                    .unreachable_ => return true,
+                    .none, .start => return false,
+                    .call_stmt => {
+                        for (ps.super_flows) |s| if (s == f) return true;
+                        f = ps.a[f];
+                    },
+                    .assign, .cond_true, .cond_false, .switch_clause, .switch_no_match => f = ps.a[f],
+                    .branch_label, .loop_label => {
+                        // `flow_a` holds the pending id until seal() flattens
+                        // the list into `flow_extra`.
+                        const p = ps.pendings[ps.a[f]];
+                        if (p.count == 0) return true; // no path in at all
+                        var l = p.head;
+                        while (l != 0) : (l = ps.ante_links[l].next) {
+                            if (!ps.ask(ps.ante_links[l].value)) return false;
+                        }
+                        return true;
+                    },
+                }
+            }
+        }
+    };
 
     /// The declaration spaces of one declaration NODE — `decl_spaces.ofTag` plus
     /// the one fact that is not a property of the kind: a `namespace` block
@@ -1513,6 +1764,7 @@ const Binder = struct {
             .block => {
                 const saved = b.cur_scope;
                 _ = try b.pushScope(.block, node);
+                try b.recordOverloadSiblings(b.tree.nodeRange(node));
                 for (b.tree.nodeRange(node)) |stmt| try b.bindStatement(stmt);
                 b.popScope(saved);
             },
@@ -1836,6 +2088,7 @@ const Binder = struct {
             b.cur_flow = try b.finishPending(pid);
             if (ctag == .case_clause or ctag == .default_clause) {
                 const cr = b.tree.extraData(ast.SubRange, cd.rhs);
+                try b.recordOverloadSiblings(b.tree.extraRange(cr.start, cr.end));
                 for (b.tree.extraRange(cr.start, cr.end)) |stmt| try b.bindStatement(stmt);
             }
             prev = b.cur_flow;
@@ -1872,6 +2125,7 @@ const Binder = struct {
             // The catch body's statements bind directly in the catch scope so
             // `catch (e) { let e; }` is caught (TS2492).
             if (cd.rhs != 0 and b.nodeTag(cd.rhs) == .block) {
+                try b.recordOverloadSiblings(b.tree.nodeRange(cd.rhs));
                 for (b.tree.nodeRange(cd.rhs)) |stmt| try b.bindStatement(stmt);
             } else {
                 try b.bindStatement(cd.rhs);
@@ -2011,14 +2265,31 @@ const Binder = struct {
             const flags: SymbolFlags = .{ .has_impl = d.rhs != 0 };
             _ = try b.declare(b.cur_scope, atom, .function, node, proto.name_token, flags);
         }
-        try b.bindFunctionLike(node, d.lhs, d.rhs, false);
+        try b.bindFunctionLike(node, d.lhs, d.rhs, .not_ctor);
     }
+
+    /// What kind of constructor (if any) a function-like is — the axis three
+    /// separate rules read: parameter properties, the constructor return join,
+    /// and `this`-before-`super`.
+    const CtorKind = enum {
+        not_ctor,
+        /// A constructor of a class with no `extends`, or with `extends null`
+        /// (tsc's `classDeclarationExtendsNull`, which skips the `super` check
+        /// because there is no base constructor to call).
+        base_ctor,
+        derived_ctor,
+
+        fn isCtor(k: CtorKind) bool {
+            return k != .not_ctor;
+        }
+    };
 
     /// Shared by function declarations/expressions, arrows, methods, and
     /// function types. Creates the function scope (params + body top-level
     /// share it, so `function f(x) { let x }` clashes) and a fresh `start`
-    /// flow for the body. `is_ctor` adds parameter properties.
-    fn bindFunctionLike(b: *Binder, node: Node, proto_idx: u32, body: Node, is_ctor: bool) Error!void {
+    /// flow for the body. A constructor also gets parameter properties.
+    fn bindFunctionLike(b: *Binder, node: Node, proto_idx: u32, body: Node, ctor: CtorKind) Error!void {
+        const is_ctor = ctor.isCtor();
         const proto = b.tree.extraData(ast.FnProto, proto_idx);
         // Flow node in effect where this function expression appears — its
         // "definition point". Recorded as the body-start's antecedent so the
@@ -2039,10 +2310,20 @@ const Binder = struct {
         // so a nested `return` never joins an enclosing constructor's exit.
         const ret_pid: ?PendingId = if (is_ctor and body != 0) try b.newPending() else null;
         b.ctor_return = ret_pid;
+        // Overwritten (not or-ed) so that a nested function-like of any kind —
+        // arrow included, which is what `includeArrowFunctions` buys tsc — ends
+        // the region `this`-before-`super` covers.
+        b.in_derived_ctor = ctor == .derived_ctor;
 
         try b.bindTypeParams(proto.tp_start, proto.tp_end);
+        const home: ParamHome = if (!is_ctor)
+            .other
+        else if (body != 0)
+            .ctor_impl
+        else
+            .ctor_signature;
         for (b.tree.extraRange(proto.params_start, proto.params_end)) |param| {
-            try b.bindParam(param, is_ctor);
+            try b.bindParam(param, home);
         }
         try b.bindType(proto.return_type);
 
@@ -2050,6 +2331,7 @@ const Binder = struct {
             b.cur_flow = try b.addFlow(.start, outer_flow, node);
             if (b.nodeTag(body) == .block) {
                 // Body statements bind directly in the function scope.
+                try b.recordOverloadSiblings(b.tree.nodeRange(body));
                 for (b.tree.nodeRange(body)) |stmt| try b.bindStatement(stmt);
             } else {
                 try b.bindExpr(body); // arrow expression body
@@ -2122,7 +2404,32 @@ const Binder = struct {
         }
     }
 
-    fn bindParam(b: *Binder, node: Node, is_ctor: bool) Error!void {
+    /// Where a parameter list lives, as far as parameter properties go.
+    /// `public`/`private`/`protected`/`readonly`/`override` on a parameter
+    /// DECLARES a class member, so the position decides both whether the
+    /// member appears and whether the modifier is legal at all.
+    const ParamHome = enum {
+        /// `constructor(public x: T) { }` — the one legal position.
+        ctor_impl,
+        /// A bodyless `constructor(public x: T);` — an overload signature or an
+        /// ambient `declare class` constructor. tsc still BINDS the member
+        /// (`isParameterPropertyDeclaration` asks only about the parent's
+        /// kind), and reports TS2369 on the modifier.
+        ctor_signature,
+        /// Anything else: function, method, accessor, arrow, function type.
+        other,
+
+        fn isCtor(h: ParamHome) bool {
+            return h != .other;
+        }
+    };
+
+    /// tsc's `ModifierFlags.ParameterPropertyModifier` — the modifiers whose
+    /// presence on a parameter makes it a parameter property.
+    const param_prop_mask = ast.Flags.public | ast.Flags.private |
+        ast.Flags.protected | ast.Flags.readonly | ast.Flags.override;
+
+    fn bindParam(b: *Binder, node: Node, home: ParamHome) Error!void {
         if (node == null_node) return;
         const d = b.tree.nodeData(node);
         switch (b.nodeTag(node)) {
@@ -2135,10 +2442,18 @@ const Binder = struct {
                 try b.bindPattern(d.lhs, .param, node);
                 try b.bindType(e.type_ann);
                 try b.bindExpr(e.init);
+                // TS2369, tsc's `checkParameter`: a parameter property outside
+                // a constructor implementation has no body to assign it, so
+                // every other position rejects the modifier. `main_token` on a
+                // `.param_full` is the parameter's first token — the modifier
+                // itself, which is where tsc's parameter-node span starts.
+                if (e.flags & param_prop_mask != 0 and home != .ctor_impl) {
+                    try b.diag(.param_property_outside_ctor_impl, b.tree.nodeMainToken(node));
+                }
                 // Constructor parameter property: also a class member.
                 const prop_mask = ast.Flags.public | ast.Flags.private |
                     ast.Flags.protected | ast.Flags.readonly;
-                if (is_ctor and e.flags & prop_mask != 0 and
+                if (home.isCtor() and e.flags & prop_mask != 0 and
                     b.nodeTag(d.lhs) == .identifier)
                 {
                     const class_scope = b.scope_parents.items[b.cur_scope];
@@ -2209,6 +2524,15 @@ const Binder = struct {
         for (b.tree.extraRange(data.impl_start, data.impl_end)) |h| {
             if (h != null_node) try b.bindHeritage(h, false);
         }
+        // Does this class have a base CONSTRUCTOR to call? `extends null` does
+        // not (tsc's `classDeclarationExtendsNull`, which exempts the class from
+        // the `super`-before-`this` rule entirely — measured: `class C extends
+        // null { a: any; constructor() { this.a = 1 } }` is clean). tsc asks the
+        // question of the base TYPE; the syntactic form is the only way to write
+        // it, and reading the heritage expression here keeps the binder out of
+        // type resolution.
+        const derived = data.extends != 0 and
+            b.nodeTag(b.tree.nodeData(data.extends).lhs) != .null_literal;
 
         const ms = try b.newScope(.class_members, node, cs);
         const ss = try b.newScope(.class_statics, node, cs);
@@ -2229,6 +2553,7 @@ const Binder = struct {
         b.cur_block = node;
         defer b.cur_block = saved_block;
 
+        try b.recordOverloadSiblings(b.tree.extraRange(data.members_start, data.members_end));
         for (b.tree.extraRange(data.members_start, data.members_end)) |member| {
             if (member == null_node) continue;
             const md = b.tree.nodeData(member);
@@ -2260,7 +2585,13 @@ const Binder = struct {
                         .non_public = proto.flags & nonpublic_mask != 0,
                     });
                     const is_ctor = b.tree.tokens.tag(tok) == .keyword_constructor and !is_static;
-                    try b.bindFunctionLike(member, md.lhs, md.rhs, is_ctor);
+                    const ctor: CtorKind = if (!is_ctor)
+                        .not_ctor
+                    else if (derived)
+                        .derived_ctor
+                    else
+                        .base_ctor;
+                    try b.bindFunctionLike(member, md.lhs, md.rhs, ctor);
                 },
                 // `static { … }` — the parser's only `.block` class member.
                 //
@@ -2288,6 +2619,7 @@ const Binder = struct {
                     // there is no return target to join into.
                     b.ctor_return = null;
                     b.cur_flow = try b.addFlow(.start, outer_flow, member);
+                    try b.recordOverloadSiblings(b.tree.nodeRange(member));
                     for (b.tree.nodeRange(member)) |stmt| try b.bindStatement(stmt);
                     b.restoreState(saved_sb);
                 },
@@ -2473,6 +2805,7 @@ const Binder = struct {
         b.ctx_base = b.ctxs.items.len;
         b.cur_flow = try b.addFlow(.start, no_flow, node);
 
+        try b.recordOverloadSiblings(b.tree.extraRange(data.body_start, data.body_end));
         for (b.tree.extraRange(data.body_start, data.body_end)) |stmt| {
             try b.bindStatement(stmt);
         }
@@ -2521,6 +2854,7 @@ const Binder = struct {
         b.ctx_base = b.ctxs.items.len;
         b.cur_flow = try b.addFlow(.start, no_flow, node);
 
+        try b.recordOverloadSiblings(b.tree.extraRange(data.body_start, data.body_end));
         for (b.tree.extraRange(data.body_start, data.body_end)) |stmt| {
             if (stmt != null_node) try b.bindStatement(stmt);
         }
@@ -2556,6 +2890,7 @@ const Binder = struct {
         b.ctx_base = b.ctxs.items.len;
         b.cur_flow = try b.addFlow(.start, no_flow, node);
 
+        try b.recordOverloadSiblings(b.tree.extraRange(data.body_start, data.body_end));
         for (b.tree.extraRange(data.body_start, data.body_end)) |stmt| {
             if (stmt != null_node) try b.bindStatement(stmt);
         }
@@ -3275,6 +3610,22 @@ const Binder = struct {
         return .{ .t = t, .f = try b.finishPending(pid) };
     }
 
+    /// A `super` reaching for a PROPERTY inside a derived class's constructor —
+    /// the TS17011 half of the `this`-before-`super` rule, recorded with the
+    /// flow in effect exactly as a `this` is.
+    ///
+    /// tsc's condition is "any `super` that is not the callee of its own call",
+    /// but the only OTHER legal shape is a property access: a bare `super` is
+    /// TS1034 in tsc's parser, which suppresses the file's whole semantic pass,
+    /// so reporting nothing there is what matches. Measured: `superAccess2.ts`
+    /// (`xx = super`, `constructor(public z = super, …)`) answers TS1034 five
+    /// times and no TS17011, and `super<T>()` — whose callee is a bare `super`
+    /// under a type-argument list — answers TS2754 alone.
+    fn noteSuperProperty(b: *Binder, recv: Node) Error!void {
+        if (!b.in_derived_ctor or b.nodeTag(recv) != .super_expr) return;
+        try b.this_in_derived_ctor.append(b.scratch, .{ .value = recv, .next = b.cur_flow });
+    }
+
     fn bindExpr(b: *Binder, node: Node) Error!void {
         if (node == null_node) return;
         const d = b.tree.nodeData(node);
@@ -3283,6 +3634,7 @@ const Binder = struct {
             .member_expr, .optional_member_expr => {
                 if (b.isOptionalChain(node) and b.chainHasRest(node)) return b.bindOptionalChainValue(node);
                 try b.bindExpr(d.lhs);
+                try b.noteSuperProperty(d.lhs);
                 // Narrowable reference (`x.y` discriminants): attach flow.
                 try b.attachFlow(node);
             },
@@ -3294,6 +3646,7 @@ const Binder = struct {
                 if (b.isOptionalChain(node) and b.chainHasRest(node)) return b.bindOptionalChainValue(node);
                 try b.bindExpr(d.lhs);
                 try b.bindExpr(d.rhs);
+                try b.noteSuperProperty(d.lhs);
                 // An element access whose index is a literal (`arr[0]`) or a
                 // bare identifier (`ICON_BY_TAG[tag]`) is a narrowable
                 // reference exactly like a dotted member — `if
@@ -3394,7 +3747,7 @@ const Binder = struct {
                     }
                 }
             },
-            .arrow_fn, .function_expr => try b.bindFunctionLike(node, d.lhs, d.rhs, false),
+            .arrow_fn, .function_expr => try b.bindFunctionLike(node, d.lhs, d.rhs, .not_ctor),
             .class_decl => try b.bindClass(node, false), // class expression
             .function_decl => try b.bindFunctionDecl(node), // recovery
             .interface_decl => try b.bindInterface(node),
@@ -3410,8 +3763,6 @@ const Binder = struct {
             .true_literal,
             .false_literal,
             .null_literal,
-            .this_expr,
-            .super_expr,
             .new_target,
             .import_expr,
             .omitted,
@@ -3420,6 +3771,19 @@ const Binder = struct {
             .empty_stmt,
             .debugger_stmt,
             => {},
+
+            .super_expr => {},
+
+            // A leaf as far as names go, but inside a derived class's
+            // constructor its position relative to the `super(...)` call is a
+            // diagnostic (TS17009) — recorded with the flow in effect and
+            // answered once the file's flow graph is complete. The `super`
+            // half of the same rule is `noteSuperProperty`.
+            .this_expr => {
+                if (b.in_derived_ctor) {
+                    try b.this_in_derived_ctor.append(b.scratch, .{ .value = node, .next = b.cur_flow });
+                }
+            },
 
             .jsx_element => {
                 const e = b.tree.extraData(ast.JsxElementData, d.lhs);
@@ -3438,6 +3802,15 @@ const Binder = struct {
                 if (b.nodeTag(d.lhs) == .import_expr) try b.bindDynamicImport(node);
                 var it = b.tree.childIterator(node);
                 while (it.next()) |child| try b.bindExpr(child);
+                // tsc's `bindCallExpressionFlow`: a `super(...)` call — in ANY
+                // position, not just a statement — advances the flow, so that
+                // `this` after it can be told apart from `this` before it. The
+                // arguments are bound first (as they are in tsc), which is why
+                // `super(this)` still reports.
+                if (b.nodeTag(d.lhs) == .super_expr) {
+                    b.cur_flow = try b.addFlow(.call_stmt, b.cur_flow, node);
+                    try b.super_call_flows.append(b.scratch, b.cur_flow);
+                }
             },
 
             // Everything else: recurse over expression children generically.
@@ -3689,7 +4062,7 @@ const Binder = struct {
         _ = try b.pushScope(.function, node);
         try b.bindTypeParams(proto.tp_start, proto.tp_end);
         for (b.tree.extraRange(proto.params_start, proto.params_end)) |param| {
-            try b.bindParam(param, false);
+            try b.bindParam(param, .other);
         }
         try b.bindType(proto.return_type);
         b.popScope(saved_scope);

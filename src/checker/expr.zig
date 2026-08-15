@@ -25,6 +25,7 @@ const Error = checker_zig.Error;
 
 const accessibility = @import("accessibility.zig");
 const comma = @import("comma.zig");
+const computed_key = @import("computed_key.zig");
 const conditions = @import("conditions.zig");
 const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
@@ -2121,6 +2122,8 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                 if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) {
                     const key_expr = c.tree.nodeData(pd.lhs).lhs;
                     const kt = try c.checkExprCached(key_expr, types.no_type);
+                    // TS2464. (wave-8 D: one flagged call into `computed_key.zig`.)
+                    try computed_key.report(c, pd.lhs, kt);
                     // A `unique symbol` key names a real, nominally-keyed
                     // property (`{ [k]: v }`); any other computed key stays
                     // dynamic (no static member).
@@ -2246,7 +2249,28 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                 if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) {
                     const wk = c.wellKnownKeyOfExpr(c.tree.nodeData(pd.lhs).lhs) orelse {
                         // Any other computed key stays dynamic: the body is
-                        // still checked, and no static member is declared.
+                        // still checked, and no static member is declared —
+                        // but tsc still checks the key EXPRESSION, which is
+                        // where a TS2464 (and any diagnostic the key earns in
+                        // its own right) comes from.
+                        //
+                        // Checked in the METHOD's scope, because tsc's
+                        // `getControlFlowContainer` stops at any function-like
+                        // and a method is one: the key's identifiers are
+                        // therefore OUTER variables to the definite-assignment
+                        // rule and assume initialization, where a plain
+                        // property's are not. Measured: `var s: string;
+                        // ({ [s]: 0 })` reports TS2454 and `({ [s]() {} })`
+                        // reports nothing (`symbolProperty1.ts` answers only
+                        // its property key; `computedPropertyNames10`, all
+                        // methods, answers nothing at all).
+                        // (wave-8 D: one flagged call into `computed_key.zig`.)
+                        {
+                            const saved_scope = c.cur_scope;
+                            defer c.cur_scope = saved_scope;
+                            if (try c.scopeOf(pd.rhs)) |s| c.cur_scope = s;
+                            _ = try computed_key.checkComputedName(c, pd.lhs);
+                        }
                         _ = try c.checkExprCached(pd.rhs, types.no_type);
                         continue;
                     };
