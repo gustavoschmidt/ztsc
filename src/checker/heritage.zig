@@ -127,7 +127,7 @@ pub fn checkInterfaceExtends(c: *Checker, sym: SymbolId, node: Node, name_token:
         if (!try relatableBase(c, base) or base == self) continue;
         if (try inheritedVerbatim(c, derived, try c.resolveStructural(base))) continue;
         if (try c.isAssignable(self, base)) continue;
-        if (try untrustworthyOverride(c, sym, self, base, &own)) continue;
+        if (try untrustworthyOverride(c, sym, base, &own)) continue;
         try c.diagFmt(2430, c.tokSpan(name_token), "Interface '{s}' incorrectly extends interface '{s}'.{s}", .{
             try c.typeToString(self),
             try c.typeToString(base),
@@ -321,84 +321,48 @@ fn relatableBase(c: *Checker, base: TypeId) Error!bool {
 }
 
 /// The relation just said this interface does NOT extend its base. Is that
-/// verdict trustworthy? Two override shapes say no, and the check declines
+/// verdict trustworthy? One override shape says no, and the check declines
 /// rather than report a TS2430 tsc does not.
 ///
-/// (1) An own member with a GENERIC signature the base does not have.
+/// (A second arm used to sit here: an own member with a GENERIC signature the
+/// base does not have, declined because ztsc's relation erased such a source's
+/// type parameters to their constraints instead of instantiating it in the
+/// target's context. `genericSourceRelatesByInference` now does the
+/// instantiation for a generic target too — and compares un-erased — so the
+/// arm's own "removing it is the observable test" is satisfied and it is
+/// gone: `callSignatureAssignabilityInInheritance3`,
+/// `constructSignatureAssignabilityInInheritance3` and
+/// `subtypingWithConstructSignatures6` report again, while
+/// `deeplyNestedCheck.ts`'s `child<U extends Extract<keyof T, string>>(path: U)`
+/// against `child(path: string)` stays silent because the inference now solves
+/// `U := string`.)
 ///
-/// tsc's `compareSignaturesRelated` instantiates a generic SOURCE signature in
-/// the target's context (`instantiateSignatureInContextOf`) before comparing
-/// parameters, so `child<U extends Extract<keyof T, string>>(path: U)` relates
-/// to `child(path: string)` by solving `U := string`. ztsc's relation does
-/// that only once the outer type arguments are known; with the interface's own
-/// `T` still free it compares `string` against the uninstantiated `U` and says
-/// no, which would report TS2430 on code tsc accepts (`deeplyNestedCheck.ts`).
-///
-/// This arm is deliberately narrow — a generic member on the DERIVED side,
-/// shadowing a base member — because the reverse shape (a generic member in
-/// the BASE, as in `subtypingWithGenericCallSignaturesWithOptionalParameters`)
-/// is a genuine under-report of the same relation gap and must not be turned
-/// into silence here as well.
-///
-/// (2) An own member written with METHOD syntax that redeclares a base member.
-/// tsc relates methods BIVARIANTLY — `strictFunctionTypes` exempts them, so a
-/// redeclaration only has to relate in one direction, either one. ztsc applies
-/// the exemption inside its signature relation but loses it where the member
-/// is reached through the optional form (`m?(…)`, stored as
+/// What remains is an own member written with METHOD syntax that redeclares a
+/// base member. tsc relates methods BIVARIANTLY — `strictFunctionTypes` exempts
+/// them, so a redeclaration only has to relate in one direction, either one.
+/// ztsc applies the exemption inside its signature relation but loses it where
+/// the member is reached through the optional form (`m?(…)`, stored as
 /// `((…) => …) | undefined`) and the two `this` parameters name classes its
 /// model does not relate. `@types/node`'s
 /// `DuplexOptions.construct?(this: Duplex, …)` over
 /// `WritableOptions.construct?(this: Writable, …)` is both at once, and it
 /// reported a TS2430 tsc does not.
 ///
-/// That arm is syntactic on purpose: what it needs is how the member was
+/// The test is syntactic on purpose: what it needs is how the member was
 /// WRITTEN (method versus property-with-a-function-type), which is exactly the
 /// distinction tsc's bivariance rule keys on and which the resolved type no
 /// longer carries. Property-written members (`a: (x: T) => T`) are unaffected,
 /// which is what keeps the `subtypingWith…` and
 /// `callSignatureAssignabilityInInheritance` families reporting.
 ///
-/// Removing either arm is the observable test that the corresponding relation
-/// gap is fixed.
+/// Removing it is the observable test that the bivariance gap is fixed.
 fn untrustworthyOverride(
     c: *Checker,
     sym: SymbolId,
-    self: TypeId,
     base: TypeId,
     own: *const std.AutoHashMapUnmanaged(Atom, void),
 ) Error!bool {
     if (own.count() == 0) return false;
-    if (try methodOverridesBaseMember(c, sym, base)) return true;
-    const derived = try c.resolveStructural(self);
-    const rb = try c.resolveStructural(base);
-    for (0..c.ts.objectPropCount(derived)) |i| {
-        const p = c.ts.objectProp(derived, @intCast(i));
-        if (!own.contains(p.name)) continue;
-        const bp = (try c.propOfTypeEx(rb, p.name, false)) orelse continue;
-        if (try hasGenericSignature(c, p.ty) and !try hasGenericSignature(c, bp.ty)) return true;
-    }
-    return false;
-}
-
-/// Does `t` carry a call or construct signature with type parameters of its
-/// own? A method's type is a bare `.function`; an overload set or a callable
-/// object carries them on an `.object`.
-fn hasGenericSignature(c: *Checker, t: TypeId) Error!bool {
-    const r = try c.resolveStructural(t);
-    if (c.ts.kind(r) == .function) return c.ts.fnTypeParams(r).len != 0;
-    if (c.ts.kind(r) != .object) return false;
-    for (0..c.ts.objectCallSigCount(r)) |i| {
-        if (c.ts.fnTypeParams(c.ts.objectCallSig(r, @intCast(i))).len != 0) return true;
-    }
-    for (0..c.ts.objectConstructSigCount(r)) |i| {
-        if (c.ts.fnTypeParams(c.ts.objectConstructSig(r, @intCast(i))).len != 0) return true;
-    }
-    return false;
-}
-
-/// Does this interface redeclare a base member with METHOD syntax? See
-/// `untrustworthyOverride` arm (2).
-fn methodOverridesBaseMember(c: *Checker, sym: SymbolId, base: TypeId) Error!bool {
     const rb = try c.resolveStructural(base);
     if (c.ts.kind(rb) != .object) return false;
     const saved = c.enterSymFile(sym);
