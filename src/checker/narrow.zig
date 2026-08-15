@@ -11,11 +11,13 @@
 
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
+const binder = @import("../frontend/binder.zig");
 const intern = @import("../intern.zig");
 const types = @import("../types.zig");
 
 const Node = ast.Node;
 const Atom = intern.Atom;
+const SymbolId = binder.SymbolId;
 const TypeId = types.TypeId;
 
 const checker_zig = @import("../checker.zig");
@@ -888,20 +890,39 @@ pub fn admitsNullish(c: *Checker, instance: TypeId, k: types.Kind) Error!bool {
 /// `isTypeDerivedFrom` (nominal) rather than the subtype relation a type
 /// predicate uses.
 pub fn narrowByInstance(c: *Checker, t: TypeId, instance: TypeId, sense: bool, check_derived: bool) Error!TypeId {
+    // tsc picks the relation ONCE per guard —
+    // `const isRelated = checkDerived ? isTypeDerivedFrom : isTypeSubtypeOf` —
+    // so the candidate's nominal identity is resolved once here rather than per
+    // constituent. `null` means the structural relation below applies (see
+    // `derivedTestOf`).
+    const nominal: ?DerivedTest = if (check_derived) try derivedTestOf(c, instance) else null;
     if (c.ts.kind(t) == .union_type) {
         var parts: std.ArrayList(TypeId) = .empty;
         defer parts.deinit(c.scratch());
         for (try c.memberList(t)) |m| {
-            var matches = try c.isAssignable(m, instance);
-            // tsc's `getNarrowedTypeWorker` filters with the SUBTYPE
-            // relation, and `undefined`/`null` are subtypes of nothing but
-            // themselves. Under plain assignability a "weak" guard type —
-            // an object whose properties are ALL optional, the shape of
-            // every `json is Lib` validator — accepts them, so
-            // `if (!isValidLibrary(data)) throw` left `undefined` in the
-            // guarded branch and every later use reported TS18048.
-            if (matches and isNullishKind(c.ts.kind(m)) and !try c.admitsNullish(instance, c.ts.kind(m)))
-                matches = false;
+            var matches = if (nominal) |want|
+                // tsc's `isTypeDerivedFrom(t, candidate)`: `class Derived2
+                // extends Base` is not derived from its SIBLING `class Derived1
+                // extends Base` however completely it happens to cover it, so
+                // the `else` of `someDerived instanceof Derived1` on `Derived1 |
+                // Derived2` keeps `Derived2` (`narrowByClauseExpressionInSwitchTrue7`).
+                // The nominal test also subsumes the nullish rule below —
+                // `undefined` declares no heritage, so it survives a false
+                // branch and never survives a true one.
+                try isDerivedFrom(c, m, want, 0)
+            else blk: {
+                var ok = try c.isAssignable(m, instance);
+                // tsc's `getNarrowedTypeWorker` filters with the SUBTYPE
+                // relation, and `undefined`/`null` are subtypes of nothing but
+                // themselves. Under plain assignability a "weak" guard type —
+                // an object whose properties are ALL optional, the shape of
+                // every `json is Lib` validator — accepts them, so
+                // `if (!isValidLibrary(data)) throw` left `undefined` in the
+                // guarded branch and every later use reported TS18048.
+                if (ok and isNullishKind(c.ts.kind(m)) and !try c.admitsNullish(instance, c.ts.kind(m)))
+                    ok = false;
+                break :blk ok;
+            };
             // `x instanceof Array` is the NOMINAL test, whose relation
             // (`isTypeDerivedFrom`) counts a readonly list as derived from a
             // mutable array even though the assignability relation refuses it
@@ -910,7 +931,10 @@ pub fn narrowByInstance(c: *Checker, t: TypeId, instance: TypeId, sense: bool, c
             // array constituent (`instanceofNarrowReadonlyArray.ts`). A type
             // PREDICATE keeps the strict subtype filter, which is what makes
             // `Array.isArray(x)` on a readonly array narrow to the guard's
-            // `any[]` (see the non-union arm below).
+            // `any[]` (see the non-union arm below). This is tsc's own tail
+            // clause on `isTypeDerivedFrom`, so it applies to the nominal
+            // branch above as well — though an `Array` candidate models as
+            // `.array` and never HAS a nominal declaration.
             if (!matches and check_derived) matches = try tuple_relate.readonlyDerivedFrom(c, m, instance);
             const kept = if (sense) matches else !matches;
             if (kept) try parts.append(c.scratch(), m);
@@ -963,6 +987,21 @@ pub fn narrowByInstance(c: *Checker, t: TypeId, instance: TypeId, sense: bool, c
         // not itself admit `undefined`/`null` leaves nothing behind (tsc
         // ends at `undefined & Lib`, which is `never`).
         if (isNullishKind(k) and !try c.admitsNullish(instance, k)) return types.never_type;
+        // tsc's `directlyRelated` for `instanceof` is the NOMINAL pick
+        // `isTypeDerivedFrom(t, c) ? t : isTypeDerivedFrom(c, t) ? c : never`,
+        // and it has to come before the assignability chain below because that
+        // chain cannot tell a derived class from its base when the derived one
+        // adds nothing: `class C4 extends C3 {}` is assignable to `C3` AND `C3`
+        // to `C4`, so the first clause kept the base where tsc narrows to the
+        // subclass. A nominal MISS falls through — tsc's own tail does the same
+        // (`isTypeSubtypeOf(candidate, type) ? candidate : …`), which is what
+        // keeps `s instanceof Foo` on an unrelated `s` at the intersection.
+        if (nominal) |want| {
+            if (try isDerivedFrom(c, t, want, 0)) return t;
+            if (try derivedTestOf(c, t)) |back| {
+                if (try isDerivedFrom(c, instance, back, 0)) return instance;
+            }
+        }
         // tsc filters with the SUBTYPE relation, and a `readonly T[]` is
         // not a subtype of a mutable `U[]` — it has no `push`. The reverse
         // does hold, so `getNarrowedTypeWorker`'s second clause fires and
@@ -996,18 +1035,195 @@ pub fn narrowByInstance(c: *Checker, t: TypeId, instance: TypeId, sense: bool, c
     // `never`.
     //
     // NOT for `instanceof` (`checkDerived`), whose assumeFalse arm is
-    // `filterType(type, t => !isTypeDerivedFrom(t, candidate))` — a nominal
-    // test that ztsc answers structurally. Two error classes that add no
-    // members are structurally identical to `Error`, so the identity test
-    // above would wrongly make the `else` of `e instanceof MaxHiddenRepliesError`
-    // (on `e: Error`) `never`.
-    if (!check_derived and try narrowByInstance(c, t, instance, true, check_derived) == t)
+    // `filterType(type, t => !isTypeDerivedFrom(t, candidate))` — the nominal
+    // test, which for a non-union subject is "never when derived, unchanged
+    // otherwise". Two error classes that add no members are structurally
+    // identical to `Error`, so the identity test above would wrongly make the
+    // `else` of `e instanceof MaxHiddenRepliesError` (on `e: Error`) `never`,
+    // and the nominal test correctly does not.
+    if (check_derived) {
+        if (nominal) |want| {
+            if (try isDerivedFrom(c, t, want, 0)) return types.never_type;
+        }
+        return t;
+    }
+    if (try narrowByInstance(c, t, instance, true, check_derived) == t)
         return types.never_type;
     return t;
 }
 
+/// What tsc's `isTypeDerivedFrom` tests an `instanceof` candidate FOR — its
+/// three answering clauses, picked once per guard from the candidate alone.
+const DerivedTest = union(enum) {
+    /// `hasBaseType(source, getTargetType(target))`: the candidate is a class or
+    /// interface DECLARATION and the source must declare it among its bases.
+    decl: SymbolId,
+    /// `target === globalObjectType`: "is the source an object at all".
+    object_like,
+    /// `target === globalFunctionType`: an object source WITH signatures.
+    function_like,
+};
+
+/// Which clause of `isTypeDerivedFrom` a candidate answers through, or `null`
+/// when none of them can.
+///
+/// `hasBaseType` compares `getTargetType(target)` — the DECLARATION, arguments
+/// erased — so a candidate that is not a nominal declaration at all (an
+/// anonymous `new () => {…}` return, a type literal, and in ztsc `Array<T>`,
+/// which models as `.array` and has no `declaredBaseRefs` entry to be reached
+/// through) can never be derived FROM. tsc then falls through to its structural
+/// tail, and so do the callers: they keep the structural relation they had
+/// rather than narrowing every constituent away.
+fn derivedTestOf(c: *Checker, target: TypeId) Error!?DerivedTest {
+    const k = c.ts.kind(target);
+    const ref = c.refFacetOf(target, k) orelse return null;
+    const sym = c.ts.refSymbol(ref);
+    const f = c.symFlags(sym);
+    if (!f.class and !f.interface) return null;
+    if (c.prog.globals.lookup(c.atom_Object)) |g| {
+        if (g == sym) return .object_like;
+    }
+    if (c.prog.globals.lookup(try c.atom("Function"))) |g| {
+        if (g == sym) return .function_like;
+    }
+    return .{ .decl = sym };
+}
+
+/// tsc's `isTypeDerivedFrom(source, target)`, with the target already reduced to
+/// the clause it answers through (`derivedTestOf`).
+///
+/// The `.decl` clause is `hasBaseType`: does `source` declare that class or
+/// interface among its transitive `extends` bases (itself included)? By SYMBOL,
+/// and deliberately — tsc compares against `getTargetType(target)`, so no
+/// argument is instantiated and no member is resolved. `Derived<string>` is
+/// derived from `Base<number>` as far as `instanceof` is concerned, because
+/// `instanceof` is a runtime prototype test and prototypes carry no type
+/// arguments. `implements` is not heritage here for the same reason it is not in
+/// `declaredBaseRefs`: it is a constraint the class is separately checked against
+/// (TS2420), not a prototype link.
+///
+/// The source side follows tsc's own dispatch: a union is derived only if EVERY
+/// constituent is, an intersection if ANY is, and an instantiable source
+/// (a type parameter, a deferred conditional) is followed to its base
+/// constraint — `function f<T extends Base>(x: T) { x instanceof Derived }`.
+fn isDerivedFrom(c: *Checker, source: TypeId, want: DerivedTest, depth: u32) Error!bool {
+    if (depth > 4) return false;
+    var t = source;
+    var hops: u32 = 0;
+    while (hops < 8) : (hops += 1) {
+        const k = c.ts.kind(t);
+        if (k == .this_type) {
+            t = c.ts.thisTypeInstance(t);
+            continue;
+        }
+        if (isInstantiableKind(k)) {
+            const bc = try c.baseConstraintOf(t);
+            if (bc == t or bc == types.no_type) return false;
+            t = bc;
+            continue;
+        }
+        // A `.ref` that names neither a class nor an interface is a type ALIAS,
+        // which carries no identity of its own in either direction: `type X = C`
+        // is a `C` for `hasBaseType` (the materialized instance keeps `C`'s
+        // origin ref, which `refFacetOf` reads below), and `type P = string` is
+        // not an object however the guard asks. Resolving is what lets both
+        // questions see through it.
+        if (k == .ref and !isNominalRef(c, t)) {
+            const r = try c.resolveStructural(t);
+            if (r == t) break;
+            t = r;
+            continue;
+        }
+        break;
+    }
+    const k = c.ts.kind(t);
+    if (k == .union_type or k == .intersection) {
+        // `memberAt` rather than a `memberList` copy: the recursive call may
+        // itself materialize types, and a scratch slice must not be held across
+        // that (the same reason `admitsNullish` walks this way).
+        const n = c.ts.memberCount(t);
+        for (0..n) |i| {
+            const related = try isDerivedFrom(c, c.ts.memberAt(t, @intCast(i)), want, depth + 1);
+            if (k == .union_type) {
+                if (!related) return false;
+            } else if (related) return true;
+        }
+        return k == .union_type and n > 0;
+    }
+    switch (want) {
+        // `!!(source.flags & (TypeFlags.Object | TypeFlags.NonPrimitive))`. Every
+        // object shape qualifies and no primitive does, which is the whole
+        // content of `x instanceof Object` — `string | number | Date` narrows to
+        // `Date`, and its `else` to `string | number`
+        // (`controlFlowInstanceOfGuardPrimitives`). A primitive IS assignable to
+        // the `Object` interface, so the structural relation kept all three.
+        .object_like => return switch (k) {
+            .object, .array, .tuple, .function, .overloads, .class_value, .object_keyword, .mapped => true,
+            .ref => isNominalRef(c, t),
+            else => false,
+        },
+        // `isFunctionObjectType`: an object type with call or construct
+        // signatures. (tsc's third disjunct — a `bind` member on something that
+        // is a subtype of `Function` — describes `Function` itself and the
+        // handful of interfaces that redeclare its members.)
+        .function_like => return switch (k) {
+            .function, .overloads, .class_value => true,
+            .object => c.ts.objectCallSigCount(t) != 0 or c.ts.objectConstructSigCount(t) != 0,
+            else => false,
+        },
+        .decl => {},
+    }
+    const decl = want.decl;
+    const ref = c.refFacetOf(t, k) orelse return false;
+    // Breadth-first over the declared heritage, bounded and cycle-checked like
+    // every other heritage walk (`accessibility.declaringClass`). An interface
+    // may extend several bases at once, and may extend a CLASS, so this is not
+    // the single-parent chain `derivesFromSym` walks.
+    var queue: [32]SymbolId = undefined;
+    var qn: usize = 1;
+    var head: usize = 0;
+    queue[0] = c.ts.refSymbol(ref);
+    while (head < qn) : (head += 1) {
+        const cur = queue[head];
+        if (cur == decl) return true;
+        // Copied out: a later `declaredBaseRefs` may grow the pool this slice
+        // points into.
+        var buf: [8]SymbolId = undefined;
+        var n: usize = 0;
+        for (try c.declaredBaseRefs(cur)) |b| {
+            if (n == buf.len) break;
+            if (c.ts.kind(b) != .ref) continue;
+            buf[n] = c.ts.refSymbol(b);
+            n += 1;
+        }
+        for (buf[0..n]) |bs| {
+            if (qn == queue.len) return false;
+            var dup = false;
+            for (queue[0..qn]) |q| {
+                if (q == bs) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                queue[qn] = bs;
+                qn += 1;
+            }
+        }
+    }
+    return false;
+}
+
+/// Does this reference name a class or an interface — a DECLARATION with an
+/// identity of its own — rather than a type alias?
+fn isNominalRef(c: *Checker, ref: TypeId) bool {
+    const f = c.symFlags(c.ts.refSymbol(ref));
+    return f.class or f.interface;
+}
+
 /// tsc's `narrowTypeByConstructor`: `x.constructor === C` keeps the
-/// constituents of `x` that are COMPARABLE to `C.prototype`.
+/// constituents of `x` that are CONSTRUCTED BY `C.prototype`
+/// (`isConstructedBy`).
 ///
 /// `ctor_t` is the type of the right-hand side (`typeof C`); the candidate is
 /// its `prototype` property, which is what makes the guard work for a plain
@@ -1037,29 +1253,49 @@ pub fn narrowByConstructorProp(c: *Checker, t: TypeId, ctor_t: TypeId) Error!Typ
         var parts: std.ArrayList(TypeId) = .empty;
         defer parts.deinit(c.scratch());
         for (try c.memberList(t)) |m| {
-            if (try c.isComparable(m, cand)) try parts.append(c.scratch(), m);
+            if (try isConstructedBy(c, m, cand)) try parts.append(c.scratch(), m);
         }
         return c.ts.makeUnion(c.scratch(), parts.items);
     }
-    if (try c.isComparable(t, cand)) return t;
+    if (try isConstructedBy(c, t, cand)) return t;
     return types.never_type;
+}
+
+/// tsc's `isConstructedBy(source, target)`, the filter `narrowTypeByConstructor`
+/// runs: when EITHER side is a class instance the two must name the SAME class,
+/// and only otherwise does the structural relation decide.
+///
+/// `x.constructor === C` is an exact runtime test — a subclass instance's
+/// `constructor` is the subclass — so structural coverage is beside the point
+/// and identity is the whole rule. `class C2 extends C1` narrowed by
+/// `.constructor === C1` is therefore `never`, even though a `C2` is everything a
+/// `C1` is (`typeGuardConstructorDerivedClass`), and so are two classes that
+/// declare identical members.
+fn isConstructedBy(c: *Checker, source: TypeId, cand: TypeId) Error!bool {
+    const ssym = classInstanceSymbol(c, source);
+    const csym = classInstanceSymbol(c, cand);
+    if (ssym != null or csym != null) {
+        return ssym != null and csym != null and ssym.? == csym.?;
+    }
+    return c.isComparable(source, cand);
+}
+
+/// The CLASS a type is the instance of, or `null` for anything else —
+/// tsc's `getObjectFlags(t) & ObjectFlags.Class` plus `t.symbol`. An interface
+/// instantiation is deliberately not one: interfaces have no runtime identity for
+/// a `constructor` test to match.
+fn classInstanceSymbol(c: *Checker, t: TypeId) ?SymbolId {
+    const ref = c.refFacetOf(t, c.ts.kind(t)) orelse return null;
+    const sym = c.ts.refSymbol(ref);
+    return if (c.symFlags(sym).class) sym else null;
 }
 
 /// Is `t` exactly the global `Object` or `Function` interface — the two
 /// candidates tsc refuses to narrow an `any` down to, in both the
 /// `instanceof` and the `.constructor` guard (nothing is ruled out by them).
 pub fn isObjectOrFunctionIface(c: *Checker, t: TypeId) Error!bool {
-    if (isGlobalIface(c, t, c.atom_Object)) return true;
-    return isGlobalIface(c, t, try c.atom("Function"));
-}
-
-/// Is `t` the global interface `name` names? A materialized instance still
-/// names the reference it came from (`origin`), which is what `refFacetOf`
-/// reads.
-fn isGlobalIface(c: *Checker, t: TypeId, name: Atom) bool {
-    const sym = c.prog.globals.lookup(name) orelse return false;
-    const k = c.ts.kind(t);
-    if (k == .ref) return sym == c.ts.refSymbol(t);
-    if (c.refFacetOf(t, k)) |r| return sym == c.ts.refSymbol(r);
-    return false;
+    return switch ((try derivedTestOf(c, t)) orelse return false) {
+        .object_like, .function_like => true,
+        .decl => false,
+    };
 }
