@@ -116,6 +116,11 @@ pub const Code = enum(u16) {
     line_break_not_allowed,
     /// Trailing comma or elision where the grammar forbids it.
     argument_expected,
+    /// TS1185: a `git`-style merge conflict marker (`<<<<<<< HEAD`, `=======`,
+    /// `|||||||`, `>>>>>>> branch`). Reported by the scanner over the seven
+    /// marker bytes; the marker and the losing side of the conflict are trivia,
+    /// so the file otherwise parses as the winning side alone.
+    merge_conflict_marker,
     /// TS1206: a decorator in a position the grammar forbids (parameter
     /// decorator under TC39 standard decorators).
     decorator_not_valid_here,
@@ -697,6 +702,8 @@ pub const Code = enum(u16) {
             .unterminated_regexp => "Unterminated regular expression literal.",
             .unterminated_comment => "'*/' expected.",
             .unexpected_character => "Invalid character.",
+            // Also the scanner's, and reported from the same place tsc does.
+            .merge_conflict_marker => "Merge conflict marker encountered.",
             .shebang_not_at_start => "'#!' can only be used at the start of a file.",
             .file_appears_binary => "File appears to be binary.",
             // tsc appends the corrected spelling (`Use the syntax '0o10'.`) to
@@ -936,6 +943,7 @@ pub const Code = enum(u16) {
             .expected_catch_or_finally => 1472,
             .expected_string_literal => 1141,
             .argument_expected => 1135,
+            .merge_conflict_marker => 1185,
             .unterminated_string => 1002,
             .unterminated_template => 1160,
             .unterminated_regexp => 1161,

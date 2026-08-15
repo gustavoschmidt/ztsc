@@ -174,6 +174,55 @@ pub fn scanJsxString(src: []const u8, at_index: u32) ?u32 {
     return null;
 }
 
+/// Length of a merge-conflict marker run — tsc's `mergeConflictMarkerLength`.
+const conflict_marker_len: u32 = 7; // "<<<<<<<".len
+
+/// tsc's `isConflictMarkerTrivia`: is `pos` the start of a `git`-style merge
+/// conflict marker? A marker must
+///
+///   * begin a LINE (`pos == 0`, or the byte before it is a line break),
+///   * be seven identical bytes of `<`, `>`, `=` or `|`, all within the file
+///     (tsc's bound is strict — a file whose last seven bytes are `=======`
+///     with nothing after them is not a marker), and
+///   * be followed by a space, UNLESS it is the `=======` separator, which
+///     carries no branch label and so stands alone on its line.
+///
+/// The line-break test is the ASCII pair only; a marker introduced by U+2028
+/// rather than a newline is not something a merge tool writes.
+pub fn isConflictMarker(src: []const u8, pos: u32) bool {
+    if (pos != 0 and !(src[pos - 1] == '\n' or src[pos - 1] == '\r')) return false;
+    if (pos + conflict_marker_len >= src.len) return false;
+    const ch = src[pos];
+    if (ch != '<' and ch != '>' and ch != '=' and ch != '|') return false;
+    for (src[pos .. pos + conflict_marker_len]) |c| {
+        if (c != ch) return false;
+    }
+    return ch == '=' or src[pos + conflict_marker_len] == ' ';
+}
+
+/// tsc's `scanConflictMarkerTrivia`: the offset just past the trivia a marker
+/// at `pos` swallows. `<<<<<<<` and `>>>>>>>` take the rest of their own line
+/// (their branch label); `|||||||` and `=======` take everything up to the
+/// start of the NEXT `=======`/`>>>>>>>` marker, which is what makes the
+/// losing side of the conflict disappear from the token stream — so
+/// `class C { <<<<<<< H / v=1 / ======= / v=2 / >>>>>>> B / }` parses as
+/// `class C { v = 1 }` and answers three TS1185 and nothing else.
+pub fn conflictMarkerEnd(src: []const u8, pos: u32) u32 {
+    const ch = src[pos];
+    var i = pos;
+    if (ch == '<' or ch == '>') {
+        while (i < src.len and src[i] != '\n' and src[i] != '\r') i += 1;
+        return i;
+    }
+    // A `=======` is ended only by `>>>>>>>`, a `|||||||` by either: tsc's
+    // test is `currentChar != ch`, so a marker of the SAME kind is content.
+    while (i < src.len) : (i += 1) {
+        const c = src[i];
+        if ((c == '=' or c == '>') and c != ch and isConflictMarker(src, i)) break;
+    }
+    return i;
+}
+
 /// Recompute a token's end offset by rescanning it from its start.
 /// O(token length); used for lazy spans so we never store ends.
 pub fn tokenEnd(src: []const u8, tag: Tag, start: u32) u32 {
@@ -298,6 +347,15 @@ pub const Tag = enum(u8) {
     unterminated_regexp_literal,
     /// Unterminated block comment; consumes to end of file.
     unterminated_comment,
+    /// A `git`-style merge conflict marker (`<<<<<<< HEAD`, `=======`, …) and
+    /// the trivia it swallows. tsc's `SyntaxKind.ConflictMarkerTrivia`: real
+    /// TRIVIA for the parser, which skips it in `fill` after recording TS1185 —
+    /// it is a token only because the scanner has no way to report a
+    /// diagnostic. The token's START is where scanning for it began, not the
+    /// marker (they differ only on the JSX-children path, where tsc keeps the
+    /// text's start and so blames the line ABOVE the marker for the missing
+    /// `</`); the marker itself is found again with `isConflictMarker`.
+    conflict_marker,
 
     // --- literals --------------------------------------------------------
     numeric_literal,
@@ -652,6 +710,18 @@ pub const Scanner = struct {
         while (s.index < s.src.len and s.src[s.index] != '<' and s.src[s.index] != '{') {
             s.index += 1;
         }
+        // A merge-conflict marker ENDS the children (tsc's `parseJsxChild`
+        // returns undefined for `ConflictMarkerTrivia`), and the token keeps the
+        // start the text scan began at, because `scanJsxToken` sets `tokenStart`
+        // once on entry and the marker search runs after it. That is what puts
+        // the "'</' expected" of `conflictMarkerTrivia3.tsx` at the end of the
+        // OPENING tag's line rather than on the marker. The `<`-at-`start` case
+        // is deliberately not checked: tsc returns `<` before looking, and a
+        // token start immediately after the enclosing `>` is never a line start.
+        if (s.index < s.src.len and s.index > start and isConflictMarker(s.src, s.index)) {
+            s.index = conflictMarkerEnd(s.src, s.index);
+            return .{ .tag = .conflict_marker, .start = start, .end = s.index, .newline_before = false };
+        }
         return .{ .tag = .jsx_text, .start = start, .end = s.index, .newline_before = false };
     }
 
@@ -671,6 +741,22 @@ pub const Scanner = struct {
     inline fn punct(s: *Scanner, len: u32, tag: Tag) Tag {
         s.index += len;
         return tag;
+    }
+
+    /// If a merge-conflict marker starts at `s.index`, consume it (and the
+    /// trivia it swallows) and answer `.conflict_marker`; otherwise consume
+    /// nothing. Called from the `<`, `>`, `=` and `|` arms of `scanToken`, the
+    /// four bytes tsc checks and in the same place — the start of a TOKEN,
+    /// never inside a string, template, comment or regex, which is what keeps a
+    /// markdown-ish `` `\n=======\n` `` quiet (a `=======` needs no trailing
+    /// space, so a raw pre-pass over the bytes would answer TS1185 for it).
+    /// The line-start test comes first: it is one compare, and it is false for
+    /// essentially every `<`/`=`/`>`/`|` a real file contains.
+    inline fn conflictMarker(s: *Scanner) ?Tag {
+        if (s.index != 0 and !(s.src[s.index - 1] == '\n' or s.src[s.index - 1] == '\r')) return null;
+        if (!isConflictMarker(s.src, s.index)) return null;
+        s.index = conflictMarkerEnd(s.src, s.index);
+        return .conflict_marker;
     }
 
     /// Scan one non-trivia token; s.index is at its (in-bounds) first byte.
@@ -696,6 +782,7 @@ pub const Scanner = struct {
                 return s.punct(1, .dot);
             },
             '<' => {
+                if (s.conflictMarker()) |tag| return tag;
                 if (s.at(s.index + 1) == '<') {
                     if (s.at(s.index + 2) == '=') return s.punct(3, .lt_lt_eq);
                     return s.punct(2, .lt_lt);
@@ -704,6 +791,7 @@ pub const Scanner = struct {
                 return s.punct(1, .lt);
             },
             '>' => {
+                if (s.conflictMarker()) |tag| return tag;
                 if (s.at(s.index + 1) == '>') {
                     if (s.at(s.index + 2) == '>') {
                         if (s.at(s.index + 3) == '=') return s.punct(4, .gt_gt_gt_eq);
@@ -716,6 +804,7 @@ pub const Scanner = struct {
                 return s.punct(1, .gt);
             },
             '=' => {
+                if (s.conflictMarker()) |tag| return tag;
                 if (s.at(s.index + 1) == '=') {
                     if (s.at(s.index + 2) == '=') return s.punct(3, .eq_eq_eq);
                     return s.punct(2, .eq_eq);
@@ -766,6 +855,7 @@ pub const Scanner = struct {
                 return s.punct(1, .amp);
             },
             '|' => {
+                if (s.conflictMarker()) |tag| return tag;
                 if (s.at(s.index + 1) == '|') {
                     if (s.at(s.index + 2) == '=') return s.punct(3, .pipe_pipe_eq);
                     return s.punct(2, .pipe_pipe);

@@ -204,6 +204,15 @@ const Parser = struct {
     la: [max_la]Token = undefined,
     la_len: u8 = 0,
 
+    /// Merge-conflict marker offsets seen so far, for the TS1185 batch
+    /// `flushConflictMarkers` appends. An accumulator because `fill` — where a
+    /// marker is skipped — is infallible and so cannot allocate a diagnostic;
+    /// a fixed buffer keeps it that way. A file with more than this many
+    /// markers under-reports the rest, which no real file and no corpus case
+    /// comes near (the largest writes four).
+    conflict_markers: [16]u32 = undefined,
+    conflict_marker_len: u8 = 0,
+
     tok_tags: std.ArrayList(TokTag) = .empty,
     tok_starts: std.ArrayList(u32) = .empty,
     nodes: std.MultiArrayList(ast.NodeItem) = .empty,
@@ -331,8 +340,60 @@ const Parser = struct {
 
     fn fill(p: *Parser, n: usize) void {
         while (p.la_len <= n) {
-            p.la[p.la_len] = p.scn.next();
+            var t = p.scn.next();
+            // A merge-conflict marker is TRIVIA (tsc's scanner `continue`s past
+            // it whenever `skipTrivia` is set, which it is for a parser), so the
+            // grammar never sees one. It carries a diagnostic, though, and this
+            // path cannot allocate — hence the fixed side buffer.
+            while (t.tag == .conflict_marker) {
+                p.noteConflictMarker(t);
+                const nl = t.newline_before;
+                t = p.scn.next();
+                t.newline_before = t.newline_before or nl;
+            }
+            p.la[p.la_len] = t;
             p.la_len += 1;
+        }
+    }
+
+    /// Record the marker inside a `.conflict_marker` token for the TS1185 that
+    /// `flushConflictMarkers` appends once the parse is over.
+    fn noteConflictMarker(p: *Parser, t: Token) void {
+        // The marker is the first line-start run of seven WITHIN the token: the
+        // token's own start on the ordinary path, and past the whitespace text
+        // on the JSX-children one (see `scanJsxChild`).
+        var at = t.start;
+        while (at < t.end and !scanner.isConflictMarker(p.src, at)) at += 1;
+        if (at >= t.end) return;
+        // Set semantics, not a high-water mark: a speculative parse can scan
+        // two markers and then backtrack to before the FIRST, so "later than
+        // the last one seen" would drop it when the re-scan reaches it again.
+        for (p.conflict_markers[0..p.conflict_marker_len]) |m| {
+            if (m == at) return;
+        }
+        if (p.conflict_marker_len == p.conflict_markers.len) return;
+        p.conflict_markers[p.conflict_marker_len] = at;
+        p.conflict_marker_len += 1;
+    }
+
+    /// Append one TS1185 per marker seen. Deferred to the end of the parse
+    /// because `fill` is infallible; the driver sorts diagnostics by position
+    /// before emitting them, so the deferral is invisible. The one-per-position
+    /// rule is honoured by declining a position a syntactic diagnostic already
+    /// holds — tsc, which pushes the marker at scan time, would instead have
+    /// suppressed the later parse error, but no token can start at a marker
+    /// (it is trivia), so nothing reaches that position from the parser side.
+    fn flushConflictMarkers(p: *Parser) Error!void {
+        for (p.conflict_markers[0..p.conflict_marker_len]) |at| {
+            var taken = false;
+            for (p.diags.items) |d| {
+                if (d.span.start == at and d.code.class() == .syntactic) taken = true;
+            }
+            if (taken) continue;
+            try p.diags.append(p.gpa, .{
+                .code = .merge_conflict_marker,
+                .span = .{ .start = at, .end = at + 7 },
+            });
         }
     }
 
@@ -1079,6 +1140,8 @@ const Parser = struct {
         const t = p.cur();
         std.debug.assert(t.tag == .eof);
         try p.appendTok(t);
+
+        try p.flushConflictMarkers();
     }
 
     /// Parse statements until `terminator` (or eof), pushing them on
@@ -4641,6 +4704,17 @@ const Parser = struct {
                     _ = try p.expect(.r_brace, .expected_r_brace);
                     try p.pushScratch(try p.addNode(.{ .tag = .jsx_expr_container, .main_token = lb, .data = .{ .lhs = expr, .rhs = 0 } }));
                     pos = p.lastTokEnd();
+                },
+                .conflict_marker => {
+                    // tsc's `parseJsxChild` ENDS the child list on a marker, and
+                    // the "'</' expected" that follows lands on the marker
+                    // token's start — the end of the opening tag's line, because
+                    // `scanJsxToken` fixed `tokenStart` before it went looking
+                    // (`conflictMarkerTrivia3.tsx`).
+                    p.noteConflictMarker(tok);
+                    p.jsxResync(tok.end);
+                    try p.errAtBytes(.expected_gt, tok.start, tok.end);
+                    break;
                 },
                 .lt => {
                     p.jsxResync(tok.start);
