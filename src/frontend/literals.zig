@@ -136,24 +136,33 @@ pub fn stripQuotes(text: []const u8) []const u8 {
 /// tsc's `isNumericLiteralName`: is this property NAME a number's canonical
 /// spelling — `(+name).toString() === name`? The question a rule about numeric
 /// names has to ask about a name that arrived as a STRING (`"3"`), where the
-/// token tag says nothing: `"3"` and `"1.5"` and `"-1"` are numeric names,
-/// `"0x10"` and `"1e3"` and `"bar"` are not (their values spell themselves
-/// differently), and `"NaN"`/`"Infinity"` are — all four verified against tsgo.
+/// token tag says nothing: `"3"`, `"1.5"` and `"-1"` are numeric names, while
+/// `"0x10"`, `"1e3"`, `"-0"` and `"bar"` are not — their values spell themselves
+/// differently.
+///
+/// The NON-FINITE names are excluded, which is a deliberate divergence from
+/// JavaScript and a match for the oracle: `String(+"Infinity")` is `"Infinity"`,
+/// so tsc's own predicate accepts it, but tsgo — where the spelling comes from
+/// Go's `-Inf`/`NaN` — rejects `"Infinity"` and `"-Infinity"`, and answers no
+/// TS2452 for either (`enumWithNegativeInfinityProperty.ts` exists to say so).
+/// `"NaN"` is rejected with them: tsgo answers no TS2452 there either.
 ///
 /// The canonical spelling comes from `numeric_lit`, so this predicate cannot
 /// disagree with the member atom a numeric name is keyed by.
 pub fn isNumericName(text: []const u8) bool {
     if (text.len == 0 or text.len > numeric_lit.max_name) return false;
+    const v = numeric_lit.value(text);
+    if (std.math.isNan(v) or std.math.isInf(v)) return false;
     var buf: [numeric_lit.max_name]u8 = undefined;
     return std.mem.eql(u8, numeric_lit.name(&buf, text), text);
 }
 
 test "numeric property names are the ones that spell themselves" {
     const t = std.testing;
-    for ([_][]const u8{ "0", "3", "1.5", "-1", "NaN", "Infinity", "1000" }) |s| {
+    for ([_][]const u8{ "0", "3", "1.5", "-1", "1000" }) |s| {
         try t.expect(isNumericName(s));
     }
-    for ([_][]const u8{ "", "bar", "0x10", "1e3", "1_000", "0.0", " 1", "3n" }) |s| {
+    for ([_][]const u8{ "", "bar", "0x10", "1e3", "1_000", "0.0", " 1", "3n", "-0", "NaN", "Infinity", "-Infinity" }) |s| {
         try t.expect(!isNumericName(s));
     }
 }

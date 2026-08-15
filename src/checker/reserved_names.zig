@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
+const binder = @import("../frontend/binder.zig");
 
 const Node = ast.Node;
 
@@ -60,8 +61,17 @@ pub fn checkDeclName(c: *Checker, node: Node) Error!void {
     // wording: `namespace any {}` is legal (it declares a value, and `any` is
     // only a keyword in type position), while `namespace undefined {}` shadows
     // the global `undefined` VALUE. Measured, both ways.
+    //
+    // "Shadows the global" is the whole rule, so it takes a declaration that IS
+    // in the global scope: the file's top level, and only when the file is not a
+    // module (a module's top level is its own scope, and a nested namespace is
+    // never global). `typeNamedUndefined2.ts` — `export namespace undefined` in
+    // a module, twice — is silent in tsgo, and `namespace N { namespace
+    // undefined {} }` is too.
     if (form == .namespace) {
         if (!std.mem.eql(u8, name, "undefined")) return;
+        if (c.cur_scope != binder.file_scope) return;
+        if (c.bind.imports.len != 0 or c.bind.exports.len != 0) return;
         try c.diagFmt(2397, c.tokSpan(name_token), "Declaration name conflicts with built-in global identifier '{s}'.", .{name});
         return;
     }
