@@ -1697,7 +1697,7 @@ const Parser = struct {
                 };
                 return p.parseExpressionStatement();
             },
-            .keyword_import => return p.parseImportStatement(),
+            .keyword_import => return p.parseImportStatement(null),
             .keyword_export => return p.parseExportStatement(),
             .keyword_global => {
                 // Bare `global { ... }` augmentation (no leading `declare`), as
@@ -3466,13 +3466,27 @@ const Parser = struct {
 
     // --- modules --------------------------------------------------------------
 
-    fn parseImportStatement(p: *Parser) PE!Node {
+    /// `import …;` in all its spellings. `export_kw` is the token index of a
+    /// preceding `export` modifier, or null (an optional, not a 0 sentinel: the
+    /// `export` of a file's FIRST statement IS token 0) — tsc parses
+    /// `export import` as one
+    /// statement with a modifier list and lets `checkGrammarModifiers` judge it:
+    /// an ImportEqualsDeclaration (`export import A = B.C;`, the exported
+    /// namespace alias) accepts `export`, while an ES6 ImportDeclaration
+    /// (`export import d from "m"`) earns TS1191 and nothing else — the file
+    /// still parses, so its semantic pass runs (the `es6Import*WithExport`
+    /// family is 8 corpus cases whose real keys are all downstream of that).
+    fn parseImportStatement(p: *Parser, export_kw: ?u32) PE!Node {
         // `import(` / `import.` are expressions, not declarations.
         if (p.peekTag(1) == .l_paren or p.peekTag(1) == .dot) {
             return p.parseExpressionStatement();
         }
         const kw = try p.bump(); // `import`
         p.saw_module_syntax = true;
+        // `Flags.exported` deliberately NOT set on the ES6 form: the binder reads
+        // only `type_only` out of `ImportData.flags`, and whether tsc's
+        // `export import { a } from "m"` really re-exports `a` (the family's
+        // remaining TS2323/TS2614 keys) is a binder question, not a parse one.
         var flags: u32 = 0;
 
         // `import "module";` — a side-effect-only import, which carries import
@@ -3483,6 +3497,7 @@ const Parser = struct {
             const mod = try p.bump();
             try p.skipImportAttributes();
             try p.expectSemicolon();
+            if (export_kw) |m| try p.errAtToken(.import_cannot_have_modifiers, m);
             const extra = try p.addExtra(ast.ImportData{
                 .flags = 0,
                 .default_name_token = 0,
@@ -3513,7 +3528,8 @@ const Parser = struct {
             // `import d ...` — but `import x = require(...)` is out of subset.
             default_name = try p.bump();
             if (p.curTag() == .eq) {
-                return p.finishImportEquals(kw, default_name, 0);
+                // The ImportEqualsDeclaration arm — `export` belongs here.
+                return p.finishImportEquals(kw, default_name, if (export_kw != null) ast.Flags.exported else 0);
             }
             _ = try p.eat(.comma);
         }
@@ -3535,6 +3551,7 @@ const Parser = struct {
         }
         try p.skipImportAttributes();
         try p.expectSemicolon();
+        if (export_kw) |m| try p.errAtToken(.import_cannot_have_modifiers, m);
 
         const extra = try p.addExtra(ast.ImportData{
             .flags = flags,
@@ -3689,16 +3706,12 @@ const Parser = struct {
                 try p.expectSemicolon();
                 return p.addNode(.{ .tag = .export_assign, .main_token = kw, .data = .{ .lhs = entity, .rhs = 0 } });
             },
-            .keyword_import => {
-                // `export import A = B.C;` inside a namespace (exported alias).
-                const imp_kw = try p.bump();
-                const name_tok = try p.expectIdentLike();
-                if (p.curTag() != .eq) {
-                    try p.fail(.expected_eq);
-                    return p.addNode(.{ .tag = .export_assign, .main_token = kw, .data = .{ .lhs = 0, .rhs = 0 } });
-                }
-                return p.finishImportEquals(imp_kw, name_tok, ast.Flags.exported);
-            },
+            // `export import A = B.C;` is an exported namespace alias and legal;
+            // `export import d from "m"` is an ES6 import declaration with a
+            // modifier, which tsc PARSES and then answers TS1191 for. Both
+            // spellings start the same way, so the one statement parser decides,
+            // and the `export` token it is handed is what TS1191 is blamed on.
+            .keyword_import => return p.parseImportStatement(kw),
             .asterisk => {
                 _ = try p.bump();
                 var ns_name: u32 = 0;

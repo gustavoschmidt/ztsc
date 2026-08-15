@@ -398,6 +398,12 @@ pub const Code = enum(u16) {
     /// TS1028: a second accessibility modifier on one member or parameter
     /// (`public private x`), reported on the second one.
     accessibility_modifier_already_seen,
+    /// TS1191: a modifier on an ES6 import declaration — `export import d from
+    /// "m"`, which tsc parses as an ImportDeclaration carrying an `export` and
+    /// then rejects in `checkGrammarModifiers`. Reported on the modifier.
+    /// `export import A = B.C;` is a different declaration (an
+    /// ImportEqualsDeclaration) and is legal.
+    import_cannot_have_modifiers,
     /// TS2452: `enum E { 1, 2 }` — a numeric literal as an enum member name.
     /// The grammar ACCEPTS it (it is a PropertyName), so this is a check on a
     /// parsed member, not a parse failure; rejecting it in the parser instead
@@ -589,6 +595,8 @@ pub const Code = enum(u16) {
             .statement_not_allowed_in_ambient,
             .implementation_not_allowed_in_ambient,
             .accessibility_modifier_already_seen,
+            // Same funnel as TS1184/TS1044 — `checkGrammarModifiers`.
+            .import_cannot_have_modifiers,
             .enum_member_numeric_name,
             .enum_member_private_name,
             .computed_name_in_enum,
@@ -767,6 +775,7 @@ pub const Code = enum(u16) {
             .statement_not_allowed_in_ambient => "Statements are not allowed in ambient contexts.",
             .implementation_not_allowed_in_ambient => "An implementation cannot be declared in ambient contexts.",
             .accessibility_modifier_already_seen => "Accessibility modifier already seen.",
+            .import_cannot_have_modifiers => "An import declaration cannot have modifiers.",
             .enum_member_numeric_name => "An enum member cannot have a numeric name.",
             .enum_member_private_name => "An enum member cannot be named with a private identifier.",
             .computed_name_in_enum => "Computed property names are not allowed in enums.",
@@ -972,6 +981,7 @@ pub const Code = enum(u16) {
             .statement_not_allowed_in_ambient => 1036,
             .implementation_not_allowed_in_ambient => 1183,
             .accessibility_modifier_already_seen => 1028,
+            .import_cannot_have_modifiers => 1191,
             .enum_member_numeric_name => 2452,
             .enum_member_private_name => 18024,
             .computed_name_in_enum => 1164,
