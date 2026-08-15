@@ -751,6 +751,38 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
 
     if (c.nodeTag(body) == .block) {
         for (c.tree.nodeRange(body)) |stmt| try c.checkStatement(stmt);
+        // tsc's `checkAccessorDeclaration`: a `get` accessor with a body
+        // whose END IS REACHABLE and which writes no `return` at all is
+        // TS2378, reported at the accessor's NAME.
+        //
+        // Both halves of the condition are the binder flags the ending-return
+        // analysis below reads (`HasImplicitReturn` / `HasExplicitReturn`),
+        // so the two questions are the same two asked there — but the ANSWER
+        // is independent of the return type: `get g(): void {}` and
+        // `get h(): any {}` are TS2378 even though a plain function with
+        // either annotation needs no return at all, and `get a(): number {}`
+        // is TS2378 *and* TS2355. A bare `return;` satisfies it (the binder
+        // sets `hasExplicitReturn` for any return statement), and a `return`
+        // inside a NESTED function does not (`collectReturns` stops at
+        // function boundaries, as the binder's per-function flag does).
+        if (proto.flags & ast.Flags.get != 0 and !c.ambient_ctx and
+            !c.stmtListTerminal(c.tree.nodeRange(body)))
+        {
+            // Only the presence of returns matters, so the scope handed over
+            // is irrelevant — see the TS2355 collection below.
+            var rets = try c.collectReturns(c.tree.nodeRange(body), binder.file_scope);
+            defer rets.deinit(c.scratch());
+            if (rets.exprs.items.len == 0 and !rets.bare) {
+                // The parser gives an accessor's `FnProto` the key token,
+                // which for a computed object-literal key is the `[` — the
+                // start of tsc's `node.name` either way.
+                const name_span = if (proto.name_token != 0)
+                    c.tokSpan(proto.name_token)
+                else
+                    c.tokSpan(c.tree.nodeMainToken(node));
+                try c.diagFmt(2378, name_span, "A 'get' accessor must return a value.", .{});
+            }
+        }
         // Ending-return analysis (TS2355/2366). For async the target is the
         // Promise payload; generators do not require an ending return.
         if (!is_generator and eff_ann != types.no_type and eff_ann != types.error_type) {

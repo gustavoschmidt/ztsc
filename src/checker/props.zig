@@ -290,6 +290,8 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, allow_index: bool, from_ind
         .bool_false,
         .bigint,
         .bigint_literal,
+        .symbol,
+        .unique_symbol,
         => {
             return primitiveInterfaceProp(c, t, name);
         },
@@ -622,10 +624,22 @@ fn primitiveInterfaceOf(c: *Checker, t: TypeId) Error!?TypeId {
         .boolean, .bool_true, .bool_false => iface_atom = c.atom_Boolean,
         // tsc's `getApparentType` bridges `bigint` to `globalBigIntType`, so
         // `(1n).toString(2)` and `v.toLocaleString(…)` resolve exactly as their
-        // `number` counterparts do (`bigintWithoutLib`). `symbol` has the same
-        // bridge to `Symbol` in tsc and is deliberately NOT added here yet: it
-        // would also change `keyof symbol` and every `unique symbol` receiver.
+        // `number` counterparts do (`bigintWithoutLib`).
         .bigint, .bigint_literal => iface_atom = c.atom_BigInt,
+        // `symbol` and a `unique symbol` bridge to `globalESSymbolType` the same
+        // way (tsc's `getApparentType`: `esSymbolType -> globalESSymbolType`).
+        // Without it `symbol` had NO apparent members at all — not
+        // `description`, not `toString`, and not the `constructor` that
+        // `Object` lends every other type — so a UNION with a `symbol`
+        // constituent lost the property for the whole union
+        // (`typeGuardConstructorPrimitiveTypes` reads `.constructor` off
+        // `string | number | boolean | any[] | symbol | bigint`).
+        //
+        // Interned per lookup rather than cached on `Checker`: only a member
+        // access whose receiver is a symbol reaches here, and one hash probe
+        // against the already-interned name is cheaper than another field on
+        // the hot struct.
+        .symbol, .unique_symbol => iface_atom = try c.internText("Symbol"),
         else => return null,
     }
     const sym = c.prog.globals.lookup(iface_atom) orelse return null;
