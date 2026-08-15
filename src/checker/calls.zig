@@ -29,6 +29,7 @@ const tuple_relate = @import("tuple_relate.zig");
 const ambientNamespaceType = @import("signatures.zig").ambientNamespaceType;
 const ChainLink = @import("expr.zig").ChainLink;
 const checkExprCached = @import("expr.zig").checkExprCached;
+const expr_zig = @import("expr.zig");
 const freshLiteralRejects = @import("assign.zig").freshLiteralRejects;
 const instantiate = @import("enums.zig").instantiate;
 const isAssignable = @import("assign.zig").isAssignable;
@@ -68,6 +69,125 @@ pub fn callShape(c: *Checker, node: Node) CallShape {
         .new_expr_bare => return .{ .callee = d.lhs },
         else => return .{ .callee = d.lhs },
     }
+}
+
+/// The function expression a call IMMEDIATELY INVOKES, or `null_node` — tsc's
+/// `getImmediatelyInvokedFunctionExpression`, read from the call side.
+///
+/// tsc walks UP from the parameter (`parameter.parent.parent`, through
+/// parentheses); ztsc records no parent pointers, so the fact has to be
+/// established here, where the call and its arguments are in hand, and handed
+/// down as the callee's contextual type (`iifeContextualSig`).
+///
+/// Parenthesized both ways: `(function (x) {} ("!"))` parenthesizes the CALL —
+/// so the callee is the function expression itself — while
+/// `((((function (y) {}))))("-")` parenthesizes the CALLEE, and every
+/// syntactic question about a value looks through those (`skipParens`).
+fn iifeCallee(c: *Checker, callee: Node) Node {
+    const f = expr_zig.skipParens(c, callee);
+    if (f == null_node) return null_node;
+    return switch (c.nodeTag(f)) {
+        .arrow_fn, .function_expr => f,
+        else => null_node,
+    };
+}
+
+/// tsc's `getContextuallyTypedParameterType`, IIFE arm — packaged as a
+/// synthetic contextual SIGNATURE so the ordinary contextual-parameter
+/// machinery (`paramInfo` → `paramTypeAt` / `restTupleAtPosition`) reads it:
+///
+/// ```ts
+/// const iife = getImmediatelyInvokedFunctionExpression(func);
+/// if (iife && iife.arguments) {
+///     const args = getEffectiveCallArguments(iife);
+///     const indexOfParameter = func.parameters.indexOf(parameter);
+///     if (parameter.dotDotDotToken) {
+///         return getSpreadArgumentType(args, indexOfParameter, args.length, anyType, undefined, CheckMode.Normal);
+///     }
+///     const type = indexOfParameter < args.length ?
+///         getWidenedLiteralType(checkExpression(args[indexOfParameter])) :
+///         parameter.initializer ? undefined : undefinedWideningType;
+///     return type;
+/// }
+/// ```
+///
+/// An IIFE's parameters are therefore NEVER implicit `any`: each one takes the
+/// widened type of the argument at its position, a trailing rest takes the
+/// remaining arguments as a tuple, and a parameter past the last argument is
+/// `undefined` (unless it has an initializer, which then supplies it). ztsc had
+/// no IIFE rule at all, so every unannotated parameter of one fell to implicit
+/// `any` — the whole of `contextuallyTypedIifeStrict` and three quarters of
+/// `restTuplesFromContextualTypes`.
+///
+/// The signature is built as a single rest parameter typed by the ARGUMENT
+/// TUPLE, which is what makes the two readings fall out of the existing
+/// helpers: `paramTypeAt` indexes the tuple for a positional parameter and
+/// `restTupleAtPosition` slices its tail for a rest one — the latter being
+/// exactly `getSpreadArgumentType(args, i, args.length, …)`. A SPREAD argument
+/// contributes its tuple's elements (or rides as one variadic element when its
+/// type has no fixed shape), which is `getEffectiveCallArguments` expanding a
+/// spread into synthetic expressions.
+///
+/// `no_type` for anything that is not an IIFE — including every `new` — and
+/// the return type is deliberately `no_type` too: an IIFE has no contextual
+/// RETURN type in tsc, and `checkFunctionLikeExpr` reads the contextual
+/// signature's return as one.
+fn iifeContextualSig(c: *Checker, shape: CallShape) Error!TypeId {
+    const fnode = iifeCallee(c, shape.callee);
+    if (fnode == null_node) return types.no_type;
+    var elems: std.ArrayList(types.TupleElem) = .empty;
+    defer elems.deinit(c.scratch());
+    // The arguments are typed OUT of the checker's top-down order here — the
+    // authoritative walk types each of them again, against the parameter this
+    // very signature is about to give the callee — so the pre-pass runs as a
+    // side query: no diagnostic, no `node_types` entry. tsc reaches the same
+    // place by parking `anySignature` on the call's node links while it types
+    // one argument, so the resolution it is nested inside cannot recurse.
+    c.side_query_depth += 1;
+    defer c.side_query_depth -= 1;
+    for (shape.arg_nodes) |an| {
+        if (an == null_node) continue;
+        if (c.nodeTag(an) == .spread_element) {
+            const st = try c.resolveStructural(try c.checkExprCached(c.tree.nodeData(an).lhs, types.no_type));
+            if (c.ts.kind(st) == .tuple) {
+                for (0..c.ts.tupleLen(st)) |i| try elems.append(c.scratch(), c.ts.tupleElem(st, @intCast(i)));
+            } else {
+                // No fixed shape (an array, a bare type parameter): one
+                // variadic element standing for the whole spread, which is
+                // `getSpreadArgumentType`'s `ElementFlags.Variadic` push.
+                try elems.append(c.scratch(), .{ .ty = st, .flags = types.elem_flag_rest });
+            }
+            continue;
+        }
+        try elems.append(c.scratch(), .{
+            .ty = try c.widenLiteral(try c.checkExprCached(an, types.no_type)),
+        });
+    }
+    // `undefinedWideningType` for each parameter past the last argument. The
+    // padding stops at the first parameter that has an INITIALIZER, which tsc
+    // hands no contextual type at all so its default supplies the type
+    // (`((n = 10) => n + 1)()` is `number`, not `never`), and at a rest
+    // parameter, whose empty tail `restTupleAtPosition` already answers.
+    const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(fnode).lhs);
+    const argc = elems.items.len;
+    var pi: usize = 0;
+    for (c.tree.extraRange(proto.params_start, proto.params_end)) |pn| {
+        if (pn == null_node) continue;
+        defer pi += 1;
+        if (pi < argc) continue;
+        if (c.nodeTag(pn) == .param_full) {
+            const e = c.tree.extraData(ast.ParamFull, c.tree.nodeData(pn).rhs);
+            if (e.init != 0 or e.flags & ast.Flags.rest != 0) break;
+        }
+        try elems.append(c.scratch(), .{ .ty = types.undefined_type });
+    }
+    const tup = try c.ts.makeTuple(elems.items);
+    return c.ts.makeFunction(
+        &.{.{ .name = 0, .ty = tup, .flags = types.param_flag_rest }},
+        types.no_type,
+        &.{},
+        0,
+    );
 }
 
 /// `import("m")` in *expression* position: `Promise<<namespace object of
@@ -255,7 +375,10 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
         const link = try c.chainObjType(shape.callee);
         if (link.chained) chained = true;
         break :blk link.ty;
-    } else try c.checkExprCached(shape.callee, types.no_type);
+    } else try c.checkExprCached(shape.callee, if (is_new)
+        types.no_type
+    else
+        try iifeContextualSig(c, shape));
     if (shape.optional) {
         if (c.containsNullish(callee_t)) chained = true;
         callee_t = try c.nonNullableChain(callee_t);
@@ -1469,7 +1592,7 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
     // this skips only fill a memo other readers re-derive on miss.
     if (!c.owned_mask[c.cur_file]) return;
     const nargs = countArgs(arg_nodes);
-    const required = try c.requiredParams(sig);
+    const required = @min(try c.requiredParams(sig), iifeMinArgs(c, node, nargs));
     const total = try c.paramTotal(sig);
     const has_spread = hasSpreadArg(c, arg_nodes);
     // A TRUNCATION IS NOT AN ARITY. `instantiateId`'s depth/count guard fires
@@ -1653,6 +1776,52 @@ fn noteArgBlame(c: *Checker, anchor_out: ?*?Span, before: usize, arg_span: Span,
 /// The arrow's opening tokens are recovered from the source text rather than the
 /// token array (the AST records only the `=>`); an intervening comment stops the
 /// walk, leaving the span where it already was.
+/// The other half of tsc's IIFE rule (`iifeContextualSig` is the first): the
+/// smallest argument count the callee of `node` demands, once tsc's
+/// `isOptionalParameter` has been applied to it.
+///
+/// ```ts
+/// const iife = getImmediatelyInvokedFunctionExpression(node.parent);
+/// if (iife) {
+///     return !node.type && !node.dotDotDotToken &&
+///         node.parent.parameters.indexOf(node) >= getEffectiveCallArguments(iife).length;
+/// }
+/// ```
+///
+/// An unannotated, non-rest parameter of an IIFE past the last argument is
+/// OPTIONAL — which is what makes `((x, y, z) => 42)()` and
+/// `(function (x, undefined) { return x; })(42)` legal in tsgo where ztsc
+/// reported TS2554. It is the arity counterpart of the `undefined` those
+/// parameters are typed as: a parameter tsc gives a type to unconditionally
+/// cannot also be one the caller has to supply.
+///
+/// `maxInt` — no constraint — for a callee that is not an IIFE, so the caller's
+/// `@min` leaves the ordinary count alone. Only the too-FEW direction moves;
+/// the maximum still comes from the parameter list, since a surplus argument
+/// has no parameter to be optional at.
+fn iifeMinArgs(c: *Checker, node: Node, nargs: usize) u32 {
+    const fnode = iifeCallee(c, c.callShape(node).callee);
+    if (fnode == null_node) return std.math.maxInt(u32);
+    const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(fnode).lhs);
+    var pi: u32 = 0;
+    var min: u32 = 0;
+    for (c.tree.extraRange(proto.params_start, proto.params_end)) |pn| {
+        if (pn == null_node) continue;
+        defer pi += 1;
+        const d = c.tree.nodeData(pn);
+        const ann: Node = switch (c.nodeTag(pn)) {
+            .param => d.rhs,
+            .param_full => c.tree.extraData(ast.ParamFull, d.rhs).type_ann,
+            else => 0,
+        };
+        const rest = c.nodeTag(pn) == .param_full and
+            c.tree.extraData(ast.ParamFull, d.rhs).flags & ast.Flags.rest != 0;
+        if (pi >= nargs and ann == 0 and !rest) continue;
+        min = pi + 1;
+    }
+    return min;
+}
+
 /// tsc's `getArgumentArityError`, message and SPAN both. `min`/`max` are the
 /// parameter counts over the whole candidate set (a lone signature is a set of
 /// one) and `has_rest` says some candidate takes a rest parameter — which is

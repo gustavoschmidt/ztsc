@@ -595,7 +595,33 @@ fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_implicit
     if (type_ann == 0 and setter_ctx != types.no_type and index == 0) {
         ctx_ty = setter_ctx;
     } else if (type_ann == 0 and ctx_sig != types.no_type and c.ts.kind(ctx_sig) == .function) {
-        if (try c.paramTypeAt(ctx_sig, index)) |ct| ctx_ty = ct;
+        // tsc's `getContextuallyTypedParameterType` closes with a choice on
+        // the parameter's own form, not on the contextual signature's:
+        //
+        // ```ts
+        // return parameter.dotDotDotToken && lastOrUndefined(func.parameters) === parameter ?
+        //     getRestTypeAtPosition(contextualSignature, index) :
+        //     tryGetTypeAtPosition(contextualSignature, index);
+        // ```
+        //
+        // A trailing REST parameter takes the whole remaining parameter list
+        // as a TUPLE — `restTupleAtPosition`, which the signature relation
+        // already uses for the same purpose. `paramTypeAt` answers the type
+        // of ONE position, so `f((...x) => {})` against
+        // `(cb: (...args: [number, boolean, string]) => void)` typed `x` as
+        // `number` (position 0's type) instead of `[number, boolean, string]`:
+        // silent wherever the body ignored `x`, and a false TS2488 the moment
+        // it destructured one (`const [a, b] = params` over
+        // `(...params: [number, string] | [number, Error]) => number`, whose
+        // rest is a UNION of tuples and has no positional reading at all).
+        //
+        // A rest parameter is last by construction — the parser rejects
+        // anything after it — so the `lastOrUndefined` half needs no test.
+        if (flags & types.param_flag_rest != 0) {
+            ctx_ty = try c.restTupleAtPosition(ctx_sig, index);
+        } else if (try c.paramTypeAt(ctx_sig, index)) |ct| {
+            ctx_ty = ct;
+        }
     }
     if (type_ann != 0) {
         ty = try c.typeFromTypeNode(type_ann);

@@ -200,6 +200,21 @@ fn measuredAt(bits: u32, i: usize) Measured {
 pub fn measuredVariances(c: *Checker, owner: SymbolId) Error!?u32 {
     if (c.measured_variance.get(owner)) |v| return v;
     if (c.variance_measure_depth >= max_variance_measure_depth) return null;
+    // A measurement is a property of the GENERIC, not of the question that
+    // happened to ask for it, and `measured_variance` caches it per symbol for
+    // the whole run — so it must be taken under ONE relation. tsc's
+    // `getVariances` probes with `isTypeAssignableTo` over its marker types no
+    // matter which relation is being answered; without this pin the first
+    // comparable question to reach a generic (a `<`, a `===`, an `as`) would
+    // publish a measurement taken under the lenient rules and every later
+    // assignability question would read it back.
+    //
+    // The `varianceVerdict` USE of a measurement is deliberately left on the
+    // ambient relation, which is also tsc (`relateVariances` compares the type
+    // arguments with `isRelatedTo`, the current relation's entry point).
+    const saved_kind = c.rel_kind;
+    c.rel_kind = .assignable;
+    defer c.rel_kind = saved_kind;
     const f = c.symFlags(owner);
     if (!f.interface and !f.class and !f.type_alias) return null;
 
