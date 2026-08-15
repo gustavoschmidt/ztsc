@@ -274,10 +274,14 @@ pub const FlowTag = enum(u8) {
     /// switch over a literal-union discriminant never takes it — so the binder
     /// always emits it and the checker decides.
     switch_no_match,
-    /// A call statement whose callee is a dotted name — a candidate
-    /// assertion-function call. a = antecedent, b = the call node. The
-    /// checker resolves the callee lazily; a non-assertion call is a
-    /// pass-through.
+    /// A call whose result the flow graph has to remember: a statement-position
+    /// dotted-name call (a candidate assertion function) or a `super(...)` call
+    /// anywhere. a = antecedent, b = the call node. tsc's `FlowFlags.Call`,
+    /// which serves the same two purposes (`getTypeAtFlowCall` and
+    /// `isPostSuperFlowNode`). The checker resolves an assertion callee lazily
+    /// and a `super` callee resolves to nothing, so for the checker a super
+    /// call is a plain pass-through; the binder's `this`-before-`super` walk is
+    /// the only reader that cares which it is.
     call_stmt,
 };
 

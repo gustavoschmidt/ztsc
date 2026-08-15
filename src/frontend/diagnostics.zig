@@ -255,6 +255,24 @@ pub const Code = enum(u16) {
     namespace_prior_to_merge,
     /// TS2492: redeclaring a catch-clause parameter in the catch block.
     catch_redeclare,
+    /// TS2369: an accessibility/`readonly`/`override` modifier on a parameter
+    /// of anything other than a constructor WITH A BODY — an overload
+    /// signature, an ambient `declare class` constructor, a method, an
+    /// accessor, an arrow, or a bare function type. A parameter property
+    /// declares a class member, so the one position that can honour it is the
+    /// constructor whose body would do the assigning (tsc's `checkParameter`).
+    /// Reported over the parameter's first token, which is the modifier.
+    param_property_outside_ctor_impl,
+    /// TS17009: `this` reached in a derived class's constructor on a path that
+    /// has not run `super(...)` yet — the base constructor is what brings the
+    /// instance into existence. Reported on the `this` keyword. Flow-sensitive
+    /// (tsc's `isPostSuperFlowNode`), so `if (c) { super() } this.x` reports
+    /// even though the `super` call comes first in the text.
+    super_before_this,
+    /// TS17011: the same rule for `super.x` (or `super["x"]`) — a property of
+    /// the base prototype reached before the base constructor has run. tsc's
+    /// `checkSuperExpression`, which exempts the `super` that IS the call.
+    super_before_super_property,
 
     // --- ambient-context and modifier grammar (checked in the parser) ------
     /// TS1036: an executable statement in an ambient context (`declare
@@ -420,6 +438,9 @@ pub const Code = enum(u16) {
             .enum_first_member_needs_initializer,
             .namespace_prior_to_merge,
             .catch_redeclare,
+            .param_property_outside_ctor_impl,
+            .super_before_this,
+            .super_before_super_property,
             .decorator_not_valid_here,
             .label_not_allowed,
             .public_not_on_module_element,
@@ -652,6 +673,9 @@ pub const Code = enum(u16) {
             .enum_first_member_needs_initializer => "In an enum with multiple declarations, only one declaration can omit an initializer for its first enum element.",
             .namespace_prior_to_merge => "A namespace declaration cannot be located prior to a class or function with which it is merged.",
             .catch_redeclare => "cannot redeclare identifier in catch clause",
+            .param_property_outside_ctor_impl => "A parameter property is only allowed in a constructor implementation.",
+            .super_before_this => "'super' must be called before accessing 'this' in the constructor of a derived class.",
+            .super_before_super_property => "'super' must be called before accessing a property of 'super' in the constructor of a derived class.",
             .unsupported_syntax => "syntax not yet supported by ztsc",
             .unsupported_satisfies => "'satisfies' is not yet supported by ztsc",
         };
@@ -769,6 +793,9 @@ pub const Code = enum(u16) {
             .enum_first_member_needs_initializer => 2432,
             .namespace_prior_to_merge => 2434,
             .catch_redeclare => 2492,
+            .param_property_outside_ctor_impl => 2369,
+            .super_before_this => 17009,
+            .super_before_super_property => 17011,
             .decorator_not_valid_here => 1206,
             .label_not_allowed => 1344,
             .public_not_on_module_element,
