@@ -2212,9 +2212,19 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                 // walk; that case falls back to `any` (an under-report:
                 // `{ m() { return this.nope; } }` goes unreported) rather
                 // than to the ambient `this`, which would be wrong.
+                //
+                // The contextual type is taken NON-NULLABLE, which is tsc's
+                // own `getWidenedType(getNonNullableType(contextualType))`. A
+                // nullable annotation is a statement about the VARIABLE, not
+                // about the literal being written into it: every method of
+                // `let p: Point | null = { x: 10, moveBy() { this.x += dx } }`
+                // runs on a real `Point`, and reading `this.x` through the
+                // union reported "possibly null" at every member access
+                // (`thisTypeInObjectLiterals2`, 12 keys across the `| null`,
+                // `| undefined` and `| null | undefined` spellings).
                 const saved_this = c.this_type;
                 defer c.this_type = saved_this;
-                c.this_type = if (rctx != types.no_type) rctx else 0;
+                c.this_type = if (rctx != types.no_type) try c.nonNullable(rctx) else 0;
                 // A SYMBOL-keyed method or accessor shorthand
                 // (`{ [Symbol.toStringTag]() {…} }`,
                 // `{ set [Symbol.toPrimitive](p) {…} }`) declares a real,
