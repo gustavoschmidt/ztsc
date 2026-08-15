@@ -2207,8 +2207,23 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                     // but tsc still checks the expression, which is where a
                     // TS2464 (and any diagnostic the key expression earns in
                     // its own right) comes from.
+                    //
+                    // Checked in the METHOD's scope, because tsc's
+                    // `getControlFlowContainer` stops at any function-like and a
+                    // method is one: the key's identifiers are therefore OUTER
+                    // variables to the definite-assignment rule and assume
+                    // initialization, where a plain property's are not.
+                    // Measured: `var s: string; ({ [s]: 0 })` reports TS2454 and
+                    // `({ [s]() {} })` reports nothing (`symbolProperty1.ts`
+                    // answers only its property key; `computedPropertyNames10`,
+                    // all methods, answers nothing at all).
                     // (wave-8 D: one flagged call into `computed_key.zig`.)
-                    _ = try computed_key.checkComputedName(c, pd.lhs);
+                    {
+                        const saved_scope = c.cur_scope;
+                        defer c.cur_scope = saved_scope;
+                        if (try c.scopeOf(pd.rhs)) |s| c.cur_scope = s;
+                        _ = try computed_key.checkComputedName(c, pd.lhs);
+                    }
                     _ = try c.checkExprCached(pd.rhs, types.no_type);
                     continue;
                 }
