@@ -36,6 +36,7 @@ const FileId = checker_zig.FileId;
 
 const hasTypeMeaning = @import("names.zig").hasTypeMeaning;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
+const static_tp_scope = @import("static_tp_scope.zig");
 const indexOfAtom = @import("generics.zig").indexOfAtom;
 const intrinsicStringMapping = @import("generics.zig").intrinsicStringMapping;
 const stripQuotes = Checker.stripQuotes;
@@ -150,6 +151,15 @@ pub fn typeFromTypeNameEx(c: *Checker, name_node: Node, args: []const TypeId, ou
                     // (value space only) / unresolved: any (documented).
                     .namespace, .default_expr, .ambient_ns, .export_equals_prop, .dual, .any => return types.any_type,
                 }
+            }
+            // TS2302: a class's type parameters do not reach its static
+            // members. Reported here rather than at the declaration because
+            // tsc's is a RESOLUTION failure — the name is answered with
+            // nothing, so the reference is `error` and earns no cascade.
+            // (wave-8 D: one flagged call into `static_tp_scope.zig`.)
+            if (static_tp_scope.refFromStaticMember(c, sym, tok)) {
+                try c.diagFmt(2302, c.tokSpan(tok), "Static members cannot reference class type parameters.", .{});
+                return types.error_type;
             }
             if (out_sym) |o| o.* = sym;
             return c.materializeTypeRef(sym, args, tok, a);
