@@ -3862,16 +3862,8 @@ pub const Checker = struct {
     pub const typeofSwitchIsExhaustive = stmts_zig.typeofSwitchIsExhaustive;
     pub const containsBreak = stmts_zig.containsBreak;
     pub const checkClass = stmts_zig.checkClass;
-    pub const decoCode = stmts_zig.decoCode;
-    pub const decoContextName = stmts_zig.decoContextName;
-    pub const decoContextRef = stmts_zig.decoContextRef;
-    pub const checkDecoratorSig = stmts_zig.checkDecoratorSig;
-    pub const decoSigMatches = stmts_zig.decoSigMatches;
-    pub const decoAcceptsValue = stmts_zig.decoAcceptsValue;
-    pub const decoContextMismatch = stmts_zig.decoContextMismatch;
     pub const globalSymNamed = stmts_zig.globalSymNamed;
     pub const propAssignedInCtor = stmts_zig.propAssignedInCtor;
-    pub const DecoPos = stmts_zig.DecoPos;
 
     const conditions_zig = @import("checker/conditions.zig");
 };
