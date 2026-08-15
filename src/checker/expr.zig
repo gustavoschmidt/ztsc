@@ -25,6 +25,7 @@ const Error = checker_zig.Error;
 
 const accessibility = @import("accessibility.zig");
 const comma = @import("comma.zig");
+const computed_key = @import("computed_key.zig");
 const conditions = @import("conditions.zig");
 const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
@@ -2104,6 +2105,8 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                 if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) {
                     const key_expr = c.tree.nodeData(pd.lhs).lhs;
                     const kt = try c.checkExprCached(key_expr, types.no_type);
+                    // TS2464. (wave-8 D: one flagged call into `computed_key.zig`.)
+                    try computed_key.report(c, pd.lhs, kt);
                     // A `unique symbol` key names a real, nominally-keyed
                     // property (`{ [k]: v }`); any other computed key stays
                     // dynamic (no static member).
@@ -2199,6 +2202,13 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                 defer c.this_type = saved_this;
                 c.this_type = if (rctx != types.no_type) rctx else 0;
                 if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) {
+                    // The key of an object METHOD or accessor contributes no
+                    // static member, so the type walk above never reads it —
+                    // but tsc still checks the expression, which is where a
+                    // TS2464 (and any diagnostic the key expression earns in
+                    // its own right) comes from.
+                    // (wave-8 D: one flagged call into `computed_key.zig`.)
+                    _ = try computed_key.checkComputedName(c, pd.lhs);
                     _ = try c.checkExprCached(pd.rhs, types.no_type);
                     continue;
                 }

@@ -255,6 +255,19 @@ pub const Code = enum(u16) {
     namespace_prior_to_merge,
     /// TS2492: redeclaring a catch-clause parameter in the catch block.
     catch_redeclare,
+    /// TS2389: the declaration immediately after an overload signature HAS a
+    /// body but a different name, so the set never got its implementation and
+    /// the body belongs to something else. tsc's message names the expected
+    /// name; a Diagnostic here is a code plus a span, so the invariant half of
+    /// the sentence is what is reported (the policy TS2300 already follows).
+    /// Blamed on the misnamed implementation, not on the signature.
+    overload_impl_name_mismatch,
+    /// TS2387/TS2388: a mixed static/instance overload set — two same-named
+    /// methods of one class, one `static` and one not, so neither side has an
+    /// implementation. tsc words it as an instruction to the SECOND declaration
+    /// and reports on its name.
+    overload_must_be_static,
+    overload_must_not_be_static,
     /// TS2369: an accessibility/`readonly`/`override` modifier on a parameter
     /// of anything other than a constructor WITH A BODY — an overload
     /// signature, an ambient `declare class` constructor, a method, an
@@ -438,6 +451,9 @@ pub const Code = enum(u16) {
             .enum_first_member_needs_initializer,
             .namespace_prior_to_merge,
             .catch_redeclare,
+            .overload_impl_name_mismatch,
+            .overload_must_be_static,
+            .overload_must_not_be_static,
             .param_property_outside_ctor_impl,
             .super_before_this,
             .super_before_super_property,
@@ -673,6 +689,9 @@ pub const Code = enum(u16) {
             .enum_first_member_needs_initializer => "In an enum with multiple declarations, only one declaration can omit an initializer for its first enum element.",
             .namespace_prior_to_merge => "A namespace declaration cannot be located prior to a class or function with which it is merged.",
             .catch_redeclare => "cannot redeclare identifier in catch clause",
+            .overload_impl_name_mismatch => "function implementation name must match the overload it follows",
+            .overload_must_be_static => "Function overload must be static.",
+            .overload_must_not_be_static => "Function overload must not be static.",
             .param_property_outside_ctor_impl => "A parameter property is only allowed in a constructor implementation.",
             .super_before_this => "'super' must be called before accessing 'this' in the constructor of a derived class.",
             .super_before_super_property => "'super' must be called before accessing a property of 'super' in the constructor of a derived class.",
@@ -793,6 +812,9 @@ pub const Code = enum(u16) {
             .enum_first_member_needs_initializer => 2432,
             .namespace_prior_to_merge => 2434,
             .catch_redeclare => 2492,
+            .overload_impl_name_mismatch => 2389,
+            .overload_must_be_static => 2387,
+            .overload_must_not_be_static => 2388,
             .param_property_outside_ctor_impl => 2369,
             .super_before_this => 17009,
             .super_before_super_property => 17011,
