@@ -36,6 +36,7 @@ const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
 const annTypeMaybeUnique = Checker.annTypeMaybeUnique;
+const computed_key = @import("computed_key.zig");
 const implicit_any = @import("implicit_any.zig");
 const inferVarFromNode = @import("generics.zig").inferVarFromNode;
 const mergeBaseObjectPlain = @import("classes.zig").mergeBaseObjectPlain;
@@ -272,7 +273,16 @@ fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
             }
             return c.ts.makeIntersection(c.scratch(), parts.items);
         },
-        .object_type => return c.objectTypeFromMembers(c.tree.nodeRange(node), 0),
+        .object_type => {
+            // A type literal has no declaration walk of its own, so its
+            // members' computed NAMES are checked here — the one place every
+            // written `{ … }` passes through. `typeFromTypeNode` memoizes by
+            // `(file, node)` and reports against the file the node lives in, so
+            // this is once per literal wherever the materialization starts.
+            // (wave-10 A: one flagged call into `computed_key.zig`.)
+            try computed_key.checkMemberNames(c, c.tree.nodeRange(node), .type_space);
+            return c.objectTypeFromMembers(c.tree.nodeRange(node), 0);
+        },
         .function_type => return c.signatureOfProto(node, d.lhs, false, true),
         .constructor_type => {
             // `new (…) => R` / `abstract new (…) => R`: an object

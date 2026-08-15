@@ -1635,6 +1635,19 @@ pub const Checker = struct {
     /// cycle (`[A.k]` where `A`'s type materialization re-resolves the same
     /// key) degrades to the placeholder instead of recursing unboundedly.
     computed_key_depth: u32 = 0,
+    /// tsc's `markAliasReferenced` gate: would the reference being checked be
+    /// EMITTED? A computed member name in an interface or a type literal would
+    /// not — the name lives in type space — so an `import type` alias used there
+    /// is not a value use and earns no TS1361, while a TYPE used as a value
+    /// still earns its TS2693. A class body's computed name is emitted code and
+    /// keeps both. Measured against tsgo 7.0.2: of `interface I { [KeyAlias]: T
+    /// }`, `type T = { [KeyAlias]: U }`, `class C { [KeyAlias]: T }`,
+    /// `{ [KeyAlias]: 1 }` and `const v = KeyAlias`, only the first two are
+    /// silent, and all five report TS2693 for a plain type name.
+    ///
+    /// Set only around `computed_key.checkMemberNames` for those two homes, and
+    /// restored on the way out. (wave-10 A.)
+    in_type_space_name: bool = false,
     /// `infer V` binder identity: (conditional nodeKey, name atom) -> a
     /// dense id. Keyed by (conditional, name) so the *same* infer name used at
     /// several sites in one conditional's extends clause is one variable

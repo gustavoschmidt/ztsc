@@ -598,7 +598,12 @@ fn checkIdentifier(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         .wrong_space => |sym| {
             const wf = c.symFlags(sym);
             if (wf.import_binding and wf.type_only) {
-                try c.diagFmt(1361, c.tokSpan(tok), "'{s}' cannot be used as a value because it was imported using 'import type'.", .{c.tokenText(tok)});
+                // Not in a position that would be emitted (see
+                // `Checker.in_type_space_name`) — tsc's `markAliasReferenced`
+                // never runs there. (wave-10 A: one flagged guard.)
+                if (!c.in_type_space_name) {
+                    try c.diagFmt(1361, c.tokSpan(tok), "'{s}' cannot be used as a value because it was imported using 'import type'.", .{c.tokenText(tok)});
+                }
                 return types.error_type;
             }
             try c.diagFmt(2693, c.tokSpan(tok), "'{s}' only refers to a type, but is being used as a value here.", .{c.tokenText(tok)});

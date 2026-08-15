@@ -28,6 +28,11 @@ const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
+/// Is a member's computed name emitted code (a class body, an object literal)
+/// or type space only (an interface, a type literal)? The distinction is
+/// `Checker.in_type_space_name`'s.
+pub const Home = enum { emitted, type_space };
+
 /// Check a `.computed_name` node's key expression, reporting TS2464 when the
 /// type it produces cannot name a property. Returns the key type so a caller
 /// that also needs it (an object literal deciding what member the key
@@ -40,6 +45,37 @@ pub fn checkComputedName(c: *Checker, name_node: Node) Error!TypeId {
     const kt = try c.checkExprCached(c.tree.nodeData(name_node).lhs, types.no_type);
     try report(c, name_node, kt);
     return kt;
+}
+
+/// The computed NAMES of a class body's or an interface's members — tsc's
+/// `checkComputedPropertyName`, reached from the declaration walk so it runs in
+/// the file that owns the declaration and for an unreferenced container too.
+///
+/// The key expression is where a computed member's own diagnostics live: an
+/// unresolved key is TS2304 (`class C { [nosuch]: number }`), and a key whose
+/// type cannot name a property is TS2464. Neither was reachable before the
+/// parser retained the expression — the key was a token, resolved by TEXT, and a
+/// failed resolution fell back to a name placeholder in silence.
+///
+/// tsc guards the whole thing on `getNodeLinks(node.expression).resolvedType`
+/// being unset, i.e. on the expression not having been checked yet; ztsc's
+/// equivalent is the node-type memo, which keeps a second walk over the same
+/// members from doubling the reports.
+///
+/// `home` says whether the member name is EMITTED code — see
+/// `Checker.in_type_space_name` for the one diagnostic that turns on.
+pub fn checkMemberNames(c: *Checker, members: []const Node, home: Home) Error!void {
+    // Almost every file has no computed member name at all.
+    if (c.tree.computed_keys.len == 0) return;
+    const saved = c.in_type_space_name;
+    defer c.in_type_space_name = saved;
+    c.in_type_space_name = home == .type_space;
+    for (members) |m| {
+        if (m == null_node) continue;
+        const key = c.tree.computedKey(m) orelse continue;
+        if (c.node_types.contains(c.nodeKey(c.tree.nodeData(key).lhs))) continue;
+        _ = try checkComputedName(c, key);
+    }
 }
 
 /// TS2464 for a key whose type the caller already has. tsc anchors the report
