@@ -606,8 +606,43 @@ const Parser = struct {
         try p.diags.append(p.gpa, span);
     }
 
+    /// The three messages tsc gives a MISSING NAME NODE — `createIdentifier`'s
+    /// own "Identifier expected", and the two its callers pass in,
+    /// `parsePrimaryExpression`'s "Expression expected" and
+    /// `parseEntityNameOfTypeReference`'s "Type expected". They are the only
+    /// diagnostics that move at end of file (see `errAtCur`).
+    fn missingNameNode(code: Code) bool {
+        return switch (code) {
+            .expected_expression, .expected_identifier, .expected_type => true,
+            else => false,
+        };
+    }
+
+    /// Where the eof token's leading trivia BEGAN — just past the last real
+    /// token, or the start of the file when there is none. tsc's
+    /// `scanner.getTokenFullStart()`, which is `fullStartPos`, set at the top of
+    /// `scan()` before the trivia loop runs.
+    fn eofFullStart(p: *Parser) u32 {
+        if (p.tok_tags.items.len == 0) return 0;
+        return p.lastTokEnd();
+    }
+
     fn errAtCur(p: *Parser, code: Code) Error!void {
         const t = p.cur();
+        // tsc's `createMissingNode(reportAtCurrentPosition: token() ===
+        // EndOfFileToken)`: when the parse ran out of FILE, a missing name node
+        // is blamed on the position where the eof token's trivia began — just
+        // past the last real token — and not on the eof token itself. tsc's own
+        // comment is "Only for end of file because the error gets reported
+        // incorrectly on embedded script tags". Measured against tsgo: `const y
+        // =` followed by a comment line answers TS1109 at the end of the FIRST
+        // line, and `const c = foo.` answers TS1003 there, while `const a = {`
+        // and `class D { m(` keep their TS1005 on the eof token — `parseExpected`
+        // has no such rule.
+        if (t.tag == .eof and missingNameNode(code)) {
+            const at = p.eofFullStart();
+            return p.addDiag(code, .{ .code = code, .span = .{ .start = at, .end = at } });
+        }
         const end = if (t.end > t.start) t.end else t.start + 1;
         try p.addDiag(code, .{
             .code = code,
