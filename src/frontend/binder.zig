@@ -72,6 +72,8 @@ const intern = @import("../intern.zig");
 const numeric_lit = @import("../numeric_lit.zig");
 const diagnostics = @import("diagnostics.zig");
 const literals = @import("literals.zig");
+const decl_spaces = @import("decl_spaces.zig");
+const impl_expected = @import("impl_expected.zig");
 const source = @import("source.zig");
 
 const Ast = ast.Ast;
@@ -255,8 +257,10 @@ pub fn bind(
     try b.sym_decl_count.append(b.scratch, 0);
     try b.sym_reported.append(b.scratch, 0);
     try b.sym_block.append(b.scratch, 0);
+    try b.sym_local_bits.append(b.scratch, 0);
     try b.decl_links.append(b.scratch, .{ .value = 0, .next = 0 });
     try b.decl_name_toks.append(b.scratch, 0);
+    try b.decl_origins.append(b.scratch, .{ .block = 0, .exported = false, .ambient = false });
     try b.ante_links.append(b.scratch, .{ .value = 0, .next = 0 });
 
     try b.scope_parents.append(b.scratch, 0);
@@ -272,10 +276,29 @@ pub fn bind(
         if (stmt != null_node) try b.bindStatement(stmt);
     }
 
+    // Post-bind checks over a name's whole declaration SET: each one is a
+    // property of the set rather than of any single declaration, so each runs
+    // once the last declaration is in.
+    try b.checkMergedExports();
+    try b.checkMissingImplementations();
+    try b.checkEnumFirstMembers();
+    try b.checkNamespacePriorToMerge();
     return b.seal();
 }
 
 const Link = struct { value: u32, next: u32 };
+
+/// Where one declaration of a symbol was bound: which `cur_block` it sat in,
+/// whether it carried an `export` modifier, and whether it was in an AMBIENT
+/// context. Packed into one word because there is one per declaration of every
+/// symbol in the file — see `decl_origins`. (A block is an AST node index;
+/// `u30` bounds it at 2^30 nodes, three orders of magnitude past the largest
+/// file either compiler will parse.)
+const DeclOrigin = packed struct(u32) {
+    exported: bool,
+    ambient: bool,
+    block: u30,
+};
 const Pending = struct { head: u32 = 0, tail: u32 = 0, count: u32 = 0 };
 const PendingId = u32;
 
@@ -332,6 +355,21 @@ const Binder = struct {
     /// recovering a name token from a node would mean a switch over every
     /// declaration shape.
     decl_name_toks: std.ArrayList(TokenIndex) = .empty,
+    /// Where each `decl_links` entry came from: the declaration BLOCK it was
+    /// bound in, whether it carried an `export` modifier, and whether it was in
+    /// an AMBIENT context. tsc records the first two by splitting a container's
+    /// members over an `exports` and a `locals` table; ztsc has one member table
+    /// per scope, so the facts have to be carried per declaration for
+    /// `checkMergedExports` (TS2395) to reconstruct the split, and the ambient
+    /// bit for `checkMissingImplementations` (TS2391) to skip a `.d.ts`. Parallel
+    /// to `decl_links` and, like it, scratch-only.
+    decl_origins: std.ArrayList(DeclOrigin) = .empty,
+    /// Flag bits contributed by the declarations of a symbol that did NOT carry
+    /// an `export` modifier, within the block those declarations are in
+    /// (`sym_block`; reset when the block changes). tsc's `locals` table entry
+    /// for a container member, which an EXPORTED declaration fills with a
+    /// placeholder of no meaning — see `priorFlags`. Scratch-only.
+    sym_local_bits: std.ArrayList(u32) = .empty,
 
     // scopes under construction
     scope_parents: std.ArrayList(ScopeId) = .empty,
@@ -639,6 +677,11 @@ const Binder = struct {
         const link: u32 = @intCast(b.decl_links.items.len);
         try b.decl_links.append(b.scratch, .{ .value = node, .next = 0 });
         try b.decl_name_toks.append(b.scratch, name_tok);
+        try b.decl_origins.append(b.scratch, .{
+            .block = @intCast(b.cur_block),
+            .exported = b.exporting_node != 0,
+            .ambient = b.ambient,
+        });
         if (b.sym_decl_head.items[sym] == 0) {
             b.sym_decl_head.items[sym] = link;
         } else {
@@ -731,14 +774,54 @@ const Binder = struct {
     /// diagnostic collection deduplicate; carrying the count instead keeps
     /// the walk O(new declarations) and needs no dedup pass. The newcomer is
     /// appended by the caller straight after, hence the `+ 1`.
-    /// Report `code` at the symbol's FIRST declaration. TS2440 needs it: the
+    /// Report `code` at the symbol's IMPORT declaration. TS2440 needs it: the
     /// message names the import declaration, which may be the one already in
     /// the table (`let b = 1; import { b } from "./m";` points at line 2's
-    /// import, not at the `let`).
-    fn diagAtFirstDecl(b: *Binder, sym: SymbolId, code: Code) Error!void {
-        const link = b.sym_decl_head.items[sym];
+    /// import, not at the `let`). Falls back to the first declaration when no
+    /// declaration is an import, which the caller's clash rules make
+    /// unreachable — it takes an import on one side to pick this code at all.
+    fn diagAtImportDecl(b: *Binder, sym: SymbolId, code: Code) Error!void {
+        var link = b.sym_decl_head.items[sym];
         if (link == 0) return;
-        try b.diag(code, b.dupDiagTok(b.decl_links.items[link].value, b.decl_name_toks.items[link]));
+        const first = link;
+        while (link != 0) : (link = b.decl_links.items[link].next) {
+            const l = b.decl_links.items[link];
+            if (importDeclStart(b, l.value) == null) continue;
+            return b.diag(code, b.importConflictTok(l.value, b.decl_name_toks.items[link]));
+        }
+        const l = b.decl_links.items[first];
+        try b.diag(code, b.dupDiagTok(l.value, b.decl_name_toks.items[first]));
+    }
+
+    /// The token TS2440 lands on for the alias declaration `decl`.
+    ///
+    /// tsc reports it from `checkAliasSymbol` as `error(node, …)` — at the whole
+    /// ALIAS DECLARATION, not at the local name it binds. For `import x = m.m`
+    /// that is the `import` keyword (or the `export` in front of `export import
+    /// q = M1.s`), and for a named import specifier it is the IMPORTED name,
+    /// where `x as x44` starts. Every other alias shape — a default or namespace
+    /// import — is spelled with the local name first, so the name token already
+    /// is the declaration's first token.
+    fn importConflictTok(b: *Binder, decl: Node, name_tok: TokenIndex) TokenIndex {
+        return importDeclStart(b, decl) orelse name_tok;
+    }
+
+    /// The first token of an alias declaration whose start differs from its
+    /// local name, or null for every other shape. Split out so
+    /// `diagAtImportDecl` can use it as the "is this declaration the import?"
+    /// test it already needs the answer for.
+    fn importDeclStart(b: *Binder, decl: Node) ?TokenIndex {
+        if (decl == null_node) return null;
+        switch (b.nodeTag(decl)) {
+            .import_equals => {
+                const main = b.tree.nodeMainToken(decl);
+                // `export import q = …`: tsc's node span starts at the modifier.
+                if (main > 0 and b.tree.tokens.tag(main - 1) == .keyword_export) return main - 1;
+                return main;
+            },
+            .import_specifier => return b.tree.nodeMainToken(decl),
+            else => return null,
+        }
     }
 
     /// Do the declarations already in the table and the one now being bound
@@ -836,10 +919,14 @@ const Binder = struct {
         if (gop.found_existing) {
             const sym = gop.value_ptr.*;
             const existing = b.sym_flags.items[sym];
-            if (effectiveBits(existing) & kind.excludes() != 0 and
+            // A container's `locals` table is per BLOCK: reopening a namespace
+            // starts a fresh one.
+            if (b.sym_block.items[sym] != b.cur_block) b.sym_local_bits.items[sym] = 0;
+            const prior = b.priorFlags(scope, sym, existing);
+            if (effectiveBits(prior) & kind.excludes() != 0 and
                 !b.mergesAcrossBlocks(scope, sym))
             {
-                const code = dupCode(existing, kind);
+                const code = dupCode(prior, kind);
                 switch (code) {
                     // TS2492 names the REDECLARATION alone and leaves the
                     // `catch (e)` binding unmarked; a duplicate TYPE
@@ -851,9 +938,9 @@ const Binder = struct {
                     // side of the clash it is: `import {a} …; let a = 1;` and
                     // `let b = 1; import {b} …` both point at the import.
                     .import_conflict => if (n_import)
-                        try b.diag(code, name_tok)
+                        try b.diag(code, b.importConflictTok(decl_node, name_tok))
                     else
-                        try b.diagAtFirstDecl(sym, code),
+                        try b.diagAtImportDecl(sym, code),
                     else => if (kind == .type_param or existing.type_param)
                         try b.diag(code, name_tok)
                     else
@@ -882,6 +969,7 @@ const Binder = struct {
             }
             b.sym_flags.items[sym] = existing.merge(flags);
             b.sym_block.items[sym] = b.cur_block;
+            if (b.exporting_node == 0) b.sym_local_bits.items[sym] |= flags.bits();
             try b.appendDecl(sym, decl_node, name_tok);
             try b.noteExport(sym, atom, scope);
             return sym;
@@ -896,10 +984,44 @@ const Binder = struct {
         try b.sym_decl_count.append(b.scratch, 0);
         try b.sym_reported.append(b.scratch, 0);
         try b.sym_block.append(b.scratch, b.cur_block);
+        try b.sym_local_bits.append(b.scratch, if (b.exporting_node == 0) flags.bits() else 0);
         gop.value_ptr.* = sym;
         try b.appendDecl(sym, decl_node, name_tok);
         try b.noteExport(sym, atom, scope);
         return sym;
+    }
+
+    /// The flags a new declaration's `excludes` mask is tested against: which
+    /// of the name's EARLIER declarations can displace it.
+    ///
+    /// Everywhere but a module/namespace container that is simply the symbol's
+    /// accumulated flags. A container, though, has TWO symbol tables in tsc —
+    /// `exports` and `locals` — and an `export`ed member is declared in
+    /// `exports` with its full meaning while `locals` gets a placeholder of no
+    /// meaning at all (`ExportValue` for a value, nothing for a type; neither
+    /// appears in any `excludes` mask). So:
+    ///
+    ///   * an `export`ed newcomer is checked against `exports` (the earlier
+    ///     exported declarations) AND the current block's `locals` — i.e.
+    ///     against everything, which is the accumulated flags;
+    ///   * a LOCAL newcomer is checked against `locals` alone, where the
+    ///     earlier exported declarations left nothing to collide with.
+    ///
+    /// Hence `export type A = {}; type A = {}` is not a duplicate identifier at
+    /// all (verified against tsgo 7.0.2, in both orders — reversed, the local
+    /// declaration is in `locals` first and the exported one's placeholder does
+    /// collide, so TS2300 stands). What such a pair earns instead is TS2395,
+    /// which `checkMergedExports` reports.
+    ///
+    /// `ns_uninstantiated` is folded in from the live flags because it is set
+    /// *after* `declare` returns (`bindNamespace` needs the symbol id first),
+    /// so the accumulated local bits never carry it.
+    fn priorFlags(b: *Binder, scope: ScopeId, sym: SymbolId, existing: SymbolFlags) SymbolFlags {
+        if (b.exporting_node != 0) return existing;
+        if (scope != file_scope and b.scope_kinds.items[scope] != .namespace) return existing;
+        var f: SymbolFlags = @bitCast(b.sym_local_bits.items[sym]);
+        f.ns_uninstantiated = existing.ns_uninstantiated;
+        return f;
     }
 
     /// The function/class merge check, tsc's `checkFunctionOrConstructorSymbol`
@@ -937,6 +1059,269 @@ const Binder = struct {
         // includes `Class` — so the single non-ambient one is the target.)
         if (!existing.function)
             try b.diagMergedDecls(sym, .class_decl, .class_cannot_implement_overloads);
+    }
+
+    /// tsc's `checkExportsOnMergedDeclarations` (TS2395): every declaration of a
+    /// name that MERGED must agree on visibility — all `export`ed or all local —
+    /// in each declaration space they claim in common. See `decl_spaces.zig`.
+    ///
+    /// Runs once over the file's symbols after everything is bound, rather than
+    /// per declaration as tsc does, because the rule is about the whole set: tsc
+    /// runs the check on the first declaration of each KIND and lets its
+    /// diagnostic collection dedupe the repeats, which one pass over the set
+    /// produces directly.
+    ///
+    /// Only a module/namespace CONTAINER has the exports/locals split the rule
+    /// exists to police; a script's top level, a function body, a class or an
+    /// interface has one table and no `export` modifiers to disagree about.
+    fn checkMergedExports(b: *Binder) Error!void {
+        for (1..b.sym_names.items.len) |i| {
+            const sym: SymbolId = @intCast(i);
+            if (b.sym_decl_count.items[sym] < 2) continue;
+            // A failed merge was already reported. tsc answers one with a FRESH
+            // symbol, so the declarations it split apart are not a merged
+            // declaration and never reach this check.
+            if (b.sym_reported.items[sym] != 0) continue;
+            // `export default class C {}` carries BOTH modifiers, which tsc
+            // weighs against the non-default declarations separately (TS2652).
+            // ztsc does not report that one, and reporting TS2395 in its place
+            // would be the wrong error, so the symbol is left alone.
+            if (b.sym_flags.items[sym].export_default) continue;
+            const scope = b.sym_scopes.items[sym];
+            if (scope == file_scope) {
+                if (!b.saw_module_syntax) continue;
+            } else if (b.scope_kinds.items[scope] != .namespace) continue;
+            try b.checkMergedExportsOf(sym);
+        }
+    }
+
+    /// The per-symbol half. Declarations are grouped by the BLOCK they were
+    /// bound in: each `namespace N { … }` block has its own `locals` table, so a
+    /// local declaration in one block and an `export`ed one in another never
+    /// share a table and are not an error (`duplicateSymbolsExportMatching`'s
+    /// first three `namespace M` blocks are all legal for exactly that reason).
+    fn checkMergedExportsOf(b: *Binder, sym: SymbolId) Error!void {
+        const head = b.sym_decl_head.items[sym];
+        var group = head;
+        while (group != 0) : (group = b.decl_links.items[group].next) {
+            const block = b.decl_origins.items[group].block;
+            if (b.blockSeenBefore(head, group, block)) continue;
+
+            var exported: decl_spaces.Spaces = .{};
+            var local: decl_spaces.Spaces = .{};
+            var link = group;
+            while (link != 0) : (link = b.decl_links.items[link].next) {
+                const o = b.decl_origins.items[link];
+                if (o.block != block) continue;
+                // An unmodelled declaration kind (an alias, whose spaces are
+                // its target's) switches the whole symbol off rather than
+                // inviting a guess.
+                const sp = b.declSpaces(b.decl_links.items[link].value) orelse return;
+                if (o.exported) exported = exported.merge(sp) else local = local.merge(sp);
+            }
+            const common = decl_spaces.conflict(exported, local);
+            if (!common.any()) continue;
+
+            link = group;
+            while (link != 0) : (link = b.decl_links.items[link].next) {
+                const o = b.decl_origins.items[link];
+                if (o.block != block) continue;
+                const node = b.decl_links.items[link].value;
+                const sp = b.declSpaces(node) orelse continue;
+                // Only the declarations that contributed to the shared space.
+                if (!sp.intersect(common).any()) continue;
+                try b.diag(
+                    .merged_decl_export_mismatch,
+                    b.dupDiagTok(node, b.decl_name_toks.items[link]),
+                );
+            }
+        }
+    }
+
+    /// Is the declaration behind `link` in an AMBIENT context — tsc's
+    /// `NodeFlags.Ambient`?
+    ///
+    /// `decl_origins` carries the INHERITED half (a `.d.ts`, a `declare
+    /// namespace` body, a `declare class` body), which is all `b.ambient` knows
+    /// when the name is bound: a declaration's OWN `declare` modifier is not in
+    /// it, because `bindNamespace`/`bindClass` declare the name before entering
+    /// the body it makes ambient. So the modifier is read back off the node here.
+    /// Without it `declare namespace foo { … } class foo {}` — legal, and the
+    /// point of `partiallyAmbientClodule` — looked like a namespace written
+    /// before a live class.
+    fn declIsAmbient(b: *Binder, link: u32) bool {
+        if (b.decl_origins.items[link].ambient) return true;
+        const node = b.decl_links.items[link].value;
+        if (node == null_node) return false;
+        const d = b.tree.nodeData(node);
+        const flags: u32 = switch (b.nodeTag(node)) {
+            .function_decl, .class_method => b.tree.extraData(ast.FnProto, d.lhs).flags,
+            .class_decl => b.tree.extraData(ast.ClassData, d.lhs).flags,
+            .namespace_decl => b.tree.extraData(ast.NamespaceData, d.lhs).flags,
+            .enum_decl => b.tree.extraData(ast.EnumData, d.lhs).flags,
+            else => return false,
+        };
+        return flags & ast.Flags.declare != 0;
+    }
+
+    /// Was `block` already the block of a declaration earlier in `sym`'s list
+    /// than `stop`? Keeps `checkMergedExportsOf` to one report per group without
+    /// a set: a name has a handful of declarations at most.
+    fn blockSeenBefore(b: *Binder, head: u32, stop: u32, block: u31) bool {
+        var link = head;
+        while (link != stop) : (link = b.decl_links.items[link].next) {
+            if (b.decl_origins.items[link].block == block) return true;
+        }
+        return false;
+    }
+
+    /// tsc's `checkFunctionOrConstructorSymbol` arm for a missing implementation
+    /// (TS2391, TS2390 for a constructor): a name declared with overload
+    /// signatures needs one declaration with a BODY, and the diagnostic lands on
+    /// the LAST non-ambient function-like declaration of the name. The
+    /// per-declaration rule — and every exclusion — is `impl_expected.zig`.
+    ///
+    /// One pass over the file's symbols after everything is bound, for the same
+    /// reason `checkMergedExports` is: the verdict is a property of the whole
+    /// declaration set, and "the last one" is only known once there are no more.
+    fn checkMissingImplementations(b: *Binder) Error!void {
+        for (1..b.sym_names.items.len) |i| {
+            const sym: SymbolId = @intCast(i);
+            const f = b.sym_flags.items[sym];
+            if (!f.function and !f.method) continue;
+
+            // tsc's `lastSeenNonAmbientDeclaration`.
+            var last: u32 = 0;
+            var link = b.sym_decl_head.items[sym];
+            while (link != 0) : (link = b.decl_links.items[link].next) {
+                if (b.decl_origins.items[link].ambient) continue;
+                switch (b.nodeTag(b.decl_links.items[link].value)) {
+                    .function_decl, .class_method => last = link,
+                    else => {},
+                }
+            }
+            if (last == 0) continue;
+
+            const node = b.decl_links.items[last].value;
+            const name_tok = b.decl_name_toks.items[last];
+            // tsc's `nodeIsMissing(node.name)` bail: a recovered declaration
+            // with no name to report at.
+            if (name_tok == 0) continue;
+            const d = b.tree.nodeData(node);
+            const proto = b.tree.extraData(ast.FnProto, d.lhs);
+            const scope = b.scope_kinds.items[b.sym_scopes.items[sym]];
+            const is_ctor = scope == .class_members and
+                b.tree.tokens.tag(name_tok) == .keyword_constructor;
+            switch (impl_expected.expected(scope, b.nodeTag(node), proto.flags, is_ctor, d.rhs != 0)) {
+                .none => {},
+                // A computed method name (`[Symbol.iterator](x: string): string;`)
+                // is reported at the `[`, as every duplicate-name diagnostic is.
+                .function => try b.diag(
+                    .missing_function_implementation,
+                    b.dupDiagTok(node, name_tok),
+                ),
+                .constructor => try b.diag(.missing_constructor_implementation, name_tok),
+            }
+        }
+    }
+
+    /// tsc's `checkEnumDeclaration` arm for TS2432: the blocks of a merged
+    /// `enum` share one member table, so only ONE of them may start with a
+    /// member that omits its initializer — a second such block would give its
+    /// first member the value 0 all over again.
+    ///
+    ///     enum E { A }
+    ///     enum E { B }   // TS2432 on `B`
+    ///
+    /// Reported on the offending block's first member, and only from the second
+    /// such block on: `enum E { A } enum E { B = 1 } enum E { C }` names `C`
+    /// alone.
+    fn checkEnumFirstMembers(b: *Binder) Error!void {
+        for (1..b.sym_names.items.len) |i| {
+            const sym: SymbolId = @intCast(i);
+            if (!b.sym_flags.items[sym].enum_decl) continue;
+            if (b.sym_decl_count.items[sym] < 2) continue;
+            var seen_missing = false;
+            var link = b.sym_decl_head.items[sym];
+            while (link != 0) : (link = b.decl_links.items[link].next) {
+                const node = b.decl_links.items[link].value;
+                // A merged `enum`/`namespace` pair puts both kinds here.
+                if (b.nodeTag(node) != .enum_decl) continue;
+                const data = b.tree.extraData(ast.EnumData, b.tree.nodeData(node).lhs);
+                const members = b.tree.extraRange(data.members_start, data.members_end);
+                if (members.len == 0 or members[0] == null_node) continue;
+                const first = members[0];
+                // `enum_member`: lhs = the initializer expression (0 = none).
+                if (b.tree.nodeData(first).lhs != 0) continue;
+                if (seen_missing) {
+                    try b.diag(.enum_first_member_needs_initializer, b.tree.nodeMainToken(first));
+                } else {
+                    seen_missing = true;
+                }
+            }
+        }
+    }
+
+    /// tsc's `checkModuleDeclaration` arm for TS2434: a namespace that merges
+    /// with a class or a function must not be written BEFORE it. The merged
+    /// value is the class/function object with the namespace's exports added, so
+    /// the namespace block has to run second:
+    ///
+    ///     namespace m { var y = 2; }
+    ///     class m { }                 // TS2434 on the namespace's name
+    ///
+    /// Only an INSTANTIATED, non-ambient namespace block is judged (a type-only
+    /// one emits nothing, so nothing has to run at all — `namespace m {} class m
+    /// {}` is legal), and only against a non-ambient class or an IMPLEMENTED
+    /// function (an overload signature has no body to be shadowed).
+    fn checkNamespacePriorToMerge(b: *Binder) Error!void {
+        for (1..b.sym_names.items.len) |i| {
+            const sym: SymbolId = @intCast(i);
+            const f = b.sym_flags.items[sym];
+            if (!f.namespace_decl or f.ns_uninstantiated) continue;
+            if (!f.class and !f.function) continue;
+            if (b.sym_decl_count.items[sym] < 2) continue;
+
+            // tsc's `getFirstNonAmbientClassOrFunctionDeclaration`.
+            var merge_tok: TokenIndex = 0;
+            var link = b.sym_decl_head.items[sym];
+            while (link != 0) : (link = b.decl_links.items[link].next) {
+                if (b.declIsAmbient(link)) continue;
+                const node = b.decl_links.items[link].value;
+                switch (b.nodeTag(node)) {
+                    .class_decl => {},
+                    // A function needs a BODY to be the merge's runtime half.
+                    .function_decl => if (b.tree.nodeData(node).rhs == 0) continue,
+                    else => continue,
+                }
+                merge_tok = b.decl_name_toks.items[link];
+                break;
+            }
+            if (merge_tok == 0) continue;
+
+            link = b.sym_decl_head.items[sym];
+            while (link != 0) : (link = b.decl_links.items[link].next) {
+                if (b.declIsAmbient(link)) continue;
+                const node = b.decl_links.items[link].value;
+                if (b.nodeTag(node) != .namespace_decl) continue;
+                if (!b.instantiated(node)) continue;
+                const name_tok = b.decl_name_toks.items[link];
+                // Token indices run in source order, so this is tsc's
+                // `node.pos < firstNonAmbientClassOrFunc.pos`.
+                if (name_tok < merge_tok) try b.diag(.namespace_prior_to_merge, name_tok);
+            }
+        }
+    }
+
+    /// The declaration spaces of one declaration NODE — `decl_spaces.ofTag` plus
+    /// the one fact that is not a property of the kind: a `namespace` block
+    /// claims the VALUE space only when it is instantiated.
+    fn declSpaces(b: *Binder, node: Node) ?decl_spaces.Spaces {
+        if (node == null_node) return null;
+        const tag = b.nodeTag(node);
+        var sp = decl_spaces.ofTag(tag) orelse return null;
+        if (tag == .namespace_decl and b.instantiated(node)) sp.value = true;
+        return sp;
     }
 
     /// Report `code` at the name of every declaration of `sym` whose node tag
@@ -1798,6 +2183,13 @@ const Binder = struct {
         const clear_export = b.exporting_node;
         b.exporting_node = 0;
         defer b.exporting_node = clear_export;
+        // A `declare class`'s members are ambient, so a bodyless method there is
+        // a declaration and not a missing implementation
+        // (`checkMissingImplementations`). Inherited, like a `declare namespace`
+        // body's: `declare namespace N { class C { m(): void; } }`.
+        const was_ambient = b.ambient;
+        b.ambient = was_ambient or (data.flags & ast.Flags.declare) != 0;
+        defer b.ambient = was_ambient;
 
         const cs = try b.pushScope(.class, node);
         // A class EXPRESSION's name is not declared in the enclosing scope,
@@ -4081,10 +4473,80 @@ test "dup: an enum on either side of a failed merge is TS2567" {
     try expectBindCodes("enum E { A } var E;", &.{ .enum_merge_conflict, .enum_merge_conflict });
     try expectBindCodes("var E; enum E { A }", &.{ .enum_merge_conflict, .enum_merge_conflict });
     try expectBindCodes("enum E { A } class E {}", &.{ .enum_merge_conflict, .enum_merge_conflict });
-    // Enum+enum and enum+namespace still merge.
-    try expectBindCodes("enum E { A } enum E { B }", &.{});
+    // Enum+enum and enum+namespace still merge. Two blocks whose first member
+    // omits its initializer are TS2432 (`checkEnumFirstMembers`) and not a
+    // failed merge; giving the second block's first member a value keeps the
+    // pair silent.
+    try expectBindCodes("enum E { A } enum E { B }", &.{.enum_first_member_needs_initializer});
+    try expectBindCodes("enum E { A } enum E { B = 1 }", &.{});
     try expectBindCodes("enum E { A } namespace E { export const v = 1; }", &.{});
     try testing.expectEqual(@as(u16, 2567), Code.enum_merge_conflict.tsCode());
+}
+
+test "merged declarations must agree on visibility (TS2395)" {
+    const both: []const Code = &.{ .merged_decl_export_mismatch, .merged_decl_export_mismatch };
+    // One space claimed twice with disagreeing visibility, in a namespace body
+    // and at the top level of a module.
+    try expectBindCodes("namespace N { interface I {} export interface I {} }", both);
+    try expectBindCodes("namespace N { export interface I {} interface I {} }", both);
+    try expectBindCodes("interface c {} export interface c {}", both);
+    try expectBindCodes("interface d {} export class d {}", both);
+    try expectBindCodes("namespace M {} export namespace M {}", both);
+    try expectBindCodes("namespace M { var v: string; export var v: string; }", both);
+    // An `export`ed declaration leaves nothing in `locals` for a later local one
+    // to collide with, so this pair is TS2395 and NOT a duplicate identifier —
+    // while the reverse order stays a duplicate and earns no TS2395.
+    try expectBindCodes("export type A = {}; type A = {}", both);
+    try expectBindCodes("type A = {}; export type A = {}", &.{ .duplicate_identifier, .duplicate_identifier });
+    // No space in common: a type, a namespace and a value can share a name.
+    try expectBindCodes("type t = 0; namespace t { interface I {} } export const t = 0;", &.{});
+    try expectBindCodes("interface b {} export const b = 1;", &.{});
+    // Each block of a reopened namespace has its own `locals`, so a local in one
+    // block beside an `export`ed one in another is legal.
+    try expectBindCodes(
+        "namespace M { export interface E {} interface I {} } namespace M { interface E {} export interface I {} }",
+        &.{},
+    );
+    // A script's top level has no export table to disagree with.
+    try expectBindCodes("interface c {} interface c {}", &.{});
+    try testing.expectEqual(@as(u16, 2395), Code.merged_decl_export_mismatch.tsCode());
+}
+
+test "an overload set needs an implementation (TS2391, TS2390)" {
+    try expectBindCodes("function f();", &.{.missing_function_implementation});
+    try expectBindCodes("function f(): void; function f() {}", &.{});
+    // The LAST non-ambient declaration is the one named, whether or not an
+    // earlier one had a body.
+    try expectBindCodes(
+        "class C { m(n: number): string; m(x: any) { return \"\"; } m(s: string): string; }",
+        &.{.missing_function_implementation},
+    );
+    try expectBindCodes("class C { static s(): void; }", &.{.missing_function_implementation});
+    try expectBindCodes("class C { constructor(); }", &.{.missing_constructor_implementation});
+    try expectBindCodes("namespace N { function f(): void; }", &.{.missing_function_implementation});
+    // Ambient, `abstract`, optional, accessor, and interface/type-literal
+    // members are all legally bodyless.
+    try expectBindCodes("declare function f(): void;", &.{});
+    try expectBindCodes("declare class C { m(): void; }", &.{});
+    try expectBindCodes("declare namespace N { function f(): void; }", &.{});
+    try expectBindCodes("abstract class C { abstract m(): void; }", &.{});
+    try expectBindCodes("class C { m?(): void; }", &.{});
+    try expectBindCodes("interface I { m(): void; }", &.{});
+    try expectBindCodes("type T = { m(): void };", &.{});
+    try testing.expectEqual(@as(u16, 2391), Code.missing_function_implementation.tsCode());
+    try testing.expectEqual(@as(u16, 2390), Code.missing_constructor_implementation.tsCode());
+}
+
+test "a namespace may not precede the class or function it merges with (TS2434)" {
+    try expectBindCodes("namespace m { var y = 2; } function m() {}", &.{.namespace_prior_to_merge});
+    try expectBindCodes("namespace m { export var y = 2; } class m {}", &.{.namespace_prior_to_merge});
+    // Legal: the namespace comes second, is type-only, or the merge partner is
+    // ambient / an overload signature with no body.
+    try expectBindCodes("function m() {} namespace m { export var y = 2; }", &.{});
+    try expectBindCodes("namespace m {} function m() {}", &.{});
+    try expectBindCodes("namespace m { export var y = 2; } declare function m(): void;", &.{});
+    try expectBindCodes("namespace m { export interface I { a: number } } function m() {}", &.{});
+    try testing.expectEqual(@as(u16, 2434), Code.namespace_prior_to_merge.tsCode());
 }
 
 test "dup: a type-only namespace merges with a variable, an instantiated one does not" {

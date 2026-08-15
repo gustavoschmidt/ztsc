@@ -19,6 +19,8 @@ pub const literals = @import("frontend/literals.zig");
 pub const ast = @import("frontend/ast.zig");
 pub const parser = @import("frontend/parser.zig");
 pub const binder = @import("frontend/binder.zig");
+pub const decl_spaces = @import("frontend/decl_spaces.zig");
+pub const impl_expected = @import("frontend/impl_expected.zig");
 pub const types = @import("types.zig");
 pub const numeric_lit = @import("numeric_lit.zig");
 pub const libs = @import("libs.zig");
@@ -49,6 +51,8 @@ test {
     _ = ast;
     _ = parser;
     _ = binder;
+    _ = decl_spaces;
+    _ = impl_expected;
     _ = types;
     _ = libs;
     _ = paths;
