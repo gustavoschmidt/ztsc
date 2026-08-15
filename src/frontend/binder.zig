@@ -355,11 +355,13 @@ const Binder = struct {
     /// declaration shape.
     decl_name_toks: std.ArrayList(TokenIndex) = .empty,
     /// Where each `decl_links` entry came from: the declaration BLOCK it was
-    /// bound in and whether it carried an `export` modifier. tsc records both
-    /// by splitting a container's members over an `exports` and a `locals`
-    /// table; ztsc has one member table per scope, so the two facts have to be
-    /// carried per declaration for `checkMergedExports` (TS2395) to reconstruct
-    /// the split. Parallel to `decl_links` and, like it, scratch-only.
+    /// bound in, whether it carried an `export` modifier, and whether it was in
+    /// an AMBIENT context. tsc records the first two by splitting a container's
+    /// members over an `exports` and a `locals` table; ztsc has one member table
+    /// per scope, so the facts have to be carried per declaration for
+    /// `checkMergedExports` (TS2395) to reconstruct the split, and the ambient
+    /// bit for `checkMissingImplementations` (TS2391) to skip a `.d.ts`. Parallel
+    /// to `decl_links` and, like it, scratch-only.
     decl_origins: std.ArrayList(DeclOrigin) = .empty,
     /// Flag bits contributed by the declarations of a symbol that did NOT carry
     /// an `export` modifier, within the block those declarations are in
