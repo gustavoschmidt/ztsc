@@ -233,6 +233,26 @@ pub const Code = enum(u16) {
     function_merge_needs_ambient_class,
     /// TS2440: import binding clashes with a local declaration.
     import_conflict,
+    /// TS2395: two declarations of one name that DO merge, one `export`ed and
+    /// one not, claiming a declaration space in common — tsc's
+    /// `checkExportsOnMergedDeclarations`. Reported at the name of every
+    /// declaration that contributed to the shared space. See `decl_spaces.zig`
+    /// for the rule and for why the duplicate-identifier diagnostic that would
+    /// otherwise cover the pair is deliberately absent.
+    merged_decl_export_mismatch,
+    /// TS2391: a function/method whose LAST non-ambient declaration has no
+    /// body, so the overload set has no implementation. See
+    /// `impl_expected.zig`.
+    missing_function_implementation,
+    /// TS2390: the same for a class CONSTRUCTOR, which tsc gives its own
+    /// message.
+    missing_constructor_implementation,
+    /// TS2432: a second block of a merged `enum` whose first member omits its
+    /// initializer. Reported on that member.
+    enum_first_member_needs_initializer,
+    /// TS2434: an instantiated namespace block written BEFORE the class or
+    /// function it merges with. Reported on the namespace's name.
+    namespace_prior_to_merge,
     /// TS2492: redeclaring a catch-clause parameter in the catch block.
     catch_redeclare,
 
@@ -363,6 +383,11 @@ pub const Code = enum(u16) {
             .class_cannot_implement_overloads,
             .function_merge_needs_ambient_class,
             .import_conflict,
+            .merged_decl_export_mismatch,
+            .missing_function_implementation,
+            .missing_constructor_implementation,
+            .enum_first_member_needs_initializer,
+            .namespace_prior_to_merge,
             .catch_redeclare,
             .decorator_not_valid_here,
             .label_not_allowed,
@@ -562,6 +587,11 @@ pub const Code = enum(u16) {
             .class_cannot_implement_overloads => "Class declaration cannot implement overload list.",
             .function_merge_needs_ambient_class => "Function with bodies can only merge with classes that are ambient.",
             .import_conflict => "import declaration conflicts with local declaration",
+            .merged_decl_export_mismatch => "Individual declarations in merged declaration must be all exported or all local.",
+            .missing_function_implementation => "Function implementation is missing or not immediately following the declaration.",
+            .missing_constructor_implementation => "Constructor implementation is missing.",
+            .enum_first_member_needs_initializer => "In an enum with multiple declarations, only one declaration can omit an initializer for its first enum element.",
+            .namespace_prior_to_merge => "A namespace declaration cannot be located prior to a class or function with which it is merged.",
             .catch_redeclare => "cannot redeclare identifier in catch clause",
             .unsupported_syntax => "syntax not yet supported by ztsc",
             .unsupported_satisfies => "'satisfies' is not yet supported by ztsc",
@@ -667,6 +697,11 @@ pub const Code = enum(u16) {
             .class_cannot_implement_overloads => 2813,
             .function_merge_needs_ambient_class => 2814,
             .import_conflict => 2440,
+            .merged_decl_export_mismatch => 2395,
+            .missing_function_implementation => 2391,
+            .missing_constructor_implementation => 2390,
+            .enum_first_member_needs_initializer => 2432,
+            .namespace_prior_to_merge => 2434,
             .catch_redeclare => 2492,
             .decorator_not_valid_here => 1206,
             .label_not_allowed => 1344,
