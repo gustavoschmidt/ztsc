@@ -71,6 +71,7 @@ const scanner = @import("scanner.zig");
 const intern = @import("../intern.zig");
 const numeric_lit = @import("../numeric_lit.zig");
 const diagnostics = @import("diagnostics.zig");
+const literals = @import("literals.zig");
 const source = @import("source.zig");
 
 const Ast = ast.Ast;
@@ -556,15 +557,9 @@ const Binder = struct {
     /// Strips the delimiters off a literal module specifier. Backticks are
     /// included because a no-substitution template literal is a legal
     /// specifier for `import()` (`` import(`./m`) ``).
-    fn stripQuotes(text: []const u8) []const u8 {
-        if (text.len >= 2 and (text[0] == '"' or text[0] == '\'' or text[0] == '`')) {
-            const last = text[text.len - 1];
-            if (last == text[0]) return text[1 .. text.len - 1];
-            return text[1..];
-        }
-        if (text.len >= 1 and (text[0] == '"' or text[0] == '\'' or text[0] == '`')) return text[1..];
-        return text;
-    }
+    /// One copy of the rule, in `literals.zig`, so the parser's numeric-name
+    /// check and the member atom a quoted name interns to cannot disagree.
+    const stripQuotes = literals.stripQuotes;
 
     fn tokSpan(b: *Binder, tok: TokenIndex) Span {
         const start = b.tree.tokens.start(tok);
@@ -1810,8 +1805,9 @@ const Binder = struct {
         // {} }` names the class (tsc gives the ClassExpression a local
         // symbol in its own scope). Declared here, in the class scope, so it
         // shadows nothing outside.
+        var self_sym: SymbolId = no_symbol;
         if (!declare_name and data.name_token != 0) {
-            _ = try b.declare(cs, try b.atomOfToken(data.name_token), .class, node, data.name_token, .{
+            self_sym = try b.declare(cs, try b.atomOfToken(data.name_token), .class, node, data.name_token, .{
                 .nonambient_class = !b.ambient,
             });
         }
@@ -1827,6 +1823,15 @@ const Binder = struct {
         if (class_sym != no_symbol) {
             try b.member_scopes.put(b.scratch, class_sym, ms);
             try b.static_scopes.put(b.scratch, class_sym, ss);
+        }
+        // A class EXPRESSION's self-name symbol names the SAME class, so it owns
+        // the same two member tables. Without this the name resolved to a class
+        // symbol with no members at all: `const K = class Foo { static p = 1; m()
+        // { return Foo.p } }` answered TS2339 for `Foo.p`, and `classStaticBlock27.ts`
+        // reported six of them once static-block bodies started being checked.
+        if (self_sym != no_symbol) {
+            try b.member_scopes.put(b.scratch, self_sym, ms);
+            try b.static_scopes.put(b.scratch, self_sym, ss);
         }
         const saved_block = b.cur_block;
         b.cur_block = node;
@@ -1864,6 +1869,35 @@ const Binder = struct {
                     });
                     const is_ctor = b.tree.tokens.tag(tok) == .keyword_constructor and !is_static;
                     try b.bindFunctionLike(member, md.lhs, md.rhs, is_ctor);
+                },
+                // `static { … }` — the parser's only `.block` class member.
+                //
+                // (wave-7 A: the static-block SCOPE region of `bindClass`.)
+                //
+                // tsc binds a ClassStaticBlockDeclaration as a function-like
+                // container: its own locals, its own control-flow graph, and a
+                // `this` that is the class's static side (the checker's job,
+                // `checkStaticBlock`). A `.function` scope is therefore exactly
+                // right — every boundary rule that reads the scope chain
+                // (`var` hoisting, `arguments`, TDZ, `enclosingFnIsAsync`)
+                // wants the block to BE a boundary — and the scope hangs off
+                // the class scope like a method body's, not off `ss`: a member
+                // table is never in the lexical chain (see
+                // `resolvePrivateName`), and a bare name inside the block does
+                // not see the static members (`x` is TS2304 where `this.x`
+                // resolves), which is exactly what parenting at `cs` gives.
+                .block => {
+                    const outer_flow = b.cur_flow;
+                    const saved_sb = b.saveState();
+                    const sbs = try b.pushScope(.function, member);
+                    b.var_scope = sbs;
+                    b.ctx_base = b.ctxs.items.len;
+                    // No `return` may reach out of a static block (TS18041), so
+                    // there is no return target to join into.
+                    b.ctor_return = null;
+                    b.cur_flow = try b.addFlow(.start, outer_flow, member);
+                    for (b.tree.nodeRange(member)) |stmt| try b.bindStatement(stmt);
+                    b.restoreState(saved_sb);
                 },
                 .decorator => try b.bindExpr(md.lhs),
                 .error_node, .unsupported => {},

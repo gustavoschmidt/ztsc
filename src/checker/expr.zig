@@ -593,7 +593,9 @@ fn checkIdentifier(c: *Checker, node: Node) Error!TypeId {
             // has no symbol for it either — `checkIdentifier` answers
             // `getGlobalIArgumentsType()` once `isInsideFunction` holds).
             if (std.mem.eql(u8, c.atomText(a), "arguments")) {
-                if (try c.implicitArgumentsType()) |t| return t;
+                // The span is for the one boundary that answers with a
+                // diagnostic instead of a type (TS2815 in a class static block).
+                if (try c.implicitArgumentsType(c.nodeSpan(node))) |t| return t;
             }
             // A primitive TYPE name in a value position is TS2693, ahead of
             // both the suggestion and the not-found message (tsc's

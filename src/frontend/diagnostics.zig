@@ -252,6 +252,11 @@ pub const Code = enum(u16) {
     /// parsed member, not a parse failure; rejecting it in the parser instead
     /// cost a false TS1003 plus the file's whole semantic pass.
     enum_member_numeric_name,
+    /// TS1164: `enum E { [foo] = 1 }` — a computed enum member name that does not
+    /// wrap a string, numeric or no-substitution-template literal. The literal
+    /// forms ARE legal (`["4"]`, `[2]`, `` [`a`] ``, measured), and their name is
+    /// the literal's own, so only the rest reach this.
+    computed_name_in_enum,
     /// TS18024: `enum E { #x }` — a private identifier as an enum member name.
     enum_member_private_name,
     /// TS1539: `{ 1n: 123 }` — a BigInt literal as a property name. The grammar
@@ -291,6 +296,32 @@ pub const Code = enum(u16) {
     /// TS1214: the same, in a file that is an external module — likewise strict
     /// for a reason the reader may not have chosen.
     strict_reserved_word_in_module,
+    /// TS1359: a reserved word standing where a *BindingIdentifier* is required,
+    /// which for ztsc means one thing — `await` inside an await context (an
+    /// `async` function's parameters and body, or a class static block). tsc's
+    /// `createIdentifier` prefers this wording over TS1003 whenever the token is
+    /// a reserved word. Like the TS1212 family above, the message drops the word
+    /// tsc names; like them, it is a GRAMMAR diagnostic (measured — see
+    /// `class`), despite reading as parser code in tsc.
+    reserved_word_here,
+
+    // --- class static blocks (tsc's `checkGrammar*`, so all four are semantic)
+    /// TS18037: `await x` inside a static block. The operator parses — a static
+    /// block IS an await context — but a static initializer cannot await.
+    await_in_static_block,
+    /// TS18038: the same for `for await (… of …)`, worded for the loop.
+    for_await_in_static_block,
+    /// TS18041: `return` inside a static block. A block is a function-like
+    /// container, so the parse is fine; there is just nothing to return to.
+    return_in_static_block,
+    /// TS1163: `yield` inside a static block — a container that is not a
+    /// generator body. Outside one, a `yield` in non-generator code is the
+    /// TS1212/TS1213 reserved-word family instead.
+    yield_not_in_generator,
+    /// TS1108: a `return` with no function body around it at all. A class field
+    /// initializer counts as one (it runs as an implicit function), so this is
+    /// only the file/namespace top level.
+    return_outside_function,
 
     // --- `eval`/`arguments` as a declared name (tsc's `checkStrictModeEvalOrArguments`)
     /// TS1100/TS1210/TS1215: `eval` or `arguments` DECLARED — a variable, a
@@ -398,6 +429,7 @@ pub const Code = enum(u16) {
             .accessibility_modifier_already_seen,
             .enum_member_numeric_name,
             .enum_member_private_name,
+            .computed_name_in_enum,
             // `{ 1n: 123 }` reports TS1539 next to the TS2464/TS2538 its
             // siblings earn in the same file — tsc's checker.
             .bigint_property_name,
@@ -409,6 +441,26 @@ pub const Code = enum(u16) {
             .strict_reserved_word,
             .strict_reserved_word_in_class,
             .strict_reserved_word_in_module,
+            // The four static-block rules and TS1108 are `checkGrammar*` in
+            // tsc's CHECKER (`checkAwaitExpression`, `checkForOfStatement`,
+            // `checkClassStaticBlockDeclaration`, `checkYieldExpression`,
+            // `checkReturnStatement`) — TS1xxx numbers on semantic
+            // diagnostics, so a syntactic error anywhere suppresses them.
+            // `classStaticBlock7.ts` reports its TS18037/TS1163/TS18041 set
+            // with nothing else in the file, and adding a sibling TS2322
+            // leaves both standing.
+            //
+            // TS1359 belongs here too, which is a MEASURED surprise: tsc's
+            // `createIdentifier` is parser code, yet `class C { static { let
+            // await = 1 } }` next to `const q: string = 1` reports the TS1359
+            // AND the TS2322 AND a sibling function's TS1212 — so tsgo files
+            // this one with the grammar pass, not with the parse diagnostics.
+            .reserved_word_here,
+            .await_in_static_block,
+            .for_await_in_static_block,
+            .return_in_static_block,
+            .yield_not_in_generator,
+            .return_outside_function,
             // Same pass as the TS1212 family: tsc's binder, so semantic.
             .eval_in_strict,
             .arguments_in_strict,
@@ -505,6 +557,7 @@ pub const Code = enum(u16) {
             .accessibility_modifier_already_seen => "Accessibility modifier already seen.",
             .enum_member_numeric_name => "An enum member cannot have a numeric name.",
             .enum_member_private_name => "An enum member cannot be named with a private identifier.",
+            .computed_name_in_enum => "Computed property names are not allowed in enums.",
             .bigint_property_name => "A 'bigint' literal cannot be used as a property name.",
             .private_name_outside_class => "Private identifiers are not allowed outside class bodies.",
             .private_name_in_var_decl => "Private identifiers are not allowed in variable declarations.",
@@ -516,6 +569,12 @@ pub const Code = enum(u16) {
             .strict_reserved_word => "Identifier expected. This is a reserved word in strict mode.",
             .strict_reserved_word_in_class => "Identifier expected. This is a reserved word in strict mode. Class definitions are automatically in strict mode.",
             .strict_reserved_word_in_module => "Identifier expected. This is a reserved word in strict mode. Modules are automatically in strict mode.",
+            .reserved_word_here => "Identifier expected. This is a reserved word that cannot be used here.",
+            .await_in_static_block => "'await' expression cannot be used inside a class static block.",
+            .for_await_in_static_block => "'for await' loops cannot be used inside a class static block.",
+            .return_in_static_block => "A 'return' statement cannot be used inside a class static block.",
+            .yield_not_in_generator => "A 'yield' expression is only allowed in a generator body.",
+            .return_outside_function => "A 'return' statement can only be used within a function body.",
             .eval_in_strict => evalStrictMessage("eval"),
             .arguments_in_strict => evalStrictMessage("arguments"),
             .eval_in_class => evalClassMessage("eval"),
@@ -647,6 +706,7 @@ pub const Code = enum(u16) {
             .accessibility_modifier_already_seen => 1028,
             .enum_member_numeric_name => 2452,
             .enum_member_private_name => 18024,
+            .computed_name_in_enum => 1164,
             .bigint_property_name => 1539,
             .private_name_outside_class => 18016,
             .private_name_in_var_decl => 18029,
@@ -655,6 +715,12 @@ pub const Code = enum(u16) {
             .strict_reserved_word => 1212,
             .strict_reserved_word_in_class => 1213,
             .strict_reserved_word_in_module => 1214,
+            .reserved_word_here => 1359,
+            .await_in_static_block => 18037,
+            .for_await_in_static_block => 18038,
+            .return_in_static_block => 18041,
+            .yield_not_in_generator => 1163,
+            .return_outside_function => 1108,
             .eval_in_strict, .arguments_in_strict => 1100,
             .eval_in_class, .arguments_in_class => 1210,
             .eval_in_module, .arguments_in_module => 1215,

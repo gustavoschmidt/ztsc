@@ -143,6 +143,26 @@ pub fn parseOpts(gpa: Allocator, src: []const u8, opts: Opts) error{ OutOfMemory
 
 const max_la = 5; // `[a.b]` computed-key gate peeks `[ a . b ]` = 5 tokens
 
+/// The innermost function-like boundary a parse is inside. See `Parser.fn_ctx`.
+const FnCtx = enum {
+    /// No enclosing function body: a source file's or namespace's top level.
+    none,
+    /// A non-async function, method, accessor, arrow, or a class field
+    /// initializer (tsc parses one as its own implicit function).
+    sync,
+    /// An `async` function, method or arrow — tsc's await context.
+    async_fn,
+    /// A class `static { … }` block — also an await context, and the only
+    /// boundary with grammar rules of its own.
+    static_block,
+
+    /// Whether `await` is the operator here rather than an Identifier
+    /// (tsc's `inAwaitContext`).
+    fn awaits(k: FnCtx) bool {
+        return k == .async_fn or k == .static_block;
+    }
+};
+
 const Parser = struct {
     /// Transient arena: all growable lists live here during the parse.
     gpa: Allocator,
@@ -202,6 +222,42 @@ const Parser = struct {
     /// A class body is strict whatever the file is, and tsc says so in its own
     /// wording, so the choice between TS1212 and TS1213 is this counter.
     class_depth: u32 = 0,
+
+    /// The innermost function-like boundary being parsed. tsc keeps the same
+    /// information in two context bits (`NodeFlags.AwaitContext` plus the
+    /// container kind); one enum is enough here because every rule that reads it
+    /// asks about the INNERMOST boundary:
+    ///
+    ///   * `.async_fn` and `.static_block` are tsc's await context — `await` is
+    ///     the operator, never an Identifier (TS1359 for a binding named
+    ///     `await`, TS1109 when the operator has no operand);
+    ///   * `.static_block` additionally earns the four static-block grammar
+    ///     rules (TS18037 `await`, TS1163 `yield`, TS18041 `return`, TS18038
+    ///     `for await`), all of which tsc reports only when the *innermost*
+    ///     container is the block — a nested `async function` inside one is
+    ///     ordinary async code;
+    ///   * `.none` is "no function body at all", which is what TS1108 says
+    ///     about a `return`.
+    ///
+    /// Set at every function-like boundary — a function/method/accessor body
+    /// (with its parameters), an arrow body, a static block, and a class field
+    /// initializer, which tsc parses outside the await context because the
+    /// initializer runs as its own implicit function.
+    fn_ctx: FnCtx = .none,
+
+    /// tsc's `NodeFlags.DisallowConditionalTypesContext`: true while parsing a
+    /// type position where a conditional type may not appear unparenthesized —
+    /// the `extends` clause of a conditional type, and the constraint of an
+    /// `infer T extends C`. Set by `disallowConditionalTypesAnd`'s two callers
+    /// and CLEARED again on the way down into a postfix type, so a parenthesized
+    /// or braced type (`(A extends B ? C : D)`, a mapped type's `in` clause)
+    /// starts over with conditionals allowed — tsc's
+    /// `allowConditionalTypesAnd(parsePostfixTypeOrHigher)`.
+    ///
+    /// One rule reads it: whether `infer T extends C` keeps its constraint or
+    /// hands the `extends` back to an enclosing conditional type. See the
+    /// `.keyword_infer` arm.
+    no_cond_type: bool = false,
     /// Whether the file has top-level module syntax (`import`/`export`), tsc's
     /// `externalModuleIndicator`, for TS1214. Only known once the whole file is
     /// parsed, so the diagnostics are recorded as TS1212 and rewritten in
@@ -1831,8 +1887,13 @@ const Parser = struct {
         const kw = try p.bump();
         var is_await: u32 = 0;
         if (p.curTag() == .keyword_await) {
-            _ = try p.bump(); // `for await` — recorded for the checker
+            const aw = try p.bump(); // `for await` — recorded for the checker
             is_await = 1;
+            // TS18038: same rule as TS18037 for the loop form, and tsc words it
+            // for the loop rather than for the operator.
+            if (p.fn_ctx == .static_block and p.spec == 0) {
+                try p.errAtToken(.for_await_in_static_block, aw);
+            }
         }
         _ = try p.expect(.l_paren, .expected_l_paren);
 
@@ -1982,6 +2043,16 @@ const Parser = struct {
 
     fn parseReturnStatement(p: *Parser) PE!Node {
         const kw = try p.bump();
+        // Where a `return` may stand, tsc's `checkGrammarReturnStatement` /
+        // `checkGrammarStaticBlock`: inside a class static block it is TS18041,
+        // and with no function body around it at all it is TS1108. A class field
+        // initializer counts as a body (`.sync`), which is why `fn_ctx` and not
+        // a "saw a function" flag answers this.
+        if (p.spec == 0 and !p.ambient) switch (p.fn_ctx) {
+            .static_block => try p.errAtToken(.return_in_static_block, kw),
+            .none => try p.errAtToken(.return_outside_function, kw),
+            .sync, .async_fn => {},
+        };
         var expr: Node = null_node;
         const t = p.curTag();
         // ASI: `return\nvalue` returns undefined.
@@ -2023,14 +2094,28 @@ const Parser = struct {
         var flags = flags_in;
         const kw = try p.bump(); // `function`
         if (try p.eat(.asterisk) != null) flags |= ast.Flags.generator;
+        // The NAME's context: a function DECLARATION's name is parsed in the
+        // enclosing context (`async function await() {}` at the top level is
+        // legal, and a plain `function await() {}` inside a static block is
+        // not), while a function EXPRESSION that is itself `async`/`*` parses
+        // its name inside the new context — tsc's `parseFunctionExpression`
+        // wraps exactly that one in `doInAwaitContext`. Neither ever turns an
+        // inherited await context OFF, which is why `.sync` is only installed
+        // once the name is behind us.
+        const saved_fn_ctx = p.fn_ctx;
+        defer p.fn_ctx = saved_fn_ctx;
+        const inner: FnCtx = if (flags & ast.Flags.async != 0) .async_fn else .sync;
+        if (is_expr and inner == .async_fn) p.fn_ctx = inner;
         var name_tok: u32 = 0;
         if (isIdentLike(p.curTag())) {
             try p.checkStrictReserved();
+            try p.checkAwaitReservedName();
             name_tok = try p.bump();
             try p.checkEvalOrArguments(name_tok);
         } else if (!anon_ok) {
             try p.fail(.expected_identifier);
         }
+        p.fn_ctx = inner;
         const proto = try p.parseFnProtoRest(flags, name_tok);
         var body: Node = null_node;
         if (p.curTag() == .l_brace) {
@@ -2323,6 +2408,7 @@ const Parser = struct {
             else => {
                 if (isIdentLike(p.curTag())) {
                     try p.checkStrictReserved();
+                    try p.checkAwaitReservedName();
                     const tok = try p.bump();
                     try p.checkEvalOrArguments(tok);
                     return p.addNode(.{ .tag = .identifier, .main_token = tok, .data = .{ .lhs = 0, .rhs = 0 } });
@@ -2394,7 +2480,14 @@ const Parser = struct {
                 // that DECLARE a member, not on this one).
                 const key = try p.bump();
                 var value: Node = null_node;
-                if (try p.eat(.colon) != null) value = try p.parseBindingName(.private_name_outside_class);
+                if (try p.eat(.colon) != null) {
+                    value = try p.parseBindingName(.private_name_outside_class);
+                } else {
+                    // Shorthand: the key IS the bound name, so `{ await }` in an
+                    // await context is TS1359 — while `{ await: other }` names a
+                    // property and is fine (measured).
+                    try p.checkAwaitReservedNameAt(key);
+                }
                 var init: Node = null_node;
                 if (try p.eat(.eq) != null) init = try p.parseAssignExpr(.{});
                 try p.pushScratch(try p.addNode(.{ .tag = .binding_property, .main_token = key, .data = .{ .lhs = value, .rhs = init } }));
@@ -2438,6 +2531,10 @@ const Parser = struct {
         const kw = try p.bump(); // `class`
         var name_tok: u32 = 0;
         if (isIdentLike(p.curTag()) and p.curTag() != .keyword_implements) {
+            // A class name is parsed in the ENCLOSING context (tsc's
+            // `parseNameOfClassDeclarationOrExpression` inherits it), so
+            // `class await {}` inside a static block is TS1359.
+            try p.checkAwaitReservedName();
             name_tok = try p.bump();
         }
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
@@ -2471,6 +2568,7 @@ const Parser = struct {
             const diags_before = p.diags.items.len;
             if (try p.eat(.semicolon) != null) continue;
             try p.pushScratch(try p.parseClassMember());
+            try p.dropDecoratorsOnStaticBlock(top);
             if (p.curIdx() == before) {
                 // The member parse consumed nothing. If it already said why
                 // (a member-name failure reports TS1068 at this very token),
@@ -2518,6 +2616,29 @@ const Parser = struct {
     /// call (`@a.b(args)`) — not an arbitrary expression (no binary ops). The
     /// resulting `.decorator` node carries the expression in `data.lhs`; the
     /// checker name-resolves and type-checks it (undefined name ⇒ TS2304).
+    /// TS1206 for a DECORATED static block: `@dec static { }` is not a thing —
+    /// tsc's `checkClassStaticBlockDeclaration` reports "Decorators are not
+    /// valid here." on the first `@` and never looks at the expression, so the
+    /// decorator nodes are dropped from the member list here as well. Keeping
+    /// them would have the binder resolve the decorator name and the checker
+    /// type it, inventing the TS2304/TS2307 tsc does not report.
+    ///
+    /// Called after each member is pushed, with `top` the scratch base of the
+    /// member list, so the run being dropped is exactly the decorators that
+    /// precede the block just parsed.
+    fn dropDecoratorsOnStaticBlock(p: *Parser, top: usize) Error!void {
+        const items = p.scratch.items;
+        if (items.len <= top + 1) return;
+        const tags = p.nodes.items(.tag);
+        if (tags[items[items.len - 1]] != .block) return;
+        var n = items.len - 1;
+        while (n > top and tags[items[n - 1]] == .decorator) n -= 1;
+        if (n == items.len - 1) return;
+        if (p.spec == 0) try p.errAtToken(.decorator_not_valid_here, p.nodes.items(.main_token)[items[n]]);
+        items[n] = items[items.len - 1];
+        p.scratch.shrinkRetainingCapacity(n + 1);
+    }
+
     fn parseDecorator(p: *Parser) PE!Node {
         const at = try p.bump(); // `@`
         var expr: Node = null_node;
@@ -2588,9 +2709,11 @@ const Parser = struct {
         // plain `.block` member so the statements inside land in the tree with
         // real spans instead of derailing the member loop (which read `static`
         // as a FIELD name and then answered "';' expected" at the `{`, the
-        // single largest source of ztsc's excess TS1005). The binder ignores a
-        // `.block` member, so the body is not checked yet — an under-report,
-        // never a wrong answer.
+        // single largest source of ztsc's excess TS1005).
+        //
+        // The block is a function-like boundary and an await context, which
+        // `fn_ctx` records for the four grammar rules that only hold there
+        // (TS18037/TS1163/TS18041/TS18038) and for `await`-as-a-name (TS1359).
         //
         // A modifier RUN may precede it (`async static {`, `public static {`,
         // `readonly private static {`): tsc parses all of them as one modifier
@@ -2604,6 +2727,9 @@ const Parser = struct {
                 for (0..n) |_| _ = try p.bump();
             }
             _ = try p.bump(); // `static`
+            const saved_fn_ctx = p.fn_ctx;
+            defer p.fn_ctx = saved_fn_ctx;
+            p.fn_ctx = .static_block;
             return p.parseBlock();
         }
 
@@ -2703,6 +2829,9 @@ const Parser = struct {
         }
         if (p.curTag() == .l_paren or p.atLt()) {
             // Method / constructor / accessor.
+            const saved_fn_ctx = p.fn_ctx;
+            defer p.fn_ctx = saved_fn_ctx;
+            p.fn_ctx = if (flags & ast.Flags.async != 0) .async_fn else .sync;
             const proto = try p.parseFnProtoRest(flags, name_tok);
             var body: Node = null_node;
             if (p.curTag() == .l_brace) {
@@ -2724,7 +2853,15 @@ const Parser = struct {
         var type_ann: Node = null_node;
         if (try p.eat(.colon) != null) type_ann = try p.parseType();
         var init: Node = null_node;
-        if (try p.eat(.eq) != null) init = try p.parseAssignExpr(.{});
+        if (try p.eat(.eq) != null) {
+            // A field initializer runs as its own implicit function, so it is
+            // parsed outside any enclosing await context: `x = await` inside a
+            // class written in a static block names the outer `await` binding.
+            const saved_fn_ctx = p.fn_ctx;
+            defer p.fn_ctx = saved_fn_ctx;
+            p.fn_ctx = .sync;
+            init = try p.parseAssignExpr(.{});
+        }
         try p.expectSemicolon();
         const extra = try p.addExtra(ast.Field{ .flags = flags, .type_ann = type_ann, .init = init });
         return p.addNode(.{ .tag = .class_field, .main_token = name_tok, .data = .{ .lhs = extra, .rhs = 0 } });
@@ -2796,6 +2933,7 @@ const Parser = struct {
     fn expectIdentLike(p: *Parser) PE!u32 {
         if (isIdentLike(p.curTag())) {
             try p.checkStrictReserved();
+            try p.checkAwaitReservedName();
             return p.bump();
         }
         try p.fail(.expected_identifier);
@@ -2838,6 +2976,31 @@ const Parser = struct {
             .strict_reserved_word_in_class
         else
             .strict_reserved_word);
+    }
+
+    /// TS1359, tsc's `createIdentifier`: inside an await context — an `async`
+    /// function's parameters and body, or a class static block — `await` is not
+    /// a BindingIdentifier, so a declaration trying to bind that name reports
+    /// "Identifier expected. 'await' is a reserved word that cannot be used
+    /// here." Called from the same funnels as `checkStrictReserved` plus the two
+    /// name positions that bump their token directly (a class name, an
+    /// object-pattern shorthand), and deliberately NOT from an identifier
+    /// REFERENCE: there `await` is the operator, and a missing operand is the
+    /// TS1109 the unary arm reports.
+    ///
+    /// The message names the token, which the renderer reads back off the span —
+    /// see `main.zig`'s emit loop.
+    fn checkAwaitReservedName(p: *Parser) Error!void {
+        if (p.spec > 0 or p.ambient) return;
+        if (!p.fn_ctx.awaits() or p.curTag() != .keyword_await) return;
+        try p.errAtCur(.reserved_word_here);
+    }
+
+    /// `checkAwaitReservedName` for a token that has already been consumed.
+    fn checkAwaitReservedNameAt(p: *Parser, tok: u32) Error!void {
+        if (p.spec > 0 or p.ambient) return;
+        if (!p.fn_ctx.awaits() or p.tokTagAt(tok) != .keyword_await) return;
+        try p.errAtToken(.reserved_word_here, tok);
     }
 
     /// TS1100/TS1210/TS1215, tsc's `checkStrictModeEvalOrArguments`: `eval` and
@@ -2937,24 +3100,70 @@ const Parser = struct {
     }
 
     fn parseEnumMember(p: *Parser) PE!Node {
+        // A COMPUTED member name is legal in an enum when it wraps a string,
+        // numeric or no-substitution-template literal — tsc's
+        // `checkGrammarEnumDeclaration` only rejects the ones that are not
+        // (`[foo]`, `["a" + "b"]`, `[0n]`) — and the name it declares is the
+        // literal's own, so the brackets are simply consumed and the literal
+        // becomes the member's name token: `["4"] = 4` and `"4" = 4` are the
+        // same member, which is also how they collide.
+        var computed_at: ?u32 = null;
+        if (p.curTag() == .l_bracket) {
+            if (p.peekTag(2) == .r_bracket and switch (p.peekTag(1)) {
+                .string_literal, .numeric_literal, .no_substitution_template_literal => true,
+                else => false,
+            }) {
+                computed_at = p.curIdx();
+                _ = try p.bump(); // `[`
+            } else {
+                if (p.spec > 0) return error.Backtrack;
+                try p.errAtCur(.computed_name_in_enum);
+                // Consume the whole member so nothing cascades: the bracketed
+                // expression, then any initializer. No member is produced —
+                // tsc's answer for one of these is the TS1164 alone.
+                _ = try p.bump(); // `[`
+                var depth: u32 = 1;
+                while (depth > 0 and p.curTag() != .eof) {
+                    switch (p.curTag()) {
+                        .l_bracket => depth += 1,
+                        .r_bracket => depth -= 1,
+                        else => {},
+                    }
+                    _ = try p.bump();
+                }
+                if (try p.eat(.eq) != null) _ = try p.parseAssignExpr(.{});
+                return p.errorNode();
+            }
+        }
         // Member name: an enum member name is a PropertyName, so a numeric or
         // private one PARSES and is then rejected by name (TS2452 / TS18024) —
         // rejecting it here instead cost a false TS1003 and, with it, the whole
-        // file's semantic pass.
+        // file's semantic pass. TS2452 is about the NAME, not the token: a
+        // BigInt literal (`0n`) and a string that spells a number (`"3"`) earn
+        // it as surely as `3` does (measured).
         const name_code: ?Code = switch (p.curTag()) {
-            .numeric_literal => .enum_member_numeric_name,
+            .numeric_literal, .bigint_literal => .enum_member_numeric_name,
+            .string_literal, .no_substitution_template_literal => if (literals.isNumericName(literals.stripQuotes(p.laText(0))))
+                .enum_member_numeric_name
+            else
+                null,
             .private_identifier => .enum_member_private_name,
             else => null,
         };
-        if (name_code == null and !isIdentLike(p.curTag()) and p.curTag() != .string_literal) {
+        if (name_code == null and !isIdentLike(p.curTag()) and p.curTag() != .string_literal and
+            p.curTag() != .no_substitution_template_literal)
+        {
             try p.fail(.expected_identifier);
             return p.errorNode();
         }
         if (name_code) |code| {
             if (p.spec > 0) return error.Backtrack;
-            try p.errAtCur(code);
+            // tsc blames the whole member name, which for a computed one starts
+            // at the `[`.
+            if (computed_at) |lb| try p.errAtToken(code, lb) else try p.errAtCur(code);
         }
         const name_tok = try p.bump();
+        if (computed_at != null) _ = try p.expect(.r_bracket, .expected_r_bracket);
         var init: Node = null_node;
         if (try p.eat(.eq) != null) init = try p.parseAssignExpr(.{});
         return p.addNode(.{ .tag = .enum_member, .main_token = name_tok, .data = .{ .lhs = init, .rhs = 0 } });
@@ -3533,6 +3742,14 @@ const Parser = struct {
 
     fn parseYield(p: *Parser, ctx: ExprCtx) PE!Node {
         const kw = try p.bump();
+        // TS1163: a static block is a function-like container that is not a
+        // generator, so a `yield` written there is only ever an error. Reported
+        // for the static block alone — a `yield` in an ordinary non-generator
+        // function is the TS1212/TS1213 reserved-word family instead, which
+        // `checkStrictReserved` owns.
+        if (p.fn_ctx == .static_block and p.spec == 0) {
+            try p.errAtToken(.yield_not_in_generator, kw);
+        }
         var delegate: u32 = 0;
         var operand: Node = null_node;
         if (!p.nlBefore()) {
@@ -3561,7 +3778,7 @@ const Parser = struct {
             .params_end = params.end,
             .return_type = 0,
         });
-        const body = try p.parseArrowBody(ctx);
+        const body = try p.parseArrowBody(ctx, 0);
         return p.addNode(.{ .tag = .arrow_fn, .main_token = arrow_tok, .data = .{ .lhs = proto, .rhs = body } });
     }
 
@@ -3605,7 +3822,7 @@ const Parser = struct {
                 // Committed: the body parses non-speculatively.
                 p.spec -= 1;
                 defer p.spec += 1;
-                const body = try p.parseArrowBody(ctx);
+                const body = try p.parseArrowBody(ctx, flags);
                 return p.addNode(.{ .tag = .arrow_fn, .main_token = arrow_tok, .data = .{ .lhs = proto, .rhs = body } });
             }
         }
@@ -3651,11 +3868,18 @@ const Parser = struct {
         // Committed: parse the body non-speculatively so its errors surface.
         p.spec -= 1;
         defer p.spec += 1;
-        const body = try p.parseArrowBody(ctx);
+        const body = try p.parseArrowBody(ctx, flags);
         return p.addNode(.{ .tag = .arrow_fn, .main_token = arrow_tok, .data = .{ .lhs = proto, .rhs = body } });
     }
 
-    fn parseArrowBody(p: *Parser, ctx: ExprCtx) PE!Node {
+    /// An arrow's body, with the function-like boundary it establishes. Every
+    /// arrow form funnels through here — the one-parameter shorthand, the
+    /// parenthesized form and the generic form — so `flags` is the only place
+    /// that has to know whether the arrow is `async`.
+    fn parseArrowBody(p: *Parser, ctx: ExprCtx, flags: u32) PE!Node {
+        const saved_fn_ctx = p.fn_ctx;
+        defer p.fn_ctx = saved_fn_ctx;
+        p.fn_ctx = if (flags & ast.Flags.async != 0) .async_fn else .sync;
         if (p.curTag() == .l_brace) return p.parseFunctionBody();
         return p.parseAssignExpr(.{ .no_in = ctx.no_in });
     }
@@ -3781,10 +4005,36 @@ const Parser = struct {
                 return p.addNode(.{ .tag = .prefix_unary, .main_token = op, .data = .{ .lhs = operand, .rhs = 0 } });
             },
             .keyword_await => {
-                // `await expr` when an expression follows; else `await` is
-                // an ordinary identifier.
-                if (canStartExpression(p.peekTag(1)) and p.peekTag(1) != .colon) {
+                // In an await context `await` is ALWAYS the operator — an
+                // operand that is missing earns the TS1109 the operand parse
+                // reports, which is what tsc answers for `await;` inside an
+                // async function or a static block. Outside one, `await` is an
+                // ordinary identifier unless an expression follows.
+                //
+                if (p.fn_ctx.awaits() or (canStartExpression(p.peekTag(1)) and p.peekTag(1) != .colon)) {
                     const op = try p.bump();
+                    // TS18037: the operator is legal syntax inside a static
+                    // block but never legal code there — a static initializer
+                    // cannot await. Only the INNERMOST boundary counts: an
+                    // `async function` written inside the block is ordinary
+                    // async code.
+                    if (p.fn_ctx == .static_block and p.spec == 0) {
+                        try p.errAtToken(.await_in_static_block, op);
+                    }
+                    // A MISSING operand is reported here rather than left to the
+                    // operand parse, because that parse turns the failure into
+                    // `Backtrack` while speculating — abandoning the construct
+                    // being tried instead of reporting inside it. `async (a =
+                    // await) => {}` in an async body is exactly that shape: tsc
+                    // parses the arrow and answers one TS1109 in its parameter
+                    // list, where aborting the arrow re-reads the whole
+                    // statement and invents a cascade. Reporting while
+                    // speculating is safe — `restore` drops the diagnostic along
+                    // with the rest of an abandoned parse.
+                    if (!canStartExpression(p.curTag())) {
+                        try p.errAtCur(.expected_expression);
+                        return p.addNode(.{ .tag = .prefix_unary, .main_token = op, .data = .{ .lhs = try p.errorNode(), .rhs = 0 } });
+                    }
                     const operand = try p.parseSimpleUnaryExpr(ctx);
                     return p.addNode(.{ .tag = .prefix_unary, .main_token = op, .data = .{ .lhs = operand, .rhs = 0 } });
                 }
@@ -4574,6 +4824,9 @@ const Parser = struct {
             },
             .l_paren, .lt, .lt_lt => {
                 // Method shorthand: value is a function_expr.
+                const saved_fn_ctx = p.fn_ctx;
+                defer p.fn_ctx = saved_fn_ctx;
+                p.fn_ctx = if (flags & ast.Flags.async != 0) .async_fn else .sync;
                 const proto = try p.parseFnProtoRest(flags, key_tok);
                 var body: Node = null_node;
                 if (p.curTag() == .l_brace) body = try p.parseFunctionBody() else try p.fail(.expected_l_brace);
@@ -4622,8 +4875,21 @@ const Parser = struct {
         // parsing a function type, exactly as before.
         if (p.curTag() == .keyword_extends and !p.nlBefore() and p.spec == 0) {
             const ext_kw = try p.bump();
-            const extends_ty = try p.parseNonConditionalType(.nullable_marker);
+            const extends_ty = blk: {
+                // tsc's `disallowConditionalTypesAnd(parseTypeWorker)`: the
+                // clause admits no bare conditional, and an `infer T extends C`
+                // inside it therefore KEEPS its constraint — the `?` that
+                // follows can only belong to this conditional.
+                const saved_ncd = p.no_cond_type;
+                defer p.no_cond_type = saved_ncd;
+                p.no_cond_type = true;
+                break :blk try p.parseNonConditionalType(.nullable_marker);
+            };
             _ = try p.expect(.question, .expected_colon);
+            // Both branches are full types again (`allowConditionalTypesAnd`).
+            const saved_ncd = p.no_cond_type;
+            defer p.no_cond_type = saved_ncd;
+            p.no_cond_type = false;
             const true_ty = try p.parseType();
             _ = try p.expect(.colon, .expected_colon);
             const false_ty = try p.parseType();
@@ -4799,12 +5065,42 @@ const Parser = struct {
                 const name = try p.expectIdentLike();
                 var constraint: Node = null_node;
                 if (p.curTag() == .keyword_extends and !p.nlBefore()) {
+                    // tsc's `tryParseConstraintOfInferType`: parse the
+                    // constraint with conditional types disallowed, then keep it
+                    // only if a conditional type could not have claimed this
+                    // `extends` instead. Where conditionals ARE allowed and a
+                    // `?` follows, the whole constraint is given back and the
+                    // `extends` belongs to the conditional type around the
+                    // `infer` — `{ [P in infer U extends keyof T ? 1 : 0]: 1 }`
+                    // is a mapped type over a conditional, not an `infer` with a
+                    // constraint. Inside a conditional's own `extends` clause
+                    // (`no_cond_type`) there is no such reading, so the
+                    // constraint stands: `T extends infer U extends number ? 1 :
+                    // 0` binds `U` with a constraint.
+                    const state = p.save();
+                    const saved_ncd = p.no_cond_type;
                     _ = try p.bump();
-                    constraint = try p.parseNonConditionalType(.nullable_marker);
+                    p.no_cond_type = true;
+                    const c = try p.parseNonConditionalType(.nullable_marker);
+                    p.no_cond_type = saved_ncd;
+                    if (saved_ncd or p.curTag() != .question) {
+                        constraint = c;
+                    } else {
+                        p.restore(state);
+                    }
                 }
                 return p.addNode(.{ .tag = .infer_type, .main_token = kw, .data = .{ .lhs = name, .rhs = constraint } });
             },
-            else => return p.parsePostfixType(tq),
+            // tsc's `allowConditionalTypesAnd(parsePostfixTypeOrHigher)`: below
+            // the type operators the context starts over, so a parenthesized,
+            // braced or bracketed type nested in a conditional's `extends`
+            // clause admits a conditional type of its own.
+            else => {
+                const saved_ncd = p.no_cond_type;
+                defer p.no_cond_type = saved_ncd;
+                p.no_cond_type = false;
+                return p.parsePostfixType(tq);
+            },
         }
     }
 
