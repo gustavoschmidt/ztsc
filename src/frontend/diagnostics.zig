@@ -342,6 +342,10 @@ pub const Code = enum(u16) {
     /// TS2390: the same for a class CONSTRUCTOR, which tsc gives its own
     /// message.
     missing_constructor_implementation,
+    /// TS2516: the same, for an ABSTRACT method — which is legally bodyless, so
+    /// the only way its declarations can be wrong is by not being consecutive.
+    /// Only the non-consecutive arm reaches it.
+    abstract_decls_not_consecutive,
     /// TS2432: a second block of a merged `enum` whose first member omits its
     /// initializer. Reported on that member.
     enum_first_member_needs_initializer,
@@ -543,6 +547,7 @@ pub const Code = enum(u16) {
             .merged_decl_export_mismatch,
             .missing_function_implementation,
             .missing_constructor_implementation,
+            .abstract_decls_not_consecutive,
             .enum_first_member_needs_initializer,
             .namespace_prior_to_merge,
             .catch_redeclare,
@@ -873,6 +878,7 @@ pub const Code = enum(u16) {
             .merged_decl_export_mismatch => "Individual declarations in merged declaration must be all exported or all local.",
             .missing_function_implementation => "Function implementation is missing or not immediately following the declaration.",
             .missing_constructor_implementation => "Constructor implementation is missing.",
+            .abstract_decls_not_consecutive => "All declarations of an abstract method must be consecutive.",
             .enum_first_member_needs_initializer => "In an enum with multiple declarations, only one declaration can omit an initializer for its first enum element.",
             .namespace_prior_to_merge => "A namespace declaration cannot be located prior to a class or function with which it is merged.",
             .catch_redeclare => "cannot redeclare identifier in catch clause",
@@ -996,6 +1002,7 @@ pub const Code = enum(u16) {
             .merged_decl_export_mismatch => 2395,
             .missing_function_implementation => 2391,
             .missing_constructor_implementation => 2390,
+            .abstract_decls_not_consecutive => 2516,
             .enum_first_member_needs_initializer => 2432,
             .namespace_prior_to_merge => 2434,
             .catch_redeclare => 2492,
