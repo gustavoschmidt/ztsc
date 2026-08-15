@@ -1143,6 +1143,32 @@ const Binder = struct {
         }
     }
 
+    /// Is the declaration behind `link` in an AMBIENT context — tsc's
+    /// `NodeFlags.Ambient`?
+    ///
+    /// `decl_origins` carries the INHERITED half (a `.d.ts`, a `declare
+    /// namespace` body, a `declare class` body), which is all `b.ambient` knows
+    /// when the name is bound: a declaration's OWN `declare` modifier is not in
+    /// it, because `bindNamespace`/`bindClass` declare the name before entering
+    /// the body it makes ambient. So the modifier is read back off the node here.
+    /// Without it `declare namespace foo { … } class foo {}` — legal, and the
+    /// point of `partiallyAmbientClodule` — looked like a namespace written
+    /// before a live class.
+    fn declIsAmbient(b: *Binder, link: u32) bool {
+        if (b.decl_origins.items[link].ambient) return true;
+        const node = b.decl_links.items[link].value;
+        if (node == null_node) return false;
+        const d = b.tree.nodeData(node);
+        const flags: u32 = switch (b.nodeTag(node)) {
+            .function_decl, .class_method => b.tree.extraData(ast.FnProto, d.lhs).flags,
+            .class_decl => b.tree.extraData(ast.ClassData, d.lhs).flags,
+            .namespace_decl => b.tree.extraData(ast.NamespaceData, d.lhs).flags,
+            .enum_decl => b.tree.extraData(ast.EnumData, d.lhs).flags,
+            else => return false,
+        };
+        return flags & ast.Flags.declare != 0;
+    }
+
     /// Was `block` already the block of a declaration earlier in `sym`'s list
     /// than `stop`? Keeps `checkMergedExportsOf` to one report per group without
     /// a set: a name has a handful of declarations at most.
@@ -1265,7 +1291,7 @@ const Binder = struct {
             var merge_tok: TokenIndex = 0;
             var link = b.sym_decl_head.items[sym];
             while (link != 0) : (link = b.decl_links.items[link].next) {
-                if (b.decl_origins.items[link].ambient) continue;
+                if (b.declIsAmbient(link)) continue;
                 const node = b.decl_links.items[link].value;
                 switch (b.nodeTag(node)) {
                     .class_decl => {},
@@ -1280,7 +1306,7 @@ const Binder = struct {
 
             link = b.sym_decl_head.items[sym];
             while (link != 0) : (link = b.decl_links.items[link].next) {
-                if (b.decl_origins.items[link].ambient) continue;
+                if (b.declIsAmbient(link)) continue;
                 const node = b.decl_links.items[link].value;
                 if (b.nodeTag(node) != .namespace_decl) continue;
                 if (!b.instantiated(node)) continue;
