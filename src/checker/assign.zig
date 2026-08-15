@@ -47,6 +47,70 @@ const report_zig = @import("assign_report.zig");
 // assignability
 // =====================================================================
 
+/// WHICH relation a `relate` walk is answering — tsc's `relation` parameter,
+/// which every one of its relation functions carries and which selects both the
+/// rule set and the pair cache (`assignableRelation` / `comparableRelation` /
+/// `identityRelation`, each with its own `Map`).
+///
+/// ztsc answered every question with assignability and bolted the comparable
+/// relation's leniencies on as retries at the sites that ask for it
+/// (`relationalComparable`, `typesHaveOverlap`, `castComparable`). That works
+/// for a leniency the OUTERMOST pair needs and cannot work for one a pair two
+/// levels down needs, which is where the whole
+/// `comparisonOperatorWithNoRelationship*` family lives:
+///
+/// ```ts
+/// declare var a5: { fn(a?: Base): void };
+/// declare var b5: { fn(a?: C): void };
+/// a5 < b5;   // tsgo: legal
+/// ```
+///
+/// `Base` and `C` are unrelated in both directions, so nothing the outer
+/// retry can do makes the pair comparable — but the PARAMETERS are
+/// `Base | undefined` and `C | undefined`, and a union SOURCE under the
+/// comparable relation only needs SOME constituent related (`undefined` is),
+/// so the parameter comparison two frames down succeeds. The flag has to ride
+/// the walk.
+///
+/// Carried on the `Checker` rather than as a parameter for the same reason
+/// `rel_assumed` is: a frame's descendants are reached through
+/// `isAssignableInner` and through helpers spread over half a dozen files,
+/// none of which thread relation state. It is per-frame context that children
+/// inherit, saved and restored at the three entry points — the pattern
+/// `rel_expanding` and `fn_ctx` already use — and it is folded into the pair
+/// memo's key (`relate`), so the two relations never read each other's
+/// verdicts.
+pub const Relation = enum {
+    /// tsc's `assignableRelation`. Every relation question in the checker
+    /// except the three comparable entry points below.
+    assignable,
+    /// tsc's `comparableRelation`: "is there any overlap between these two
+    /// types" rather than "does every value of the first fit the second".
+    /// Strictly more lenient than assignability, by three documented rules —
+    /// a union source distributes EXISTENTIALLY (`someTypeRelatedToType`
+    /// where assignability uses `eachTypeRelatedToType`), a generic signature
+    /// is ERASED to `any` rather than instantiated in the target's context
+    /// (`eraseGenerics = relation === comparableRelation`), and an optional
+    /// source property may satisfy a required target one.
+    comparable,
+};
+
+/// Switch the live relation to `kind` and hand back the one it replaced, for the
+/// caller to `defer`-restore. Three entry points need the identical two lines,
+/// and a missed restore would silently answer the REST of the program's
+/// assignability questions with the lenient rule set — so the pairing is worth
+/// naming even though it saves no code.
+///
+/// `isComparable` is deliberately NOT one of them. It is the narrowing /
+/// discriminant / `switch`-case overlap probe as much as a comparable one, and
+/// the sites tsc actually reaches through `isTypeComparableTo` are the three
+/// below; switching it would loosen every narrowing in the checker at once.
+fn enterRelation(c: *Checker, kind: Relation) Relation {
+    const saved = c.rel_kind;
+    c.rel_kind = kind;
+    return saved;
+}
+
 pub fn isComparable(c: *Checker, a: TypeId, b: TypeId) Error!bool {
     return (try c.isAssignable(a, b)) or (try c.isAssignable(b, a));
 }
@@ -71,6 +135,13 @@ pub fn isComparable(c: *Checker, a: TypeId, b: TypeId) Error!bool {
 /// {a:string}|any[]|Date|{}|object|T` legal, `T < U` and `T < number|bigint|E`
 /// (the numeric screen at the call site) rejected, `V extends U < U` legal.
 pub fn relationalComparable(c: *Checker, a: TypeId, b: TypeId) Error!bool {
+    // tsc's `isTypeComparableTo` is the COMPARABLE relation, not assignability
+    // with patches: the leniencies it needs (`Relation.comparable`) fire
+    // wherever the walk reaches them, and the type-parameter rules below are
+    // the ones tsc keeps ON TOP of the relation, in
+    // `isTypeRelatedTo`/`isSimpleTypeRelatedTo`.
+    const saved = enterRelation(c, .comparable);
+    defer c.rel_kind = saved;
     return (try comparableOneWay(c, a, b, 0)) or (try comparableOneWay(c, b, a, 0));
 }
 
@@ -125,6 +196,14 @@ pub fn maybeAssignable(c: *Checker, a: TypeId, b: TypeId) Error!bool {
 /// required leniency. Kept to the cast site only — narrowing/discriminant
 /// uses of isComparable are unchanged.
 pub fn castComparable(c: *Checker, a: TypeId, b: TypeId) Error!bool {
+    // Same relation as `relationalComparable` — `checkAssertionWorker` asks
+    // `isTypeComparableTo(exprType, targetType) || isTypeComparableTo(targetType,
+    // exprType)`. The ad-hoc retries below are what the relation itself now
+    // covers for a nested pair; they stay because each also encodes a rule tsc
+    // applies OUTSIDE the relation (a type parameter read through its
+    // constraint, a deferred conditional peeled to its branches).
+    const saved = enterRelation(c, .comparable);
+    defer c.rel_kind = saved;
     return c.castComparableRec(a, b, 0);
 }
 
@@ -515,6 +594,16 @@ pub fn typeParamOverlapOperand(c: *Checker, t: TypeId) Error!TypeId {
 /// Union-distributing overlap test for TS2367/TS2678: some pair of
 /// constituents must be comparable.
 pub fn typesHaveOverlap(c: *Checker, a: TypeId, b: TypeId) Error!bool {
+    // The third comparable entry point, and the same relation as the other two:
+    // tsc's equality operators ask
+    // `isTypeEqualityComparableTo(left, right) || isTypeEqualityComparableTo(right, left)`,
+    // whose body is `target.flags & Nullable || isTypeComparableTo(source, target)`.
+    // Without the relation kind the `==`/`===` half of every
+    // `comparisonOperator…` case stayed a false TS2367 while its `<`/`>` half
+    // (`relationalComparable`) had already been fixed — sixteen keys per case,
+    // the exact same pairs.
+    const saved = enterRelation(c, .comparable);
+    defer c.rel_kind = saved;
     return c.typesHaveOverlapRec(a, b, 0);
 }
 
@@ -546,6 +635,21 @@ pub fn typesHaveOverlapRec(c: *Checker, a: TypeId, b: TypeId, depth: u32) Error!
     // `T`'s union constraint is not assignable to one literal. The
     // constraint keeps the real negatives (`T extends "a" | "b"` vs
     // `"zzz"` still has no overlap).
+    //
+    // …with the carve-out tsc puts back on purpose, and which the RELATIONAL
+    // operators already had (`constraintChainReaches`): "forbid comparing a
+    // type parameter with another type parameter unless one extends the
+    // other". The leniency above exists because a parameter COULD be
+    // instantiated to the other operand's type; when both sides are
+    // parameters that reasoning is available to each of them and tsc declines
+    // it, so `t === u` over `<T, U>` is a TS2367 in tsgo while `t < u` already
+    // was one in ztsc. Sixteen keys in `comparisonOperatorWithTypeParameter`
+    // and four in `…NoRelationshipTypeParameter` were exactly that asymmetry.
+    const tpa = try c.resolveStructural(a);
+    const tpb = try c.resolveStructural(b);
+    if (c.ts.kind(tpa) == .type_param and c.ts.kind(tpb) == .type_param) {
+        return (try constraintChainReaches(c, tpa, tpb)) or (try constraintChainReaches(c, tpb, tpa));
+    }
     const pa = try c.typeParamOverlapOperand(a);
     if (pa != a) return if (pa == 0) true else c.typesHaveOverlapRec(pa, b, depth + 1);
     const pb = try c.typeParamOverlapOperand(b);
@@ -1110,7 +1214,14 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!RelAnswer {
     // from) now hits the in-progress mark instead of restarting the walk.
     // Sound for exactly the reason the reflexive fast-path above is.
     const cacheable = memoize and (isCompound(sk) or isCompound(tk));
-    const key = (@as(u64, relKeyOf(s, sk, sr)) << 32) | relKeyOf(t, tk, tr);
+    // WHICH relation is asking is part of the question, so it is part of the
+    // key — tsc gives each relation its own `Map` for the same reason. The two
+    // TypeIds occupy 31 bits each at the very most (a `TypeId` indexes the type
+    // store, and a program with 2^31 types cannot be loaded), so the top bit is
+    // free to carry the relation and the assignable relation's keys — every key
+    // the checker used before this — are unchanged.
+    const key = (@as(u64, relKeyOf(s, sk, sr)) << 32) | relKeyOf(t, tk, tr) |
+        @as(u64, @intFromBool(c.rel_kind == .comparable)) << 63;
     if (cacheable) {
         if (c.relation.get(key)) |v| {
             c.stats.relation_hits += 1;
@@ -2061,8 +2172,32 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
             if (try c.isAssignable(mu, t)) return true;
         }
     }
-    // Source union distributes first.
+    // Source union distributes first — and HOW it distributes is the relation's
+    // first difference. tsc:
+    //
+    // ```ts
+    // if (source.flags & TypeFlags.Union) {
+    //     result = relation === comparableRelation ?
+    //         someTypeRelatedToType(source as UnionType, target, …) :
+    //         eachTypeRelatedToType(source as UnionType, target, …);
+    // }
+    // ```
+    //
+    // Assignability needs EVERY constituent to fit (a value of the union type
+    // may be any of them); comparability asks only whether the two types
+    // OVERLAP, so one constituent that fits is a witness. That is what makes
+    // `{ fn(a?: Base): void } < { fn(a?: C): void }` legal in tsgo with `Base`
+    // and `C` unrelated: the parameters are `Base | undefined` and
+    // `C | undefined`, and `undefined` is the overlap. Sixteen keys in
+    // `comparisonOperatorWithNoRelationshipObjectsOnOptionalProperty` and the
+    // optional-parameter half of `…OnCallSignature`/`…OnConstructorSignature`.
     if (sk == .union_type) {
+        if (c.rel_kind == .comparable) {
+            for (try c.memberList(s)) |m| {
+                if (try c.isAssignable(m, t)) return true;
+            }
+            return false;
+        }
         for (try c.memberList(s)) |m| {
             if (!try c.isAssignable(m, t)) return false;
         }
@@ -4394,7 +4529,29 @@ pub fn signatureAssignableModeInner(c: *Checker, s: TypeId, t: TypeId, mode: Sig
     return c.signatureAssignableModeInnerErase(s, t, mode, .constraints);
 }
 
-pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode: SigMode, erase_in: Erase) Error!bool {
+pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode: SigMode, erase_in0: Erase) Error!bool {
+    // The relation's second difference, and tsc says so in a comment of its
+    // own at the one place that decides it (`signaturesRelatedTo`):
+    //
+    // ```ts
+    // // For simple functions (functions with a single signature) we only erase type parameters for
+    // // the comparable relation. Otherwise, if the source signature is generic, we instantiate it
+    // // in the context of the target signature before checking the relationship.
+    // const eraseGenerics = relation === comparableRelation || !!compilerOptions.noStrictGenericChecks;
+    // ```
+    //
+    // So `{ fn<T>(t: T): T }` and `{ fn<T>(t: T[]): T }` are COMPARABLE — both
+    // erase to `fn(t: any)`-shaped signatures, and `any` overlaps everything —
+    // while neither is ASSIGNABLE to the other, which tsgo confirms in both
+    // directions. Instantiating the source in the target's context instead
+    // (the assignable rule, made authoritative in 82f2209) answered the
+    // comparable question with the strict verdict, and every
+    // `a7 < b7` / `a7 == b7` in the family became a false TS2365/TS2367.
+    //
+    // Forcing the erasure here rather than at the caller keeps it out of the
+    // hot path: the assignable relation reads one already-loaded byte and is
+    // otherwise untouched.
+    const erase_in: Erase = if (c.rel_kind == .comparable) .any else erase_in0;
     // tsc's canonical type-IDENTITY probe `(<G>() => G extends X ? A : B)`
     // (react-hook-form's `IsEqual`, and other libraries) compares two types
     // for identity: `IsEqual<X,Y>` reduces to `(<G>()=>G extends X?1:2)

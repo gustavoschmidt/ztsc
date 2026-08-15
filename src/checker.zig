@@ -1084,6 +1084,12 @@ pub const Checker = struct {
     /// through. See bench/repeat_sweep.sh, which pins both counters under a
     /// serial front end and documents why it cannot under a parallel one.
     relation: IntMap(u64, u8) = .empty,
+    /// WHICH relation the live `relate` walk is answering. See
+    /// `checker/assign.zig`'s `Relation`: the comparable relation's rules fire
+    /// arbitrarily deep inside a walk, so the kind rides the frame the way
+    /// `rel_expanding` does, and it is folded into the `relation` key above so
+    /// the two never read each other's verdicts.
+    rel_kind: assign_zig.Relation = .assignable,
     /// ref TypeId -> expanded structural type.
     expansions: IntMap(TypeId, TypeId) = .empty,
     /// ref TypeId -> the `budget_epoch` in which expanding it came back
