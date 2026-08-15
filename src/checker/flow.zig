@@ -26,8 +26,8 @@ const countArgs = @import("calls.zig").countArgs;
 const atom = Checker.atom;
 const findBindingType = @import("signatures.zig").findBindingType;
 const init = Checker.init;
-const isInstantiableKind = @import("expr.zig").isInstantiableKind;
 const lazy_base_depth = @import("instantiate.zig").lazy_base_depth;
+const narrowable = @import("narrowable.zig");
 const propOfType = @import("props.zig").propOfType;
 const reduceSubtypes = @import("typenode.zig").reduceSubtypes;
 const refExpansionActive = @import("instantiate.zig").refExpansionActive;
@@ -206,47 +206,11 @@ fn patternParentUnion(c: *Checker, decl: Node, is_const: bool, key: u64) Error!T
     const whole = try patternParentType(c, decl, is_const);
     var parent: TypeId = types.no_type;
     if (whole != types.no_type) {
-        const r = try patternParentConstraint(c, try c.resolveStructural(whole));
+        const r = try narrowable.substituteConstraints(c, try c.resolveStructural(whole));
         if (c.ts.kind(r) == .union_type) parent = r;
     }
     try c.pattern_parent_types.put(c.cm(), key, parent);
     return parent;
-}
-
-/// tsc's `mapType(parentType, getBaseConstraintOrType)`: the destructured
-/// parent seen through type-parameter constraints, so
-///
-///     function f<T extends { kind: 'A', payload: number }
-///                         | { kind: 'B', payload: string }>({ kind, payload }: T)
-///
-/// destructures the CONSTRAINT's union and a guard on `kind` still narrows
-/// `payload`. Without it the parent type is the bare `T`, "not a union", and
-/// the whole sibling-narrowing rule declined (`dependentDestructuredVariables`
-/// f13/f14).
-///
-/// Only an INSTANTIABLE constituent is replaced — tsc's
-/// `getBaseConstraintOfType` answers `undefined` for a plain object type, and
-/// ztsc's `baseConstraintOf` would otherwise substitute the type parameters
-/// nested INSIDE one (`A<T> | B<T>` becoming `A<con> | B<con>`), which is a
-/// different type than the destructuring is written against.
-fn patternParentConstraint(c: *Checker, r: TypeId) Error!TypeId {
-    if (c.ts.kind(r) != .union_type) return constraintOrSelf(c, r);
-    var parts: std.ArrayList(TypeId) = .empty;
-    defer parts.deinit(c.scratch());
-    var changed = false;
-    for (try c.memberList(r)) |m| {
-        const cm = try constraintOrSelf(c, m);
-        if (cm != m) changed = true;
-        try parts.append(c.scratch(), cm);
-    }
-    if (!changed) return r;
-    return c.ts.makeUnion(c.scratch(), parts.items);
-}
-
-fn constraintOrSelf(c: *Checker, t: TypeId) Error!TypeId {
-    if (!isInstantiableKind(c.ts.kind(t))) return t;
-    const con = try c.baseConstraintOf(t);
-    return try c.resolveStructural(con);
 }
 
 /// The direct `binding_property` of `pat` that binds `name`, if it is one

@@ -40,6 +40,7 @@ const gatherSpreadProps = @import("typenode.zig").gatherSpreadProps;
 const globalThisType = @import("instantiate.zig").globalThisType;
 const inForHeadWriteTarget = @import("flow.zig").inForHeadWriteTarget;
 const names_zig = @import("names.zig");
+const narrowable = @import("narrowable.zig");
 const hasTypeMeaning = @import("names.zig").hasTypeMeaning;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
 const indexableConstituent = @import("typenode.zig").indexableConstituent;
@@ -165,7 +166,7 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     const d = c.tree.nodeData(node);
     const main_tok = c.tree.nodeMainToken(node);
     switch (c.nodeTag(node)) {
-        .identifier => return checkIdentifier(c, node),
+        .identifier => return checkIdentifier(c, node, ctx),
         .number_literal => return c.ts.makeNumberLiteral(c.numberTokenValue(main_tok), true),
         .string_literal => return c.ts.makeStringLiteral(try c.memberAtom(main_tok), true),
         .bigint_literal => return c.ts.makeBigIntLiteral(try c.atomOfToken(main_tok), true),
@@ -253,10 +254,24 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             else
                 checkObjectLiteral(c, node, ctx);
         },
-        .member_expr, .optional_member_expr => return checkMemberExpr(c, node),
-        .index_expr, .optional_index_expr => return checkIndexExpr(c, node, true),
-        .call_expr, .call_expr_targs, .optional_call => return c.checkCallExpr(node, false, ctx),
-        .new_expr, .new_expr_targs, .new_expr_bare => return c.checkCallExpr(node, true, ctx),
+        .member_expr, .optional_member_expr => return checkMemberExpr(c, node, ctx),
+        .index_expr, .optional_index_expr => return checkIndexExpr(c, node, true, ctx),
+        // A call/`new` CALLEE is in a constraint position (its apparent type is
+        // where the overload set comes from). Announced around the whole call
+        // rather than around the callee's own check, which lives in
+        // `calls.zig`; the argument walk it also spans cannot see the
+        // announcement, whose `nodeKey` matches the callee alone. `d.lhs` is the
+        // callee in every one of these shapes (`callShape`).
+        .call_expr, .call_expr_targs, .optional_call => {
+            const saved = enterConstraintPos(c, d.lhs, null_node);
+            defer c.constraint_pos = saved;
+            return c.checkCallExpr(node, false, ctx);
+        },
+        .new_expr, .new_expr_targs, .new_expr_bare => {
+            const saved = enterConstraintPos(c, d.lhs, null_node);
+            defer c.constraint_pos = saved;
+            return c.checkCallExpr(node, true, ctx);
+        },
         .instantiation_expr => {
             const base = try c.checkExprCached(d.lhs, types.no_type);
             const r = c.tree.extraData(ast.SubRange, d.rhs);
@@ -517,7 +532,7 @@ fn checkPrivateName(c: *Checker, tok: TokenIndex, a: Atom) Error!TypeId {
     }
 }
 
-fn checkIdentifier(c: *Checker, node: Node) Error!TypeId {
+fn checkIdentifier(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     const tok = c.tree.nodeMainToken(node);
     if (c.tree.tokens.tag(tok) == .keyword_undefined) return types.undefined_type;
     const a = try c.atomOfToken(tok);
@@ -549,7 +564,11 @@ fn checkIdentifier(c: *Checker, node: Node) Error!TypeId {
                     }
                 }
             }
-            const declared = try c.typeOfSymbol(sym);
+            // tsc's `getNarrowableTypeForReference`: a type variable with a
+            // union constraint enters the flow walk AS that constraint where
+            // the constraint is what decides the outcome anyway (see
+            // `narrowable.zig`), so a guard has constituents to filter.
+            const declared = try c.narrowableRefType(node, try c.typeOfSymbol(sym), ctx);
             // TDZ (TS2448) and definite assignment (TS2454). Both are
             // `void` — they contribute nothing to this identifier's type,
             // which is `flowTypeOfReference(declared)` below either way —
@@ -2563,17 +2582,27 @@ pub const ChainLink = struct { ty: TypeId, chained: bool };
 /// reports.
 pub fn chainObjType(c: *Checker, node: Node) Error!ChainLink {
     return switch (c.nodeTag(node)) {
-        .member_expr, .optional_member_expr => memberChainInner(c, node),
-        .index_expr, .optional_index_expr => indexChainInner(c, node, true),
+        .member_expr, .optional_member_expr => memberChainInner(c, node, types.no_type),
+        .index_expr, .optional_index_expr => indexChainInner(c, node, true, types.no_type),
         .call_expr, .call_expr_targs, .optional_call => c.checkCallExprInner(node, false, types.no_type),
         else => .{ .ty = try c.checkExprCached(node, types.no_type), .chained = false },
     };
 }
 
-fn checkMemberExpr(c: *Checker, node: Node) Error!TypeId {
-    const link = try memberChainInner(c, node);
+fn checkMemberExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
+    const link = try memberChainInner(c, node, ctx);
     if (link.chained) return c.makeUnion2(link.ty, types.undefined_type);
     return link.ty;
+}
+
+/// Announce `ref` as a CONSTRAINT POSITION for the duration of its own check
+/// (`index_expr` = the element-access exception's index, `null_node` for a
+/// property access or callee). Restores the previous announcement, so a nested
+/// access inside `ref`'s own subtree makes its own — see `ConstraintPos`.
+fn enterConstraintPos(c: *Checker, ref: Node, index_expr: Node) narrowable.ConstraintPos {
+    const saved = c.constraint_pos;
+    c.constraint_pos = .{ .node = c.nodeKey(ref), .index_expr = index_expr };
+    return saved;
 }
 
 /// Property access, treated as a link in a (possibly single-element)
@@ -2583,15 +2612,22 @@ fn checkMemberExpr(c: *Checker, node: Node) Error!TypeId {
 /// non-`?.` continuation whose object is *declared* nullish still reports
 /// TS2532/18047-9 via `checkNonNullType` (the marker distinguishes the
 /// chain's own undefined from an inherently-nullable intermediate).
-fn memberChainInner(c: *Checker, node: Node) Error!ChainLink {
+fn memberChainInner(c: *Checker, node: Node, ctx: TypeId) Error!ChainLink {
     const d = c.tree.nodeData(node);
     const own_optional = c.nodeTag(node) == .optional_member_expr;
     var chained = false;
-    var obj_t = if (c.isOptionalChain(d.lhs)) blk: {
-        const link = try c.chainObjType(d.lhs);
-        if (link.chained) chained = true;
-        break :blk link.ty;
-    } else try c.checkExprCached(d.lhs, types.no_type);
+    var obj_t = obj: {
+        // A property-access receiver is in a constraint position (its apparent
+        // type is what the lookup below uses either way).
+        const saved = enterConstraintPos(c, d.lhs, null_node);
+        defer c.constraint_pos = saved;
+        if (c.isOptionalChain(d.lhs)) {
+            const link = try c.chainObjType(d.lhs);
+            if (link.chained) chained = true;
+            break :obj link.ty;
+        }
+        break :obj try c.checkExprCached(d.lhs, types.no_type);
+    };
     const name_tok: TokenIndex = d.rhs;
     const name = try c.memberAtom(name_tok);
     if (own_optional) {
@@ -2619,6 +2655,10 @@ fn memberChainInner(c: *Checker, node: Node) Error!ChainLink {
         try accessibility.checkSuperField(c, name, name_tok);
     }
     var pt = try propertyTypeOf(c, obj_t, name, name_tok, site);
+    // tsc's `getNarrowableTypeForReference`, the property-access arm: this
+    // access is itself a reference, so a union-constrained type variable it
+    // reads enters the flow walk as its constraint (see `narrowable.zig`).
+    pt = try c.narrowableRefType(node, pt, ctx);
     // Property-path narrowing: peel the whole access spine into a member
     // path (`x.p`, `this.p`, `x.a.b`, …) capped at `max_deep_ref_depth`.
     if (try c.buildRefKey(node)) |key| {
@@ -3006,22 +3046,29 @@ pub fn numericNameIndexHit(c: *Checker, r: TypeId, rk: types.Kind, text: []const
     return numericIndexHit(c, r, rk, v);
 }
 
-fn checkIndexExpr(c: *Checker, node: Node, narrow: bool) Error!TypeId {
-    const link = try indexChainInner(c, node, narrow);
+fn checkIndexExpr(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!TypeId {
+    const link = try indexChainInner(c, node, narrow, ctx);
     if (link.chained) return c.makeUnion2(link.ty, types.undefined_type);
     return link.ty;
 }
 
 /// Element access as an optional-chain link (see `memberChainInner`).
-fn indexChainInner(c: *Checker, node: Node, narrow: bool) Error!ChainLink {
+fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!ChainLink {
     const d = c.tree.nodeData(node);
     const own_optional = c.nodeTag(node) == .optional_index_expr;
     var chained = false;
-    var obj_t = if (c.isOptionalChain(d.lhs)) blk: {
-        const link = try c.chainObjType(d.lhs);
-        if (link.chained) chained = true;
-        break :blk link.ty;
-    } else try c.checkExprCached(d.lhs, types.no_type);
+    var obj_t = obj: {
+        // An element-access receiver is in a constraint position too, except
+        // for the `T[K]` case the index expression decides (`ConstraintPos`).
+        const saved = enterConstraintPos(c, d.lhs, d.rhs);
+        defer c.constraint_pos = saved;
+        if (c.isOptionalChain(d.lhs)) {
+            const link = try c.chainObjType(d.lhs);
+            if (link.chained) chained = true;
+            break :obj link.ty;
+        }
+        break :obj try c.checkExprCached(d.lhs, types.no_type);
+    };
     // The index expression runs only on the chain's non-nullish branch, so
     // it sees the chain's own guards (`pushChainGuards`).
     const idx_t = idx: {
@@ -3264,6 +3311,8 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool) Error!ChainLink {
     // `arr[0] = other` inside a guard on `arr[0]` (the dotted-member write
     // path reads the declared property type for the same reason).
     if (narrow) {
+        // tsc's `getNarrowableTypeForReference`, element-access arm.
+        result = try c.narrowableRefType(node, result, ctx);
         if (try c.buildRefKey(node)) |key| {
             result = try c.flowTypeOfKey(node, key, result);
         }
@@ -4152,7 +4201,7 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
             }
             const r = try c.resolveStructural(obj_t);
             if (try readonlyIndexWriteAt(c, r, node, d.rhs)) return types.error_type;
-            return checkIndexExpr(c, node, false);
+            return checkIndexExpr(c, node, false, types.no_type);
         },
         .array_literal, .object_literal, .array_pattern, .object_pattern => {
             // Destructuring-assignment pattern in the expression cover
