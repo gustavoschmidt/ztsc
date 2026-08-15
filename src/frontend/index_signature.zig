@@ -40,6 +40,13 @@ pub const Shape = struct {
     initializer: bool,
     /// Whether the parameter has a `: T` annotation.
     parameter_type: bool,
+    /// Whether that annotation is PROVABLY a legal index key type — the bare
+    /// `string`, `number` or `symbol` keyword. tsc's TS1337 and TS1268 sit
+    /// between the parameter-type check and the value-type one and need the type
+    /// RESOLVED, so a parameter type this cannot vouch for makes the last arm
+    /// (TS1021) stay silent rather than answer where tsc would have said TS1268:
+    /// `[a: boolean]` and `[index: RegExp]` are TS1268 in tsgo, measured.
+    parameter_type_indexable: bool,
     /// Whether a `: T` followed the `]`.
     value_type: bool,
 };
@@ -92,8 +99,15 @@ fn chainOf(s: Shape) ?Report {
     if (!s.parameter_type) {
         return .{ .code = .index_sig_parameter_type_annotation, .token = s.name_token.? };
     }
-    // TS1268 would go here: it needs the parameter type RESOLVED, so an
-    // unanswered rule rather than a guess at the next arm's code.
+    // TS1337 ("cannot be a literal type or generic type") and TS1268 ("must be
+    // 'string', 'number', 'symbol', or a template literal type") go HERE, ahead
+    // of the value-type check, and both need the parameter type RESOLVED. So the
+    // last arm only fires for a parameter type that provably passes them; every
+    // other spelling is an under-report rather than a wrong key. Getting this
+    // order wrong is what the s2 sweep caught: `[a: boolean]`, `[index: any]`
+    // and `[index: RegExp]` have no value type either, and tsgo answers TS1268
+    // for all three.
+    if (!s.parameter_type_indexable) return null;
     if (!s.value_type) return .{ .code = .index_sig_type_annotation, .token = s.bracket_token };
     return null;
 }
@@ -138,6 +152,7 @@ const ok: Shape = .{
     .question = null,
     .initializer = false,
     .parameter_type = true,
+    .parameter_type_indexable = true,
     .value_type = true,
 };
 
@@ -218,4 +233,21 @@ test "each arm in tsc's order, and each on tsc's token" {
     s.value_type = false;
     try std.testing.expectEqual(Code.index_sig_type_annotation, check(s).chain.?.code);
     try std.testing.expectEqual(@as(u32, 10), check(s).chain.?.token); // the `[`
+}
+
+test "no value type, but a key type TS1268 would have caught first, stays silent" {
+    // `interface I { [a: boolean] }` is TS1268 in tsgo, not TS1021.
+    var s = ok;
+    s.value_type = false;
+    s.parameter_type_indexable = false;
+    try std.testing.expectEqual(Reports{}, check(s));
+    // ...and a well-formed one is still silent, not suddenly reported.
+    s = ok;
+    s.parameter_type_indexable = false;
+    try std.testing.expectEqual(Reports{}, check(s));
+    // The arms AHEAD of TS1268 in the walk are unaffected by it.
+    s = ok;
+    s.parameter_type_indexable = false;
+    s.question = 23;
+    try std.testing.expectEqual(Code.index_sig_question_mark, check(s).chain.?.code);
 }

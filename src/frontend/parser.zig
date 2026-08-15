@@ -6114,6 +6114,7 @@ const Parser = struct {
             .question = null,
             .initializer = false,
             .parameter_type = false,
+            .parameter_type_indexable = false,
             .value_type = false,
         };
         // Only the FIRST parameter is described: every rule past the count
@@ -6130,7 +6131,19 @@ const Parser = struct {
             const name_tok = try p.expectIdentLike();
             const question = try p.eat(.question);
             var ty: Node = null_node;
-            if (try p.eat(.colon) != null) ty = try p.parseType();
+            // Whether the annotation is the bare `string`, `number` or `symbol`
+            // keyword — the only spellings that provably clear tsc's TS1337 and
+            // TS1268, which sit ahead of the value-type check and need the type
+            // resolved. One token exactly, so `string[]` and `string | number`
+            // do not qualify.
+            var indexable = false;
+            if (try p.eat(.colon) != null) {
+                const key_kw = p.curTag();
+                const before = p.curIdx();
+                ty = try p.parseType();
+                indexable = p.curIdx() == before + 1 and
+                    (key_kw == .keyword_string or key_kw == .keyword_number or key_kw == .keyword_symbol);
+            }
             var initializer = false;
             if (try p.eat(.eq) != null) {
                 _ = try p.parseAssignExpr(.{});
@@ -6143,6 +6156,7 @@ const Parser = struct {
                 shape.question = question;
                 shape.initializer = initializer;
                 shape.parameter_type = ty != null_node;
+                shape.parameter_type_indexable = indexable;
                 key_type = ty;
             }
             shape.parameters += 1;
