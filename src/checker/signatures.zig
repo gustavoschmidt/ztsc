@@ -464,6 +464,65 @@ fn thisParamAnn(c: *Checker, pn: Node) ?Node {
     };
 }
 
+/// How many parameters a function expression / arrow REQUIRES, read off its
+/// SYNTAX alone — the count tsc's `isAritySmaller` compares a candidate
+/// contextual signature against:
+///
+/// ```ts
+/// for (; targetParameterCount < target.parameters.length; targetParameterCount++) {
+///     const param = target.parameters[targetParameterCount];
+///     if (param.initializer || param.questionToken || param.dotDotDotToken) break;
+/// }
+/// ```
+///
+/// A leading `this` annotation is not a parameter (`signatureOfProtoCtx`
+/// drops it from the list as well), so it never counts.
+///
+/// Syntactic on purpose: the question is asked BEFORE the signature is built,
+/// because the answer decides whether a contextual signature is supplied to
+/// build it with at all.
+fn syntacticRequiredParams(c: *Checker, fn_node: Node) u32 {
+    const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(fn_node).lhs);
+    var n: u32 = 0;
+    var seen_param = false;
+    for (c.tree.extraRange(proto.params_start, proto.params_end)) |pn| {
+        if (pn == null_node) continue;
+        if (!seen_param) {
+            seen_param = true;
+            if (thisParamAnn(c, pn) != null) continue;
+        }
+        if (c.nodeTag(pn) == .param_full) {
+            const e = c.tree.extraData(ast.ParamFull, c.tree.nodeData(pn).rhs);
+            if (e.init != 0 or e.flags & (ast.Flags.optional | ast.Flags.rest) != 0) break;
+        }
+        n += 1;
+    }
+    return n;
+}
+
+/// tsc's `isAritySmaller`, the guard `getContextualCallSignature` applies
+/// before handing a contextual signature to a function expression: a
+/// signature that supplies FEWER parameters than the expression requires is
+/// dropped entirely, so every unannotated parameter is implicit `any` rather
+/// than taking a type from a shape that does not reach it.
+///
+/// `no_type` in, `no_type` out. A contextual signature with a rest parameter
+/// can absorb any arity and is never smaller (tsc's
+/// `!hasEffectiveRestParameter` conjunct).
+///
+/// Only the SYNTHESIZED contextual signatures consult this today — a
+/// decorator's runtime call shape (`decorators.zig`), which is built from the
+/// decorated declaration and can therefore be the wrong width for the
+/// decorator someone wrote. Every other contextual type in ztsc comes from a
+/// declaration and reaches `contextualCallSig`, which does not apply the rule
+/// yet; doing so there is a corpus-wide change and a separate item.
+pub fn contextSigForFnExpr(c: *Checker, fn_node: Node, ctx_sig: TypeId) TypeId {
+    if (ctx_sig == types.no_type or c.ts.kind(ctx_sig) != .function) return ctx_sig;
+    const n = c.ts.fnParamCount(ctx_sig);
+    if (n > 0 and c.ts.fnParam(ctx_sig, n - 1).rest()) return ctx_sig;
+    return if (n < syntacticRequiredParams(c, fn_node)) types.no_type else ctx_sig;
+}
+
 /// Resolve a `.type_predicate` return-type node into a `Predicate`:
 /// map the guarded name to a parameter index and evaluate the target
 /// type. `this is T` uses the `this_param` sentinel.

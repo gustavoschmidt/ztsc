@@ -1566,8 +1566,7 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
         else
             types.any_type;
         for (decos) |deco| {
-            const dt = try checkDecorator(c, deco);
-            try decorators.checkClassDecoratorSig(c, deco, dt, class_val);
+            try decorators.checkClassDecorator(c, deco, class_val);
         }
         c.cur_scope = saved_ds;
     }
@@ -1744,8 +1743,10 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
                 // surrounding the class (at class-definition time), so its
                 // `this` is the enclosing `this`, not the instance.
                 c.this_type = saved_this;
-                const dt = try checkDecorator(c, member);
-                // The decorated member is the next non-decorator member.
+                // The decorated member is the next non-decorator member. It
+                // is needed BEFORE the decorator expression is checked: the
+                // expression's contextual type is the call shape the runtime
+                // will invoke it with, which is built from the member.
                 var target: Node = null_node;
                 var k = mi + 1;
                 while (k < members.len) : (k += 1) {
@@ -1754,7 +1755,7 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
                         break;
                     }
                 }
-                if (target != null_node) try checkMemberDecoratorSig(c, member, dt, target, this_t, class_sym);
+                try decorators.checkMemberDecorator(c, member, target, this_t, class_sym);
             },
             // `static { … }` — the parser's only `.block` class member. The
             // block's statements run with `this` = the static side, in the
@@ -1786,18 +1787,10 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
     }
 }
 
-// Decorator checking lives in `decorators.zig`; re-exported here because the
-// class walk above drives it and `Checker`'s method aliases name this file.
-pub const DecoPos = decorators.DecoPos;
-const checkDecorator = decorators.checkDecorator;
-pub const checkDecoratorSig = decorators.checkDecoratorSig;
-const checkMemberDecoratorSig = decorators.checkMemberDecoratorSig;
-pub const decoAcceptsValue = decorators.decoAcceptsValue;
-pub const decoCode = decorators.decoCode;
-pub const decoContextMismatch = decorators.decoContextMismatch;
-pub const decoContextName = decorators.decoContextName;
-pub const decoContextRef = decorators.decoContextRef;
-pub const decoSigMatches = decorators.decoSigMatches;
+// Decorator checking lives in `decorators.zig`; the class walk above drives it
+// through its two entry points (`checkClassDecorator`, `checkMemberDecorator`)
+// and needs no re-export. `globalSymNamed` is the one helper other files reach
+// for, and `Checker`'s method alias names this file.
 pub const globalSymNamed = decorators.globalSymNamed;
 
 /// The merged-range id a real global symbol folds into, or the symbol itself.
