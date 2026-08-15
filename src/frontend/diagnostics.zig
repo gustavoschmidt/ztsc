@@ -404,6 +404,28 @@ pub const Code = enum(u16) {
     /// `export import A = B.C;` is a different declaration (an
     /// ImportEqualsDeclaration) and is legal.
     import_cannot_have_modifiers,
+
+    /// tsc's `checkGrammarIndexSignatureParameters`, in its own order — see
+    /// `src/frontend/index_signature.zig`, which decides which one fires. The
+    /// brackets PARSE as a parameter list, so all of these sit next to whatever
+    /// the file's semantic pass has to say.
+    /// TS1096: `[a, b]: T` (or `[]: T`).
+    index_sig_one_parameter,
+    /// TS1025: `[key: string,]: T`.
+    index_sig_trailing_comma,
+    /// TS1017: `[...rest: any[]]: T`.
+    index_sig_rest_parameter,
+    /// TS1018: `[public k: string]: T`.
+    index_sig_accessibility_modifier,
+    /// TS1019: `[k?: string]: T`.
+    index_sig_question_mark,
+    /// TS1020: `[k: string = "a"]: T`.
+    index_sig_initializer,
+    /// TS1022: `[k]: T` reached as an index signature — only via a shape tsc's
+    /// lookahead claims for one, e.g. `[k,]`.
+    index_sig_parameter_type_annotation,
+    /// TS1021: `[k: string]` with no value type. Reported on the whole node.
+    index_sig_type_annotation,
     /// TS2452: `enum E { 1, 2 }` — a numeric literal as an enum member name.
     /// The grammar ACCEPTS it (it is a PropertyName), so this is a check on a
     /// parsed member, not a parse failure; rejecting it in the parser instead
@@ -597,6 +619,18 @@ pub const Code = enum(u16) {
             .accessibility_modifier_already_seen,
             // Same funnel as TS1184/TS1044 — `checkGrammarModifiers`.
             .import_cannot_have_modifiers,
+            // `checkGrammarIndexSignatureParameters`, likewise the checker's:
+            // `[public x: string]: string` answers TS1018 next to the TS2369 its
+            // parameter property earns, and `[a: number = 1]: number` answers
+            // TS1020 next to a TS2371 (measured).
+            .index_sig_one_parameter,
+            .index_sig_trailing_comma,
+            .index_sig_rest_parameter,
+            .index_sig_accessibility_modifier,
+            .index_sig_question_mark,
+            .index_sig_initializer,
+            .index_sig_parameter_type_annotation,
+            .index_sig_type_annotation,
             .enum_member_numeric_name,
             .enum_member_private_name,
             .computed_name_in_enum,
@@ -776,6 +810,14 @@ pub const Code = enum(u16) {
             .implementation_not_allowed_in_ambient => "An implementation cannot be declared in ambient contexts.",
             .accessibility_modifier_already_seen => "Accessibility modifier already seen.",
             .import_cannot_have_modifiers => "An import declaration cannot have modifiers.",
+            .index_sig_one_parameter => "An index signature must have exactly one parameter.",
+            .index_sig_trailing_comma => "An index signature cannot have a trailing comma.",
+            .index_sig_rest_parameter => "An index signature cannot have a rest parameter.",
+            .index_sig_accessibility_modifier => "An index signature parameter cannot have an accessibility modifier.",
+            .index_sig_question_mark => "An index signature parameter cannot have a question mark.",
+            .index_sig_initializer => "An index signature parameter cannot have an initializer.",
+            .index_sig_parameter_type_annotation => "An index signature parameter must have a type annotation.",
+            .index_sig_type_annotation => "An index signature must have a type annotation.",
             .enum_member_numeric_name => "An enum member cannot have a numeric name.",
             .enum_member_private_name => "An enum member cannot be named with a private identifier.",
             .computed_name_in_enum => "Computed property names are not allowed in enums.",
@@ -982,6 +1024,14 @@ pub const Code = enum(u16) {
             .implementation_not_allowed_in_ambient => 1183,
             .accessibility_modifier_already_seen => 1028,
             .import_cannot_have_modifiers => 1191,
+            .index_sig_one_parameter => 1096,
+            .index_sig_trailing_comma => 1025,
+            .index_sig_rest_parameter => 1017,
+            .index_sig_accessibility_modifier => 1018,
+            .index_sig_question_mark => 1019,
+            .index_sig_initializer => 1020,
+            .index_sig_parameter_type_annotation => 1022,
+            .index_sig_type_annotation => 1021,
             .enum_member_numeric_name => 2452,
             .enum_member_private_name => 18024,
             .computed_name_in_enum => 1164,

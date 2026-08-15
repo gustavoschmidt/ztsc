@@ -59,6 +59,7 @@ const diagnostics = @import("diagnostics.zig");
 const directives = @import("directives.zig");
 const literals = @import("literals.zig");
 const modifier_order = @import("modifier_order.zig");
+const index_signature = @import("index_signature.zig");
 
 const TokTag = scanner.Tag;
 const Token = scanner.Token;
@@ -2926,7 +2927,7 @@ const Parser = struct {
         switch (p.curTag()) {
             .l_bracket => {
                 // Computed member name / index signature in class.
-                if (isIdentLike(p.peekTag(1)) and p.peekTag(2) == .colon) {
+                if (p.atIndexSignature()) {
                     return p.parseIndexSignatureAsClassMember(flags);
                 }
                 // Well-known-symbol key `[Symbol.iterator]`: keyed by a
@@ -5980,7 +5981,7 @@ const Parser = struct {
         // Index signature `[k: K]: V`.
         var name_tok: u32 = 0;
         if (p.curTag() == .l_bracket) {
-            if (isIdentLike(p.peekTag(1)) and p.peekTag(2) == .colon) {
+            if (p.atIndexSignature()) {
                 return p.parseIndexSignature(flags);
             }
             // `['data-state']: string` / `[0]: T`. A computed key whose
@@ -6073,21 +6074,110 @@ const Parser = struct {
         return p.addNode(.{ .tag = .property_signature, .main_token = name_tok, .data = .{ .lhs = type_ann, .rhs = flags } });
     }
 
+    /// tsc's `isUnambiguouslyIndexSignature`, run as a lookahead from the `[`.
+    /// The sequence an index signature is SPELLED with is `[ id :`, but tsc
+    /// claims five more for error recovery, each of which then answers one
+    /// grammar diagnostic instead of a cascade of parse errors: `[...`, `[]`,
+    /// `[id,`, `[id?,`, `[id?:`, `[id?]`, and `[<modifier> id`. Plain `[id]`,
+    /// `[id.b]`, `[id =` and a literal key are NOT claimed — they are computed
+    /// property names, which is why `[Symbol.iterator]` and `[Kind]` still
+    /// parse as members.
+    fn atIndexSignature(p: *Parser) bool {
+        std.debug.assert(p.curTag() == .l_bracket);
+        const t1 = p.peekTag(1);
+        if (t1 == .dot_dot_dot or t1 == .r_bracket) return true;
+        if (index_signature.isModifierKind(t1)) return isIdentLike(p.peekTag(2));
+        if (!isIdentLike(t1)) return false;
+        const t2 = p.peekTag(2);
+        // A `,` cannot appear in a computed property name (no comma expression
+        // there), so tsc reads it as a badly formed indexer to give the better
+        // error.
+        if (t2 == .colon or t2 == .comma) return true;
+        if (t2 != .question) return false;
+        const t3 = p.peekTag(3);
+        return t3 == .colon or t3 == .comma or t3 == .r_bracket;
+    }
+
+    /// `[k: K]: V` and every shape `atIndexSignature` claims. tsc parses the
+    /// brackets as a PARAMETER LIST and leaves the judging to
+    /// `checkGrammarIndexSignatureParameters`; `index_signature.check` is that
+    /// function, and this collects the shape it needs.
     fn parseIndexSignature(p: *Parser, flags: u32) PE!Node {
         const lb = try p.bump(); // '['
-        const name_tok = try p.expectIdentLike();
-        _ = try p.expect(.colon, .expected_colon);
-        const key_type = try p.parseType();
+        var shape: index_signature.Shape = .{
+            .bracket_token = lb,
+            .parameters = 0,
+            .name_token = null,
+            .trailing_comma = null,
+            .rest = null,
+            .modifier = null,
+            .question = null,
+            .initializer = false,
+            .parameter_type = false,
+            .value_type = false,
+        };
+        // Only the FIRST parameter is described: every rule past the count
+        // check reads `parameters[0]`, and the count check outranks them all.
+        var key_type: Node = null_node;
+        while (p.curTag() != .r_bracket and p.curTag() != .eof) {
+            const first = shape.parameters == 0;
+            const rest = try p.eat(.dot_dot_dot);
+            var modifier: ?u32 = null;
+            while (index_signature.isModifierKind(p.curTag()) and isIdentLike(p.peekTag(1))) {
+                const m = try p.bump();
+                if (modifier == null) modifier = m;
+            }
+            const name_tok = try p.expectIdentLike();
+            const question = try p.eat(.question);
+            var ty: Node = null_node;
+            if (try p.eat(.colon) != null) ty = try p.parseType();
+            var initializer = false;
+            if (try p.eat(.eq) != null) {
+                _ = try p.parseAssignExpr(.{});
+                initializer = true;
+            }
+            if (first) {
+                shape.name_token = name_tok;
+                shape.rest = rest;
+                shape.modifier = modifier;
+                shape.question = question;
+                shape.initializer = initializer;
+                shape.parameter_type = ty != null_node;
+                key_type = ty;
+            }
+            shape.parameters += 1;
+            // A `,` that is the last thing in the brackets is tsc's
+            // `hasTrailingComma` on the parameter list.
+            const comma = try p.eat(.comma) orelse break;
+            shape.trailing_comma = if (p.curTag() == .r_bracket) comma else null;
+            // `expectIdentLike` does not consume on failure, so a token that is
+            // neither a name nor `]` would spin here forever without this.
+            if (!isIdentLike(p.curTag()) and p.curTag() != .dot_dot_dot and
+                !index_signature.isModifierKind(p.curTag())) break;
+        }
         _ = try p.expect(.r_bracket, .expected_r_bracket);
-        _ = try p.expect(.colon, .expected_colon);
-        const value_type = try p.parseType();
+        var value_type: Node = null_node;
+        if (try p.eat(.colon) != null) {
+            value_type = try p.parseType();
+            shape.value_type = true;
+        }
         // A type-literal member list separates with `;` OR `,`
         // (`{ [k: string]: E, [k: number]: E }` is legal and common); the
         // member loop eats the separator, so a `,` here is not a missing
         // semicolon. Without this, that shape reported a false TS1005 — and a
         // false parse error suppresses the whole file's semantic pass.
         if (p.curTag() != .comma) try p.expectSemicolon();
-        const extra = try p.addExtra(ast.IndexSig{ .name_token = name_tok, .key_type = key_type, .value_type = value_type });
+        const reports = index_signature.check(shape);
+        if (reports.trailing_comma) |r| try p.errAtToken(r.code, r.token);
+        if (reports.chain) |r| try p.errAtToken(r.code, r.token);
+        // The checker wants a key and a value type; a missing one becomes an
+        // error node rather than 0, which is what every other recovery path in
+        // this parser hands it.
+        const extra = try p.addExtra(ast.IndexSig{
+            .name_token = shape.name_token orelse lb,
+            .key_type = if (key_type != null_node) key_type else try p.errorNode(),
+            .value_type = if (value_type != null_node) value_type else try p.errorNode(),
+        });
         return p.addNode(.{ .tag = .index_signature, .main_token = lb, .data = .{ .lhs = extra, .rhs = flags } });
     }
 };
