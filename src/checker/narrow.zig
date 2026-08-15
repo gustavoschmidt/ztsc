@@ -377,29 +377,78 @@ pub fn narrowByTypeofResolved(c: *Checker, t: TypeId, which: usize, sense: bool)
                 continue;
             }
             const keep = try c.typeofMatchesFn(m, which);
-            const kept = if (sense) keep else !keep;
-            if (kept) try parts.append(c.scratch(), m);
+            if (!sense) {
+                if (!keep) try parts.append(c.scratch(), m);
+                continue;
+            }
+            if (keep) {
+                try parts.append(c.scratch(), m);
+            } else if (try typeofSupertypeOf(c, m, which)) |implied| {
+                try parts.append(c.scratch(), implied);
+            }
         }
         return c.ts.makeUnion(c.scratch(), parts.items);
     }
     const k = c.ts.kind(t);
     if (k == .any or k == .unknown or k == .err) {
         if (!sense) return t;
-        return switch (which) {
-            0 => types.string_type,
-            1 => types.number_type,
-            2 => types.bigint_type,
-            3 => types.boolean_type,
-            4 => types.symbol_type,
-            5 => types.undefined_type,
-            6 => if (k == .unknown) try c.makeUnion2(types.object_keyword_type, types.null_type) else types.any_type,
-            7 => t, // "function": no Function type in subset — keep
-            else => t,
-        };
+        if (which == 6) {
+            return if (k == .unknown) try c.makeUnion2(types.object_keyword_type, types.null_type) else types.any_type;
+        }
+        return typeofImpliedType(which) orelse t;
     }
     const matches = try c.typeofMatchesFn(t, which);
-    if (sense) return if (matches) t else types.never_type;
+    if (sense) {
+        if (matches) return t;
+        if (try typeofSupertypeOf(c, t, which)) |implied| return implied;
+        return types.never_type;
+    }
     return if (matches) types.never_type else t;
+}
+
+/// The primitive type `typeof x === "<name>"` implies, for the six names that
+/// have one (tsc's `typeofTypesByName`). `"object"` and `"function"` have no
+/// single type in ztsc's subset and are answered by their callers.
+fn typeofImpliedType(which: usize) ?TypeId {
+    return switch (which) {
+        0 => types.string_type,
+        1 => types.number_type,
+        2 => types.bigint_type,
+        3 => types.boolean_type,
+        4 => types.symbol_type,
+        5 => types.undefined_type,
+        else => null,
+    };
+}
+
+/// The asserting arm of tsc's `narrowTypeForTypeof`: a constituent whose own
+/// kind does NOT match the `typeof` becomes the implied primitive when it is a
+/// SUPERTYPE of it, rather than being filtered out.
+///
+///     function f(x: { toString(): string } | undefined) {
+///         return typeof x === "string" ? x.toUpperCase() : "";
+///     }
+///
+/// `string` satisfies `{ toString(): string }`, so the guard can only be true
+/// for a `string` and tsc narrows to exactly that. Filtering the constituent
+/// away instead left `never`, and every read on the branch was a TS2339
+/// (`strictTypeofUnionNarrowing`). Same for `{}` and for a weak
+/// `{ toString?(): string }`.
+///
+/// `object`/`function` are excluded: they name no single type here, and the
+/// object-kind tests in `typeofMatchesFn` already keep every constituent that
+/// could satisfy them.
+fn typeofSupertypeOf(c: *Checker, m: TypeId, which: usize) Error!?TypeId {
+    const implied = typeofImpliedType(which) orelse return null;
+    // Only an OBJECT-ish constituent can be a supertype of a primitive without
+    // matching it; screening on the kind keeps the relation query off the hot
+    // path of every `typeof` narrowing over a union of primitives.
+    switch (c.ts.kind(try c.resolveStructural(m))) {
+        .object, .ref, .intersection, .object_keyword => {},
+        else => return null,
+    }
+    if (!try c.isAssignable(implied, m)) return null;
+    return implied;
 }
 
 /// `typeofMatches` plus tsc's `isFunctionObjectType`: for `typeof x ===
