@@ -154,6 +154,185 @@ pub fn check(c: *Checker, recv: TypeId, name: Atom, name_tok: TokenIndex, site: 
     });
 }
 
+/// TS2855 at a `super.x` access: a class FIELD the base class declares is not
+/// reachable through `super` at all.
+///
+/// This is a rule about the DECLARATION, not about accessibility: `super.p`
+/// compiles to `Base.prototype.p` (or `Reflect.get(Base.prototype, "p", this)`),
+/// and a field lives on the INSTANCE, so there is nothing on the prototype to
+/// read whatever the modifiers say. tsc runs it inside
+/// `checkPropertyAccessibility`, ahead of the `private`/`protected` rules and
+/// with an early return — which is why a `private` base field reports this and
+/// not TS2341 (`superPropertyAccess`), and a `protected` one this and not
+/// TS2445/TS2446 (`protectedClassPropertyAccessibleWithinSubclass3`).
+///
+/// tsc's premise is `every(prop.declarations, isPropertyDeclaration)`, so a
+/// member that is a METHOD or an ACCESSOR anywhere in its declaration set is
+/// fine (both live on the prototype), and so is `super.m1 = …`, whose target is
+/// a method. Only the instance table is searched: a STATIC field reached through
+/// `super` in a static method is a property of the base CONSTRUCTOR and works,
+/// while a static field reached through an instance `super` is not a member of
+/// the instance type at all and is tsc's TS2576.
+///
+/// Reached from the `super`-receiver member-access sites only, so a program
+/// without `super.x` pays nothing.
+pub fn checkSuperField(c: *Checker, name: Atom, name_tok: TokenIndex) Error!void {
+    // The innermost enclosing class is the one whose base `super` names.
+    var it = EnclosingClasses.init(c);
+    const cls = it.next(c) orelse return;
+    var sym = (try baseClassSymOf(c, cls)) orelse return;
+    var hops: u32 = 0;
+    while (hops < 32) : (hops += 1) {
+        // The FIRST base that declares the name is the one whose declarations
+        // decide, exactly as the property lookup that found it would resolve.
+        if (instanceMember(c, sym, name)) |msym| {
+            if (!allClassFields(c, msym)) return;
+            try c.diagFmt(2855, c.tokSpan(name_tok), "Class field '{s}' defined by the parent class is not accessible in the child class via super.", .{c.atomText(name)});
+            return;
+        }
+        sym = (try baseClassSymOf(c, sym)) orelse return;
+    }
+}
+
+/// tsc's `isConflictingPrivateProperty` half of `getReducedType`: an
+/// INTERSECTION whose constituents contribute the same property name from
+/// DIFFERENT declarations, at least one of them `private`, is uninhabited —
+/// no value can satisfy two distinct private declarations, since a private
+/// member is only ever the one its own class declared.
+///
+/// It is the rule that makes a mixin stack of privates collapse:
+/// `mixB.(Anonymous class) & A`, where both halves declare `private pvt`,
+/// reduces to `never`, and EVERY access on it is then TS2339 — including
+/// accesses to unrelated public members (`ab.pb`, `mixinPrivateAndProtected`).
+/// tsc reports the reduction as the elaboration on that TS2339.
+///
+/// "From different declarations" is load-bearing and is what keeps a derived
+/// class out of it: `class D extends C` inherits C's `private x`, so `C & D`
+/// resolves the name to the very same symbol in both constituents and tsc's
+/// `createUnionOrIntersectionProperty` hands back that one symbol
+/// (`singleProp`) rather than a synthetic one — no conflict, no reduction.
+/// `protected` is not in the rule at all: two protected declarations of the same
+/// name are compatible, and an access to one is the ordinary TS2445.
+///
+/// COST. Screened three ways before anything is walked: the type must be an
+/// intersection, of at most `max_isect_constituents` object constituents, and
+/// at least one of them must carry a NON-PUBLIC property at all — one flag scan
+/// over already-resolved property tables. Only then does the name-sharing scan
+/// run.
+pub fn intersectionPrivateConflict(c: *Checker, t: TypeId) Error!bool {
+    const n = c.ts.memberCount(t);
+    if (n < 2 or n > max_isect_constituents) return false;
+    var parts: [max_isect_constituents]TypeId = undefined;
+    var objs: [max_isect_constituents]TypeId = undefined;
+    var cn: usize = 0;
+    var any_non_public = false;
+    for (0..n) |i| {
+        const m = c.ts.memberAt(t, @intCast(i));
+        const r = try c.resolveStructural(m);
+        if (c.ts.kind(r) != .object) continue;
+        parts[cn] = m;
+        objs[cn] = r;
+        cn += 1;
+        for (0..c.ts.objectPropCount(r)) |pi| {
+            if (c.ts.objectProp(r, @intCast(pi)).nonPublic()) any_non_public = true;
+        }
+    }
+    if (cn < 2 or !any_non_public) return false;
+    for (0..cn) |i| {
+        // Indices, not a slice: `propOfType` and the declaration walk below may
+        // both grow the type store, and only a pointer into it would go stale.
+        for (0..c.ts.objectPropCount(objs[i])) |pi| {
+            const name = c.ts.objectProp(objs[i], @intCast(pi)).name;
+            var first: ?SymbolId = null;
+            var distinct = false;
+            var private = false;
+            var holders: usize = 0;
+            for (0..cn) |j| {
+                if ((try c.propOfType(objs[j], name)) == null) continue;
+                holders += 1;
+                const msym = try declaredMember(c, parts[j], name);
+                if (msym) |s| {
+                    if (accessOfMember(c, s, false) == .private) private = true;
+                    if (first) |f| {
+                        if (f != s) distinct = true;
+                    } else first = s;
+                } else {
+                    // A constituent that is not a class (a type literal, a
+                    // mapped type) contributes its own declaration of the name,
+                    // which is by construction not the class's.
+                    distinct = true;
+                }
+            }
+            if (holders >= 2 and distinct and private) return true;
+        }
+    }
+    return false;
+}
+
+/// Beyond this, an intersection is not the shape the rule is about and the scan
+/// is not worth its quadratic term.
+const max_isect_constituents = 8;
+
+/// The member symbol `name` resolves to on the class `t` names, following the
+/// `extends` chain — the declaration side of the property, which the resolved
+/// property table does not carry.
+fn declaredMember(c: *Checker, t: TypeId, name: Atom) Error!?SymbolId {
+    const ref = c.refFacetOf(t, c.ts.kind(t)) orelse return null;
+    var sym = c.ts.refSymbol(ref);
+    var hops: u32 = 0;
+    while (hops < 32) : (hops += 1) {
+        if (instanceMember(c, sym, name)) |m| return m;
+        sym = (try baseClassSymOf(c, sym)) orelse return null;
+    }
+    return null;
+}
+
+/// The class symbol `sym`'s `extends` clause names, when it names one directly.
+fn baseClassSymOf(c: *Checker, sym: SymbolId) Error!?SymbolId {
+    if (!c.symFlags(sym).class) return null;
+    const ref = (try c.baseClassRef(sym)) orelse return null;
+    if (c.ts.kind(ref) != .ref) return null;
+    const next = c.ts.refSymbol(ref);
+    return if (next == sym) null else next;
+}
+
+/// `name`'s member symbol in `sym`'s INSTANCE member table, if it declares one.
+fn instanceMember(c: *Checker, sym: SymbolId, name: Atom) ?SymbolId {
+    const saved = c.enterSymFile(sym);
+    defer c.restoreCtx(saved);
+    const ms = c.bind.membersScopeOf(c.localOf(sym)) orelse return null;
+    const lo = c.bind.scope_members_start[ms];
+    const hi = c.bind.scope_members_start[ms + 1];
+    for (lo..hi) |i| {
+        if (c.bind.member_atoms[i] != name) continue;
+        return c.toGlobal(c.bind.member_syms[i]);
+    }
+    return null;
+}
+
+/// tsc's `every(prop.declarations, isClassFieldAndNotAutoAccessor)`, plus "and
+/// not static" — a static declaration is never in the table this walks, so it
+/// can only appear here through a merged member symbol.
+///
+/// An `accessor x = 1` field is spelled like a field and is not one: it declares
+/// a get/set pair on the PROTOTYPE over a private backing slot, so `super.x`
+/// finds the getter and works (`classFieldSuperAccessible`). A parameter
+/// property (`constructor(public p: string)`) is excluded by the tag test — its
+/// declaration is a parameter, not a field — and tsc excludes it the same way,
+/// even though it initializes an instance member exactly as a field does.
+fn allClassFields(c: *Checker, msym: SymbolId) bool {
+    const saved = c.enterSymFile(msym);
+    defer c.restoreCtx(saved);
+    const decls = c.declsOf(msym);
+    if (decls.len == 0) return false;
+    for (decls) |decl| {
+        if (c.nodeTag(decl) != .class_field) return false;
+        const f = c.tree.extraData(ast.Field, c.tree.nodeData(decl).lhs).flags;
+        if (f & (ast.Flags.static | ast.Flags.accessor) != 0) return false;
+    }
+    return true;
+}
+
 /// `typeToString(getDeclaringClass(prop))`: the class's own DECLARED type, so a
 /// generic class names its parameters (`MyGenericClass<T>`, not
 /// `MyGenericClass`).

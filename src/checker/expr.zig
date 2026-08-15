@@ -2533,6 +2533,14 @@ fn memberChainInner(c: *Checker, node: Node) Error!ChainLink {
         .dir = if (c.write_target_node != 0 and c.nodeKey(node) == c.write_target_node) .none else .read,
         .recv_node = d.lhs,
     };
+    // `super.x` on a base-class FIELD is TS2855, and it is a question about the
+    // DECLARATION rather than about the receiver's type — which is what makes it
+    // reachable at all: `super` types as `any` here, so no property lookup runs.
+    // `.none` is the compound-assignment re-read, whose write half already ran
+    // this (see `checkAssignmentTarget`).
+    if (c.nodeTag(d.lhs) == .super_expr and site.dir != .none) {
+        try accessibility.checkSuperField(c, name, name_tok);
+    }
     var pt = try propertyTypeOf(c, obj_t, name, name_tok, site);
     // Property-path narrowing: peel the whole access spine into a member
     // path (`x.p`, `this.p`, `x.a.b`, …) capped at `max_deep_ref_depth`.
@@ -2670,6 +2678,17 @@ fn entityNameOf(c: *Checker, node: Node) ?[]const u8 {
 /// property, so a public member costs one branch.
 fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex, site: accessibility.Site) Error!TypeId {
     const k = c.ts.kind(t);
+    // tsc's `getReducedApparentType`, which every property access runs its
+    // receiver through: an intersection with a CONFLICTING PRIVATE property is
+    // uninhabited, and `never` has no members whatever name was asked for — so
+    // even a public member of one constituent is TS2339 (see
+    // `accessibility.intersectionPrivateConflict`).
+    if (k == .intersection and try accessibility.intersectionPrivateConflict(c, t)) {
+        try c.diagFmt(2339, c.tokSpan(name_tok), "Property '{s}' does not exist on type 'never'.", .{
+            c.atomText(name),
+        });
+        return types.error_type;
+    }
     switch (k) {
         .any, .err, .none => return types.any_type,
         // `never` has no members, so tsc's `getPropertyOfType` finds nothing
@@ -3988,6 +4007,10 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
             var obj_t = try c.checkExprCached(d.lhs, types.no_type);
             obj_t = try checkNonNullType(c, obj_t, d.lhs);
             const name = try c.memberAtom(d.rhs);
+            // `super.field = v` is TS2855 like the read is — tsc's
+            // `checkPropertyAccessibility` runs on both directions. See the
+            // read site in `memberChainInner`.
+            if (c.nodeTag(d.lhs) == .super_expr) try accessibility.checkSuperField(c, name, d.rhs);
             const r = try c.resolveStructural(obj_t);
             if (try c.propOfType(r, name)) |p| {
                 if (p.nonPublic()) try accessibility.check(c, obj_t, name, d.rhs, .{ .dir = .write, .recv_node = d.lhs });
