@@ -1,0 +1,326 @@
+//! The one NOMINAL rule inside the structural relation: tsc's
+//! `private`/`protected` member screen in `propertiesRelatedTo`.
+//!
+//! Two classes that each declare `private a: string` are UNRELATED, however
+//! identical their member types, because a `private` member is only ever the
+//! one its own class declared — no value can satisfy two separate private
+//! declarations of the same name. tsc spells the whole rule as a comparison of
+//! the two property SYMBOLS' declarations, run before either member type is
+//! related (`checker.ts`, `propertiesRelatedTo`):
+//!
+//!     if (sourceProp !== targetProp) {
+//!         const sourcePropFlags = getDeclarationModifierFlagsFromSymbol(sourceProp);
+//!         const targetPropFlags = getDeclarationModifierFlagsFromSymbol(targetProp);
+//!         if (sourcePropFlags & ModifierFlags.Private || targetPropFlags & ModifierFlags.Private) {
+//!             if (sourceProp.valueDeclaration !== targetProp.valueDeclaration) {
+//!                 …Types_have_separate_declarations_of_a_private_property…
+//!                 return Ternary.False;
+//!             }
+//!         } else if (targetPropFlags & ModifierFlags.Protected) {
+//!             if (!isValidOverrideOf(sourceProp, targetProp)) {
+//!                 …Property_0_is_protected_but_type_1_is_not_a_class_derived_from_2…
+//!                 return Ternary.False;
+//!             }
+//!         } else if (sourcePropFlags & ModifierFlags.Protected) {
+//!             …Property_0_is_protected_in_type_1_but_public_in_type_2…
+//!             return Ternary.False;
+//!         }
+//!     }
+//!
+//! `isValidOverrideOf` is `hasBaseType(getDeclaringClass(sourceProp),
+//! getDeclaringClass(targetProp))`: a `protected` target member accepts a
+//! source member only from a class DERIVED from the one that declared it, which
+//! is the same asymmetry the access-site rule has (TS2446 — one subclass cannot
+//! read a sibling subclass's protected state).
+//!
+//! ztsc has no property symbols: a resolved `types.Prop` is a name, a type and
+//! a flag word, and `prop_flag_non_public` is the only trace the declaration
+//! leaves on it. The declaration side is therefore rediscovered the way
+//! `accessibility.zig` rediscovers it at an access site — by walking the
+//! receiver's declared heritage for the class whose member table declares the
+//! name — and two properties are "the same symbol" exactly when that walk lands
+//! on the same member symbol from both sides. That is the identity tsc's
+//! `valueDeclaration` comparison observes: an INHERITED private member resolves
+//! to the base's one symbol from the base and from every derived class, so
+//! `class D extends A {}` still relates to `A`, while a re-declaration in `D`
+//! is its own symbol and does not.
+//!
+//! COST. Every caller screens on `prop_flag_non_public` first — already loaded
+//! on the `Prop`/table slot the relation walk read to get the member's name —
+//! so a program whose compared types have no non-public member anywhere pays
+//! one predictable-false branch per property pair and nothing else. Only past
+//! that bit does anything here run, and then it is the binder's member tables
+//! and the already-memoized `declaredBaseRefs` heritage: no type is resolved
+//! and no member type is instantiated.
+
+const binder = @import("../frontend/binder.zig");
+const intern = @import("../intern.zig");
+const types = @import("../types.zig");
+
+const Atom = intern.Atom;
+const SymbolId = binder.SymbolId;
+const TypeId = types.TypeId;
+
+const checker_zig = @import("../checker.zig");
+const Checker = checker_zig.Checker;
+const Error = checker_zig.Error;
+
+const accessibility = @import("accessibility.zig");
+const Access = accessibility.Access;
+
+/// Bounds shared by both heritage walks below, matching every other bounded
+/// heritage walk in the checker (`accessibility.declaringClass`,
+/// `heritage.baseClassMember`).
+const max_heritage_nodes = 32;
+
+/// The screen for the one pair the property walk can never see: two distinct
+/// REFERENCES whose member tables materialize to the very same type id.
+///
+/// ztsc hash-conses member tables, so `class A { private a: string }` and
+/// `class B { private a: string }` are ONE object type — and the relation's
+/// reference arm answers `rs == rt` as "related" without comparing a single
+/// property. tsc has no such collapse (a class's instance type is a fresh
+/// object per declaration), and the pair is precisely the one the nominal rule
+/// is about: nothing structural distinguishes the two classes, only their
+/// declarations do. So the shared table decides nothing here; the two
+/// references' own declarations do.
+///
+/// Screened on the table's flag words first, so an identical-table pair with no
+/// non-public member anywhere — the common case this shortcut exists for —
+/// answers after one scan of already-resolved `Prop`s and no heritage walk at
+/// all.
+pub fn identicalTableRelated(c: *Checker, src: TypeId, dst: TypeId, table: TypeId) Error!bool {
+    if (c.ts.kind(table) != .object) return true;
+    const n = c.ts.objectPropCount(table);
+    for (0..n) |i| {
+        // One table, so its flags are BOTH sides' flags: a name non-public here
+        // is non-public on the source and on the target.
+        if (!c.ts.objectProp(table, @intCast(i)).nonPublic()) continue;
+        const name = c.ts.objectProp(table, @intCast(i)).name;
+        if (!try nonPublicPropRelated(c, src, dst, name, true, true)) return false;
+    }
+    return true;
+}
+
+/// Whether the property `name` — already known to carry
+/// `prop_flag_non_public` on at least one of the two sides — may relate at all,
+/// BEFORE its member types are compared. `false` is tsc's `Ternary.False`
+/// straight out of `propertiesRelatedTo`.
+///
+/// `src` and `dst` are the two sides as the relation holds them: a `.ref`, or a
+/// materialized object whose `origin` names one (`refFacetOf`). `*_non_public`
+/// are the two `Prop` flag bits the caller already read.
+///
+/// A side that names no class at all — a type literal, a mapped type, an
+/// anonymous object — yields no declaring symbol, and that is an ANSWER, not a
+/// failure: its property is declared somewhere the other side's class is not, so
+/// tsc's `valueDeclaration` comparison says "different" and a non-public
+/// declaration on the OTHER side decides the pair. That is what makes
+/// `{ a: string }` and a `class P { private a: string }` mutually unassignable in
+/// both directions.
+///
+/// The one case that is neither is a side whose property CARRIES the non-public
+/// flag and whose declaration this walk could not find — a private static
+/// (reached through a synthesized construct-signature object, which names no
+/// class), or a member inherited through a heritage clause that is not a plain
+/// reference (`class D extends Mixin(Base)`), where the flag was folded into
+/// `D`'s own table without a declaring symbol to attribute it to. There the rule
+/// has no `valueDeclaration` to compare and this answers `true`: an
+/// under-report, never a false positive.
+pub fn nonPublicPropRelated(
+    c: *Checker,
+    src: TypeId,
+    dst: TypeId,
+    name: Atom,
+    src_non_public: bool,
+    dst_non_public: bool,
+) Error!bool {
+    return (try nonPublicPropMismatch(c, src, dst, name, src_non_public, dst_non_public)) == null;
+}
+
+/// WHICH of tsc's four terminal messages the pair earned, for the elaboration
+/// re-walk (`elaborate.zig`) to render. `null` is "related".
+///
+/// The rule and its message are one decision in tsc — the `reportError` call
+/// sits in the arm that returns `Ternary.False` — so they are one function here
+/// too, and `nonPublicPropRelated` is this asked for its bit. Two copies of the
+/// arm order would drift, and the drift would be a message that names a rule the
+/// relation did not apply.
+pub const Mismatch = union(enum) {
+    /// `Types have separate declarations of a private property '{name}'.`
+    separate_private,
+    /// `Property '{name}' is private in type '{private_cls}' but not in type
+    /// '{other}'.` — tsc names the PRIVATE side first whichever direction the
+    /// assignment ran in.
+    private_one_side: struct { private_cls: SymbolId, other: TypeId },
+    /// `Property '{name}' is protected but type '{src}' is not a class derived
+    /// from '{tgt}'.`
+    protected_not_derived: struct { src_cls: ?SymbolId, tgt_cls: SymbolId },
+    /// `Property '{name}' is protected in type '{src}' but public in type
+    /// '{tgt}'.` — the whole SOURCE and TARGET types, not the declaring classes.
+    protected_vs_public,
+};
+
+fn nonPublicPropMismatch(
+    c: *Checker,
+    src: TypeId,
+    dst: TypeId,
+    name: Atom,
+    src_non_public: bool,
+    dst_non_public: bool,
+) Error!?Mismatch {
+    const s = try declaringMember(c, src, name);
+    const t = try declaringMember(c, dst, name);
+    // tsc's `sourceProp !== targetProp` guard: one symbol reached from both
+    // sides is one declaration, so an inherited non-public member relates and
+    // `class D extends P {}` is still a `P`.
+    if (s != null and t != null and s.?.msym == t.?.msym) return null;
+    var s_access: Access = .public;
+    if (s) |x| {
+        s_access = accessibility.accessOfMember(c, x.msym, false);
+    } else if (src_non_public or !try declaresOwnMember(c, src, name)) return null;
+    var t_access: Access = .public;
+    if (t) |x| {
+        t_access = accessibility.accessOfMember(c, x.msym, false);
+    } else if (dst_non_public or !try declaresOwnMember(c, dst, name)) return null;
+    if (s_access == .private and t_access == .private) return .separate_private;
+    if (s_access == .private) return .{ .private_one_side = .{ .private_cls = s.?.cls, .other = dst } };
+    if (t_access == .private) return .{ .private_one_side = .{ .private_cls = t.?.cls, .other = src } };
+    // `isValidOverrideOf`: a `protected` target member accepts only a source
+    // member declared by a class DERIVED from the declaring one. A source with
+    // no declaring class at all supplies none.
+    if (t_access == .protected) {
+        if (s) |sc| {
+            if (try derivesFrom(c, sc.cls, t.?.cls)) return null;
+        }
+        return .{ .protected_not_derived = .{
+            .src_cls = if (s) |sc| sc.cls else null,
+            .tgt_cls = t.?.cls,
+        } };
+    }
+    if (s_access == .protected) return .protected_vs_public;
+    return null;
+}
+
+/// The mismatch for the FIRST target property that has one — the elaboration
+/// re-walk's entry point, mirroring the order `propertiesRelatedTo` visits
+/// properties in. `table` is the target's resolved member table, whose flag
+/// words screen the walk exactly as the relation's own loop does.
+pub fn firstMismatch(c: *Checker, src: TypeId, dst: TypeId, table: TypeId) Error!?Named {
+    if (c.ts.kind(table) != .object) return null;
+    for (0..c.ts.objectPropCount(table)) |i| {
+        const tp = c.ts.objectProp(table, @intCast(i));
+        const sp = (try c.propOfTypeEx(src, tp.name, false)) orelse continue;
+        if (!sp.nonPublic() and !tp.nonPublic()) continue;
+        if (try nonPublicPropMismatch(c, src, dst, tp.name, sp.nonPublic(), tp.nonPublic())) |m| {
+            return .{ .name = tp.name, .why = m };
+        }
+    }
+    return null;
+}
+
+pub const Named = struct { name: Atom, why: Mismatch };
+
+/// Does `ty` DECLARE a member named `name`, as opposed to ANSWERING that name
+/// through an index signature, through an `any` base, or through the global
+/// `Object` augment?
+///
+/// tsc's premise for the whole rule is that both sides have a property SYMBOL:
+/// `propertiesRelatedTo` reaches the accessibility arm only once
+/// `getPropertyOfType(source, name)` has handed it one, and a name satisfied by
+/// an index info has none. ztsc's `relationSrcProp` synthesizes a `Prop` for all
+/// three of those cases, so the side with no declaring class has to be
+/// distinguished from the side with no declaration at all — and it is exactly
+/// this distinction that keeps `interface State extends AnyAlias {}` assignable
+/// to a nominal class with a `private` member (`assignability/075`,
+/// `assignability/076`: tsc relates such an interface AS `any`, so its
+/// properties are not declarations of anything).
+fn declaresOwnMember(c: *Checker, ty: TypeId, name: Atom) Error!bool {
+    const r = try c.resolveStructural(ty);
+    switch (c.ts.kind(r)) {
+        .object => {
+            for (0..c.ts.objectPropCount(r)) |i| {
+                if (c.ts.objectProp(r, @intCast(i)).name == name) return true;
+            }
+            return false;
+        },
+        .intersection => {
+            for (try c.memberList(r)) |m| {
+                if (try declaresOwnMember(c, m, name)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
+/// The class (or interface) symbol whose own member table declares `name`, plus
+/// that member's symbol — tsc's `getDeclaringClass(prop)` and the property
+/// symbol itself, which it has for free from the member table the lookup came
+/// out of.
+///
+/// Breadth-first over the DECLARED heritage rather than the class `extends`
+/// chain alone, because an interface may extend a class and several bases at
+/// once, and the property lookup that produced the `Prop` followed the same
+/// graph.
+const Declaring = struct { cls: SymbolId, msym: SymbolId };
+
+fn declaringMember(c: *Checker, ty: TypeId, name: Atom) Error!?Declaring {
+    const ref = c.refFacetOf(ty, c.ts.kind(ty)) orelse return null;
+    var queue: [max_heritage_nodes]SymbolId = undefined;
+    var seen: [max_heritage_nodes]SymbolId = undefined;
+    var qn: usize = 1;
+    var head: usize = 0;
+    var n: usize = 0;
+    queue[0] = c.ts.refSymbol(ref);
+    while (head < qn) {
+        const sym = queue[head];
+        head += 1;
+        if (n == seen.len) return null;
+        var dup = false;
+        for (seen[0..n]) |s| if (s == sym) {
+            dup = true;
+        };
+        if (dup) continue;
+        seen[n] = sym;
+        n += 1;
+        if (accessibility.instanceMember(c, sym, name)) |msym| return .{ .cls = sym, .msym = msym };
+        for (try c.declaredBaseRefs(sym)) |b| {
+            if (c.ts.kind(b) != .ref or qn == queue.len) continue;
+            queue[qn] = c.ts.refSymbol(b);
+            qn += 1;
+        }
+    }
+    return null;
+}
+
+/// tsc's `hasBaseType(derived, base)` over the declared heritage graph:
+/// equality included, so a class is its own base and a re-declaration inside a
+/// derived class is still a valid override of the base's `protected` member.
+fn derivesFrom(c: *Checker, derived: SymbolId, base: SymbolId) Error!bool {
+    var queue: [max_heritage_nodes]SymbolId = undefined;
+    var seen: [max_heritage_nodes]SymbolId = undefined;
+    var qn: usize = 1;
+    var head: usize = 0;
+    var n: usize = 0;
+    queue[0] = derived;
+    while (head < qn) {
+        const sym = queue[head];
+        head += 1;
+        if (sym == base) return true;
+        if (n == seen.len) return false;
+        var dup = false;
+        for (seen[0..n]) |s| if (s == sym) {
+            dup = true;
+        };
+        if (dup) continue;
+        seen[n] = sym;
+        n += 1;
+        for (try c.declaredBaseRefs(sym)) |b| {
+            if (c.ts.kind(b) != .ref or qn == queue.len) continue;
+            queue[qn] = c.ts.refSymbol(b);
+            qn += 1;
+        }
+    }
+    return false;
+}

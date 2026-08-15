@@ -297,7 +297,12 @@ fn baseClassSymOf(c: *Checker, sym: SymbolId) Error!?SymbolId {
 }
 
 /// `name`'s member symbol in `sym`'s INSTANCE member table, if it declares one.
-fn instanceMember(c: *Checker, sym: SymbolId, name: Atom) ?SymbolId {
+///
+/// `pub` for `nominal_members.zig`, which rediscovers the same declaration side
+/// of a property inside the RELATION (tsc's `private`/`protected` screen in
+/// `propertiesRelatedTo`) and must ask the identical question of the identical
+/// table — see the note there.
+pub fn instanceMember(c: *Checker, sym: SymbolId, name: Atom) ?SymbolId {
     const saved = c.enterSymFile(sym);
     defer c.restoreCtx(saved);
     const ms = c.bind.membersScopeOf(c.localOf(sym)) orelse return null;
@@ -336,7 +341,11 @@ fn allClassFields(c: *Checker, msym: SymbolId) bool {
 /// `typeToString(getDeclaringClass(prop))`: the class's own DECLARED type, so a
 /// generic class names its parameters (`MyGenericClass<T>`, not
 /// `MyGenericClass`).
-fn declaringClassName(c: *Checker, cls: SymbolId) Error![]const u8 {
+///
+/// `pub` for `elaborate.zig` (see `instanceMember`): tsc's `private`/`protected`
+/// messages inside `propertiesRelatedTo` name the declaring class through the
+/// very same `typeToString(getDeclaringClass(prop))`.
+pub fn declaringClassName(c: *Checker, cls: SymbolId) Error![]const u8 {
     var tps: std.ArrayList(checker_zig.Checker.TypeParamInfo) = .empty;
     defer tps.deinit(c.scratch());
     try c.typeParamsOf(cls, &tps);
@@ -436,7 +445,11 @@ fn declaringClass(c: *Checker, recv: TypeId, name: Atom, site: Site) Error!?Decl
 /// modifiers for a write when the symbol has a `set` accessor, the getter's
 /// for a read when it has a `get` accessor, else the first class-body
 /// declaration's.
-fn accessOfMember(c: *Checker, msym: SymbolId, writing: bool) Access {
+///
+/// `pub` for `nominal_members.zig` (see `instanceMember`): tsc reads the same
+/// `getDeclarationModifierFlagsFromSymbol` in `propertiesRelatedTo`, there
+/// always in the READ direction.
+pub fn accessOfMember(c: *Checker, msym: SymbolId, writing: bool) Access {
     const saved = c.enterSymFile(msym);
     defer c.restoreCtx(saved);
     var first: ?u32 = null;

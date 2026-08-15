@@ -42,6 +42,7 @@ const generics_zig = @import("generics.zig");
 const tuple_zig = @import("tuple_relate.zig");
 const variance_zig = @import("variance.zig");
 const report_zig = @import("assign_report.zig");
+const nominal_members = @import("nominal_members.zig");
 
 // =====================================================================
 // assignability
@@ -1658,6 +1659,14 @@ fn heritageInheritsUnchanged(c: *Checker, src_ref: TypeId, base: TypeId) Error!b
         const sp = (try c.propOfTypeEx(st, bp.name, false)) orelse return false;
         if (sp.ty != bp.ty) return false;
         if (sp.optional() != bp.optional()) return false;
+        // A NON-PUBLIC member is inherited only when the derived declaration IS
+        // the base's. Type identity does not settle that: `class R extends A {
+        // private a: string }` redeclares A's `private a: string` at the very
+        // same type, and the two declarations are still unrelated (tsc reports
+        // TS2415 on the `extends` clause and answers "not related" at every
+        // use). See `nominal_members.zig`.
+        if ((sp.nonPublic() or bp.nonPublic()) and
+            !try nominal_members.nonPublicPropRelated(c, src_ref, base, bp.name, sp.nonPublic(), bp.nonPublic())) return false;
     }
     // Index signatures and call/construct signatures are inherited the same
     // way and compared the same way. A base that has none demands nothing.
@@ -2524,7 +2533,10 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         const rs = try c.resolveStructural(s);
         const rt = try c.resolveStructural(t);
         if (rs == s and rt == t) return false;
-        if (rs == rt) return true;
+        // One hash-consed table for two distinct references is where the
+        // nominal `private`/`protected` rule has to be asked, because no
+        // property walk follows (see `nominal_members.identicalTableRelated`).
+        if (rs == rt) return nominal_members.identicalTableRelated(c, s, t, rs);
         return relateFolded(c, rs, rt, false);
     }
     // The single-element variadic-tuple bridge: for a generic `T`, `[...T]`
@@ -2732,6 +2744,13 @@ const ObjSide = struct {
         return c.ts.objectProp(v.table, i).flags;
     }
 
+    /// This side as the NOMINAL screen wants it: the reference whose symbol
+    /// names the declaring class, or the materialized table when there is none
+    /// (whose `origin` `refFacetOf` still consults). See `nominal_members.zig`.
+    fn nominal(v: ObjSide) TypeId {
+        return if (v.ref != 0) v.ref else v.table;
+    }
+
     fn nameAt(v: ObjSide, c: *const Checker, i: u32) Atom {
         return c.ts.objectProp(v.table, i).name;
     }
@@ -2895,6 +2914,14 @@ fn lazyStructural(c: *Checker, sv: ObjSide, tv: ObjSide) Error!bool {
         if (sv.slotOf(c, tv.nameAt(c, ti))) |si| {
             const s_opt = sv.flagsAt(c, si) & types.prop_flag_optional != 0;
             if (s_opt and !t_opt) return false;
+            // The nominal screen, on the same flag bit the eager walk reads —
+            // carried through `instantiateId`'s `.object` arm, so it is
+            // readable off the un-substituted table (see `nominal_members.zig`
+            // and `structuralAssignable`, the eager form of this walk).
+            const s_np = sv.flagsAt(c, si) & types.prop_flag_non_public != 0;
+            const t_np = tv.flagsAt(c, ti) & types.prop_flag_non_public != 0;
+            if ((s_np or t_np) and
+                !try nominal_members.nonPublicPropRelated(c, sv.nominal(), tv.nominal(), tv.nameAt(c, ti), s_np, t_np)) return false;
             st = try sv.typeAt(c, si);
             if (s_opt) st = try c.makeUnion2(st, types.undefined_type);
         } else if (try c.objectInterfaceProp(tv.nameAt(c, ti))) |op| {
@@ -3369,6 +3396,11 @@ pub fn structuralAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
             return false;
         };
         if (sp.optional() and !tp.optional()) return false;
+        // tsc's `private`/`protected` screen, ahead of relating the member
+        // types exactly as `propertiesRelatedTo` runs it. Gated on the flag
+        // already loaded on both `Prop`s — see `nominal_members.zig`.
+        if ((sp.nonPublic() or tp.nonPublic()) and
+            !try nominal_members.nonPublicPropRelated(c, s, t, tp.name, sp.nonPublic(), tp.nonPublic())) return false;
         var st = sp.ty;
         if (sp.optional()) st = try c.makeUnion2(st, types.undefined_type);
         var tt = tp.ty;

@@ -66,6 +66,9 @@ const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
+const accessibility = @import("accessibility.zig");
+const nominal_members = @import("nominal_members.zig");
+
 /// Deepest chain rendered. tsgo has no cutoff; this is a resource bound so a
 /// pathological (or cyclic-but-unequal) type pair cannot produce an unbounded
 /// message. Well past anything a real program produces.
@@ -130,6 +133,12 @@ const Tail = union(enum) {
     /// A tuple too short for its target. Prints BELOW the last level's
     /// relation line (tsc does not suppress that one).
     tuple_arity: struct { have: u32, need: u32 },
+    /// tsc's terminal `private`/`protected` message out of
+    /// `propertiesRelatedTo` (see `nominal_members.zig`), already rendered:
+    /// which of the four sentences applies is the relation's own decision, so
+    /// it is taken from there rather than re-derived here. Prints BELOW the
+    /// last level's relation line, like `tuple_arity`.
+    nominal: []const u8,
 };
 
 const Found = union(enum) { step: Level, tail: Tail };
@@ -357,7 +366,7 @@ fn findStep(c: *Checker, s0: TypeId, t0: TypeId, missing_ok: bool) Error!?Found 
     // tsc's `structuredTypeRelatedTo` order, and the order the messages must
     // nest in.
     if (store.kind(t) == .object) {
-        if (try propertyStep(c, s0, s, t, missing_ok)) |f| return f;
+        if (try propertyStep(c, s0, t0, s, t, missing_ok)) |f| return f;
     }
 
     if (try signatureStep(c, s, t, false)) |f| return f;
@@ -412,7 +421,12 @@ fn bestUnionMatch(c: *Checker, s: TypeId, t: TypeId) Error!?TypeId {
 
 /// A missing required property (the chain's tail) or the first incompatible
 /// one (a `.property` step).
-fn propertyStep(c: *Checker, s0: TypeId, s: TypeId, t: TypeId, missing_ok: bool) Error!?Found {
+/// `s0`/`t0` are the two sides as the caller was handed them, `s`/`t` their
+/// `resolveStructural`ed forms. Both spellings are needed: the member tables come
+/// from the resolved pair, while the nominal screen needs the REFERENCES —
+/// hash-consing makes two nominally distinct classes with the same members one
+/// resolved type (see `nominal_members.identicalTableRelated`).
+fn propertyStep(c: *Checker, s0: TypeId, t0: TypeId, s: TypeId, t: TypeId, missing_ok: bool) Error!?Found {
     const store = &c.ts;
     const objecty = switch (store.kind(s)) {
         .object, .intersection => true,
@@ -435,6 +449,15 @@ fn propertyStep(c: *Checker, s0: TypeId, s: TypeId, t: TypeId, missing_ok: bool)
             std.mem.sort(Atom, missing.items, c, atomTextLess);
             return .{ .tail = .{ .missing = missing.items } };
         }
+    }
+
+    // The nominal `private`/`protected` screen, which `propertiesRelatedTo`
+    // runs per matched property AFTER the unmatched-property pass and BEFORE it
+    // relates a single member type — so its message comes first here too. It is
+    // terminal: tsc reports and returns, leaving the enclosing relation line as
+    // the head.
+    if (try nominal_members.firstMismatch(c, s0, t0, t)) |m| {
+        return .{ .tail = .{ .nominal = try nominalText(c, s0, t0, m) } };
     }
 
     // The first incompatible property, in name-TEXT order. The stored order is
@@ -472,6 +495,45 @@ fn propertyStep(c: *Checker, s0: TypeId, s: TypeId, t: TypeId, missing_ok: bool)
 
 fn atomTextLess(c: *Checker, a: Atom, b: Atom) bool {
     return std.mem.order(u8, c.atomText(a), c.atomText(b)) == .lt;
+}
+
+/// tsc's four `propertiesRelatedTo` accessibility messages, verbatim. Which one
+/// applies is decided where the rule is (`nominal_members.zig`); this only
+/// spells it. The type names follow tsc's own arguments: the DECLARING CLASS for
+/// the private/derived-from messages (`typeToString(getDeclaringClass(prop))`,
+/// which prints a generic class with its parameters), and the whole source and
+/// target for the protected-vs-public one.
+fn nominalText(c: *Checker, s: TypeId, t: TypeId, m: nominal_members.Named) Error![]const u8 {
+    const name = try propDisplay(c, m.name);
+    return switch (m.why) {
+        .separate_private => std.fmt.allocPrint(
+            c.scratch(),
+            "Types have separate declarations of a private property '{s}'.",
+            .{name},
+        ) catch error.OutOfMemory,
+        .private_one_side => |p| blk: {
+            const priv = try accessibility.declaringClassName(c, p.private_cls);
+            break :blk std.fmt.allocPrint(
+                c.scratch(),
+                "Property '{s}' is private in type '{s}' but not in type '{s}'.",
+                .{ name, priv, try c.typeToString(p.other) },
+            ) catch error.OutOfMemory;
+        },
+        .protected_not_derived => |p| blk: {
+            const src = if (p.src_cls) |cls| try accessibility.declaringClassName(c, cls) else try c.typeToString(s);
+            const tgt = try accessibility.declaringClassName(c, p.tgt_cls);
+            break :blk std.fmt.allocPrint(
+                c.scratch(),
+                "Property '{s}' is protected but type '{s}' is not a class derived from '{s}'.",
+                .{ name, src, tgt },
+            ) catch error.OutOfMemory;
+        },
+        .protected_vs_public => std.fmt.allocPrint(
+            c.scratch(),
+            "Property '{s}' is protected in type '{s}' but public in type '{s}'.",
+            .{ name, try c.typeToString(s), try c.typeToString(t) },
+        ) catch error.OutOfMemory,
+    };
 }
 
 /// The single call (or construct) signature of `ty`, when it has exactly one.
@@ -580,6 +642,7 @@ fn render(c: *Checker, levels: []const Level, tail: Tail) Error![]const u8 {
             tail.tuple_arity.have, tail.tuple_arity.need,
         });
     }
+    if (tail == .nominal) try line(&out.writer, &indent, "{s}", .{tail.nominal});
     return out.written();
 }
 
