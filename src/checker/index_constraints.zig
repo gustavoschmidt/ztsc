@@ -129,6 +129,11 @@ const Own = struct {
     number: ?Site = null,
     string: ?Site = null,
     symbol: ?Site = null,
+    /// The declared KEY type of the string-slot index signature when it is a
+    /// template-literal pattern rather than plain `string` (0 = plain). tsc's
+    /// `isApplicableIndexType` gates the property check on the name being
+    /// assignable to this.
+    string_key: TypeId = 0,
 
     fn idx(o: Own, slot: Slot) ?Site {
         return switch (slot) {
@@ -255,6 +260,13 @@ fn checkOne(c: *Checker, obj: TypeId, own: Own, fallback: ?IfaceFallback) Error!
         for (applicableSlots(text)) |slot| {
             const idx_ty = infos.get(slot);
             if (idx_ty == 0) continue;
+            // A pattern-keyed string index only constrains names assignable
+            // to the pattern (tsc's `isApplicableIndexType`).
+            if (slot == .string and own.string_key != 0 and
+                !try c.isAssignable(try c.ts.makeStringLiteral(p.name, false), own.string_key))
+            {
+                continue;
+            }
             const site = try errorSite(c, own, fallback, p.name, slot) orelse continue;
             if (try c.isAssignable(p.ty, idx_ty)) continue;
             try file(c, site, 2411, "Property '{s}' of type '{s}' is not assignable to '{s}' index type '{s}'.", .{
@@ -448,10 +460,17 @@ fn addIndex(c: *Checker, out: *Own, node: Node, extra: ast.ExtraIndex) Error!voi
         .symbol
     else if (key == types.string_type)
         .string
-    else
-        // A template-literal or union key domain, which ztsc does not model as
-        // an index signature at all — nothing here can be said about it.
+    else {
+        // A template-literal (pattern) key domain. ztsc's type store folds it
+        // into the string-index slot, but tsc's `isApplicableIndexType` only
+        // applies it to member names ASSIGNABLE to the pattern
+        // (`jsxNamespacedNameNotComparedToNonMatchingIndexSignature`:
+        // `"ns:thing"` is not constrained by `` [key: `do-${string}`] ``).
+        // Record the declared key so the property walk can ask.
+        out.string_key = key;
+        out.setIdx(.string, .{ .file = c.cur_file, .span = c.nodeSpan(node) });
         return;
+    };
     out.setIdx(slot, .{ .file = c.cur_file, .span = c.nodeSpan(node) });
 }
 
