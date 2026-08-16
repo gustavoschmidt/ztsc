@@ -36,6 +36,7 @@ const decorators = @import("decorators.zig");
 const diagFmt = Checker.diagFmt;
 const elaborate = @import("elaborate.zig");
 const heritage = @import("heritage.zig");
+const index_constraints = @import("index_constraints.zig");
 const isNonPrimitiveKind = @import("assign.zig").isNonPrimitiveKind;
 const isNullishUnion = @import("flow.zig").isNullishUnion;
 const iteration = @import("iteration.zig");
@@ -1774,6 +1775,19 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
         }
     }
 
+    // Both halves of the class must agree with whatever index signature they
+    // carry — tsc's two `checkIndexConstraints` calls, which run after the
+    // member walk and before `checkPropertyInitialization`.
+    if (class_sym != binder.no_symbol) {
+        try index_constraints.checkClassIndexConstraints(
+            c,
+            node,
+            class_sym,
+            this_t,
+            try c.classStaticType(class_sym),
+        );
+    }
+
     // Both remaining checks read the constructor's FLOW, so they run after the
     // member walk has checked its body. `check_prop_init` is exactly "not
     // ambient, and this file is ours to report on" — the two conditions TS2612
@@ -1830,6 +1844,7 @@ fn checkInterfaceDecl(c: *Checker, node: Node) Error!void {
             try c.checkTypeParamListsIdentical(mergedOrSelf(c, c.toGlobal(sym)), data.name_token);
             try c.checkSubsequentMemberDecls(c.toGlobal(sym), node);
             try heritage.checkInterfaceExtends(c, c.toGlobal(sym), node, data.name_token);
+            try index_constraints.checkInterfaceIndexConstraints(c, c.toGlobal(sym), node, data.name_token);
         }
     }
 }
