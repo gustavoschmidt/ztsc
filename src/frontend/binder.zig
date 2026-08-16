@@ -72,6 +72,8 @@ const intern = @import("../intern.zig");
 const numeric_lit = @import("../numeric_lit.zig");
 const diagnostics = @import("diagnostics.zig");
 const literals = @import("literals.zig");
+const default_exports = @import("default_exports.zig");
+const member_names = @import("member_names.zig");
 const decl_spaces = @import("decl_spaces.zig");
 const impl_expected = @import("impl_expected.zig");
 const source = @import("source.zig");
@@ -474,6 +476,17 @@ const Binder = struct {
     pending_label: Atom = 0,
     /// True while binding the name(s) of an `export`ed declaration.
     exporting_node: Node = 0,
+    /// True while binding the DECLARATION under an `export default` — the
+    /// modifier form (`export default class C {}`), not the expression one.
+    ///
+    /// Such a declaration publishes under the name `default`, never under `C`,
+    /// so its local name carries no exported meaning: tsc's `locals` entry for
+    /// it is the same meaningless placeholder every exported declaration gets,
+    /// and the collision that DOES exist lives on the `default` export name
+    /// (TS2528, `checkDefaultExportClashes`). Kept separate from
+    /// `exporting_node` because that field also drives `noteExport`, and an
+    /// export record under the local name would publish `C` as well.
+    in_export_default: bool = false,
     /// The class / interface / object-type declaration whose members are
     /// being bound (0 outside one). Two blocks of a merging container share a
     /// member scope, and a name repeated ACROSS them merges rather than
@@ -1029,7 +1042,7 @@ const Binder = struct {
             }
             b.sym_flags.items[sym] = existing.merge(flags);
             b.sym_block.items[sym] = b.cur_block;
-            if (b.exporting_node == 0) b.sym_local_bits.items[sym] |= flags.bits();
+            if (b.declaresLocalMeaning()) b.sym_local_bits.items[sym] |= flags.bits();
             try b.appendDecl(sym, decl_node, name_tok);
             try b.noteExport(sym, atom, scope);
             return sym;
@@ -1044,11 +1057,39 @@ const Binder = struct {
         try b.sym_decl_count.append(b.scratch, 0);
         try b.sym_reported.append(b.scratch, 0);
         try b.sym_block.append(b.scratch, b.cur_block);
-        try b.sym_local_bits.append(b.scratch, if (b.exporting_node == 0) flags.bits() else 0);
+        try b.sym_local_bits.append(b.scratch, if (b.declaresLocalMeaning()) flags.bits() else 0);
         gop.value_ptr.* = sym;
         try b.appendDecl(sym, decl_node, name_tok);
         try b.noteExport(sym, atom, scope);
         return sym;
+    }
+
+    /// The export context a nested container BODY runs under: none. `export`
+    /// and `export default` apply to the declaration they wrap, never to the
+    /// declarations inside its body (tsc gets this from `container` moving), so
+    /// every site that pushes a function/class/namespace body clears both flags
+    /// and restores them on the way out.
+    const ExportCtx = struct { node: Node, default: bool };
+
+    fn clearExportCtx(b: *Binder) ExportCtx {
+        const saved: ExportCtx = .{ .node = b.exporting_node, .default = b.in_export_default };
+        b.exporting_node = 0;
+        b.in_export_default = false;
+        return saved;
+    }
+
+    fn restoreExportCtx(b: *Binder, saved: ExportCtx) void {
+        b.exporting_node = saved.node;
+        b.in_export_default = saved.default;
+    }
+
+    /// Does the declaration being bound put a MEANING in its container's
+    /// `locals` table? An `export`ed one does not — tsc leaves a placeholder
+    /// there and declares the meaning in `exports` — and an `export default`
+    /// declaration does not either, for the same reason under a different name
+    /// (see `in_export_default`).
+    fn declaresLocalMeaning(b: *const Binder) bool {
+        return b.exporting_node == 0 and !b.in_export_default;
     }
 
     /// The flags a new declaration's `excludes` mask is tested against: which
@@ -1077,7 +1118,7 @@ const Binder = struct {
     /// *after* `declare` returns (`bindNamespace` needs the symbol id first),
     /// so the accumulated local bits never carry it.
     fn priorFlags(b: *Binder, scope: ScopeId, sym: SymbolId, existing: SymbolFlags) SymbolFlags {
-        if (b.exporting_node != 0) return existing;
+        if (b.exporting_node != 0 and !b.in_export_default) return existing;
         if (scope != file_scope and b.scope_kinds.items[scope] != .namespace) return existing;
         var f: SymbolFlags = @bitCast(b.sym_local_bits.items[sym]);
         f.ns_uninstantiated = existing.ns_uninstantiated;
@@ -2411,9 +2452,8 @@ const Binder = struct {
         // constant reference captured by this closure (tsc: FlowStart.node).
         const outer_flow = b.cur_flow;
         const saved = b.saveState();
-        const clear_export = b.exporting_node;
-        b.exporting_node = 0;
-        defer b.exporting_node = clear_export;
+        const saved_export = b.clearExportCtx();
+        defer b.restoreExportCtx(saved_export);
 
         const s = try b.pushScope(.function, node);
         b.var_scope = s;
@@ -2573,6 +2613,15 @@ const Binder = struct {
                     const class_scope = b.scope_parents.items[b.cur_scope];
                     if (b.memberScopeOfClassScope(class_scope)) |ms| {
                         const tok = b.tree.nodeMainToken(d.lhs);
+                        // TS2398: the modifier makes this a class member, and
+                        // `constructor` is the one member name a class cannot
+                        // have. Still DECLARED (under the literal text — the
+                        // constructor itself sits under a reserved key), so two
+                        // ctor signatures that both spell it are still the
+                        // duplicate identifier tsc reports.
+                        if (b.tree.tokens.tag(tok) == .keyword_constructor) {
+                            try b.diag(.ctor_as_param_property_name, tok);
+                        }
                         _ = try b.declare(ms, try b.atomOfToken(tok), .property, node, tok, .{
                             .readonly_member = e.flags & ast.Flags.readonly != 0,
                             .non_public = e.flags & nonpublic_mask != 0,
@@ -2609,9 +2658,8 @@ const Binder = struct {
             });
         }
         const saved = b.saveState();
-        const clear_export = b.exporting_node;
-        b.exporting_node = 0;
-        defer b.exporting_node = clear_export;
+        const saved_export = b.clearExportCtx();
+        defer b.restoreExportCtx(saved_export);
         // A `declare class`'s members are ambient, so a bodyless method there is
         // a declaration and not a missing implementation
         // (`checkMissingImplementations`). Inherited, like a `declare namespace`
@@ -2695,9 +2743,28 @@ const Binder = struct {
                     const is_set = proto.flags & ast.Flags.set != 0;
                     const tok = b.tree.nodeMainToken(member);
                     try b.bindComputedKey(member, proto.flags);
+                    // TS1341: an ACCESSOR named `constructor` is not the
+                    // constructor (tsc's parser only makes a METHOD of that name
+                    // a `ConstructorDeclaration`) — it is an ordinary accessor
+                    // occupying a slot the prototype reserves, which tsc rejects
+                    // outright. Not gated on `static`.
+                    if ((is_get or is_set) and b.tree.tokens.tag(tok) == .keyword_constructor) {
+                        try b.diag(.ctor_may_not_be_accessor, tok);
+                    }
                     const kind: DeclKind = if (is_get) .getter else if (is_set) .setter else .method;
                     if (!nameless(proto.flags)) {
-                        const atom = try b.memberNameKey(tok, proto.flags);
+                        // The constructor goes in the member table under a RESERVED
+                        // key, tsc's `InternalSymbolName.Constructor`: `constructor`
+                        // is a name a parameter property can be spelled with
+                        // (`constructor(public constructor: string)`), and keying
+                        // both under the literal text made every such class a
+                        // duplicate-identifier pair. Nothing looks the constructor
+                        // up by text — `isCtorMember`/`isCtorName` are the only two
+                        // ways to ask, and both know the reserved spelling.
+                        const atom = if (member_names.isCtorMethod(b.tree, member, proto.flags))
+                            try b.atomOf(member_names.ctor_member_name)
+                        else
+                            try b.memberNameKey(tok, proto.flags);
                         _ = try b.declare(if (is_static) ss else ms, atom, kind, member, tok, .{
                             .static_member = is_static,
                             .has_impl = md.rhs != 0 and !is_get and !is_set,
@@ -2902,9 +2969,11 @@ const Binder = struct {
         const is_ambient = was_ambient or (data.flags & ast.Flags.declare != 0);
         b.ambient = is_ambient;
         defer b.ambient = was_ambient;
-        const clear_export = b.exporting_node;
-        b.exporting_node = if (is_ambient) node else 0;
-        defer b.exporting_node = clear_export;
+        const saved_export = b.clearExportCtx();
+        defer b.restoreExportCtx(saved_export);
+        // A `declare namespace` body exports its members implicitly, so the
+        // context is re-armed at the block itself rather than cleared.
+        if (is_ambient) b.exporting_node = node;
 
         // Merged blocks bind into one shared namespace scope.
         var ns_scope: ScopeId = 0;
@@ -2964,9 +3033,8 @@ const Binder = struct {
         const was_ambient = b.ambient;
         b.ambient = true;
         defer b.ambient = was_ambient;
-        const clear_export = b.exporting_node;
-        b.exporting_node = 0;
-        defer b.exporting_node = clear_export;
+        const saved_export = b.clearExportCtx();
+        defer b.restoreExportCtx(saved_export);
 
         try b.scope_stack.append(b.scratch, gs);
         b.cur_scope = gs;
@@ -2997,9 +3065,8 @@ const Binder = struct {
         const was_ambient = b.ambient;
         b.ambient = true;
         defer b.ambient = was_ambient;
-        const clear_export = b.exporting_node;
-        b.exporting_node = 0;
-        defer b.exporting_node = clear_export;
+        const saved_export = b.clearExportCtx();
+        defer b.restoreExportCtx(saved_export);
         const saved_mod_scope = b.ambient_mod_scope;
         b.ambient_mod_scope = ms;
         defer b.ambient_mod_scope = saved_mod_scope;
@@ -3204,11 +3271,77 @@ const Binder = struct {
         }
     }
 
+    /// TS2528, once per file: which of the file's `export default`s cannot share
+    /// the `default` export slot. The rule (and why "more than one" is the wrong
+    /// test) is default_exports.zig; this half maps the export records onto it
+    /// and owns the report positions — tsc's `getNameOfDeclaration(decl) ||
+    /// decl`, i.e. the declaration's own name, or the whole `export default`
+    /// statement when it declares none.
+    ///
+    /// Only file-scope records take part. A `declare module "spec" { export
+    /// default … }` block is a container of its own and would need its own slot;
+    /// mixing the two would report a clash between declarations that never
+    /// shared a table.
+    fn checkDefaultExportClashes(b: *Binder) Error!void {
+        var kinds: std.ArrayList(default_exports.Kind) = .empty;
+        defer kinds.deinit(b.scratch);
+        var toks: std.ArrayList(TokenIndex) = .empty;
+        defer toks.deinit(b.scratch);
+        for (b.export_recs.items) |rec| {
+            if (rec.kind != .default or rec.scope != file_scope) continue;
+            const inner = b.tree.nodeData(rec.node).lhs;
+            // `getNameOfDeclaration`: the declared name when there is one. An
+            // anonymous `export default function () {}` and an expression that
+            // is not an entity name both fall back to the statement, which is
+            // why those keys sit at the `export` keyword.
+            var tok = b.tree.nodeMainToken(rec.node);
+            const kind: default_exports.Kind = switch (b.nodeTag(inner)) {
+                .function_decl => k: {
+                    const proto = b.tree.extraData(ast.FnProto, b.tree.nodeData(inner).lhs);
+                    if (proto.name_token != 0) tok = proto.name_token;
+                    break :k .function;
+                },
+                .class_decl => k: {
+                    const data = b.tree.extraData(ast.ClassData, b.tree.nodeData(inner).lhs);
+                    if (data.name_token != 0) tok = data.name_token;
+                    break :k .class_;
+                },
+                .interface_decl => k: {
+                    const data = b.tree.extraData(ast.InterfaceData, b.tree.nodeData(inner).lhs);
+                    if (data.name_token != 0) tok = data.name_token;
+                    break :k .interface_;
+                },
+                // `export default Foo` — an ALIAS to every meaning `Foo` has,
+                // and the one expression form that reports on its own name.
+                .identifier => k: {
+                    tok = b.tree.nodeMainToken(inner);
+                    break :k .alias;
+                },
+                else => .property,
+            };
+            try kinds.append(b.scratch, kind);
+            try toks.append(b.scratch, tok);
+        }
+        if (kinds.items.len < 2) return;
+        const out = try b.scratch.alloc(bool, kinds.items.len);
+        defer b.scratch.free(out);
+        default_exports.clashing(kinds.items, out);
+        for (out, toks.items) |clashes, tok| {
+            if (clashes) try b.diag(.multiple_default_exports, tok);
+        }
+    }
+
     fn bindExportDefault(b: *Binder, node: Node) Error!void {
         const d = b.tree.nodeData(node);
         const inner = d.lhs;
         var local: Atom = 0;
         var sym: SymbolId = no_symbol;
+        // The declaration forms below publish under `default`, not under their
+        // own name, so their local name declares no meaning — see
+        // `in_export_default`. The expression form declares nothing at all.
+        const saved_default = b.in_export_default;
+        b.in_export_default = true;
+        defer b.in_export_default = saved_default;
         switch (b.nodeTag(inner)) {
             .function_decl => {
                 const proto = b.tree.extraData(ast.FnProto, b.tree.nodeData(inner).lhs);
@@ -4500,6 +4633,7 @@ const Binder = struct {
                 if (result.resolveWithGlobals(rec.local, rec.scope, b.global_scopes.items)) |sym| rec.sym = sym;
             }
         }
+        try b.checkDefaultExportClashes();
         // tsc's *export context* (`setExportContextFlag` / `hasExportDeclarations`):
         // a declaration file whose top level contains no export DECLARATION
         // (`export { … }`, `export * from`, `export =`, `export default <expr>`)
@@ -4770,7 +4904,7 @@ test "golden: class members vs statics, parameter properties" {
         \\    scope 2: class_members C
         \\      x: property
         \\      m: method impl
-        \\      constructor: method impl
+        \\      __@ctor: method impl
         \\      z: property
         \\    scope 3: class_statics C
         \\      y: property static

@@ -164,6 +164,14 @@ pub fn packageNameField(text: []const u8) ?[]const u8 {
     return packageStringField(text, &.{"\"name\""});
 }
 
+/// `package.json` `"version"` field. Read only together with `"name"`, as the
+/// second half of a package's identity (see package_id.zig): tsc calls two
+/// copies of a package the same file only when both fields are present and
+/// equal.
+pub fn packageVersionField(text: []const u8) ?[]const u8 {
+    return packageStringField(text, &.{"\"version\""});
+}
+
 /// The TypeScript version ztsc answers `typesVersions` range keys as. It is the
 /// version of the vendored lib and of the pinned oracle (tsgo 7.0.2), so a
 /// package that ships a version-gated declaration set hands ztsc the same set it

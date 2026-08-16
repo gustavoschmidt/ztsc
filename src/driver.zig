@@ -40,6 +40,7 @@ const parser = @import("frontend/parser.zig");
 const binder = @import("frontend/binder.zig");
 const intern = @import("intern.zig");
 const libs = @import("libs.zig");
+const package_id = @import("link/package_id.zig");
 const paths_mod = @import("link/paths.zig");
 const resolve = @import("link/resolve.zig");
 const modules = @import("link/modules.zig");
@@ -650,6 +651,18 @@ pub fn build(
         jsx_runtime_fid,
         &timings,
     );
+
+    // Package-identity dedup, shared with the serial builder: two on-disk
+    // copies of one package version are ONE module, so every specifier that
+    // resolved to a later copy is re-pointed at the first (package_id.zig).
+    // Runs AFTER the renumbering: the winner is "lowest file id", and only the
+    // renumbered ids are graph-derived — the discovery order this loop handed
+    // out depends on worker completion order, so deciding it earlier would make
+    // the answer scheduling-dependent.
+    if (try package_id.redirects(arena, resolve_scratch.allocator(), rcache, io, Io.Dir.cwd(), tables.paths.items)) |map| {
+        for (tables.spec_files.items) |spec_files| package_id.applyTo(map, spec_files);
+    }
+    _ = resolve_scratch.reset(.retain_capacity);
 
     const link_timer = Timer.start(io);
     const prog = try linkProgram(arena, gpa, io, interner, &tables, opts.link_opts, jsx_runtime_fid orelse modules.no_file);

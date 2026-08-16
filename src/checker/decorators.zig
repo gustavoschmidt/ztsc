@@ -395,7 +395,9 @@ fn legacyMemberShape(c: *Checker, target: Node, this_t: TypeId, class_sym: Symbo
         },
         .class_method => {
             const proto = c.tree.extraData(ast.FnProto, md.lhs);
-            if (c.isCtorName(try c.memberAtom(c.tree.nodeMainToken(target)))) return null;
+            // A constructor takes no decorator (the grammar rejects it) and
+            // tsc has no head message for that position.
+            if (c.isCtorMember(target, proto.flags)) return null;
             const is_get = proto.flags & ast.Flags.get != 0;
             const is_set = proto.flags & ast.Flags.set != 0;
             pos = if (is_get) .getter else if (is_set) .setter else .method;

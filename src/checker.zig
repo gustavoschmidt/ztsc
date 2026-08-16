@@ -3425,6 +3425,7 @@ pub const Checker = struct {
     }
     pub const classInstanceGeneric = instantiate_zig.classInstanceGeneric;
     pub const isCtorName = instantiate_zig.isCtorName;
+    pub const isCtorMember = instantiate_zig.isCtorMember;
     pub const refExpansionActive = instantiate_zig.refExpansionActive;
     pub const classGenericInProgress = instantiate_zig.classGenericInProgress;
     pub const classTableProvisional = instantiate_zig.classTableProvisional;

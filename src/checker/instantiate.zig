@@ -724,6 +724,7 @@ pub const baseRefProvisional = classes.baseRefProvisional;
 pub const baseRefCut = classes.baseRefCut;
 pub const classInterfaceHalfBases = classes.classInterfaceHalfBases;
 pub const isCtorName = classes.isCtorName;
+pub const isCtorMember = classes.isCtorMember;
 pub const classGenericInProgress = classes.classGenericInProgress;
 pub const refExpansionActive = classes.refExpansionActive;
 pub const lazyRefProp = classes.lazyRefProp;
