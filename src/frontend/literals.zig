@@ -53,13 +53,21 @@ pub fn checkNumeric(text: []const u8, start: u32) ?Finding {
             else => null,
         };
         if (radix) |code| {
-            // `0x` alone, or `0xn` (the BigInt suffix is not a digit).
-            const digits = text[2..];
-            const empty = digits.len == 0 or (digits.len == 1 and (digits[0] == 'n' or digits[0] == 'N'));
-            // No prefixed radix has an exponent form, so this is the only rule
-            // that can apply to one — and `0xe` ends in an `e` that IS a digit.
-            if (!empty) return null;
-            return .{ .code = code, .span = .{ .start = start + 2, .end = start + 3 } };
+            // `0x` alone, `0xn` (the BigInt suffix is not a digit), and `0x_`
+            // (separators are not digits either). tsc's
+            // `scanBinaryOrOctalOrHexDigits` consumes the digits AND the
+            // separators and then asks whether it collected any real digit, so
+            // the blame lands past the separators: `0x_` is TS1125 on the
+            // character after the `_`, not on the `_` (which earns its own
+            // TS6188). No prefixed radix has an exponent form, so this is the
+            // only rule that can apply to one — and `0xe` ends in an `e` that IS
+            // a digit.
+            const e = runEnd(text, 2, radixOf(text[1]).?);
+            for (text[2..e]) |c| {
+                if (c != '_') return null;
+            }
+            const at = start + @as(u32, @intCast(e));
+            return .{ .code = code, .span = .{ .start = at, .end = at + 1 } };
         }
         // A leading zero followed by a digit. Which of the two rules applies is
         // decided by the FIRST digit only: tsc scans `0` + octal digits as a
@@ -98,13 +106,195 @@ fn danglingExponentAt(text: []const u8) ?u32 {
         if (i < 2) return null;
         i -= 1;
     }
+    // Where the digit should have been: the END of the exponent's fragment,
+    // which is past any separators it collected. A separator is not a digit, so
+    // `1.0e_+10` scans as `1.0e_` and tsc's exponent fragment comes back empty
+    // — TS1124 lands after the `_`, next to the TS6188 the `_` itself earns.
     const at = i;
+    while (i > 1 and text[i - 1] == '_') i -= 1;
     if (text[i - 1] == '+' or text[i - 1] == '-') {
         if (i < 2) return null;
         i -= 1;
     }
     if ((text[i - 1] | 0x20) != 'e') return null;
     return @intCast(at);
+}
+
+/// TS6188/TS6189: where a numeric literal's `_` separators are allowed to sit.
+///
+/// ES2021 numeric separators may only sit BETWEEN two digits, and tsc's scanner
+/// says so one separator at a time while it walks the literal's fragments —
+/// which is why one literal can earn several findings, and why the wording
+/// depends on the neighbour: a separator directly after another one is TS6189
+/// ("Multiple consecutive numeric separators are not permitted"), anywhere else
+/// it is TS6188 ("Numeric separators are not allowed here").
+///
+/// A literal has up to three separator FRAGMENTS, and each starts the rule over:
+/// the integer part, the part after the `.`, and the part after `e`/`E` and its
+/// optional sign (a prefixed-radix literal has exactly one, after `0x`/`0o`/`0b`).
+/// `scanNumberFragment` reports a separator it cannot allow where it stands, and
+/// then — after the loop — a TRAILING one, which is how `10_` earns a finding
+/// even though the separator was consumed happily. tsc's one-diagnostic-per-
+/// position rule collapses the two when they coincide, so `0.0__` is the TS6189
+/// alone; this walk yields both, in position order, and `Parser.addDiag`
+/// collapses them exactly as tsc's `parseErrorAtPosition` does.
+///
+/// One shape is special and had to be read off tsc rather than guessed:
+/// `scanNumber` tests for a `_` immediately after a leading `0` BEFORE the
+/// fragment walk, reports TS6188 there, and then re-scans the fragment from the
+/// `0` — so `0__0` earns TS6188 on the first separator (which the fragment walk
+/// would have allowed, it following a digit) and TS6189 on the second. Measured:
+/// `t/n1.ts` runs all of it past tsgo 7.0.2 and every position agrees.
+///
+/// A leading zero followed by a DIGIT is left alone. There tsc uses `scanDigits`,
+/// which knows nothing about separators and ends the token at the first one, so
+/// `08_1` is a leading-zero literal `08` plus an identifier and earns no
+/// separator finding at all — a tokenization difference, not a separator rule
+/// (ztsc's scanner swallows the `_`), and it belongs with the leading-zero work.
+pub const SeparatorWalk = struct {
+    text: []const u8,
+    base: u32,
+    /// The fragments still to walk, in source order.
+    frags: [3]Frag = undefined,
+    n_frags: u8 = 0,
+    frag: u8 = 0,
+    i: usize = 0,
+    allow_sep: bool = false,
+    prev_sep: bool = false,
+    /// The current fragment's trailing-separator finding, held back until the
+    /// fragment's own loop has finished (tsc reports it after the loop).
+    pending: ?Finding = null,
+    /// `scanNumber`'s pre-fragment report for `0_`.
+    leading: ?Finding = null,
+
+    const Frag = struct { start: usize, end: usize };
+
+    /// True when the token cannot contain a separator at all — the guard that
+    /// keeps this off the hot path for the ~all numeric literals with none.
+    pub fn any(text: []const u8) bool {
+        return std.mem.indexOfScalar(u8, text, '_') != null;
+    }
+
+    pub fn init(text: []const u8, base: u32) SeparatorWalk {
+        var w: SeparatorWalk = .{ .text = text, .base = base };
+        w.plan();
+        if (w.n_frags > 0) w.i = w.frags[0].start;
+        return w;
+    }
+
+    pub fn next(w: *SeparatorWalk) ?Finding {
+        if (w.leading) |f| {
+            w.leading = null;
+            return f;
+        }
+        while (w.frag < w.n_frags) {
+            const end = w.frags[w.frag].end;
+            while (w.i < end) {
+                const c = w.text[w.i];
+                if (c == '_') {
+                    const off = w.i;
+                    w.i += 1;
+                    if (w.allow_sep) {
+                        w.allow_sep = false;
+                        w.prev_sep = true;
+                        continue;
+                    }
+                    return w.at(if (w.prev_sep) .multiple_numeric_separators else .numeric_separator_not_allowed, off);
+                }
+                w.allow_sep = true;
+                w.prev_sep = false;
+                w.i += 1;
+            }
+            // Fragment done: its trailing separator, then start the next one.
+            const done = w.frag;
+            w.frag += 1;
+            if (w.frag < w.n_frags) {
+                w.i = w.frags[w.frag].start;
+                w.allow_sep = false;
+                w.prev_sep = false;
+            }
+            const fe = w.frags[done].end;
+            if (fe > w.frags[done].start and w.text[fe - 1] == '_') {
+                return w.at(.numeric_separator_not_allowed, fe - 1);
+            }
+        }
+        return null;
+    }
+
+    fn at(w: *const SeparatorWalk, code: Code, off: usize) Finding {
+        const s = w.base + @as(u32, @intCast(off));
+        return .{ .code = code, .span = .{ .start = s, .end = s + 1 } };
+    }
+
+    /// Split the literal into the fragments tsc walks. Mirrors `scanNumber`'s
+    /// control flow, which is the only way the positions can agree.
+    fn plan(w: *SeparatorWalk) void {
+        const t = w.text;
+        if (t.len < 2) return;
+        if (t[0] == '0') {
+            if (radixOf(t[1])) |base| {
+                w.push(2, runEnd(t, 2, base));
+                return;
+            }
+            if (t[1] == '_') {
+                // `scanNumber`'s own report, then `pos--` and walk the integer
+                // fragment from the `0` again.
+                w.leading = w.at(.numeric_separator_not_allowed, 1);
+            } else if (isDigit(t[1])) {
+                // `scanDigits` — separator-blind (see the doc comment).
+                return;
+            }
+        }
+        var i = runEnd(t, 0, .dec);
+        w.push(0, i);
+        if (i < t.len and t[i] == '.') {
+            i += 1;
+            const e = runEnd(t, i, .dec);
+            w.push(i, e);
+            i = e;
+        }
+        if (i < t.len and (t[i] | 0x20) == 'e') {
+            i += 1;
+            if (i < t.len and (t[i] == '+' or t[i] == '-')) i += 1;
+            w.push(i, runEnd(t, i, .dec));
+        }
+    }
+
+    fn push(w: *SeparatorWalk, start: usize, end: usize) void {
+        w.frags[w.n_frags] = .{ .start = start, .end = end };
+        w.n_frags += 1;
+    }
+};
+
+/// The radix a `0x`/`0o`/`0b` prefix names, or null for anything else.
+fn radixOf(c: u8) ?Radix {
+    return switch (c) {
+        'x', 'X' => .hex,
+        'o', 'O' => .oct,
+        'b', 'B' => .bin,
+        else => null,
+    };
+}
+
+const Radix = enum { bin, oct, dec, hex };
+
+/// End of the run of digits-and-separators starting at `i`. The scanner has
+/// already ended the token, so this only has to stop at the BigInt suffix and at
+/// the `.`/`e` that begin the next fragment.
+fn runEnd(text: []const u8, i: usize, radix: Radix) usize {
+    var j = i;
+    while (j < text.len) {
+        const c = text[j];
+        const ok = switch (radix) {
+            .bin => c == '0' or c == '1',
+            .oct => c >= '0' and c <= '7',
+            .dec => isDigit(c),
+            .hex => isHex(c),
+        };
+        if (!ok and c != '_') break;
+        j += 1;
+    }
+    return j;
 }
 
 /// TS1352/TS1353: a BigInt suffix on a literal that cannot carry one. Only ever
@@ -413,6 +603,94 @@ test "numeric: an exponent with no digits blames the character after it" {
     try expectNumeric("0x1e", null, 0);
     try expectNumeric("1.", null, 0);
     try expectNumeric("1n", null, 0);
+}
+
+test "numeric separators: every finding, in tsc's order" {
+    // Each expectation is `(text, [(code, offset)…])`, and every one of them is
+    // a line of `t/n1.ts` measured against tsgo 7.0.2. Offsets are 0-based, so
+    // add one for the column tsgo prints.
+    const sep: Code = .numeric_separator_not_allowed;
+    const mult: Code = .multiple_numeric_separators;
+    const cases = [_]struct { text: []const u8, want: []const struct { Code, u32 } }{
+        // Well-formed: between two digits, in every fragment.
+        .{ .text = "1_000_000", .want = &.{} },
+        .{ .text = "0b00_11", .want = &.{} },
+        .{ .text = "0x1_2", .want = &.{} },
+        .{ .text = "1_0.2_3e4_5", .want = &.{} },
+        // A trailing separator, reported after the fragment's own loop.
+        .{ .text = "10_", .want = &.{.{ sep, 2 }} },
+        .{ .text = "0b00_", .want = &.{.{ sep, 4 }} },
+        .{ .text = "0x1_", .want = &.{.{ sep, 3 }} },
+        .{ .text = "0e0_", .want = &.{.{ sep, 3 }} },
+        // A leading one, per fragment.
+        .{ .text = "0b_110", .want = &.{.{ sep, 2 }} },
+        .{ .text = "0._0", .want = &.{.{ sep, 2 }} },
+        .{ .text = "0e_0", .want = &.{.{ sep, 2 }} },
+        .{ .text = "0e+_0", .want = &.{.{ sep, 3 }} },
+        // Consecutive.
+        .{ .text = "1__0", .want = &.{.{ mult, 2 }} },
+        .{ .text = "0b01__11", .want = &.{.{ mult, 5 }} },
+        .{ .text = "0.0__0", .want = &.{.{ mult, 4 }} },
+        // A trailing pair: the walk yields the TS6189 and then the trailing
+        // TS6188 at the SAME offset, which `Parser.addDiag` collapses exactly as
+        // tsc's one-diagnostic-per-position rule does.
+        .{ .text = "0.0__", .want = &.{ .{ mult, 4 }, .{ sep, 4 } } },
+        // `scanNumber`'s own pre-fragment report for a `_` right after a leading
+        // `0`, which is why the second separator here is the CONSECUTIVE one.
+        .{ .text = "0__0.0e0", .want = &.{ .{ sep, 1 }, .{ mult, 2 } } },
+        // …and why `0_.0` is one finding: the pre-report and the fragment's
+        // trailing one land on the same offset.
+        .{ .text = "0_.0", .want = &.{ .{ sep, 1 }, .{ sep, 1 } } },
+        // The error branch does not set "previous was a separator", so a run at
+        // the start of a radix fragment is all TS6188.
+        .{ .text = "0b___0111010_0101_1", .want = &.{ .{ sep, 2 }, .{ sep, 3 }, .{ sep, 4 } } },
+        // A leading zero followed by a DIGIT is `scanDigits`, which is
+        // separator-blind.
+        .{ .text = "08_1", .want = &.{} },
+        .{ .text = "01_2", .want = &.{} },
+    };
+    for (cases) |c| {
+        var got: std.ArrayList(struct { Code, u32 }) = .empty;
+        defer got.deinit(std.testing.allocator);
+        if (SeparatorWalk.any(c.text)) {
+            var w: SeparatorWalk = .init(c.text, 0);
+            while (w.next()) |f| try got.append(std.testing.allocator, .{ f.code, f.span.start });
+        }
+        std.testing.expectEqualSlices(struct { Code, u32 }, c.want, got.items) catch |e| {
+            std.debug.print("--- separators for: {s}\n", .{c.text});
+            return e;
+        };
+    }
+}
+
+test "numeric separators: the cheap guard agrees with the walk" {
+    for ([_][]const u8{ "1", "0x1f", "1.5e-3", "0b1011", "1n", "0" }) |t| {
+        try std.testing.expect(!SeparatorWalk.any(t));
+    }
+}
+
+test "numeric: a radix prefix whose digits are only separators" {
+    // `scanBinaryOrOctalOrHexDigits` consumes the separators before asking
+    // whether it saw a digit, so the blame is past them (and the separators earn
+    // their own TS6188).
+    try expectNumeric("0x_", .hex_digit_expected, 3);
+    try expectNumeric("0x__", .hex_digit_expected, 4);
+    try expectNumeric("0b_", .binary_digit_expected, 3);
+    try expectNumeric("0o_", .octal_digit_expected, 3);
+    try expectNumeric("0x_n", .hex_digit_expected, 3);
+    try expectNumeric("0x_1", null, 0);
+}
+
+test "numeric: an exponent whose digits are only separators" {
+    // `1.0e_+10` scans as `1.0e_` (a separator is not a sign), and the empty
+    // exponent fragment is blamed past it — corpus `49.ts`/`50.ts`.
+    try expectNumeric("1.0e_", .digit_expected, 5);
+    try expectNumeric("1e_", .digit_expected, 3);
+    try expectNumeric("1e-_", .digit_expected, 4);
+    // A separator that is not in the exponent leaves it well-formed.
+    try expectNumeric("0.0_", null, 0);
+    try expectNumeric("1_e9", null, 0);
+    try expectNumeric("0_", null, 0);
 }
 
 test "numeric: a BigInt suffix on a literal that cannot carry one" {

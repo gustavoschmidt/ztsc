@@ -511,6 +511,18 @@ const Parser = struct {
         switch (t.tag) {
             .numeric_literal, .bigint_literal => {
                 const text = p.tokenText(t);
+                // TS6188/TS6189 first, because tsc's scanner reports a
+                // misplaced separator from inside the digit scan and the radix
+                // / leading-zero / exponent rules only afterwards — and where
+                // the two coincide (`0x_`'s separator against its "digit
+                // expected") the one-per-position rule keeps whichever came
+                // first.
+                if (literals.SeparatorWalk.any(text)) {
+                    var sw: literals.SeparatorWalk = .init(text, t.start);
+                    while (sw.next()) |f| {
+                        try p.addDiag(f.code, .{ .code = f.code, .span = f.span });
+                    }
+                }
                 if (literals.checkNumeric(text, t.start)) |f| {
                     try p.addDiag(f.code, .{ .code = f.code, .span = f.span });
                 }

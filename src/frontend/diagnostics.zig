@@ -37,6 +37,11 @@ pub const Code = enum(u16) {
     hex_digit_expected,
     /// TS1124: `1e`, `1E-` — an exponent marker with no digits after it.
     digit_expected,
+    /// TS6188: `10_`, `0b_1`, `0._0` — a numeric separator that is not between
+    /// two digits. See `literals.SeparatorWalk` for the fragment rule.
+    numeric_separator_not_allowed,
+    /// TS6189: `1__0` — a numeric separator directly after another one.
+    multiple_numeric_separators,
     /// TS1177: `0b` with no digits.
     binary_digit_expected,
     /// TS1178: `0o` with no digits.
@@ -787,6 +792,8 @@ pub const Code = enum(u16) {
             .escape_sequence_not_allowed => "This escape sequence is not allowed.",
             .hex_digit_expected => "Hexadecimal digit expected.",
             .digit_expected => "Digit expected.",
+            .numeric_separator_not_allowed => "Numeric separators are not allowed here.",
+            .multiple_numeric_separators => "Multiple consecutive numeric separators are not permitted.",
             .binary_digit_expected => "Binary digit expected.",
             .octal_digit_expected => "Octal digit expected.",
             .unicode_escape_out_of_range => "An extended Unicode escape value must be between 0x0 and 0x10FFFF inclusive.",
@@ -1043,6 +1050,8 @@ pub const Code = enum(u16) {
             .escape_sequence_not_allowed => 1488,
             .hex_digit_expected => 1125,
             .digit_expected => 1124,
+            .numeric_separator_not_allowed => 6188,
+            .multiple_numeric_separators => 6189,
             .binary_digit_expected => 1177,
             .octal_digit_expected => 1178,
             .unicode_escape_out_of_range => 1198,
