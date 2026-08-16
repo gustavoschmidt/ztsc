@@ -580,7 +580,13 @@ fn checkIdentifier(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
                 if ((f.let_decl or f.const_decl or f.class or f.enum_decl) and !f.function and !f.var_decl and !f.param) {
                     try checkTdz(c, sym, node, tok);
                 }
-                if ((f.let_decl or f.var_decl) and !f.param and !f.const_decl) {
+                if ((f.let_decl or f.var_decl) and !f.param and !f.const_decl and
+                    // A computed member name is evaluated outside its
+                    // container's flow, so nothing read there is "used before
+                    // being assigned" (`Checker.in_computed_member_name`).
+                    // (wave-10 A: one flagged guard.)
+                    !c.in_computed_member_name)
+                {
                     try checkUseBeforeAssigned(c, sym, node, tok, declared);
                     try checkEvolvingVarRead(c, sym, node, tok);
                 }
@@ -598,7 +604,12 @@ fn checkIdentifier(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         .wrong_space => |sym| {
             const wf = c.symFlags(sym);
             if (wf.import_binding and wf.type_only) {
-                try c.diagFmt(1361, c.tokSpan(tok), "'{s}' cannot be used as a value because it was imported using 'import type'.", .{c.tokenText(tok)});
+                // Not in a position that would be emitted (see
+                // `Checker.in_type_space_name`) — tsc's `markAliasReferenced`
+                // never runs there. (wave-10 A: one flagged guard.)
+                if (!c.in_type_space_name) {
+                    try c.diagFmt(1361, c.tokSpan(tok), "'{s}' cannot be used as a value because it was imported using 'import type'.", .{c.tokenText(tok)});
+                }
                 return types.error_type;
             }
             try c.diagFmt(2693, c.tokSpan(tok), "'{s}' only refers to a type, but is being used as a value here.", .{c.tokenText(tok)});
@@ -649,6 +660,14 @@ fn checkTdz(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex) Error!void 
     // `containerOf` maps a field initializer back to the module scope, so
     // the container test alone cannot see it.
     if (c.instance_field_init_depth > 0) return;
+    // …and so does a use inside a computed member NAME that tsc's
+    // `isBlockScopedNameDeclaredBeforeUse` exempts — see
+    // `Checker.defer_computed_key_tdz`. `forwardRefInTypeDeclaration.ts` is the
+    // case: `interface Foo2 { [s2]: number }` before `const s2 = "x"` is legal,
+    // and so is the same key in a type literal, a `declare class` and a class
+    // method, while a non-ambient class FIELD still reports.
+    // (wave-10 A: one flagged guard.)
+    if (c.defer_computed_key_tdz) return;
     const use_container = c.containerOf(c.cur_scope);
     const decl_container = c.containerOf(c.symScope(sym));
     if (use_container != decl_container) return;

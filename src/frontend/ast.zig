@@ -79,7 +79,19 @@ pub const Flags = struct {
     pub const exported: u32 = 1 << 21; // `export import A = ...` (exported alias)
     pub const computed_sym: u32 = 1 << 22; // `[k]` computed key naming a const `unique symbol` (main_token = the key identifier)
     pub const computed_sym_qual: u32 = 1 << 23; // qualified `[a.b]` computed key (with computed_sym; main_token = the member identifier, object identifier at main_token - 2)
+    pub const computed_expr: u32 = 1 << 24; // `[expr]` computed key that names NOTHING (main_token = the `[`; the key expression is in `Ast.computedKey`)
 };
+
+/// A member's retained computed key: `member` is the class/type member node,
+/// `key` the `[…]` `.computed_name` node the parser kept for it.
+///
+/// Kept as a side table rather than a field on each member's extra data
+/// because a computed member name is rare — a few per app, none in most files —
+/// while `ast.Field`/`ast.FnProto` are per method and per field in every class
+/// in the program. The parser appends one entry as it finishes each computed
+/// member, and node indices grow with creation order, so the table is sorted
+/// by `member` and `Ast.computedKey` can binary-search it.
+pub const ComputedKey = struct { member: Node, key: Node };
 
 /// Maps a well-known `Symbol` property name (the `iterator` in
 /// `[Symbol.iterator]`) to the synthetic member key the binder and checker
@@ -717,6 +729,25 @@ pub const Ast = struct {
     /// diagnostics (bind + link + check) are surfaced, never for the parser's
     /// own; `.none` for the files — nearly all of them — with no directive.
     comment_directives: directives.File = .none,
+    /// Retained computed member names, sorted by member node (see
+    /// `ComputedKey`). Empty for the overwhelming majority of files.
+    computed_keys: []const ComputedKey = &.{},
+
+    /// The `[…]` key node a class/type member's computed name was parsed from,
+    /// or null when the member's name is not computed. Only the members whose
+    /// flags carry one of the `computed*` bits can have an entry, so a caller
+    /// that has already tested the flags saves the search.
+    pub fn computedKey(a: *const Ast, member: Node) ?Node {
+        var lo: usize = 0;
+        var hi: usize = a.computed_keys.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const e = a.computed_keys[mid];
+            if (e.member == member) return e.key;
+            if (e.member < member) lo = mid + 1 else hi = mid;
+        }
+        return null;
+    }
 
     pub fn nodeTag(a: *const Ast, node: Node) Tag {
         return a.nodes.items(.tag)[node];

@@ -28,6 +28,7 @@ const max_instantiation_count = checker_zig.max_instantiation_count;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const accessibility = @import("accessibility.zig");
 const baseClassRef = @import("instantiate.zig").baseClassRef;
+const computed_key = @import("computed_key.zig");
 const conditions = @import("conditions.zig");
 const checkExprCached = @import("expr.zig").checkExprCached;
 const classStaticType = @import("enums.zig").classStaticType;
@@ -1659,6 +1660,14 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
     // (TS2808) — a property of the declarations alone, so it runs before any
     // member's type is resolved.
     try accessibility.checkAccessorVisibility(c, members);
+    // The members' computed NAMES (TS2304 in a key, TS2464 for a key that
+    // cannot name a property). Driven from here, like the two calls around it,
+    // so it runs once, in the file that owns the class.
+    // (wave-10 A: one flagged call into `computed_key.zig`.)
+    try computed_key.checkMemberNames(c, members, if (c.ambient_ctx or data.flags & ast.Flags.declare != 0)
+        .ambient_class_body
+    else
+        .class_body);
     // The same pairing, for the other question the two halves answer together:
     // whose annotation supplies the property's type (TS7032/TS7033).
     try implicit_any.reportAccessorImplicitAny(c, members);
@@ -1805,6 +1814,11 @@ fn checkInterfaceDecl(c: *Checker, node: Node) Error!void {
     // method signatures) fire even for unused interfaces.
     const d = c.tree.nodeData(node);
     const data = c.tree.extraData(ast.InterfaceData, d.lhs);
+    // The members' computed NAMES, in the enclosing scope (which is where a
+    // computed key is evaluated) and before the name guard, because a nameless
+    // interface's members are still written down.
+    // (wave-10 A: one flagged call into `computed_key.zig`.)
+    try computed_key.checkMemberNames(c, c.tree.extraRange(data.members_start, data.members_end), .type_space);
     if (data.name_token == 0) return;
     const a = try c.atomOfToken(data.name_token);
     const saved = c.cur_scope;

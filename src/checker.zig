@@ -1635,6 +1635,35 @@ pub const Checker = struct {
     /// cycle (`[A.k]` where `A`'s type materialization re-resolves the same
     /// key) degrades to the placeholder instead of recursing unboundedly.
     computed_key_depth: u32 = 0,
+    /// tsc's `markAliasReferenced` gate: would the reference being checked be
+    /// EMITTED? A computed member name in an interface or a type literal would
+    /// not — the name lives in type space — so an `import type` alias used there
+    /// is not a value use and earns no TS1361, while a TYPE used as a value
+    /// still earns its TS2693. A class body's computed name is emitted code and
+    /// keeps both. Measured against tsgo 7.0.2: of `interface I { [KeyAlias]: T
+    /// }`, `type T = { [KeyAlias]: U }`, `class C { [KeyAlias]: T }`,
+    /// `{ [KeyAlias]: 1 }` and `const v = KeyAlias`, only the first two are
+    /// silent, and all five report TS2693 for a plain type name.
+    ///
+    /// Set only around `computed_key.checkMemberNames` for those two homes, and
+    /// restored on the way out. (wave-10 A.)
+    in_type_space_name: bool = false,
+    /// A forward reference inside the computed member NAME being checked is
+    /// legal — tsc's `isInAmbientOrTypeNode || isUsedInFunctionOrInstanceProperty`
+    /// arm of `isBlockScopedNameDeclaredBeforeUse`, which exempts an interface, a
+    /// type node, an ambient context and anything under a function-like node (so
+    /// a class METHOD's name but not a class FIELD's). Read by `checkTdz`; set
+    /// only around `computed_key.checkMemberNames`, which documents the boundary.
+    /// (wave-10 A.)
+    defer_computed_key_tdz: bool = false,
+    /// A computed member NAME is being checked at all. tsc evaluates one outside
+    /// its container's control flow, so a variable read there is never "used
+    /// before being assigned" (TS2454): `var s: string; class C { [s]: number }`
+    /// and the same key in an interface or a type literal are all silent, while
+    /// the identical read in an OBJECT LITERAL's key reports — measured against
+    /// tsgo 7.0.2 (`t/k9.ts`, and corpus `computedPropertyNames12`–`15`). Read by
+    /// `checkUseBeforeAssigned`'s caller. (wave-10 A.)
+    in_computed_member_name: bool = false,
     /// `infer V` binder identity: (conditional nodeKey, name atom) -> a
     /// dense id. Keyed by (conditional, name) so the *same* infer name used at
     /// several sites in one conditional's extends clause is one variable

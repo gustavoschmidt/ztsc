@@ -37,6 +37,11 @@ pub const Code = enum(u16) {
     hex_digit_expected,
     /// TS1124: `1e`, `1E-` — an exponent marker with no digits after it.
     digit_expected,
+    /// TS6188: `10_`, `0b_1`, `0._0` — a numeric separator that is not between
+    /// two digits. See `literals.SeparatorWalk` for the fragment rule.
+    numeric_separator_not_allowed,
+    /// TS6189: `1__0` — a numeric separator directly after another one.
+    multiple_numeric_separators,
     /// TS1177: `0b` with no digits.
     binary_digit_expected,
     /// TS1178: `0o` with no digits.
@@ -440,6 +445,20 @@ pub const Code = enum(u16) {
     /// forms ARE legal (`["4"]`, `[2]`, `` [`a`] ``, measured), and their name is
     /// the literal's own, so only the rest reach this.
     computed_name_in_enum,
+    /// TS1166: `class C { ["a" + "b"]: number }` — a computed CLASS PROPERTY
+    /// name that cannot name a property. See `computed_member.zig` for the rule
+    /// and for why the four siblings below differ only in wording.
+    computed_name_in_class_property,
+    /// TS1168: `class C { ["a" + "b"](): void }` — the same key on a method
+    /// with no body (an overload signature or an `abstract` method).
+    computed_name_in_method_overload,
+    /// TS1165: `declare class C { ["a" + "b"](): void }` — the same key on a
+    /// method in an ambient context.
+    computed_name_in_ambient_context,
+    /// TS1169: `interface I { ["a" + "b"]: number }`.
+    computed_name_in_interface,
+    /// TS1170: `type T = { ["a" + "b"]: number }`.
+    computed_name_in_type_literal,
     /// TS18024: `enum E { #x }` — a private identifier as an enum member name.
     enum_member_private_name,
     /// TS1539: `{ 1n: 123 }` — a BigInt literal as a property name. The grammar
@@ -639,6 +658,16 @@ pub const Code = enum(u16) {
             .enum_member_numeric_name,
             .enum_member_private_name,
             .computed_name_in_enum,
+            // The TS116x family is `checkGrammarProperty`/`checkGrammarMethod`
+            // in tsc's CHECKER, so a real parse error suppresses it exactly as
+            // it suppresses a TS2322: `class C { ["a" + "b"]: number = 1 }`
+            // next to `const q: string = 1` reports both, and adding
+            // `let z = 1 + ;` leaves only the TS1109 (measured, `t/k6.ts`).
+            .computed_name_in_class_property,
+            .computed_name_in_method_overload,
+            .computed_name_in_ambient_context,
+            .computed_name_in_interface,
+            .computed_name_in_type_literal,
             // `{ 1n: 123 }` reports TS1539 next to the TS2464/TS2538 its
             // siblings earn in the same file — tsc's checker.
             .bigint_property_name,
@@ -763,6 +792,8 @@ pub const Code = enum(u16) {
             .escape_sequence_not_allowed => "This escape sequence is not allowed.",
             .hex_digit_expected => "Hexadecimal digit expected.",
             .digit_expected => "Digit expected.",
+            .numeric_separator_not_allowed => "Numeric separators are not allowed here.",
+            .multiple_numeric_separators => "Multiple consecutive numeric separators are not permitted.",
             .binary_digit_expected => "Binary digit expected.",
             .octal_digit_expected => "Octal digit expected.",
             .unicode_escape_out_of_range => "An extended Unicode escape value must be between 0x0 and 0x10FFFF inclusive.",
@@ -826,6 +857,11 @@ pub const Code = enum(u16) {
             .enum_member_numeric_name => "An enum member cannot have a numeric name.",
             .enum_member_private_name => "An enum member cannot be named with a private identifier.",
             .computed_name_in_enum => "Computed property names are not allowed in enums.",
+            .computed_name_in_class_property => "A computed property name in a class property declaration must have a simple literal type or a 'unique symbol' type.",
+            .computed_name_in_method_overload => "A computed property name in a method overload must refer to an expression whose type is a literal type or a 'unique symbol' type.",
+            .computed_name_in_ambient_context => "A computed property name in an ambient context must refer to an expression whose type is a literal type or a 'unique symbol' type.",
+            .computed_name_in_interface => "A computed property name in an interface must refer to an expression whose type is a literal type or a 'unique symbol' type.",
+            .computed_name_in_type_literal => "A computed property name in a type literal must refer to an expression whose type is a literal type or a 'unique symbol' type.",
             .bigint_property_name => "A 'bigint' literal cannot be used as a property name.",
             .private_name_outside_class => "Private identifiers are not allowed outside class bodies.",
             .private_name_in_var_decl => "Private identifiers are not allowed in variable declarations.",
@@ -1014,6 +1050,8 @@ pub const Code = enum(u16) {
             .escape_sequence_not_allowed => 1488,
             .hex_digit_expected => 1125,
             .digit_expected => 1124,
+            .numeric_separator_not_allowed => 6188,
+            .multiple_numeric_separators => 6189,
             .binary_digit_expected => 1177,
             .octal_digit_expected => 1178,
             .unicode_escape_out_of_range => 1198,
@@ -1041,6 +1079,11 @@ pub const Code = enum(u16) {
             .enum_member_numeric_name => 2452,
             .enum_member_private_name => 18024,
             .computed_name_in_enum => 1164,
+            .computed_name_in_class_property => 1166,
+            .computed_name_in_method_overload => 1168,
+            .computed_name_in_ambient_context => 1165,
+            .computed_name_in_interface => 1169,
+            .computed_name_in_type_literal => 1170,
             .bigint_property_name => 1539,
             .private_name_outside_class => 18016,
             .private_name_in_var_decl => 18029,
