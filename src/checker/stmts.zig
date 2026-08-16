@@ -1665,7 +1665,10 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
     // cannot name a property). Driven from here, like the two calls around it,
     // so it runs once, in the file that owns the class.
     // (wave-10 A: one flagged call into `computed_key.zig`.)
-    try computed_key.checkMemberNames(c, members, .emitted);
+    try computed_key.checkMemberNames(c, members, if (c.ambient_ctx or data.flags & ast.Flags.declare != 0)
+        .ambient_class_body
+    else
+        .class_body);
     // The same pairing, for the other question the two halves answer together:
     // whose annotation supplies the property's type (TS7032/TS7033).
     try implicit_any.reportAccessorImplicitAny(c, members);

@@ -28,10 +28,20 @@ const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
-/// Is a member's computed name emitted code (a class body, an object literal)
-/// or type space only (an interface, a type literal)? The distinction is
-/// `Checker.in_type_space_name`'s.
-pub const Home = enum { emitted, type_space };
+/// Where a member's computed name sits, for the two rules that care whether a
+/// reference in it is real EMITTED code evaluated at class-definition time.
+///
+///   * `Checker.in_type_space_name` — tsc's `markAliasReferenced` gate. An
+///     interface's or a type literal's member name is type space, and an ambient
+///     class body is emitted nowhere (the same reason `stmts.zig` skips checking
+///     an ambient `extends` clause as a value), so neither is a value use.
+///   * `Checker.defer_computed_key_tdz` — tsc's
+///     `isInAmbientOrTypeNode || isUsedInFunctionOrInstanceProperty` inside
+///     `isBlockScopedNameDeclaredBeforeUse`. A forward reference in a computed
+///     name is legal in all of those, AND in a class METHOD's name, because
+///     walking up from there hits a function-like node. What is left — the only
+///     position that reports — is a non-ambient class FIELD's name.
+pub const Home = enum { class_body, ambient_class_body, type_space };
 
 /// Check a `.computed_name` node's key expression, reporting TS2464 when the
 /// type it produces cannot name a property. Returns the key type so a caller
@@ -68,12 +78,21 @@ pub fn checkMemberNames(c: *Checker, members: []const Node, home: Home) Error!vo
     // Almost every file has no computed member name at all.
     if (c.tree.computed_keys.len == 0) return;
     const saved = c.in_type_space_name;
-    defer c.in_type_space_name = saved;
-    c.in_type_space_name = home == .type_space;
+    const saved_tdz = c.defer_computed_key_tdz;
+    const saved_in_name = c.in_computed_member_name;
+    defer {
+        c.in_type_space_name = saved;
+        c.defer_computed_key_tdz = saved_tdz;
+        c.in_computed_member_name = saved_in_name;
+    }
+    c.in_type_space_name = home != .class_body;
+    c.in_computed_member_name = true;
     for (members) |m| {
         if (m == null_node) continue;
         const key = c.tree.computedKey(m) orelse continue;
         if (c.node_types.contains(c.nodeKey(c.tree.nodeData(key).lhs))) continue;
+        // Only a non-ambient class FIELD's name is a use that can be too early.
+        c.defer_computed_key_tdz = home != .class_body or c.nodeTag(m) != .class_field;
         _ = try checkComputedName(c, key);
     }
 }
