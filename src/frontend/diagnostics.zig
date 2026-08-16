@@ -394,6 +394,14 @@ pub const Code = enum(u16) {
     /// Reported on the name token, and NOT gated on `static` (`static get
     /// constructor` reports too — verified against tsgo 7.0.2).
     ctor_may_not_be_accessor,
+    /// TS2528: two `export default`s that cannot share the slot. Not every pair
+    /// collides — function overloads merge, and a function and an interface are
+    /// legal side by side — so the rule is tsc's `declareSymbol` includes/
+    /// excludes algebra on the reserved `default` export name, with only the
+    /// MESSAGE special-cased (a collision on any other name is TS2300). See
+    /// default_exports.zig. Reported on each colliding declaration's name, or on
+    /// the whole `export default` statement when it declares no name.
+    multiple_default_exports,
     /// TS17009: `this` reached in a derived class's constructor on a path that
     /// has not run `super(...)` yet — the base constructor is what brings the
     /// instance into existence. Reported on the `this` keyword. Flow-sensitive
@@ -603,6 +611,7 @@ pub const Code = enum(u16) {
             .overload_must_not_be_static,
             .param_property_outside_ctor_impl,
             .ctor_as_param_property_name,
+            .multiple_default_exports,
             .super_before_this,
             .super_before_super_property,
             .decorator_not_valid_here,
@@ -962,6 +971,7 @@ pub const Code = enum(u16) {
             .param_property_outside_ctor_impl => "A parameter property is only allowed in a constructor implementation.",
             .ctor_as_param_property_name => "'constructor' cannot be used as a parameter property name.",
             .ctor_may_not_be_accessor => "Class constructor may not be an accessor.",
+            .multiple_default_exports => "A module cannot have multiple default exports.",
             .super_before_this => "'super' must be called before accessing 'this' in the constructor of a derived class.",
             .super_before_super_property => "'super' must be called before accessing a property of 'super' in the constructor of a derived class.",
             .unsupported_syntax => "syntax not yet supported by ztsc",
@@ -1098,6 +1108,7 @@ pub const Code = enum(u16) {
             .param_property_outside_ctor_impl => 2369,
             .ctor_as_param_property_name => 2398,
             .ctor_may_not_be_accessor => 1341,
+            .multiple_default_exports => 2528,
             .super_before_this => 17009,
             .super_before_super_property => 17011,
             .decorator_not_valid_here => 1206,
