@@ -2318,6 +2318,19 @@ pub const Checker = struct {
     atom_Boolean: Atom = 0,
     atom_BigInt: Atom = 0,
     atom_Function: Atom = 0,
+    /// The two `strictBindCallApply` refinements of `Function`: a type with
+    /// CALL signatures takes `bind`/`call`/`apply` from `CallableFunction`,
+    /// one with CONSTRUCT signatures from `NewableFunction` (tsc's
+    /// `globalCallableFunctionType`/`globalNewableFunctionType`). ztsc is
+    /// strict-only, so the flag is always on.
+    atom_CallableFunction: Atom = 0,
+    atom_NewableFunction: Atom = 0,
+    /// The three names — and the only three — those two interfaces refine.
+    /// Checked first so a lookup for any other name never pays for the
+    /// specialized interface at all.
+    atom_bind: Atom = 0,
+    atom_call: Atom = 0,
+    atom_apply: Atom = 0,
     atom_Object: Atom = 0,
     /// The one member a class's constructor side gets that the global
     /// `Function` interface does not supply usefully — see `classValueProp`.
@@ -2556,6 +2569,11 @@ pub const Checker = struct {
         c.atom_Boolean = try c.atom("Boolean");
         c.atom_BigInt = try c.atom("BigInt");
         c.atom_Function = try c.atom("Function");
+        c.atom_CallableFunction = try c.atom("CallableFunction");
+        c.atom_NewableFunction = try c.atom("NewableFunction");
+        c.atom_bind = try c.atom("bind");
+        c.atom_call = try c.atom("call");
+        c.atom_apply = try c.atom("apply");
         c.atom_Object = try c.atom("Object");
         c.atom_prototype = try c.atom("prototype");
         c.atom_Promise = try c.atom("Promise");

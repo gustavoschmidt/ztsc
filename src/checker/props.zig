@@ -105,7 +105,7 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, o: PropLookup) Error!?types
             // (`.bind`/`.call`/`.apply`/`.name`/`.length`/…). Plain
             // (non-callable) objects do NOT — an absent member stays TS2339.
             if (!o.skip_augment and (s.objectCallSigCount(t) > 0 or s.objectConstructSigCount(t) > 0)) {
-                if (try functionInterfaceProp(c, name)) |p| return p;
+                if (try functionInterfaceProp(c, augmentOfObject(c, t), name)) |p| return p;
             }
             if (!allow_index) {
                 // An interface whose only base is `any` and which declares
@@ -428,7 +428,7 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, o: PropLookup) Error!?types
         // A bare function type or overload set (arrow/normal function,
         // `(x) => y`, an overloaded signature) has the apparent members of
         // the global `Function` interface.
-        .function, .overloads => return if (o.skip_augment) null else functionInterfaceProp(c, name),
+        .function, .overloads => return if (o.skip_augment) null else functionInterfaceProp(c, .callable, name),
         else => return null,
     }
 }
@@ -515,12 +515,60 @@ fn keyofStillGeneric(c: *Checker, t: TypeId, depth: u32) Error!bool {
     }
 }
 
+/// Which global interface a function-shaped type borrows its apparent members
+/// from — tsc's `getPropertyOfType` tail:
+///
+/// ```ts
+/// const functionType = resolved === anyFunctionType ? globalFunctionType :
+///     resolved.callSignatures.length ? globalCallableFunctionType :
+///     resolved.constructSignatures.length ? globalNewableFunctionType :
+///     undefined;
+/// ```
+///
+/// `globalCallableFunctionType`/`globalNewableFunctionType` ARE
+/// `globalFunctionType` unless `strictBindCallApply` is on, in which case they
+/// are the `CallableFunction`/`NewableFunction` interfaces — which extend
+/// `Function` and override exactly `bind`, `call` and `apply` with generic
+/// signatures that instantiate against the receiver's own signature. ztsc runs
+/// strict-only, so the refined form is always the right one.
+pub const FnAugment = enum {
+    /// No call/construct signatures of its own reached the decision (a class
+    /// value's `Function` tail, `anyFunctionType`): plain `Function`.
+    plain,
+    /// Has call signatures — `CallableFunction`.
+    callable,
+    /// Has construct signatures but no call signatures — `NewableFunction`.
+    newable,
+};
+
+/// The augment an OBJECT type's signature lists select, in tsc's own order
+/// (call signatures win over construct signatures).
+fn augmentOfObject(c: *const Checker, t: TypeId) FnAugment {
+    if (c.ts.objectCallSigCount(t) > 0) return .callable;
+    if (c.ts.objectConstructSigCount(t) > 0) return .newable;
+    return .plain;
+}
+
 /// Look `name` up on the global `Function` interface — the apparent members
 /// (`bind`/`call`/`apply`/`name`/`length`/`toString`/…) that tsc gives every
-/// function-shaped type. Returns null when the lib has no `Function`
-/// interface (`--noLib`) or the property genuinely isn't a `Function`
-/// member, so a bogus member on a callable still degrades to TS2339.
-fn functionInterfaceProp(c: *Checker, name: Atom) Error!?types.Prop {
+/// function-shaped type — or, for the three names `strictBindCallApply`
+/// refines, on `CallableFunction`/`NewableFunction` first. Returns null when
+/// the lib has no `Function` interface (`--noLib`) or the property genuinely
+/// isn't a `Function` member, so a bogus member on a callable still degrades
+/// to TS2339.
+fn functionInterfaceProp(c: *Checker, aug: FnAugment, name: Atom) Error!?types.Prop {
+    // Gate on the three refined names before touching the specialized
+    // interface: every other lookup (`.name`, `.length`, a TS2339 miss) then
+    // costs exactly what it did before.
+    if (aug != .plain and (name == c.atom_bind or name == c.atom_call or name == c.atom_apply)) {
+        const iface_atom = if (aug == .callable) c.atom_CallableFunction else c.atom_NewableFunction;
+        if (c.prog.globals.lookup(iface_atom)) |isym| {
+            if (c.symFlags(isym).interface) {
+                const iref = try c.ts.makeRef(isym, &.{});
+                if (try c.propOfType(try c.resolveStructural(iref), name)) |p| return p;
+            }
+        }
+    }
     const sym = c.prog.globals.lookup(c.atom_Function) orelse return null;
     if (!c.symFlags(sym).interface) return null;
     const ref = try c.ts.makeRef(sym, &.{});
@@ -564,7 +612,10 @@ fn classValueProp(c: *Checker, cls: SymbolId, name: Atom, o: PropLookup) Error!?
         };
     }
     if (o.skip_augment) return null;
-    return functionInterfaceProp(c, name);
+    // A class VALUE resolves to construct signatures and no call signatures,
+    // so `bind`/`call`/`apply` come from `NewableFunction`: `C.bind(undefined,
+    // 10)` yields `new (b: string) => C`, not `any`.
+    return functionInterfaceProp(c, .newable, name);
 }
 
 /// Look `name` up on the global `Object` interface — the

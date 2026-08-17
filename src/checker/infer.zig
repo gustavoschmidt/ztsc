@@ -1779,6 +1779,73 @@ fn echoesInferVar(c: *Checker, t: TypeId, tp_syms: []const u32) Error!bool {
     return false;
 }
 
+/// The one construct-signature shape whose PARAMETERS carry inference
+/// information when the source is a class value: a pattern written
+/// `new (...args: P) => …` whose single rest parameter's type `P` mentions a
+/// variable this call is solving.
+///
+/// That is exactly `NewableFunction`'s `strictBindCallApply` trio —
+/// `call<T, A extends any[]>(this: new (...args: A) => T, …)` and
+/// `bind<A, B, R>(this: new (...args: [...A, ...B]) => R, …)` — and binding
+/// `A` to the class's own constructor parameter list is what turns
+/// `C.call(c, 10)` into "Expected 3 arguments, but got 2" rather than a
+/// TS2684 on `C` itself.
+///
+/// Deliberately narrow. The general rule (`inferFromSignature` pairing every
+/// parameter) is wrong here because a class value's constructor arity is
+/// unrelated to the arity of the `new (…) => T` interfaces that pattern is
+/// otherwise written for; requiring a lone rest parameter typed by a live
+/// variable leaves `new (...args: any[]) => T` — what those interfaces
+/// universally write — pairing nothing, exactly as before.
+///
+/// Contravariant, as parameter positions are: the candidate it records must
+/// outrank the covariant one the call's own `...args: A` supplies, or
+/// `C.call(c, 10)` would bind `A` to the short argument list and report
+/// nothing at all.
+fn inferFromClassCtorParams(
+    c: *Checker,
+    param: TypeId,
+    class_value: TypeId,
+    tp_syms: []const u32,
+    candidates: []TypeId,
+    depth: u32,
+) Error!void {
+    const s = &c.ts;
+    var rest_pat: TypeId = types.no_type;
+    for (0..s.objectConstructSigCount(param)) |i| {
+        const psig = s.objectConstructSig(param, @intCast(i));
+        if (s.fnParamCount(psig) != 1) return;
+        const p0 = s.fnParam(psig, 0);
+        if (!p0.rest()) return;
+        if (!try echoesInferVar(c, p0.ty, tp_syms)) return;
+        // More than one candidate pattern signature: no basis to pick.
+        if (rest_pat != types.no_type) return;
+        rest_pat = p0.ty;
+    }
+    if (rest_pat == types.no_type) return;
+
+    var ctor_sigs: std.ArrayList(TypeId) = .empty;
+    defer ctor_sigs.deinit(c.scratch());
+    try c.ctorSignatures(s.classSymbol(class_value), &ctor_sigs);
+    // An overloaded constructor gives no single parameter list to bind.
+    if (ctor_sigs.items.len != 1) return;
+    const csig = ctor_sigs.items[0];
+    if (s.kind(csig) != .function) return;
+
+    var elems: std.ArrayList(types.TupleElem) = .empty;
+    defer elems.deinit(c.scratch());
+    for (0..s.fnParamCount(csig)) |i| {
+        const sp = s.fnParam(csig, @intCast(i));
+        var eflags: u32 = 0;
+        if (sp.rest()) eflags |= types.elem_flag_rest;
+        if (sp.optional()) eflags |= types.elem_flag_optional;
+        try elems.append(c.scratch(), .{ .ty = sp.ty, .flags = eflags });
+    }
+    c.infer_ctx.contra_pos += 1;
+    defer c.infer_ctx.contra_pos -= 1;
+    try c.unify(rest_pat, try s.makeTuple(elems.items), tp_syms, candidates, depth + 1);
+}
+
 /// Whether any argument is a function EXPRESSION — the only thing Phase 2 of
 /// `inferTypeArgs` contextually types, and so the only reason to pay for the
 /// seed's constraint clamp.
@@ -2884,6 +2951,7 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                         try c.unify(s.fnReturn(psig), inst, tp_syms, candidates, depth + 1);
                     }
                 }
+                try inferFromClassCtorParams(c, param, ra, tp_syms, candidates, depth);
                 return;
             }
             // A still-generic MAPPED source against an index-signature
@@ -3351,6 +3419,30 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 if (!all_unbound or erased_self) {
                     ra = try c.instantiate(ra, map_list.items);
                     if (s.kind(ra) != .function) return;
+                }
+            }
+            // tsc's `inferFromSignature` head, which runs BEFORE the
+            // parameters: a `this` type on both sides infers CONTRAVARIANTLY,
+            // exactly as an ordinary parameter does
+            // (`inferFromContravariantTypes(sourceThisType, targetThisType)`).
+            //
+            // This is what makes `strictBindCallApply` resolve. The lib's
+            // `CallableFunction.call<T, A extends any[], R>(this: (this: T,
+            // ...args: A) => R, thisArg: T, ...args: A): R` takes `T` from the
+            // RECEIVER's own `this` type, and `thisArg: T` supplies a
+            // competing COVARIANT candidate from the actual argument. tsc
+            // prefers the contravariant one unless the covariant one is a
+            // subtype of it, so `c.foo.call(undefined, 10, "hello")` keeps
+            // `T = C` and reports the bad `undefined` argument — where a
+            // covariant-only walk inferred `T = undefined` and reported a
+            // TS2684 on the receiver that tsc never emits.
+            {
+                const p_this = s.fnThisType(param);
+                const a_this = s.fnThisType(ra);
+                if (p_this != 0 and a_this != 0) {
+                    c.infer_ctx.contra_pos += 1;
+                    defer c.infer_ctx.contra_pos -= 1;
+                    try c.unify(p_this, a_this, tp_syms, candidates, depth + 1);
                 }
             }
             // A trailing rest param in the *pattern* (`(...args: T)` with

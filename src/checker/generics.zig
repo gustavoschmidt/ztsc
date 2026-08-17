@@ -865,6 +865,11 @@ fn collectInferVars(c: *Checker, t: TypeId, out: *std.ArrayList(u32), refs: ?*st
         .function => {
             for (0..s.fnParamCount(t)) |i| try collectInferVars(c, s.fnParam(t, @intCast(i)).ty, out, refs);
             try collectInferVars(c, s.fnReturn(t), out, refs);
+            // The `this` parameter is a position like any other: the lib's
+            // `ThisParameterType<T>` declares its variable there and nowhere
+            // else (`T extends (this: infer U, ...args: never) => any ? U :
+            // unknown`).
+            if (s.fnThisType(t) != 0) try collectInferVars(c, s.fnThisType(t), out, refs);
         },
         .ref => {
             for (0..s.refArgCount(t)) |i| try collectInferVars(c, s.refArgAt(t, i), out, refs);
@@ -1639,6 +1644,31 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
                     for (0..raw) |i| try exp.append(c.scratch(), s.fnParam(src, @intCast(i)));
                 }
             }
+            // A `this` parameter pairs CONTRAVARIANTLY, exactly as an ordinary
+            // parameter does — tsc's `inferFromSignature` head, which runs the
+            // pair through `inferFromContravariantTypes` before touching the
+            // parameter list, and only when the SOURCE declares one (an absent
+            // `this` leaves the pattern's variable unbound, which is precisely
+            // what makes `ThisParameterType<() => void>` land on `unknown`).
+            //
+            // Without it the lib's
+            //   `type ThisParameterType<T> =
+            //        T extends (this: infer U, ...args: never) => any ? U : unknown`
+            // left `U` unbound for EVERY `this`-annotated function, so the
+            // conditional's own check (`this: unknown` against the source's
+            // real receiver) failed and the answer was always `unknown`. That
+            // in turn made `OmitThisParameter` the identity and let
+            // `CallableFunction.bind`'s first overload accept any `thisArg`
+            // at all.
+            {
+                const p_this = s.fnThisType(pattern);
+                const s_this = s.fnThisType(src);
+                if (p_this != 0 and s_this != 0) {
+                    var st = s_this;
+                    if (base_map.items.len != 0) st = try c.instantiate(st, base_map.items);
+                    try c.inferFromExtends(st, p_this, ids, vals, !contra, depth + 1);
+                }
+            }
             const src_count: u32 = @intCast(exp.items.len);
             const pat_count = s.fnParamCount(pattern);
             const pat_has_rest = pat_count != 0 and s.fnParam(pattern, pat_count - 1).rest();
@@ -1990,6 +2020,7 @@ fn containsInferInner(c: *Checker, t: TypeId) Error!bool {
             for (0..s.fnParamCount(t)) |i| {
                 if (try c.containsInfer(s.fnParam(t, @intCast(i)).ty)) break :blk true;
             }
+            if (s.fnThisType(t) != 0 and try c.containsInfer(s.fnThisType(t))) break :blk true;
             break :blk false;
         },
         .ref => blk: {
