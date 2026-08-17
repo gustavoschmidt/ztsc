@@ -4307,6 +4307,22 @@ const Parser = struct {
                 const decl = try p.parseStatementUnchecked();
                 return p.addNode(.{ .tag = .export_decl, .main_token = kw, .data = .{ .lhs = decl, .rhs = 0 } });
             },
+            .at => {
+                // `export @dec class C { }` — tsc parses decorators and
+                // modifiers as ONE list, in either order, so the decorators may
+                // follow the `export`. Both orders are silent.
+                //
+                // The decorator nodes are parsed (so a malformed one still
+                // reports) but not retained: a `.decorator` node is checked as a
+                // sibling STATEMENT, and this one has no place in the statement
+                // list — the `export` already claimed it. Deliberate
+                // under-report of the decorator's own name resolution, the same
+                // trade a decorated class EXPRESSION makes, and never a false
+                // positive.
+                while (p.curTag() == .at) _ = try p.parseDecorator();
+                const decl = try p.parseStatementUnchecked();
+                return p.addNode(.{ .tag = .export_decl, .main_token = kw, .data = .{ .lhs = decl, .rhs = 0 } });
+            },
             else => {
                 try p.fail(.expected_export_clause);
                 return p.errorNode();
