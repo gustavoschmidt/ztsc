@@ -2045,6 +2045,125 @@ fn condTrueSubstituted(c: *Checker, cond: TypeId) Error!TypeId {
     return c.instantiate(tru, &map);
 }
 
+/// How far the false-branch chain below is followed. `ZeroOf<T>` (five nested
+/// conditionals) is the shape that needs more than one step; beyond this the
+/// walk gives the constraint up and the branch-union reading stands.
+const max_cond_constraint_steps: u32 = 16;
+
+/// tsc's `getConstraintOfDistributiveConditionalType`, asked for its BOOLEAN:
+/// does the conditional relate to `target` through the constraint you get by
+/// putting the check parameter's own constraint in its place?
+///
+/// ```ts
+/// type IsArray<T> = T extends unknown[] ? true : false;
+/// function f<T extends unknown[]>(x: IsArray<T>) { const t: true = x; }  // ok
+/// ```
+///
+/// Every instantiation of `T` is a subtype of `unknown[]`, so every
+/// instantiation of `IsArray<T>` is `true` — a fact the branch-union reading
+/// (`true | false`) cannot see. tsc computes it by re-evaluating the
+/// conditional with `T := constraint`.
+///
+/// The re-evaluation is NOT the ordinary one. `object extends unknown[]` is
+/// `false` as a type of its own, but `IsArray<T>` under `T extends object`
+/// stays `boolean` in tsgo, because an `object` may still BE an array: the
+/// constraint bounds `T` from above and settles the conditional only when the
+/// bound settles EVERY instantiation. So each level decides three ways:
+///
+///   * `constraint` is assignable to the extends type — every `T` takes the
+///     true branch;
+///   * no constituent of the extends type is assignable to `constraint` — no
+///     `T` can satisfy it, so every `T` takes the false branch (and a false
+///     branch that is another conditional on the same parameter is walked, the
+///     `ZeroOf<T>` chain);
+///   * otherwise undecided — no distributive constraint at all, and the caller's
+///     branch-union answer stands.
+///
+/// Purely additive: it is only ever asked after the branch-union reading has
+/// already refused, and it only ever returns `true`.
+fn distributiveConstraintRelates(c: *Checker, cond: TypeId, target: TypeId) Error!bool {
+    const s = &c.ts;
+    if (!s.condDistributive(cond)) return false;
+    const chk = s.condCheck(cond);
+    if (s.kind(chk) != .type_param) return false;
+    const con = try c.typeParamConstraint(s.typeParamSymbol(chk));
+    if (con == types.no_type or con == chk or con == types.error_type) return false;
+    switch (s.kind(con)) {
+        // An `unknown`/`any` bound settles nothing the branch union did not.
+        .unknown, .any => return false,
+        else => {},
+    }
+    const map = [_]TpMap{.{ .sym = s.typeParamSymbol(chk), .ty = con }};
+    var cur = cond;
+    var steps: u32 = 0;
+    while (steps < max_cond_constraint_steps) : (steps += 1) {
+        const ext = try c.instantiate(s.condExtends(cur), &map);
+        if (try c.isAssignable(con, ext)) {
+            return c.isAssignable(try c.instantiate(s.condTrue(cur), &map), target);
+        }
+        if (try extendsReachableFrom(c, ext, con)) {
+            // Undecided. What is left of the chain is a deferred conditional
+            // again, and a deferred conditional's constraint is the union of
+            // its branches — the caller's own reading, but over the branches
+            // the levels ABOVE have already ruled out. With nothing ruled out
+            // it is the caller's answer verbatim, so there is nothing to add.
+            if (steps == 0) return false;
+            return c.isAssignable(try remainingBranchUnion(c, cur, &map), target);
+        }
+        const fls = s.condFalse(cur);
+        if (s.kind(fls) == .conditional and s.condCheck(fls) == chk and s.condDistributive(fls)) {
+            cur = fls;
+            continue;
+        }
+        return c.isAssignable(try c.instantiate(fls, &map), target);
+    }
+    return false;
+}
+
+/// The branch union of a conditional whose check the constraint did not settle
+/// — tsc's `getDefaultConstraintOfConditionalType`, applied down the false-branch
+/// chain because each nested conditional's own default constraint is again its
+/// branch union.
+///
+/// Walks the chain instead of instantiating it: substituting the constraint into
+/// a nested conditional would RESOLVE it (its check is concrete by then) and
+/// throw away branches tsc keeps.
+fn remainingBranchUnion(c: *Checker, cond: TypeId, map: []const TpMap) Error!TypeId {
+    const s = &c.ts;
+    var parts: std.ArrayList(TypeId) = .empty;
+    defer parts.deinit(c.scratch());
+    var cur = cond;
+    var steps: u32 = 0;
+    while (steps < max_cond_constraint_steps) : (steps += 1) {
+        try parts.append(c.scratch(), try c.instantiate(s.condTrue(cur), map));
+        const fls = s.condFalse(cur);
+        if (s.kind(fls) != .conditional) {
+            try parts.append(c.scratch(), try c.instantiate(fls, map));
+            break;
+        }
+        cur = fls;
+    }
+    return s.makeUnion(c.scratch(), parts.items);
+}
+
+/// Could some instantiation of a parameter bounded by `con` satisfy `extends
+/// ext`? tsc's approximation, and the one its own results pin: yes exactly when
+/// some CONSTITUENT of `ext` is assignable to `con`.
+///
+/// `T extends string` against `extends "abc" | 42` is the case that needs the
+/// union split — `"abc" | 42` is not assignable to `string`, but `"abc"` is, so
+/// a `T` of `"abc"` takes the true branch and the conditional stays undecided
+/// (tsgo reports `boolean` there, not `false`).
+fn extendsReachableFrom(c: *Checker, ext: TypeId, con: TypeId) Error!bool {
+    if (c.ts.kind(ext) == .union_type) {
+        for (try c.memberList(ext)) |m| {
+            if (try c.isAssignable(m, con)) return true;
+        }
+        return false;
+    }
+    return c.isAssignable(ext, con);
+}
+
 /// Whether a true branch is cheap to rewrite: an ALLOWLIST of type shapes that
 /// an `instantiate` finishes in one pass over what is already materialized.
 ///
@@ -2232,7 +2351,13 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         // make a branch relate that the bare branch did not.
         const tru_ok = (try c.isAssignable(try c.condTrueUnderExtends(s), t)) or
             (try c.isAssignable(try condTrueSubstituted(c, s), t));
-        return tru_ok and (try c.isAssignable(c.ts.condFalse(s), t));
+        if (tru_ok and (try c.isAssignable(c.ts.condFalse(s), t))) return true;
+        // Only now — with the both-branches reading already refused — is the
+        // narrower DISTRIBUTIVE constraint worth computing. tsc tries it first
+        // and falls back to the branch union; the two are alternatives for a
+        // single boolean, so running the cheap one first costs a clean program
+        // nothing.
+        return distributiveConstraintRelates(c, s, t);
     }
     // A deferred `keyof T` source relates through its apparent
     // constraint `string | number | symbol`; handled before union-target
@@ -2846,6 +2971,14 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         // assignable to the base's static side, and a structural comparison
         // still says so.
         .class_value => {
+            // The abstract-constructor rule (see `sourceSatisfiesSigs`) between
+            // two class VALUES, where materializing both sides would have lost
+            // the bit: `typeof AbstractB` is not a `typeof ConcreteA`, however
+            // well their statics and constructors line up, because the target
+            // can be `new`ed. The reverse stays legal.
+            if (sk == .class_value and
+                try c.classIsAbstract(c.ts.classSymbol(s)) and
+                !try c.classIsAbstract(c.ts.classSymbol(t))) return false;
             const tgt_static = try c.classConstructType(c.ts.classSymbol(t));
             if (sk != .class_value) return c.structuralAssignable(s, tgt_static);
             return c.structuralAssignable(try c.classConstructType(c.ts.classSymbol(s)), tgt_static);
@@ -4327,6 +4460,19 @@ pub fn nonDiscPropsAssignable(c: *Checker, s: TypeId, member: TypeId, excl: Atom
     return true;
 }
 
+/// Is `t` an object that is nothing but ONE construct signature — the shape a
+/// `new (…) => R` / `abstract new (…) => R` type literal builds, and the one
+/// shape whose abstract-ness ztsc's model cannot recover? See the
+/// abstract-constructor screen in `sourceSatisfiesSigs`.
+pub fn bareConstructSigObject(c: *const Checker, t: TypeId) bool {
+    if (c.ts.kind(t) != .object) return false;
+    return c.ts.objectConstructSigCount(t) == 1 and
+        c.ts.objectCallSigCount(t) == 0 and
+        c.ts.objectPropCount(t) == 0 and
+        c.ts.objectStringIndex(t) == 0 and
+        c.ts.objectNumberIndex(t) == 0;
+}
+
 /// Whether `s` provides a signature assignable to each of `t`'s call
 /// (`is_construct == false`) or construct (`true`) signatures.
 /// Function ↔ callable-object relate in both directions; a `class_value`
@@ -4348,6 +4494,38 @@ pub fn nonDiscPropsAssignable(c: *Checker, s: TypeId, member: TypeId, excl: Atom
 pub fn sourceSatisfiesSigs(c: *Checker, s: TypeId, t: TypeId, is_construct: bool) Error!bool {
     const sk = c.ts.kind(s);
     if (sk == .any or sk == .err) return true;
+    // tsc's `signaturesRelatedTo`, construct half, ahead of every signature
+    // comparison:
+    //
+    //     const sourceIsAbstract = !!(sourceSignatures[0].flags & SignatureFlags.Abstract);
+    //     const targetIsAbstract = !!(targetSignatures[0].flags & SignatureFlags.Abstract);
+    //     if (sourceIsAbstract && !targetIsAbstract) {
+    //         …Cannot_assign_an_abstract_constructor_type_to_a_non_abstract_constructor_type…
+    //         return Ternary.False;
+    //     }
+    //
+    // An abstract class's constructor cannot be CALLED, so letting `typeof A`
+    // through a `new () => A` target would hand the caller a `new` on a class
+    // with unimplemented members. The reverse direction stays legal — a
+    // concrete constructor satisfies an abstract-constructor target — which is
+    // why the test is one-sided.
+    //
+    // ztsc carries the `abstract` bit on the class DECLARATION rather than on
+    // the signature, so the source side is recognized by its `.class_value`
+    // kind — and the TARGET side has to be one ztsc can be sure is not
+    // abstract. `typenode` builds `abstract new (…) => R` and `new (…) => R`
+    // into the same object and keeps no bit apart, so the only targets this
+    // fires on are the ones that CANNOT have been written either way: an
+    // object carrying anything besides one lone construct signature.
+    // `abstract new (…) => T` is exactly that lone signature, so a genuinely
+    // abstract target is never mistaken for a concrete one — at the cost of
+    // under-reporting a target spelled `new () => A` on its own
+    // (`classAbstractAssignabilityConstructorFunction`), which is the
+    // direction this project takes when a bit is missing.
+    if (is_construct and sk == .class_value and
+        !bareConstructSigObject(c, t) and
+        c.ts.objectConstructSigCount(t) > 0 and
+        try c.classIsAbstract(c.ts.classSymbol(s))) return false;
     var src: std.ArrayList(TypeId) = .empty;
     defer src.deinit(c.scratch());
     switch (sk) {
@@ -5034,6 +5212,17 @@ pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode
     const rest_pair: ?u32 = blk: {
         const both = @min(s_count, t_count);
         if (both == 0) break :blk null;
+        // …but only when ONE side has it. Two signatures that each declare a
+        // generic rest (`(…, ...args: Args) => R` on both sides, jotai's
+        // `WritableAtom`'s `set`) are two instantiations of one shape, and
+        // ztsc relates their type parameters as the DISTINCT parameters they
+        // are: `Args` against `Args` is not `Args` here, so comparing the two
+        // rests as whole types rejects a signature that is its own equal. The
+        // element-wise reading, which erases both to the same thing, is the
+        // one that gets that pair right — and the rule is only ever needed
+        // where the OTHER side is concrete enough to say something the
+        // elements cannot.
+        if (sigInstantiableRest(c, se) != sigInstantiableRest(c, te)) break :blk both - 1;
         if ((try c.sigRestUnion(se)) == null and (try c.sigRestUnion(te)) == null) break :blk null;
         break :blk both - 1;
     };
@@ -5047,8 +5236,8 @@ pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode
                 // it, because `any[]` is not assignable to a tuple with a
                 // required element.
                 if (try anyRestFrom(c, te, i)) continue;
-                const st = try c.restTupleAtPosition(se, i);
-                const tt = try c.restTupleAtPosition(te, i);
+                const st = try restTypeAtPosition(c, se, i);
+                const tt = try restTypeAtPosition(c, te, i);
                 if (try c.isAssignable(tt, st)) continue;
                 if (mode != .none or !bivariant) return false;
                 if (!try c.isAssignable(st, tt)) return false;
@@ -5418,6 +5607,77 @@ pub fn paramTotal(c: *Checker, sig: TypeId) Error!u32 {
         return count - 1 + len;
     }
     return std.math.maxInt(u32);
+}
+
+/// tsc's `getNonArrayRestType` for the family `sigNonArrayRest` does not cover:
+/// a rest parameter still typed by an INSTANTIABLE type — a bare type parameter
+/// (`...args: A`), a conditional (`...args: T extends 1 ? [x] : [x, y]`), an
+/// indexed access. Such a rest has no element type worth comparing
+/// position-wise: `A` is not `A[number]`, and relating the elements loses the
+/// only thing the target could have said about it.
+///
+/// tsc packs both sides' remaining parameters into one tuple at that position
+/// and relates them contravariantly, which is what makes
+/// `(...args: A) => void` REJECT a target `(...args: unknown[]) => void` —
+/// `unknown[]` is assignable to `A`'s constraint but not to `A`. Element-wise
+/// both sides read `unknown` and the pair was accepted (`strictBindCallApply1`,
+/// whose `callback.bind(2)` then blamed the argument instead of the receiver).
+///
+/// One already-loaded kind read on the last parameter, and only for a signature
+/// that HAS a rest parameter; deliberately no `resolveStructural`, so an alias
+/// `.ref` (which resolves to an array or a tuple in every shape this covers)
+/// costs nothing on the relation's hot path.
+fn sigInstantiableRest(c: *const Checker, sig: TypeId) bool {
+    return instantiableRestType(c, sig) != null;
+}
+
+fn instantiableRestType(c: *const Checker, sig: TypeId) ?TypeId {
+    const count = c.ts.fnParamCount(sig);
+    if (count == 0) return null;
+    const p = c.ts.fnParam(sig, count - 1);
+    if (!p.rest()) return null;
+    // `...args: [...Args]` is `...args: Args` (see `loneVariadic`), and the two
+    // spellings meet each other constantly — a contextually typed
+    // `(this, ...args) => …` written against a `(...args: Args) => …` parameter
+    // comes back with the spread form.
+    const ty = loneVariadic(c, p.ty);
+    return switch (c.ts.kind(ty)) {
+        .type_param, .conditional, .index_access => ty,
+        else => null,
+    };
+}
+
+/// tsc's `getRestTypeAtPosition`, which answers with the REST TYPE ITSELF at the
+/// rest's own position:
+///
+/// ```ts
+/// return pos === parameterCount - 1 ? restType : createArrayType(getIndexedAccessType(restType, numberType));
+/// ```
+///
+/// `restTupleAtPosition` packs it into a tuple instead, which is the same type
+/// for every rest that HAS a positional expansion (`makeTuple` collapses a lone
+/// variadic element back to its array) and a strictly weaker one for a rest that
+/// does not: `[...(T extends 1 ? [x] : [x, y])]` relates through the variadic
+/// element's element type, where the bare conditional relates as itself and
+/// rejects — `strictBindCallApply1`'s `baz` callback.
+fn restTypeAtPosition(c: *Checker, sig: TypeId, pos: u32) Error!TypeId {
+    if (instantiableRestType(c, sig)) |rt| {
+        if (pos + 1 == c.ts.fnParamCount(sig)) return rt;
+    }
+    return loneVariadic(c, try c.restTupleAtPosition(sig, pos));
+}
+
+/// `[...X]` IS `X` — tsc's `createNormalizedTupleType` collapses a tuple whose
+/// only element spreads another type. `makeTuple` already does it when `X` is an
+/// array (there is an array type to collapse to); a `[...Args]` written over a
+/// type PARAMETER keeps the wrapper, and comparing that wrapper against the bare
+/// `Args` the other side supplies rejects a signature that is its own equal
+/// (`esDecorators-contextualTypes.2`'s `(this, ...args) => …` against
+/// `(this: This, ...args: Args) => Return`).
+fn loneVariadic(c: *const Checker, t: TypeId) TypeId {
+    if (c.ts.kind(t) != .tuple or c.ts.tupleLen(t) != 1) return t;
+    const e = c.ts.tupleElem(t, 0);
+    return if (e.rest()) e.ty else t;
 }
 
 /// Is everything `sig` accepts from position `pos` onward an UNBOUNDED rest

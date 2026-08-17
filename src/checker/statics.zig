@@ -25,6 +25,7 @@ const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
 const isCtorName = @import("instantiate.zig").isCtorName;
 const classIndexInfos = @import("classes.zig").classIndexInfos;
+const derivesFrom = @import("classes.zig").derivesFrom;
 
 /// One own static member of `cls`, resolved WITHOUT materializing its
 /// siblings — tsc's `getPropertyOfType` on the static side, which reaches
@@ -410,8 +411,55 @@ pub fn classStaticType(c: *Checker, sym: SymbolId) Error!TypeId {
     // folded THAT and cached the hole permanently. Which demand arrives inside
     // the window is a partition/order accident, so the diagnostics moved with
     // `--checkers`. Leaving a cut object uncached costs one rebuild.
-    if (!cut) try c.class_static_cache.put(c.cm(), sym, result);
+    if (!cut) {
+        try c.class_static_cache.put(c.cm(), sym, result);
+        try noteStaticOwner(c, sym, result);
+    }
     return result;
+}
+
+/// The poison value of `Checker.class_static_owner`: a static table two classes
+/// share, which therefore names neither.
+const ambiguous_static_owner: SymbolId = binder.no_symbol;
+
+/// Record `result` as `sym`'s static side, for the `private`/`protected` screen
+/// inside the relation (`nominal_members.zig`) and the messages it renders.
+///
+/// One entry per class that has a static member at all — the same order of
+/// magnitude as `class_static_cache` itself, and written once per class since
+/// only the memoizing path reaches here. An EMPTY static table is skipped: it
+/// declares nothing, so it can never be a declaration side, and `{}` is far too
+/// widely shared for an attribution to mean anything.
+///
+/// Two classes DO share a table routinely: `class D extends B {}` adds no
+/// static of its own, so its merged static side IS `B`'s. That sharing is
+/// harmless — a static lookup from `D` walks into `B` and finds `B`'s member
+/// symbol, which is exactly what the lookup from `B` finds — so the entry keeps
+/// the BASE-most class of the two and the answer is the same whichever side
+/// asked. Two UNRELATED classes that happen to have identical static tables
+/// have no such common answer, and the entry is poisoned instead: an arbitrary
+/// pick would make the rule's verdict depend on which class the checker
+/// materialized first, and the poison's fallback ("no declaration side") is the
+/// under-report ztsc had before the index existed.
+fn noteStaticOwner(c: *Checker, sym: SymbolId, result: TypeId) Error!void {
+    std.debug.assert(sym != ambiguous_static_owner);
+    if (c.ts.kind(result) != .object or c.ts.objectPropCount(result) == 0) return;
+    const gop = try c.class_static_owner.getOrPut(c.cm(), result);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = sym;
+        return;
+    }
+    const cur = gop.value_ptr.*;
+    if (cur == ambiguous_static_owner or cur == sym) return;
+    if (try derivesFrom(c, sym, cur)) return;
+    gop.value_ptr.* = if (try derivesFrom(c, cur, sym)) sym else ambiguous_static_owner;
+}
+
+/// The class whose static side `ty` IS, when the static table names exactly one
+/// — the static analogue of a class instance type's `.ref` symbol.
+pub fn staticOwner(c: *const Checker, ty: TypeId) ?SymbolId {
+    const sym = c.class_static_owner.get(ty) orelse return null;
+    return if (sym == ambiguous_static_owner) null else sym;
 }
 
 /// A class value (`typeof C`) rendered as an ordinary *structural*

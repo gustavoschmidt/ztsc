@@ -67,6 +67,7 @@ const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
 const accessibility = @import("accessibility.zig");
+const assign_zig = @import("assign.zig");
 const nominal_members = @import("nominal_members.zig");
 
 /// Deepest chain rendered. tsgo has no cutoff; this is a resource bound so a
@@ -139,6 +140,12 @@ const Tail = union(enum) {
     /// it is taken from there rather than re-derived here. Prints BELOW the
     /// last level's relation line, like `tuple_arity`.
     nominal: []const u8,
+    /// tsc's `Cannot_assign_an_abstract_constructor_type_to_a_non_abstract_constructor_type`,
+    /// out of `signaturesRelatedTo`'s construct half (see
+    /// `assign.sourceSatisfiesSigs`). Terminal, and it REPLACES the walk: tsc
+    /// returns as soon as the abstract bit decides the pair, so nothing below
+    /// it is ever compared.
+    abstract_ctor,
 };
 
 const Found = union(enum) { step: Level, tail: Tail };
@@ -290,6 +297,7 @@ fn findStep(c: *Checker, s0: TypeId, t0: TypeId, missing_ok: bool) Error!?Found 
 
     const s = try c.resolveStructural(s0);
     const t = try c.resolveStructural(t0);
+    if (try abstractCtorTail(c, s0, t0, t)) return .{ .tail = .abstract_ctor };
     switch (store.kind(s)) {
         .err, .none, .any, .never => return null,
         else => {},
@@ -419,6 +427,25 @@ fn bestUnionMatch(c: *Checker, s: TypeId, t: TypeId) Error!?TypeId {
     return best;
 }
 
+/// Is this pair the one the abstract-constructor rule decided — an abstract
+/// class VALUE against a target that can be `new`ed? Asked before the walk,
+/// because tsc's relation returns there and never compares a member.
+///
+/// The condition is `assign.sourceSatisfiesSigs`' and the `.class_value` target
+/// arm's, read off the two sides as the caller holds them: a materialized
+/// static object no longer carries the `abstract` bit.
+fn abstractCtorTail(c: *Checker, s0: TypeId, t0: TypeId, t: TypeId) Error!bool {
+    const store = &c.ts;
+    if (store.kind(s0) != .class_value) return false;
+    if (!try c.classIsAbstract(store.classSymbol(s0))) return false;
+    if (store.kind(t0) == .class_value) {
+        return !try c.classIsAbstract(store.classSymbol(t0));
+    }
+    return store.kind(t) == .object and
+        store.objectConstructSigCount(t) > 0 and
+        !assign_zig.bareConstructSigObject(c, t);
+}
+
 /// A missing required property (the chain's tail) or the first incompatible
 /// one (a `.property` step).
 /// `s0`/`t0` are the two sides as the caller was handed them, `s`/`t` their
@@ -457,7 +484,7 @@ fn propertyStep(c: *Checker, s0: TypeId, t0: TypeId, s: TypeId, t: TypeId, missi
     // terminal: tsc reports and returns, leaving the enclosing relation line as
     // the head.
     if (try nominal_members.firstMismatch(c, s0, t0, t)) |m| {
-        return .{ .tail = .{ .nominal = try nominalText(c, s0, t0, m) } };
+        return .{ .tail = .{ .nominal = try nominalText(c, s0, m) } };
     }
 
     // The first incompatible property, in name-TEXT order. The stored order is
@@ -503,7 +530,7 @@ fn atomTextLess(c: *Checker, a: Atom, b: Atom) bool {
 /// the private/derived-from messages (`typeToString(getDeclaringClass(prop))`,
 /// which prints a generic class with its parameters), and the whole source and
 /// target for the protected-vs-public one.
-fn nominalText(c: *Checker, s: TypeId, t: TypeId, m: nominal_members.Named) Error![]const u8 {
+fn nominalText(c: *Checker, s: TypeId, m: nominal_members.Named) Error![]const u8 {
     const name = try propDisplay(c, m.name);
     return switch (m.why) {
         .separate_private => std.fmt.allocPrint(
@@ -512,7 +539,14 @@ fn nominalText(c: *Checker, s: TypeId, t: TypeId, m: nominal_members.Named) Erro
             .{name},
         ) catch error.OutOfMemory,
         .private_one_side => |p| blk: {
-            const priv = try accessibility.declaringClassName(c, p.private_cls);
+            const cls = try accessibility.declaringClassName(c, p.private_cls);
+            // The static side prints as `typeof C` — tsc's message names the
+            // whole source type there, not the declaring class.
+            const priv = if (!p.private_statics) cls else std.fmt.allocPrint(
+                c.scratch(),
+                "typeof {s}",
+                .{c.symbolName(p.private_cls)},
+            ) catch return error.OutOfMemory;
             break :blk std.fmt.allocPrint(
                 c.scratch(),
                 "Property '{s}' is private in type '{s}' but not in type '{s}'.",
@@ -528,10 +562,10 @@ fn nominalText(c: *Checker, s: TypeId, t: TypeId, m: nominal_members.Named) Erro
                 .{ name, src, tgt },
             ) catch error.OutOfMemory;
         },
-        .protected_vs_public => std.fmt.allocPrint(
+        .protected_vs_public => |p| std.fmt.allocPrint(
             c.scratch(),
             "Property '{s}' is protected in type '{s}' but public in type '{s}'.",
-            .{ name, try c.typeToString(s), try c.typeToString(t) },
+            .{ name, try c.typeToString(p.src), try c.typeToString(p.tgt) },
         ) catch error.OutOfMemory,
     };
 }
@@ -643,6 +677,7 @@ fn render(c: *Checker, levels: []const Level, tail: Tail) Error![]const u8 {
         });
     }
     if (tail == .nominal) try line(&out.writer, &indent, "{s}", .{tail.nominal});
+    if (tail == .abstract_ctor) try line(&out.writer, &indent, "Cannot assign an abstract constructor type to a non-abstract constructor type.", .{});
     return out.written();
 }
 

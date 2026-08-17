@@ -67,11 +67,11 @@ const Error = checker_zig.Error;
 
 const accessibility = @import("accessibility.zig");
 const Access = accessibility.Access;
+const statics_zig = @import("statics.zig");
 
-/// Bounds shared by both heritage walks below, matching every other bounded
-/// heritage walk in the checker (`accessibility.declaringClass`,
-/// `heritage.baseClassMember`).
-const max_heritage_nodes = 32;
+const classes = @import("classes.zig");
+const max_heritage_nodes = classes.max_heritage_nodes;
+const derivesFrom = classes.derivesFrom;
 
 /// The screen for the one pair the property walk can never see: two distinct
 /// REFERENCES whose member tables materialize to the very same type id.
@@ -120,13 +120,12 @@ pub fn identicalTableRelated(c: *Checker, src: TypeId, dst: TypeId, table: TypeI
 /// both directions.
 ///
 /// The one case that is neither is a side whose property CARRIES the non-public
-/// flag and whose declaration this walk could not find — a private static
-/// (reached through a synthesized construct-signature object, which names no
-/// class), or a member inherited through a heritage clause that is not a plain
-/// reference (`class D extends Mixin(Base)`), where the flag was folded into
-/// `D`'s own table without a declaring symbol to attribute it to. There the rule
-/// has no `valueDeclaration` to compare and this answers `true`: an
-/// under-report, never a false positive.
+/// flag and whose declaration this walk could not find — a member inherited
+/// through a heritage clause that is not a plain reference (`class D extends
+/// Mixin(Base)`), where the flag was folded into `D`'s own table without a
+/// declaring symbol to attribute it to, or a static side two classes share
+/// (`statics.staticOwner`). There the rule has no `valueDeclaration` to compare
+/// and this answers `true`: an under-report, never a false positive.
 pub fn nonPublicPropRelated(
     c: *Checker,
     src: TypeId,
@@ -151,15 +150,28 @@ pub const Mismatch = union(enum) {
     separate_private,
     /// `Property '{name}' is private in type '{private_cls}' but not in type
     /// '{other}'.` — tsc names the PRIVATE side first whichever direction the
-    /// assignment ran in.
-    private_one_side: struct { private_cls: SymbolId, other: TypeId },
+    /// assignment ran in. `private_statics` renders `typeof C` for a
+    /// `private static`, which is how tsc's `typeToString(source)` prints the
+    /// static side.
+    private_one_side: struct { private_cls: SymbolId, private_statics: bool, other: TypeId },
     /// `Property '{name}' is protected but type '{src}' is not a class derived
     /// from '{tgt}'.`
     protected_not_derived: struct { src_cls: ?SymbolId, tgt_cls: SymbolId },
     /// `Property '{name}' is protected in type '{src}' but public in type
-    /// '{tgt}'.` — the whole SOURCE and TARGET types, not the declaring classes.
-    protected_vs_public,
+    /// '{tgt}'.` — the whole SOURCE and TARGET types, not the declaring classes,
+    /// each in its DISPLAY form (`displayType`).
+    protected_vs_public: struct { src: TypeId, tgt: TypeId },
 };
+
+/// The type as tsc PRINTS it in the messages above. A class's static side is a
+/// plain object here and `typeof C` in tsc, so the reverse index that named its
+/// class (`declaringMember`) names it for the message too; everything else is
+/// already the type tsc holds.
+fn displayType(c: *Checker, ty: TypeId) Error!TypeId {
+    if (c.ts.kind(ty) == .class_value) return ty;
+    const cls = statics_zig.staticOwner(c, ty) orelse return ty;
+    return c.ts.makeClassValue(cls);
+}
 
 fn nonPublicPropMismatch(
     c: *Checker,
@@ -184,8 +196,16 @@ fn nonPublicPropMismatch(
         t_access = accessibility.accessOfMember(c, x.msym, false);
     } else if (dst_non_public or !try declaresOwnMember(c, dst, name)) return null;
     if (s_access == .private and t_access == .private) return .separate_private;
-    if (s_access == .private) return .{ .private_one_side = .{ .private_cls = s.?.cls, .other = dst } };
-    if (t_access == .private) return .{ .private_one_side = .{ .private_cls = t.?.cls, .other = src } };
+    if (s_access == .private) return .{ .private_one_side = .{
+        .private_cls = s.?.cls,
+        .private_statics = s.?.statics,
+        .other = try displayType(c, dst),
+    } };
+    if (t_access == .private) return .{ .private_one_side = .{
+        .private_cls = t.?.cls,
+        .private_statics = t.?.statics,
+        .other = try displayType(c, src),
+    } };
     // `isValidOverrideOf`: a `protected` target member accepts only a source
     // member declared by a class DERIVED from the declaring one. A source with
     // no declaring class at all supplies none.
@@ -198,7 +218,10 @@ fn nonPublicPropMismatch(
             .tgt_cls = t.?.cls,
         } };
     }
-    if (s_access == .protected) return .protected_vs_public;
+    if (s_access == .protected) return .{ .protected_vs_public = .{
+        .src = try displayType(c, src),
+        .tgt = try displayType(c, dst),
+    } };
     return null;
 }
 
@@ -263,16 +286,47 @@ fn declaresOwnMember(c: *Checker, ty: TypeId, name: Atom) Error!bool {
 /// chain alone, because an interface may extend a class and several bases at
 /// once, and the property lookup that produced the `Prop` followed the same
 /// graph.
-const Declaring = struct { cls: SymbolId, msym: SymbolId };
+const Declaring = struct {
+    cls: SymbolId,
+    msym: SymbolId,
+    /// Was the member found on the class's STATIC side (`typeof C`) rather than
+    /// its instance side? Only the rendering differs — tsc names the static side
+    /// `typeof C` where the instance side is plain `C` — but the two sides are
+    /// separate member tables, so a `private static x` and a `private x` of the
+    /// same class are different declarations and never the same symbol.
+    statics: bool,
+};
 
+/// The class whose OWN member table declares `name`, on whichever side of the
+/// class `ty` is.
+///
+/// The instance side is a `.ref` (or an object tagged with one), which names its
+/// symbol directly. The static side is a plain materialized object — `typeof C`
+/// carries no reference — so it names its class through the reverse index
+/// `classStaticType` fills in (`statics.staticOwner`); that index is the whole
+/// reason a `private static` shadow is a TS2417 here and was silently accepted
+/// before.
 fn declaringMember(c: *Checker, ty: TypeId, name: Atom) Error!?Declaring {
-    const ref = c.refFacetOf(ty, c.ts.kind(ty)) orelse return null;
+    const k = c.ts.kind(ty);
+    var statics = false;
+    const root = blk: {
+        if (c.refFacetOf(ty, k)) |ref| break :blk c.ts.refSymbol(ref);
+        if (k == .class_value) {
+            statics = true;
+            break :blk c.ts.classSymbol(ty);
+        }
+        if (statics_zig.staticOwner(c, ty)) |cls| {
+            statics = true;
+            break :blk cls;
+        }
+        return null;
+    };
     var queue: [max_heritage_nodes]SymbolId = undefined;
     var seen: [max_heritage_nodes]SymbolId = undefined;
     var qn: usize = 1;
     var head: usize = 0;
     var n: usize = 0;
-    queue[0] = c.ts.refSymbol(ref);
+    queue[0] = root;
     while (head < qn) {
         const sym = queue[head];
         head += 1;
@@ -284,7 +338,15 @@ fn declaringMember(c: *Checker, ty: TypeId, name: Atom) Error!?Declaring {
         if (dup) continue;
         seen[n] = sym;
         n += 1;
-        if (accessibility.instanceMember(c, sym, name)) |msym| return .{ .cls = sym, .msym = msym };
+        const found = if (statics)
+            accessibility.staticMember(c, sym, name)
+        else
+            accessibility.instanceMember(c, sym, name);
+        if (found) |msym| return .{ .cls = sym, .msym = msym, .statics = statics };
+        // Statics are not inherited through an interface, and an interface has
+        // no static side at all, so the static search stays on the class chain
+        // (`accessibility.declaringClass` bounds its own walk the same way).
+        if (statics and !c.symFlags(sym).class) continue;
         for (try c.declaredBaseRefs(sym)) |b| {
             if (c.ts.kind(b) != .ref or qn == queue.len) continue;
             queue[qn] = c.ts.refSymbol(b);
@@ -292,35 +354,4 @@ fn declaringMember(c: *Checker, ty: TypeId, name: Atom) Error!?Declaring {
         }
     }
     return null;
-}
-
-/// tsc's `hasBaseType(derived, base)` over the declared heritage graph:
-/// equality included, so a class is its own base and a re-declaration inside a
-/// derived class is still a valid override of the base's `protected` member.
-fn derivesFrom(c: *Checker, derived: SymbolId, base: SymbolId) Error!bool {
-    var queue: [max_heritage_nodes]SymbolId = undefined;
-    var seen: [max_heritage_nodes]SymbolId = undefined;
-    var qn: usize = 1;
-    var head: usize = 0;
-    var n: usize = 0;
-    queue[0] = derived;
-    while (head < qn) {
-        const sym = queue[head];
-        head += 1;
-        if (sym == base) return true;
-        if (n == seen.len) return false;
-        var dup = false;
-        for (seen[0..n]) |s| if (s == sym) {
-            dup = true;
-        };
-        if (dup) continue;
-        seen[n] = sym;
-        n += 1;
-        for (try c.declaredBaseRefs(sym)) |b| {
-            if (c.ts.kind(b) != .ref or qn == queue.len) continue;
-            queue[qn] = c.ts.refSymbol(b);
-            qn += 1;
-        }
-    }
-    return false;
 }
