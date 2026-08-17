@@ -515,6 +515,12 @@ pub const Code = enum(u16) {
     /// TS2434: an instantiated namespace block written BEFORE the class or
     /// function it merges with. Reported on the namespace's name.
     namespace_prior_to_merge,
+    /// TS2433: the same merge, split across FILES — the namespace block and
+    /// the class/function it merges with are in different source files, so no
+    /// ordering could make the namespace run second. Reported on the
+    /// namespace's name; found by the linker, not the binder, because only the
+    /// cross-file merge knows about the other half.
+    namespace_split_across_files,
     /// TS2492: redeclaring a catch-clause parameter in the catch block.
     catch_redeclare,
     /// TS2389: the declaration immediately after an overload signature HAS a
@@ -1233,6 +1239,7 @@ pub const Code = enum(u16) {
             .abstract_decls_not_consecutive => "All declarations of an abstract method must be consecutive.",
             .enum_first_member_needs_initializer => "In an enum with multiple declarations, only one declaration can omit an initializer for its first enum element.",
             .namespace_prior_to_merge => "A namespace declaration cannot be located prior to a class or function with which it is merged.",
+            .namespace_split_across_files => "A namespace declaration cannot be in a different file from a class or function with which it is merged.",
             .catch_redeclare => "cannot redeclare identifier in catch clause",
             .overload_impl_name_mismatch => "function implementation name must match the overload it follows",
             .overload_must_be_static => "Function overload must be static.",
@@ -1384,6 +1391,7 @@ pub const Code = enum(u16) {
             .abstract_decls_not_consecutive => 2516,
             .enum_first_member_needs_initializer => 2432,
             .namespace_prior_to_merge => 2434,
+            .namespace_split_across_files => 2433,
             .catch_redeclare => 2492,
             .overload_impl_name_mismatch => 2389,
             .overload_must_be_static => 2387,
