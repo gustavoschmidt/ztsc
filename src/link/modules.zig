@@ -2910,6 +2910,18 @@ const Linker = struct {
                 if (l.no_implicit_any and !side_effect and untypedJsModule(l.files[mfile].path)) {
                     try l.diag(file, 7016, l.tokSpan(file, mod_tok), "Could not find a declaration file for module '{s}'. '{s}' implicitly has an 'any' type.", .{ stripped, l.files[mfile].path });
                 }
+                // …and a file that exists but is a SCRIPT has no module symbol
+                // to import from. tsc's `resolveExternalModuleName`: the file
+                // resolved, `sourceFile.symbol` is undefined, so it reports
+                // TS2306 at the specifier and binds nothing. A side-effect
+                // import asks for no name and stays silent, and a synthetic
+                // JSON/JS any-module (which carries `export = any` and never
+                // sees a binder) is not a script.
+                if (!side_effect and !l.files[mfile].bind.is_module and
+                    paths.anyModuleSourceFor(l.files[mfile].path) == null)
+                {
+                    try l.diag(file, 2306, l.tokSpan(file, mod_tok), "File '{s}' is not a module.", .{l.files[mfile].path});
+                }
                 return true;
             }
         }
