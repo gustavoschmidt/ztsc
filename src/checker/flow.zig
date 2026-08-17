@@ -802,7 +802,9 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
             // An exhaustive `default`-less switch cannot fall out of its
             // clause list, so this edge does not exist.
             if (c.switchIsExhaustive(sw)) return types.never_type;
-            return flowType(c, ante, key, declared, depth + 1);
+            const before = try flowType(c, ante, key, declared, depth + 1);
+            if (before == types.never_type) return before;
+            return narrowBySwitchNoMatch(c, before, sw, key, declared);
         },
         .call_stmt => {
             const call = b.flowNode(flow);
@@ -2765,9 +2767,24 @@ fn narrowBySwitchClause(c: *Checker, t: TypeId, clause: Node, key: RefKey, decl:
     // don't back-reference it, so scan: the discriminant condition
     // narrows only when it's the reference or `ref.prop`.
     const sw = switchOfClause(c, clause) orelse return t;
+    return narrowBySwitchOn(c, t, sw, clause, key, decl);
+}
+
+/// The "no clause matched" edge out of a `default`-less switch. tsc models it
+/// as a `FlowSwitchClause` with `clauseStart === clauseEnd`, which its
+/// narrowers read as `hasDefaultClause` — i.e. it narrows EXACTLY like an
+/// explicit `default:`, by excluding every `case` label. `switchIsExhaustive`
+/// only answers the coarse "does this edge exist at all" question; the
+/// exclusion is what types the reference when it does.
+fn narrowBySwitchNoMatch(c: *Checker, t: TypeId, sw: Node, key: RefKey, decl: TypeId) Error!TypeId {
+    return narrowBySwitchOn(c, t, sw, null_node, key, decl);
+}
+
+/// `clause == null_node` means the implicit-default (no-match) edge.
+fn narrowBySwitchOn(c: *Checker, t: TypeId, sw: Node, clause: Node, key: RefKey, decl: TypeId) Error!TypeId {
     var disc = c.tree.nodeData(sw).lhs;
     while (disc != null_node and c.nodeTag(disc) == .paren_expr) disc = c.tree.nodeData(disc).lhs;
-    const is_default = c.nodeTag(clause) == .default_clause;
+    const is_default = clause == null_node or c.nodeTag(clause) == .default_clause;
 
     // `switch (true) { case <guard>: … }` — TS 5.3's switch-on-`true`
     // narrowing (tsc's `narrowTypeBySwitchOnTrue`). Each clause expression is
@@ -2785,14 +2802,7 @@ fn narrowBySwitchClause(c: *Checker, t: TypeId, clause: Node, key: RefKey, decl:
         prop = disc_prop;
     }
     if (!direct and prop == 0 and c.nodeTag(disc) == .prefix_unary and try typeofTargetOf(c, disc, key)) {
-        // switch (typeof x)
-        if (is_default) return t;
-        const test_node = c.tree.nodeData(clause).lhs;
-        const tt = try c.ts.regularLiteral(try c.checkExprCached(test_node, types.no_type));
-        if (c.ts.kind(tt) == .string_literal) {
-            return c.narrowByTypeof(t, c.ts.literalAtom(tt), true);
-        }
-        return t;
+        return narrowBySwitchOnTypeof(c, t, sw, clause, is_default);
     }
     if (!direct and prop == 0) return t;
 
@@ -2847,6 +2857,54 @@ fn narrowBySwitchClause(c: *Checker, t: TypeId, clause: Node, key: RefKey, decl:
         return narrowByOptChainContainment(c, narrowed, test_node, true, true);
     }
     return narrowed;
+}
+
+/// The `typeof` string a `case` label stands for, or 0 when the label is not a
+/// string literal (tsc's `getSwitchClauseTypeOfWitnesses` gives up on the whole
+/// switch then, which is why the caller treats 0 as "narrow nowhere").
+fn typeofWitness(c: *Checker, clause: Node) Error!Atom {
+    const test_node = c.tree.nodeData(clause).lhs;
+    if (test_node == 0) return 0;
+    const tt = try c.ts.regularLiteral(try c.checkExprCached(test_node, types.no_type));
+    if (c.ts.kind(tt) != .string_literal) return 0;
+    return c.ts.literalAtom(tt);
+}
+
+/// tsc's `narrowTypeBySwitchOnTypeOf`, in its two halves:
+///
+///   * `default:` — and the implicit no-match edge, which tsc spells as an
+///     empty clause range — keeps only the constituents that are not-equal to
+///     EVERY handled `case` label.
+///   * a `case` clause narrows to its own label, but only after the labels of
+///     every PRECEDING clause have been excluded. That exclusion chain is what
+///     makes a repeated `case 'number':` `never` on its second appearance, and
+///     what leaves a `case 'boolean':` written after a `default:` holding just
+///     the constituents the earlier clauses missed (`narrowingByTypeofInSwitch`).
+///
+/// A `case` label that is not a string literal makes tsc's witness list empty,
+/// and then NO clause of the switch narrows at all — hence the whole-switch
+/// bail rather than a per-clause one.
+fn narrowBySwitchOnTypeof(c: *Checker, t0: TypeId, sw: Node, clause: Node, is_default: bool) Error!TypeId {
+    const r = c.tree.extraData(ast.SubRange, c.tree.nodeData(sw).rhs);
+    var t = t0;
+    var own: Atom = 0;
+    var past = false;
+    for (c.tree.extraRange(r.start, r.end)) |cl| {
+        if (cl == clause) past = true;
+        if (cl == null_node or c.nodeTag(cl) != .case_clause) continue;
+        const w = try typeofWitness(c, cl);
+        if (w == 0) return t0;
+        if (cl == clause) {
+            own = w;
+            continue;
+        }
+        // For a `case` clause only the labels written BEFORE it are excluded;
+        // `default:` (and the no-match edge) excludes every label there is.
+        if (!is_default and past) continue;
+        t = try c.narrowByTypeof(t, w, false);
+    }
+    if (is_default or own == 0) return t;
+    return c.narrowByTypeof(t, own, true);
 }
 
 /// tsc's `narrowTypeBySwitchOnTrue`: in `switch (true)` every `case`
