@@ -919,21 +919,20 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
         // EVOLVING array a `let x = []` starts out as; every other reference
         // (and every non-evolving antecedent type) passes straight through.
         .array_mutation => {
+            const before = try flowType(c, b.flow_a[flow], key, declared, depth + 1);
+            // The antecedent type is the gate, and it is the free one: only a
+            // query that is ALREADY carrying an evolving array can be grown by
+            // a mutation, so every other reference passing through this node
+            // skips the (name-resolving) match test entirely. tsc asks the two
+            // in the other order and falls through to the same answer.
+            if (c.ts.kind(before) != .evolving_array) return before;
+            if (key.len != 0 or isPseudoRoot(key.sym)) return before;
             const mutation = b.flowNode(flow);
-            const ante = b.flow_a[flow];
-            var matches = false;
-            if (key.len == 0 and !isPseudoRoot(key.sym)) {
-                const saved = c.cur_scope;
-                defer c.cur_scope = saved;
-                c.cur_scope = b.flowScope(flow);
-                const target = arrayMutationTarget(c, mutation);
-                matches = target != null_node and try identIsSym(c, target, key.sym);
-            }
-            const before = try flowType(c, ante, key, declared, depth + 1);
-            if (!matches or c.ts.kind(before) != .evolving_array) return before;
             const saved = c.cur_scope;
             defer c.cur_scope = saved;
             c.cur_scope = b.flowScope(flow);
+            const target = arrayMutationTarget(c, mutation);
+            if (target == null_node or !try identIsSym(c, target, key.sym)) return before;
             return evolveArray(c, before, mutation);
         },
         .cond_true, .cond_false => {
