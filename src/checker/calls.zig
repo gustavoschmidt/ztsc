@@ -866,6 +866,30 @@ fn checkThisArg(c: *Checker, node: Node, sig: TypeId) Error!void {
     }
 }
 
+/// Where an overload failure that is really a RECEIVER failure belongs: the
+/// `this` argument's own span, when `sig` declares a `this` parameter the
+/// call's receiver does not satisfy. Null when the signature has no `this`
+/// parameter, when the call has no receiver expression to blame (tsc falls back
+/// to the call node there, which is this caller's default anchor anyway), or
+/// when the receiver does satisfy it.
+///
+/// The relation here is exactly `checkThisArg`'s — the same pair, asked of a
+/// candidate rather than of the one resolved signature — so it answers out of
+/// the relation memo and costs a `checkExprCached` hit on the receiver.
+fn thisArgMismatchSpan(c: *Checker, node: Node, sig: TypeId) Error!?Span {
+    const this_ty = c.ts.fnThisType(sig);
+    if (this_ty == 0 or this_ty == types.void_type or this_ty == types.any_type) return null;
+    const callee = c.callShape(node).callee;
+    const recv_node = switch (c.nodeTag(callee)) {
+        .member_expr, .optional_member_expr, .index_expr, .optional_index_expr => c.tree.nodeData(callee).lhs,
+        else => return null,
+    };
+    if (recv_node == null_node) return null;
+    const recv = try c.checkExprCached(recv_node, types.no_type);
+    if (try c.isAssignable(recv, this_ty)) return null;
+    return c.nodeSpan(recv_node);
+}
+
 /// Whether `node` is a call/`new` that WROTE a type-argument list — i.e. one
 /// whose type arguments `writtenTypeArgNodes` can read back at the TS2344
 /// drain. `resolveSignatureCall` also serves synthesized call sites (`super(…)`,
@@ -1101,7 +1125,18 @@ fn resolveSignatureCall(
     // scan only as the fallback for a candidate whose failure is not an
     // argument relation at all.
     var anchor = c.nodeSpan(c.callShape(node).callee);
-    if (arg_anchor) |a| {
+    // …with the THIS ARGUMENT ahead of every one of them.
+    // `getSignatureApplicabilityError` relates the receiver to the signature's
+    // `this` parameter first and RETURNS as soon as that fails, so a candidate
+    // the receiver itself does not satisfy blames the receiver — tsc's
+    // `errorNode = thisArgumentNode || node` — and never gets as far as an
+    // argument. `callback.bind(2)` over `strictBindCallApply`'s
+    // `bind<T, AX, R>(this: (this: T, ...args: AX[]) => R, …)` is that shape:
+    // a `(this: 1, ...args: T) => void` with a GENERIC rest cannot be the
+    // `this` of any of them, and the `2` ztsc blamed is incidental.
+    if (try thisArgMismatchSpan(c, node, inst_last)) |a| {
+        anchor = a;
+    } else if (arg_anchor) |a| {
         anchor = a;
     } else for (c.diags.items[saved..]) |d| {
         if (d.file != c.cur_file) continue;

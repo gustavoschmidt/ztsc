@@ -67,6 +67,7 @@ const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
 const accessibility = @import("accessibility.zig");
+const assign_zig = @import("assign.zig");
 const nominal_members = @import("nominal_members.zig");
 
 /// Deepest chain rendered. tsgo has no cutoff; this is a resource bound so a
@@ -139,6 +140,12 @@ const Tail = union(enum) {
     /// it is taken from there rather than re-derived here. Prints BELOW the
     /// last level's relation line, like `tuple_arity`.
     nominal: []const u8,
+    /// tsc's `Cannot_assign_an_abstract_constructor_type_to_a_non_abstract_constructor_type`,
+    /// out of `signaturesRelatedTo`'s construct half (see
+    /// `assign.sourceSatisfiesSigs`). Terminal, and it REPLACES the walk: tsc
+    /// returns as soon as the abstract bit decides the pair, so nothing below
+    /// it is ever compared.
+    abstract_ctor,
 };
 
 const Found = union(enum) { step: Level, tail: Tail };
@@ -290,6 +297,7 @@ fn findStep(c: *Checker, s0: TypeId, t0: TypeId, missing_ok: bool) Error!?Found 
 
     const s = try c.resolveStructural(s0);
     const t = try c.resolveStructural(t0);
+    if (try abstractCtorTail(c, s0, t0, t)) return .{ .tail = .abstract_ctor };
     switch (store.kind(s)) {
         .err, .none, .any, .never => return null,
         else => {},
@@ -417,6 +425,25 @@ fn bestUnionMatch(c: *Checker, s: TypeId, t: TypeId) Error!?TypeId {
     if (best_score == 0) return null;
     if (try c.isAssignable(s, best)) return null;
     return best;
+}
+
+/// Is this pair the one the abstract-constructor rule decided — an abstract
+/// class VALUE against a target that can be `new`ed? Asked before the walk,
+/// because tsc's relation returns there and never compares a member.
+///
+/// The condition is `assign.sourceSatisfiesSigs`' and the `.class_value` target
+/// arm's, read off the two sides as the caller holds them: a materialized
+/// static object no longer carries the `abstract` bit.
+fn abstractCtorTail(c: *Checker, s0: TypeId, t0: TypeId, t: TypeId) Error!bool {
+    const store = &c.ts;
+    if (store.kind(s0) != .class_value) return false;
+    if (!try c.classIsAbstract(store.classSymbol(s0))) return false;
+    if (store.kind(t0) == .class_value) {
+        return !try c.classIsAbstract(store.classSymbol(t0));
+    }
+    return store.kind(t) == .object and
+        store.objectConstructSigCount(t) > 0 and
+        !assign_zig.bareConstructSigObject(c, t);
 }
 
 /// A missing required property (the chain's tail) or the first incompatible
@@ -650,6 +677,7 @@ fn render(c: *Checker, levels: []const Level, tail: Tail) Error![]const u8 {
         });
     }
     if (tail == .nominal) try line(&out.writer, &indent, "{s}", .{tail.nominal});
+    if (tail == .abstract_ctor) try line(&out.writer, &indent, "Cannot assign an abstract constructor type to a non-abstract constructor type.", .{});
     return out.written();
 }
 
