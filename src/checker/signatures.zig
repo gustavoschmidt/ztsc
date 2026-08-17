@@ -28,6 +28,7 @@ const Error = checker_zig.Error;
 const RefKey = @import("flow.zig").RefKey;
 const baseTypeVariableOfClass = @import("classes.zig").baseTypeVariableOfClass;
 const checkExprCached = @import("expr.zig").checkExprCached;
+const contextualReturnType = @import("expr.zig").contextualReturnType;
 const containsTypeParam = @import("enums.zig").containsTypeParam;
 const destructure = @import("destructure.zig");
 const finalizeInferredReturn = @import("names.zig").finalizeInferredReturn;
@@ -211,16 +212,7 @@ pub fn signatureOfProtoCtx(
     // property position). Threaded into the body's return-type probe so
     // return expressions are contextually typed. An async body's returns are
     // typed by the *awaited* contextual type (`Promise<T>` context → `T`).
-    var ret_ctx: TypeId = if (ctx_sig != types.no_type and c.ts.kind(ctx_sig) == .function)
-        c.ts.fnReturn(ctx_sig)
-    else
-        types.no_type;
-    // …and, when there is none, tsc's IIFE arm: an immediately-invoked function
-    // expression returns into the CALL's contextual type. See
-    // `Checker.iife_ret_ctx`.
-    if (ret_ctx == types.no_type and node != 0 and c.iife_ret_ctx_callee == c.nodeKey(node)) {
-        ret_ctx = c.iife_ret_ctx;
-    }
+    const ret_ctx: TypeId = contextualReturnType(c, node, ctx_sig);
     var ret: TypeId = types.any_type;
     var pred: ?types.Predicate = null;
     if (proto.return_type != 0 and c.nodeTag(proto.return_type) == .type_predicate) {

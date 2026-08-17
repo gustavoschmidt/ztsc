@@ -5659,12 +5659,26 @@ fn checkFunctionLikeExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     // body walk re-checked the same expressions context-free, so anything
     // nested in a returned object literal (a handler, a callback) lost its
     // contextual type and its parameters went implicit-`any`.
-    const ctx_ret: TypeId = if (ctx_sig != types.no_type and c.ts.kind(ctx_sig) == .function)
-        c.ts.fnReturn(ctx_sig)
-    else
-        types.no_type;
-    try c.checkFunctionBody(node, d.lhs, d.rhs, sig, ctx_ret);
+    try c.checkFunctionBody(node, d.lhs, d.rhs, sig, contextualReturnType(c, node, ctx_sig));
     return sig;
+}
+
+/// tsc's `getContextualReturnType` for a function-like with no return
+/// annotation: the contextual signature's return, and failing that the arm for
+/// an IMMEDIATELY-INVOKED function expression, whose body returns into the
+/// call's own contextual type (`Checker.iife_ret_ctx`).
+///
+/// Read in both places a body's return expressions are typed — the return-type
+/// PROBE in `signatures.zig` and the body walk here — because the walk re-checks
+/// the same expressions and a context missing from either one is a context the
+/// nested callbacks never see.
+pub fn contextualReturnType(c: *const Checker, node: Node, ctx_sig: TypeId) TypeId {
+    if (ctx_sig != types.no_type and c.ts.kind(ctx_sig) == .function) {
+        const r = c.ts.fnReturn(ctx_sig);
+        if (r != types.no_type) return r;
+    }
+    if (node != 0 and c.iife_ret_ctx_callee == c.nodeKey(node)) return c.iife_ret_ctx;
+    return types.no_type;
 }
 
 pub fn templateAtom(c: *Checker, tok: TokenIndex) Error!Atom {

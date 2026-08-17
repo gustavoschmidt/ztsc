@@ -740,7 +740,22 @@ pub fn contextualIteration(c: *Checker, ctx: TypeId, is_async: bool) Error!?Iter
         return null;
     }
     const y = if (is_async) c.asyncGeneratorYieldType(ctx) else c.generatorYieldType(ctx);
-    if (y == 0) return null;
+    if (y == 0) {
+        // `Iterable<T, TReturn>` / `AsyncIterable<…>` are legal generator
+        // return types too, and `iteration.generatorYieldType` — whose job is
+        // the CHECK target — leaves them out because a written `Iterable`
+        // annotation is not what tsc relates a `yield` to. As a CONTEXT it is:
+        // `function* (): Iterator<Iterable<(x: string) => number>>` types the
+        // inner generator of `yield (function*(){…})()` through it.
+        if (c.ts.kind(ctx) != .ref) return null;
+        const sym = c.ts.refSymbol(ctx);
+        const name = try c.atom(if (is_async) "AsyncIterable" else "Iterable");
+        const g = c.prog.globals.lookup(name) orelse return null;
+        if (sym != g) return null;
+        const iargs = c.ts.refArgs(ctx);
+        if (iargs.len == 0) return null;
+        return .{ .yield = iargs[0], .ret = if (iargs.len >= 2) iargs[1] else types.no_type };
+    }
     const args = c.ts.refArgs(ctx);
     return .{ .yield = y, .ret = if (args.len >= 2) args[1] else types.no_type };
 }
