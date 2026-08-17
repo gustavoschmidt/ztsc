@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-17, post wave 14)
+## Standings (2026-08-17, post wave 15)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **6692 / 8627 (77.6%)** |
-| excess keys (false positives) | 3541 | 2156 |
-| missing keys (under-reports) | 8617 | 4511 |
+| exact-match cases | 4902 / 7815 (62.7%) | **6749 / 8627 (78.2%)** |
+| excess keys (false positives) | 3541 | 2103 |
+| missing keys (under-reports) | 8617 | 4428 |
 | bucketed (ztsc parse error, incomparable) | 825 | 13 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Fourteen waves landed (3–14), every one with ZERO match→non-match regressions in
+Fifteen waves landed (3–15), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -146,7 +146,81 @@ isMemberOfStringMapping, and union-signature rest-param combining. D landed
 ambient-module-body specifier resolution, scoped @types mangling
 (mangleScopedPackageName), TS2306.
 
-## Ranked next queue (wave 15) — distilled from wave-14 agent reports
+Wave 15 (+57 cases): A landed TS2403 block-scope rule, the `export =` TDZ
+exemption, TS2686, and the full generator/IIFE contextual-type mechanism
+(FnCtx.yield_ctx/gen_ret_ctx separate from the check target). B finished the
+UMD↔global merge, TS2303 UMD alias node, and unified module-instance-state on
+tsc's getModuleInstanceState (the five "TS2694 residue" cases were mis-mapped:
+three are parse-suppression, two need resolution-mode import attributes — deep).
+C landed getUnionSignatures' FIRST pass (bounded arity, TS2554/2555), the
+weak-type rule for primitive sources (wrapper-interface members;
+isKnownProperty excludes Object/Function augments), castComparable through
+constraints one-way, and did-you-mean-to-call anchoring. D replaced
+classifyEnumInit with tsc's createEvaluator (TS1061/1066/2474/2477/2478),
+fixed intersection iteration, static-block flow scoping, TS2466.
+
+## Ranked next queue (wave 16) — distilled from wave-15 agent reports
+
+1. expr.zig one-arm items (mapped exactly): array-literal SPREAD swallows
+   iteration failure instead of TS2488 (expr.zig:1176); destructuring-
+   ASSIGNMENT element typing never falls back / never reports TS2461/TS2488
+   (expr.zig:5111 destructuringElementType) — iteratorSpreadInArray8/10,
+   iterableArrayPattern23/24.
+2. Enums, one step away each: TS18033 (checkEnum's !computed fall-through
+   needs checkTypeAssignableTo(init, number) with elaborated wording — 3
+   cases); TS2651 forward-reference (already DETECTED in forwardEnumMember;
+   needs a separate syntactic pass in checkEnum because enumMembersOf is
+   memoized/re-entrant).
+3. try/finally definite assignment (flowAfterFinally1, oracle-confirmed FP):
+   tsc's FlowFlags.ReduceLabel — post-finally flow drops the pre-try
+   antecedent; ztsc's bindTry joins `pre` unconditionally. Real work.
+4. unionReductionMutualSubtypes: typenode.reduceSubtypes must use
+   SignatureCheckMode.StrictArity (parameter COUNT, not min-count) — keeps
+   the wrong twin today; one-line-ish.
+5. conditionalTypesSimplifyWhenTrivial (12 excess keys / 1 case): tsc
+   resolves a conditional eagerly when the permissive check type fails the
+   extends (→ false) or the restrictive one passes (→ true); ztsc defers.
+6. blockScopedSameNameFunctionDeclaration* (4 cases, 8 excess TS2554):
+   block-scoped function shadowing — binder scoping.
+7. TS2440 import-conflicts-with-local (8 one-key cases, binder.zig);
+   TS2649 (2 — global_dup.zig:67 documents the arm; mergeClash must return
+   the failing source index; augmentExportEquals7 may be a different
+   mechanism — oracle first); TS2693 residue (7, binder/expr).
+8. TS2769 anchor: tsc uses the chosen candidate's own diagnostic span,
+   falling back to the whole call node when candidates disagree (~4 keys,
+   needs candidate-wise spans in calls.zig).
+9. Readonly index residue, re-scoped by wave-15 C: `static readonly
+   [s: string]` on classes (statics.zig/classes.zig, 9 keys in
+   staticIndexSignature2/4, incl. TS2542 on property access); write-side
+   check on generic mapped types + readonlyIndexWriteAt relaxed to objects
+   (expr.zig indexed-access path); TS2536 type-node residue (18 keys,
+   typenode.zig).
+10. TS2417 private/protected statics (4, nominal statics in assign.zig);
+    TS2507 non-constructor extends (3, stmts.zig); TS2430 (3); TS2433
+    class/namespace merge across files (4, link).
+11. TS2683 this-container rule (9 under-report cases): rule is oracled
+    (object-literal methods and contextual-this callbacks DON'T report;
+    script top-level arrow is TS7041) but ztsc's this_type is 0 in all of
+    them — needs an enclosing-container walk first or the FP blast radius
+    is large.
+12. Nested `module "a" {}` inside `declare module "D"`: ztsc treats it as a
+    satisfying ambient module where tsc does not (moduleAugmentationsImports3,
+    importInsideModule) — but mergeAmbientBlocks DEPENDS on that nesting for
+    moduleAugmentationInAmbientModule1-4. Needs care.
+13. generatorTypeCheck26 last key: contextualArrayElemType must read a
+    contextual iterable's yield type before resolveStructural expands the ref.
+14. nestedExcessPropertyChecking: fresh-literal weak_rule_off disables the
+    weak check for the whole SUBTREE; tsc per-frame (risky — conformance
+    flow/062 is the tripwire).
+15. resolution-mode import attributes (2 cases; needs (specifier, mode)-keyed
+    module graph — deep, low priority).
+16. Determinism defect with a concrete witness: social-app `--checkers=1` and
+    `--file-order=reverse` diverge; `Navigation.tsx:778:29` prints
+    `NativeStackNavigationProp<{…}>` in one partition and the expanded shape
+    in the other. Pattern-matches the open instantiation-budget partition bug.
+17. Regex BODY validator (dedicated-wave-sized).
+
+## Superseded queue (wave 15, kept for context)
 
 1. One-code-away clusters scanned by B: TS2403 (14 files, stmts.zig),
    TS2449 (9), TS2440 (8), TS2488 leftovers (iteratorSpreadInArray8/10,
