@@ -5269,7 +5269,14 @@ fn readonlyIndexWriteAt(c: *Checker, obj: TypeId, node: Node, idx_node: Node) Er
     if (try c.literalKeyAtom(idx_t)) |key| {
         if (try c.propOfTypeEx(obj, key, false)) |_| return false;
     }
-    try reportReadonlyIndexWrite(c, obj, node, try c.typeIsNumberLike(idx_t));
+    // An `any` (or already-errored) key is applicable to EVERY index signature
+    // — tsc's `isApplicableIndexType` is an assignability test, which `any`
+    // passes — so `findApplicableIndexInfo` answers the number one, the string
+    // signature being its last resort. That is what makes `E[bogus]--` on an
+    // enum's readonly reverse-mapping signature TS2542.
+    const ik = c.ts.kind(idx_t);
+    const numeric = ik == .any or ik == .err or try c.typeIsNumberLike(idx_t);
+    try reportReadonlyIndexWrite(c, obj, node, numeric);
     return false;
 }
 
