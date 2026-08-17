@@ -496,8 +496,23 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
                 // (tsc's addOptionality for a mapped index info).
                 var sindex: TypeId = 0;
                 var nindex: TypeId = 0;
+                // `readonly` on the resulting signatures: the source's own,
+                // then the map's `+readonly`/`-readonly` on top — the same
+                // composition `applyPropModifiers` performs for named props.
+                var sindex_ro = false;
+                var nindex_ro = false;
                 if (as_clause == 0) {
                     const src_index = try c.collectHomoIndex(src);
+                    sindex_ro = src_index.string_readonly;
+                    nindex_ro = src_index.number_readonly;
+                    if (flags & types.mapped_flag_readonly_add != 0) {
+                        sindex_ro = true;
+                        nindex_ro = true;
+                    }
+                    if (flags & types.mapped_flag_readonly_remove != 0) {
+                        sindex_ro = false;
+                        nindex_ro = false;
+                    }
                     if (src_index.string != 0) {
                         var v = try c.substMappedKey(value, key_id, types.string_type);
                         if (flags & types.mapped_flag_optional_add != 0) v = try c.makeUnion2(v, types.undefined_type);
@@ -515,12 +530,14 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
                 // source's were (see `obj_flag_mapped_keys`): a map over
                 // `Record<string, V>` keeps the flag, a map over a written
                 // `{ [k: string]: V }` keeps the `string | number` widening.
-                const obj_flags: u32 = if ((sindex != 0 or nindex != 0) and
+                var obj_flags: u32 = if ((sindex != 0 or nindex != 0) and
                     s.kind(src) == .object and
                     s.objectFlags(src) & types.obj_flag_mapped_keys != 0)
                     types.obj_flag_mapped_keys
                 else
                     0;
+                if (sindex_ro and sindex != 0) obj_flags |= types.obj_flag_readonly_string_index;
+                if (nindex_ro and nindex != 0) obj_flags |= types.obj_flag_readonly_number_index;
                 if (arrayish.items.len == 0) {
                     const mapped = try c.objectFromPropsFlags(props.items, sindex, nindex, obj_flags);
                     // An enum-keyed member is NAMED by the enum only in a side
@@ -671,10 +688,18 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
     // The index signatures here came out of the map's own key set — a `string`
     // or `number` member of the constraint — so `keyof` must report exactly
     // that set (see `obj_flag_mapped_keys`).
-    const obj = try s.makeObject(props.items, sindex, nindex, if (sindex != 0 or nindex != 0)
-        types.obj_flag_mapped_keys
-    else
-        0);
+    var obj_flags: u32 = if (sindex != 0 or nindex != 0) types.obj_flag_mapped_keys else 0;
+    // `{ readonly [K in string]: V }` / `Readonly<Record<string, V>>`: the
+    // map's own `readonly` modifier lands on the INDEX SIGNATURE it produces,
+    // exactly as it lands on a named property (tsc's `addMemberForKeyType`
+    // builds the index info with `isReadonly` from the modifiers). There is no
+    // source signature to remove it from on this path, so only `+readonly`
+    // matters.
+    if (flags & types.mapped_flag_readonly_add != 0) {
+        if (sindex != 0) obj_flags |= types.obj_flag_readonly_string_index;
+        if (nindex != 0) obj_flags |= types.obj_flag_readonly_number_index;
+    }
+    const obj = try s.makeObject(props.items, sindex, nindex, obj_flags);
     for (name_types.items) |nt| {
         try c.putKeyNameType(obj, nt.name, nt.ty);
     }
@@ -786,6 +811,11 @@ pub fn collectHomoProps(c: *Checker, t: TypeId, out: *std.ArrayList(types.Prop))
 pub const HomoIndex = struct {
     string: TypeId = 0,
     number: TypeId = 0,
+    /// `readonly` on the signature that filled the slot above — the map's own
+    /// `+readonly`/`-readonly` applies on top of it, as it does for a named
+    /// property's flags.
+    string_readonly: bool = false,
+    number_readonly: bool = false,
 };
 
 /// Collect the string/number index-signature value types of a homomorphic
@@ -803,8 +833,14 @@ fn collectHomoIndexInto(c: *Checker, t: TypeId, found: *HomoIndex) Error!void {
     const r = try c.resolveStructural(t);
     switch (c.ts.kind(r)) {
         .object => {
-            if (found.string == 0) found.string = c.ts.objectStringIndex(r);
-            if (found.number == 0) found.number = c.ts.objectNumberIndex(r);
+            if (found.string == 0) {
+                found.string = c.ts.objectStringIndex(r);
+                if (found.string != 0) found.string_readonly = c.ts.stringIndexIsReadonly(r);
+            }
+            if (found.number == 0) {
+                found.number = c.ts.objectNumberIndex(r);
+                if (found.number != 0) found.number_readonly = c.ts.numberIndexIsReadonly(r);
+            }
         },
         .intersection => {
             for (try c.memberList(r)) |m| try collectHomoIndexInto(c, m, found);

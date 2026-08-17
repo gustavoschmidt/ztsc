@@ -47,6 +47,15 @@ pub fn propOfTypeEx(c: *Checker, t: TypeId, name: Atom, allow_index: bool) Error
     return propOfTypeIdx(c, t, name, .{ .allow_index = allow_index });
 }
 
+/// `propOfType`, plus whether the answer came from a string INDEX SIGNATURE
+/// rather than from a declared or apparent member. The WRITE sites need the
+/// distinction: a readonly property is TS2540 and suppresses the assignability
+/// check, a readonly index signature is TS2542 and does not (tsc's
+/// `checkReferenceExpression` reports and carries on).
+pub fn propOfTypeViaIndex(c: *Checker, t: TypeId, name: Atom, via_index: *bool) Error!?types.Prop {
+    return propOfTypeIdx(c, t, name, .{ .from_index = via_index });
+}
+
 /// tsc's `getPropertyOfType(t, name, /*skipObjectFunctionPropertyAugment*/ true)`
 /// — the lookup CONTEXTUAL typing runs. A property's contextual type is what
 /// the target DECLARES for that name, never what the global `Function` and

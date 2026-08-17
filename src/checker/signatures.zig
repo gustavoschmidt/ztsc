@@ -464,6 +464,20 @@ fn thisParamAnn(c: *Checker, pn: Node) ?Node {
     };
 }
 
+/// Does this function-like's parameter list open with a `this` parameter?
+/// The purely SYNTACTIC question — no signature is built — which is what a
+/// `this` EXPRESSION asks to tell a function that has a receiver from one whose
+/// `this` is implicitly `any` (TS2683).
+pub fn declaresThisParam(c: *Checker, proto_idx: u32) bool {
+    const proto = c.tree.extraData(ast.FnProto, proto_idx);
+    for (c.tree.extraRange(proto.params_start, proto.params_end)) |pn| {
+        if (pn == null_node) continue;
+        // Only the FIRST parameter can be the `this` one.
+        return thisParamAnn(c, pn) != null;
+    }
+    return false;
+}
+
 /// How many parameters a function expression / arrow REQUIRES, read off its
 /// SYNTAX alone — the count tsc's `isAritySmaller` compares a candidate
 /// contextual signature against:

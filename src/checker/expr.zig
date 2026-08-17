@@ -169,6 +169,78 @@ pub fn checkExprCached(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
 /// file scope that tsc's `getThisContainer` would stop at? Only there does a
 /// bare `this` belong to the file rather than to a function, a class or a
 /// namespace body.
+/// Where a `this` expression's receiver comes from — tsc's `getThisContainer`
+/// with arrow functions skipped, which is the container `tryGetThisTypeAt`
+/// asks for a `this` type.
+const ThisFrame = struct {
+    /// The nearest enclosing NON-arrow function-like, or `null_node` when the
+    /// reference sits directly in a class body, a namespace or the file.
+    fn_node: Node = null_node,
+    /// Did the walk cross an arrow on the way out? tsc's
+    /// `capturedByArrowFunction`, which turns the global `this` into TS7041.
+    via_arrow: bool = false,
+    /// A class, namespace or enum body encloses the reference with no function
+    /// between — so `this` belongs to that, not to the file.
+    in_body: bool = false,
+};
+
+fn thisFrame(c: *const Checker) ThisFrame {
+    var out: ThisFrame = .{};
+    var cur = c.cur_scope;
+    while (cur != binder.file_scope) {
+        switch (c.bind.scope_kinds[cur]) {
+            .function => {
+                const owner = c.bind.scope_owners[cur];
+                // An arrow has no `this` of its own; the search continues out.
+                if (c.nodeTag(owner) != .arrow_fn) {
+                    out.fn_node = owner;
+                    return out;
+                }
+                out.via_arrow = true;
+            },
+            .class, .class_members, .class_statics, .namespace, .enum_body => out.in_body = true,
+            else => {},
+        }
+        cur = c.bind.scope_parents[cur];
+    }
+    return out;
+}
+
+/// Does the function `this` resolves against have a receiver at all? tsc's
+/// `tryGetThisTypeAt`, reduced to the yes/no the diagnostic needs:
+///
+///   * a class member — method, accessor, constructor — always does (the
+///     instance type, or the static side);
+///   * a function-like written as an object-literal member does (the literal's
+///     own type, contextual or inferred) — `getContainingObjectLiteral`;
+///   * a function with a `this` parameter of its own does, and so does one that
+///     takes one from its contextual signature (`assignContextualParameterTypes`
+///     copies the context's `thisParameter` onto the signature).
+///
+/// Everything else — a plain `function` declaration or expression, however
+/// deeply nested inside a class or another `this`-bearing frame — does not.
+fn thisFrameOwnsThis(c: *Checker, fn_node: Node) bool {
+    switch (c.nodeTag(fn_node)) {
+        .function_expr, .function_decl => {},
+        // A class member (and anything else a `.function` scope can own) has a
+        // receiver installed by its own walk.
+        else => return true,
+    }
+    if (c.this_bound_fns.contains(thisBoundKey(c, fn_node))) return true;
+    return sig_zig.declaresThisParam(c, c.tree.nodeData(fn_node).lhs);
+}
+
+/// `Checker.this_bound_fns` key for a function node in the CURRENT file.
+fn thisBoundKey(c: *const Checker, fn_node: Node) u64 {
+    return (@as(u64, c.cur_file) << 32) | fn_node;
+}
+
+/// Record that `fn_node` has a receiver of its own — see
+/// `Checker.this_bound_fns`.
+fn markThisBound(c: *Checker, fn_node: Node) Error!void {
+    try c.this_bound_fns.put(c.cm(), thisBoundKey(c, fn_node), {});
+}
+
 fn atFileTopLevel(c: *const Checker) bool {
     var cur = c.cur_scope;
     while (cur != binder.file_scope) {
@@ -197,6 +269,18 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         .null_literal => return types.null_type,
         .regex_literal => return types.any_type, // RegExp needs lib (documented)
         .this_expr => {
+            const frame = thisFrame(c);
+            // tsc's `getThisContainer(node, /*includeArrowFunctions*/ false)`
+            // landed on a FUNCTION. That function owns `this`, and when it has
+            // none of its own the reference is implicitly `any` — TS2683.
+            // `c.this_type` is NOT the test: it is inherited by a nested plain
+            // function from whatever frame encloses it, which is exactly the
+            // shape tsc reports (`class C { m() { function inner() { this } } }`).
+            if (frame.fn_node != null_node) {
+                if (thisFrameOwnsThis(c, frame.fn_node)) return c.this_type;
+                try c.diagFmt(2683, c.nodeSpan(node), "'this' implicitly has type 'any' because it does not have a type annotation.", .{});
+                return types.any_type;
+            }
             if (c.this_type != 0) return c.this_type;
             // tsc's `tryGetThisTypeAt(node, /*includeGlobalThis*/ true)`: at
             // the TOP LEVEL of a plain script — no enclosing function, class
@@ -204,10 +288,17 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // `typeof globalThis`. That is what makes `++this` an arithmetic
             // error (TS2356) rather than a reference error.
             //
-            // The top level of a MODULE is `undefined` instead, and inside a
-            // function with no `this` parameter tsc raises TS2683 and falls
-            // back to `any`; both stay `any` here (documented gaps).
-            if (atFileTopLevel(c) and c.bind.imports.len == 0 and c.bind.exports.len == 0) {
+            // Reaching it through an ARROW is TS7041 instead: the arrow closes
+            // over the *global* `this`, which is almost never what was meant
+            // (tsc's `capturedByArrowFunction` arm, which fires before the
+            // TS2683 one).
+            //
+            // The top level of a MODULE is `undefined` instead; that stays
+            // `any` here (documented gap).
+            if (!frame.in_body and c.bind.imports.len == 0 and c.bind.exports.len == 0) {
+                if (frame.via_arrow) {
+                    try c.diagFmt(7041, c.nodeSpan(node), "The containing arrow function captures the global value of 'this'.", .{});
+                }
                 return c.globalThisType();
             }
             return types.any_type;
@@ -2646,6 +2737,20 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
     for (c.tree.nodeRange(node)) |prop| {
         if (prop == null_node) continue;
         const pd = c.tree.nodeData(prop);
+        // tsc's `getContainingObjectLiteral`: a function-like written as an
+        // object-literal MEMBER — a `m() {}` shorthand (whose body the parser
+        // hangs off it as a `function_expr`) or a `function () {}` property
+        // VALUE — takes `this` from the literal, so a `this` inside it is never
+        // TS2683. Deliberately not through parentheses: tsc asks whether the
+        // function expression's PARENT is the property assignment, which
+        // `{ a: (function () {}) }` fails.
+        switch (c.nodeTag(prop)) {
+            .object_method => try markThisBound(c, pd.rhs),
+            .object_property => {
+                if (pd.rhs != null_node and c.nodeTag(pd.rhs) == .function_expr) try markThisBound(c, pd.rhs);
+            },
+            else => {},
+        }
         switch (c.nodeTag(prop)) {
             .object_property => {
                 if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) {
@@ -3523,7 +3628,31 @@ pub fn numericKeyProp(c: *Checker, r: TypeId, lit: TypeId) Error!?types.Prop {
     if (v != @floor(v) or @abs(v) >= 9007199254740992.0) return null;
     var buf: [24]u8 = undefined;
     const txt = std.fmt.bufPrint(&buf, "{d}", .{@as(i64, @intFromFloat(v))}) catch return null;
-    return c.propOfType(r, try c.internText(txt));
+    const name = try c.internText(txt);
+    var via_index = false;
+    const p = (try c.propOfTypeViaIndex(r, name, &via_index)) orelse return null;
+    // A declared member wins outright. An answer that came from the STRING
+    // index signature does not: for a NUMERIC key tsc's
+    // `findApplicableIndexInfo` consults the string signature "only when no
+    // other index signature applies", so a receiver carrying both answers from
+    // its number one. `class C { static [s: string]: number; static
+    // [s: number]: 42 }` read `C[2]` as `number` without this.
+    if (via_index) {
+        const ni = try numberIndexSlot(c, r);
+        if (ni != 0) return .{ .name = name, .ty = ni, .flags = 0 };
+    }
+    return p;
+}
+
+/// The receiver's NUMBER index-signature value type, or 0 when it has none.
+/// Unlike `numberIndexType` this never falls back to the string signature —
+/// the caller is deciding WHICH signature applies.
+fn numberIndexSlot(c: *Checker, r: TypeId) Error!TypeId {
+    return switch (c.ts.kind(r)) {
+        .object => c.ts.objectNumberIndex(r),
+        .class_value => numberIndexSlot(c, try c.classStaticType(c.ts.classSymbol(r))),
+        else => 0,
+    };
 }
 
 /// tsc's `isNumericLiteralName`: a property name that is *exactly* how
@@ -3571,6 +3700,13 @@ fn numericIndexHit(c: *Checker, r: TypeId, rk: types.Kind, v: f64) Error!?TypeId
             const iv: u32 = if (v >= 0 and v == @floor(v) and v < 4096) @intFromFloat(v) else 4096;
             if (iv < c.ts.tupleLen(rt)) {
                 const e = c.ts.tupleElem(rt, iv);
+                // A REST element's stored type is the ARRAY, and it occupies
+                // every position from its own slot onward: the element type of
+                // `[number, number, ...number[]]` at index 2 is `number`, not
+                // `number[]`. Reading `e.ty` straight made `v[2]` the whole
+                // rest array — the out-of-fixed-range path below already asks
+                // `tupleElemTypeAt`, which is the rule.
+                if (e.rest()) return c.tupleElemTypeAt(rt, iv);
                 return if (e.optional()) try c.makeUnion2(e.ty, types.undefined_type) else e.ty;
             }
             return c.tupleElemTypeAt(rt, iv);
@@ -4030,6 +4166,19 @@ fn checkDeleteOperand(c: *Checker, operand: Node) Error!void {
         _ = try readonlyIndexWriteAt(c, recv, expr, ed.rhs);
     }
     const name = (try deleteTargetName(c, expr, tag)) orelse return;
+    // `delete i.a` where the name resolves through a readonly string index is
+    // the same TS2542 the assignment is — tsc's `checkDeleteExpression` runs
+    // `checkReferenceExpression` on the operator's operand whatever its
+    // spelling. (The element-access spelling went through the branch above.)
+    if (tag == .member_expr) {
+        if (c.nodeType(ed.lhs)) |ot| {
+            const rt = try c.resolveStructural(try c.nonNullableChain(ot));
+            var via_index = false;
+            if (try c.propOfTypeViaIndex(rt, name, &via_index)) |_| {
+                if (via_index) try reportReadonlyIndexWrite(c, rt, expr, false);
+            }
+        }
+    }
     // A link INSIDE a `?.` spine publishes no node type — `chainObjType` is what
     // types it, and it does not write the memo — so ask that instead of giving
     // up. `delete o.b?.c.d?.e` needs it: the receiver `o.b?.c.d` is two links
@@ -4639,6 +4788,20 @@ fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     }
 }
 
+/// The receiver an `obj.m = function () {…}` assignment lends the function as
+/// its `this` (tsc's `getContextualThisParameterType`), or null when the shape
+/// does not match: the target must be a property/element ACCESS and the value a
+/// plain function expression, since an arrow has no `this` of its own.
+fn assignedMethodThis(c: *Checker, target: Node, value: Node) Error!?TypeId {
+    if (value == null_node or c.nodeTag(value) != .function_expr) return null;
+    const recv: Node = switch (c.nodeTag(target)) {
+        .member_expr, .index_expr => c.tree.nodeData(target).lhs,
+        else => return null,
+    };
+    if (recv == null_node) return null;
+    return try c.checkExprCached(recv, types.no_type);
+}
+
 fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
     const d = c.tree.nodeData(node);
     const op = c.tree.tokens.tag(c.tree.nodeMainToken(node));
@@ -4668,6 +4831,17 @@ fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
     const unchecked = assignTargetIsEvolving(c, d.lhs);
     var rhs_ctx: TypeId = if (op == .eq) target_t else types.no_type;
     if (target_t == types.error_type or unchecked) rhs_ctx = types.no_type;
+    // tsc's `getContextualThisParameterType`, last arm: in `obj.m = function
+    // () {…}` (any assignment operator) the function's `this` is the type of
+    // `obj` — the idiom that makes `Element.prototype.remove ??= function () {
+    // this.parentNode }` legal instead of TS2683. A contextual signature with
+    // a `this` parameter of its own already won inside `checkFunctionLikeExpr`.
+    const saved_this = c.this_type;
+    defer c.this_type = saved_this;
+    if (try assignedMethodThis(c, d.lhs, d.rhs)) |recv| {
+        c.this_type = recv;
+        try markThisBound(c, d.rhs);
+    }
     const rt = try c.checkExprCached(d.rhs, rhs_ctx);
     switch (op) {
         .eq => {
@@ -4969,25 +5143,103 @@ fn assignTargetIsEvolving(c: *Checker, target0: Node) bool {
     };
 }
 
-/// A write through `obj[idx]` — an assignment target or a `delete` operand —
-/// where `obj` (already structurally resolved) is a readonly list. Reports
-/// TS2540 on a fixed element and TS2542 on the readonly index signature, and
-/// answers whether it reported, in which case the caller hands back
+/// tsc's `findApplicableIndexInfo` reduced to the one question a WRITE asks:
+/// is the index signature the write lands on declared `readonly`?
+///
+/// A numeric key prefers the number signature and falls back to the string one
+/// ("the string index signature applies only when no other index signature
+/// does"); a string key sees the string signature alone. A UNION has an index
+/// signature only when every constituent does, and it is readonly when any of
+/// them is (`getUnionIndexInfos`' `isReadonly: some(...)`); an INTERSECTION
+/// carries every constituent's signatures, so one readonly member is enough.
+const IndexWrite = enum { none, mutable, readonly };
+
+fn indexWriteVerdict(c: *Checker, t: TypeId, numeric: bool) Error!IndexWrite {
+    const s = &c.ts;
+    switch (s.kind(t)) {
+        .object => {
+            if (numeric and s.objectNumberIndex(t) != 0)
+                return if (s.numberIndexIsReadonly(t)) .readonly else .mutable;
+            if (s.objectStringIndex(t) == 0) return .none;
+            return if (s.stringIndexIsReadonly(t)) .readonly else .mutable;
+        },
+        // `C.foo = 1` / `C[42] = 42` on `class C { static readonly [s: string]:
+        // number }`: the class VALUE's index signatures live on its static-side
+        // object, which `resolveStructural` does not unwrap to.
+        .class_value => return indexWriteVerdict(c, try c.classStaticType(s.classSymbol(t)), numeric),
+        .union_type => {
+            var v: IndexWrite = .none;
+            for (try c.memberList(t)) |m| {
+                switch (try indexWriteVerdict(c, try c.resolveStructural(m), numeric)) {
+                    .none => return .none,
+                    .readonly => v = .readonly,
+                    .mutable => if (v == .none) {
+                        v = .mutable;
+                    },
+                }
+            }
+            return v;
+        },
+        .intersection => {
+            var v: IndexWrite = .none;
+            for (try c.memberList(t)) |m| {
+                switch (try indexWriteVerdict(c, try c.resolveStructural(m), numeric)) {
+                    .none => {},
+                    .readonly => return .readonly,
+                    .mutable => v = .mutable,
+                }
+            }
+            return v;
+        },
+        else => return .none,
+    }
+}
+
+/// TS2542 at a write that lands on a readonly index signature. tsc's
+/// `checkReferenceExpression` reports it and CARRIES ON — unlike the readonly
+/// *property* refusal (TS2540) it does not suppress the assignability check, so
+/// `xs[k] = "s"` on a `readonly [k: string]: number` says both TS2542 and
+/// TS2322. Hence nothing to answer: the caller keeps the real target type.
+fn reportReadonlyIndexWrite(c: *Checker, obj: TypeId, node: Node, numeric: bool) Error!void {
+    if (try indexWriteVerdict(c, obj, numeric) != .readonly) return;
+    try c.diagFmt(2542, c.nodeSpan(node), "Index signature in type '{s}' only permits reading.", .{
+        try c.typeToString(obj),
+    });
+}
+
+/// A write through `obj[idx]` — an assignment target or a `delete` operand.
+/// Reports TS2540 on a readonly list's fixed element and TS2542 on a readonly
+/// index signature (a readonly list's, or a declared `readonly [k: …]`), and
+/// answers whether the TS2540 arm fired, in which case the caller hands back
 /// `error_type` to suppress the cascading TS2322.
 ///
 /// The index expression is checked here rather than by the caller so the
 /// literal-index question can be asked; `checkExprCached` makes the second
 /// check on the ordinary path free.
 fn readonlyIndexWriteAt(c: *Checker, obj: TypeId, node: Node, idx_node: Node) Error!bool {
-    if (c.ts.kind(obj) != .tuple and c.ts.kind(obj) != .array) return false;
     const idx_t = try c.ts.regularLiteral(try c.checkExprCached(idx_node, types.no_type));
-    switch (tuple_relate.readonlyIndexWrite(c, obj, idx_t) orelse return false) {
-        .element => |iv| try c.diagFmt(2540, c.nodeSpan(idx_node), "Cannot assign to '{d}' because it is a read-only property.", .{iv}),
-        .index_signature => try c.diagFmt(2542, c.nodeSpan(node), "Index signature in type '{s}' only permits reading.", .{
-            try c.typeToString(obj),
-        }),
+    if (c.ts.kind(obj) == .tuple or c.ts.kind(obj) == .array) {
+        switch (tuple_relate.readonlyIndexWrite(c, obj, idx_t) orelse return false) {
+            .element => |iv| {
+                try c.diagFmt(2540, c.nodeSpan(idx_node), "Cannot assign to '{d}' because it is a read-only property.", .{iv});
+                return true;
+            },
+            .index_signature => {
+                try c.diagFmt(2542, c.nodeSpan(node), "Index signature in type '{s}' only permits reading.", .{
+                    try c.typeToString(obj),
+                });
+                return false;
+            },
+        }
     }
-    return true;
+    // A key that NAMES a declared member writes that member, whose own
+    // `readonly` is the member-access path's TS2540 — the index signature is
+    // never consulted (tsc's `getPropertyNameFromIndex` runs first).
+    if (try c.literalKeyAtom(idx_t)) |key| {
+        if (try c.propOfTypeEx(obj, key, false)) |_| return false;
+    }
+    try reportReadonlyIndexWrite(c, obj, node, try c.typeIsNumberLike(idx_t));
+    return false;
 }
 
 /// tsc's `left.kind === ObjectLiteralExpression || ArrayLiteralExpression`
@@ -5072,7 +5324,12 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
             // read site in `memberChainInner`.
             if (c.nodeTag(d.lhs) == .super_expr) try accessibility.checkSuperField(c, name, d.rhs);
             const r = try c.resolveStructural(obj_t);
-            if (try c.propOfType(r, name)) |p| {
+            // A dotted write that resolves through a string INDEX SIGNATURE
+            // rather than a declared member (`i.a = 1` on
+            // `{ readonly [s: string]: number }`) is TS2542, not TS2540 — and
+            // it does not suppress the assignability check.
+            var via_index = false;
+            if (try c.propOfTypeViaIndex(r, name, &via_index)) |p| {
                 const wsite: accessibility.Site = .{ .dir = .write, .recv_node = d.lhs };
                 // A `#name` write from outside the declaring class is the same
                 // TS18013 the read is (`Base.#prop = 10` in a derived class).
@@ -5086,6 +5343,7 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
                 // errors, so the property must be an OWN member of the
                 // constructor's class.
                 const ctor_ok = c.nodeTag(d.lhs) == .this_expr and c.ctorClassOwnsMember(name);
+                if (via_index) try reportReadonlyIndexWrite(c, r, node, false);
                 if (p.readonly() and !ctor_ok) {
                     try c.diagFmt(2540, c.tokSpan(d.rhs), "Cannot assign to '{s}' because it is a read-only property.", .{c.atomText(name)});
                     return types.error_type; // suppress cascading 2322
@@ -5868,7 +6126,12 @@ fn checkFunctionLikeExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         ctx_sig != types.no_type and c.ts.kind(ctx_sig) == .function)
     {
         const ctx_this = c.ts.fnThisType(ctx_sig);
-        if (ctx_this != 0) c.this_type = ctx_this;
+        if (ctx_this != 0) {
+            c.this_type = ctx_this;
+            // Recorded so a `this` in the body knows the receiver is THIS
+            // function's and not an outer frame's — see `thisFrameOwnsThis`.
+            try markThisBound(c, node);
+        }
     }
     const sig = try c.signatureOfProtoCtx(node, d.lhs, false, ctx_sig == types.no_type, ctx_sig);
     // An own `this` parameter wins; `checkFunctionBody` installs it.

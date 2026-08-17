@@ -701,6 +701,10 @@ pub fn numberIndexType(c: *Checker, r: TypeId) Error!TypeId {
             return types.any_type;
         },
         .string => return types.string_type,
+        // A class VALUE's index signatures are declared `static` and live on
+        // its static-side object, which `resolveStructural` does not unwrap to:
+        // `class C { static [s: number]: 42 }` makes `C[2]` a `42`, not `any`.
+        .class_value => return c.numberIndexType(try c.classStaticType(c.ts.classSymbol(r))),
         else => return types.any_type,
     }
 }
