@@ -265,6 +265,11 @@ pub const Code = enum(u16) {
     /// element with one PARSES and `checkGrammarBindingElement` reports on the
     /// bound NAME. Grammar-class.
     rest_element_property_name,
+    /// TS1540: `module M { }` — the `module` keyword spelling of a NAMESPACE is
+    /// deprecated, and only the `declare module "spec" { }` ambient form may
+    /// still use it. Reported on the NAME, once per segment of a dotted one
+    /// (`module not.ok {}` answers twice). Grammar-class.
+    module_keyword_for_namespace,
 
     // --- modifier order and repetition (tsc's `checkGrammarModifiers`) -------
     /// TS1030 `'{0}' modifier already seen.` — the same modifier twice on one
@@ -659,6 +664,7 @@ pub const Code = enum(u16) {
             .decorator_not_valid_here,
             .decorator_on_method_overload,
             .decorator_on_second_accessor,
+            .module_keyword_for_namespace,
             .label_not_allowed,
             .public_not_on_module_element,
             .private_not_on_module_element,
@@ -975,6 +981,7 @@ pub const Code = enum(u16) {
             .jsx_needs_one_parent => "JSX expressions must have one parent element.",
             .jsx_text_rbrace => "Unexpected token. Did you mean `{'}'}` or `&rbrace;`?",
             .jsx_text_gt => "Unexpected token. Did you mean `{'>'}` or `&gt;`?",
+            .module_keyword_for_namespace => "A 'namespace' declaration should not be declared using the 'module' keyword. Please use the 'namespace' keyword instead.",
             .jsx_comma_operator => "JSX expressions may not use the comma operator. Did you mean to write an array?",
             .rest_element_property_name => "A rest element cannot have a property name.",
             .mod_seen_static => modSeenMessage("static"),
@@ -1223,6 +1230,7 @@ pub const Code = enum(u16) {
             .jsx_needs_one_parent => 2657,
             .jsx_text_rbrace => 1381,
             .jsx_text_gt => 1382,
+            .module_keyword_for_namespace => 1540,
             .jsx_comma_operator => 18007,
             .rest_element_property_name => 2566,
             .mod_seen_static,

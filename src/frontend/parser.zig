@@ -3783,17 +3783,10 @@ const Parser = struct {
     /// dotted name (`namespace A.B {}`) falls back to unsupported.
     fn parseNamespaceDecl(p: *Parser, flags: u32) PE!Node {
         const kw = try p.bump(); // `namespace` / `module`
-        const name_tok = try p.expectIdentLike();
-        // Dotted namespace name (`namespace A.B { ... }`) is deferred.
-        if (p.curTag() == .dot) {
-            p.skipUnsupportedBlockish();
-            return p.unsupportedFrom(kw);
-        }
-        _ = try p.expect(.l_brace, .expected_l_brace);
-        const top = p.scratchTop();
-        defer p.scratch.shrinkRetainingCapacity(top);
         // `declare namespace N { ... }` makes the whole body ambient; a plain
-        // `namespace` nested in an ambient one inherits it.
+        // `namespace` nested in an ambient one inherits it. Set here rather than
+        // inside `parseNamespaceName` so a dotted name sets it once, for the one
+        // body all its segments share.
         const was_ambient = p.ambient;
         p.ambient = was_ambient or flags & ast.Flags.declare != 0;
         defer p.ambient = was_ambient;
@@ -3801,8 +3794,48 @@ const Parser = struct {
         const was_module_body = p.module_body;
         p.module_body = true;
         defer p.module_body = was_module_body;
-        try p.parseStatementList(top, .r_brace, false);
-        _ = try p.expect(.r_brace, .expected_r_brace);
+        return p.parseNamespaceName(kw, flags);
+    }
+
+    /// One segment of a namespace name, plus everything to its right.
+    ///
+    /// A DOTTED name is sugar: `namespace A.B.C { … }` declares `A`, whose sole
+    /// member is `B`, whose sole member is `C`, which holds the body — which is
+    /// exactly the tree tsc's `parseModuleOrNamespaceDeclaration` builds, one
+    /// recursive call per `.`. Desugaring here means the binder, the linker and
+    /// the checker never learn that dotted names exist.
+    ///
+    /// Each inner segment is wrapped in an `export_decl`: `A.B.C` is reachable
+    /// from outside as `A.B.C`, so every segment but the outermost is an export
+    /// of the one before it. tsc gets there by a different route (the nested
+    /// declaration is a member of a namespace whose only body is that
+    /// declaration) and the observable answer is the same.
+    fn parseNamespaceName(p: *Parser, kw: u32, flags: u32) PE!Node {
+        const name_tok = try p.expectIdentLike();
+        // TS1540: `module M { }` is the deprecated spelling of `namespace M { }`
+        // — only `declare module "spec" { }` may still say `module`, and that
+        // form never reaches here. tsc blames the NAME, so a dotted name
+        // answers once per segment.
+        if (p.spec == 0 and p.tokTagAt(kw) == .keyword_module) {
+            try p.errAtToken(.module_keyword_for_namespace, name_tok);
+        }
+        const top = p.scratchTop();
+        defer p.scratch.shrinkRetainingCapacity(top);
+        if (try p.eat(.dot) != null) {
+            // The inner segments carry neither `declare` nor `export`: the
+            // outermost one already answered for both, and repeating `declare`
+            // would re-enter the ambient bookkeeping this body has entered once.
+            const inner = try p.parseNamespaceName(kw, flags & ~ast.Flags.declare);
+            try p.pushScratch(try p.addNode(.{
+                .tag = .export_decl,
+                .main_token = kw,
+                .data = .{ .lhs = inner, .rhs = 0 },
+            }));
+        } else {
+            _ = try p.expect(.l_brace, .expected_l_brace);
+            try p.parseStatementList(top, .r_brace, false);
+            _ = try p.expect(.r_brace, .expected_r_brace);
+        }
         const body = try p.scratchToSpan(top);
         const extra = try p.addExtra(ast.NamespaceData{
             .flags = flags,
