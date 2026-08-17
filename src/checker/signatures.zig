@@ -26,6 +26,7 @@ const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
 const RefKey = @import("flow.zig").RefKey;
+const baseTypeVariableOfClass = @import("classes.zig").baseTypeVariableOfClass;
 const checkExprCached = @import("expr.zig").checkExprCached;
 const containsTypeParam = @import("enums.zig").containsTypeParam;
 const destructure = @import("destructure.zig");
@@ -1330,7 +1331,15 @@ fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
 /// signatures come first so overload resolution sees them in declaration
 /// order.
 fn callableClassValue(c: *Checker, sym: SymbolId, f: binder.SymbolFlags) Error!TypeId {
-    const cls = try c.ts.makeClassValue(sym);
+    const cls0 = try c.ts.makeClassValue(sym);
+    // tsc's `getTypeOfFuncClassEnumModule`: a class whose base CONSTRUCTOR
+    // type is a type variable has that variable intersected into its own
+    // static type (`getBaseTypeVariableOfClass`), so a mixin class is
+    // assignable to the `T` its factory promises to return.
+    const cls = if (try baseTypeVariableOfClass(c, sym)) |tv|
+        try c.ts.makeIntersection(c.scratch(), &.{ cls0, tv })
+    else
+        cls0;
     if (!f.function) return cls;
     return c.ts.makeIntersection(c.scratch(), &.{ try functionSymbolType(c, sym), cls });
 }

@@ -1502,6 +1502,56 @@ pub fn classBaseEntitySym(c: *Checker, node: Node) Error!?SymbolId {
     }
 }
 
+/// tsc's `getBaseTypeVariableOfClass`: the type VARIABLE a class extends,
+/// when its base constructor type is one (or an intersection containing one).
+/// `getTypeOfFuncClassEnumModule` intersects it into the class's own static
+/// type, which is what makes a mixin factory type-check:
+///
+/// ```ts
+/// function Mixin<T extends abstract new (...a: any) => any>(base: T):
+///     T & (abstract new (...a: any) => Mixin) {
+///   abstract class MixinClass extends base implements Mixin { … }
+///   return MixinClass;   // typeof MixinClass & T
+/// }
+/// ```
+///
+/// Without the `& T` the returned value satisfies the anonymous-constructor
+/// half of the declared return and nothing at all of the `T` half, so every
+/// such `return` was a TS2322 (`mixinAbstractClasses`, `mixinClassesAnnotated`).
+///
+/// Only a bare-identifier base is examined. A type variable can only ever
+/// reach a heritage clause through a name — a parameter or a local bound to
+/// one — so the restriction costs nothing and keeps this off the path of the
+/// dotted/qualified bases that make up the rest of the corpus. A base that
+/// resolves to a class SYMBOL is the ordinary nominal case and answers null
+/// without typing anything.
+pub fn baseTypeVariableOfClass(c: *Checker, sym: SymbolId) Error!?TypeId {
+    const saved_ctx = c.enterSymFile(sym);
+    defer c.restoreCtx(saved_ctx);
+    for (c.declsOf(sym)) |decl| {
+        if (c.nodeTag(decl) != .class_decl) continue;
+        const data = c.tree.extraData(ast.ClassData, c.tree.nodeData(decl).lhs);
+        if (data.extends == 0) return null;
+        const hd = c.tree.nodeData(data.extends);
+        if (c.nodeTag(hd.lhs) != .identifier) return null;
+        const saved = c.cur_scope;
+        defer c.cur_scope = saved;
+        if (try c.scopeOf(decl)) |s| c.cur_scope = s;
+        const bs = (try c.classBaseEntitySym(hd.lhs)) orelse return null;
+        const bf = c.symFlags(bs);
+        if (bf.class or bf.interface or bf.namespace_decl) return null;
+        const bt = try c.typeOfSymbol(bs);
+        if (c.ts.kind(bt) == .type_param) return bt;
+        if (c.ts.kind(bt) == .intersection) {
+            for (try c.memberList(bt)) |m| {
+                if (c.ts.kind(m) == .type_param) return m;
+            }
+        }
+        return null;
+    }
+    return null;
+}
+
 /// When a class `extends <expr>` and `<expr>` is a *value* (not a class
 /// symbol) whose type carries construct signatures — the
 /// `declare const Base: { new (input): R }` mixin-base pattern, e.g. the
