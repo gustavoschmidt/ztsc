@@ -717,10 +717,14 @@ pub fn drainDeferredBodies(c: *Checker) Error!void {
     c.deferred_bodies.clearRetainingCapacity();
 }
 
+/// The yield element type and the return type a generator's return type
+/// carries — `Generator<Y, R, N>`'s first two arguments.
+pub const IterationCtx = struct { yield: TypeId, ret: TypeId };
+
 /// The yield and return contexts a generator takes from a CONTEXTUAL return
 /// type — tsc's `getContextualIterationType`, which reads
-/// `getIterationTypeOfGeneratorFunctionReturnType` off the contextual signature's
-/// return type. Null when that type names no generator.
+/// `getIterationTypeOfGeneratorFunctionReturnType` off the contextual
+/// signature's return type. Null when that type names no generator.
 ///
 /// The contextual type is routinely a UNION with the generator as one arm
 /// (`() => number | Generator<(arg: number) => void, any, void>` —
@@ -729,8 +733,6 @@ pub fn drainDeferredBodies(c: *Checker) Error!void {
 ///
 /// Purely contextual: both halves only TYPE the operands, and nothing is
 /// reported against either — see `FnCtx.yield_ctx`.
-pub const IterationCtx = struct { yield: TypeId, ret: TypeId };
-
 pub fn contextualIteration(c: *Checker, ctx: TypeId, is_async: bool) Error!?IterationCtx {
     if (ctx == 0 or ctx == types.no_type) return null;
     if (c.ts.kind(ctx) == .union_type) {
