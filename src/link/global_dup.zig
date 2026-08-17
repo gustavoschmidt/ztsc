@@ -161,7 +161,11 @@ pub const Contributor = struct {
     file: program.FileId,
     tree: *const ast.Ast,
     src: []const u8,
-    decls: []const ast.Node,
+    decls: []const ast.Node = &.{},
+    /// Spans of declarations that own no declaration NODE the name walk can
+    /// reach — today only `export as namespace X`, whose name is a bare token
+    /// (see umd.zig). Reported verbatim, alongside `decls`.
+    spans: []const Span = &.{},
 };
 
 /// Report `code` at the name of EVERY declaration of every contributor — tsc's
@@ -188,6 +192,9 @@ pub fn reportAll(
                 .start = start,
                 .end = scanner.tokenEnd(c.src, c.tree.tokens.tag(tok), start),
             };
+            try diags[c.file].append(arena, .{ .code = ts, .span = span, .msg = msg });
+        }
+        for (c.spans) |span| {
             try diags[c.file].append(arena, .{ .code = ts, .span = span, .msg = msg });
         }
     }
