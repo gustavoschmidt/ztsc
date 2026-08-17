@@ -439,15 +439,13 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             const in_async = if (c.fn_ctx) |fc| fc.is_async else false;
             const delegate = d.rhs != 0;
             if (d.lhs != 0) {
-                // With no annotation to check against, the operand is still
-                // TYPED by the contextual signature's yield type — tsc's
-                // `getContextualIterationType`. It is a context and not a
-                // target: nothing below relates the operand to it (see
-                // `FnCtx.yield_ctx`).
-                // A DELEGATION yields what its operand yields, so the operand
-                // is contextually the generator type itself — tsc's
-                // `getContextualTypeForYieldOperand` returns the contextual
-                // return type unfiltered for `yield*` (`FnCtx.gen_ret_ctx`).
+                // tsc's `getContextualTypeForYieldOperand`. A DELEGATION
+                // yields what its operand yields, so `yield* xs` types `xs`
+                // by the generator's whole contextual return type
+                // (`FnCtx.gen_ret_ctx`); a plain `yield x` types `x` by the
+                // yield element — the annotation's when there is one, else the
+                // contextual signature's (`FnCtx.yield_ctx`). Both of the
+                // latter two are CONTEXTS: only `yt`, below, is related to.
                 const ctx_yt: TypeId = if (delegate)
                     (if (c.fn_ctx) |fc| fc.gen_ret_ctx else 0)
                 else if (yt != 0 and yt != types.no_type)
@@ -643,15 +641,16 @@ fn checkPrivateName(c: *Checker, tok: TokenIndex, a: Atom) Error!TypeId {
 /// this very name" is the whole test: an import binding, a local shadow, and a
 /// script's or lib's own global all live somewhere else and answer false.
 ///
-/// Cost: the three flag tests are free, and the `export as namespace` scan
-/// behind them walks ONE file's top-level statement tags — reached only by a
-/// value name that resolves across a file boundary into a declaration module,
-/// which apart from this pattern means a `declare global { … }` contribution.
-/// tsc's `every(merged.declarations, …)` is what makes a name that ALSO has a
+/// tsc's `every(merged.declarations, …)` is what keeps a name that ALSO has a
 /// non-UMD declaration legal: `declare global { const React: typeof
 /// import("./module") }` beside `export as namespace React` gives the merged
-/// symbol a real global `const`, and a module may read that (it is a global
-/// like any other). So every contributor has to be a publisher of this name.
+/// symbol a real global `const`, and a module may read that like any other
+/// global. So EVERY contributor has to be a publisher of this name.
+///
+/// Cost: the flag tests are free, and the `export as namespace` scan behind
+/// them walks ONE file's top-level statement tags — reached only by a value
+/// name that resolves across a file boundary into a declaration module, which
+/// apart from this pattern means a `declare global { … }` contribution.
 fn isUmdGlobalRef(c: *Checker, a: Atom, sym: SymbolId) bool {
     if (!c.bind.is_module) return false; // a script may use the global freely
     if (c.prog.isMergedId(sym)) {
