@@ -785,15 +785,19 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
         yield_type = c.generatorYieldType(ann);
         eff_ann = types.no_type;
     }
-    // With no return annotation the yield type comes from the CONTEXTUAL
-    // return type instead — tsc's `getContextualIterationType`, which is
-    // `getIterationTypeOfGeneratorFunctionReturnType(Yield,
-    // getContextualReturnType(func), isAsync)`. That is what gives `num` its
-    // type in `const f: () => Generator<(arg: number) => void, …> =
-    // function*() { yield (num) => … }`, instead of a TS7006.
-    if (is_generator and yield_type == 0 and proto.return_type == 0 and ret_ctx != types.no_type) {
-        yield_type = if (is_async) c.asyncGeneratorYieldType(ret_ctx) else c.generatorYieldType(ret_ctx);
-    }
+    // No contextual fallback for an un-annotated generator's yield type.
+    // tsc's `getContextualIterationType` exists, but taking it here (plus a
+    // union arm in `generatorYieldType`, so
+    // `() => number | Generator<F, any, void>` answers) was measured to buy
+    // nothing and cost one false TS2322: `generatorTypeCheck63`'s
+    // `strategy("Nothing", function*(state: State) { yield 1; … })` earns a
+    // per-yield error ztsc would then report and tsgo does not — tsgo blames
+    // the ARGUMENT (TS2345) and leaves the yield alone. The family this was
+    // meant to fix (`contextualTypeOnYield1/2`, `generatorTypeCheck27-30`) is
+    // blocked elsewhere anyway: the parameters of an arrow written as a yield
+    // operand are typed while the enclosing generator's return type is
+    // INFERRED, and that walk builds its own `fn_ctx` with `yield_type = 0`
+    // in `signatures.zig`. (wave 13 B, measured.)
     // Contextual return type: only meaningful when nothing was written and
     // the function is not a generator. Async unwraps to the payload, as
     // `eff_ann` does for a written `Promise<T>`.
