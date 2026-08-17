@@ -2572,6 +2572,17 @@ const Linker = struct {
         // (`export * from "fs"`) cannot: the registry those names live in is
         // built after every file table (`buildAmbient`), so it is empty at this
         // point. That half runs as a deferred pass — `starMergeFilesFromAmbient`.
+        //
+        // TS2308 rides along: tsc builds the star merge in a table of its own
+        // (`nestedSymbols`) precisely so it can tell a name two stars disagree
+        // about from one the module also declares itself. `own_exports` is that
+        // distinction here — the table is insertion-ordered, so everything pass
+        // 1 put in it sits below that mark.
+        const own_exports = t.count();
+        var star_first: std.AutoArrayHashMapUnmanaged(Atom, StarSource) = .empty;
+        defer star_first.deinit(l.scratch);
+        var star_dups: std.ArrayList(StarDup) = .empty;
+        defer star_dups.deinit(l.scratch);
         for (f.bind.exports) |rec| {
             if (rec.kind != .reexport_all) continue;
             const mfile = f.specs.get(rec.module) orelse continue;
@@ -2579,12 +2590,19 @@ const Linker = struct {
             const mt = try l.table(mfile);
             for (mt.keys(), mt.values()) |name, tgt| {
                 if (name == l.atom_default or name == l.atom_export_equals) continue;
+                const gop = try star_first.getOrPut(l.scratch, name);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = .{ .node = rec.node, .target = tgt };
+                } else if (!sameStarTarget(gop.value_ptr.target, tgt)) {
+                    try star_dups.append(l.scratch, .{ .name = name, .node = rec.node });
+                }
                 if (t.contains(name)) continue;
                 var final = tgt;
                 final.type_only = final.type_only or rec.type_only;
                 try t.put(l.scratch, name, final);
             }
         }
+        try l.reportStarCollisions(file, t, own_exports, &star_first, star_dups.items);
 
         // Pass 3: a `declare module "spec" { … }` augmentation's declarations
         // are exports of the module `spec` resolves to. tsc merges the
@@ -3666,6 +3684,70 @@ const Linker = struct {
                     try l.diag(file, 6053, miss.span, "File '{s}' not found.", .{miss.name});
                 },
             }
+        }
+    }
+
+    /// Which `export *` first contributed a name, and what it contributed —
+    /// tsc's `ExportCollisionTracker.specifierText` plus the symbol the
+    /// comparison is against.
+    const StarSource = struct { node: ast.Node, target: Target };
+
+    /// One `export *` that re-exported a name an EARLIER one already gave a
+    /// different meaning. tsc reports at the later declaration and names the
+    /// earlier one's specifier.
+    const StarDup = struct { name: Atom, node: ast.Node };
+
+    /// tsc's `resolveSymbol(targetSymbol) === resolveSymbol(sourceSymbol)`: two
+    /// stars that reach the SAME declaration are not a collision, however many
+    /// paths lead there (a diamond of re-exports is legal and common). ztsc's
+    /// `Target` is already the resolved end of that walk, so identity is a field
+    /// comparison — `type_only` excluded, because it records how the name
+    /// travelled and not what it names.
+    fn sameStarTarget(a: Target, b: Target) bool {
+        return a.kind == b.kind and a.file == b.file and a.payload == b.payload and a.name == b.name;
+    }
+
+    /// TS2308, tsc's `getExportsOfModuleWorker` collision pass: `export * from
+    /// "a"` and `export * from "b"` both exporting `x`, where the two `x`es are
+    /// different declarations, makes neither win — tsc reports at every star
+    /// past the first and names the first one's specifier.
+    ///
+    /// Two suppressions, both tsc's: a name the module also exports ITSELF wins
+    /// outright and says nothing (`symbols.has(id)`), and `default` / `export=`
+    /// never travel through a star to begin with.
+    ///
+    /// The specifier is quoted as WRITTEN — tsc's `getTextOfNode` hands the
+    /// message the source text, quotes included, so `export * from "./t1"`
+    /// reports `Module "./t1" has already…` and a single-quoted one keeps its
+    /// own quotes.
+    ///
+    /// Scope: stars whose source is a RESOLVED FILE, which is what this pass
+    /// merges. One served by an ambient `declare module "spec"` block settles in
+    /// `starMergeFilesFromAmbient`, past every file table, and goes unjudged.
+    fn reportStarCollisions(
+        l: *Linker,
+        file: FileId,
+        t: *const std.AutoArrayHashMapUnmanaged(Atom, Target),
+        own_exports: usize,
+        star_first: *const std.AutoArrayHashMapUnmanaged(Atom, StarSource),
+        dups: []const StarDup,
+    ) Error!void {
+        if (dups.len == 0) return;
+        const f = &l.files[file];
+        for (dups) |d| {
+            if (t.getIndex(d.name)) |i| {
+                if (i < own_exports) continue;
+            }
+            const first = star_first.get(d.name) orelse continue;
+            const spec_tok = f.tree.nodeData(first.node).rhs;
+            if (spec_tok == 0) continue;
+            try l.diag(
+                file,
+                2308,
+                l.nodeSpan(file, d.node),
+                "Module {s} has already exported a member named '{s}'. Consider explicitly re-exporting to resolve the ambiguity.",
+                .{ f.tree.tokenSlice(f.src, spec_tok), l.atomText(d.name) },
+            );
         }
     }
 
