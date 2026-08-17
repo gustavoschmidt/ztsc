@@ -3575,6 +3575,7 @@ pub const Checker = struct {
     const props_zig = @import("checker/props.zig");
     pub const propOfType = props_zig.propOfType;
     pub const propOfTypeEx = props_zig.propOfTypeEx;
+    pub const ctxPropOfType = props_zig.ctxPropOfType;
     pub const objectInterfaceProp = props_zig.objectInterfaceProp;
     pub const arrayApparentObject = props_zig.arrayApparentObject;
     pub const makePromise = props_zig.makePromise;
