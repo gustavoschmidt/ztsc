@@ -15,6 +15,9 @@ const types = @import("../types.zig");
 const Node = ast.Node;
 const null_node = ast.null_node;
 
+const binder = @import("../frontend/binder.zig");
+const ScopeId = binder.ScopeId;
+
 const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
 
@@ -38,6 +41,18 @@ pub fn stmtListTerminal(c: *Checker, stmts: []const Node) bool {
     return !reachable;
 }
 
+/// Make `node`'s own scope current and answer the previous one, for a
+/// `defer` to put back. The mirror of what `checkStatement` does around a
+/// block: this walk resolves callees (`callReturnsNever`) and switch
+/// discriminants, and both have to resolve where they are WRITTEN.
+/// Best-effort — a scope-table fault that runs out of memory leaves the
+/// ambient scope, which is the enclosing one.
+fn enterScope(c: *Checker, node: Node) ScopeId {
+    const saved = c.cur_scope;
+    if (c.scopeOf(node) catch null) |s| c.cur_scope = s;
+    return saved;
+}
+
 pub fn stmtTerminal(c: *Checker, node: Node) bool {
     const d = c.tree.nodeData(node);
     switch (c.nodeTag(node)) {
@@ -49,11 +64,18 @@ pub fn stmtTerminal(c: *Checker, node: Node) bool {
         // makes the endpoint unreachable — no TS2366, and no phantom
         // `| undefined` on an inferred return type. `flowReachable` already
         // reads this for narrowing; both endpoint consumers need it too.
+        // `null` scope: this walk keeps `cur_scope` on the block it is
+        // inside (see `enterScope`), so the callee already resolves where it
+        // is written.
         .expr_stmt => return switch (c.nodeTag(d.lhs)) {
-            .call_expr, .call_expr_targs, .optional_call => c.callReturnsNever(d.lhs) catch false,
+            .call_expr, .call_expr_targs, .optional_call => c.callReturnsNever(d.lhs, null) catch false,
             else => false,
         },
-        .block => return c.stmtListTerminal(c.tree.nodeRange(node)),
+        .block => {
+            const saved = enterScope(c, node);
+            defer c.cur_scope = saved;
+            return c.stmtListTerminal(c.tree.nodeRange(node));
+        },
         .if_else_stmt => {
             const e = c.tree.extraData(ast.IfElse, d.rhs);
             return c.stmtTerminal(e.then_stmt) and c.stmtTerminal(e.else_stmt);
@@ -69,6 +91,11 @@ pub fn stmtTerminal(c: *Checker, node: Node) bool {
             // terminal only when neither falls through.
             const try_terminal = c.stmtTerminal(d.lhs);
             if (e.catch_clause != null_node) {
+                // A catch body's statements are bound in the CLAUSE's scope,
+                // not in one of their own (so `catch (e) { let e }` is
+                // TS2492) — the block node owns nothing to enter.
+                const saved = enterScope(c, e.catch_clause);
+                defer c.cur_scope = saved;
                 const catch_block = c.tree.nodeData(e.catch_clause).rhs;
                 return try_terminal and c.stmtTerminal(catch_block);
             }
@@ -93,6 +120,10 @@ pub fn stmtTerminal(c: *Checker, node: Node) bool {
 /// literal-union discriminant), every clause ends terminally, and no
 /// clause breaks out.
 pub fn switchTerminal(c: *Checker, node: Node) bool {
+    // One case-block scope covers every clause (the binder pushes it on the
+    // switch node itself), and the clause statements live in it.
+    const saved = enterScope(c, node);
+    defer c.cur_scope = saved;
     const d = c.tree.nodeData(node);
     const r = c.tree.extraData(ast.SubRange, d.rhs);
     var has_default = false;
