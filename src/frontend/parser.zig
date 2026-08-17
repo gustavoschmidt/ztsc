@@ -593,6 +593,15 @@ const Parser = struct {
                     try p.addDiag(f.code, .{ .code = f.code, .span = f.span });
                 }
             },
+            // Only the FLAGS; see `literals.RegexFlagWalk` for why the body is
+            // left alone. `init` walks back over the flags run, so a literal
+            // with none costs one byte test.
+            .regexp_literal => {
+                var w: literals.RegexFlagWalk = .init(p.tokenText(t), t.start);
+                while (w.next()) |f| {
+                    try p.addDiag(f.code, .{ .code = f.code, .span = f.span });
+                }
+            },
             else => {},
         }
     }
@@ -1044,6 +1053,21 @@ const Parser = struct {
 
     fn nodeDataAt(p: *const Parser, node: Node) ast.Data {
         return p.nodes.items(.data)[node];
+    }
+
+    /// One field of an extra record the parser itself wrote, by name — the
+    /// build-time counterpart of `Ast.extraData`, which cannot run until the
+    /// tree is finished. Reading a single field keeps the caller from having to
+    /// know the record's layout.
+    fn extraFieldAt(p: *const Parser, comptime T: type, comptime name: []const u8, index: u32) u32 {
+        const fields = @typeInfo(T).@"struct".fields;
+        const off = comptime blk: {
+            for (fields, 0..) |f, i| {
+                if (std.mem.eql(u8, f.name, name)) break :blk i;
+            }
+            @compileError("no field '" ++ name ++ "' in " ++ @typeName(T));
+        };
+        return p.extra.items[index + off];
     }
 
     fn addExtra(p: *Parser, extra: anytype) Error!u32 {
@@ -2230,6 +2254,43 @@ const Parser = struct {
         return p.addNode(.{ .tag = .do_stmt, .main_token = kw, .data = .{ .lhs = body, .rhs = cond } });
     }
 
+    /// tsc's `checkGrammarForInOrForOfStatement`, the arm about the declaration
+    /// LIST: a `for…in`/`for…of` head takes exactly ONE declaration, and that
+    /// one may not have an initializer. tsc `return`s on its first hit, so a
+    /// head with two INITIALIZED declarations answers for the count alone.
+    ///
+    /// Positions are tsc's, measured: the count is blamed on the SECOND
+    /// declarator's first token (`grammarErrorOnFirstToken(declarations[1])`)
+    /// and the initializer on the declarator's NAME.
+    ///
+    /// The type-annotation arm below these two (TS2483/TS2404) is left out: it
+    /// needs no more than these do, but no corpus case is one key away from it
+    /// and ztsc already answers those heads with a checker diagnostic tsc's
+    /// `return` suppresses, so adding it would leave the excess in place.
+    fn checkForInOfHead(p: *Parser, init: Node, is_of: bool) Error!void {
+        if (p.spec != 0 or init == null_node) return;
+        switch (p.nodeTagAt(init)) {
+            .var_decl => {
+                const data = p.nodeDataAt(init);
+                const second = p.extra.items[data.lhs + 1];
+                const code: Code = if (is_of) .for_of_one_declaration else .for_in_one_declaration;
+                try p.errAtToken(code, p.nodeMainTokenAt(second));
+            },
+            .var_decl_one => {
+                const decl = p.nodeDataAt(init).lhs;
+                const has_init = switch (p.nodeTagAt(decl)) {
+                    .declarator_init => true,
+                    .declarator_full => p.extraFieldAt(ast.DeclaratorFull, "init", p.nodeDataAt(decl).rhs) != null_node,
+                    else => false,
+                };
+                if (!has_init) return;
+                const code: Code = if (is_of) .for_of_declaration_initializer else .for_in_declaration_initializer;
+                try p.errAtToken(code, p.nodeMainTokenAt(decl));
+            },
+            else => {},
+        }
+    }
+
     fn parseForStatement(p: *Parser) PE!Node {
         const kw = try p.bump();
         var is_await: u32 = 0;
@@ -2253,6 +2314,7 @@ const Parser = struct {
             // for-of / for-in?
             if (p.curTag() == .keyword_of or p.curTag() == .keyword_in) {
                 const is_of = p.curTag() == .keyword_of;
+                try p.checkForInOfHead(init, is_of);
                 _ = try p.bump();
                 const right = if (is_of) try p.parseAssignExpr(.{}) else try p.parseExpression(.{});
                 _ = try p.expect(.r_paren, .expected_r_paren);

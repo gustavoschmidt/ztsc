@@ -24,6 +24,13 @@ pub const Code = enum(u16) {
     unterminated_string,
     unterminated_template,
     unterminated_regexp,
+    /// TS1499/TS1500/TS1502: the FLAGS of a regular expression literal. tsc's
+    /// scanner judges them one character at a time, so all three are syntactic.
+    /// `d g i m s u v y` are the flags; `u` and `v` both select Unicode mode
+    /// and only one of them may.
+    regexp_unknown_flag,
+    regexp_duplicate_flag,
+    regexp_unicode_and_unicode_sets,
     unterminated_comment,
     unexpected_character,
     /// TS18026: `#!` anywhere but the first line of the file.
@@ -297,6 +304,16 @@ pub const Code = enum(u16) {
     /// syntactic, and the text still becomes a child either way.
     jsx_text_rbrace,
     jsx_text_gt,
+    /// TS1188/TS1091: a `for…of` / `for…in` head declares more than one
+    /// variable. Reported on the SECOND declarator's first token, which is
+    /// tsc's `grammarErrorOnFirstToken(declarations[1])`.
+    for_of_one_declaration,
+    for_in_one_declaration,
+    /// TS1190/TS1189: the one declaration a `for…of` / `for…in` head may have
+    /// carries an initializer. Reported on the declaration's NAME. tsc's chain
+    /// `return`s, so a head that is wrong about the count never reaches these.
+    for_of_declaration_initializer,
+    for_in_declaration_initializer,
     /// TS17008: an opening tag whose element ran to end of file, or whose
     /// closing tag turned out to belong to an ENCLOSING element
     /// (`<div><span></div>` blames the `span`). tsc reports it on the OPENING
@@ -791,6 +808,10 @@ pub const Code = enum(u16) {
             .decorator_not_valid_here,
             .decorator_on_method_overload,
             .decorator_on_second_accessor,
+            .for_of_one_declaration,
+            .for_in_one_declaration,
+            .for_of_declaration_initializer,
+            .for_in_declaration_initializer,
             .module_keyword_for_namespace,
             .quoted_module_name_needs_ambient,
             .namespace_needs_a_name,
@@ -973,6 +994,9 @@ pub const Code = enum(u16) {
             // lowercase phrasing so the two groups stay visibly distinct.
             .unterminated_string => "Unterminated string literal.",
             .unterminated_template => "Unterminated template literal.",
+            .regexp_unknown_flag => "Unknown regular expression flag.",
+            .regexp_duplicate_flag => "Duplicate regular expression flag.",
+            .regexp_unicode_and_unicode_sets => "The Unicode (u) flag and the Unicode Sets (v) flag cannot be set simultaneously.",
             .unterminated_regexp => "Unterminated regular expression literal.",
             .unterminated_comment => "'*/' expected.",
             .unexpected_character => "Invalid character.",
@@ -1132,6 +1156,10 @@ pub const Code = enum(u16) {
             .jsx_needs_one_parent => "JSX expressions must have one parent element.",
             .jsx_text_rbrace => "Unexpected token. Did you mean `{'}'}` or `&rbrace;`?",
             .jsx_text_gt => "Unexpected token. Did you mean `{'>'}` or `&gt;`?",
+            .for_of_one_declaration => "Only a single variable declaration is allowed in a 'for...of' statement.",
+            .for_in_one_declaration => "Only a single variable declaration is allowed in a 'for...in' statement.",
+            .for_of_declaration_initializer => "The variable declaration of a 'for...of' statement cannot have an initializer.",
+            .for_in_declaration_initializer => "The variable declaration of a 'for...in' statement cannot have an initializer.",
             .jsx_element_unclosed => "JSX element '{0}' has no corresponding closing tag.",
             .jsx_expected_closing_tag => "Expected corresponding JSX closing tag for '{0}'.",
             .jsx_fragment_unclosed => "JSX fragment has no corresponding closing tag.",
@@ -1276,6 +1304,9 @@ pub const Code = enum(u16) {
             .unterminated_string => 1002,
             .unterminated_template => 1160,
             .unterminated_regexp => 1161,
+            .regexp_unknown_flag => 1499,
+            .regexp_duplicate_flag => 1500,
+            .regexp_unicode_and_unicode_sets => 1502,
             .unterminated_comment => 1010,
             .unexpected_character => 1127,
             .shebang_not_at_start => 18026,
@@ -1413,6 +1444,10 @@ pub const Code = enum(u16) {
             .jsx_needs_one_parent => 2657,
             .jsx_text_rbrace => 1381,
             .jsx_text_gt => 1382,
+            .for_of_one_declaration => 1188,
+            .for_in_one_declaration => 1091,
+            .for_of_declaration_initializer => 1190,
+            .for_in_declaration_initializer => 1189,
             .jsx_element_unclosed => 17008,
             .jsx_expected_closing_tag => 17002,
             .jsx_fragment_unclosed => 17014,

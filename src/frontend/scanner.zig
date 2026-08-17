@@ -1048,9 +1048,7 @@ pub const Scanner = struct {
                     s.index += 1;
                     if (!in_class) {
                         // Flags: identifier-continue characters.
-                        while (s.index < s.src.len and
-                            (isIdentCont(s.src[s.index]) or s.src[s.index] >= 0x80))
-                        {
+                        while (s.index < s.src.len and isRegexFlagByte(s.src[s.index])) {
                             s.index += 1;
                         }
                         return .regexp_literal;
@@ -1365,6 +1363,15 @@ inline fn isIdentStart(c: u8) bool {
 
 inline fn isIdentCont(c: u8) bool {
     return isIdentStart(c) or isDigit(c);
+}
+
+/// A byte that a regular expression's FLAGS run may contain — identifier-
+/// continue, or any non-ASCII lead/continuation byte. Public because
+/// `literals.RegexFlagWalk` finds the flags by walking back over exactly this
+/// run, and the two must agree about where the run begins or the walk would
+/// judge part of the body.
+pub fn isRegexFlagByte(c: u8) bool {
+    return isIdentCont(c) or c >= 0x80;
 }
 
 // ---------------------------------------------------------------------------

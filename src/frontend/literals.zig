@@ -538,6 +538,100 @@ fn hexValue(c: u8) u32 {
     return (c | 0x20) - 'a' + 10;
 }
 
+/// The FLAGS of a regular-expression literal — the tail of tsc's
+/// `scanRegularExpressionWorker`, which walks the run after the closing `/` and
+/// judges one character at a time.
+///
+/// `d g i m s u v y` are the flags. Anything else is TS1499, a repeat is
+/// TS1500, and `u` with `v` is TS1502 reported on the SECOND of the pair —
+/// each measured against tsgo 7.0.2 (`/x/a`, `/x/gg`, `/x/uv`, `/x/abc`, which
+/// answers three times). tsc's remaining arm, "this flag is only available when
+/// targeting ES2015 or later", cannot fire here: ztsc pins `esnext`, where
+/// every flag is available.
+///
+/// Only the FLAGS. tsc validates the regex BODY too (TS1125 for a `\u{}` with
+/// no hex digit, TS1508 for a bare `}`, and some forty more), which needs a
+/// real body parse — quantifier braces, character classes, the `(?ims-ims:`
+/// modifier group — and is deliberately left alone: a wrong error there is a
+/// SYNTACTIC one, and a syntactic error suppresses every semantic diagnostic in
+/// the whole program. A flag is a closed set of single letters, so this half
+/// cannot fire on valid code.
+///
+/// The flags are found by walking BACK from the end of the token, not forward
+/// through the body: the scanner defines them as exactly the maximal trailing
+/// run of `scanner.isRegexFlagByte`, so re-deriving them the same way cannot
+/// disagree with it — and re-walking the body here would be a second copy of
+/// `scanRegex`.
+pub const RegexFlagWalk = struct {
+    text: []const u8,
+    base: u32,
+    i: usize,
+    /// The flags accepted so far, one bit each. `u8` because there are eight.
+    seen: u8 = 0,
+
+    const d: u8 = 1 << 0;
+    const g: u8 = 1 << 1;
+    const i_flag: u8 = 1 << 2;
+    const m: u8 = 1 << 3;
+    const s: u8 = 1 << 4;
+    const u: u8 = 1 << 5;
+    const v: u8 = 1 << 6;
+    const y: u8 = 1 << 7;
+    /// `u` and `v` both select Unicode mode, and only one of them may.
+    const unicode_mode = u | v;
+
+    fn flagBit(c: u8) ?u8 {
+        return switch (c) {
+            'd' => d,
+            'g' => g,
+            'i' => i_flag,
+            'm' => m,
+            's' => s,
+            'u' => u,
+            'v' => v,
+            'y' => y,
+            else => null,
+        };
+    }
+
+    /// `text` is the literal's exact source text (`/body/flags`) and `base` its
+    /// file offset.
+    pub fn init(text: []const u8, base: u32) RegexFlagWalk {
+        var from = text.len;
+        while (from > 0 and scanner.isRegexFlagByte(text[from - 1])) from -= 1;
+        // The byte before the run has to be the closing `/`. When it is not,
+        // the token is not a complete regex literal (an unterminated one has
+        // its own tag) and there is nothing here to judge.
+        if (from == 0 or text[from - 1] != '/') from = text.len;
+        return .{ .text = text, .base = base, .i = from };
+    }
+
+    pub fn next(w: *RegexFlagWalk) ?Finding {
+        while (w.i < w.text.len) {
+            const from = w.i;
+            // A flag is one ASCII letter; a non-ASCII code point is reported
+            // whole, which is what puts the column on the character rather
+            // than on one of its continuation bytes.
+            const width = std.unicode.utf8ByteSequenceLength(w.text[from]) catch 1;
+            w.i = @min(from + width, w.text.len);
+            if (width != 1) return w.at(.regexp_unknown_flag, from);
+            const bit = flagBit(w.text[from]) orelse return w.at(.regexp_unknown_flag, from);
+            if (w.seen & bit != 0) return w.at(.regexp_duplicate_flag, from);
+            const clash = bit & unicode_mode != 0 and w.seen & unicode_mode != 0;
+            w.seen |= bit;
+            if (clash) return w.at(.regexp_unicode_and_unicode_sets, from);
+        }
+        return null;
+    }
+
+    fn at(w: *const RegexFlagWalk, code: Code, from: usize) Finding {
+        return .{ .code = code, .span = .{
+            .start = w.base + @as(u32, @intCast(from)),
+            .end = w.base + @as(u32, @intCast(w.i)),
+        } };
+    }
+};
+
 // ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
@@ -806,6 +900,63 @@ test "escapes: extended unicode range and termination" {
         try testing.expectEqual(@as(usize, 1), got.len);
         try testing.expectEqual(Code.unicode_escape_out_of_range, got[0].code);
     }
+}
+
+fn regexFlags(text: []const u8, buf: []Finding) []Finding {
+    var w: RegexFlagWalk = .init(text, 0);
+    var n: usize = 0;
+    while (w.next()) |f| : (n += 1) buf[n] = f;
+    return buf[0..n];
+}
+
+test "regex flags: the eight legal ones, in any order, answer nothing" {
+    var buf: [8]Finding = undefined;
+    try testing.expectEqual(@as(usize, 0), regexFlags("/x/dgimsuy", &buf).len);
+    try testing.expectEqual(@as(usize, 0), regexFlags("/x/v", &buf).len);
+    try testing.expectEqual(@as(usize, 0), regexFlags("/x/", &buf).len);
+    // A body that ends in flag-shaped bytes is still body, not flags.
+    try testing.expectEqual(@as(usize, 0), regexFlags("/abc/", &buf).len);
+}
+
+test "regex flags: one finding per offending character, at that character" {
+    var buf: [8]Finding = undefined;
+    {
+        const got = regexFlags("/x/a", &buf);
+        try testing.expectEqual(@as(usize, 1), got.len);
+        try testing.expectEqual(Code.regexp_unknown_flag, got[0].code);
+        try testing.expectEqual(@as(u32, 3), got[0].span.start);
+    }
+    // Three unknown flags are three findings, each one character wide.
+    {
+        const got = regexFlags("/x/abc", &buf);
+        try testing.expectEqual(@as(usize, 3), got.len);
+        try testing.expectEqual(@as(u32, 3), got[0].span.start);
+        try testing.expectEqual(@as(u32, 4), got[1].span.start);
+        try testing.expectEqual(@as(u32, 5), got[2].span.start);
+    }
+    {
+        const got = regexFlags("/x/gg", &buf);
+        try testing.expectEqual(@as(usize, 1), got.len);
+        try testing.expectEqual(Code.regexp_duplicate_flag, got[0].code);
+        try testing.expectEqual(@as(u32, 4), got[0].span.start); // the SECOND `g`
+    }
+    // `u` and `v` clash, and the report is on whichever came second.
+    for ([_][]const u8{ "/x/uv", "/x/vu" }) |text| {
+        const got = regexFlags(text, &buf);
+        try testing.expectEqual(@as(usize, 1), got.len);
+        try testing.expectEqual(Code.regexp_unicode_and_unicode_sets, got[0].code);
+        try testing.expectEqual(@as(u32, 4), got[0].span.start);
+    }
+}
+
+test "regex flags: a non-ASCII flag is reported once, over the whole character" {
+    var buf: [8]Finding = undefined;
+    // U+1D667 MATHEMATICAL SANS-SERIF BOLD SMALL G, four bytes.
+    const got = regexFlags("/x/\u{1D667}", &buf);
+    try testing.expectEqual(@as(usize, 1), got.len);
+    try testing.expectEqual(Code.regexp_unknown_flag, got[0].code);
+    try testing.expectEqual(@as(u32, 3), got[0].span.start);
+    try testing.expectEqual(@as(u32, 7), got[0].span.end);
 }
 
 test "escapes: the cheap guard agrees with the walk" {
