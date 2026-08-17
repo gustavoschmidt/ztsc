@@ -4460,8 +4460,6 @@ pub fn nonDiscPropsAssignable(c: *Checker, s: TypeId, member: TypeId, excl: Atom
     return true;
 }
 
-/// Whether `s` provides a signature assignable to each of `t`'s call
-/// (`is_construct == false`) or construct (`true`) signatures.
 /// Is `t` an object that is nothing but ONE construct signature — the shape a
 /// `new (…) => R` / `abstract new (…) => R` type literal builds, and the one
 /// shape whose abstract-ness ztsc's model cannot recover? See the
@@ -4475,6 +4473,8 @@ pub fn bareConstructSigObject(c: *const Checker, t: TypeId) bool {
         c.ts.objectNumberIndex(t) == 0;
 }
 
+/// Whether `s` provides a signature assignable to each of `t`'s call
+/// (`is_construct == false`) or construct (`true`) signatures.
 /// Function ↔ callable-object relate in both directions; a `class_value`
 /// satisfies construct signatures (constructable) — under-reporting exact
 /// shape mismatches rather than spuriously rejecting a valid class value.
@@ -5212,7 +5212,17 @@ pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode
     const rest_pair: ?u32 = blk: {
         const both = @min(s_count, t_count);
         if (both == 0) break :blk null;
-        if (sigInstantiableRest(c, se) or sigInstantiableRest(c, te)) break :blk both - 1;
+        // …but only when ONE side has it. Two signatures that each declare a
+        // generic rest (`(…, ...args: Args) => R` on both sides, jotai's
+        // `WritableAtom`'s `set`) are two instantiations of one shape, and
+        // ztsc relates their type parameters as the DISTINCT parameters they
+        // are: `Args` against `Args` is not `Args` here, so comparing the two
+        // rests as whole types rejects a signature that is its own equal. The
+        // element-wise reading, which erases both to the same thing, is the
+        // one that gets that pair right — and the rule is only ever needed
+        // where the OTHER side is concrete enough to say something the
+        // elements cannot.
+        if (sigInstantiableRest(c, se) != sigInstantiableRest(c, te)) break :blk both - 1;
         if ((try c.sigRestUnion(se)) == null and (try c.sigRestUnion(te)) == null) break :blk null;
         break :blk both - 1;
     };
