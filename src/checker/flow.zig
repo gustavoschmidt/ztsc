@@ -526,6 +526,11 @@ fn flowReachableInner(c: *Checker, flow: FlowId) Error!bool {
             }
             return false;
         },
+        // A reduction only ever REMOVES antecedents from its target, so
+        // walking the continuation with the target's full list can only
+        // over-report reachability — the safe side for every consumer of this
+        // answer (it is asked to *suppress* a report, never to raise one).
+        .reduce_label => return flowReachable(c, b.reduceAntecedent(flow)),
         // Only the entry edge: a loop's back edges are reachable exactly
         // when the head is, so following them would answer with itself.
         .loop_label => {
@@ -1030,8 +1035,33 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
             const narrowed = try narrowByAssertCall(c, solid, call, key, declared);
             return if (narrowed == solid) before else narrowed;
         },
+        // tsc's ReduceLabel arm: continue at the end of the `finally` block,
+        // with the label at its top restricted to the normal-exit edges for
+        // the rest of this walk. `flow_reduce` carries the restriction and
+        // `key`'s reduce depth carries the memo separation (see `RefKey.deep`).
+        .reduce_label => {
+            const d = key.reduceDepth();
+            // Past the encodable nesting the query would share a memo slot
+            // with the un-reduced walk, so it stops narrowing instead.
+            if (d >= RefKey.max_reduce_depth) return declared;
+            c.flow_reduce.shrinkRetainingCapacity(d);
+            try c.flow_reduce.append(c.cm(), flow);
+            return flowType(c, b.reduceAntecedent(flow), key.withReduceDepth(d + 1), declared, depth + 1);
+        },
         .branch_label, .loop_label => {
-            const antes = b.flowAntecedents(flow);
+            var antes = b.flowAntecedents(flow);
+            var k = key;
+            // Is this the label a live reduction targets? Only the innermost
+            // one can be (`flow_reduce` nests), and only a `branch_label` is
+            // ever a target.
+            const rd = key.reduceDepth();
+            if (rd != 0 and rd <= c.flow_reduce.items.len) {
+                const r = c.flow_reduce.items[rd - 1];
+                if (b.reduceTarget(r) == flow) {
+                    antes = b.reduceAntecedents(r);
+                    k = key.withReduceDepth(rd - 1);
+                }
+            }
             // A loop label whose reference is *never assigned inside the
             // loop* keeps its pre-loop narrowing across the whole loop body
             // (tsc `getTypeAtFlowLoopLabel`: a reference only re-widens at a
@@ -1093,7 +1123,7 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
                     c.member_written_syms.contains(key.sym));
                 const assigned_in_loop = root_assigned or member_written;
                 if (!assigned_in_loop) {
-                    const entry_t = try flowType(c, antes[0], key, declared, depth + 1);
+                    const entry_t = try flowType(c, antes[0], k, declared, depth + 1);
                     if (entry_t != declared) return entry_t;
                 }
             }
@@ -1129,7 +1159,7 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
                     published = true;
                     frame = c.flow_loop_stack.items.len;
                     const q: FlowQ = (@as(u64, c.cur_flow_base + flow) << 32) |
-                        try refKeyIndex(c, key, declared);
+                        try refKeyIndex(c, k, declared);
                     // `parts` is scratch-backed and this publishes it where a
                     // deeper query can read it, so it is the one place in the
                     // checker that hands a scratch buffer sideways. It stays
@@ -1149,7 +1179,7 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
                     // `flowTypeCache` around exactly this walk.
                     c.no_publish_depth += 1;
                 }
-                const t = try flowType(c, a, key, declared, depth + 1);
+                const t = try flowType(c, a, k, declared, depth + 1);
                 if (t != types.never_type) try parts.append(c.scratch(), t);
             }
             if (published) {
@@ -1294,7 +1324,7 @@ fn patternWritesRef(c: *Checker, node: Node, key: RefKey) Error!bool {
 /// spelling of the one-link `this`-rooted reference `key` stands for? See the
 /// call site for why the equivalence lives here and not in `refMatchesPath`.
 fn writesThisStringIndex(c: *Checker, target: Node, key: RefKey) Error!bool {
-    if (key.sym != this_flow_root or key.len != 1 or key.deep != 0) return false;
+    if (key.sym != this_flow_root or key.len != 1 or key.deepId() != 0) return false;
     if (key.path[0].isIndex()) return false;
     var n = c.referenceCandidate(target);
     while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
@@ -3459,6 +3489,11 @@ fn definitelyAssignedInner(c: *Checker, flow: FlowId, sym: SymbolId) Error!bool 
         .cond_true, .cond_false, .switch_clause, .call_stmt, .array_mutation => {
             return c.definitelyAssigned(b.flow_a[flow], sym);
         },
+        // A pass-through: the target label keeps its full antecedent list, so
+        // the answer stays on the conservative "not definitely assigned" side.
+        // Separating the two walks would need the reduce depth in `da_cache`'s
+        // key, and this walk exists only for computed property names.
+        .reduce_label => return c.definitelyAssigned(b.reduceAntecedent(flow), sym),
         .switch_no_match => {
             // The "no clause matched" edge out of a `default`-less switch.
             // When the switch is exhaustive over a literal-union
@@ -3545,6 +3580,9 @@ fn saReaches(c: *Checker, flow: FlowId, sym: SymbolId, seen: []bool) Error!bool 
         .cond_true, .cond_false, .switch_clause, .call_stmt, .switch_no_match, .array_mutation => {
             return saReaches(c, b.flow_a[flow], sym, seen);
         },
+        // Pass-through (some-path question, so the un-reduced target can only
+        // over-report — the same side `definitelyAssigned` errs on).
+        .reduce_label => return saReaches(c, b.reduceAntecedent(flow), sym, seen),
         .branch_label, .loop_label => {
             for (b.flowAntecedents(flow)) |a| {
                 if (try saReaches(c, a, sym, seen)) return true;

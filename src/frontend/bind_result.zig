@@ -290,6 +290,25 @@ pub const FlowTag = enum(u8) {
     /// bare reference reads it (see `getTypeAtFlowArrayMutation`); for every
     /// other reference it is a pass-through.
     array_mutation,
+    /// tsc's `FlowFlags.ReduceLabel`: continue at one flow node, but with a
+    /// branch label somewhere above it restricted to a SUBSET of its own
+    /// antecedents. It exists for exactly one construct — the normal exit of
+    /// a `try`/`finally` (see `Binder.bindTry`). The finally block is entered
+    /// from every way control can reach it (normal completion of the try /
+    /// catch block, and — conservatively — an exception at any point inside
+    /// them), so a reference read INSIDE the finally block must see all of
+    /// them. Control that leaves the statement normally, though, can only have
+    /// come through the normal-completion edges, so the exception edge has to
+    /// be dropped on the way out. Without that, `var x: {}; try { x = f() }
+    /// finally { g() } x` reports "used before being assigned"
+    /// (`flowAfterFinally1`).
+    ///
+    /// Layout: `a..b` is a `flow_extra` range whose first two entries are the
+    /// TARGET label and the ANTECEDENT to continue at, followed by the
+    /// target's reduced antecedent list. `reduceTarget`/`reduceAntecedent`/
+    /// `reduceAntecedents` read the three parts; `flowAntecedents` answers
+    /// with the one-element continuation so the generic walks stay generic.
+    reduce_label,
 };
 
 pub const ImportKind = enum(u8) { default, namespace, named, side_effect, equals };
@@ -704,8 +723,28 @@ pub const Bind = struct {
         return switch (b.flow_tags[flow]) {
             .branch_label, .loop_label => b.flow_extra[b.flow_a[flow]..b.flow_b[flow]],
             .none, .unreachable_, .start => b.flow_extra[0..0],
+            // The continuation, as a one-element slice: a walk that does not
+            // implement the reduction still sees the right edge (it just does
+            // not narrow the target label).
+            .reduce_label => b.flow_extra[b.flow_a[flow] + 1 ..][0..1],
             else => b.flow_a[flow .. flow + 1], // single antecedent, stored in a
         };
+    }
+
+    /// The branch label a `reduce_label` restricts (see `FlowTag.reduce_label`).
+    pub fn reduceTarget(b: *const Bind, flow: FlowId) FlowId {
+        return b.flow_extra[b.flow_a[flow]];
+    }
+
+    /// The flow node a `reduce_label` continues at.
+    pub fn reduceAntecedent(b: *const Bind, flow: FlowId) FlowId {
+        return b.flow_extra[b.flow_a[flow] + 1];
+    }
+
+    /// The antecedent list the target label is restricted to. Never empty:
+    /// the binder emits `unreachable_` instead of a reduction to nothing.
+    pub fn reduceAntecedents(b: *const Bind, flow: FlowId) []const FlowId {
+        return b.flow_extra[b.flow_a[flow] + 2 .. b.flow_b[flow]];
     }
 
     /// The AST node a flow node references (assign/condition/switch), or 0.

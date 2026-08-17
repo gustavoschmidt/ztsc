@@ -337,6 +337,8 @@ const DeclOrigin = packed struct(u32) {
 };
 const Pending = struct { head: u32 = 0, tail: u32 = 0, count: u32 = 0 };
 const PendingId = u32;
+/// The non-list half of a `reduce_label` (see `Binder.reduce_edges`).
+const ReduceEdges = struct { target: FlowId, antecedent: FlowId };
 
 const CtxKind = enum(u8) { loop, switch_blk, labeled };
 const Ctx = struct {
@@ -444,6 +446,12 @@ const Binder = struct {
     flow_scopes: std.ArrayList(ScopeId) = .empty,
     pendings: std.ArrayList(Pending) = .empty,
     ante_links: std.ArrayList(Link) = .empty,
+    /// The two extra edges a `reduce_label` carries (its target label and the
+    /// node it continues at), indexed by that flow node's `flow_b`. Kept out
+    /// of the SoA columns because it is the only tag needing four edges and
+    /// there are a handful per file — `seal` flattens all three parts into one
+    /// `flow_extra` range (see `FlowTag.reduce_label`).
+    reduce_edges: std.ArrayList(ReduceEdges) = .empty,
     flow_pairs: std.ArrayList(Link) = .empty, // value=node, next=flow
     /// tsc's `isEvolvingArrayOperationTarget` reads, recorded while the PARENT
     /// is bound (the AST has no parent links). value = the identifier node,
@@ -1818,6 +1826,8 @@ const Binder = struct {
         const ps: PostSuper = .{
             .tags = b.flow_tags.items,
             .a = b.flow_a.items,
+            .b = b.flow_b.items,
+            .reduce_edges = b.reduce_edges.items,
             .pendings = b.pendings.items,
             .ante_links = b.ante_links.items,
             .super_flows = b.super_call_flows.items,
@@ -1847,6 +1857,8 @@ const Binder = struct {
     const PostSuper = struct {
         tags: []const FlowTag,
         a: []const u32,
+        b: []const u32,
+        reduce_edges: []const ReduceEdges,
         pendings: []const Pending,
         ante_links: []const Link,
         super_flows: []const FlowId,
@@ -1880,6 +1892,11 @@ const Binder = struct {
                         f = ps.a[f];
                     },
                     .assign, .cond_true, .cond_false, .switch_clause, .switch_no_match, .array_mutation => f = ps.a[f],
+                    // Pass through to the continuation. The target label is
+                    // walked with its full antecedent list, which can only
+                    // make the answer more conservative ("super may not have
+                    // run"), never less.
+                    .reduce_label => f = ps.reduce_edges[ps.b[f]].antecedent,
                     .branch_label, .loop_label => {
                         // `flow_a` holds the pending id until seal() flattens
                         // the list into `flow_extra`.
@@ -1998,6 +2015,15 @@ const Binder = struct {
         if (p.count == 0) return unreachable_flow;
         if (p.count == 1) return b.ante_links.items[p.head].value;
         return b.addFlow(.branch_label, pid, 0);
+    }
+
+    /// tsc's `createReduceLabel`. `pid` is the pending holding the reduced
+    /// antecedent list; `flow_a` keeps it (like a label's) until `seal`, and
+    /// `flow_b` indexes the two edges that do not fit in the SoA columns.
+    fn addReduceLabel(b: *Binder, target: FlowId, antecedent: FlowId, pid: PendingId) Error!FlowId {
+        const idx: u32 = @intCast(b.reduce_edges.items.len);
+        try b.reduce_edges.append(b.scratch, .{ .target = target, .antecedent = antecedent });
+        return b.addFlow(.reduce_label, pid, idx);
     }
 
     /// A loop head must exist before its back edges do, so it is created
@@ -2469,20 +2495,53 @@ const Binder = struct {
             after_catch = b.cur_flow;
         }
 
-        const pid = try b.newPending();
-        try b.pendAdd(pid, after_try);
-        try b.pendAdd(pid, after_catch);
-        var joined = try b.finishPending(pid);
-        if (e.finally_block != 0) {
-            // Conservative: the finally body may also run mid-try.
-            const fp = try b.newPending();
-            try b.pendAdd(fp, pre);
-            try b.pendAdd(fp, joined);
-            b.cur_flow = try b.finishPending(fp);
-            try b.bindStatement(e.finally_block);
-            joined = b.cur_flow;
+        if (e.finally_block == 0) {
+            const pid = try b.newPending();
+            try b.pendAdd(pid, after_try);
+            try b.pendAdd(pid, after_catch);
+            b.cur_flow = try b.finishPending(pid);
+            return;
         }
-        b.cur_flow = joined;
+
+        // tsc's `bindTryStatement` finally arm. The finally block is entered
+        // from the normal completion of the try/catch block AND — this is the
+        // conservative part — from an exception raised at any point inside
+        // them, which is approximated by the pre-try flow. All of those are
+        // real for a reference read INSIDE the finally block, so they are the
+        // label's antecedents.
+        const fp = try b.newPending();
+        try b.pendAdd(fp, after_try);
+        try b.pendAdd(fp, after_catch);
+        const normal_count = b.pendings.items[fp].count;
+        try b.pendAdd(fp, pre); // the exception edge
+        const all_count = b.pendings.items[fp].count;
+        const finally_label = try b.finishPending(fp);
+        b.cur_flow = finally_label;
+        try b.bindStatement(e.finally_block);
+        const end_finally = b.cur_flow;
+
+        // Leaving the statement normally, though, means no exception was
+        // raised — so the exception edge must be dropped on the way out. tsc
+        // spells that `createReduceLabel(finallyLabel, normalExitLabel
+        // .antecedents, currentFlow)`: continue at the end of the finally
+        // block, but with the finally label restricted to the normal-exit
+        // edges. Joining the pre-try flow in unconditionally instead (what
+        // ztsc did) made every variable the try block assigns read as possibly
+        // unassigned afterwards (`flowAfterFinally1`).
+        if (normal_count == 0 or end_finally == unreachable_flow) {
+            // No normal way in (or the finally block never completes): the
+            // statement has no normal exit either.
+            b.cur_flow = unreachable_flow;
+        } else if (all_count == normal_count) {
+            // The exception edge was already one of the normal ones (or was
+            // unreachable): nothing to reduce.
+            b.cur_flow = end_finally;
+        } else {
+            const rp = try b.newPending();
+            try b.pendAdd(rp, after_try);
+            try b.pendAdd(rp, after_catch);
+            b.cur_flow = try b.addReduceLabel(finally_label, end_finally, rp);
+        }
     }
 
     fn bindCatchBinding(b: *Binder, binding: Node) Error!void {
@@ -5016,6 +5075,19 @@ const Binder = struct {
                     }
                     flow_b[i] = @intCast(extra.items.len);
                 },
+                // Target, continuation, then the reduced antecedent list.
+                .reduce_label => {
+                    const ed = b.reduce_edges.items[b.flow_b.items[i]];
+                    const p = b.pendings.items[b.flow_a.items[i]];
+                    flow_a[i] = @intCast(extra.items.len);
+                    try extra.append(b.scratch, ed.target);
+                    try extra.append(b.scratch, ed.antecedent);
+                    var l = p.head;
+                    while (l != 0) : (l = b.ante_links.items[l].next) {
+                        try extra.append(b.scratch, b.ante_links.items[l].value);
+                    }
+                    flow_b[i] = @intCast(extra.items.len);
+                },
                 else => {
                     flow_a[i] = b.flow_a.items[i];
                     flow_b[i] = b.flow_b.items[i];
@@ -5377,7 +5449,7 @@ test "golden: var hoists out of blocks to the function scope" {
         \\    y: var
         \\    scope 2: block
         \\      z: let
-        \\flow: nodes=5 attach=0 (start=2 assign=3 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0)
+        \\flow: nodes=5 attach=0 (start=2 assign=3 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0 reduce=0)
         \\
     );
 }
@@ -5388,7 +5460,7 @@ test "golden: function declaration in a block is block-scoped (modern semantics)
         \\  scope 1: block
         \\    g: function impl
         \\    scope 2: function g
-        \\flow: nodes=2 attach=0 (start=2 assign=0 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0)
+        \\flow: nodes=2 attach=0 (start=2 assign=0 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0 reduce=0)
         \\
     );
 }
@@ -5401,7 +5473,7 @@ test "golden: let shadowing chain (TDZ names, one symbol per scope)" {
         \\    a: let
         \\    scope 2: block
         \\      a: let
-        \\flow: nodes=4 attach=3 (start=1 assign=3 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0)
+        \\flow: nodes=4 attach=3 (start=1 assign=3 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0 reduce=0)
         \\
     );
 }
@@ -5425,7 +5497,7 @@ test "golden: class members vs statics, parameter properties" {
         \\    scope 5: function s
         \\    scope 6: function constructor
         \\      z: param
-        \\flow: nodes=4 attach=1 (start=4 assign=0 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0)
+        \\flow: nodes=4 attach=1 (start=4 assign=0 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0 reduce=0)
         \\
     );
 }
@@ -5441,7 +5513,7 @@ test "golden: params, destructured params, defaults referencing earlier params" 
         \\    d: param
         \\    f2: param
         \\    g2: param
-        \\flow: nodes=2 attach=3 (start=2 assign=0 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0)
+        \\flow: nodes=2 attach=3 (start=2 assign=0 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0 reduce=0)
         \\
     );
     // The defaults' references to earlier params resolve in-file.
@@ -5456,7 +5528,7 @@ test "golden: catch parameter gets its own scope shared with the body" {
         \\  scope 1: block
         \\  scope 2: catch_clause
         \\    e: catch
-        \\flow: nodes=4 attach=3 (start=1 assign=0 cond=0 branch=1 loop=0 switch=0 call=2 arraymut=0)
+        \\flow: nodes=4 attach=3 (start=1 assign=0 cond=0 branch=1 loop=0 switch=0 call=2 arraymut=0 reduce=0)
         \\unresolved: f(1) g(1)
         \\
     );
@@ -5471,7 +5543,7 @@ test "golden: for and for-of heads scope their declarations" {
         \\  scope 3: for_head
         \\    x: const
         \\    scope 4: block
-        \\flow: nodes=8 attach=5 (start=1 assign=3 cond=2 branch=0 loop=2 switch=0 call=0 arraymut=0)
+        \\flow: nodes=8 attach=5 (start=1 assign=3 cond=2 branch=0 loop=2 switch=0 call=0 arraymut=0 reduce=0)
         \\unresolved: xs(1)
         \\
     );
@@ -5486,7 +5558,7 @@ test "golden: import records incl. type-only, namespace, side-effect" {
         \\  T: import type-only
         \\  ns: import
         \\  X: import type-only
-        \\flow: nodes=1 attach=0 (start=1 assign=0 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0)
+        \\flow: nodes=1 attach=0 (start=1 assign=0 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0 reduce=0)
         \\import local=d imported=default from="./m" default
         \\import local=a imported=a from="./m" named
         \\import local=c imported=b from="./m" named
@@ -5504,7 +5576,7 @@ test "golden: export records (decl, alias, re-export, star, default)" {
         \\  k: const exported
         \\  ef: function exported impl
         \\  scope 1: function ef
-        \\flow: nodes=3 attach=0 (start=2 assign=1 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0)
+        \\flow: nodes=3 attach=0 (start=2 assign=1 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0 reduce=0)
         \\export exported=k local=k named
         \\export exported=ef local=ef named
         \\export exported=kk local=k named
@@ -5525,7 +5597,7 @@ test "golden: overload signatures group into one symbol" {
         \\    a: param
         \\  scope 3: function ov
         \\    a: param
-        \\flow: nodes=2 attach=0 (start=2 assign=0 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0)
+        \\flow: nodes=2 attach=0 (start=2 assign=0 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0 reduce=0)
         \\
     );
 }
@@ -5541,7 +5613,7 @@ test "golden: interface-interface merge shares one members scope" {
         \\      b: property
         \\    scope 3: function m
         \\  scope 4: interface I
-        \\flow: nodes=1 attach=0 (start=1 assign=0 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0)
+        \\flow: nodes=1 attach=0 (start=1 assign=0 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0 reduce=0)
         \\
     );
 }
@@ -5553,7 +5625,7 @@ test "golden: type alias with type params" {
         \\  v: let
         \\  scope 1: type_alias Alias
         \\    T: type-param
-        \\flow: nodes=1 attach=0 (start=1 assign=0 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0)
+        \\flow: nodes=1 attach=0 (start=1 assign=0 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0 reduce=0)
         \\
     );
 }
@@ -6020,6 +6092,15 @@ fn checkBinderOnArbitraryBytes(alloc: Allocator, interner: *Interner, input: []c
                 for (b.flow_extra[b.flow_a[f]..b.flow_b[f]]) |a| {
                     try testing.expect(a < n_flows);
                 }
+            },
+            .reduce_label => {
+                // target + continuation + at least one reduced antecedent.
+                try testing.expect(b.flow_a[f] + 2 < b.flow_b[f]);
+                try testing.expect(b.flow_b[f] <= b.flow_extra.len);
+                for (b.flow_extra[b.flow_a[f]..b.flow_b[f]]) |a| {
+                    try testing.expect(a < n_flows);
+                }
+                try testing.expectEqual(FlowTag.branch_label, b.flow_tags[b.reduceTarget(@intCast(f))]);
             },
             .assign, .cond_true, .cond_false, .switch_clause, .switch_no_match, .call_stmt, .array_mutation => {
                 try testing.expect(b.flow_a[f] < n_flows);
