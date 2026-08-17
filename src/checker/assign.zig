@@ -2484,8 +2484,28 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         // matter what the holes hold. Applying it here narrows the leniency
         // to the cases that actually need a matcher.
         if (sk == .template_literal_type) return !template_zig.definitelyUnrelated(c, s, t);
-        if (sk == .string_mapping) return true;
+        // A string-transform intrinsic gets no such concession: tsc's
+        // `isTypeMatchedByTemplateLiteralType` infers nothing from a
+        // `StringMapping` source, and the base constraint it falls back on is
+        // plain `string`, which no pattern accepts. `Capitalize<string>` is
+        // NOT a `` `A${string}` `` (the empty string is capitalized and has no
+        // `A`), and the conformance case says so.
         return false;
+    }
+    // String-transform intrinsic TARGET. `Uppercase<string>` is not `string`:
+    // it denotes the strings that ARE their own uppercase, so membership is
+    // decided by re-applying the intrinsic stack and asking whether the source
+    // came back unchanged (`isMemberOfStringMapping`). Two intrinsics relate
+    // only when they are the SAME intrinsic over related arguments — tsc
+    // returns outright false for `Lowercase<X>` against `Uppercase<Y>`,
+    // because `Uppercase<Lowercase<string>>` and `Uppercase<string>` really
+    // are different sets (the German sharp s lowercases to `ss`).
+    if (tk == .string_mapping) {
+        if (sk == .string_mapping) {
+            if (c.ts.stringMappingKind(s) != c.ts.stringMappingKind(t)) return false;
+            return c.isAssignable(c.ts.stringMappingArg(s), c.ts.stringMappingArg(t));
+        }
+        return template_zig.isMemberOfStringMapping(c, s, t);
     }
     // Template-literal pattern / string-mapping *source* against anything
     // else: `string` answers for it. Both are SUBTYPES of `string` — that is

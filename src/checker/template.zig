@@ -510,13 +510,26 @@ pub fn stringLiteralOf(c: *Checker, t0: TypeId) Error!?Atom {
 
 /// Apply a string-transform intrinsic. Concrete string → transformed
 /// string-literal; union → distribute; still-generic arg → defer as a
-/// `string_mapping` type. `string` itself maps to `string`.
+/// `string_mapping` type.
+///
+/// `Uppercase<string>` DEFERS too, and that is the whole point: it denotes the
+/// strings that are their own uppercase, a strictly smaller set than `string`.
+/// Collapsing it made `x2 = x1` (`Uppercase<string> = string`) legal and every
+/// mapping mutually assignable. tsc's `getStringMappingType` sends
+/// `Any | String | StringMapping` to `getStringMappingTypeForGenericType`, and
+/// the relation decides membership with `isMemberOfStringMapping`.
 pub fn applyStringMapping(c: *Checker, kind_idx: u32, arg0: TypeId) Error!TypeId {
     const s = &c.ts;
     const arg = try c.resolveStructural(arg0);
     switch (s.kind(arg)) {
-        .string => return types.string_type,
         .any, .err => return arg,
+        // `Mapping<Mapping<T>> === Mapping<T>` for the SAME intrinsic only:
+        // applying uppercase twice is applying it once. Different intrinsics
+        // do NOT collapse — the German sharp s makes
+        // `Uppercase<Lowercase<string>>` a different set from
+        // `Uppercase<string>`, which is exactly what the conformance case
+        // asserts.
+        .string_mapping => if (s.stringMappingKind(arg) == kind_idx) return arg,
         .never => return types.never_type,
         .union_type => {
             var parts: std.ArrayList(TypeId) = .empty;
@@ -543,6 +556,58 @@ pub fn applyStringMapping(c: *Checker, kind_idx: u32, arg0: TypeId) Error!TypeId
     // Still generic (type param / mapped_param / infer / nested template
     // pattern / another mapping) → defer.
     return s.makeStringMapping(kind_idx, arg);
+}
+
+/// tsc's `isMemberOfStringMapping`: is every string `source` denotes also one
+/// `target` denotes, when `target` is (a stack of) string-transform
+/// intrinsics? A string is a member of `Uppercase<X>` exactly when uppercasing
+/// it changes nothing AND it is a member of `X` — which is what makes
+/// `Uppercase<string>` a real constraint rather than a synonym for `string`,
+/// and `Uppercase<Lowercase<string>>` a different set again.
+///
+/// ```ts
+/// if (target.flags & (String | AnyOrUnknown)) return true;
+/// if (target.flags & TemplateLiteral) return isTypeAssignableTo(source, target);
+/// if (target.flags & StringMapping) {
+///     const stack = []; while (target is StringMapping) { stack.unshift(target.symbol); target = target.type }
+///     const mapped = reduceLeft(stack, (memo, sym) => getStringMappingType(sym, memo), source);
+///     return mapped === source && isMemberOfStringMapping(source, target);
+/// }
+/// return false;
+/// ```
+///
+/// Depth-capped: the stack is bounded by the nesting actually written, but the
+/// recursion runs under the relation and a pathological alias chain must not
+/// grow it without bound.
+pub fn isMemberOfStringMapping(c: *Checker, source0: TypeId, target0: TypeId) Error!bool {
+    const s = &c.ts;
+    // Both sides in resolved form: `applyStringMapping` resolves its argument,
+    // so the `mapped == source` identity below has to compare like with like.
+    const source = try c.resolveStructural(source0);
+    const target = try c.resolveStructural(target0);
+    switch (s.kind(target)) {
+        .string, .any, .unknown, .err => return true,
+        .template_literal_type => return c.isAssignable(source, target),
+        .string_mapping => {},
+        else => return false,
+    }
+    // The intrinsics from the OUTSIDE in, so re-applying them to `source`
+    // runs innermost-first — tsc's `unshift` + `reduceLeft`.
+    var stack: [8]u32 = undefined;
+    var n: usize = 0;
+    var inner = target;
+    while (s.kind(inner) == .string_mapping) {
+        if (n == stack.len) return false; // deeper than anything real; concede nothing
+        stack[stack.len - 1 - n] = s.stringMappingKind(inner);
+        n += 1;
+        inner = try c.resolveStructural(s.stringMappingArg(inner));
+    }
+    var mapped = source;
+    for (stack[stack.len - n ..]) |kind_idx| {
+        mapped = try c.applyStringMapping(kind_idx, mapped);
+    }
+    if (mapped != source) return false;
+    return isMemberOfStringMapping(c, source, inner);
 }
 
 /// `transformString` over an interned atom, re-interning the result.
@@ -737,6 +802,15 @@ pub fn holeAccepts(c: *Checker, hole0: TypeId, str: []const u8) Error!bool {
             return true;
         },
         .template_literal_type => return c.matchTemplatePattern(str, hole),
+        // A string-transform hole — what `Uppercase<`aA${string}`>` leaves
+        // behind as `` `AA${Uppercase<string>}` `` — admits exactly the text
+        // the transform does not move (tsc's
+        // `isValidTypeForTemplateLiteralPlaceholder`, StringMapping arm).
+        .string_mapping => return isMemberOfStringMapping(
+            c,
+            try s.makeStringLiteral(try c.internText(str), false),
+            hole,
+        ),
         else => return false,
     }
 }
