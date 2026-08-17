@@ -3606,6 +3606,7 @@ pub const Checker = struct {
     pub const reduceConditional = generics_zig.reduceConditional;
     pub const resolveConcreteConditional = generics_zig.resolveConcreteConditional;
     pub const planConditional = generics_zig.planConditional;
+    pub const simplifyConditional = generics_zig.simplifyConditional;
     pub const finishCondPlan = generics_zig.finishCondPlan;
     pub const condTrueBranch = generics_zig.condTrueBranch;
     pub const indexOfId = generics_zig.indexOfId;

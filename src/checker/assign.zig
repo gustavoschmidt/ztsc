@@ -1148,6 +1148,13 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!RelAnswer {
     var t = try c.ts.regularLiteral(t1);
     s = try c.ts.regular(s);
     t = try c.ts.regular(t);
+    // tsc's `getNormalizedType`, which runs `getSimplifiedType` over both
+    // operands before the relation looks at either: a conditional that is
+    // trivially its own check type (`T extends T ? T : never`) is the check
+    // type here, however deferred it stays everywhere else. Two kind reads on
+    // a pair that already failed the identity test — see `simplifyConditional`.
+    s = c.simplifyConditional(s);
+    t = c.simplifyConditional(t);
     if (s == t) return .yes;
     // The same simplification, one level down: a `this` NESTED inside a
     // deferred operator (`this extends {_zod:…} ? this["_zod"]["output"] :
@@ -3280,6 +3287,26 @@ pub fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
                 return true;
             }
         }
+    }
+    // tsc `structuredTypeRelatedTo`, the SOURCE-mapped arm: "a source type
+    // `{ [P in Q]: X }` is related to a target type `T` if `keyof T` is
+    // related to `Q` and `X` is related to `T[P]`." Narrowed to the shape
+    // where `X` IS `T[P]` — the identity map written over an explicit key set
+    // rather than over `keyof T` — so the second half is free and the first
+    // (a `keyof` of the target) is only computed for a template that already
+    // names the target. `Pick<Params, keyof Params>` is the case: it is not
+    // homomorphic in ztsc's sense (its key set is a written `Q`, not
+    // `keyof Params`), so the identity arm below never saw it.
+    //
+    // The `keyof T <: Q` gate is what tsc's rule turns on and is not
+    // optional: `Pick<T, "a">` and `Pick<T, K>` produce FEWER keys than `T`
+    // requires, and tsgo rejects both.
+    if (sk == .mapped and !c.mappedAddsOptional(s) and c.ts.mappedAs(s) == 0) {
+        const val = c.ts.mappedValue(s);
+        if (c.ts.kind(val) == .index_access and
+            c.ts.indexAccessObj(val) == t and
+            c.ts.indexAccessIndex(val) == c.ts.mappedKeyParam(s) and
+            try c.isAssignable(try c.keyofType(t), try c.mappedKeySet(s))) return true;
     }
     // A homomorphic identity map with only modifier changes IS its source
     // (`Readonly<P>` → `P`). A map that adds `?` is not, and one that
