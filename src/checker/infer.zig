@@ -1824,18 +1824,38 @@ fn inferFromClassCtorParams(
     }
     if (rest_pat == types.no_type) return;
 
+    const cls = s.classSymbol(class_value);
     var ctor_sigs: std.ArrayList(TypeId) = .empty;
     defer ctor_sigs.deinit(c.scratch());
-    try c.ctorSignatures(s.classSymbol(class_value), &ctor_sigs);
+    try c.ctorSignatures(cls, &ctor_sigs);
     // An overloaded constructor gives no single parameter list to bind.
     if (ctor_sigs.items.len != 1) return;
     const csig = ctor_sigs.items[0];
     if (s.kind(csig) != .function) return;
 
+    // The class's OWN type parameters are free in that signature (`declare
+    // class Bag<T> { constructor(...args: T[]) }`), and a candidate mentioning
+    // them is worse than none: `asFunction(Bag)` would bind `A` to `[...T[]]`
+    // and every later `newBag('a', 'b', 'c')` becomes TS2345. tsc erases them
+    // to their base constraints before inferring (`getBaseSignature`), which
+    // is what makes `A` land on `unknown[]` there. `instanceofInstanceType`
+    // above does the same thing on the return side, at `any`.
+    var erase: std.ArrayList(TpMap) = .empty;
+    defer erase.deinit(c.scratch());
+    {
+        var tps: std.ArrayList(checker_zig.Checker.TypeParamInfo) = .empty;
+        defer tps.deinit(c.scratch());
+        try c.typeParamsOf(cls, &tps);
+        for (tps.items) |tp| {
+            try erase.append(c.scratch(), .{ .sym = tp.sym, .ty = try c.typeParamFallback(tp.sym) });
+        }
+    }
+
     var elems: std.ArrayList(types.TupleElem) = .empty;
     defer elems.deinit(c.scratch());
     for (0..s.fnParamCount(csig)) |i| {
-        const sp = s.fnParam(csig, @intCast(i));
+        var sp = s.fnParam(csig, @intCast(i));
+        if (erase.items.len != 0) sp.ty = try c.instantiate(sp.ty, erase.items);
         var eflags: u32 = 0;
         if (sp.rest()) eflags |= types.elem_flag_rest;
         if (sp.optional()) eflags |= types.elem_flag_optional;
