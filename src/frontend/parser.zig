@@ -1766,6 +1766,9 @@ const Parser = struct {
                         if (isModuleNameLiteral(p.peekTag(1)) and !p.peekNewline(1)) {
                             return p.parseAmbientModule(true);
                         }
+                        if (p.peekTag(1) == .l_brace and !p.peekNewline(1)) {
+                            return p.parseAnonymousNamespace(true);
+                        }
                         const start = p.curIdx();
                         _ = try p.bump();
                         p.skipUnsupportedBlockish();
@@ -1836,6 +1839,7 @@ const Parser = struct {
                     // an ambient one makes, plus the TS1035 that says so.
                     return p.parseAmbientModule(false);
                 }
+                if (t1 == .l_brace and !p.peekNewline(1)) return p.parseAnonymousNamespace(false);
                 return p.parseExpressionStatement();
             },
             .at => return p.parseDecorator(),
@@ -3848,6 +3852,37 @@ const Parser = struct {
         const extra = try p.addExtra(ast.NamespaceData{
             .flags = flags,
             .name_token = name_tok,
+            .body_start = body.start,
+            .body_end = body.end,
+        });
+        return p.addNode(.{ .tag = .namespace_decl, .main_token = kw, .data = .{ .lhs = extra, .rhs = 0 } });
+    }
+
+    /// `module { … }` / `namespace { … }` — a namespace with NO NAME, which is
+    /// TS1437 on the `{`. tsc parses it as a namespace whose name node is
+    /// missing, so the body still parses and its declarations still bind;
+    /// ztsc models "declares no namespace symbol, contributes its body outward"
+    /// with the same `global_aug` flag `declare global { … }` uses, which is
+    /// what keeps `declare module { class XDate … }` followed by
+    /// `new XDate()` from inventing a TS2304 the oracle does not report.
+    fn parseAnonymousNamespace(p: *Parser, declared: bool) PE!Node {
+        const kw = try p.bump(); // `module` / `namespace`
+        if (p.spec == 0) try p.errAtCur(.namespace_needs_a_name);
+        _ = try p.expect(.l_brace, .expected_l_brace);
+        const top = p.scratchTop();
+        defer p.scratch.shrinkRetainingCapacity(top);
+        const was_ambient = p.ambient;
+        p.ambient = was_ambient or declared;
+        defer p.ambient = was_ambient;
+        const was_module_body = p.module_body;
+        p.module_body = true;
+        defer p.module_body = was_module_body;
+        try p.parseStatementList(top, .r_brace, false);
+        _ = try p.expect(.r_brace, .expected_r_brace);
+        const body = try p.scratchToSpan(top);
+        const extra = try p.addExtra(ast.NamespaceData{
+            .flags = ast.Flags.global_aug | (if (declared) ast.Flags.declare else 0),
+            .name_token = kw,
             .body_start = body.start,
             .body_end = body.end,
         });
