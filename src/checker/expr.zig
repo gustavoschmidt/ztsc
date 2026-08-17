@@ -2436,13 +2436,36 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                         // its property key; `computedPropertyNames10`, all
                         // methods, answers nothing at all).
                         // (wave-8 D: one flagged call into `computed_key.zig`.)
-                        {
+                        const kt = blk: {
                             const saved_scope = c.cur_scope;
                             defer c.cur_scope = saved_scope;
                             if (try c.scopeOf(pd.rhs)) |s| c.cur_scope = s;
-                            _ = try computed_key.checkComputedName(c, pd.lhs);
-                        }
-                        _ = try c.checkExprCached(pd.rhs, types.no_type);
+                            break :blk try computed_key.checkComputedName(c, pd.lhs);
+                        };
+                        // tsc's `getContextualTypeForObjectLiteralElement`
+                        // ends with the arm for a member whose name is NOT
+                        // bindable: `mapType(type, t =>
+                        // findApplicableIndexInfo(getIndexInfosOfStructuredType(t),
+                        // getLiteralTypeFromPropertyName(element.name))?.type)`
+                        // — the contextual type's INDEX SIGNATURE that this
+                        // key applies to, exactly as the `key: value` form
+                        // above uses it. `var o: I = { ["" + 0](y) {…} }` with
+                        // `I`'s `[s: string]: (x: string) => number` is what
+                        // gives `y` its type instead of a TS7006.
+                        //
+                        // Gated on the literal HAVING a contextual type, which
+                        // is also why reading the key's type here reports
+                        // nothing tsc does not: `getApparentTypeOfContextualType`
+                        // returns undefined without one, so tsc never reaches
+                        // `getLiteralTypeFromPropertyName` and never evaluates
+                        // a method's key at all (the measurement in the note
+                        // above).
+                        const mctx: TypeId = if (rctx == types.no_type) types.no_type else switch (c.ts.kind(try c.resolveStructural(kt))) {
+                            .string, .string_literal, .template_literal_type, .string_mapping => try ctxIndexType(c, rctx, false),
+                            .number, .number_literal, .number_literal_fresh => try ctxIndexType(c, rctx, true),
+                            else => types.no_type,
+                        };
+                        _ = try c.checkExprCached(pd.rhs, mctx);
                         continue;
                     };
                     key = try c.atom(wk);

@@ -108,6 +108,18 @@ fn awaitedTypeRec(c: *Checker, t: TypeId, depth: u32) Error!TypeId {
 /// named built-in iterators like `MapIterator<T>`), return that `T`;
 /// otherwise 0.
 pub fn generatorYieldType(c: *Checker, t: TypeId) TypeId {
+    // tsc's `getIterationTypesOfGeneratorFunctionReturnType` distributes over a
+    // UNION, and only a generator constituent has a yield type to give: the
+    // contextual return type of a `function*` written into
+    // `() => number | Generator<F, any, void>` is exactly that shape. Nothing
+    // here allocates, so the borrowed member slice stays valid.
+    if (c.ts.kind(t) == .union_type) {
+        for (c.ts.members(t)) |m| {
+            const y = generatorYieldType(c, m);
+            if (y != 0) return y;
+        }
+        return 0;
+    }
     if (c.ts.kind(t) != .ref) return 0;
     const sym = c.ts.refSymbol(t);
     const names = [_]Atom{
@@ -130,6 +142,14 @@ pub fn generatorYieldType(c: *Checker, t: TypeId) TypeId {
 /// async-iterator ref (`AsyncGenerator<T>`/`AsyncIterator<T>`/
 /// `AsyncIterableIterator<T>`/`AsyncIteratorObject<T>`), else 0.
 pub fn asyncGeneratorYieldType(c: *Checker, t: TypeId) TypeId {
+    // Union arm, for the same reason as `generatorYieldType`'s.
+    if (c.ts.kind(t) == .union_type) {
+        for (c.ts.members(t)) |m| {
+            const y = asyncGeneratorYieldType(c, m);
+            if (y != 0) return y;
+        }
+        return 0;
+    }
     if (c.ts.kind(t) != .ref) return 0;
     const sym = c.ts.refSymbol(t);
     const names = [_]Atom{
