@@ -126,9 +126,27 @@ pub const Code = enum(u16) {
     /// marker bytes; the marker and the losing side of the conflict are trivia,
     /// so the file otherwise parses as the winning side alone.
     merge_conflict_marker,
-    /// TS1206: a decorator in a position the grammar forbids (parameter
-    /// decorator under TC39 standard decorators).
+    /// TS1206: a decorator in a position the grammar forbids — see
+    /// `decorator_target.zig` for which positions those are.
     decorator_not_valid_here,
+    /// TS1249: `@dec m(): void;` — a decorator on a method OVERLOAD, which tsc
+    /// separates out of TS1206 with its own wording.
+    decorator_on_method_overload,
+    /// TS1207: `@a get x() {} @b set x(v) {}` — only ONE of a get/set pair may
+    /// carry modifiers, and tsc reports on the second.
+    decorator_on_second_accessor,
+    /// TS1433: `m(@dec this: C) {}` — a decorator on a `this` parameter, which
+    /// answers ahead of TS1206 in both decorator dialects.
+    ///
+    /// SYNTACTIC, not grammatical, unlike every other TS12xx decorator rule:
+    /// tsc raises it from the PARSER (`parseErrorAtRange(modifiers, …)`), which
+    /// shows in two ways measured against tsgo 7.0.2 — it is blamed on the
+    /// parameter's FULL start, the offset just past the previous token with
+    /// leading trivia included rather than the `@` itself
+    /// (`m(a: C,    @dec this: C)` answers at the column right after the comma),
+    /// and it silences every grammar diagnostic in the file behind it, since
+    /// `grammarErrorOnNode` gives up once `hasParseDiagnostics(sourceFile)`.
+    decorator_on_this_param,
     /// TS1344: `label: var x = 1` — a label on a DECLARATION. tsc's grammar
     /// pass, so it is gated rather than gating.
     label_not_allowed,
@@ -634,6 +652,8 @@ pub const Code = enum(u16) {
             .super_before_this,
             .super_before_super_property,
             .decorator_not_valid_here,
+            .decorator_on_method_overload,
+            .decorator_on_second_accessor,
             .label_not_allowed,
             .public_not_on_module_element,
             .private_not_on_module_element,
@@ -911,6 +931,9 @@ pub const Code = enum(u16) {
             .eval_in_module => evalModuleMessage("eval"),
             .arguments_in_module => evalModuleMessage("arguments"),
             .decorator_not_valid_here => "Decorators are not valid here.",
+            .decorator_on_method_overload => "A decorator can only decorate a method implementation, not an overload.",
+            .decorator_on_second_accessor => "Decorators cannot be applied to multiple get/set accessors of the same name.",
+            .decorator_on_this_param => "Neither decorators nor modifiers may be applied to 'this' parameters.",
             .label_not_allowed => "A label is not allowed here.",
             .public_not_on_module_element => moduleElementModifierMessage("public"),
             .private_not_on_module_element => moduleElementModifierMessage("private"),
@@ -1155,6 +1178,9 @@ pub const Code = enum(u16) {
             .super_before_this => 17009,
             .super_before_super_property => 17011,
             .decorator_not_valid_here => 1206,
+            .decorator_on_method_overload => 1249,
+            .decorator_on_second_accessor => 1207,
+            .decorator_on_this_param => 1433,
             .label_not_allowed => 1344,
             .public_not_on_module_element,
             .private_not_on_module_element,

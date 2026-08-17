@@ -61,6 +61,7 @@ const literals = @import("literals.zig");
 const modifier_order = @import("modifier_order.zig");
 const index_signature = @import("index_signature.zig");
 const computed_member = @import("computed_member.zig");
+const decorator_target = @import("decorator_target.zig");
 
 const TokTag = scanner.Tag;
 const Token = scanner.Token;
@@ -254,6 +255,14 @@ const Parser = struct {
     /// counter because it describes the INNERMOST class body, and a nested class
     /// declaration restores the enclosing one's answer on the way out.
     abstract_class: bool = false,
+
+    /// Is the class whose body is being parsed a class DECLARATION rather than a
+    /// class expression? Read only by `decorator_target.zig`, for which legacy
+    /// decorators reject every member of a class EXPRESSION. A flag rather than
+    /// a counter for the same reason as `abstract_class`: it describes the
+    /// innermost class body, and each nested class restores the enclosing
+    /// answer on the way out.
+    in_class_decl: bool = false,
 
     /// The innermost function-like boundary being parsed. tsc keeps the same
     /// information in two context bits (`NodeFlags.AwaitContext` plus the
@@ -1231,7 +1240,22 @@ const Parser = struct {
         // prevent noisiness"), which is exactly one flag per call of this
         // function — every block, module block and source file gets its own.
         var reported_ambient_stmt = ambient_reported;
+        // The first `@` of the decorator run currently open, for TS1206. A
+        // statement-position decorator run may only decorate a CLASS
+        // declaration; the run is judged where it ENDS, once the token after it
+        // is known, and reports once on its first `@` (`decorator_target.zig`).
+        var deco_at: ?u32 = null;
         while (p.curTag() != terminator and p.curTag() != .eof) {
+            if (p.curTag() == .at) {
+                if (deco_at == null) deco_at = p.curIdx();
+            } else if (deco_at) |at| {
+                deco_at = null;
+                if (p.spec == 0 and !p.decoratedStatementIsClass()) {
+                    if (decorator_target.diagnose(p.experimental_decorators, .{ .kind = .other })) |code| {
+                        try p.errAtToken(code, at);
+                    }
+                }
+            }
             // tsc's `parseList` gate: a token that starts no statement is
             // reported and skipped, never parsed.
             if (!p.atStartOfStatement()) {
@@ -1265,6 +1289,24 @@ const Parser = struct {
                 p.synchronize();
             }
         }
+    }
+
+    /// Does a CLASS declaration follow the decorator run that just closed? tsc
+    /// parses decorators as part of the modifier list, so every modifier that
+    /// may precede `class` in statement position is transparent here:
+    /// `@dec export class C {}`, `@dec declare class C {}` and
+    /// `@dec export default class C {}` are all silent, measured against
+    /// tsgo 7.0.2. Anything else the run precedes is TS1206.
+    fn decoratedStatementIsClass(p: *Parser) bool {
+        var i: usize = 0;
+        while (i < 4) : (i += 1) {
+            switch (p.peekTag(i)) {
+                .keyword_class => return true,
+                .keyword_export, .keyword_default, .keyword_declare, .keyword_abstract => {},
+                else => return false,
+            }
+        }
+        return false;
     }
 
     /// A statement that RUNS, as opposed to one that only declares. The
@@ -1589,11 +1631,11 @@ const Parser = struct {
                 return p.addNode(.{ .tag = .debugger_stmt, .main_token = tok, .data = .{ .lhs = 0, .rhs = 0 } });
             },
             .keyword_function => return p.parseFunctionDecl(0, false),
-            .keyword_class => return p.parseClassDecl(0),
+            .keyword_class => return p.parseClassDecl(0, .declaration),
             .keyword_abstract => {
                 if (p.peekTag(1) == .keyword_class and !p.peekNewline(1)) {
                     _ = try p.bump();
-                    return p.parseClassDecl(ast.Flags.abstract);
+                    return p.parseClassDecl(ast.Flags.abstract, .declaration);
                 }
                 return p.parseExpressionStatement();
             },
@@ -1660,7 +1702,7 @@ const Parser = struct {
                         const was_ambient = p.ambient;
                         p.ambient = true;
                         defer p.ambient = was_ambient;
-                        return p.parseClassDecl(ast.Flags.declare);
+                        return p.parseClassDecl(ast.Flags.declare, .declaration);
                     },
                     .keyword_abstract => {
                         _ = try p.bump();
@@ -1668,7 +1710,7 @@ const Parser = struct {
                         const was_ambient = p.ambient;
                         p.ambient = true;
                         defer p.ambient = was_ambient;
-                        return p.parseClassDecl(ast.Flags.declare | ast.Flags.abstract);
+                        return p.parseClassDecl(ast.Flags.declare | ast.Flags.abstract, .declaration);
                     },
                     .keyword_interface => {
                         _ = try p.bump();
@@ -2495,7 +2537,8 @@ const Parser = struct {
     fn parseParam(p: *Parser) PE!Node {
         // Parameter decorators (`@dec x: T`) are a grammar error under TC39
         // standard decorators: consume them (so the parameter itself still
-        // parses cleanly, no cascade) and report TS1206 per decorator.
+        // parses cleanly, no cascade) and report ONCE on the run's first `@`,
+        // which is where tsc's `checkGrammarModifiers` stops.
         //
         // Under `experimentalDecorators` they are legal, so the diagnostic is
         // dropped. The expression is still consumed and then DISCARDED rather
@@ -2505,11 +2548,41 @@ const Parser = struct {
         // AST edge. Skipping it under-reports (an undefined name inside
         // `@Inject(Nope)` goes unnamed) and can never invent a diagnostic —
         // the trade the flag is documented to make.
+        var deco_at: ?u32 = null;
+        // The parameter's FULL start — the offset just past the previous token,
+        // leading trivia and all. TS1433 is blamed there where TS1206 is blamed
+        // on the `@` itself; measured against tsgo 7.0.2 on
+        // `m(a: C,    @dec this: C)`, which answers at the column right after
+        // the comma for the one and at the `@` for the other.
+        var deco_start: u32 = 0;
         while (p.curTag() == .at) {
             if (p.spec > 0) return error.Backtrack;
+            if (deco_at == null) deco_start = p.lastTokEnd();
             const at = try p.bump(); // `@`
+            if (deco_at == null) deco_at = at;
             if (canStartExpression(p.curTag())) _ = try p.parseLhsExpression(.{});
-            if (!p.experimental_decorators) try p.errAtToken(.decorator_not_valid_here, at);
+        }
+        if (deco_at) |at| {
+            // A `this` parameter is TS1433 whichever dialect is in force, and it
+            // answers ahead of TS1206. Otherwise the only rule ztsc applies here
+            // is the dialect one: legacy decorators allow a parameter decorator,
+            // TC39 ones do not. tsc narrows the legacy side further (the owner
+            // must be a constructor, method or setter WITH A BODY, in a class
+            // DECLARATION) — a deliberate under-report, since the owner's body
+            // is not parsed yet and no measured case in the suite needs it.
+            const site: decorator_target.Site = .{
+                .kind = .parameter,
+                .this_param = p.curTag() == .keyword_this,
+                .param_owner_decoratable = true,
+                .has_body = true,
+                .in_class_decl = true,
+            };
+            if (decorator_target.diagnose(p.experimental_decorators, site)) |code| {
+                if (code == .decorator_on_this_param)
+                    try p.errAtBytes(code, deco_start, deco_start + 1)
+                else
+                    try p.errAtToken(code, at);
+            }
         }
         const start_tok = p.curIdx();
         var flags: u32 = 0;
@@ -2732,7 +2805,12 @@ const Parser = struct {
 
     // --- classes ------------------------------------------------------------
 
-    fn parseClassDecl(p: *Parser, flags_in: u32) PE!Node {
+    /// Is the `class` being parsed a DECLARATION or an EXPRESSION? The two share
+    /// every production; only legacy decorators tell them apart, and they do it
+    /// member by member (`decorator_target.zig`).
+    const ClassForm = enum { declaration, expression };
+
+    fn parseClassDecl(p: *Parser, flags_in: u32, form: ClassForm) PE!Node {
         const kw = try p.bump(); // `class`
         var name_tok: u32 = 0;
         if (isIdentLike(p.curTag()) and p.curTag() != .keyword_implements) {
@@ -2769,13 +2847,28 @@ const Parser = struct {
         const was_abstract_class = p.abstract_class;
         p.abstract_class = flags_in & ast.Flags.abstract != 0;
         defer p.abstract_class = was_abstract_class;
+        const was_class_decl = p.in_class_decl;
+        p.in_class_decl = form == .declaration;
+        defer p.in_class_decl = was_class_decl;
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
+        // The first `@` of the decorator run currently open. The run is judged
+        // against the member that closes it (`decorator_target.zig`), so the
+        // member itself needs it — a decorated member that is a grammar error
+        // suppresses the TS116x its computed name would otherwise earn, exactly
+        // as tsc's `checkGrammarModifiers` short-circuits `checkGrammarProperty`.
+        var deco_at: ?u32 = null;
         while (p.curTag() != .r_brace and p.curTag() != .eof) {
             const before = p.curIdx();
             const diags_before = p.diags.items.len;
             if (try p.eat(.semicolon) != null) continue;
-            try p.pushScratch(try p.parseClassMember());
+            if (p.curTag() == .at) {
+                if (deco_at == null) deco_at = p.curIdx();
+                try p.pushScratch(try p.parseDecorator());
+                continue;
+            }
+            try p.pushScratch(try p.parseClassMember(deco_at, top));
+            deco_at = null;
             try p.dropDecoratorsOnStaticBlock(top);
             if (p.curIdx() == before) {
                 // The member parse consumed nothing. If it already said why
@@ -3060,14 +3153,21 @@ const Parser = struct {
 
     /// Finish a member whose name was computed: report the TS116x its home and
     /// shape earn, and retain the key expression against the member node.
+    ///
+    /// `modifiers_reported` is tsc's short-circuit — `checkGrammarProperty` and
+    /// `checkGrammarMethod` never run on a member whose modifier list already
+    /// answered, so `@dec [foo()]: any` in a class expression is TS1206 alone
+    /// and `public private [foo()]: any` is TS1028 alone. The key is retained
+    /// either way: the diagnostic is suppressed, the AST edge is not.
     fn finishComputedName(
         p: *Parser,
         cn: ComputedName,
         member: Node,
         home: computed_member.Home,
         kind: computed_member.MemberKind,
+        modifiers_reported: bool,
     ) Error!void {
-        if (cn.non_bindable) {
+        if (cn.non_bindable and !modifiers_reported) {
             if (computed_member.grammarCode(home, kind, p.ambient)) |code| {
                 try p.errAtToken(code, cn.l_bracket);
             }
@@ -3075,11 +3175,10 @@ const Parser = struct {
         if (cn.key != null_node) try p.computed_keys.append(p.gpa, .{ .member = member, .key = cn.key });
     }
 
-    fn parseClassMember(p: *Parser) PE!Node {
-        // Decorators on members: a `.decorator` node preceding the decorated
-        // member (the body loop re-enters for the member itself).
-        if (p.curTag() == .at) return p.parseDecorator();
-
+    /// `deco_at` is the first `@` of the decorator run this member closes, if
+    /// any, and `members_top` the scratch base of the member list — the members
+    /// already parsed, which a decorated accessor consults for its pair.
+    fn parseClassMember(p: *Parser, deco_at: ?u32, members_top: usize) PE!Node {
         // `static { … }` — a class static initialization block. Parsed as a
         // plain `.block` member so the statements inside land in the tree with
         // real spans instead of derailing the member loop (which read `static`
@@ -3109,7 +3208,13 @@ const Parser = struct {
         }
 
         var flags: u32 = 0;
-        var mod_reported = false;
+        // The first modifier-order hit, HELD rather than reported: tsc walks one
+        // modifier list per member, decorators and keywords together, and
+        // `return`s on its first error — and a decorator sits ahead of every
+        // keyword, so `@dec public private x` in a class expression is the
+        // decorator's TS1206 alone. `reportMemberGrammar` decides between them
+        // once the member's shape (and so the decorator's verdict) is known.
+        var mod_err: ?ModifierErr = null;
         while (true) {
             const bit = classMemberModifierBit(p.curTag());
             if (bit == 0) break;
@@ -3123,10 +3228,9 @@ const Parser = struct {
             // Repeated or out-of-order modifiers: tsc's `checkGrammarModifiers`
             // returns on its FIRST hit, so `public private static x` answers
             // once, for `private`, and never mentions `static`.
-            if (!mod_reported and p.spec == 0) {
+            if (mod_err == null) {
                 if (modifier_order.check(flags, bit, p.abstract_class)) |code| {
-                    try p.errAtCur(code);
-                    mod_reported = true;
+                    mod_err = .{ .code = code, .token = p.curIdx() };
                 }
             }
             _ = try p.bump();
@@ -3142,6 +3246,7 @@ const Parser = struct {
             .l_bracket => {
                 // Computed member name / index signature in class.
                 if (p.atIndexSignature()) {
+                    _ = try p.reportMemberGrammar(deco_at, .{ .kind = .other }, mod_err);
                     return p.parseIndexSignatureAsClassMember(flags);
                 }
                 const cn = try p.parseComputedMemberName();
@@ -3161,6 +3266,7 @@ const Parser = struct {
                 } else {
                     // A CLASS member name: tsc's `parseClassElement` answers
                     // TS1068 here, not the object-literal TS1136.
+                    _ = try p.reportMemberGrammar(deco_at, .{ .kind = .other }, mod_err);
                     try p.fail(.expected_class_member);
                     return p.errorNode();
                 }
@@ -3190,17 +3296,31 @@ const Parser = struct {
                 try p.expectSemicolon(); // overload signature / abstract
             }
             const member = try p.addNode(.{ .tag = .class_method, .main_token = name_tok, .data = .{ .lhs = proto, .rhs = body } });
+            const is_accessor = flags & (ast.Flags.get | ast.Flags.set) != 0;
+            const grammar_err = try p.reportMemberGrammar(deco_at, .{
+                .kind = if (is_accessor)
+                    .accessor
+                else if (computed == null and p.tokTagAt(name_tok) == .keyword_constructor)
+                    .constructor
+                else
+                    .method,
+                .private_name = computed == null and p.tokTagAt(name_tok) == .private_identifier,
+                .has_body = body != null_node,
+                .in_class_decl = p.in_class_decl,
+                .second_accessor_of_modified_pair = is_accessor and computed == null and
+                    p.isSecondAccessorOfModifiedPair(members_top, name_tok, flags),
+            }, mod_err);
             if (computed) |cn| {
                 // An accessor is judged by neither `checkGrammarProperty` nor
                 // `checkGrammarMethod`; a method is, and what it earns turns on
                 // whether it has a BODY.
-                const kind: computed_member.MemberKind = if (flags & (ast.Flags.get | ast.Flags.set) != 0)
+                const kind: computed_member.MemberKind = if (is_accessor)
                     .accessor
                 else if (body != null_node)
                     .method_impl
                 else
                     .method_signature;
-                try p.finishComputedName(cn, member, .class_body, kind);
+                try p.finishComputedName(cn, member, .class_body, kind, grammar_err);
             }
             return member;
         }
@@ -3228,9 +3348,83 @@ const Parser = struct {
         try p.expectSemicolon();
         const extra = try p.addExtra(ast.Field{ .flags = flags, .type_ann = type_ann, .init = init });
         const member = try p.addNode(.{ .tag = .class_field, .main_token = name_tok, .data = .{ .lhs = extra, .rhs = 0 } });
-        if (computed) |cn| try p.finishComputedName(cn, member, .class_body, .property);
+        const grammar_err = try p.reportMemberGrammar(deco_at, .{
+            .kind = .property,
+            .private_name = computed == null and p.tokTagAt(name_tok) == .private_identifier,
+            .abstract = flags & ast.Flags.abstract != 0,
+            .declare = flags & ast.Flags.declare != 0,
+            .in_class_decl = p.in_class_decl,
+        }, mod_err);
+        if (computed) |cn| try p.finishComputedName(cn, member, .class_body, .property, grammar_err);
         return member;
     }
+
+    /// The one grammar diagnostic a class member's modifier list earns, if any.
+    /// tsc walks decorators and keyword modifiers as ONE list and `return`s on
+    /// its first hit, and a decorator always precedes the keywords, so the
+    /// decorator's verdict wins over a repeated/out-of-order modifier. True when
+    /// something was reported — tsc's
+    /// `if (!checkGrammarModifiers(node) && !checkGrammarProperty(node))`, which
+    /// is what keeps the TS116x of a decorated computed name quiet.
+    fn reportMemberGrammar(
+        p: *Parser,
+        deco_at: ?u32,
+        site: decorator_target.Site,
+        mod_err: ?ModifierErr,
+    ) Error!bool {
+        if (p.spec != 0) return false;
+        if (deco_at) |at| {
+            if (decorator_target.diagnose(p.experimental_decorators, site)) |code| {
+                try p.errAtToken(code, at);
+                return true;
+            }
+        }
+        if (mod_err) |m| {
+            try p.errAtToken(m.code, m.token);
+            return true;
+        }
+        return false;
+    }
+
+    /// Is the accessor being finished the SECOND `get`/`set` of its name in this
+    /// class body, with the first DECORATED? tsc's `getAllAccessorDeclarations`
+    /// pairs by property name and matching `static`-ness and skips dynamic names
+    /// entirely; only the second of the pair may be told off (TS1207).
+    ///
+    /// tsc's own wording for the first accessor's side of the test is "has
+    /// modifiers", but tsgo 7.0.2 answers as though it read "has decorators":
+    /// `static get x() {}` followed by `@dec static set x(v) {}` is silent,
+    /// where `@a get x() {}` followed by `@b set x(v) {}` is TS1207.
+    ///
+    /// `members_top` is the scratch base of the member list, whose entries are
+    /// the members already parsed plus the decorator nodes between them.
+    fn isSecondAccessorOfModifiedPair(p: *Parser, members_top: usize, name_tok: u32, flags: u32) bool {
+        const items = p.scratch.items[members_top..];
+        const tags = p.nodes.items(.tag);
+        const data = p.nodes.items(.data);
+        const main = p.nodes.items(.main_token);
+        const name = p.tokenTextAt(name_tok);
+        const is_static = flags & ast.Flags.static != 0;
+        var seen: u32 = 0;
+        var first_modified = false;
+        for (items, 0..) |m, i| {
+            if (tags[m] != .class_method) continue;
+            // `flags` is `ast.FnProto`'s first field, so it is the first word of
+            // the method's extra data.
+            const proto_flags = p.extra.items[data[m].lhs];
+            if (proto_flags & (ast.Flags.get | ast.Flags.set) == 0) continue;
+            if ((proto_flags & ast.Flags.static != 0) != is_static) continue;
+            if (main[m] == 0 or !std.mem.eql(u8, p.tokenTextAt(main[m]), name)) continue;
+            seen += 1;
+            if (seen > 1) return false; // this member is the third or later
+            first_modified = i > 0 and tags[items[i - 1]] == .decorator;
+        }
+        return seen == 1 and first_modified;
+    }
+
+    /// A modifier-order diagnostic held back until the member's whole modifier
+    /// list has been judged. See `reportMemberGrammar`.
+    const ModifierErr = struct { code: Code, token: u32 };
 
     fn parseIndexSignatureAsClassMember(p: *Parser, flags: u32) PE!Node {
         return p.parseIndexSignature(flags);
@@ -3879,7 +4073,7 @@ const Parser = struct {
                         try p.expectSemicolon();
                         break :blk e;
                     },
-                    .keyword_class => try p.parseClassDecl(0),
+                    .keyword_class => try p.parseClassDecl(0, .declaration),
                     // `export default interface I { … }` — legal, and the only
                     // TYPE-side default export form.
                     // `export default interface I { … }` — the declaration
@@ -3889,7 +4083,7 @@ const Parser = struct {
                     .keyword_abstract => blk: {
                         if (p.peekTag(1) == .keyword_class) {
                             _ = try p.bump();
-                            break :blk try p.parseClassDecl(ast.Flags.abstract);
+                            break :blk try p.parseClassDecl(ast.Flags.abstract, .declaration);
                         }
                         const e = try p.parseAssignExpr(.{});
                         try p.expectSemicolon();
@@ -5095,7 +5289,7 @@ const Parser = struct {
                 }
                 return p.leaf(.identifier);
             },
-            .keyword_class => return p.parseClassDecl(0),
+            .keyword_class => return p.parseClassDecl(0, .expression),
             .at => {
                 // A decorated class EXPRESSION: `({ x: @dec class {} })`,
                 // `f(@dec class {})`. TC39 standard decorators put the
@@ -5106,12 +5300,23 @@ const Parser = struct {
                 // TS1206, exactly as at statement level.
                 //
                 // The decorator nodes are parsed (so a malformed one still
-                // reports) but not attached: `pending_class_decos` is a
-                // STATEMENT-list protocol, and a class expression is not in
-                // one. Deliberate under-report — the decorator's own signature
-                // check is skipped for this form, never a false positive.
+                // reports) but not attached to the class: a class EXPRESSION has
+                // nowhere to hang them. Deliberate under-report — the
+                // decorator's own signature check is skipped for this form,
+                // never a false positive.
+                const at = p.curIdx();
                 while (p.curTag() == .at) _ = try p.parseDecorator();
-                if (p.curTag() == .keyword_class) return p.parseClassDecl(0);
+                if (p.curTag() == .keyword_class) {
+                    // Legacy decorators decorate a class DECLARATION only, so
+                    // `var v = @dec class C {}` is TS1206 where the same source
+                    // under TC39 decorators is silent.
+                    if (p.spec == 0) {
+                        if (decorator_target.diagnose(p.experimental_decorators, .{ .kind = .class_expr })) |code| {
+                            try p.errAtToken(code, at);
+                        }
+                    }
+                    return p.parseClassDecl(0, .expression);
+                }
                 try p.errAtToken(.decorator_not_valid_here, p.lastIdx());
                 return p.parseAssignExpr(ctx);
             },
@@ -6236,13 +6441,13 @@ const Parser = struct {
                 _ = try p.parseFunctionBody();
             }
             const member = try p.addNode(.{ .tag = .method_signature, .main_token = name_tok, .data = .{ .lhs = proto, .rhs = flags } });
-            if (computed) |cn| try p.finishComputedName(cn, member, p.typeMemberHome(), .method_signature);
+            if (computed) |cn| try p.finishComputedName(cn, member, p.typeMemberHome(), .method_signature, false);
             return member;
         }
         var type_ann: Node = null_node;
         if (try p.eat(.colon) != null) type_ann = try p.parseType();
         const member = try p.addNode(.{ .tag = .property_signature, .main_token = name_tok, .data = .{ .lhs = type_ann, .rhs = flags } });
-        if (computed) |cn| try p.finishComputedName(cn, member, p.typeMemberHome(), .property);
+        if (computed) |cn| try p.finishComputedName(cn, member, p.typeMemberHome(), .property, false);
         return member;
     }
 
