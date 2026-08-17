@@ -594,7 +594,10 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
                     // arguments blames the surplus ARGUMENTS, not the callee
                     // (`getArgumentArityError`'s `args.slice(maxCount)` node
                     // array) — see `reportArityError`.
-                    try reportArityError(c, node, shape.arg_nodes, nargs, 0, 0, false);
+                    var eff: std.ArrayList(EffArg) = .empty;
+                    defer eff.deinit(c.scratch());
+                    _ = try effectiveArgs(c, shape.arg_nodes, &eff);
+                    try reportArityError(c, node, eff.items, eff.items.len, 0, 0, false);
                 }
                 return .{ .ty = instance_ret, .chained = chained };
             }
@@ -948,7 +951,6 @@ fn resolveSignatureCall(
     ret_ctx: TypeId,
 ) Error!TypeId {
     if (sigs.len == 0) return types.any_type;
-    const nargs = countArgs(arg_nodes);
     if (sigs.len == 1) {
         // An explicit list on a call is one of the four sites tsc gates on the
         // type parameters' constraints (TS2344 — see
@@ -965,6 +967,17 @@ fn resolveSignatureCall(
         return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst);
     }
     // Overloads: first signature whose arity fits and whose args check.
+    //
+    // ARITY is counted over the EFFECTIVE argument list, tsc's
+    // `getEffectiveCallArguments` — a spread of a tuple spends one position
+    // per element. Counting the written arguments instead made a spread ONE
+    // position, so `pli(...[reads, writes, writes] as const)` matched the
+    // one-parameter overload and never reached the three-position one
+    // (`callWithSpread4`).
+    var eff: std.ArrayList(EffArg) = .empty;
+    defer eff.deinit(c.scratch());
+    const spread_at = try effectiveArgs(c, arg_nodes, &eff);
+    const eff_n = eff.items.len;
     //
     // tsc's `resolveCall` keeps two rejection piles: `candidatesForArgumentError`
     // (arity fit, arguments did not) and `candidatesForArgumentArityError`. Only
@@ -1023,11 +1036,18 @@ fn resolveSignatureCall(
         const inst = try c.instantiateSigForCall(sig, explicit_targs, arg_nodes, node, ret_ctx);
         const req = try c.requiredParams(inst);
         const tot = try c.paramTotal(inst);
-        if (nargs < req or nargs > tot) {
+        // `hasCorrectArity` over the effective list: a list that still holds
+        // an UNBOUNDED entry asks only whether that entry's position is one
+        // the signature can reach, since its length is not known statically.
+        const fits = if (spread_at) |si|
+            si >= req and (tot == std.math.maxInt(u32) or si < tot)
+        else
+            eff_n >= req and eff_n <= tot;
+        if (!fits) {
             // Fold this candidate into the set-wide arity picture tsc reports
             // when NO candidate ever reaches argument checking. A truncated
             // instantiation has no arity to contribute (see `checkCallArguments`).
-            if (c.ts.kind(inst) == .function) arity.note(req, tot, nargs);
+            if (c.ts.kind(inst) == .function) arity.note(req, tot, eff_n);
             c.rollbackArgDiags(saved_infer, infer_file, arg_nodes);
             c.inst_count = saved_inst_count;
             c.newBudgetWindow();
@@ -1051,16 +1071,25 @@ fn resolveSignatureCall(
     // `getArgumentArityError` over the whole set — with no TS2769 at all. Twelve
     // of the suite's TS2769/TS2554 divergences are exactly this pile mix-up.
     //
-    // A call carrying a SPREAD argument is left alone: its argument count is not
-    // known statically, so tsc answers with TS2556 about the spread instead, and
-    // guessing a count here could only invent an arity claim.
-    if (arg_err_count == 0 and arity.seen and !hasSpreadArg(c, arg_nodes)) {
-        if (nargs > arity.min and nargs < arity.max and !arity.rest) {
+    // A call whose effective list still holds an UNBOUNDED spread has no
+    // argument count to talk about, so `getArgumentArityError` answers about
+    // the SPREAD instead and never reaches its counting arms:
+    //
+    // ```ts
+    // const spreadIndex = getSpreadArgumentIndex(args);
+    // if (spreadIndex > -1) {
+    //     return createDiagnosticForNode(args[spreadIndex], Diagnostics.A_spread_argument_must_either_have_a_tuple_type_or_be_passed_to_a_rest_parameter);
+    // }
+    // ```
+    if (arg_err_count == 0 and arity.seen) {
+        if (spread_at) |si| {
+            try c.diagFmt(2556, argErrorSpan(c, eff.items[si].node), "A spread argument must either have a tuple type or be passed to a rest parameter.", .{});
+        } else if (eff_n > arity.min and eff_n < arity.max and !arity.rest) {
             try c.diagFmt(2575, calleeErrorSpan(c, node), "No overload expects {d} arguments, but overloads do exist that expect either {d} or {d} arguments.", .{
-                nargs, arity.below orelse arity.min, arity.above orelse arity.max,
+                eff_n, arity.below orelse arity.min, arity.above orelse arity.max,
             });
         } else {
-            try reportArityError(c, node, arg_nodes, nargs, arity.min, arity.max, arity.rest);
+            try reportArityError(c, node, eff.items, eff_n, arity.min, arity.max, arity.rest);
         }
         // Type the arguments (no report) and carry on with the first candidate,
         // exactly as the TS2769 path below does.
@@ -2173,8 +2202,17 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
             if (!spread_fits and iifeCallee(c, c.callShape(node).callee) == null_node) {
                 try c.diagFmt(2556, argErrorSpan(c, eff.items[si].node), "A spread argument must either have a tuple type or be passed to a rest parameter.", .{});
             }
-        } else if (!has_spread and (nargs < required or nargs > total)) {
-            try reportArityError(c, node, arg_nodes, nargs, required, total, total == std.math.maxInt(u32));
+        } else {
+            // No unbounded entry left, so the argument COUNT is known — even
+            // when the call was written with a spread, because every one of
+            // them expanded to a fixed list. tsc counts the EFFECTIVE
+            // arguments, an optional tuple element included: `f(...t)` with
+            // `t: [string, string?]` against `(a: string)` is
+            // "Expected 1 arguments, but got 2".
+            const n = eff.items.len;
+            if (n < required or n > total) {
+                try reportArityError(c, node, eff.items, n, required, total, total == std.math.maxInt(u32));
+            }
         }
     }
     // tsc reports at most ONE argument error per call. `checkApplicableSignature`
@@ -2394,7 +2432,7 @@ fn iifeMinArgs(c: *Checker, node: Node, nargs: usize) u32 {
 fn reportArityError(
     c: *Checker,
     node: Node,
-    arg_nodes: []const Node,
+    eff: []const EffArg,
     nargs: usize,
     min: u32,
     max: u32,
@@ -2405,7 +2443,7 @@ fn reportArityError(
         return;
     }
     const span = if (nargs > max)
-        extraArgsSpan(c, arg_nodes, max) orelse calleeErrorSpan(c, node)
+        extraArgsSpan(c, eff, max) orelse calleeErrorSpan(c, node)
     else
         calleeErrorSpan(c, node);
     if (min != max) {
@@ -2441,12 +2479,12 @@ fn hasSpreadArg(c: *Checker, arg_nodes: []const Node) bool {
 /// `args[max].pos` through the last argument's end — tsc's span for a call
 /// with too many arguments. Null when there is no argument at that position
 /// (nothing to blame, so the caller falls back to the callee).
-fn extraArgsSpan(c: *Checker, arg_nodes: []const Node, from: u32) ?Span {
+fn extraArgsSpan(c: *Checker, eff: []const EffArg, from: u32) ?Span {
     var i: u32 = 0;
     var start: ?u32 = null;
     var end: u32 = 0;
-    for (arg_nodes) |an| {
-        if (an == null_node) continue;
+    for (eff) |ea| {
+        const an = ea.node;
         defer i += 1;
         if (i < from) continue;
         const sp = c.nodeSpan(an);
