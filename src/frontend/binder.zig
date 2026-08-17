@@ -284,6 +284,7 @@ pub fn bind(
     // property of the set rather than of any single declaration, so each runs
     // once the last declaration is in.
     try b.checkMergedExports();
+    try b.checkRedeclaredExports();
     try b.checkMissingImplementations();
     try b.checkEnumFirstMembers();
     try b.checkNamespacePriorToMerge();
@@ -1195,6 +1196,95 @@ const Binder = struct {
             } else if (b.scope_kinds.items[scope] != .namespace) continue;
             try b.checkMergedExportsOf(sym);
         }
+    }
+
+    /// TS2323: a MODULE's exported binding declared more than once.
+    ///
+    /// `var v` twice, or two `function f` overloads with two bodies, MERGE into
+    /// one symbol and earn no duplicate-identifier error — but a module's export
+    /// list is a set of bindings, and it cannot carry the same name twice, so
+    /// tsc rejects the merge at the module boundary instead:
+    ///
+    ///     export var Foo = 2;
+    ///     export var Foo = 42;   // TS2323, on BOTH names
+    ///
+    /// Three conditions, each measured against tsgo:
+    ///
+    ///   * the MODULE's top level only. A `namespace N` merges the same pair
+    ///     silently (`export var nv` twice inside one is legal), and a script
+    ///     has no export list at all.
+    ///   * a symbol that is ONLY `var`, or ONLY `function` — the two meanings
+    ///     that merge into a single emitted binding. `let`/`const` are TS2451
+    ///     and a `var` beside a `function` is TS2300, so neither is a merge at
+    ///     all; `interface`, `enum` and `namespace` merge into one binding and
+    ///     are legal; a `class` is a duplicate identifier. Reading it off the
+    ///     symbol's own meaning bits is what makes every one of those fall out
+    ///     of the same test, and is why the check does not consult
+    ///     `sym_reported` — TS2393 ("duplicate function implementation") rides
+    ///     ALONGSIDE this diagnostic, and a rejected merge never has a single
+    ///     meaning bit to begin with.
+    ///   * every declaration `export`ed by a MODIFIER. A mixed set is TS2395,
+    ///     and a name exported by an `export { … }` specifier is one binding
+    ///     however many times its target was declared.
+    ///
+    /// A FUNCTION additionally counts only its IMPLEMENTATIONS: an overload set
+    /// is many declarations of one binding, so `export function f(a: number):
+    /// number; export function f(a: any): any { … }` is legal and common. What
+    /// collides is a second BODY, and tsc reports only on the bodies —
+    /// `f(sig); f(){}; f(){}` answers TS2393 three times and TS2323 twice
+    /// (measured).
+    fn checkRedeclaredExports(b: *Binder) Error!void {
+        if (!b.saw_module_syntax) return;
+        const var_only = bind_result.fbits(.{ .var_decl = true });
+        const fn_only = bind_result.fbits(.{ .function = true });
+        for (1..b.sym_names.items.len) |i| {
+            const sym: SymbolId = @intCast(i);
+            if (b.sym_decl_count.items[sym] < 2) continue;
+            if (b.sym_scopes.items[sym] != file_scope) continue;
+            const meaning = b.sym_flags.items[sym].bits() &
+                (bind_result.mask_value | bind_result.mask_type);
+            const fns = meaning == fn_only;
+            if (meaning != var_only and !fns) continue;
+            var bindings: u32 = 0;
+            var link = b.sym_decl_head.items[sym];
+            while (link != 0) : (link = b.decl_links.items[link].next) {
+                if (!b.declIsExported(link)) break;
+                if (!fns or b.functionHasBody(b.decl_links.items[link].value)) bindings += 1;
+            } else {
+                if (bindings < 2) continue;
+                link = b.sym_decl_head.items[sym];
+                while (link != 0) : (link = b.decl_links.items[link].next) {
+                    const l = b.decl_links.items[link];
+                    if (fns and !b.functionHasBody(l.value)) continue;
+                    try b.diag(.redeclared_exported_variable, b.dupDiagTok(l.value, b.decl_name_toks.items[link]));
+                }
+            }
+        }
+    }
+
+    /// Is this declaration a function WITH a body — an implementation rather
+    /// than an overload signature?
+    fn functionHasBody(b: *const Binder, node: Node) bool {
+        if (node == null_node or b.nodeTag(node) != .function_decl) return false;
+        return b.tree.nodeData(node).rhs != 0;
+    }
+
+    /// Does this declaration publish a module binding — either through an
+    /// `export` modifier, or as the declaration form of `export default`?
+    ///
+    /// `decl_origins.exported` covers only the first: `export default function
+    /// f() {}` leaves `exporting_node` clear because the name it publishes is
+    /// `default`, not `f` (see `in_export_default`). The binding is a binding
+    /// all the same, and two of them collide exactly as two `export var` do —
+    /// tsc answers TS2323 for `default` at each function's NAME. Recognized off
+    /// the token before the declaration's own first token, which is where the
+    /// modifier that would otherwise have set the flag sits.
+    fn declIsExported(b: *const Binder, link: u32) bool {
+        if (b.decl_origins.items[link].exported) return true;
+        const node = b.decl_links.items[link].value;
+        if (node == null_node) return false;
+        const main = b.tree.nodeMainToken(node);
+        return main > 0 and b.tree.tokens.tag(main - 1) == .keyword_default;
     }
 
     /// The per-symbol half. Declarations are grouped by the BLOCK they were
@@ -3241,9 +3331,17 @@ const Binder = struct {
             if (member == null_node or b.nodeTag(member) != .index_signature) continue;
             const md = b.tree.nodeData(member);
             if (md.rhs & ast.Flags.static != 0) continue;
-            const key_type = b.tree.extraData(ast.IndexSig, md.lhs).key_type;
-            if (key_type == null_node or b.nodeTag(key_type) == .error_node) continue;
-            const span = b.tree.span(b.src, key_type);
+            const e = b.tree.extraData(ast.IndexSig, md.lhs);
+            // tsc reads `declaration.parameters.length === 1 &&
+            // declaration.parameters[0].type` before anything else, so a
+            // signature the grammar already rejected for its parameter COUNT
+            // claims no key domain — `[a: string, b: string]` beside
+            // `[c: string]` is not a duplicate pair. The parser decided that
+            // (`index_signature.check`) and reported it at this very token, so
+            // the answer is read back rather than recomputed.
+            if (b.indexSigParamCountRejected(e.name_token)) continue;
+            if (e.key_type == null_node or b.nodeTag(e.key_type) == .error_node) continue;
+            const span = b.tree.span(b.src, e.key_type);
             try keys.append(b.scratch, b.src[span.start..span.end]);
             try sites.append(b.scratch, member);
         }
@@ -3252,6 +3350,24 @@ const Binder = struct {
             if (!index_signature.duplicateKey(keys.items, i)) continue;
             try b.diag(.duplicate_index_signature, b.memberStartToken(member));
         }
+    }
+
+    /// Did the parser answer TS1096 ("An index signature must have exactly one
+    /// parameter") for the signature whose first parameter is `name_token`?
+    ///
+    /// That diagnostic is anchored on exactly this token (`index_signature`'s
+    /// chain reports `shape.name_token`, which is what the parser stores as
+    /// `IndexSig.name_token`), so the match is a span-start equality rather than
+    /// a containment test. Almost every file carries no parse diagnostics at
+    /// all, and this is only reached for a member list with two or more index
+    /// signatures.
+    fn indexSigParamCountRejected(b: *const Binder, name_token: TokenIndex) bool {
+        if (b.tree.diagnostics.len == 0) return false;
+        const start = b.tree.tokens.start(name_token);
+        for (b.tree.diagnostics) |d| {
+            if (d.code == .index_sig_one_parameter and d.span.start == start) return true;
+        }
+        return false;
     }
 
     /// The first token of a class or type member — its `main_token` walked back

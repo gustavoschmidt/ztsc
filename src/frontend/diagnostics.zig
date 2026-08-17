@@ -345,6 +345,12 @@ pub const Code = enum(u16) {
     /// for the rule and for why the duplicate-identifier diagnostic that would
     /// otherwise cover the pair is deliberately absent.
     merged_decl_export_mismatch,
+    /// TS2323: a module's exported binding declared more than once — `export
+    /// var Foo` twice, or two `export function f` bodies. The declarations MERGE
+    /// (no duplicate identifier), but a module's export list is a set of
+    /// bindings and cannot carry one name twice. Reported on every declaration's
+    /// name. See `Binder.checkRedeclaredExports`.
+    redeclared_exported_variable,
     /// TS2391: a function/method whose LAST non-ambient declaration has no
     /// body, so the overload set has no implementation. See
     /// `impl_expected.zig`.
@@ -636,6 +642,7 @@ pub const Code = enum(u16) {
             .function_merge_needs_ambient_class,
             .import_conflict,
             .merged_decl_export_mismatch,
+            .redeclared_exported_variable,
             .missing_function_implementation,
             .missing_constructor_implementation,
             .abstract_decls_not_consecutive,
@@ -1015,6 +1022,7 @@ pub const Code = enum(u16) {
             .function_merge_needs_ambient_class => "Function with bodies can only merge with classes that are ambient.",
             .import_conflict => "import declaration conflicts with local declaration",
             .merged_decl_export_mismatch => "Individual declarations in merged declaration must be all exported or all local.",
+            .redeclared_exported_variable => "Cannot redeclare exported variable.",
             .missing_function_implementation => "Function implementation is missing or not immediately following the declaration.",
             .missing_constructor_implementation => "Constructor implementation is missing.",
             .abstract_decls_not_consecutive => "All declarations of an abstract method must be consecutive.",
@@ -1161,6 +1169,7 @@ pub const Code = enum(u16) {
             .function_merge_needs_ambient_class => 2814,
             .import_conflict => 2440,
             .merged_decl_export_mismatch => 2395,
+            .redeclared_exported_variable => 2323,
             .missing_function_implementation => 2391,
             .missing_constructor_implementation => 2390,
             .abstract_decls_not_consecutive => 2516,
