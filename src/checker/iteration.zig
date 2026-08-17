@@ -201,6 +201,24 @@ pub fn iterationElementType(c: *Checker, rt: TypeId) Error!?TypeId {
             }
             return try c.ts.makeUnion(c.scratch(), parts.items);
         },
+        // An INTERSECTION iterates through whichever constituents carry the
+        // protocol, and the element is their intersection. tsc gets this for
+        // free — `getPropertyOfType(X[] & Y[], Symbol.iterator)` is the
+        // intersection of the two members, calling it yields
+        // `ArrayIterator<X> & ArrayIterator<Y>`, and `next()`'s `value` comes
+        // out `X & Y`. ztsc's `propOfType` finds no such member, so `X[] &
+        // Y[]` reported a false TS2488 (`for-of58`). Constituents that are
+        // NOT iterable are skipped rather than failing the whole type, which
+        // matches the property lookup: `Foo[] & { tag: 1 }` still iterates.
+        .intersection => {
+            var parts: std.ArrayList(TypeId) = .empty;
+            defer parts.deinit(c.scratch());
+            for (try c.memberList(r)) |m| {
+                if (try c.iterationElementType(m)) |e| try parts.append(c.scratch(), e);
+            }
+            if (parts.items.len == 0) return null;
+            return try c.ts.makeIntersection(c.scratch(), parts.items);
+        },
         else => {},
     }
     // `[Symbol.iterator](): Iterator<E>` protocol.

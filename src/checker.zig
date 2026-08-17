@@ -871,7 +871,11 @@ pub const map_containers = [_][]const u8{
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
 /// constant value literal (`no_type` when the initializer is computed).
-pub const EnumMemberEntry = struct { name: Atom, value: TypeId };
+/// `computed` separates tsc's two ways of having no value — an initializer
+/// the constant evaluator could not fold, versus an auto-increment that ran
+/// off the end of a numeric chain — which `enumInfo.has_computed` needs and
+/// the value alone cannot tell apart.
+pub const EnumMemberEntry = struct { name: Atom, value: TypeId, computed: bool = false };
 /// A memoized `keyof <object table>`, tagged with the `key_name_types`
 /// generation it was computed under — see `Checker.keyof_obj_cache`.
 const KeyofEntry = struct { ty: TypeId, gen: u32 };
@@ -3589,7 +3593,6 @@ pub const Checker = struct {
     pub const substThis = enums_zig.substThis;
     pub const containsThisType = enums_zig.containsThisType;
     pub const EnumInfo = enums_zig.EnumInfo;
-    pub const EnumInitKind = enums_zig.EnumInitKind;
     pub const EnumMemberCollect = enums_zig.EnumMemberCollect;
     pub const TpMap = enums_zig.TpMap;
     pub const InferKey = enums_zig.InferKey;

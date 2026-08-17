@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
+const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
 
 const Node = ast.Node;
@@ -52,10 +53,72 @@ pub const Home = enum { class_body, ambient_class_body, type_space };
 /// walk hand over whatever it has for a name.
 pub fn checkComputedName(c: *Checker, name_node: Node) Error!TypeId {
     if (name_node == null_node or c.nodeTag(name_node) != .computed_name) return types.no_type;
-    const kt = try c.checkExprCached(c.tree.nodeData(name_node).lhs, types.no_type);
+    const expr = c.tree.nodeData(name_node).lhs;
+    if (superInNameIsError(c)) try reportSuperInName(c, expr, 0);
+    const kt = try c.checkExprCached(expr, types.no_type);
     try report(c, name_node, kt);
     return kt;
 }
+
+/// TS2466: a `super` reference written inside a computed property NAME.
+///
+/// tsc's `getSuperContainer` steps OVER a ComputedPropertyName — it jumps
+/// straight past the owning member and keeps walking — so a `super` in a
+/// member's NAME never reaches a legal container, however ordinary the member
+/// is: `class C extends B { [super.bar()]() {} }` is an error even though the
+/// very same `super.bar()` in that method's BODY is fine.
+/// `checkSuperExpression` then re-walks for an enclosing computed name and
+/// reports this wording in place of the generic "super outside a constructor"
+/// one.
+///
+/// What the skip LANDS ON is the whole question, and it is a question about
+/// the member's surroundings, not about the name: `class C extends B { foo() {
+/// var o = { [super.bar()]() {} } } }` skips the object method and finds
+/// `C.foo`, which IS a legal container, so tsc is silent — as it is for the
+/// same shape wrapped in a nested class expression or in an arrow. So the
+/// report is confined to the case where the skip can find nothing at all: no
+/// enclosing function-like SCOPE anywhere above the name, i.e. a member of a
+/// top-level class. Everything nested stays silent, which under-reports the
+/// one shape tsc still errors on (a super CALL inside an arrow,
+/// `computedPropertyNames30`) and never invents one.
+fn superInNameIsError(c: *Checker) bool {
+    var s = c.cur_scope;
+    while (true) {
+        if (c.bind.scope_kinds[s] == .function) return false;
+        if (s == binder.file_scope) return true;
+        s = c.bind.scope_parents[s];
+    }
+}
+
+/// Walk the name expression for a `super`, stopping at a nested
+/// `function`/class boundary: such a node IS a super container, and
+/// `getSuperContainer` returns it before the computed name is ever reached.
+fn reportSuperInName(c: *Checker, node: Node, depth: u16) Error!void {
+    if (node == null_node or depth > max_name_depth) return;
+    switch (c.nodeTag(node)) {
+        .super_expr => return c.diagFmt(
+            2466,
+            c.nodeSpan(node),
+            "'super' cannot be referenced in a computed property name.",
+            .{},
+        ),
+        // A `super` written inside one of these has IT as its container, so
+        // the computed name never enters the answer.
+        .function_expr,
+        .function_decl,
+        .class_decl,
+        .class_method,
+        .object_method,
+        .class_field,
+        => return,
+        else => {},
+    }
+    var it = c.tree.childIterator(node);
+    while (it.next()) |child| try reportSuperInName(c, child, depth + 1);
+}
+
+/// Far above any hand-written key expression; the cap only ever under-reports.
+const max_name_depth: u16 = 200;
 
 /// The computed NAMES of a class body's or an interface's members — tsc's
 /// `checkComputedPropertyName`, reached from the declaration walk so it runs in

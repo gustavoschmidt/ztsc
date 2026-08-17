@@ -3033,6 +3033,12 @@ const Binder = struct {
         b.cur_block = node;
         defer b.cur_block = saved_block;
 
+        // A STATIC BLOCK is the one part of a class body whose control flow
+        // leaves it (see the `.block` arm). Successive blocks chain through
+        // this, and the class hands it to whatever follows the declaration;
+        // null means the body had none and the outer flow is untouched.
+        var static_exit: ?FlowId = null;
+
         try b.recordOverloadSiblings(b.tree.extraRange(data.members_start, data.members_end));
         for (b.tree.extraRange(data.members_start, data.members_end)) |member| {
             if (member == null_node) continue;
@@ -3115,17 +3121,27 @@ const Binder = struct {
                 // not see the static members (`x` is TS2304 where `this.x`
                 // resolves), which is exactly what parenting at `cs` gives.
                 .block => {
-                    const outer_flow = b.cur_flow;
                     const saved_sb = b.saveState();
+                    // A static block is a SCOPE boundary but not a FLOW one:
+                    // it runs at class-definition time, so tsc threads the
+                    // enclosing control flow straight through it. `let x:
+                    // number | string = 1; class C { static { x = "a" } } x`
+                    // narrows to `string`, and a variable assigned there is
+                    // assigned afterwards (`classStaticBlock28` reported a
+                    // false TS2454 while the block started a fresh graph).
+                    // A CONDITIONAL assignment inside still leaves it
+                    // possibly-unassigned, which falls out of the same splice
+                    // — verified against the oracle all three ways.
+                    if (static_exit) |f| b.cur_flow = f;
                     const sbs = try b.pushScope(.function, member);
                     b.var_scope = sbs;
                     b.ctx_base = b.ctxs.items.len;
                     // No `return` may reach out of a static block (TS18041), so
                     // there is no return target to join into.
                     b.ctor_return = null;
-                    b.cur_flow = try b.addFlow(.start, outer_flow, member);
                     try b.recordOverloadSiblings(b.tree.nodeRange(member));
                     for (b.tree.nodeRange(member)) |stmt| try b.bindStatement(stmt);
+                    static_exit = b.cur_flow;
                     b.restoreState(saved_sb);
                 },
                 .decorator => try b.bindExpr(md.lhs),
@@ -3135,6 +3151,12 @@ const Binder = struct {
         }
         try b.checkDuplicateIndexSignatures(b.tree.extraRange(data.members_start, data.members_end));
         b.restoreState(saved);
+        // A static block's flow is the class declaration's own continuation.
+        // Nothing else in the body leaks: a computed member NAME assigns at
+        // class-definition time too, but tsc still calls the variable
+        // unassigned afterwards (`privateNameComputedPropertyName2`), so the
+        // restore above is what the rest of the body gets.
+        if (static_exit) |f| b.cur_flow = f;
     }
 
     /// `extends`/`implements` entry: `extends` is a value read (with flow),
