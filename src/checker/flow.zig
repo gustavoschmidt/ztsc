@@ -14,6 +14,7 @@ const null_node = ast.null_node;
 const TokenIndex = ast.TokenIndex;
 const Atom = intern.Atom;
 const SymbolId = binder.SymbolId;
+const ScopeId = binder.ScopeId;
 const FlowId = binder.FlowId;
 const TypeId = types.TypeId;
 
@@ -526,6 +527,11 @@ fn flowReachableInner(c: *Checker, flow: FlowId) Error!bool {
             }
             return false;
         },
+        // A reduction only ever REMOVES antecedents from its target, so
+        // walking the continuation with the target's full list can only
+        // over-report reachability — the safe side for every consumer of this
+        // answer (it is asked to *suppress* a report, never to raise one).
+        .reduce_label => return flowReachable(c, b.reduceAntecedent(flow)),
         // Only the entry edge: a loop's back edges are reachable exactly
         // when the head is, so following them would answer with itself.
         .loop_label => {
@@ -555,28 +561,37 @@ fn flowReachableInner(c: *Checker, flow: FlowId) Error!bool {
 /// callee from inside a flow query is the re-entrancy `guardCallOf`'s header
 /// note documents.
 fn callStmtReturnsNever(c: *Checker, flow: FlowId) Error!bool {
-    return callReturnsNever(c, c.bind.flowNode(flow));
+    // The scope the CALL STATEMENT was bound in — the flow node's own. The
+    // walk that got here started at some reference whose ambient scope is
+    // unrelated (a loop back-edge reaches this node from a shallower one),
+    // and the callee has to resolve where it is written.
+    return callReturnsNever(c, c.bind.flowNode(flow), c.bind.flowScope(flow));
 }
 
 /// The same question asked of a call NODE, so consumers with no flow node to
 /// hand can ask it too (`stmtTerminal`'s endpoint analysis).
 ///
-/// Resolving the callee needs the scope it was WRITTEN in, and neither caller
-/// has it: a flow walk runs at the querying reference's scope, and
-/// `stmtTerminal` recurses into nested blocks from the body's. The binder
-/// attaches a flow entry to every identifier and member read
-/// (`bindIdentifierRef` / `bindExpr`), and `flowScope` on that entry is
-/// exactly the scope wanted — reading it here is what keeps a callee declared
-/// in an inner block (`const render = () => …; … render();`) from resolving
-/// against the function scope, where the name does not exist and
-/// `checkExprCached` would report a phantom TS2304.
-pub fn callReturnsNever(c: *Checker, call: Node) Error!bool {
+/// Resolving the callee needs the scope it was WRITTEN in, which a flow walk
+/// does not have (it runs at the querying reference's scope, and a loop back
+/// edge reaches a call statement from a shallower one) — so `scope` carries
+/// it, and `null` means "the ambient scope is already right", which is how
+/// `stmtTerminal` asks: it tracks block scopes as it descends, exactly as
+/// `checkStatement` does.
+///
+/// This resolution is not free of consequences: `checkExprCached` MEMOIZES the
+/// callee's type, so getting the scope wrong here does not merely mis-answer
+/// the never-ness question — it pins the wrong symbol's type on the callee
+/// node for the authoritative check that follows. A block-scoped `function
+/// foo() {}` shadowing the enclosing `function foo(a: number)` read as the
+/// outer one and every call to it was TS2554
+/// (`blockScopedSameNameFunctionDeclaration*`).
+pub fn callReturnsNever(c: *Checker, call: Node, scope: ?ScopeId) Error!bool {
     if (call == null_node) return false;
     const shape = c.callShape(call);
     const callee = shape.callee;
     const saved = c.cur_scope;
     defer c.cur_scope = saved;
-    if (c.bind.flowAt(callee)) |f| c.cur_scope = c.bind.flowScope(f);
+    if (scope) |s| c.cur_scope = s;
     const callee_t = switch (c.nodeTag(callee)) {
         .member_expr, .optional_member_expr, .index_expr, .optional_index_expr => c.nodeType(callee) orelse
             try declaredPathType(c, callee),
@@ -1030,8 +1045,33 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
             const narrowed = try narrowByAssertCall(c, solid, call, key, declared);
             return if (narrowed == solid) before else narrowed;
         },
+        // tsc's ReduceLabel arm: continue at the end of the `finally` block,
+        // with the label at its top restricted to the normal-exit edges for
+        // the rest of this walk. `flow_reduce` carries the restriction and
+        // `key`'s reduce depth carries the memo separation (see `RefKey.deep`).
+        .reduce_label => {
+            const d = key.reduceDepth();
+            // Past the encodable nesting the query would share a memo slot
+            // with the un-reduced walk, so it stops narrowing instead.
+            if (d >= RefKey.max_reduce_depth) return declared;
+            c.flow_reduce.shrinkRetainingCapacity(d);
+            try c.flow_reduce.append(c.cm(), flow);
+            return flowType(c, b.reduceAntecedent(flow), key.withReduceDepth(d + 1), declared, depth + 1);
+        },
         .branch_label, .loop_label => {
-            const antes = b.flowAntecedents(flow);
+            var antes = b.flowAntecedents(flow);
+            var k = key;
+            // Is this the label a live reduction targets? Only the innermost
+            // one can be (`flow_reduce` nests), and only a `branch_label` is
+            // ever a target.
+            const rd = key.reduceDepth();
+            if (rd != 0 and rd <= c.flow_reduce.items.len) {
+                const r = c.flow_reduce.items[rd - 1];
+                if (b.reduceTarget(r) == flow) {
+                    antes = b.reduceAntecedents(r);
+                    k = key.withReduceDepth(rd - 1);
+                }
+            }
             // A loop label whose reference is *never assigned inside the
             // loop* keeps its pre-loop narrowing across the whole loop body
             // (tsc `getTypeAtFlowLoopLabel`: a reference only re-widens at a
@@ -1093,7 +1133,7 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
                     c.member_written_syms.contains(key.sym));
                 const assigned_in_loop = root_assigned or member_written;
                 if (!assigned_in_loop) {
-                    const entry_t = try flowType(c, antes[0], key, declared, depth + 1);
+                    const entry_t = try flowType(c, antes[0], k, declared, depth + 1);
                     if (entry_t != declared) return entry_t;
                 }
             }
@@ -1129,7 +1169,7 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
                     published = true;
                     frame = c.flow_loop_stack.items.len;
                     const q: FlowQ = (@as(u64, c.cur_flow_base + flow) << 32) |
-                        try refKeyIndex(c, key, declared);
+                        try refKeyIndex(c, k, declared);
                     // `parts` is scratch-backed and this publishes it where a
                     // deeper query can read it, so it is the one place in the
                     // checker that hands a scratch buffer sideways. It stays
@@ -1149,7 +1189,7 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
                     // `flowTypeCache` around exactly this walk.
                     c.no_publish_depth += 1;
                 }
-                const t = try flowType(c, a, key, declared, depth + 1);
+                const t = try flowType(c, a, k, declared, depth + 1);
                 if (t != types.never_type) try parts.append(c.scratch(), t);
             }
             if (published) {
@@ -1294,7 +1334,7 @@ fn patternWritesRef(c: *Checker, node: Node, key: RefKey) Error!bool {
 /// spelling of the one-link `this`-rooted reference `key` stands for? See the
 /// call site for why the equivalence lives here and not in `refMatchesPath`.
 fn writesThisStringIndex(c: *Checker, target: Node, key: RefKey) Error!bool {
-    if (key.sym != this_flow_root or key.len != 1 or key.deep != 0) return false;
+    if (key.sym != this_flow_root or key.len != 1 or key.deepId() != 0) return false;
     if (key.path[0].isIndex()) return false;
     var n = c.referenceCandidate(target);
     while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
@@ -2008,6 +2048,13 @@ fn narrowByEqualityCond(c: *Checker, t: TypeId, lhs: Node, rhs: Node, strict: bo
     if (try typeofChainContainsRef(c, rhs, key)) {
         return narrowByTypeofChainContainment(c, t, lhs, sense);
     }
+    // `typeof <ref>.k === "…"` — the discriminant reading of the same shape.
+    if (typeofOperand(c, lhs)) |op| {
+        if (try narrowByTypeofDiscriminant(c, t, op, rhs, sense, key, decl)) |n| return n;
+    }
+    if (typeofOperand(c, rhs)) |op| {
+        if (try narrowByTypeofDiscriminant(c, t, op, lhs, sense, key, decl)) |n| return n;
+    }
     // <ref> === <literal> / <literal> === <ref>
     if (try refMatches(c, lhs, key)) {
         return narrowByLiteralEquality(c, t, rhs, strict, sense);
@@ -2157,19 +2204,42 @@ fn optChainComparandConstituentOk(c: *Checker, m: TypeId, strict: bool, sense: b
     return nullish;
 }
 
+/// The operand of `typeof <expr>`, or null when `node` is not one.
+fn typeofOperand(c: *Checker, node: Node) ?Node {
+    if (node == null_node or c.nodeTag(node) != .prefix_unary) return null;
+    if (c.tree.tokens.tag(c.tree.nodeMainToken(node)) != .keyword_typeof) return null;
+    return c.tree.nodeData(node).lhs;
+}
+
 fn typeofTargetOf(c: *Checker, node: Node, key: RefKey) Error!bool {
-    if (node == null_node or c.nodeTag(node) != .prefix_unary) return false;
-    if (c.tree.tokens.tag(c.tree.nodeMainToken(node)) != .keyword_typeof) return false;
-    return refMatches(c, c.tree.nodeData(node).lhs, key);
+    const operand = typeofOperand(c, node) orelse return false;
+    return refMatches(c, operand, key);
 }
 
 /// `node` is `typeof <expr>` whose `<expr>` is an optional chain containing
 /// `key`'s reference at an optional link (but is not the ref itself — that
 /// exact case is `typeofTargetOf`).
 fn typeofChainContainsRef(c: *Checker, node: Node, key: RefKey) Error!bool {
-    if (node == null_node or c.nodeTag(node) != .prefix_unary) return false;
-    if (c.tree.tokens.tag(c.tree.nodeMainToken(node)) != .keyword_typeof) return false;
-    return optionalChainContainsRef(c, c.tree.nodeData(node).lhs, key);
+    const operand = typeofOperand(c, node) orelse return false;
+    return optionalChainContainsRef(c, operand, key);
+}
+
+/// `typeof <ref>.k === "…"` read as a DISCRIMINANT guard on `<ref>`: the
+/// filter each constituent has to survive is the typeof question asked of its
+/// own `k`. tsc's `narrowTypeByTypeof` falls through to
+/// `getDiscriminantPropertyAccess` + `narrowTypeByDiscriminant` for exactly
+/// this shape — the operand is a property access on the reference rather than
+/// the reference itself — which is what makes `typeof a.error === 'undefined'`
+/// pick the `{ error: undefined, result: {…} }` constituent out of a union
+/// keyed on `error`'s definedness (`narrowingTypeofUndefined1`). Null — "not
+/// this arm, keep looking" — when the operand is not such an access at all;
+/// once it is, a comparand that is not a string literal answers `t` unchanged,
+/// exactly as the two `typeofTargetOf` arms above do.
+fn narrowByTypeofDiscriminant(c: *Checker, t: TypeId, op: Node, value: Node, sense: bool, key: RefKey, decl: TypeId) Error!?TypeId {
+    const prop = (try discriminantOfRef(c, op, key)) orelse return null;
+    const rt = try c.ts.regularLiteral(try c.checkExprCached(value, types.no_type));
+    if (c.ts.kind(rt) != .string_literal) return t;
+    return try narrow.narrowByDiscriminantTypeof(c, t, prop, c.ts.literalAtom(rt), sense, decl);
 }
 
 /// Narrow a chain receiver `t` to non-null when a `typeof <chain>` branch
@@ -3102,19 +3172,50 @@ fn narrowByGuardCall(c: *Checker, t: TypeId, call: Node, sense: bool, key: RefKe
 
 /// tsc's `narrowTypeByTypePredicate` optional-chain arm: the guarded
 /// ARGUMENT is an optional chain whose receiver is the tracked reference
-/// (`Array.isArray(data?.detail)`). A nullish receiver short-circuits the
-/// chain to `undefined`, so when the predicate's asserted type cannot BE
-/// `undefined`, the asserting branch proves the receiver did not
-/// short-circuit — narrow it to non-null. Only the true branch says
-/// anything (a failed predicate is equally consistent with a nullish
-/// receiver), which is why tsc gates this on `assumeTrue`.
+/// (`Array.isArray(data?.detail)`, `!isNil(animal?.breed?.size)`). A nullish
+/// receiver short-circuits the chain to `undefined`, so a branch that says
+/// anything definite about the chain's value also says the receiver did not
+/// short-circuit — narrow it to non-null.
+///
+/// Both branches can say it, by the mirror-image tests tsc spells
+/// `assumeTrue && !hasTypeFacts(predicate.type, TypeFacts.EQUndefined) ||
+/// !assumeTrue && everyType(predicate.type, isNullableType)`:
+///
+///   * taken as TRUE, the branch proves it when the asserted type cannot BE
+///     `undefined` (`isString(n?.child?.value)`);
+///   * taken as FALSE, when the asserted type is nullish THROUGHOUT, so its
+///     complement excludes `undefined` (`!isNil(animal?.breed?.size)`, with
+///     `isNil(v): v is undefined | null` — `typePredicatesOptionalChaining3`).
+///
+/// The two other combinations say nothing and must not narrow: a refuted
+/// `x is string` is equally consistent with a short-circuit, and an asserted
+/// `x is string | undefined` is too (`089_guard_call_arg_chain_negatives`).
 fn narrowByGuardArgChain(c: *Checker, t: TypeId, g: GuardCall, sense: bool, key: RefKey) Error!TypeId {
-    if (!sense) return t;
     if (g.pred.asserts) return t; // narrows after the call, not in the condition
     if (g.pred.ty == types.no_type) return t;
-    if (try c.admitsNullish(g.pred.ty, .undefined)) return t;
+    const proves = if (sense)
+        !try c.admitsNullish(g.pred.ty, .undefined)
+    else
+        everyConstituentNullish(c, g.pred.ty);
+    if (!proves) return t;
     if (!try optionalChainContainsRef(c, g.arg, key)) return t;
     return c.nonNullable(t);
+}
+
+/// tsc's `everyType(t, isNullableType)`: is every constituent `undefined`,
+/// `null` or `void`? `any`/`unknown` are not — their domains include
+/// non-nullish values, so refuting them proves nothing.
+fn everyConstituentNullish(c: *Checker, t: TypeId) bool {
+    if (c.ts.kind(t) == .union_type) {
+        for (c.ts.members(t)) |m| {
+            if (!everyConstituentNullish(c, m)) return false;
+        }
+        return true;
+    }
+    return switch (c.ts.kind(t)) {
+        .undefined, .null, .void => true,
+        else => false,
+    };
 }
 
 /// `assertIsT(x);` — an assertion-function call statement narrows the
@@ -3459,6 +3560,11 @@ fn definitelyAssignedInner(c: *Checker, flow: FlowId, sym: SymbolId) Error!bool 
         .cond_true, .cond_false, .switch_clause, .call_stmt, .array_mutation => {
             return c.definitelyAssigned(b.flow_a[flow], sym);
         },
+        // A pass-through: the target label keeps its full antecedent list, so
+        // the answer stays on the conservative "not definitely assigned" side.
+        // Separating the two walks would need the reduce depth in `da_cache`'s
+        // key, and this walk exists only for computed property names.
+        .reduce_label => return c.definitelyAssigned(b.reduceAntecedent(flow), sym),
         .switch_no_match => {
             // The "no clause matched" edge out of a `default`-less switch.
             // When the switch is exhaustive over a literal-union
@@ -3545,6 +3651,9 @@ fn saReaches(c: *Checker, flow: FlowId, sym: SymbolId, seen: []bool) Error!bool 
         .cond_true, .cond_false, .switch_clause, .call_stmt, .switch_no_match, .array_mutation => {
             return saReaches(c, b.flow_a[flow], sym, seen);
         },
+        // Pass-through (some-path question, so the un-reduced target can only
+        // over-report — the same side `definitelyAssigned` errs on).
+        .reduce_label => return saReaches(c, b.reduceAntecedent(flow), sym, seen),
         .branch_label, .loop_label => {
             for (b.flowAntecedents(flow)) |a| {
                 if (try saReaches(c, a, sym, seen)) return true;

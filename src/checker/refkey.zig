@@ -148,7 +148,23 @@ pub const PathElem = struct {
 pub const RefKey = struct {
     sym: SymbolId,
     path: [max_ref_depth]PathElem = [_]PathElem{.{}} ** max_ref_depth,
-    /// 1-based `deep_path_list` id, or 0 when the path is inline.
+    /// Low `deep_bits`: the 1-based `deep_path_list` id, or 0 when the path
+    /// is inline. High `reduce_bits`: the REDUCE-LABEL DEPTH this query is
+    /// taken under (see below). Two unrelated numbers share the field because
+    /// `RefKey` has no spare byte: `sym` + `path` fills 16 of its 20 bytes and
+    /// `deep`/`len`/`opt_init` fill the other four exactly, so widening it
+    /// pushes `RefQ` off its 24-byte commitment for a value that is zero in
+    /// every query outside a `try`/`finally`.
+    ///
+    /// The reduce depth rides in the KEY for the same reason `opt_init` does.
+    /// A `reduce_label` walk answers the flow nodes of a `finally` block
+    /// DIFFERENTLY from a walk that starts inside that block (the label at the
+    /// top of the block offers fewer antecedents), so the two must not share a
+    /// `flow_same`/`flow_narrow` slot. Depth alone separates them exactly:
+    /// the region walked under `d` active reductions is the body of the `d`-th
+    /// `finally` block, those bodies nest, and a body is only entered through
+    /// its own reduce label — so `(flow node, depth)` determines which
+    /// reduction is in effect (`Checker.flow_reduce` holds the stack itself).
     deep: u16 = 0,
     len: u8 = 0,
     /// A DEFINITE-ASSIGNMENT query — `strictPropertyInitialization` for a
@@ -178,6 +194,28 @@ pub const RefKey = struct {
     /// padding byte `deep`/`len` already left in a 20-byte struct, so `RefQ`
     /// keeps its 24-byte commitment.
     opt_init: bool = false,
+
+    /// How `deep` is split (see its doc comment).
+    pub const deep_bits: u16 = 13;
+    pub const deep_mask: u16 = (1 << deep_bits) - 1;
+    /// Deepest `finally`-block nesting a reduce walk can encode. Past it the
+    /// walk stops narrowing (sound under-narrowing, like an over-deep path).
+    pub const max_reduce_depth: u16 = (1 << (16 - deep_bits)) - 1;
+
+    /// The 1-based `deep_path_list` id (0 = the path is inline).
+    pub inline fn deepId(k: RefKey) u16 {
+        return k.deep & deep_mask;
+    }
+    pub inline fn reduceDepth(k: RefKey) u16 {
+        return k.deep >> deep_bits;
+    }
+    /// The same reference, queried under `d` active reductions.
+    pub fn withReduceDepth(k: RefKey, d: u16) RefKey {
+        std.debug.assert(d <= max_reduce_depth);
+        var r = k;
+        r.deep = k.deepId() | (d << deep_bits);
+        return r;
+    }
 };
 
 /// One interned over-deep link sequence (see `RefKey.deep`). Slots past
@@ -253,7 +291,9 @@ pub fn makeRefKey(c: *Checker, sym: SymbolId, elems: []const PathElem) Error!?Re
     @memcpy(dp.elems[0..elems.len], elems);
     const gop = try c.deep_path_ids.getOrPut(c.cm(), dp);
     if (!gop.found_existing) {
-        if (c.deep_path_list.items.len >= std.math.maxInt(u16)) {
+        // `deep` only has `deep_bits` for the id (the rest is the reduce
+        // depth); past that a path is simply untracked.
+        if (c.deep_path_list.items.len >= RefKey.deep_mask) {
             gop.value_ptr.* = 0;
         } else {
             try c.deep_path_list.append(c.cm(), dp);
@@ -261,7 +301,7 @@ pub fn makeRefKey(c: *Checker, sym: SymbolId, elems: []const PathElem) Error!?Re
         }
     }
     if (gop.value_ptr.* == 0) return null;
-    key.deep = gop.value_ptr.*;
+    key.deep = gop.value_ptr.*; // reduce depth is applied later, by the walk
     return key;
 }
 
@@ -270,8 +310,8 @@ pub fn makeRefKey(c: *Checker, sym: SymbolId, elems: []const PathElem) Error!?Re
 /// storage); a deep one is copied into `buf` rather than handed out as a
 /// view of `deep_path_list`, which a later `makeRefKey` may reallocate.
 pub fn refPath(c: *const Checker, key: *const RefKey, buf: *[max_deep_ref_depth]PathElem) []const PathElem {
-    if (key.deep == 0) return key.path[0..key.len];
-    @memcpy(buf[0..key.len], c.deep_path_list.items[key.deep - 1].elems[0..key.len]);
+    if (key.deepId() == 0) return key.path[0..key.len];
+    @memcpy(buf[0..key.len], c.deep_path_list.items[key.deepId() - 1].elems[0..key.len]);
     return buf[0..key.len];
 }
 
