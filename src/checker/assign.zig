@@ -2131,13 +2131,24 @@ fn substitutableBranch(c: *Checker, t: TypeId, depth: u32) Error!bool {
 /// Additive: every caller falls through to its previous rule on `false`.
 fn condBranchwiseRelated(c: *Checker, s: TypeId, t: TypeId) Error!bool {
     const st = &c.ts;
-    if (st.condExtends(s) != st.condExtends(t)) return false;
+    // The source's own `infer` binders are re-bound to the target's first, so
+    // that two conditionals written the same way but DECLARED separately still
+    // meet the identity test below — see `rebindCondInferVars`.
+    var s_ext = st.condExtends(s);
+    var s_tru = st.condTrue(s);
+    if (s_ext != st.condExtends(t)) {
+        if (try c.rebindCondInferVars(s, t)) |r| {
+            s_ext = r.extends;
+            s_tru = r.true_branch;
+        }
+    }
+    if (s_ext != st.condExtends(t)) return false;
     const s_chk = st.condCheck(s);
     const t_chk = st.condCheck(t);
     if (s_chk != t_chk) {
         if (!(try c.isAssignable(s_chk, t_chk)) and !(try c.isAssignable(t_chk, s_chk))) return false;
     }
-    const tru_ok = (try c.isAssignable(st.condTrue(s), st.condTrue(t))) or
+    const tru_ok = (try c.isAssignable(s_tru, st.condTrue(t))) or
         (try c.isAssignable(try condTrueOverExtends(c, s), st.condTrue(t)));
     return tru_ok and try c.isAssignable(st.condFalse(s), st.condFalse(t));
 }

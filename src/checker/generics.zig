@@ -618,6 +618,100 @@ fn unmatchedPatternProperty(c: *Checker, chk: TypeId, pattern: TypeId) Error!boo
     return false;
 }
 
+/// Match `input` against the `pattern` that declares `ids`, filling `vals`
+/// with what each binder inferred (`no_type` for one nothing matched) — one
+/// `inferTypes` call with the inference bookkeeping saved and restored around
+/// it.
+///
+/// The bookkeeping is what makes a NESTED match safe: `infer_gen` is a fresh
+/// key space for this match's `infer_visited` entries, so an inference
+/// re-entered from inside this one (through an `instantiate` in the walk)
+/// cannot invalidate the outer one's; `infer_prio_of` is tsc's
+/// `InferenceInfo.priority`, one per binder, seeded worse than every real
+/// priority so the first candidate always takes over.
+pub fn inferBinders(c: *Checker, input: TypeId, pattern: TypeId, ids: []const u32, vals: []TypeId) Error!void {
+    const saved_gen = c.infer_gen;
+    const saved_steps = c.infer_steps;
+    c.infer_gen = c.infer_gen_next;
+    c.infer_gen_next +%= 1;
+    c.infer_steps = 0;
+    const saved_prio_of = c.infer_prio_of;
+    const saved_prio_owner = c.infer_prio_owner;
+    const saved_prio = c.infer_prio;
+    const prio_of = try c.scratch().alloc(u16, ids.len);
+    for (prio_of) |*p| p.* = InferPrio.max_value;
+    c.infer_prio_of = prio_of;
+    c.infer_prio_owner = vals.ptr;
+    c.infer_prio = InferPrio.none;
+    defer {
+        c.infer_gen = saved_gen;
+        c.infer_steps = saved_steps;
+        c.infer_prio_of = saved_prio_of;
+        c.infer_prio_owner = saved_prio_owner;
+        c.infer_prio = saved_prio;
+    }
+    try c.inferFromExtends(input, pattern, ids, vals, false, 0);
+}
+
+/// The source conditional's `extends` clause and TRUE branch, rewritten so its
+/// own `infer` binders are the TARGET conditional's — tsc's "if the source has
+/// infer type parameters, we instantiate them in the context of the target"
+/// (`structuredTypeRelatedTo`, conditional vs conditional):
+///
+/// ```ts
+/// const ctx = createInferenceContext(sourceParams, …);
+/// inferTypes(ctx.inferences, target.extendsType, sourceExtends, …);
+/// sourceExtends = instantiateType(sourceExtends, ctx.mapper);
+/// ```
+///
+/// Two conditionals WRITTEN the same way but declared separately bind distinct
+/// `infer` variables, so their extends clauses are distinct types and the
+/// identity test below them fails on nothing but the binder identities. `type
+/// Cond1 = X extends [infer A] ? A : never` and an identically written `Cond2`
+/// were mutually unassignable for exactly that reason
+/// (`identicalGenericConditionalsWithInferRelated`), and so was any interface
+/// method whose return type is such a conditional — the implementing class
+/// re-declares it, which re-declares its binders (TS2416 on the same case).
+///
+/// Null — the pair stands as written — when the source declares no binders, or
+/// when the match leaves one unbound, which means the two extends clauses are
+/// not the same pattern at all.
+pub fn rebindCondInferVars(c: *Checker, src: TypeId, tgt: TypeId) Error!?struct { extends: TypeId, true_branch: TypeId } {
+    const s = &c.ts;
+    const s_ext = s.condExtends(src);
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(c.scratch());
+    var refs: std.ArrayList(u32) = .empty;
+    defer refs.deinit(c.scratch());
+    try collectInferVars(c, s_ext, &ids, &refs);
+    if (ids.items.len == 0) return null;
+    const vals = try c.scratch().alloc(TypeId, ids.items.len);
+    for (vals) |*v| v.* = types.no_type;
+    try inferBinders(c, s.condExtends(tgt), s_ext, ids.items, vals);
+    for (vals) |v| {
+        if (v == types.no_type) return null;
+    }
+    // An `infer V` occurrence carries WHICH occurrence it is: the binder's
+    // DECLARATION in the extends clause and every REFERENCE to it in the true
+    // branch are distinct interned types with the same logical id (see
+    // `infer_var_reference`). The values just inferred come from the target's
+    // extends clause, so they are declarations; substituting them into the
+    // true branch would leave a declaration where the target holds a
+    // reference, and the two would not compare equal. So the branch gets the
+    // reference form of the same binders.
+    const ref_vals = try c.scratch().alloc(TypeId, vals.len);
+    for (vals, ref_vals) |v, *rv| {
+        rv.* = if (s.kind(v) == .infer_var and !s.inferVarIsRef(v))
+            try s.makeInferVar(s.inferVarId(v), s.inferVarName(v), true)
+        else
+            v;
+    }
+    return .{
+        .extends = try substInfer(c, s_ext, ids.items, vals),
+        .true_branch = try substInfer(c, s.condTrue(src), ids.items, ref_vals),
+    };
+}
+
 fn planConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId) Error!CondPlan {
     // Kept in scratch, never freed here: `ids`/`vals` are handed back to
     // the caller, which substitutes them into a branch it has yet to
@@ -685,33 +779,7 @@ fn planConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId) Error!C
     const vals = try c.scratch().alloc(TypeId, ids.items.len);
     for (vals) |*v| v.* = types.no_type;
     if (ids.items.len > 0) {
-        // A fresh key space for this match's `infer_visited` entries, restored
-        // on exit so an inference re-entered from inside this one (through an
-        // `instantiate` in the walk) cannot invalidate the outer one's.
-        const saved_gen = c.infer_gen;
-        const saved_steps = c.infer_steps;
-        c.infer_gen = c.infer_gen_next;
-        c.infer_gen_next +%= 1;
-        c.infer_steps = 0;
-        // tsc's `InferenceInfo.priority`, one per binder, seeded worse than
-        // every real priority so the first candidate always takes over. Saved
-        // and restored around a nested match the same way `infer_gen` is.
-        const saved_prio_of = c.infer_prio_of;
-        const saved_prio_owner = c.infer_prio_owner;
-        const saved_prio = c.infer_prio;
-        const prio_of = try c.scratch().alloc(u16, ids.items.len);
-        for (prio_of) |*p| p.* = InferPrio.max_value;
-        c.infer_prio_of = prio_of;
-        c.infer_prio_owner = vals.ptr;
-        c.infer_prio = InferPrio.none;
-        defer {
-            c.infer_gen = saved_gen;
-            c.infer_steps = saved_steps;
-            c.infer_prio_of = saved_prio_of;
-            c.infer_prio_owner = saved_prio_owner;
-            c.infer_prio = saved_prio;
-        }
-        try c.inferFromExtends(chk, extends_ty, ids.items, vals, false, 0);
+        try inferBinders(c, chk, extends_ty, ids.items, vals);
         for (vals) |*v| {
             if (v.* == types.no_type) v.* = types.unknown_type; // unmatched → unknown
         }
