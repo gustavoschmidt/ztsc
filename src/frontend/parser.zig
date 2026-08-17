@@ -2380,7 +2380,12 @@ const Parser = struct {
         if (isIdentLike(p.curTag()) and !p.nlBefore()) {
             label = try p.bump();
         }
-        if (p.spec == 0) {
+        // An AMBIENT context skips the whole family: tsc guards
+        // `checkGrammarBreakOrContinueStatement` behind
+        // `checkGrammarStatementInAmbientContext`, which has already answered
+        // TS1036 for the statement and returns true. Measured — `break;` alone
+        // in a `.d.ts` is TS1036 and nothing else.
+        if (p.spec == 0 and !p.ambient) {
             if (p.jumpTargetCode(is_break, label)) |code| try p.errAtToken(code, kw);
         }
         try p.expectSemicolon();
