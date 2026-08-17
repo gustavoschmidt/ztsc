@@ -211,10 +211,16 @@ pub fn signatureOfProtoCtx(
     // property position). Threaded into the body's return-type probe so
     // return expressions are contextually typed. An async body's returns are
     // typed by the *awaited* contextual type (`Promise<T>` context → `T`).
-    const ret_ctx: TypeId = if (ctx_sig != types.no_type and c.ts.kind(ctx_sig) == .function)
+    var ret_ctx: TypeId = if (ctx_sig != types.no_type and c.ts.kind(ctx_sig) == .function)
         c.ts.fnReturn(ctx_sig)
     else
         types.no_type;
+    // …and, when there is none, tsc's IIFE arm: an immediately-invoked function
+    // expression returns into the CALL's contextual type. See
+    // `Checker.iife_ret_ctx`.
+    if (ret_ctx == types.no_type and node != 0 and c.iife_ret_ctx_callee == c.nodeKey(node)) {
+        ret_ctx = c.iife_ret_ctx;
+    }
     var ret: TypeId = types.any_type;
     var pred: ?types.Predicate = null;
     if (proto.return_type != 0 and c.nodeTag(proto.return_type) == .type_predicate) {
@@ -1005,6 +1011,7 @@ fn inferGeneratorReturn(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId)
             .is_generator = true,
             .yield_type = 0,
             .yield_ctx = yield_ctx,
+            .gen_ret_ctx = ret_ctx,
         };
         const saved_scope = c.cur_scope;
         defer c.cur_scope = saved_scope;

@@ -869,9 +869,10 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
     // for it), so `IterableIterator<F, F>`'s `return x => x.length` was typed
     // by nothing at all. See `contextualIteration`.
     var yield_ctx: TypeId = 0;
+    var gen_ret_ctx: TypeId = 0;
     if (is_generator) {
-        const src = if (proto.return_type != 0) ann else ret_ctx;
-        if (try contextualIteration(c, src, is_async)) |it| {
+        gen_ret_ctx = if (proto.return_type != 0) ann else ret_ctx;
+        if (try contextualIteration(c, gen_ret_ctx, is_async)) |it| {
             yield_ctx = it.yield;
             eff_ret_ctx = it.ret;
         }
@@ -883,6 +884,7 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
         .is_generator = is_generator,
         .yield_type = yield_type,
         .yield_ctx = yield_ctx,
+        .gen_ret_ctx = gen_ret_ctx,
     };
 
     // Check parameter initializers against annotations.

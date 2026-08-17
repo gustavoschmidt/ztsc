@@ -605,6 +605,18 @@ const FnCtx = struct {
     /// `function*(state: State) { yield 1 }` into a per-yield TS2322 that tsgo
     /// does not report (it blames the argument instead). 0 = none.
     yield_ctx: TypeId = 0,
+    /// The generator's whole contextual RETURN type — its annotation when it
+    /// has one, else the contextual signature's return. This is what tsc's
+    /// `getContextualTypeForYieldOperand` hands a DELEGATION:
+    ///
+    /// ```ts
+    /// return node.asteriskToken ? contextualReturnType
+    ///     : getIterationTypeOfGeneratorFunctionReturnType(Yield, contextualReturnType, isAsync);
+    /// ```
+    ///
+    /// `yield* xs` yields what `xs` yields, so the operand is contextually the
+    /// generator type itself rather than its element. Contextual only. 0 = none.
+    gen_ret_ctx: TypeId = 0,
 };
 
 /// A function body whose check was postponed because it was reached while
@@ -1691,6 +1703,27 @@ pub const Checker = struct {
     /// `stmts.checkExportTarget`'s bare-identifier call, and restored after.
     /// (wave-15 A.)
     in_export_equals_target: bool = false,
+    /// The contextual RETURN type an immediately-invoked function expression
+    /// takes from its call — tsc's last arm of `getContextualReturnType`:
+    ///
+    /// ```ts
+    /// const iife = getImmediatelyInvokedFunctionExpression(functionDecl);
+    /// if (iife) return getContextualType(iife, contextFlags);
+    /// ```
+    ///
+    /// `iife_ret_ctx_callee` is the `nodeKey` of the callee (parens skipped) and
+    /// `iife_ret_ctx` the call's own contextual type; the key is what keeps the
+    /// context on the callee alone, since the arguments — which
+    /// `iifeContextualSig` types as a side query from inside the same call —
+    /// are function expressions just as often. 0 = none.
+    ///
+    /// ztsc's IIFE contextual PARAMETER types already ride a synthetic
+    /// signature (`calls.iifeContextualSig`) whose return is deliberately
+    /// empty; this is the return half, which that signature cannot carry
+    /// because it is built before the call's own contextual type is in reach.
+    /// Set only around `checkExpr`'s call arm, and restored after. (wave-15 A.)
+    iife_ret_ctx_callee: u64 = 0,
+    iife_ret_ctx: TypeId = 0,
     /// A computed member NAME is being checked at all. tsc evaluates one outside
     /// its container's control flow, so a variable read there is never "used
     /// before being assigned" (TS2454): `var s: string; class C { [s]: number }`

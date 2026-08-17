@@ -301,6 +301,20 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         .call_expr, .call_expr_targs, .optional_call => {
             const saved = enterConstraintPos(c, d.lhs, null_node);
             defer c.constraint_pos = saved;
+            // An IIFE's body returns into THIS call's contextual type — see
+            // `Checker.iife_ret_ctx`. Announced here rather than in `calls.zig`
+            // because the synthetic contextual signature an IIFE callee is
+            // checked against is built before `ctx` is in reach there.
+            const saved_iife_callee = c.iife_ret_ctx_callee;
+            const saved_iife_ctx = c.iife_ret_ctx;
+            defer {
+                c.iife_ret_ctx_callee = saved_iife_callee;
+                c.iife_ret_ctx = saved_iife_ctx;
+            }
+            if (ctx != types.no_type and d.lhs != null_node) {
+                c.iife_ret_ctx_callee = c.nodeKey(skipParens(c, d.lhs));
+                c.iife_ret_ctx = ctx;
+            }
             return c.checkCallExpr(node, false, ctx);
         },
         .new_expr, .new_expr_targs, .new_expr_bare => {
@@ -430,10 +444,16 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
                 // `getContextualIterationType`. It is a context and not a
                 // target: nothing below relates the operand to it (see
                 // `FnCtx.yield_ctx`).
-                const ctx_yt: TypeId = if (yt != 0 and yt != types.no_type)
+                // A DELEGATION yields what its operand yields, so the operand
+                // is contextually the generator type itself — tsc's
+                // `getContextualTypeForYieldOperand` returns the contextual
+                // return type unfiltered for `yield*` (`FnCtx.gen_ret_ctx`).
+                const ctx_yt: TypeId = if (delegate)
+                    (if (c.fn_ctx) |fc| fc.gen_ret_ctx else 0)
+                else if (yt != 0 and yt != types.no_type)
                     yt
                 else if (c.fn_ctx) |fc| fc.yield_ctx else 0;
-                const vt = try c.checkExprCached(d.lhs, if (delegate) types.no_type else ctx_yt);
+                const vt = try c.checkExprCached(d.lhs, ctx_yt);
                 if (!delegate and yt != 0 and yt != types.no_type and yt != types.error_type and c.ts.kind(yt) != .any) {
                     // Async generators may yield `T | PromiseLike<T>`:
                     // the yielded value is awaited before it is emitted.
