@@ -653,6 +653,13 @@ fn checkPrivateName(c: *Checker, tok: TokenIndex, a: Atom) Error!TypeId {
 /// apart from this pattern means a `declare global { … }` contribution.
 fn isUmdGlobalRef(c: *Checker, a: Atom, sym: SymbolId) bool {
     if (!c.bind.is_module) return false; // a script may use the global freely
+    // Own-file symbols answer without `symFile`'s binary search — this runs on
+    // every value-position identifier, and a name declared here is never a UMD
+    // global.
+    if (!c.prog.isMergedId(sym)) {
+        const base = c.prog.sym_base;
+        if (sym >= base[c.cur_file] and sym < base[c.cur_file + 1]) return false;
+    }
     if (c.prog.isMergedId(sym)) {
         const parts = c.prog.mergedSym(sym).parts;
         if (parts.len == 0) return false;
