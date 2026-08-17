@@ -43,22 +43,66 @@ const hasValueMeaning = @import("names.zig").hasValueMeaning;
 /// merge is walked part by part.
 pub fn valuelessNamespace(c: *const Checker, sym: SymbolId) bool {
     if (!c.symFlags(sym).namespace_decl) return false;
-    if (!c.prog.isMergedId(sym)) return uninstantiatedPart(c.symFlags(sym));
+    if (!c.prog.isMergedId(sym)) return uninstantiatedPart(c, sym);
     const m = c.prog.mergedSym(sym);
     for (m.parts) |p| {
-        if (!uninstantiatedPart(c.symFlags(p))) return false;
+        if (!uninstantiatedPart(c, p)) return false;
     }
     return m.parts.len != 0;
 }
 
-/// One declaration's flags: a namespace block with no value in it, merged with
-/// nothing that carries a value meaning of its own. An import binding counts
-/// as a value here — an alias's own meaning is the target's, which this
-/// syntactic screen cannot see.
-fn uninstantiatedPart(f: binder.SymbolFlags) bool {
+/// `valuelessNamespace` through an ENTITY-NAME alias. `import U = Outer.uninst`
+/// carries exactly the meanings its right-hand side has, so `typeof U` and
+/// `U.member` in value position are the same TS2708 the namespace's own name
+/// earns (`typeofInternalModules`). The `= require("m")` form has an import
+/// RECORD and is the linker's; only the entity form is walked here.
+pub fn valuelessNamespaceRef(c: *Checker, sym: SymbolId) Error!bool {
+    if (valuelessNamespace(c, sym)) return true;
+    const f = c.symFlags(sym);
+    if (!f.import_binding or c.importTarget(sym) != null) return false;
+    return switch ((try c.importEqualsEntityContainer(sym)) orelse return false) {
+        .ns => |ns| valuelessNamespace(c, ns),
+        .module => false,
+    };
+}
+
+/// One declaration: a namespace block with no value in it, merged with nothing
+/// that carries a value meaning of its own. An import binding counts as a value
+/// here — an alias's own meaning is the target's, which this flag screen cannot
+/// see.
+fn uninstantiatedPart(c: *const Checker, sym: SymbolId) bool {
+    const f = c.symFlags(sym);
     if (!f.namespace_decl or !f.ns_uninstantiated) return false;
-    return !(f.var_decl or f.let_decl or f.const_decl or f.function or f.class or
-        f.param or f.catch_param or f.enum_decl or f.enum_member or f.import_binding);
+    if (f.var_decl or f.let_decl or f.const_decl or f.function or f.class or
+        f.param or f.catch_param or f.enum_decl or f.enum_member or f.import_binding) return false;
+    return !exportsAnAlias(c, sym, 8);
+}
+
+/// The one instantiating shape `ns_uninstantiated` misses. tsc's
+/// `getModuleInstanceStateWorker` returns `NonInstantiated` for an import
+/// declaration only when it is NOT exported, so `namespace C { export import a
+/// = A }` does emit a runtime object — but the parser records that `export` as
+/// a FLAG on the import node instead of as an `export` wrapper, and the
+/// binder's syntactic walk only unwraps the wrapper.
+///
+/// Asked of the symbol table rather than the syntax, and only of a namespace
+/// the flag has already called type-only, so the walk is paid on the handful of
+/// namespaces whose verdict it can change (`exportImportAlias`: `namespace C {
+/// export import a = A }`, read as `C.a.x`). `depth` bounds the nested-block
+/// recursion; a scope tree cannot cycle, so it is only belt and braces.
+fn exportsAnAlias(c: *const Checker, ns: SymbolId, depth: u8) bool {
+    if (depth == 0) return true; // "cannot tell" ⇒ stay silent
+    const nb = c.symBind(ns);
+    const scope = nb.namespaceScopeOf(c.localOf(ns)) orelse return false;
+    const file = c.symFile(ns);
+    for (nb.member_syms[nb.scope_members_start[scope]..nb.scope_members_start[scope + 1]]) |s| {
+        const f = nb.symbol_flags[s];
+        if (!f.exported) continue;
+        if (f.import_binding) return true;
+        if (f.namespace_decl and f.ns_uninstantiated and
+            exportsAnAlias(c, c.toGlobalIn(file, s), depth - 1)) return true;
+    }
+    return false;
 }
 
 /// Value type of an import binding, via the sealed link tables.

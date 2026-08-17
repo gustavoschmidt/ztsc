@@ -41,6 +41,7 @@ const heritage = @import("heritage.zig");
 const index_constraints = @import("index_constraints.zig");
 const isNonPrimitiveKind = @import("assign.zig").isNonPrimitiveKind;
 const isNullishUnion = @import("flow.zig").isNullishUnion;
+const modvalue = @import("modvalue.zig");
 const iteration = @import("iteration.zig");
 const reachability = @import("reachability.zig");
 const reserved_names = @import("reserved_names.zig");
@@ -186,7 +187,7 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
             // expression.
             if (e.module_token == 0 and e.entity != null_node) {
                 const exported = e.flags & ast.Flags.exported != 0 and
-                    e.flags & ast.Flags.declare == 0 and !c.ambient_ctx;
+                    !c.ambient_ctx and !precededByDeclare(c, node);
                 try typespace.checkImportEqualsEntity(c, e.entity, exported);
             }
         },
@@ -227,8 +228,15 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
 fn checkExportTarget(c: *Checker, expr: Node) Error!void {
     if (c.nodeTag(expr) == .identifier) {
         const a = try c.atomOfToken(c.tree.nodeMainToken(expr));
-        // Type or namespace meaning only: a legal export target, silent.
-        if (c.resolveSpace(a, c.cur_scope, true) == .wrong_space) return;
+        switch (c.resolveSpace(a, c.cur_scope, true)) {
+            // Type or namespace meaning only: a legal export target, silent.
+            .wrong_space => return,
+            // `SymbolFlags.All` includes the namespace meaning, so a namespace
+            // that emits no runtime object is a legal export target too — the
+            // value-position TS2708 does not apply here.
+            .sym => |sym| if (try modvalue.valuelessNamespaceRef(c, sym)) return,
+            .none => {},
+        }
     }
     _ = try c.checkExprCached(expr, types.no_type);
 }
