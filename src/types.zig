@@ -367,6 +367,24 @@ pub const obj_flag_mapped_keys: u32 = 128;
 /// signature, which is exactly what makes `E[1]` a `string` instead of a
 /// TS7053.
 pub const obj_flag_enum_index: u32 = 256;
+/// The STRING index signature is declared `readonly` (tsc's
+/// `IndexInfo.isReadonly`). Writing through it — `o.anything = v`, `o[k] = v`,
+/// `delete o.k`, `o[k]++` — is TS2542, and unlike the readonly-PROPERTY refusal
+/// it does NOT suppress the assignability check: tsc's `checkReferenceExpression`
+/// reports and carries on, so `xs[k] = "s"` on a `readonly [k: string]: number`
+/// says both TS2542 and TS2322.
+///
+/// A flag rather than a per-info record because the index slot is a bare
+/// `TypeId` in the object's shape words, and interning must keep
+/// `{ readonly [k: string]: V }` and `{ [k: string]: V }` apart, exactly as
+/// tsc's two `IndexInfo`s are apart.
+pub const obj_flag_readonly_string_index: u32 = 512;
+/// The NUMBER index signature is declared `readonly` — see
+/// `obj_flag_readonly_string_index`. A numeric enum's reverse-mapping signature
+/// (`obj_flag_enum_index`) is readonly too without carrying this bit: tsc's
+/// shared `enumNumberIndexInfo` is built `isReadonly: true`, which is what makes
+/// `E[0] = "x"` TS2542. `numberIndexIsReadonly` folds the two together.
+pub const obj_flag_readonly_number_index: u32 = 1024;
 pub const prop_flag_optional: u32 = 1;
 pub const prop_flag_readonly: u32 = 2;
 /// A `private`/`protected` class member (tsc's `ModifierFlags.NonPublic`).
@@ -778,6 +796,19 @@ pub const Store = struct {
     pub fn objectNumberIndex(s: *const Store, id: TypeId) TypeId {
         if (id < s.base_len) return s.base.?.objectNumberIndex(id);
         return s.extra.items[s.dataA(id) + 2];
+    }
+    /// Is the object's STRING index signature declared `readonly`?
+    /// See `obj_flag_readonly_string_index`.
+    pub fn stringIndexIsReadonly(s: *const Store, id: TypeId) bool {
+        return s.kind(id) == .object and
+            s.objectFlags(id) & obj_flag_readonly_string_index != 0;
+    }
+    /// Is the object's NUMBER index signature declared `readonly`? A numeric
+    /// enum's reverse-mapping signature counts: tsc's shared
+    /// `enumNumberIndexInfo` is `isReadonly: true`.
+    pub fn numberIndexIsReadonly(s: *const Store, id: TypeId) bool {
+        return s.kind(id) == .object and
+            s.objectFlags(id) & (obj_flag_readonly_number_index | obj_flag_enum_index) != 0;
     }
     pub fn objectPropCount(s: *const Store, id: TypeId) u32 {
         return s.dataB(id);

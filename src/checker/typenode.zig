@@ -1081,6 +1081,10 @@ pub fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, obj_flags:
     var nindex: TypeId = 0;
     var sym_index = false;
     var str_index = false;
+    // `readonly` on whichever signature last claimed each slot — tsc's
+    // `IndexInfo.isReadonly`, which the write sites report TS2542 from.
+    var sindex_ro = false;
+    var nindex_ro = false;
     // Method overload grouping: name -> sig list.
     var methods: std.AutoHashMapUnmanaged(Atom, std.ArrayList(TypeId)) = .empty;
     defer {
@@ -1181,9 +1185,12 @@ pub fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, obj_flags:
                 const e = c.tree.extraData(ast.IndexSig, md.lhs);
                 const key = try c.typeFromTypeNode(e.key_type);
                 const val = try c.typeFromTypeNode(e.value_type);
+                const ro = md.rhs & ast.Flags.readonly != 0;
                 if (key == types.number_type) {
                     nindex = val;
+                    nindex_ro = ro;
                 } else {
+                    sindex_ro = ro;
                     // A `symbol`-keyed signature shares the string slot, so
                     // everything that reads an index signature is unchanged;
                     // the flag is only there for `keyof`. A string signature
@@ -1216,10 +1223,12 @@ pub fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, obj_flags:
         if (setter_keys.contains(k.*)) continue;
         if (prop_index.get(k.*)) |idx| props.items[idx].flags |= types.prop_flag_readonly;
     }
-    const flags = if (sym_index and !str_index and nindex == 0)
+    var flags = if (sym_index and !str_index and nindex == 0)
         obj_flags | types.obj_flag_symbol_index
     else
         obj_flags;
+    if (sindex_ro and sindex != 0) flags |= types.obj_flag_readonly_string_index;
+    if (nindex_ro and nindex != 0) flags |= types.obj_flag_readonly_number_index;
     const obj = try c.ts.makeObjectSigs(props.items, sindex, nindex, flags, call_sigs.items, construct_sigs.items);
     for (name_types.items) |nt| {
         try c.putKeyNameType(obj, nt.name, nt.ty);

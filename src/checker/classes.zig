@@ -348,6 +348,18 @@ pub fn mergeBaseResolved(c: *Checker, derived: TypeId, base: TypeId) Error!TypeI
         const obj = (try c.arrayInterfaceObject(base)) orelse return derived;
         return c.mergeBaseObject(derived, obj, false);
     }
+    // `interface X extends C` where `C` names a class VALUE — always through a
+    // `typeof` alias, since a bare class name in an `extends` denotes its
+    // INSTANCE. The value's members live on its static-side object, which
+    // `resolveStructural` does not unwrap to, so the object-only guard dropped
+    // the base whole. The lib is the case in point: `interface
+    // IteratorConstructor extends IteratorObjectConstructor`, with
+    // `type IteratorObjectConstructor = typeof Iterator` over the abstract
+    // class, lost its `new ()` — so `new Iterator<number>()` was a false
+    // TS2351 and `class C extends Iterator<number>` a false TS2507.
+    if (c.ts.kind(base) == .class_value) {
+        return c.mergeBaseObject(derived, try c.classConstructType(c.ts.classSymbol(base)), false);
+    }
     return c.mergeBaseObject(derived, base, false);
 }
 
@@ -400,10 +412,19 @@ pub const ClassIndexInfos = struct {
     /// the domain — the exact condition `typenode`'s interface/type-literal
     /// builder sets `obj_flag_symbol_index` on.
     sym_only: bool = false,
+    /// `readonly` on whichever signature claimed each slot — tsc's
+    /// `IndexInfo.isReadonly`. `class C { static readonly [s: string]: number }`
+    /// makes `C.foo = 1` TS2542.
+    str_readonly: bool = false,
+    num_readonly: bool = false,
 
-    /// `base` plus the symbol-index flag when this half earned it.
+    /// `base` plus the symbol-index and readonly-index flags this half earned.
     pub fn objFlags(i: ClassIndexInfos, base: u32) u32 {
-        return if (i.sym_only) base | types.obj_flag_symbol_index else base;
+        var f = base;
+        if (i.sym_only) f |= types.obj_flag_symbol_index;
+        if (i.str_readonly and i.str != 0) f |= types.obj_flag_readonly_string_index;
+        if (i.num_readonly and i.num != 0) f |= types.obj_flag_readonly_number_index;
+        return f;
     }
 };
 
@@ -443,14 +464,18 @@ pub fn classIndexInfos(c: *Checker, sym: SymbolId, statics: bool) Error!ClassInd
             const e = c.tree.extraData(ast.IndexSig, md.lhs);
             const key = try c.typeFromTypeNode(e.key_type);
             const val = try c.typeFromTypeNode(e.value_type);
+            const ro = md.rhs & ast.Flags.readonly != 0;
             if (key == types.number_type) {
                 out.num = val;
+                out.num_readonly = ro;
             } else if (key == types.string_type) {
                 str_index = true;
                 out.str = val;
+                out.str_readonly = ro;
             } else if (key == types.symbol_type) {
                 sym_index = true;
                 out.str = val;
+                out.str_readonly = ro;
             }
         }
     }
@@ -527,7 +552,18 @@ pub fn mergeBaseObjectPlain(c: *Checker, derived: TypeId, base: TypeId, union_ov
 /// `[s: symbol]: V`) would otherwise read that value type back as a STRING
 /// index — turning every inherited member into an index-signature violation.
 fn mergedIndexFlags(c: *const Checker, derived: TypeId, base: TypeId, nidx: TypeId) u32 {
-    const flags = c.ts.objectFlags(derived);
+    var flags = c.ts.objectFlags(derived);
+    // Each slot's `readonly` bit follows whichever side SUPPLIED the slot: an
+    // inherited `readonly [k: string]` is still readonly on the derived shape
+    // (`interface B extends A {}` — TS2542 on `b.x = 1`). The derived object's
+    // own bit is only ever set alongside its own slot, so nothing spurious
+    // survives when the base wins.
+    if (c.ts.objectStringIndex(derived) == 0 and
+        c.ts.objectFlags(base) & types.obj_flag_readonly_string_index != 0)
+        flags |= types.obj_flag_readonly_string_index;
+    if (c.ts.objectNumberIndex(derived) == 0 and
+        c.ts.objectFlags(base) & types.obj_flag_readonly_number_index != 0)
+        flags |= types.obj_flag_readonly_number_index;
     if (c.ts.objectStringIndex(derived) != 0) return flags;
     const from_base = c.ts.objectFlags(base) & types.obj_flag_symbol_index != 0;
     // A number index — from either side — takes the domain back.

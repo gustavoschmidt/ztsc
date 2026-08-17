@@ -837,38 +837,38 @@ pub const LazyStat = enum(u8) {
 };
 
 pub const map_containers = [_][]const u8{
-    "node_types",             "sig_cache",                "node_scopes",
-    "reassigned_syms",        "reassigned_in_loop",       "member_written_syms",
-    "member_written_in_loop", "ns_types",                 "ambient_ns_types",
-    "relation",               "expansions",               "overload_groups",
-    "overload_group_pool",    "origin",                   "iface_generic",
-    "iface_stack",            "pending_class_decos",      "class_inst_generic",
-    "class_static_cache",     "class_static_stack",       "class_ctor_cache",
-    "enum_value_cache",       "enum_info_cache",          "enum_relation_cache",
-    "alias_generic",          "alias_state",              "alias_recursive",
-    "flow_same",              "flow_narrow",              "ref_keys",
-    "flow_loop_stack",        "flow_stack",               "flow_tmp",
-    "flow_reduce",            "da_cache",                 "ctp_cache",
-    "cmp_cache",              "ctt_cache",                "ci_cache",
-    "infer_visited",          "subst_this_cache",         "mmp_cache",
-    "arrayish_elem_cache",    "tp_constraint_cache",      "erase_cache",
-    "erase_any_cache",        "inst_map_ids",             "fresh_tp_ids",
-    "this_tp_ids",            "fresh_tp_info",            "type_node_cache",
-    "atom_cache",             "infer_ids",                "infer_constraints",
-    "infer_scopes",           "mapped_key_ids",           "mapped_key_scopes",
-    "inst_diag_at",           "infer_active",             "lazy_member_active",
-    "chain_guards",           "never_isect",              "deep_path_list",
-    "deep_path_ids",          "flow_reach",               "member_type_stack",
-    "lazy_index_objs",        "pending_type_args",        "pending_type_args_pool",
-    "pending_type_args_seen", "tp_constrained_cache",     "nominal_bases",
-    "nominal_base_pool",      "keyof_mapped_active",      "ctp_syms_seen",
-    "weak_types",             "base_ref_active",          "lazy_member",
-    "trunc_lazy_member",      "lazy_map",                 "pattern_root_decls",
-    "pattern_root_ids",       "pattern_narrow_busy",      "key_name_types",
-    "enum_members",           "keyof_obj_cache",          "trunc_expansions",
-    "inst_map_bytes",         "tp_mentions",              "smk_cache",
-    "rel_maybe",              "spec_sym_types",           "spec_tainted",
-    "last_assign_pos",        "definitely_assigned_syms",
+    "node_types",             "sig_cache",              "node_scopes",
+    "reassigned_syms",        "reassigned_in_loop",     "member_written_syms",
+    "member_written_in_loop", "ns_types",               "ambient_ns_types",
+    "relation",               "expansions",             "overload_groups",
+    "overload_group_pool",    "origin",                 "iface_generic",
+    "iface_stack",            "pending_class_decos",    "class_inst_generic",
+    "class_static_cache",     "class_static_stack",     "class_ctor_cache",
+    "enum_value_cache",       "enum_info_cache",        "enum_relation_cache",
+    "alias_generic",          "alias_state",            "alias_recursive",
+    "flow_same",              "flow_narrow",            "ref_keys",
+    "flow_loop_stack",        "flow_stack",             "flow_tmp",
+    "flow_reduce",            "da_cache",               "ctp_cache",
+    "cmp_cache",              "ctt_cache",              "ci_cache",
+    "infer_visited",          "subst_this_cache",       "mmp_cache",
+    "arrayish_elem_cache",    "tp_constraint_cache",    "erase_cache",
+    "erase_any_cache",        "inst_map_ids",           "fresh_tp_ids",
+    "this_tp_ids",            "fresh_tp_info",          "type_node_cache",
+    "atom_cache",             "infer_ids",              "infer_constraints",
+    "infer_scopes",           "mapped_key_ids",         "mapped_key_scopes",
+    "inst_diag_at",           "infer_active",           "lazy_member_active",
+    "this_bound_fns",         "chain_guards",           "never_isect",
+    "deep_path_list",         "deep_path_ids",          "flow_reach",
+    "member_type_stack",      "lazy_index_objs",        "pending_type_args",
+    "pending_type_args_pool", "pending_type_args_seen", "tp_constrained_cache",
+    "nominal_bases",          "nominal_base_pool",      "keyof_mapped_active",
+    "ctp_syms_seen",          "weak_types",             "base_ref_active",
+    "lazy_member",            "trunc_lazy_member",      "lazy_map",
+    "pattern_root_decls",     "pattern_root_ids",       "pattern_narrow_busy",
+    "key_name_types",         "enum_members",           "keyof_obj_cache",
+    "trunc_expansions",       "inst_map_bytes",         "tp_mentions",
+    "smk_cache",              "rel_maybe",              "spec_sym_types",
+    "spec_tainted",           "last_assign_pos",        "definitely_assigned_syms",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -1812,6 +1812,19 @@ pub const Checker = struct {
     fn_ctx: ?FnCtx = null,
     /// `this` type inside class methods (0 = any).
     this_type: TypeId = 0,
+    /// Function expressions that HAVE a receiver without declaring a `this`
+    /// parameter, keyed `(file << 32) | node`: an object-literal member
+    /// (`{ m() {…} }`, `{ a: function () {…} }` — tsc's
+    /// `getContainingObjectLiteral`) and one that took a `this` from its
+    /// contextual signature. A `this` inside such a function is not TS2683; see
+    /// `expr.thisFrameOwnsThis`.
+    ///
+    /// A monotonic marker set rather than a saved/restored context field
+    /// because a class field initializer's body walk is DEFERRED
+    /// (`DeferredBody`) and runs long after the object literal that owns it has
+    /// been left. Being an object-literal member is a property of the NODE, so
+    /// recording it once is both correct and cheaper than threading it.
+    this_bound_fns: std.AutoHashMapUnmanaged(u64, void) = .empty,
     /// The class symbol whose constructor body is currently being checked
     /// (`no_symbol` = not in a constructor). A `readonly` property may be
     /// assigned via `this.x` inside the constructor of the class that OWNS the
@@ -3685,6 +3698,7 @@ pub const Checker = struct {
     const props_zig = @import("checker/props.zig");
     pub const propOfType = props_zig.propOfType;
     pub const propOfTypeEx = props_zig.propOfTypeEx;
+    pub const propOfTypeViaIndex = props_zig.propOfTypeViaIndex;
     pub const ctxPropOfType = props_zig.ctxPropOfType;
     pub const objectInterfaceProp = props_zig.objectInterfaceProp;
     pub const arrayApparentObject = props_zig.arrayApparentObject;
