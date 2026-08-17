@@ -10,6 +10,7 @@ const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
 const numeric_lit = @import("../numeric_lit.zig");
 const modules = @import("../link/modules.zig");
+const paths = @import("../link/paths.zig");
 
 const Node = ast.Node;
 const null_node = ast.null_node;
@@ -424,7 +425,15 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             const in_async = if (c.fn_ctx) |fc| fc.is_async else false;
             const delegate = d.rhs != 0;
             if (d.lhs != 0) {
-                const vt = try c.checkExprCached(d.lhs, if (delegate) types.no_type else yt);
+                // With no annotation to check against, the operand is still
+                // TYPED by the contextual signature's yield type — tsc's
+                // `getContextualIterationType`. It is a context and not a
+                // target: nothing below relates the operand to it (see
+                // `FnCtx.yield_ctx`).
+                const ctx_yt: TypeId = if (yt != 0 and yt != types.no_type)
+                    yt
+                else if (c.fn_ctx) |fc| fc.yield_ctx else 0;
+                const vt = try c.checkExprCached(d.lhs, if (delegate) types.no_type else ctx_yt);
                 if (!delegate and yt != 0 and yt != types.no_type and yt != types.error_type and c.ts.kind(yt) != .any) {
                     // Async generators may yield `T | PromiseLike<T>`:
                     // the yielded value is awaited before it is emitted.
@@ -584,6 +593,55 @@ fn checkPrivateName(c: *Checker, tok: TokenIndex, a: Atom) Error!TypeId {
     }
 }
 
+/// TS2686 — a VALUE-position name that reaches its symbol only through a UMD
+/// global (`export as namespace X`), read from a file that is itself a module.
+///
+/// tsc's rule, in `resolveNameHelper`'s lazy-diagnostic block:
+///
+/// ```ts
+/// if (result && isInExternalModule && (meaning & Value) === Value && …) {
+///     const merged = getMergedSymbol(result);
+///     if (length(merged.declarations) && every(merged.declarations, d =>
+///             isNamespaceExportDeclaration(d) || isSourceFile(d) && !!d.symbol.globalExports)) {
+///         errorOrSuggestion(!allowUmdGlobalAccess, errorLocation, …);
+///     }
+/// }
+/// ```
+///
+/// A module that wants the module's exports has to import them; the global name
+/// exists for scripts. Only the VALUE meaning is refused — `declare let y: Foo`
+/// and `Foo.SubThing` in a type position are legal, which is why this lives in
+/// the value-expression identifier arm and nowhere else.
+///
+/// ztsc reaches the same verdict without tsc's alias symbol. A UMD name is
+/// published by a declaration file that is a MODULE, and the only way another
+/// file can see such a file's top-level name without importing it IS the UMD
+/// entry the linker splices into `globals` — whether the linker modeled it as
+/// the synthetic namespace (`umdNamespace`) or as the `export = <entity>`
+/// symbol the binder harvested (`umd8`'s `export = Thing; export as namespace
+/// Foo`). So "the resolved symbol lives in a declaration module that publishes
+/// this very name" is the whole test: an import binding, a local shadow, and a
+/// script's or lib's own global all live somewhere else and answer false.
+///
+/// Cost: the three flag tests are free, and the `export as namespace` scan
+/// behind them walks ONE file's top-level statement tags — reached only by a
+/// value name that resolves across a file boundary into a declaration module,
+/// which apart from this pattern means a `declare global { … }` contribution.
+fn isUmdGlobalRef(c: *Checker, a: Atom, sym: SymbolId) bool {
+    if (!c.bind.is_module) return false; // a script may use the global freely
+    const file = c.symFile(sym);
+    if (file == c.cur_file) return false;
+    const f = &c.prog.files[file];
+    if (!f.bind.is_module or !paths.isDeclarationPath(f.path)) return false;
+    const want = c.atomText(a);
+    for (f.tree.nodeRange(ast.root_node)) |stmt| {
+        if (f.tree.nodeTag(stmt) != .export_as_ns) continue;
+        const tok: TokenIndex = @intCast(f.tree.nodeData(stmt).lhs);
+        if (std.mem.eql(u8, f.tree.tokenSlice(f.src, tok), want)) return true;
+    }
+    return false;
+}
+
 fn checkIdentifier(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     const tok = c.tree.nodeMainToken(node);
     if (c.tree.tokens.tag(tok) == .keyword_undefined) return types.undefined_type;
@@ -592,6 +650,14 @@ fn checkIdentifier(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     switch (c.resolveSpace(a, c.cur_scope, true)) {
         .sym => |sym| {
             const f = c.symFlags(sym);
+            if (isUmdGlobalRef(c, a, sym)) {
+                try c.diagFmt(
+                    2686,
+                    c.tokSpan(tok),
+                    "'{s}' refers to a UMD global, but the current file is a module. Consider adding an import instead.",
+                    .{c.tokenText(tok)},
+                );
+            }
             // A namespace with no value in it is not a value (tsc's
             // `checkAndReportErrorForUsingNamespaceAsTypeOrValue`).
             if (modvalue.interesting(f) and try modvalue.valuelessNamespaceRef(c, sym, f)) {
@@ -730,6 +796,11 @@ fn checkTdz(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex) Error!void 
     // method, while a non-ambient class FIELD still reports.
     // (wave-10 A: one flagged guard.)
     if (c.defer_computed_key_tdz) return;
+    // …and so does the operand of `export = X`, which tsc's
+    // `isBlockScopedNameDeclaredBeforeUse` exempts outright: the export
+    // statement moves during emit, so `export = T` before `class T {}` has no
+    // dead zone to be in. See `Checker.in_export_equals_target`.
+    if (c.in_export_equals_target) return;
     const use_container = c.containerOf(c.cur_scope);
     const decl_container = c.containerOf(c.symScope(sym));
     if (use_container != decl_container) return;

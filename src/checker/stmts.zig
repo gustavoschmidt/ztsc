@@ -208,7 +208,7 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
                 .enum_decl,
                 .namespace_decl,
                 => try c.checkStatement(d.lhs),
-                else => try checkExportTarget(c, d.lhs),
+                else => try checkExportTarget(c, d.lhs, c.nodeTag(node) == .export_assign),
             }
         },
         else => _ = try c.checkExprCached(node, types.no_type),
@@ -225,8 +225,13 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
 /// So `export = SomeInterface` and `export default SomeTypeAlias` are legal
 /// export targets, not value-position uses, and neither is TS2693.
 /// Everything that is not a bare identifier is an ordinary expression.
-fn checkExportTarget(c: *Checker, expr: Node) Error!void {
-    if (c.nodeTag(expr) == .identifier) {
+///
+/// `is_export_equals` distinguishes `export = X` from `export default X`: only
+/// the former lifts the temporal-dead-zone rule off its operand — see
+/// `Checker.in_export_equals_target`.
+fn checkExportTarget(c: *Checker, expr: Node, is_export_equals: bool) Error!void {
+    const bare_ident = c.nodeTag(expr) == .identifier;
+    if (bare_ident) {
         const a = try c.atomOfToken(c.tree.nodeMainToken(expr));
         switch (c.resolveSpace(a, c.cur_scope, true)) {
             // Type or namespace meaning only: a legal export target, silent.
@@ -238,6 +243,9 @@ fn checkExportTarget(c: *Checker, expr: Node) Error!void {
             .none => {},
         }
     }
+    const saved = c.in_export_equals_target;
+    c.in_export_equals_target = is_export_equals and bare_ident;
+    defer c.in_export_equals_target = saved;
     _ = try c.checkExprCached(expr, types.no_type);
 }
 
@@ -709,6 +717,34 @@ pub fn drainDeferredBodies(c: *Checker) Error!void {
     c.deferred_bodies.clearRetainingCapacity();
 }
 
+/// The yield and return contexts a generator takes from a CONTEXTUAL return
+/// type — tsc's `getContextualIterationType`, which reads
+/// `getIterationTypeOfGeneratorFunctionReturnType` off the contextual signature's
+/// return type. Null when that type names no generator.
+///
+/// The contextual type is routinely a UNION with the generator as one arm
+/// (`() => number | Generator<(arg: number) => void, any, void>` —
+/// `contextualTypeOnYield1`), so the first arm that names one wins; tsc reaches
+/// the same place through `getIterationTypesOfType` over the union.
+///
+/// Purely contextual: both halves only TYPE the operands, and nothing is
+/// reported against either — see `FnCtx.yield_ctx`.
+pub const IterationCtx = struct { yield: TypeId, ret: TypeId };
+
+pub fn contextualIteration(c: *Checker, ctx: TypeId, is_async: bool) Error!?IterationCtx {
+    if (ctx == 0 or ctx == types.no_type) return null;
+    if (c.ts.kind(ctx) == .union_type) {
+        for (try c.memberList(ctx)) |m| {
+            if (try contextualIteration(c, m, is_async)) |it| return it;
+        }
+        return null;
+    }
+    const y = if (is_async) c.asyncGeneratorYieldType(ctx) else c.generatorYieldType(ctx);
+    if (y == 0) return null;
+    const args = c.ts.refArgs(ctx);
+    return .{ .yield = y, .ret = if (args.len >= 2) args[1] else types.no_type };
+}
+
 /// `ret_ctx` is the contextual signature's return type when this function
 /// has no return annotation (0 otherwise / when there is no context). It
 /// only supplies a contextual type to the return expressions — the
@@ -825,7 +861,29 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
     // `eff_ann` does for a written `Promise<T>`.
     var eff_ret_ctx: TypeId = if (proto.return_type == 0 and !is_generator) ret_ctx else types.no_type;
     if (eff_ret_ctx != types.no_type and is_async) eff_ret_ctx = try c.awaitedType(eff_ret_ctx);
-    c.fn_ctx = .{ .ret_ann = eff_ann, .ret_ctx = eff_ret_ctx, .is_async = is_async, .is_generator = is_generator, .yield_type = yield_type };
+    // A generator's yield and return contexts come from its
+    // `Generator<T, TReturn, …>` — the WRITTEN one when there is an
+    // annotation, else the contextual signature's return type. Both are
+    // contexts only; `yield_type` above is the sole check target, and a
+    // generator's `return` expression has never had one (`eff_ann` is cleared
+    // for it), so `IterableIterator<F, F>`'s `return x => x.length` was typed
+    // by nothing at all. See `contextualIteration`.
+    var yield_ctx: TypeId = 0;
+    if (is_generator) {
+        const src = if (proto.return_type != 0) ann else ret_ctx;
+        if (try contextualIteration(c, src, is_async)) |it| {
+            yield_ctx = it.yield;
+            eff_ret_ctx = it.ret;
+        }
+    }
+    c.fn_ctx = .{
+        .ret_ann = eff_ann,
+        .ret_ctx = eff_ret_ctx,
+        .is_async = is_async,
+        .is_generator = is_generator,
+        .yield_type = yield_type,
+        .yield_ctx = yield_ctx,
+    };
 
     // Check parameter initializers against annotations.
     for (c.tree.extraRange(proto.params_start, proto.params_end)) |pn| {

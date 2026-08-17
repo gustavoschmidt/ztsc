@@ -594,6 +594,17 @@ const FnCtx = struct {
     /// `IterableIterator<T>` return: the yield element type `T` (0 = infer /
     /// unchecked).
     yield_type: TypeId = 0,
+    /// Contextual yield type for a generator with NO return annotation that is
+    /// being checked against a contextual signature — tsc's
+    /// `getContextualIterationType(IterationTypeKind.Yield, func)`, which reads
+    /// the CONTEXTUAL return type's `Generator<T, …>` arm. It types the yield
+    /// operands and is never reported against, exactly like `ret_ctx`.
+    ///
+    /// Deliberately NOT `yield_type`: that one is a check target, and reusing
+    /// it would turn `generatorTypeCheck63`'s contextually typed
+    /// `function*(state: State) { yield 1 }` into a per-yield TS2322 that tsgo
+    /// does not report (it blames the argument instead). 0 = none.
+    yield_ctx: TypeId = 0,
 };
 
 /// A function body whose check was postponed because it was reached while
@@ -1665,6 +1676,21 @@ pub const Checker = struct {
     /// only around `computed_key.checkMemberNames`, which documents the boundary.
     /// (wave-10 A.)
     defer_computed_key_tdz: bool = false,
+    /// The bare identifier being checked is the operand of `export = X`. tsc's
+    /// `isBlockScopedNameDeclaredBeforeUse` exempts it by name — "inside a TS
+    /// export= declaration (since we will move the export statement during emit
+    /// to avoid TDZ)" — so
+    ///
+    ///     export = T;
+    ///     class T<X> { foo: X }
+    ///
+    /// is legal and earns no TS2449, while the same forward reference under
+    /// `export default` (not an export ASSIGNMENT) still reports. The exemption
+    /// is on the IMMEDIATE operand only: `export = ns.T` uses `ns` inside a
+    /// property access and is not exempt. Read by `checkTdz`; set only around
+    /// `stmts.checkExportTarget`'s bare-identifier call, and restored after.
+    /// (wave-15 A.)
+    in_export_equals_target: bool = false,
     /// A computed member NAME is being checked at all. tsc evaluates one outside
     /// its container's control flow, so a variable read there is never "used
     /// before being assigned" (TS2454): `var s: string; class C { [s]: number }`

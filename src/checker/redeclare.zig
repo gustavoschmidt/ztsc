@@ -291,6 +291,22 @@ pub fn checkSubsequentVarDecl(c: *Checker, decl: Node, is_const: bool) Error!voi
     };
     const f = c.symFlags(sym);
     if (!(f.var_decl or f.let_decl or f.const_decl)) return;
+    // A BLOCK-SCOPED name never has a subsequent declaration to check. tsc's
+    // `declareSymbol` reports the redeclaration (TS2451, or TS2300 when the
+    // first declaration was a `var`) and then gives the offending declaration
+    // a FRESH symbol, so `node === symbol.valueDeclaration` holds for it and
+    // `checkVariableLikeDeclaration` takes the first arm:
+    //
+    //     var a = 10; let a;          // TS2300 twice — and no TS2403
+    //     let b: number; let b: string;   // TS2451 twice — and no TS2403
+    //
+    // `let`/`const` excludes every value meaning (tsc's
+    // `BlockScopedVariableExcludes`), so ONE such bit on the symbol means every
+    // declaration after the first clashed. `var` beside `var` — the only pair
+    // that really merges — is what is left, and it is the shape TS2403 is for.
+    // (The cross-file spelling of the same rule is `mergeClash` in
+    // `firstValueDeclOf`.)
+    if (f.let_decl or f.const_decl) return;
     const value_decl = (try firstValueDeclOf(c, sym)) orelse return;
     // Node ids are per-file, so "this declarator IS the value declaration" is
     // only a question within one file.
