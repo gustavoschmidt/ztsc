@@ -2717,11 +2717,6 @@ const Binder = struct {
         body: bool = false,
     };
 
-    /// tsc's `ModifierFlags.ParameterPropertyModifier` — the modifiers whose
-    /// presence on a parameter makes it a parameter property.
-    const param_prop_mask = ast.Flags.public | ast.Flags.private |
-        ast.Flags.protected | ast.Flags.readonly | ast.Flags.override;
-
     fn bindParam(b: *Binder, node: Node, home: ParamHome) Error!void {
         if (node == null_node) return;
         const d = b.tree.nodeData(node);
@@ -2741,7 +2736,7 @@ const Binder = struct {
                 // every other position rejects the modifier. `main_token` on a
                 // `.param_full` is the parameter's first token — the modifier
                 // itself, which is where tsc's parameter-node span starts.
-                if (e.flags & param_prop_mask != 0 and !(home.ctor and home.body)) {
+                if (e.flags & member_names.param_property_mask != 0 and !(home.ctor and home.body)) {
                     try b.diag(.param_property_outside_ctor_impl, b.tree.nodeMainToken(node));
                 }
                 // TS2371, the same rule for the other thing a body is needed

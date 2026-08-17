@@ -444,7 +444,7 @@ fn addParamProps(c: *Checker, proto_idx: ast.ExtraIndex, out: *Own) Error!void {
         if (p == null_node or c.nodeTag(p) != .param_full) continue;
         const pd = c.tree.nodeData(p);
         const e = c.tree.extraData(ast.ParamFull, pd.rhs);
-        if (e.flags & param_prop_mask == 0) continue;
+        if (e.flags & member_names.param_property_mask == 0) continue;
         // Only a plain identifier parameter names a member; a binding pattern
         // with a modifier is TS1187 and declares nothing.
         if (c.nodeTag(pd.lhs) != .identifier) continue;
@@ -454,11 +454,6 @@ fn addParamProps(c: *Checker, proto_idx: ast.ExtraIndex, out: *Own) Error!void {
         }
     }
 }
-
-/// tsc's `ModifierFlags.ParameterPropertyModifier` — what makes a constructor
-/// parameter declare a class member (the binder's `param_prop_mask`).
-const param_prop_mask = ast.Flags.public | ast.Flags.private |
-    ast.Flags.protected | ast.Flags.readonly | ast.Flags.override;
 
 fn gatherInterfaceBlocks(c: *Checker, sym: SymbolId, out: *Own) Error!void {
     const saved_ctx = c.enterSymFile(sym);
