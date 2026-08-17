@@ -37,6 +37,7 @@ const FileId = checker_zig.FileId;
 const hasTypeMeaning = @import("names.zig").hasTypeMeaning;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
 const static_tp_scope = @import("static_tp_scope.zig");
+const typeparams = @import("typeparams.zig");
 const indexOfAtom = @import("generics.zig").indexOfAtom;
 const intrinsicStringMapping = @import("generics.zig").intrinsicStringMapping;
 const stripQuotes = Checker.stripQuotes;
@@ -668,21 +669,39 @@ pub fn importTypeMember(c: *Checker, import_node: Node, name_tok: TokenIndex, ar
     return types.error_type;
 }
 
-/// Does this symbol's whole meaning consist of being a namespace? tsc's
-/// `SymbolFlags.Type` excludes `Namespace`, so such a symbol names no type —
-/// see `materializeTypeRef`'s TS2709 arm and the qualified-member test.
-///
-/// A VALUE meaning is excluded too, and not because it makes the name a type:
-/// tsc answers a different diagnostic for that shape. `namespace A { export
-/// function B<T>(x: T) {} export namespace B { … } }` with `var b: A.B` is
-/// TS2749 ("refers to a value … did you mean 'typeof A.B'?"), spanning the
-/// WHOLE dotted name, not the TS2694 this predicate leads to. Until that
-/// message is spelled, such a member keeps its pre-existing silent `any`.
-fn pureNamespace(f: binder.SymbolFlags) bool {
-    if (!f.namespace_decl) return false;
-    return !(f.class or f.interface or f.type_alias or f.type_param or
-        f.enum_decl or f.import_binding or
-        f.function or f.var_decl or f.let_decl or f.const_decl);
+/// Does a namespace member name a TYPE? tsc's `SymbolFlags.Type` — `Class |
+/// Interface | Enum | EnumMember | TypeLiteral | TypeParameter | TypeAlias` —
+/// plus `Alias`, which stands for whatever it resolves to. `Namespace` is
+/// deliberately absent, which is the same exclusion `materializeTypeRef`'s
+/// TS2709 arm draws for a bare name: `namespace P { export namespace R { … } }`
+/// with `var x: P.R` is "Namespace 'P' has no exported member 'R'".
+fn memberNamesAType(f: binder.SymbolFlags) bool {
+    return f.class or f.interface or f.type_alias or f.type_param or
+        f.enum_decl or f.enum_member or f.import_binding;
+}
+
+/// Does a namespace member name a VALUE? A `namespace` block does only when it
+/// is INSTANTIATED (tsc's `ValueModule` vs `NamespaceModule`): `namespace S {
+/// export var y = 1 }` is a value, `namespace R { export interface I {} }` is
+/// not. Both oracle-verified — the first is TS2749, the second TS2694.
+fn memberNamesAValue(f: binder.SymbolFlags) bool {
+    return f.var_decl or f.let_decl or f.const_decl or f.function or f.class or
+        f.enum_decl or f.enum_member or (f.namespace_decl and !f.ns_uninstantiated);
+}
+
+/// `A.Deep.G` — the written entity name, rebuilt from its tokens (tsc's
+/// `entityNameToString`) for the messages that quote the WHOLE dotted name
+/// rather than one segment. Scratch-allocated; `diagFmt` copies.
+fn entityNameText(c: *Checker, node: Node, out: *std.ArrayList(u8)) Error!void {
+    switch (c.nodeTag(node)) {
+        .qualified_name, .member_expr => {
+            const d = c.tree.nodeData(node);
+            try entityNameText(c, d.lhs, out);
+            try out.append(c.scratch(), '.');
+            try out.appendSlice(c.scratch(), c.tokenText(d.rhs));
+        },
+        else => try out.appendSlice(c.scratch(), c.tokenText(c.tree.nodeMainToken(node))),
+    }
 }
 
 /// The qualifier of a dotted type name reached no container. tsc splits that
@@ -693,7 +712,12 @@ fn pureNamespace(f: binder.SymbolFlags) bool {
 ///     meaning (`var vv; let x: vv.T`) — TS2503 "Cannot find namespace";
 ///   * it resolves to a TYPE that is not a container (a class, an interface, a
 ///     type alias) — TS2702 "only refers to a type, but is being used as a
-///     namespace here".
+///     namespace here", refined to TS2713 ("… Did you mean to retrieve the type
+///     of the property …") when that type actually HAS the property the dotted
+///     name went on to ask for. `member_tok` is that property's token: the
+///     caller's own right-hand side for `T.abc`, or — when the failure is
+///     deeper in the chain — the INNERMOST segment, which is the one tsc
+///     quotes (`I.nested.deep` reports about `I.nested`).
 ///
 /// Both oracle-verified against tsgo 7.0.2, together with the two cases that
 /// must stay silent here: a resolved container whose deeper segment failed
@@ -703,9 +727,48 @@ fn pureNamespace(f: binder.SymbolFlags) bool {
 ///
 /// Returns whether it reported, so the caller can answer `error` instead of
 /// `any` exactly when tsc does.
-fn reportBadNsQualifier(c: *Checker, node: Node) Error!bool {
+/// Does the type `sym` declares carry a property named by `member_tok`? The
+/// TS2702-vs-TS2713 test: tsc offers the indexed-access rewrite (`T["abc"]`)
+/// exactly when the rewrite would have worked.
+///
+/// The type is built with `sym`'s own type parameters standing in for
+/// themselves (tsc's `getDeclaredTypeOfSymbol`) rather than through
+/// `namedTypeFromSymbol`, whose `fixTypeArgs` would report a second, spurious
+/// TS2314 for a generic name written bare — `interface G<T> { a: T }` with
+/// `let x: G.a` is TS2713 alone.
+///
+/// `allow_index = false`, which is tsc's rule here twice over: a string index
+/// signature does NOT make the name a property (`interface Idx { [k: string]:
+/// number }` with `Idx.whatever` stays TS2702), and neither do the CLASS's
+/// static members (only the instance type is consulted). It also means the
+/// apparent members every object inherits from the global `Object` interface
+/// are not consulted, where tsc does offer the rewrite (`Q.toString`); that
+/// stays TS2702 — the refinement only ever under-fires, never over-fires.
+fn qualifierHasProp(c: *Checker, sym: SymbolId, tok: TokenIndex, member_tok: TokenIndex) Error!bool {
+    if (member_tok == 0) return false;
+    const f = c.symFlags(sym);
+    const declared: TypeId = if (f.type_param)
+        try c.ts.makeTypeParam(sym)
+    else if (f.enum_decl)
+        try c.ts.makeEnumType(sym)
+    else blk: {
+        var tps: std.ArrayList(typeparams.TypeParamInfo) = .empty;
+        defer tps.deinit(c.scratch());
+        try c.typeParamsOf(sym, &tps);
+        const args = try c.scratch().alloc(TypeId, tps.items.len);
+        for (tps.items, 0..) |tp, i| args[i] = try c.ts.makeTypeParam(tp.sym);
+        if (f.type_alias) break :blk try c.aliasInstance(sym, args, tok);
+        if (f.interface or f.class) break :blk try c.ts.makeRef(sym, args);
+        return false;
+    };
+    return (try c.propOfTypeEx(declared, try c.memberAtom(member_tok), false)) != null;
+}
+
+fn reportBadNsQualifier(c: *Checker, node: Node, member_tok: TokenIndex) Error!bool {
     var n = node;
+    var member = member_tok;
     while (c.nodeTag(n) == .qualified_name or c.nodeTag(n) == .member_expr) {
+        member = c.tree.nodeData(n).rhs;
         n = c.tree.nodeData(n).lhs;
     }
     if (c.nodeTag(n) != .identifier) return false;
@@ -717,13 +780,21 @@ fn reportBadNsQualifier(c: *Checker, node: Node) Error!bool {
     // instanceofOperatorWithRHSHasSymbolHasInstance test).
     if (std.mem.eql(u8, c.tokenText(tok), "globalThis")) return false;
     const a = try c.atomOfToken(tok);
-    const type_only_entity = switch (c.resolveNamespaceSpace(a, c.cur_scope)) {
+    const type_sym: ?SymbolId = switch (c.resolveNamespaceSpace(a, c.cur_scope)) {
         .sym => return false,
-        .wrong_space => |sym| hasTypeMeaning(c.symFlags(sym)),
-        .none => false,
+        .wrong_space => |sym| if (hasTypeMeaning(c.symFlags(sym))) sym else null,
+        .none => null,
     };
     if ((try c.augmentModuleTypeSym(c.cur_scope, a)) != null) return false;
-    if (type_only_entity) {
+    if (type_sym) |sym| {
+        if (try qualifierHasProp(c, sym, tok, member)) {
+            try c.diagFmt(2713, c.tokSpan(tok), "Cannot access '{s}.{s}' because '{s}' is a type, but not a namespace. Did you mean to retrieve the type of the property '{s}' in '{s}' with '{s}[\"{s}\"]'?", .{
+                c.tokenText(tok),    c.tokenText(member), c.tokenText(tok),
+                c.tokenText(member), c.tokenText(tok),    c.tokenText(tok),
+                c.tokenText(member),
+            });
+            return true;
+        }
         try c.diagFmt(2702, c.tokSpan(tok), "'{s}' only refers to a type, but is being used as a namespace here.", .{c.tokenText(tok)});
         return true;
     }
@@ -762,22 +833,29 @@ pub fn typeFromQualifiedName(c: *Checker, node: Node, args: []const TypeId) Erro
         }
     }
     const container = (try c.resolveNsContainer(d.lhs)) orelse {
-        if (try reportBadNsQualifier(c, d.lhs)) return types.error_type;
+        if (try reportBadNsQualifier(c, d.lhs, name_tok)) return types.error_type;
         return types.any_type;
     };
     switch (container) {
         .ns => |ns_sym| {
             if (c.namespaceMemberSym(ns_sym, name)) |g| {
                 const mf = c.symFlags(g);
-                // A member that is ONLY a namespace is not a type — the same
-                // `SymbolFlags.Type` exclusion `materializeTypeRef` draws for a
-                // bare name. `namespace P { export namespace R { … } }` with
-                // `var x: P.R` is TS2694 here (oracle-verified: tsc's message
-                // for it really is "has no exported member 'R'", not TS2709);
-                // without the test `namedTypeFromSymbol` silently answered
-                // `any`.
-                if (mf.exported and hasTypeMeaning(mf) and !pureNamespace(mf)) {
-                    return c.namedTypeFromSymbol(g, args, name_tok);
+                if (mf.exported) {
+                    if (memberNamesAType(mf)) return c.namedTypeFromSymbol(g, args, name_tok);
+                    // Names a value and no type: tsc's `resolveEntityName`
+                    // falls through to the VALUE meaning and answers TS2749
+                    // over the whole dotted name, not TS2694 on the member.
+                    // Reaches `export var v`, `export function fn`, `export
+                    // const c`, an INSTANTIATED `export namespace S`, and the
+                    // fundule pair `export function B<T>() {} export namespace
+                    // B { … }` — which was a silent `any` before.
+                    if (memberNamesAValue(mf)) {
+                        var buf: std.ArrayList(u8) = .empty;
+                        defer buf.deinit(c.scratch());
+                        try entityNameText(c, node, &buf);
+                        try c.diagFmt(2749, c.nodeSpan(node), "'{s}' refers to a value, but is being used as a type here. Did you mean 'typeof {s}'?", .{ buf.items, buf.items });
+                        return types.error_type;
+                    }
                 }
             }
             try c.diagFmt(2694, c.tokSpan(name_tok), "Namespace '{s}' has no exported member '{s}'.", .{ c.symbolName(ns_sym), c.atomText(name) });
