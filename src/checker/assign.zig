@@ -43,6 +43,7 @@ const tuple_zig = @import("tuple_relate.zig");
 const variance_zig = @import("variance.zig");
 const report_zig = @import("assign_report.zig");
 const nominal_members = @import("nominal_members.zig");
+const template_zig = @import("template.zig");
 
 // =====================================================================
 // assignability
@@ -480,7 +481,21 @@ pub fn lenientOverlap(c: *Checker, s0: TypeId, t0: TypeId, depth: u32) Error!boo
                 if (tp.optional()) continue;
                 return false; // required target member absent from source
             };
-            if (!try c.lenientComparable(sp.ty, tp.ty, depth + 1)) return false;
+            // An OPTIONAL property's type INCLUDES `undefined` — tsc's
+            // `getTypeOfSymbol` under `strictNullChecks`, and the same two
+            // lines the assignable walk runs (`structuralAssignable`). Without
+            // them this walk judged the pair on stricter terms than the
+            // relation that sent it here, and a source property that is only
+            // ever absent (`strokeColor?: undefined`, which is what the
+            // shared-widening-context rule writes onto an object literal whose
+            // SIBLINGS declare the name) overlapped no optional target
+            // property at all. excalidraw's `elements as
+            // ExcalidrawElementSkeleton[]` is that cast.
+            var st = sp.ty;
+            if (sp.optional()) st = try c.makeUnion2(st, types.undefined_type);
+            var tt = tp.ty;
+            if (tp.optional()) tt = try c.makeUnion2(tt, types.undefined_type);
+            if (!try c.lenientComparable(st, tt, depth + 1)) return false;
         }
         // A callable/constructable target is decided on its signatures too,
         // not on its (often empty) property table: `{ new (p: A): X }` and
@@ -2462,8 +2477,35 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         // leniently. This under-reports genuine pattern mismatches, which
         // is policy-acceptable for v0.0.1 (identical patterns already
         // resolved via `s == t`). Was a release-blocking FP.
-        if (sk == .template_literal_type or sk == .string_mapping) return true;
+        //
+        // The one half of the comparison that IS sound is tsc's
+        // `templateLiteralTypesDefinitelyUnrelated` (`template.zig`): fixed
+        // text that diverges at the head or the tail rules the pair out no
+        // matter what the holes hold. Applying it here narrows the leniency
+        // to the cases that actually need a matcher.
+        if (sk == .template_literal_type) return !template_zig.definitelyUnrelated(c, s, t);
+        // A string-transform intrinsic gets no such concession: tsc's
+        // `isTypeMatchedByTemplateLiteralType` infers nothing from a
+        // `StringMapping` source, and the base constraint it falls back on is
+        // plain `string`, which no pattern accepts. `Capitalize<string>` is
+        // NOT a `` `A${string}` `` (the empty string is capitalized and has no
+        // `A`), and the conformance case says so.
         return false;
+    }
+    // String-transform intrinsic TARGET. `Uppercase<string>` is not `string`:
+    // it denotes the strings that ARE their own uppercase, so membership is
+    // decided by re-applying the intrinsic stack and asking whether the source
+    // came back unchanged (`isMemberOfStringMapping`). Two intrinsics relate
+    // only when they are the SAME intrinsic over related arguments — tsc
+    // returns outright false for `Lowercase<X>` against `Uppercase<Y>`,
+    // because `Uppercase<Lowercase<string>>` and `Uppercase<string>` really
+    // are different sets (the German sharp s lowercases to `ss`).
+    if (tk == .string_mapping) {
+        if (sk == .string_mapping) {
+            if (c.ts.stringMappingKind(s) != c.ts.stringMappingKind(t)) return false;
+            return c.isAssignable(c.ts.stringMappingArg(s), c.ts.stringMappingArg(t));
+        }
+        return template_zig.isMemberOfStringMapping(c, s, t);
     }
     // Template-literal pattern / string-mapping *source* against anything
     // else: `string` answers for it. Both are SUBTYPES of `string` — that is

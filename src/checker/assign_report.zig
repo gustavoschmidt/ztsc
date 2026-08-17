@@ -711,6 +711,24 @@ pub fn unionElemTypeAt(c: *Checker, ut: TypeId, i: u32) Error!?TypeId {
 ///
 /// Returns null when no constituent matches, which leaves the caller with
 /// its whole-union report.
+/// tsc's `isArrayLikeType`: a real array/tuple, or any non-nullable type that
+/// a `readonly any[]` accepts — which is every interface carrying a numeric
+/// index signature, `ReadonlyArray<T>` above all. Both `getBestMatchingType`
+/// probes that ask the question have to ask it the same way: reading only the
+/// `.array`/`.tuple` KINDS made `StyleProp<T> = null | void | T | false | "" |
+/// ReadonlyArray<StyleProp<T>>` look array-free, so probe (2) never fired and
+/// an object literal against it elaborated per PROPERTY where tsc reports the
+/// literal whole (social-app's `addStyle(style, {height: …})`, whose
+/// `@ts-expect-error` sits on the call line and not on the property).
+fn isArrayLikeMember(c: *Checker, m: TypeId) Error!bool {
+    const rm = try c.resolveStructural(m);
+    return switch (c.ts.kind(rm)) {
+        .array, .tuple => true,
+        .object => c.ts.objectNumberIndex(rm) != 0,
+        else => false,
+    };
+}
+
 pub fn bestMatchingUnionMember(c: *Checker, src_t: TypeId, ut: TypeId) Error!?TypeId {
     const ms = try c.memberList(ut);
     if (ms.len == 0) return null;
@@ -724,23 +742,18 @@ pub fn bestMatchingUnionMember(c: *Checker, src_t: TypeId, ut: TypeId) Error!?Ty
     // `Array` member while a sibling object constituent overlaps on none.
     if (sk == .array or sk == .tuple) {
         for (ms) |m| {
-            const rm = try c.resolveStructural(m);
-            const mk = c.ts.kind(rm);
-            if (mk == .array or mk == .tuple) return m;
-            if (mk == .object and c.ts.objectNumberIndex(rm) != 0) return m;
+            if (try isArrayLikeMember(c, m)) return m;
         }
     }
     if (sk != .object) return null;
     // (2) object source, some array-like constituent -> the first that is not.
     var has_array_like = false;
     for (ms) |m| {
-        const mk = c.ts.kind(try c.resolveStructural(m));
-        if (mk == .array or mk == .tuple) has_array_like = true;
+        if (try isArrayLikeMember(c, m)) has_array_like = true;
     }
     if (has_array_like) {
         for (ms) |m| {
-            const mk = c.ts.kind(try c.resolveStructural(m));
-            if (mk != .array and mk != .tuple) return m;
+            if (!try isArrayLikeMember(c, m)) return m;
         }
     }
     // (3) most shared property names.

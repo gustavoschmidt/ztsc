@@ -1432,11 +1432,6 @@ fn combineTwoUnionSignatures(c: *Checker, left: TypeId, right0: TypeId) Error!?T
     const s = &c.ts;
     if (s.kind(left) != .function or s.kind(right0) != .function) return null;
     if (s.fnThisType(left) != 0 or s.fnThisType(right0) != 0) return null;
-    for ([2]TypeId{ left, right0 }) |sig| {
-        for (0..s.fnParamCount(sig)) |i| {
-            if (s.fnParam(sig, @intCast(i)).rest()) return null;
-        }
-    }
     // The store may grow under `instantiate`/`makeUnion`, so the type-parameter
     // list has to be copied out before anything else touches it.
     const ltp = try c.scratch().dupe(u32, s.fnTypeParams(left));
@@ -1454,11 +1449,23 @@ fn combineTwoUnionSignatures(c: *Checker, left: TypeId, right0: TypeId) Error!?T
         right = try c.instantiate(right0, map);
         if (s.kind(right) != .function) return null;
     }
-    const lc = s.fnParamCount(left);
-    const rc = s.fnParamCount(right);
+    const lc = try unionSigPositions(c, left);
+    const rc = try unionSigPositions(c, right);
     const lreq = try c.requiredParams(left);
     const rreq = try c.requiredParams(right);
     const n = @max(lc, rc);
+    // tsc's `combineUnionParameters` rest bookkeeping: the combined signature
+    // keeps a rest at its LAST position when either side has an effective one
+    // and the longer side is the one that has it; when only the SHORTER side
+    // does, the extra rest is appended as one more position instead. Without
+    // it, a union of `push(...items: number[])` and `push(...items: string[])`
+    // was left as a two-candidate overload set, the first candidate accepted
+    // the argument, and tsc's `never` parameter never appeared
+    // (`controlFlowArrayErrors`' `(boolean[] | (string | number)[]).push(99)`).
+    const either_rest = (try unionSigEffectiveRest(c, left)) or (try unionSigEffectiveRest(c, right));
+    const longest = if (lc >= rc) left else right;
+    const shorter = if (lc >= rc) right else left;
+    const needs_extra_rest = either_rest and !try unionSigEffectiveRest(c, longest);
     var params: std.ArrayList(types.Param) = .empty;
     defer params.deinit(c.scratch());
     for (0..n) |i| {
@@ -1466,19 +1473,62 @@ fn combineTwoUnionSignatures(c: *Checker, left: TypeId, right0: TypeId) Error!?T
         // `tryGetTypeAtPosition` answers `unknown` for a position the shorter
         // signature does not declare, and `unknown` is the intersection's
         // identity — the longer signature's type survives.
-        const lp: TypeId = if (idx < lc) s.fnParam(left, idx).ty else types.unknown_type;
-        const rp: TypeId = if (idx < rc) s.fnParam(right, idx).ty else types.unknown_type;
-        const name: Atom = if (idx < lc) s.fnParam(left, idx).name else s.fnParam(right, idx).name;
-        const optional = idx >= lreq and idx >= rreq;
+        const lp: TypeId = (try c.paramTypeAt(left, idx)) orelse types.unknown_type;
+        const rp: TypeId = (try c.paramTypeAt(right, idx)) orelse types.unknown_type;
+        const name: Atom = paramNameAt(c, left, idx) orelse paramNameAt(c, right, idx) orelse 0;
+        const is_rest = either_rest and !needs_extra_rest and idx + 1 == n;
+        const optional = !is_rest and idx >= lreq and idx >= rreq;
         const ty = try s.makeIntersection(c.scratch(), &.{ lp, rp });
         try params.append(c.scratch(), .{
             .name = name,
-            .ty = ty,
-            .flags = if (optional) types.param_flag_optional else 0,
+            .ty = if (is_rest) try s.makeArray(ty) else ty,
+            .flags = if (is_rest) types.param_flag_rest else if (optional) types.param_flag_optional else 0,
+        });
+    }
+    if (needs_extra_rest) {
+        const et = (try c.paramTypeAt(shorter, n)) orelse types.unknown_type;
+        try params.append(c.scratch(), .{
+            .name = 0,
+            .ty = try s.makeArray(et),
+            .flags = types.param_flag_rest,
         });
     }
     const ret = try s.makeUnion(c.scratch(), &.{ s.fnReturn(left), s.fnReturn(right) });
     return try s.makeFunction(params.items, ret, ltp, 0);
+}
+
+/// tsc's `getParameterCount`: how many POSITIONS a signature declares. A
+/// trailing rest is one position unless it is typed by a tuple, which spreads
+/// into its own elements.
+fn unionSigPositions(c: *Checker, sig: TypeId) Error!u32 {
+    const n = c.ts.fnParamCount(sig);
+    if (n == 0 or !c.ts.fnParam(sig, n - 1).rest()) return n;
+    if (try c.sigRestTuple(sig)) |tup| return n - 1 + c.ts.tupleLen(tup);
+    return n;
+}
+
+/// tsc's `hasEffectiveRestParameter`: a trailing rest that really is
+/// open-ended — a rest typed by a FIXED tuple declares a bounded parameter
+/// list and is not one.
+fn unionSigEffectiveRest(c: *Checker, sig: TypeId) Error!bool {
+    const n = c.ts.fnParamCount(sig);
+    if (n == 0 or !c.ts.fnParam(sig, n - 1).rest()) return false;
+    if (try c.sigRestTuple(sig)) |tup| {
+        const len = c.ts.tupleLen(tup);
+        return len > 0 and c.ts.tupleElem(tup, len - 1).rest();
+    }
+    return true;
+}
+
+/// The declared name at a position, or null past the signature's own list.
+/// A rest position reuses the rest parameter's name, which is what tsc's
+/// `getParameterNameAtPosition` synthesizes from too.
+fn paramNameAt(c: *Checker, sig: TypeId, i: u32) ?Atom {
+    const n = c.ts.fnParamCount(sig);
+    if (n == 0) return null;
+    if (i < n) return c.ts.fnParam(sig, i).name;
+    const last = c.ts.fnParam(sig, n - 1);
+    return if (last.rest()) last.name else null;
 }
 
 /// A TS 4.7 instantiation expression: `f<T>` in value position and

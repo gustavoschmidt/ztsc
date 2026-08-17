@@ -1255,7 +1255,7 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         }
         return c.ts.makeArray(types.any_type); // evolving arrays out of scope
     }
-    return c.ts.makeArray(try arrayLiteralElemType(c, raw_types.items, elem_types.items));
+    return c.ts.makeArray(try arrayLiteralElemType(c, raw_types.items, elem_types.items, rctx == types.no_type));
 }
 
 /// tsc's `createArrayLiteralType`: an array literal's element type is
@@ -1282,8 +1282,9 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
 /// This is what keeps `[{ a: 1 }, { a: 1, b: 2 }]` a two-member union (both
 /// fresh, neither absorbs) while `[a, ab]` of two DECLARED types reduces to
 /// `A`, matching tsc on both.
-fn arrayLiteralElemType(c: *Checker, raw: []const TypeId, widened: []const TypeId) Error!TypeId {
-    std.debug.assert(raw.len == widened.len);
+fn arrayLiteralElemType(c: *Checker, raw: []const TypeId, widened0: []const TypeId, no_ctx: bool) Error!TypeId {
+    std.debug.assert(raw.len == widened0.len);
+    const widened = try siblingNormalized(c, raw, widened0, no_ctx);
     const plain = try c.ts.makeUnion(c.scratch(), widened);
     if (raw.len < 2) return plain;
     const raw_union = try c.ts.makeUnion(c.scratch(), raw);
@@ -1312,20 +1313,32 @@ fn arrayLiteralElemType(c: *Checker, raw: []const TypeId, widened: []const TypeI
     return c.ts.makeUnion(c.scratch(), kept.items);
 }
 
-// An array literal's elements share ONE widening context in tsc, so each
-// object-literal element should gain `name?: undefined` for every name its
-// object-literal SIBLINGS declare (`getWidenedTypeWithContext` →
-// `getPropertiesOfContext` + `getUndefinedProperty`): `[{ a: 1 }, { b: 2 }]`
-// is `({ a: number; b?: undefined } | { a?: undefined; b: number })[]`. ztsc
-// does this for the arms of a `?:` (`normalizeFreshObjectSiblings`) but not
-// for array elements, because implementing it here — reading the sibling
-// names off the RAW element types, which still carry the object-literal
-// origin, and applying them to the positionally aligned widened entry —
-// produced two false TS2352 in excalidraw's `data/transform.test.ts`
-// (`elements as ExcalidrawElementSkeleton[]`, tsgo silent). The extra
-// optional-`undefined` members are correct; what fails is comparability
-// against the big skeleton union downstream, which lives in `assign.zig`.
-// Re-land with that fixed. (wave 13 B, measured.)
+/// An array literal's elements share ONE widening context in tsc, so each
+/// object-literal element gains its object-literal SIBLINGS' missing property
+/// names as `name?: undefined` (`getWidenedTypeWithContext` →
+/// `getPropertiesOfContext` + `getUndefinedProperty`): `[{ a: 1 }, { b: 2 }]`
+/// is `({ a: number; b?: undefined } | { a?: undefined; b: number })[]`. Same
+/// rule, same helper (`names.undefinedSiblingMembers`), as the arms of a `?:`
+/// and the `return`s of one function.
+///
+/// Participation is read off the RAW element types: `widenLiteral` has already
+/// dropped the object-literal ORIGIN flag from the widened ones, and it is the
+/// raw element that says whether an `{ … }` was written there.
+///
+/// Only for a literal with NO contextual type. With one, tsc widens against
+/// the CONTEXT's properties (`getWidenedTypeWithContext` walks the contextual
+/// type, not the siblings); folding sibling names in as well makes a
+/// self-referential context diverge — conformance `indexed/008_recursive_json.ts`
+/// is the tripwire.
+fn siblingNormalized(c: *Checker, raw: []const TypeId, widened: []const TypeId, no_ctx: bool) Error![]const TypeId {
+    if (!no_ctx or widened.len < 2) return widened;
+    const take = try c.scratch().alloc(bool, widened.len);
+    defer c.scratch().free(take);
+    for (raw, widened, take) |r, w, *t| {
+        t.* = c.ts.objectIsLiteralOrigin(r) and c.ts.kind(w) == .object;
+    }
+    return (try names_zig.undefinedSiblingMembers(c, widened, take)) orelse widened;
+}
 
 /// The element type an array literal's elements should be contextually
 /// typed against, given a (structurally resolved) contextual type. A direct
