@@ -2470,12 +2470,7 @@ const Binder = struct {
         b.in_derived_ctor = ctor == .derived_ctor;
 
         try b.bindTypeParams(proto.tp_start, proto.tp_end);
-        const home: ParamHome = if (!is_ctor)
-            .other
-        else if (body != 0)
-            .ctor_impl
-        else
-            .ctor_signature;
+        const home: ParamHome = .{ .ctor = is_ctor, .body = body != 0 };
         for (b.tree.extraRange(proto.params_start, proto.params_end)) |param| {
             try b.bindParam(param, home);
         }
@@ -2558,24 +2553,24 @@ const Binder = struct {
         }
     }
 
-    /// Where a parameter list lives, as far as parameter properties go.
-    /// `public`/`private`/`protected`/`readonly`/`override` on a parameter
-    /// DECLARES a class member, so the position decides both whether the
-    /// member appears and whether the modifier is legal at all.
-    const ParamHome = enum {
-        /// `constructor(public x: T) { }` — the one legal position.
-        ctor_impl,
-        /// A bodyless `constructor(public x: T);` — an overload signature or an
-        /// ambient `declare class` constructor. tsc still BINDS the member
-        /// (`isParameterPropertyDeclaration` asks only about the parent's
-        /// kind), and reports TS2369 on the modifier.
-        ctor_signature,
-        /// Anything else: function, method, accessor, arrow, function type.
-        other,
-
-        fn isCtor(h: ParamHome) bool {
-            return h != .other;
-        }
+    /// Where a parameter list lives, on the two axes the parameter rules read.
+    ///
+    /// Both rules are really "is there a body to do the work": a parameter
+    /// property has nothing to assign the member from without one, and an
+    /// initializer has nothing to run. `ctor` is the extra condition on the
+    /// first — a parameter property declares a CLASS member, so only a
+    /// constructor can carry it.
+    const ParamHome = struct {
+        /// The list belongs to a `constructor`. A bodyless one still BINDS its
+        /// parameter properties as members (tsc's
+        /// `isParameterPropertyDeclaration` asks only about the parent's kind)
+        /// and reports TS2369 on top.
+        ctor: bool = false,
+        /// The function-like has a body: a declaration or method with a block,
+        /// an arrow. False for every signature-only position — an overload, an
+        /// `abstract`/`declare`d member, a method/call/construct signature, and
+        /// every function TYPE.
+        body: bool = false,
     };
 
     /// tsc's `ModifierFlags.ParameterPropertyModifier` — the modifiers whose
@@ -2590,6 +2585,7 @@ const Binder = struct {
             .param => {
                 try b.bindPattern(d.lhs, .param, node);
                 try b.bindType(d.rhs);
+                if (!home.body) try b.reportPatternInitializers(d.lhs);
             },
             .param_full => {
                 const e = b.tree.extraData(ast.ParamFull, d.rhs);
@@ -2601,13 +2597,21 @@ const Binder = struct {
                 // every other position rejects the modifier. `main_token` on a
                 // `.param_full` is the parameter's first token — the modifier
                 // itself, which is where tsc's parameter-node span starts.
-                if (e.flags & param_prop_mask != 0 and home != .ctor_impl) {
+                if (e.flags & param_prop_mask != 0 and !(home.ctor and home.body)) {
                     try b.diag(.param_property_outside_ctor_impl, b.tree.nodeMainToken(node));
+                }
+                // TS2371, the same rule for the other thing a body is needed
+                // for. The parameter's OWN initializer answers at the parameter
+                // (`main_token`); the ones inside its pattern answer at their
+                // own binding elements.
+                if (!home.body) {
+                    if (e.init != null_node) try b.diag(.param_initializer_outside_impl, b.tree.nodeMainToken(node));
+                    try b.reportPatternInitializers(d.lhs);
                 }
                 // Constructor parameter property: also a class member.
                 const prop_mask = ast.Flags.public | ast.Flags.private |
                     ast.Flags.protected | ast.Flags.readonly;
-                if (home.isCtor() and e.flags & prop_mask != 0 and
+                if (home.ctor and e.flags & prop_mask != 0 and
                     b.nodeTag(d.lhs) == .identifier)
                 {
                     const class_scope = b.scope_parents.items[b.cur_scope];
@@ -2629,8 +2633,74 @@ const Binder = struct {
                     }
                 }
             },
-            else => try b.bindPattern(node, .param, node),
+            else => {
+                try b.bindPattern(node, .param, node);
+                if (!home.body) try b.reportPatternInitializers(node);
+            },
         }
+    }
+
+    /// TS2371 for every `= …` inside a parameter's binding pattern, when the
+    /// signature it belongs to has no body to run them (see
+    /// `param_initializer_outside_impl`).
+    ///
+    /// tsc's `checkVariableLikeDeclaration` anchors this on the element's NAME
+    /// — its binding TARGET, not the element's first token. The two differ only
+    /// for a renamed element, and there they differ visibly: `({ key: [y] = [1]
+    /// })` answers at the `[`, not at `key`.
+    ///
+    /// That same function returns EARLY, before this rule, for a renamed
+    /// element whose target is a plain identifier in a parameter of a bodyless
+    /// function — `({ key: target = 1 }) => …` as a TYPE is the shape tsc
+    /// answers TS2842 ("unused renaming … did you mean a type annotation?")
+    /// for, and it gets that instead of this.
+    ///
+    /// Walked separately from `bindPattern` because that walk is shared with
+    /// variable, catch and implementation-parameter bindings, none of which
+    /// this rule touches.
+    fn reportPatternInitializers(b: *Binder, node: Node) Error!void {
+        if (node == null_node) return;
+        const d = b.tree.nodeData(node);
+        switch (b.nodeTag(node)) {
+            .array_pattern, .object_pattern => {
+                for (b.tree.nodeRange(node)) |el| try b.reportPatternInitializers(el);
+            },
+            .binding_default => {
+                try b.diag(.param_initializer_outside_impl, b.tree.nodeMainToken(d.lhs));
+                try b.reportPatternInitializers(d.lhs);
+            },
+            // `key`, `key: target` or `key: target = init` — `lhs` is the
+            // target, 0 for the shorthand whose key IS the target.
+            .binding_property => {
+                if (isRenamedToIdent(b, d.lhs)) return;
+                const anchor = if (d.lhs != null_node) b.tree.nodeMainToken(d.lhs) else b.tree.nodeMainToken(node);
+                if (d.rhs != 0) try b.diag(.param_initializer_outside_impl, anchor);
+                try b.reportPatternInitializers(d.lhs);
+            },
+            // `[expr]: target`, where a defaulted target is a `binding_default`.
+            .binding_property_computed => {
+                if (isRenamedToIdent(b, bindingTargetOf(b, d.rhs))) return;
+                try b.reportPatternInitializers(d.rhs);
+            },
+            .rest_element => try b.reportPatternInitializers(d.lhs),
+            else => {},
+        }
+    }
+
+    /// Is this element's binding target a plain identifier written out beside
+    /// a property name — the TS2842 shape `checkVariableLikeDeclaration`
+    /// returns on? A shorthand (`target == 0`) is not renamed, and a target
+    /// that is itself a pattern is not an identifier.
+    fn isRenamedToIdent(b: *const Binder, target: Node) bool {
+        return target != null_node and b.nodeTag(target) == .identifier;
+    }
+
+    /// The binding TARGET under an optional `= default` — tsc's
+    /// `BindingElement.name`. Every pattern tag's `main_token` is its own first
+    /// token, so the target's names the position to report.
+    fn bindingTargetOf(b: *const Binder, node: Node) Node {
+        if (node != null_node and b.nodeTag(node) == .binding_default) return b.tree.nodeData(node).lhs;
+        return node;
     }
 
     /// Find the class_members scope hanging off a class scope.
@@ -4321,7 +4391,7 @@ const Binder = struct {
         _ = try b.pushScope(.function, node);
         try b.bindTypeParams(proto.tp_start, proto.tp_end);
         for (b.tree.extraRange(proto.params_start, proto.params_end)) |param| {
-            try b.bindParam(param, .other);
+            try b.bindParam(param, .{});
         }
         try b.bindType(proto.return_type);
         b.popScope(saved_scope);

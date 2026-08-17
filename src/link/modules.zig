@@ -2336,12 +2336,25 @@ const Linker = struct {
             var side_effect = false;
             var mod_tok: ast.TokenIndex = tree.nodeData(stmt).rhs;
             if (tag == .import_decl) {
-                const data = tree.extraData(ast.ImportData, tree.nodeData(stmt).lhs);
-                side_effect = data.default_name_token == 0 and data.ns_name_token == 0 and
-                    data.spec_start == data.spec_end;
+                // A SIDE-EFFECT import is `import "m"` with no import CLAUSE at
+                // all — not merely one that binds no name. `import {} from "m"`
+                // has an (empty) clause, and tsc treats it like any other
+                // named import: TS2307, not TS2882. The clause is what sits
+                // between the `import` keyword and the specifier, so its
+                // absence is exactly "the specifier came next"
+                // (`ImportData`'s token fields cannot tell empty braces from no
+                // braces).
+                side_effect = mod_tok == tree.nodeMainToken(stmt) + 1;
             } else if (tag == .import_equals) {
                 // `import x = require("m")`: the specifier is in the extra data.
                 mod_tok = tree.extraData(ast.ImportEquals, tree.nodeData(stmt).lhs).module_token;
+            } else if (tag == .export_named) {
+                // `export {} from "m"` re-exports nothing, and tsc never
+                // resolves the specifier: no name asks for the module, so a
+                // missing one is silent (measured — `export { a } from "m"` and
+                // `export * as ns from "m"` both still answer TS2307).
+                const e = tree.extraData(ast.ExportNamed, tree.nodeData(stmt).lhs);
+                if (e.spec_start == e.spec_end) continue;
             }
             if (mod_tok == 0) continue;
             const text = tree.tokenSlice(f.src, mod_tok);

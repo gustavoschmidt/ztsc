@@ -385,6 +385,13 @@ pub const Code = enum(u16) {
     /// constructor whose body would do the assigning (tsc's `checkParameter`).
     /// Reported over the parameter's first token, which is the modifier.
     param_property_outside_ctor_impl,
+    /// TS2371: a parameter initializer where there is no BODY to run it — an
+    /// overload signature, a `declare`d or `abstract` signature, a method /
+    /// call / construct signature, or a bare function type. tsc reports it from
+    /// `checkVariableLikeDeclaration`, which runs for the parameter AND for
+    /// every binding element inside its pattern, so `({ a = 1 } = {}) => void`
+    /// as a TYPE answers twice — once at the parameter, once at `a`.
+    param_initializer_outside_impl,
     /// TS2398: a parameter property named `constructor`. The modifier turns the
     /// parameter into a class member, and `constructor` is the one member name
     /// a class cannot have — the constructor itself already owns that slot in
@@ -629,6 +636,7 @@ pub const Code = enum(u16) {
             .overload_must_be_static,
             .overload_must_not_be_static,
             .param_property_outside_ctor_impl,
+            .param_initializer_outside_impl,
             .ctor_as_param_property_name,
             .multiple_default_exports,
             .super_before_this,
@@ -1005,6 +1013,7 @@ pub const Code = enum(u16) {
             .overload_must_be_static => "Function overload must be static.",
             .overload_must_not_be_static => "Function overload must not be static.",
             .param_property_outside_ctor_impl => "A parameter property is only allowed in a constructor implementation.",
+            .param_initializer_outside_impl => "A parameter initializer is only allowed in a function or constructor implementation.",
             .ctor_as_param_property_name => "'constructor' cannot be used as a parameter property name.",
             .ctor_may_not_be_accessor => "Class constructor may not be an accessor.",
             .multiple_default_exports => "A module cannot have multiple default exports.",
@@ -1149,6 +1158,7 @@ pub const Code = enum(u16) {
             .overload_must_be_static => 2387,
             .overload_must_not_be_static => 2388,
             .param_property_outside_ctor_impl => 2369,
+            .param_initializer_outside_impl => 2371,
             .ctor_as_param_property_name => 2398,
             .ctor_may_not_be_accessor => 1341,
             .multiple_default_exports => 2528,
