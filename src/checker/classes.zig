@@ -348,6 +348,18 @@ pub fn mergeBaseResolved(c: *Checker, derived: TypeId, base: TypeId) Error!TypeI
         const obj = (try c.arrayInterfaceObject(base)) orelse return derived;
         return c.mergeBaseObject(derived, obj, false);
     }
+    // `interface X extends C` where `C` names a class VALUE — always through a
+    // `typeof` alias, since a bare class name in an `extends` denotes its
+    // INSTANCE. The value's members live on its static-side object, which
+    // `resolveStructural` does not unwrap to, so the object-only guard dropped
+    // the base whole. The lib is the case in point: `interface
+    // IteratorConstructor extends IteratorObjectConstructor`, with
+    // `type IteratorObjectConstructor = typeof Iterator` over the abstract
+    // class, lost its `new ()` — so `new Iterator<number>()` was a false
+    // TS2351 and `class C extends Iterator<number>` a false TS2507.
+    if (c.ts.kind(base) == .class_value) {
+        return c.mergeBaseObject(derived, try c.classConstructType(c.ts.classSymbol(base)), false);
+    }
     return c.mergeBaseObject(derived, base, false);
 }
 
