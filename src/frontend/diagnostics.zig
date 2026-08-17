@@ -302,6 +302,31 @@ pub const Code = enum(u16) {
     /// the source text of the token it is reported on — so this one carries
     /// `Diagnostic.arg` instead of an enum arm per keyword.
     index_sig_modifier,
+    /// TS1070: the same eleven keywords on a TYPE member that is not an index
+    /// signature — a property, method, getter or setter signature of an
+    /// `interface` block or an object type literal. tsc's `checkGrammarModifiers`
+    /// picks between this wording and TS1071's by the member's kind, and stops
+    /// at the FIRST offending modifier; `readonly` is the one that is allowed
+    /// here (on a property; on a method it is TS1024, which ztsc under-reports).
+    type_member_modifier,
+    /// TS1182: a `var`/`let`/`const` declarator whose name is a BINDING PATTERN
+    /// and which has no initializer — `var {};`, `let [a]: [any];`. tsc's
+    /// `checkGrammarVariableDeclaration` puts this arm ahead of TS1155's and
+    /// `return`s, so `const {};` answers for the pattern and not for the `const`.
+    destructuring_needs_initializer,
+    /// TS1038: a `declare` modifier inside a body that is ALREADY ambient.
+    /// tsc's `checkGrammarModifiers` arm names ONE parent kind — a
+    /// `ModuleBlock` carrying `NodeFlags.Ambient` — so `declare namespace M {
+    /// declare enum E {} }` is reported and a `.d.ts` file's top-level `declare
+    /// var x` (ambient, but a SourceFile) is not. Measured both ways.
+    declare_in_ambient_context,
+    /// TS1221/TS1222: tsc's `checkGrammarFunctionLikeDeclaration` asterisk arm,
+    /// both blamed on the `*` itself. A generator has no body to emit in an
+    /// AMBIENT context, and an overload SIGNATURE has no body at all — the two
+    /// are one `if` in tsc, in this order, so an ambient signature answers for
+    /// the context and not for the missing body.
+    generator_in_ambient_context,
+    overload_signature_generator,
     /// TS1188/TS1091: a `for…of` / `for…in` head declares more than one
     /// variable. Reported on the SECOND declarator's first token, which is
     /// tsc's `grammarErrorOnFirstToken(declarations[1])`.
@@ -883,6 +908,11 @@ pub const Code = enum(u16) {
             .decorator_on_method_overload,
             .decorator_on_second_accessor,
             .index_sig_modifier,
+            .type_member_modifier,
+            .destructuring_needs_initializer,
+            .declare_in_ambient_context,
+            .generator_in_ambient_context,
+            .overload_signature_generator,
             .for_of_one_declaration,
             .for_in_one_declaration,
             .for_of_declaration_initializer,
@@ -1259,6 +1289,11 @@ pub const Code = enum(u16) {
             .jsx_text_rbrace => "Unexpected token. Did you mean `{'}'}` or `&rbrace;`?",
             .jsx_text_gt => "Unexpected token. Did you mean `{'>'}` or `&gt;`?",
             .index_sig_modifier => "'{0}' modifier cannot appear on an index signature.",
+            .type_member_modifier => "'{0}' modifier cannot appear on a type member.",
+            .destructuring_needs_initializer => "A destructuring declaration must have an initializer.",
+            .declare_in_ambient_context => "A 'declare' modifier cannot be used in an already ambient context.",
+            .generator_in_ambient_context => "Generators are not allowed in an ambient context.",
+            .overload_signature_generator => "An overload signature cannot be declared as a generator.",
             .for_of_one_declaration => "Only a single variable declaration is allowed in a 'for...of' statement.",
             .for_in_one_declaration => "Only a single variable declaration is allowed in a 'for...in' statement.",
             .for_of_declaration_initializer => "The variable declaration of a 'for...of' statement cannot have an initializer.",
@@ -1602,6 +1637,11 @@ pub const Code = enum(u16) {
             .jsx_text_rbrace => 1381,
             .jsx_text_gt => 1382,
             .index_sig_modifier => 1071,
+            .type_member_modifier => 1070,
+            .destructuring_needs_initializer => 1182,
+            .declare_in_ambient_context => 1038,
+            .generator_in_ambient_context => 1221,
+            .overload_signature_generator => 1222,
             .for_of_one_declaration => 1188,
             .for_in_one_declaration => 1091,
             .for_of_declaration_initializer => 1190,
