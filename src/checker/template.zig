@@ -647,6 +647,34 @@ pub fn matchTemplatePattern(c: *Checker, text: []const u8, tpl: TypeId) Error!bo
     return c.matchTplHole(text[head.len..], tpl, 0);
 }
 
+/// tsc's `templateLiteralTypesDefinitelyUnrelated`: two template-literal
+/// patterns whose leading fixed text diverges inside the shorter of the two
+/// heads — or whose trailing fixed text diverges inside the shorter of the two
+/// tails — cannot describe one common string, whatever their holes are
+/// instantiated with. So neither relates to the other, in either direction and
+/// under either relation.
+///
+/// This is the SOUND half of a pattern↔pattern comparison. ztsc's relation
+/// answers the rest of the space leniently (see `assign.zig`), which
+/// under-reports; this filter takes back the cases where a mismatch is
+/// certain from the fixed text alone — `` `a${string}` `` vs `` `b${string}` ``
+/// and `` `${string}-px` `` vs `` `${string}-em` `` — without ever rejecting a
+/// pair that could overlap. Both sides must be `.template_literal_type`.
+pub fn definitelyUnrelated(c: *Checker, s: TypeId, t: TypeId) bool {
+    const store = &c.ts;
+    const sm = store.templateHoleCount(s);
+    const tm = store.templateHoleCount(t);
+    const s_start = c.atomText(store.templateHead(s));
+    const t_start = c.atomText(store.templateHead(t));
+    // A hole-less template is its own head: start and end are the same text.
+    const s_end = if (sm == 0) s_start else c.atomText(store.templateChunk(s, sm - 1));
+    const t_end = if (tm == 0) t_start else c.atomText(store.templateChunk(t, tm - 1));
+    const start_len = @min(s_start.len, t_start.len);
+    const end_len = @min(s_end.len, t_end.len);
+    if (!std.mem.eql(u8, s_start[0..start_len], t_start[0..start_len])) return true;
+    return !std.mem.eql(u8, s_end[s_end.len - end_len ..], t_end[t_end.len - end_len ..]);
+}
+
 pub fn matchTplHole(c: *Checker, rest: []const u8, tpl: TypeId, i: u32) Error!bool {
     const s = &c.ts;
     const n = s.templateHoleCount(tpl);

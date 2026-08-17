@@ -586,16 +586,36 @@ pub fn normalizeFreshObjectSiblings(c: *Checker, u: TypeId) Error!TypeId {
     const s = &c.ts;
     if (s.kind(u) != .union_type) return u;
     const members = try c.memberList(u);
-    var fresh_count: u32 = 0;
-    for (members) |m| {
-        if (s.objectIsLiteralOrigin(m)) fresh_count += 1;
+    const take = try c.scratch().alloc(bool, members.len);
+    defer c.scratch().free(take);
+    for (members, take) |m, *t| t.* = s.objectIsLiteralOrigin(m);
+    const out = (try undefinedSiblingMembers(c, members, take)) orelse return u;
+    return s.makeUnion(c.scratch(), out);
+}
+
+/// The widening-context rule itself, over a POSITIONAL member list: `take[i]`
+/// says whether member `i` takes part — tsc's `ObjectFlags.ObjectLiteral`
+/// test, decided by the caller. Returns a list aligned with `members`, or null
+/// when no member gained anything.
+///
+/// Split out of `normalizeFreshObjectSiblings` for the one caller whose
+/// members are not a union and no longer carry the flag: an array literal's
+/// per-element types have already been widened by the time they meet each
+/// other (`expr.zig`'s `arrayLiteralElemType`), so it decides participation
+/// from the RAW element types it kept alongside.
+pub fn undefinedSiblingMembers(c: *Checker, members: []const TypeId, take: []const bool) Error!?[]TypeId {
+    const s = &c.ts;
+    std.debug.assert(members.len == take.len);
+    var count: u32 = 0;
+    for (take) |t| {
+        if (t) count += 1;
     }
-    if (fresh_count < 2) return u;
-    // The union of every fresh member's property names.
+    if (count < 2) return null;
+    // The union of every participating member's property names.
     var names: std.ArrayList(Atom) = .empty;
     defer names.deinit(c.scratch());
-    for (members) |m| {
-        if (!s.objectIsLiteralOrigin(m)) continue;
+    for (members, take) |m, t| {
+        if (!t) continue;
         for (0..s.objectPropCount(m)) |i| {
             const p = s.objectProp(m, @intCast(i));
             if (indexOfAtom(names.items, p.name) == null) try names.append(c.scratch(), p.name);
@@ -604,8 +624,8 @@ pub fn normalizeFreshObjectSiblings(c: *Checker, u: TypeId) Error!TypeId {
     var out: std.ArrayList(TypeId) = .empty;
     defer out.deinit(c.scratch());
     var changed = false;
-    for (members) |m| {
-        if (!s.objectIsLiteralOrigin(m) or s.objectPropCount(m) == names.items.len) {
+    for (members, take) |m, t| {
+        if (!t or s.objectPropCount(m) == names.items.len) {
             try out.append(c.scratch(), m);
             continue;
         }
@@ -625,8 +645,9 @@ pub fn normalizeFreshObjectSiblings(c: *Checker, u: TypeId) Error!TypeId {
         changed = true;
         try out.append(c.scratch(), try s.makeObjectSigs(props.items, s.objectStringIndex(m), s.objectNumberIndex(m), s.objectFlags(m), calls.items, ctors.items));
     }
-    if (!changed) return u;
-    return s.makeUnion(c.scratch(), out.items);
+    if (!changed) return null;
+    const owned: []TypeId = try out.toOwnedSlice(c.scratch());
+    return owned;
 }
 
 /// Per-return widening for *inferred* (no-context) return types: like
