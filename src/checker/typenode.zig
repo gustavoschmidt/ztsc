@@ -754,7 +754,8 @@ pub fn reduceSubtypes(c: *Checker, t: TypeId) Error!TypeId {
             if (isEmptyAnonObject(c, o)) continue; // `{}` never absorbs
             if (m_fresh and try freshHasExcessProp(c, m, o)) continue;
             if (!try c.isAssignable(m, o)) continue; // m not a subtype of o
-            if (!m_empty and try c.isAssignable(o, m)) {
+            if (try strictArityWiderThan(c, m, o)) continue; // nor under StrictArity
+            if (!m_empty and (try c.isAssignable(o, m)) and !(try strictArityWiderThan(c, o, m))) {
                 // Mutually assignable: exactly one twin survives. A fresh
                 // literal always yields — it can never absorb, so keeping
                 // it here would keep both.
@@ -784,6 +785,36 @@ pub fn reduceSubtypes(c: *Checker, t: TypeId) Error!TypeId {
     }
     if (kept.items.len == members.len) return t;
     return c.ts.makeUnion(c.scratch(), kept.items);
+}
+
+/// Does `src` declare MORE parameter positions than `tgt` accepts? tsc's
+/// `signatureRelatedTo` runs the strict-subtype relation — the one union
+/// reduction uses — under `SignatureCheckMode.StrictArity`, where the arity
+/// guard reads `getParameterCount(source) > getParameterCount(target)` instead
+/// of assignability's `getMinArgumentCount(source) > …`. Optional parameters
+/// count, so `(b?: string) => void` is NOT a subtype of `() => void` even
+/// though the two are mutually ASSIGNABLE — which is the whole difference in
+///
+///     declare const val: { something(): void };
+///     function run(options: { something?(b?: string): void }) {
+///         const something = options.something ?? val.something;
+///         something('');
+///     }
+///
+/// (`unionReductionMutualSubtypes`): tsc reduces to the `(b?: string)` arm and
+/// the call is fine, while a symmetric reduction could keep `() => void` and
+/// report a false TS2554. A target with an EFFECTIVE rest parameter
+/// (unbounded, i.e. `paramTotal` saturates) skips the guard entirely, exactly
+/// as `hasEffectiveRestParameter` does.
+///
+/// Top-level signatures only. tsc threads the check mode through the whole
+/// relation, so a signature nested in a property is compared the same way;
+/// reproducing that needs a relation mode `isAssignable` does not carry, and
+/// the shallow rule is the one that is observable here.
+fn strictArityWiderThan(c: *Checker, src: TypeId, tgt: TypeId) Error!bool {
+    if (c.ts.kind(src) != .function or c.ts.kind(tgt) != .function) return false;
+    if ((try c.paramTotal(tgt)) == std.math.maxInt(u32)) return false;
+    return (try c.effParamCount(src)) > try c.effParamCount(tgt);
 }
 
 /// Is `t` ANY-ROOTED — `any` itself, or an array/tuple whose every element is

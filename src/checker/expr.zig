@@ -1251,7 +1251,29 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     // the element type of each array-like constituent (so array-literal
     // elements are contextually typed — literals stay literal instead of
     // widening).
-    const ctx_elem: TypeId = if (!ctx_tuple) try contextualArrayElemType(c, rctx) else types.no_type;
+    var ctx_elem: TypeId = if (!ctx_tuple) try contextualArrayElemType(c, rctx) else types.no_type;
+    // tsc's `getContextualTypeForElementExpression` ends in
+    // `getIteratedTypeOrElementType(IterationUse.Element, t, …)`, so an
+    // ITERABLE contextual type types the elements even when it is not
+    // array-like. `function* g(): IterableIterator<(x: string) => number> {
+    // yield *[x => x.length]; }` needs it — the delegation's contextual type
+    // is the generator's return type, whose resolved object carries no numeric
+    // index, so the arrow's parameter was an implicit any
+    // (`generatorTypeCheck26`).
+    //
+    // Asked of the CONTEXTUAL TYPE AS WRITTEN and only of the lib
+    // iterator-family references `generatorYieldType` names. The general
+    // `iterationElementType` on the resolved type answers for `Map`, `Set` and
+    // anything with an apparent `[Symbol.iterator]`, and offering that
+    // alongside an array alternative widens real code: `readonly T[] |
+    // Map<string, T>` contributed `T | [string, T]` to excalidraw's
+    // `arrayToMap(xs || [])`, and `("images" | …)[] | MediaTypeOptions`
+    // contributed the enum's apparent `string` to social-app's `mediaTypes:
+    // ['images']`.
+    if (ctx_elem == types.no_type and !ctx_tuple and ctx != types.no_type) {
+        const y = c.generatorYieldType(ctx);
+        if (y != 0) ctx_elem = y;
+    }
 
     var elem_types: std.ArrayList(TypeId) = .empty;
     defer elem_types.deinit(c.scratch());
@@ -2277,7 +2299,26 @@ fn checkObjectLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     // goes through `checkDestructuringElement`.
     try c.checkObjectLiteralDups(node);
     try checkSpreadPropOverrides(c, node);
+    try checkSpreadOperandTypes(c, node);
     return t;
+}
+
+/// tsc's `isValidSpreadType` gate on every `{ ...x }` element (TS2698).
+///
+/// Runs here, exactly once per literal, for the same reason
+/// `checkSpreadPropOverrides` does: `objectLiteralWhole` re-enters
+/// `objectLiteralType` once per constituent of a DISTRIBUTED union spread, and
+/// each of those passes sees one member (`{ ...(Full | null) }` would ask about
+/// `null` on its own and report where tsc, which judges the whole union, is
+/// silent). The operand's type is read from the node-type memo the walk has
+/// already published, so nothing is evaluated a second time.
+fn checkSpreadOperandTypes(c: *Checker, node: Node) Error!void {
+    for (c.tree.nodeRange(node)) |prop| {
+        if (prop == null_node or c.nodeTag(prop) != .spread_element) continue;
+        const raw = c.nodeType(c.tree.nodeData(prop).lhs) orelse continue;
+        if (try validSpreadType(c, raw, 0)) continue;
+        try c.diagFmt(2698, c.nodeSpan(prop), "Spread types may only be created from object types.", .{});
+    }
 }
 
 /// tsc's `checkSpreadPropOverrides`: a property written BEFORE a spread whose
@@ -2446,6 +2487,121 @@ fn resolveCtxTypeParams(c: *Checker, node: Node, rctx: TypeId) Error!TypeId {
     }
     if (map.items.len == 0) return rctx;
     return c.resolveStructural(try c.instantiate(rctx, map.items));
+}
+
+/// tsc's `isValidSpreadType`, the gate on `{ ...x }` (TS2698). It reads
+///
+///     const t = removeDefinitelyFalsyTypes(mapType(type, getBaseConstraintOrType));
+///     return !!(t.flags & (Any | NonPrimitive | Object | InstantiableNonPrimitive)
+///         || t.flags & UnionOrIntersection && every(t.types, isValidSpreadType));
+///
+/// The ORDER of the two rewrites is the whole subtlety: a type parameter is
+/// replaced by its CONSTRAINT first (an unconstrained one stays a type
+/// variable and passes), and only then are the definitely-falsy constituents
+/// dropped. That is why `T | (T & undefined)` and `object | T` for `T extends
+/// undefined` both spread fine — the falsy half disappears — while a bare
+/// `undefined`, reduced to `never`, does not (`spreadObjectOrFalsy`). Both
+/// rewrites re-run at every recursion, exactly as tsc's own recursive call
+/// does.
+///
+/// Measured against the pinned oracle across `undefined | null | void |
+/// unknown | never | boolean | symbol | number | string | bigint | enum | true
+/// | 0 | ""` (all rejected) and `object | () => void | number[] |
+/// { a: 1 } | undefined | { a: 1 } | null` (all accepted).
+///
+/// `depth` bounds the constraint chase; unmodelled kinds answer VALID, so a
+/// shape ztsc types loosely stays silent rather than earning a false TS2698.
+fn validSpreadType(c: *Checker, t: TypeId, depth: u8) Error!bool {
+    if (depth > 8) return true;
+    var parts: std.ArrayList(TypeId) = .empty;
+    defer parts.deinit(c.scratch());
+    try collectSpreadParts(c, t, depth, &parts);
+    // Everything dropped: `removeDefinitelyFalsyTypes` left `never`, which is
+    // not an object type (`spreadUnion3`'s `{ ...nullAndUndefinedUnion }`).
+    if (parts.items.len == 0) return false;
+    for (parts.items) |p| {
+        switch (c.ts.kind(p)) {
+            // `every(t.types, isValidSpreadType)` — and the recursion re-runs
+            // the constraint mapping, so `(T | undefined) & T` for
+            // `T extends {}` passes through `{} | undefined` -> `{}`.
+            .intersection => for (try c.memberList(p)) |m| {
+                if (!try validSpreadType(c, m, depth + 1)) return false;
+            },
+            // Primitives, literals and the INSTANTIABLE-PRIMITIVE deferrals
+            // (`keyof T`, a template-literal type, `Uppercase<T>`): the whole
+            // point of the diagnostic. A type parameter that survived the
+            // mapping is unconstrained, hence a valid type VARIABLE.
+            .unknown,
+            .string,
+            .number,
+            .boolean,
+            .bigint,
+            .symbol,
+            .bool_true,
+            .string_literal,
+            .number_literal,
+            .number_literal_fresh,
+            .bigint_literal,
+            .enum_type,
+            .unique_symbol,
+            .keyof_op,
+            .template_literal_type,
+            .string_mapping,
+            => return false,
+            else => {},
+        }
+    }
+    return true;
+}
+
+/// `removeDefinitelyFalsyTypes(mapType(t, getBaseConstraintOrType))`, flattened
+/// into the surviving constituents. A union distributes (and a constraint that
+/// is itself a union flattens into the same list, which is what `getUnionType`
+/// does after `mapType`).
+fn collectSpreadParts(c: *Checker, t: TypeId, depth: u8, out: *std.ArrayList(TypeId)) Error!void {
+    if (depth > 8) {
+        // Give up chasing: `any` is the constituent that keeps the caller quiet.
+        try out.append(c.scratch(), types.any_type);
+        return;
+    }
+    var r = try c.resolveStructural(t);
+    if (c.ts.kind(r) == .type_param) {
+        const con = try c.typeParamConstraint(c.ts.typeParamSymbol(r));
+        // An unconstrained type parameter maps to ITSELF (tsc's
+        // `getBaseConstraintOrType`), and is a valid type variable.
+        if (con == types.no_type) {
+            try out.append(c.scratch(), r);
+            return;
+        }
+        r = try c.resolveStructural(con);
+    }
+    if (c.ts.kind(r) == .union_type) {
+        for (try c.memberList(r)) |m| try collectSpreadParts(c, m, depth + 1, out);
+        return;
+    }
+    if (try definitelyFalsySpread(c, r)) return;
+    try out.append(c.scratch(), r);
+}
+
+/// tsc's `hasTypeFacts(t, TypeFacts.Truthy)` complement — the constituents
+/// `removeDefinitelyFalsyTypes` drops before `isValidSpreadType` looks at what
+/// is left. An INTERSECTION ands its constituents' facts
+/// (`getIntersectionTypeFacts`), so one falsy member makes the whole of
+/// `T & undefined` falsy — which is exactly what keeps `T | (T & undefined)`
+/// spreadable.
+fn definitelyFalsySpread(c: *Checker, r: TypeId) Error!bool {
+    return switch (c.ts.kind(r)) {
+        .undefined, .null, .void, .never, .bool_false => true,
+        .string_literal => c.atomText(c.ts.literalAtom(r)).len == 0,
+        .number_literal, .number_literal_fresh => c.ts.numberValue(r) == 0,
+        .intersection => blk: {
+            for (try c.memberList(r)) |m| {
+                if (try definitelyFalsySpread(c, try c.resolveStructural(m))) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
 }
 
 /// One constituent of an object literal's type. `dist` names the spread
@@ -5198,6 +5354,18 @@ fn arrayPatternIteratedType(c: *Checker, pat: Node, src: TypeId) Error!TypeId {
         else => {},
     }
     if (try c.iterationElementType(r)) |e| return e;
+    // A PARTLY iterable union is ztsc's own gap, not the code's: tsc types the
+    // right-hand side by the pattern's implied TUPLE, so a nested position
+    // reads its own element, while ztsc types the literal with no contextual
+    // type at all and hands the nested pattern the widened element UNION.
+    // `[this.#field, [this.#field]] = [1, [2]]` is that shape — the inner
+    // pattern's source is `number | number[]` here and `number[]` in tsc — so
+    // a union with any iterable constituent stays silent.
+    if (c.ts.kind(r) == .union_type) {
+        for (try c.memberList(r)) |m| {
+            if ((try c.iterationElementType(m)) != null) return types.no_type;
+        }
+    }
     try c.diagFmt(2488, c.nodeSpan(pat), "Type '{s}' must have a '[Symbol.iterator]()' method that returns an iterator.", .{
         try c.typeToString(src),
     });

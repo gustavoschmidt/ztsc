@@ -1780,6 +1780,60 @@ fn useBeforeAssignedWalk(c: *Checker, node: Node, cands: []const InitCand, is_ta
     while (it.next()) |child| try useBeforeAssignedWalk(c, child, cands, false);
 }
 
+/// Does a class heritage expression's type FAIL tsc's `isConstructorType`?
+/// `getBaseConstructorTypeOfClass` accepts `any` and the null widening type
+/// outright and otherwise demands a construct signature, reporting TS2507 at
+/// the expression when there is none — which is what `class B extends A` says
+/// where a local `var A = 1` shadows the class
+/// (`classExtendsShadowedConstructorFunction`,
+/// `classExtendsClauseClassNotReferringConstructor`), what `extends Alpha.x`
+/// says for a namespace's exported `number`, and what `extends Greeter` says
+/// for an `import … = require(…)` module OBJECT rather than the class inside
+/// it (`importAsBaseClass`).
+///
+/// Kinds are ALLOW-listed rather than denied: `false` is silence, so anything
+/// ztsc models loosely — a `ref` that did not resolve, a type parameter (whose
+/// mixin-constraint arm of `isConstructorType` is not modelled here), an
+/// intersection (which is what a mixin application produces), a conditional —
+/// keeps its existing under-report instead of risking a false TS2507 on a
+/// legal base class.
+fn heritageNotConstructor(c: *Checker, t: TypeId) Error!bool {
+    const r = try c.resolveStructural(t);
+    return switch (c.ts.kind(r)) {
+        // Primitives, `undefined` and literals: nothing that could carry a
+        // construct signature. `null` is tsc's explicit exemption
+        // (`baseConstructorType !== nullWideningType`), and `any`/`err`/`never`
+        // are the silent ones.
+        .unknown,
+        .void,
+        .undefined,
+        .string,
+        .number,
+        .boolean,
+        .bigint,
+        .symbol,
+        .object_keyword,
+        .bool_true,
+        .bool_false,
+        .string_literal,
+        .number_literal,
+        .number_literal_fresh,
+        .bigint_literal,
+        .enum_type,
+        .unique_symbol,
+        .array,
+        .tuple,
+        => true,
+        // A structural object — a namespace/module value, `{}`, an object
+        // literal — is a base class only when it declares a construct
+        // signature. A bare `.function` is a CALL signature and never one, so
+        // `function foo() {}` + `class C extends foo` is TS2507 too.
+        .object => c.ts.objectConstructSigCount(r) == 0,
+        .function => true,
+        else => false,
+    };
+}
+
 pub fn checkClass(c: *Checker, node: Node) Error!void {
     const d = c.tree.nodeData(node);
     const data = c.tree.extraData(ast.ClassData, d.lhs);
@@ -1858,7 +1912,12 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
         // the expression, and still reports TS1361, because that clause is real
         // emitted code.
         if (!(c.ambient_ctx or data.flags & ast.Flags.declare != 0)) {
-            _ = try c.checkExprCached(hd.lhs, types.no_type);
+            const base_t = try c.checkExprCached(hd.lhs, types.no_type);
+            if (try heritageNotConstructor(c, base_t)) {
+                try c.diagFmt(2507, c.nodeSpan(hd.lhs), "Type '{s}' is not a constructor function type.", .{
+                    try c.typeToString(base_t),
+                });
+            }
         }
         // tsc's order: the instance side first, and the static side only when
         // it passed (`checkClassLikeDeclaration`'s "Report static side error
