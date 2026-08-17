@@ -689,6 +689,45 @@ fn memberNamesAValue(f: binder.SymbolFlags) bool {
         f.enum_decl or f.enum_member or (f.namespace_decl and !f.ns_uninstantiated);
 }
 
+/// Every EXPORTED member name declared in one namespace symbol's body scope.
+/// The candidate pool for `namespaceMemberSuggestion`; the body scope's member
+/// segment is atom-sorted and sealed, so this is a slice walk.
+fn nsExportedNames(c: *Checker, ns_sym: SymbolId, out: *std.ArrayList(Atom)) Error!void {
+    const nb = c.symBind(ns_sym);
+    const ns = nb.namespaceScopeOf(c.localOf(ns_sym)) orelse return;
+    const lo = nb.scope_members_start[ns];
+    const hi = nb.scope_members_start[ns + 1];
+    for (nb.member_atoms[lo..hi], nb.member_syms[lo..hi]) |a, s| {
+        if (!nb.symbol_flags[s].exported) continue;
+        try out.append(c.scratch(), a);
+    }
+}
+
+/// tsc's `getSuggestedSymbolForNonexistentModule` for a NAMESPACE qualifier:
+/// the exported member name closest to `name`, or 0 when none is close enough.
+/// Turns the plain TS2694 into TS2724 ("'M' has no exported member named 'num'.
+/// Did you mean 'nums'?"), which is the same refinement the linker already
+/// applies to a missing named IMPORT — a namespace and a module answer a
+/// qualified name the same way, so they must misspell it the same way too.
+///
+/// A cross-file merged namespace pools every constituent's exports, exactly as
+/// `namespaceMemberSym` searches every part.
+fn namespaceMemberSuggestion(c: *Checker, ns_sym: SymbolId, name: Atom) Error!Atom {
+    var atoms: std.ArrayList(Atom) = .empty;
+    defer atoms.deinit(c.scratch());
+    if (c.prog.isMergedId(ns_sym)) {
+        for (c.prog.mergedSym(ns_sym).parts) |p| try nsExportedNames(c, p, &atoms);
+    } else {
+        try nsExportedNames(c, ns_sym, &atoms);
+    }
+    if (atoms.items.len == 0) return 0;
+    const names = try c.scratch().alloc([]const u8, atoms.items.len);
+    defer c.scratch().free(names);
+    for (atoms.items, names) |a, *n| n.* = c.atomText(a);
+    const idx = intern.spellingSuggestion(c.scratch(), c.atomText(name), names) orelse return 0;
+    return atoms.items[idx];
+}
+
 /// `A.Deep.G` — the written entity name, rebuilt from its tokens (tsc's
 /// `entityNameToString`) for the messages that quote the WHOLE dotted name
 /// rather than one segment. Scratch-allocated; `diagFmt` copies.
@@ -857,6 +896,11 @@ pub fn typeFromQualifiedName(c: *Checker, node: Node, args: []const TypeId) Erro
                         return types.error_type;
                     }
                 }
+            }
+            const sugg = try namespaceMemberSuggestion(c, ns_sym, name);
+            if (sugg != 0) {
+                try c.diagFmt(2724, c.tokSpan(name_tok), "'{s}' has no exported member named '{s}'. Did you mean '{s}'?", .{ c.symbolName(ns_sym), c.atomText(name), c.atomText(sugg) });
+                return types.error_type;
             }
             try c.diagFmt(2694, c.tokSpan(name_tok), "Namespace '{s}' has no exported member '{s}'.", .{ c.symbolName(ns_sym), c.atomText(name) });
             return types.error_type;
