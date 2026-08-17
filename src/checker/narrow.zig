@@ -654,6 +654,38 @@ pub fn narrowByDiscriminant(c: *Checker, t0: TypeId, prop: Atom, value: TypeId, 
     return c.ts.makeUnion(c.scratch(), parts.items);
 }
 
+/// tsc's `narrowTypeByDiscriminant(type, propertyAccess, t =>
+/// narrowTypeByTypeof(t, …))`: `typeof <ref>.k === "s"` filters the union
+/// `<ref>` stands for by asking the SAME typeof question of each
+/// constituent's own `k`, and drops the constituents whose `k` cannot answer
+/// it. The equality form (`<ref>.k === lit`) is `narrowByDiscriminant`; this
+/// is that rule with the comparand replaced by a typeof test, and it goes
+/// through the same `isDiscriminantProp` gate — tsc reaches both only via
+/// `getDiscriminantPropertyAccess`.
+pub fn narrowByDiscriminantTypeof(c: *Checker, t0: TypeId, prop: Atom, str: Atom, sense: bool, decl0: TypeId) Error!TypeId {
+    const t = try unionFacet(c, t0);
+    if (c.ts.kind(t) != .union_type) return t0;
+    const decl = try unionFacet(c, decl0);
+    if (!try c.isDiscriminantProp(if (c.ts.kind(decl) == .union_type) decl else t, prop))
+        return t0;
+    var parts: std.ArrayList(TypeId) = .empty;
+    defer parts.deinit(c.scratch());
+    const members = try c.memberList(t);
+    for (members) |m| {
+        const rm = try c.resolveStructural(m);
+        // A constituent without the property is not ruled out: tsc narrows
+        // `getTypeOfPropertyOfType` only where the property exists, and
+        // leaves the constituent alone otherwise.
+        const keep = if (try c.propOfType(rm, prop)) |p|
+            (try narrowByTypeof(c, p.ty, str, sense)) != types.never_type
+        else
+            true;
+        if (keep) try parts.append(c.scratch(), m);
+    }
+    if (parts.items.len == members.len) return t0; // nothing filtered
+    return c.ts.makeUnion(c.scratch(), parts.items);
+}
+
 pub fn narrowByPropTruthiness(c: *Checker, t0: TypeId, prop: Atom, sense: bool, decl0: TypeId) Error!TypeId {
     const t = try unionFacet(c, t0);
     const decl = try unionFacet(c, decl0);

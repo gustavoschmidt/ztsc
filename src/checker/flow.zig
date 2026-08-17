@@ -2048,6 +2048,13 @@ fn narrowByEqualityCond(c: *Checker, t: TypeId, lhs: Node, rhs: Node, strict: bo
     if (try typeofChainContainsRef(c, rhs, key)) {
         return narrowByTypeofChainContainment(c, t, lhs, sense);
     }
+    // `typeof <ref>.k === "…"` — the discriminant reading of the same shape.
+    if (typeofOperand(c, lhs)) |op| {
+        if (try narrowByTypeofDiscriminant(c, t, op, rhs, sense, key, decl)) |n| return n;
+    }
+    if (typeofOperand(c, rhs)) |op| {
+        if (try narrowByTypeofDiscriminant(c, t, op, lhs, sense, key, decl)) |n| return n;
+    }
     // <ref> === <literal> / <literal> === <ref>
     if (try refMatches(c, lhs, key)) {
         return narrowByLiteralEquality(c, t, rhs, strict, sense);
@@ -2197,19 +2204,42 @@ fn optChainComparandConstituentOk(c: *Checker, m: TypeId, strict: bool, sense: b
     return nullish;
 }
 
+/// The operand of `typeof <expr>`, or null when `node` is not one.
+fn typeofOperand(c: *Checker, node: Node) ?Node {
+    if (node == null_node or c.nodeTag(node) != .prefix_unary) return null;
+    if (c.tree.tokens.tag(c.tree.nodeMainToken(node)) != .keyword_typeof) return null;
+    return c.tree.nodeData(node).lhs;
+}
+
 fn typeofTargetOf(c: *Checker, node: Node, key: RefKey) Error!bool {
-    if (node == null_node or c.nodeTag(node) != .prefix_unary) return false;
-    if (c.tree.tokens.tag(c.tree.nodeMainToken(node)) != .keyword_typeof) return false;
-    return refMatches(c, c.tree.nodeData(node).lhs, key);
+    const operand = typeofOperand(c, node) orelse return false;
+    return refMatches(c, operand, key);
 }
 
 /// `node` is `typeof <expr>` whose `<expr>` is an optional chain containing
 /// `key`'s reference at an optional link (but is not the ref itself — that
 /// exact case is `typeofTargetOf`).
 fn typeofChainContainsRef(c: *Checker, node: Node, key: RefKey) Error!bool {
-    if (node == null_node or c.nodeTag(node) != .prefix_unary) return false;
-    if (c.tree.tokens.tag(c.tree.nodeMainToken(node)) != .keyword_typeof) return false;
-    return optionalChainContainsRef(c, c.tree.nodeData(node).lhs, key);
+    const operand = typeofOperand(c, node) orelse return false;
+    return optionalChainContainsRef(c, operand, key);
+}
+
+/// `typeof <ref>.k === "…"` read as a DISCRIMINANT guard on `<ref>`: the
+/// filter each constituent has to survive is the typeof question asked of its
+/// own `k`. tsc's `narrowTypeByTypeof` falls through to
+/// `getDiscriminantPropertyAccess` + `narrowTypeByDiscriminant` for exactly
+/// this shape — the operand is a property access on the reference rather than
+/// the reference itself — which is what makes `typeof a.error === 'undefined'`
+/// pick the `{ error: undefined, result: {…} }` constituent out of a union
+/// keyed on `error`'s definedness (`narrowingTypeofUndefined1`). Null — "not
+/// this arm, keep looking" — when the operand is not such an access at all;
+/// once it is, a comparand that is not a string literal answers `t` unchanged,
+/// exactly as the two `typeofTargetOf` arms above do.
+fn narrowByTypeofDiscriminant(c: *Checker, t: TypeId, op: Node, value: Node, sense: bool, key: RefKey, decl: TypeId) Error!?TypeId {
+    const prop = (try discriminantOfRef(c, op, key)) orelse return null;
+    const rt = try c.ts.regularLiteral(try c.checkExprCached(value, types.no_type));
+    if (c.ts.kind(rt) != .string_literal) return t;
+    return try narrow.narrowByDiscriminantTypeof(c, t, prop, c.ts.literalAtom(rt), sense, decl);
 }
 
 /// Narrow a chain receiver `t` to non-null when a `typeof <chain>` branch
@@ -3142,19 +3172,50 @@ fn narrowByGuardCall(c: *Checker, t: TypeId, call: Node, sense: bool, key: RefKe
 
 /// tsc's `narrowTypeByTypePredicate` optional-chain arm: the guarded
 /// ARGUMENT is an optional chain whose receiver is the tracked reference
-/// (`Array.isArray(data?.detail)`). A nullish receiver short-circuits the
-/// chain to `undefined`, so when the predicate's asserted type cannot BE
-/// `undefined`, the asserting branch proves the receiver did not
-/// short-circuit — narrow it to non-null. Only the true branch says
-/// anything (a failed predicate is equally consistent with a nullish
-/// receiver), which is why tsc gates this on `assumeTrue`.
+/// (`Array.isArray(data?.detail)`, `!isNil(animal?.breed?.size)`). A nullish
+/// receiver short-circuits the chain to `undefined`, so a branch that says
+/// anything definite about the chain's value also says the receiver did not
+/// short-circuit — narrow it to non-null.
+///
+/// Both branches can say it, by the mirror-image tests tsc spells
+/// `assumeTrue && !hasTypeFacts(predicate.type, TypeFacts.EQUndefined) ||
+/// !assumeTrue && everyType(predicate.type, isNullableType)`:
+///
+///   * taken as TRUE, the branch proves it when the asserted type cannot BE
+///     `undefined` (`isString(n?.child?.value)`);
+///   * taken as FALSE, when the asserted type is nullish THROUGHOUT, so its
+///     complement excludes `undefined` (`!isNil(animal?.breed?.size)`, with
+///     `isNil(v): v is undefined | null` — `typePredicatesOptionalChaining3`).
+///
+/// The two other combinations say nothing and must not narrow: a refuted
+/// `x is string` is equally consistent with a short-circuit, and an asserted
+/// `x is string | undefined` is too (`089_guard_call_arg_chain_negatives`).
 fn narrowByGuardArgChain(c: *Checker, t: TypeId, g: GuardCall, sense: bool, key: RefKey) Error!TypeId {
-    if (!sense) return t;
     if (g.pred.asserts) return t; // narrows after the call, not in the condition
     if (g.pred.ty == types.no_type) return t;
-    if (try c.admitsNullish(g.pred.ty, .undefined)) return t;
+    const proves = if (sense)
+        !try c.admitsNullish(g.pred.ty, .undefined)
+    else
+        everyConstituentNullish(c, g.pred.ty);
+    if (!proves) return t;
     if (!try optionalChainContainsRef(c, g.arg, key)) return t;
     return c.nonNullable(t);
+}
+
+/// tsc's `everyType(t, isNullableType)`: is every constituent `undefined`,
+/// `null` or `void`? `any`/`unknown` are not — their domains include
+/// non-nullish values, so refuting them proves nothing.
+fn everyConstituentNullish(c: *Checker, t: TypeId) bool {
+    if (c.ts.kind(t) == .union_type) {
+        for (c.ts.members(t)) |m| {
+            if (!everyConstituentNullish(c, m)) return false;
+        }
+        return true;
+    }
+    return switch (c.ts.kind(t)) {
+        .undefined, .null, .void => true,
+        else => false,
+    };
 }
 
 /// `assertIsT(x);` — an assertion-function call statement narrows the
