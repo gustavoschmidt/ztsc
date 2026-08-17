@@ -2066,7 +2066,42 @@ fn narrowByEqualityCond(c: *Checker, t: TypeId, lhs: Node, rhs: Node, strict: bo
     if (try optionalChainContainsRef(c, rhs, key)) {
         return narrowByOptChainContainment(c, t, lhs, strict, sense);
     }
+    // tsc's `narrowTypeByBooleanComparison`, its last equality arm: comparing
+    // a CONDITION to a boolean literal narrows by that condition, with the
+    // sense the comparison asserts. `err instanceof WebError === false ||
+    // err.status != 401` is the shape — the `||`'s right operand runs when
+    // the left was false, i.e. when the `instanceof` held, so `err` is
+    // narrowed there (`narrowByBooleanComparison.ts`, from TS#55395).
+    //
+    // `sense` here is already equals-folded, and tsc's four-way XOR collapses
+    // to "the comparison asserts that the condition has the literal's value"
+    // for both operators. An ACCESS expression is excluded, as it is in tsc:
+    // `x.k === true` is a discriminant test, which the arms above own.
+    if (booleanLiteralValue(c, rhs)) |bv| {
+        if (!isAccessExpression(c, lhs)) return c.narrowByCondition(t, lhs, sense == bv, key, decl);
+    }
+    if (booleanLiteralValue(c, lhs)) |bv| {
+        if (!isAccessExpression(c, rhs)) return c.narrowByCondition(t, rhs, sense == bv, key, decl);
+    }
     return t;
+}
+
+/// tsc's `isBooleanLiteral`: the `true`/`false` KEYWORDS, nothing else.
+fn booleanLiteralValue(c: *Checker, node: Node) ?bool {
+    return switch (c.nodeTag(node)) {
+        .true_literal => true,
+        .false_literal => false,
+        else => null,
+    };
+}
+
+/// tsc's `isAccessExpression`: a property or element access, in either the
+/// plain or the optional-chain spelling.
+fn isAccessExpression(c: *Checker, node: Node) bool {
+    return switch (c.nodeTag(node)) {
+        .member_expr, .optional_member_expr, .index_expr, .optional_index_expr => true,
+        else => false,
+    };
 }
 
 /// Walks an optional chain's receiver spine (`chain.expression` at each
