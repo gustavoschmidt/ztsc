@@ -896,6 +896,20 @@ fn resolveExportsField(
 /// Match `subpath` against a subpath map: an exact key first, then the
 /// longest-prefix wildcard pattern (`"./*"`, `"./d3-*"`), Node's best-match
 /// rule. The `*` captures the middle; the capture substitutes into the target.
+///
+/// Two `*` rules, both tsc's and both meaning "no match at all" rather than
+/// "match something else":
+///
+///   * a REQUESTED subpath that itself contains a `*` never takes the exact-key
+///     branch (`loadModuleFromImportsOrExports` screens `moduleName.indexOf("*")
+///     === -1` before its table lookup), so `import "p/a/*"` does not resolve
+///     through a literal `"./a/*"` key;
+///   * a KEY with two or more `*` is not a pattern (`tryParsePattern` returns
+///     undefined unless `indexOf("*") === lastIndexOf("*")`) and matches
+///     nothing — `"./a/*/b/*/c/*"` is a dead entry, not a greedy one.
+///
+/// Both are `nodeModulesExportsDoubleAsterisk`, where the specifier and the key
+/// are byte-identical and the answer is still TS2307.
 fn resolveExportsSubpath(
     f: Fs,
     alloc: Allocator,
@@ -904,11 +918,14 @@ fn resolveExportsSubpath(
     subpath: []const u8,
     probe: ExportProbe,
 ) Error!?[]u8 {
-    if (obj.get(subpath)) |v| return resolveConditionalTarget(f, alloc, pkg_dir, v, "", probe);
+    if (std.mem.indexOfScalar(u8, subpath, '*') == null) {
+        if (obj.get(subpath)) |v| return resolveConditionalTarget(f, alloc, pkg_dir, v, "", probe);
+    }
     var best: ?usize = null;
     var best_prefix: usize = 0;
     for (obj.keys, 0..) |key, i| {
         const star = std.mem.indexOfScalar(u8, key, '*') orelse continue;
+        if (std.mem.lastIndexOfScalar(u8, key, '*').? != star) continue; // not a pattern
         const prefix = key[0..star];
         const suffix = key[star + 1 ..];
         if (subpath.len < prefix.len + suffix.len) continue;
