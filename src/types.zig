@@ -355,6 +355,18 @@ pub const obj_flag_any_base: u32 = 64;
 /// this, `string | number` failed the constraint and every read through the
 /// tracker's `filter?: (item: T) => boolean` was a false TS2322/TS2344.
 pub const obj_flag_mapped_keys: u32 = 128;
+/// The object's number index signature is a numeric enum's REVERSE MAPPING —
+/// tsc's shared `enumNumberIndexInfo`, `[n: number]: string`. A numeric enum's
+/// value object carries the members' names back from their values at runtime
+/// (`E[0]` is `"A"`), and the signature is how the type system says so.
+///
+/// The flag exists because that one signature is invisible to `keyof`: tsc's
+/// `getIndexType` filters it out by IDENTITY (`info !== enumNumberIndexInfo`),
+/// so `keyof typeof E` stays `"A" | "B"` and never gains `number`. Every other
+/// consumer — element access, assignability — treats it as an ordinary index
+/// signature, which is exactly what makes `E[1]` a `string` instead of a
+/// TS7053.
+pub const obj_flag_enum_index: u32 = 256;
 pub const prop_flag_optional: u32 = 1;
 pub const prop_flag_readonly: u32 = 2;
 /// A `private`/`protected` class member (tsc's `ModifierFlags.NonPublic`).

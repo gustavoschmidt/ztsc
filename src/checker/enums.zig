@@ -586,7 +586,23 @@ pub fn enumValueType(c: *Checker, sym: SymbolId) Error!TypeId {
             try props.append(c.scratch(), .{ .name = name, .ty = mt, .flags = types.prop_flag_readonly });
         }
     }
-    const result = try c.ts.makeObject(props.items, 0, 0, 0);
+    // A NUMERIC enum reverse-maps: `E[0]` is `"A"` at runtime, and tsc gives
+    // the value object a `[n: number]: string` signature to say so (its shared
+    // `enumNumberIndexInfo`). Without it `E[1]` was a TS7053 where tsc answers
+    // `string` — which is also why `++(ENUM[1] + ENUM[2])` reported TS2357
+    // (a bad assignment target) instead of tsc's TS2356 (a bad arithmetic
+    // operand) in `incrementOperatorWithEnumTypeInvalidOperations`.
+    //
+    // tsc's gate is "the declared type is a bare enum, or some member is
+    // number-like" — i.e. everything except an enum whose every member is a
+    // string constant, which is exactly `EnumInfo.all_string`. An EMPTY enum
+    // is included (its declared type is the bare `Enum`), verified against the
+    // oracle. The flag keeps the signature out of `keyof`; see there.
+    const numeric = !(try enumInfo(c, sym)).all_string;
+    const result = if (numeric)
+        try c.ts.makeObject(props.items, 0, types.string_type, types.obj_flag_enum_index)
+    else
+        try c.ts.makeObject(props.items, 0, 0, 0);
     try c.enum_value_cache.put(c.cm(), sym, result);
     return result;
 }

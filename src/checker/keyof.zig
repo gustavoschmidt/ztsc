@@ -91,7 +91,14 @@ fn keyofObjectTableUncached(c: *Checker, r: TypeId) Error!TypeId {
             try parts.append(c.scratch(), types.number_type);
         }
     }
-    if (c.ts.objectNumberIndex(r) != 0) try parts.append(c.scratch(), types.number_type);
+    // A numeric enum's reverse-mapping signature is not a key of the enum:
+    // `keyof typeof E` is its member names, never `number`. See
+    // `obj_flag_enum_index`.
+    if (c.ts.objectNumberIndex(r) != 0 and
+        c.ts.objectFlags(r) & types.obj_flag_enum_index == 0)
+    {
+        try parts.append(c.scratch(), types.number_type);
+    }
     return c.ts.makeUnion(c.scratch(), parts.items);
 }
 

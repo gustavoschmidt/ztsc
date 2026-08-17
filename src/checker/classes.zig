@@ -2008,24 +2008,53 @@ pub fn checkAbstractImplementation(c: *Checker, class_sym: SymbolId, class_node:
 
     if (unimpl.items.len == 0) return;
     const data = c.tree.extraData(ast.ClassData, c.tree.nodeData(class_node).lhs);
-    const span = c.tokSpan(data.name_token);
-    const class_name = c.symbolName(class_sym);
     const base_name = c.symbolName(direct_base);
+    // A class EXPRESSION gets its own pair of codes and its own wording — tsc
+    // branches on `isClassExpression(derivedClassDecl)`, not on whether the
+    // class has a name — and is reported at the `class` keyword, since there is
+    // no name token to point at. `var C = class extends A {}` is TS2653, never
+    // TS2515 about a class called `C`.
+    const expr = try isClassExpr(c, class_node, class_sym);
+    const span = if (expr) c.tokSpan(c.tree.nodeMainToken(class_node)) else c.tokSpan(data.name_token);
+    const class_name = c.symbolName(class_sym);
     if (unimpl.items.len == 1) {
-        try c.diagFmt(2515, span, "Non-abstract class '{s}' does not implement inherited abstract member {s} from class '{s}'.", .{
-            class_name, c.atomText(unimpl.items[0]), base_name,
+        if (expr) {
+            try c.diagFmt(2653, span, "Non-abstract class expression does not implement inherited abstract member '{s}' from class '{s}'.", .{
+                c.atomText(unimpl.items[0]), base_name,
+            });
+        } else {
+            try c.diagFmt(2515, span, "Non-abstract class '{s}' does not implement inherited abstract member {s} from class '{s}'.", .{
+                class_name, c.atomText(unimpl.items[0]), base_name,
+            });
+        }
+        return;
+    }
+    var names: std.Io.Writer.Allocating = .init(c.scratch());
+    defer names.deinit();
+    for (unimpl.items, 0..) |m, i| {
+        if (i > 0) names.writer.writeAll(", ") catch return error.OutOfMemory;
+        names.writer.print("'{s}'", .{c.atomText(m)}) catch return error.OutOfMemory;
+    }
+    if (expr) {
+        try c.diagFmt(18052, span, "Non-abstract class expression is missing implementations for the following members of '{s}': {s}.", .{
+            base_name, names.written(),
         });
     } else {
-        var names: std.Io.Writer.Allocating = .init(c.scratch());
-        defer names.deinit();
-        for (unimpl.items, 0..) |m, i| {
-            if (i > 0) names.writer.writeAll(", ") catch return error.OutOfMemory;
-            names.writer.print("'{s}'", .{c.atomText(m)}) catch return error.OutOfMemory;
-        }
         try c.diagFmt(2654, span, "Non-abstract class '{s}' is missing implementations for the following members of '{s}': {s}.", .{
             class_name, base_name, names.written(),
         });
     }
+}
+
+/// Is this class node a class EXPRESSION? Its symbol is declared in the class's
+/// OWN scope; a class DECLARATION names itself in the enclosing one. See
+/// `Binder.bindClass`, which is where the two are put in different places, and
+/// `classSymbolOf`, which is why both are reachable from here.
+fn isClassExpr(c: *Checker, class_node: Node, class_sym: SymbolId) Error!bool {
+    const saved = c.enterSymFile(class_sym);
+    defer c.restoreCtx(saved);
+    const cs = try c.scopeOf(class_node) orelse return false;
+    return c.symScope(class_sym) == cs;
 }
 
 /// Record every member-name of a class (instance and static) into `seen`.
