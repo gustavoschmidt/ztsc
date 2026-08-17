@@ -49,6 +49,7 @@ const indexableConstituent = @import("typenode.zig").indexableConstituent;
 const init = Checker.init;
 const instantiate = @import("enums.zig").instantiate;
 const isNonPrimitiveKind = @import("assign.zig").isNonPrimitiveKind;
+const modvalue = @import("modvalue.zig");
 const props_zig = @import("props.zig");
 const propOfType = props_zig.propOfType;
 const pushChainGuards = @import("flow.zig").pushChainGuards;
@@ -591,6 +592,12 @@ fn checkIdentifier(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     switch (c.resolveSpace(a, c.cur_scope, true)) {
         .sym => |sym| {
             const f = c.symFlags(sym);
+            // A namespace with no value in it is not a value (tsc's
+            // `checkAndReportErrorForUsingNamespaceAsTypeOrValue`).
+            if (modvalue.interesting(f) and try modvalue.valuelessNamespaceRef(c, sym, f)) {
+                try c.diagFmt(2708, c.tokSpan(tok), "Cannot use namespace '{s}' as a value.", .{c.tokenText(tok)});
+                return types.error_type;
+            }
             if (f.import_binding) {
                 if (c.importTarget(sym)) |tgt0| {
                     // A dual binding (tsc's combined value-and-type symbol)
@@ -2881,6 +2888,15 @@ fn memberChainInner(c: *Checker, node: Node, ctx: TypeId) Error!ChainLink {
         try accessibility.checkSuperField(c, name, name_tok);
     }
     var pt = try propertyTypeOf(c, obj_t, name, name_tok, site);
+    // A `#name` is resolved lexically before it is looked up, so an access
+    // from outside the declaring class is TS18013 even though the member
+    // table answered (`accessibility.checkPrivateName`). Asked only once the
+    // lookup HAS answered: a `#name` no type carries keeps its TS2339.
+    if (c.tree.tokens.tag(name_tok) == .private_identifier and pt != types.error_type) {
+        if (try accessibility.checkPrivateName(c, obj_t, name, name_tok, site)) {
+            return .{ .ty = types.error_type, .chained = chained };
+        }
+    }
     // tsc's `getNarrowableTypeForReference`, the property-access arm: this
     // access is itself a reference, so a union-constrained type variable it
     // reads enters the flow walk as its constraint (see `narrowable.zig`).
@@ -4717,21 +4733,20 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
                         // A namespace whose every block declares only types
                         // emits no runtime object, so tsc never gets as far as
                         // "cannot assign to a namespace": the name does not
-                        // resolve in value space at all (TS2708, "cannot use
-                        // as a value", which ztsc does not report yet). The
-                        // `errorType` still stands — it is what suppresses the
-                        // TS2322 cascade either way.
-                        const what: ?struct { code: u16, text: []const u8 } = if (sf.enum_decl)
+                        // resolve in value space at all, and the verdict is
+                        // TS2708 ("cannot use as a value") instead.
+                        const what: struct { code: u16, text: []const u8 } = if (sf.enum_decl)
                             .{ .code = 2628, .text = "an enum" }
                         else if (sf.class)
                             .{ .code = 2629, .text = "a class" }
-                        else if (sf.namespace_decl)
-                            if (sf.ns_uninstantiated) null else .{ .code = 2631, .text = "a namespace" }
-                        else
-                            .{ .code = 2630, .text = "a function" };
-                        if (what) |w| {
-                            try c.diagFmt(w.code, c.tokSpan(tok), "Cannot assign to '{s}' because it is {s}.", .{ c.tokenText(tok), w.text });
-                        }
+                        else if (sf.namespace_decl) blk: {
+                            if (try modvalue.valuelessNamespaceRef(c, sym, sf)) {
+                                try c.diagFmt(2708, c.tokSpan(tok), "Cannot use namespace '{s}' as a value.", .{c.tokenText(tok)});
+                                return types.error_type;
+                            }
+                            break :blk .{ .code = 2631, .text = "a namespace" };
+                        } else .{ .code = 2630, .text = "a function" };
+                        try c.diagFmt(what.code, c.tokSpan(tok), "Cannot assign to '{s}' because it is {s}.", .{ c.tokenText(tok), what.text });
                         return types.error_type;
                     }
                     return c.typeOfSymbol(sym);
@@ -4754,7 +4769,13 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
             if (c.nodeTag(d.lhs) == .super_expr) try accessibility.checkSuperField(c, name, d.rhs);
             const r = try c.resolveStructural(obj_t);
             if (try c.propOfType(r, name)) |p| {
-                if (p.nonPublic()) try accessibility.check(c, obj_t, name, d.rhs, .{ .dir = .write, .recv_node = d.lhs });
+                const wsite: accessibility.Site = .{ .dir = .write, .recv_node = d.lhs };
+                // A `#name` write from outside the declaring class is the same
+                // TS18013 the read is (`Base.#prop = 10` in a derived class).
+                if (c.tree.tokens.tag(d.rhs) == .private_identifier) {
+                    if (try accessibility.checkPrivateName(c, obj_t, name, d.rhs, wsite)) return types.error_type;
+                }
+                if (p.nonPublic()) try accessibility.check(c, obj_t, name, d.rhs, wsite);
                 // A readonly property may be assigned via `this.x` inside the
                 // constructor of the class that OWNS the declaration (tsc:
                 // `checkReferenceExpression`). An inherited readonly still

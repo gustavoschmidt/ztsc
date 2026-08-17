@@ -11,12 +11,15 @@
 //! `prog.globals` table, on demand.
 
 const std = @import("std");
+const ast = @import("../frontend/ast.zig");
 const binder = @import("../frontend/binder.zig");
 const intern = @import("../intern.zig");
 const modules = @import("../link/modules.zig");
 const types = @import("../types.zig");
 
 const Atom = intern.Atom;
+const Node = ast.Node;
+const null_node = ast.null_node;
 const SymbolId = binder.SymbolId;
 const TypeId = types.TypeId;
 
@@ -26,6 +29,124 @@ const Error = checker_zig.Error;
 const FileId = checker_zig.FileId;
 
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
+
+/// tsc's `checkAndReportErrorForUsingNamespaceAsTypeOrValue`, value half:
+/// does this name denote a NON-INSTANTIATED namespace and nothing else?
+///
+/// `namespace M { export interface P {} }` declares no value at all, so tsc
+/// gives its symbol `SymbolFlags.NamespaceModule` — which is outside
+/// `SymbolFlags.Value` — and a value-position use of `M` is TS2708 rather
+/// than a type. ztsc's `hasValueMeaning` accepts every `namespace_decl` so
+/// that the lexical walk still *finds* the name (stopping there is what makes
+/// the diagnostic specific instead of "Cannot find name"); the use sites ask
+/// this instead of resolving differently.
+///
+/// A MERGED id reports the OR of its parts' flags, and `ns_uninstantiated` has
+/// to be an AND (one instantiated block makes the whole merge a value), so the
+/// merge is walked part by part.
+pub fn valuelessNamespace(c: *const Checker, sym: SymbolId) bool {
+    if (!c.symFlags(sym).namespace_decl) return false;
+    if (!c.prog.isMergedId(sym)) return uninstantiatedPart(c, sym);
+    const m = c.prog.mergedSym(sym);
+    for (m.parts) |p| {
+        if (!uninstantiatedPart(c, p)) return false;
+    }
+    return m.parts.len != 0;
+}
+
+/// `valuelessNamespace` through an ENTITY-NAME alias. `import U = Outer.uninst`
+/// carries exactly the meanings its right-hand side has, so `typeof U` and
+/// `U.member` in value position are the same TS2708 the namespace's own name
+/// earns (`typeofInternalModules`). The `= require("m")` form has an import
+/// RECORD and is the linker's; only the entity form is walked here.
+///
+/// `f` is the caller's already-loaded `symFlags(sym)`: every call site has it,
+/// and `interesting(f)` — one branch on two bits — is what keeps this off the
+/// hot path for the identifiers that are neither.
+pub fn valuelessNamespaceRef(c: *Checker, sym: SymbolId, f: binder.SymbolFlags) Error!bool {
+    if (!interesting(f)) return false;
+    if (valuelessNamespace(c, sym)) return true;
+    if (!f.import_binding or c.importTarget(sym) != null) return false;
+    return switch ((try c.importEqualsEntityContainer(sym)) orelse return false) {
+        .ns => |ns| valuelessNamespace(c, ns),
+        .module => false,
+    };
+}
+
+/// Could `valuelessNamespaceRef` possibly say yes? A name that is neither a
+/// namespace nor an alias never can, and that is every identifier in ordinary
+/// code — so the screen is inlined at each call site's already-loaded flags
+/// rather than paid as a call.
+pub fn interesting(f: binder.SymbolFlags) bool {
+    return f.namespace_decl or f.import_binding;
+}
+
+/// One declaration: a namespace block with no value in it, merged with nothing
+/// that carries a value meaning of its own. An import binding counts as a value
+/// here — an alias's own meaning is the target's, which this flag screen cannot
+/// see.
+fn uninstantiatedPart(c: *const Checker, sym: SymbolId) bool {
+    const f = c.symFlags(sym);
+    if (!f.namespace_decl or !f.ns_uninstantiated) return false;
+    if (f.var_decl or f.let_decl or f.const_decl or f.function or f.class or
+        f.param or f.catch_param or f.enum_decl or f.enum_member or f.import_binding) return false;
+    const tree = c.prog.files[c.symFile(sym)].tree;
+    for (c.declsOf(sym)) |decl| {
+        if (tree.nodeTag(decl) != .namespace_decl) continue;
+        if (!nonInstantiatedBlock(tree, decl, 16)) return false;
+    }
+    return true;
+}
+
+/// tsc's `getModuleInstanceState(node) === NonInstantiated`, which is what
+/// decides whether the binder gives a `namespace` symbol `NamespaceModule` (no
+/// value meaning, so TS2708 at a value use) or `ValueModule`.
+///
+/// NOT `binder.instantiated`, which answers the neighbouring question "does
+/// this block EMIT a runtime object with `preserveConstEnums` off" for the
+/// declaration-merge rule. The two disagree on exactly the shapes this one has
+/// to get right:
+///
+///   * a `const enum` body is `ConstEnumOnly`, not `NonInstantiated`, so the
+///     namespace keeps its value meaning (`constEnums`: `A.B.C.E.V1` is silent
+///     while the binder calls every block of `A` type-only);
+///   * an `export`ed import alias is `Instantiated` outright — tsc returns
+///     `NonInstantiated` for an import only when it is NOT exported
+///     (`exportImportAlias`: `namespace C { export import a = A }` read as
+///     `C.a.x`). The binder's walk cannot see that `export`, which the parser
+///     records as a FLAG on the import node rather than as an `export` wrapper.
+///
+/// Reached only after `ns_uninstantiated` — true wherever tsc's
+/// `NonInstantiated` is — has already screened the name, so the walk is paid on
+/// the handful of namespaces whose verdict it can change.
+fn nonInstantiatedBlock(tree: *const ast.Ast, node: Node, depth: u8) bool {
+    if (depth == 0) return false; // "cannot tell" ⇒ keep the value meaning
+    const data = tree.extraData(ast.NamespaceData, tree.nodeData(node).lhs);
+    for (tree.extraRange(data.body_start, data.body_end)) |raw| {
+        if (raw == null_node) continue;
+        // `export interface I {}` is an InterfaceDeclaration for tsc; the
+        // modifier is not a node of its own there.
+        var stmt = raw;
+        while (tree.nodeTag(stmt) == .export_decl) {
+            stmt = tree.nodeData(stmt).lhs;
+            if (stmt == null_node) return false;
+        }
+        switch (tree.nodeTag(stmt)) {
+            .interface_decl, .type_alias => {},
+            .import_decl => {
+                const e = tree.extraData(ast.ImportData, tree.nodeData(stmt).lhs);
+                if (e.flags & ast.Flags.exported != 0) return false;
+            },
+            .import_equals => {
+                const e = tree.extraData(ast.ImportEquals, tree.nodeData(stmt).lhs);
+                if (e.flags & ast.Flags.exported != 0) return false;
+            },
+            .namespace_decl => if (!nonInstantiatedBlock(tree, stmt, depth - 1)) return false,
+            else => return false,
+        }
+    }
+    return true;
+}
 
 /// Value type of an import binding, via the sealed link tables.
 pub fn importedSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {

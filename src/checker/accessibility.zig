@@ -47,6 +47,8 @@ const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
+const names = @import("names.zig");
+
 /// tsc's `ModifierFlags.AccessibilityModifier`, as the ordered lattice the
 /// accessor-pair check (TS2808) compares on: `public` > `protected` > `private`.
 pub const Access = enum(u8) {
@@ -152,6 +154,55 @@ pub fn check(c: *Checker, recv: TypeId, name: Atom, name_tok: TokenIndex, site: 
     try c.diagFmt(2446, c.tokSpan(name_tok), "Property '{s}' is protected and only accessible through an instance of class '{s}'. This is an instance of class '{s}'.", .{
         c.atomText(name), try declaringClassName(c, enclosing), try c.typeToString(found.recv),
     });
+}
+
+/// The `#name` half of the same question — tsc's
+/// `checkPrivateIdentifierPropertyAccess`, run when a property access spells
+/// its name with a PRIVATE IDENTIFIER.
+///
+/// A `#name` is not a name in any type's member table as far as tsc's lookup is
+/// concerned: it is resolved LEXICALLY first (`lookupSymbolForPrivateIdentifier
+/// Declaration` — the enclosing class chain, which a nested function inside the
+/// class body is still part of), and only a member the enclosing class declares
+/// can be read at all. So an access from outside that class splits three ways:
+///
+///   * the receiver's type HAS a `#name` member → TS18013, naming the class
+///     that declares it (`new A2().#method()`);
+///   * it does not → nothing here, and the ordinary missing-property TS2339
+///     stands.
+///
+/// A STATIC `#name` is where "has it" and "inherits it" part company: tsc puts
+/// a private INSTANCE member on every derived instance type (`x: Derived` reads
+/// `Base`'s `#prop`, which is `privateNameFieldDerivedClasses`' TS18013) but
+/// puts a private STATIC member on no derived static type at all (`x: typeof
+/// Derived` does NOT have `Base`'s `static #prop`, which is
+/// `privateNameStaticAccessorssDerivedClasses`' TS2339). ztsc's static lookup
+/// inherits both, so a static hit through a BASE class is not this diagnostic's
+/// and is left to the miss it should have been.
+///
+/// tsc has a third arm — the grammar error TS18016 for a `#name` on an
+/// `any`-like receiver with no enclosing class — which is deliberately not
+/// transcribed: every `any` ztsc produces where tsc has a real type would turn
+/// into a false positive there (`privateNameMethodClassExpression`, where the
+/// receiver is a class EXPRESSION's instance).
+///
+/// Returns whether it reported, so the access can answer `errorType` (tsc's
+/// `return errorType` on the same branch) instead of the member's type.
+///
+/// COST: one token-tag test at the call site, so a program with no `#name`
+/// access pays nothing.
+pub fn checkPrivateName(c: *Checker, recv: TypeId, name: Atom, name_tok: TokenIndex, site: Site) Error!bool {
+    // Declared by an enclosing class: the ordinary lookup is the answer.
+    // (A DIFFERENT class's `#name` on the receiver is tsc's TS18014 shadowing
+    // case, which ztsc leaves silent.)
+    if (names.resolvePrivateName(c, name, c.cur_scope) == .member) return false;
+    const owner = try declaringClass(c, recv, name, site) orelse return false;
+    if (owner.statics and
+        (c.ts.kind(owner.recv) != .ref or c.ts.refSymbol(owner.recv) != owner.cls)) return false;
+    try c.diagFmt(18013, c.tokSpan(name_tok), "Property '{s}' is not accessible outside class '{s}' because it has a private identifier.", .{
+        c.atomText(name), try declaringClassName(c, owner.cls),
+    });
+    return true;
 }
 
 /// TS2855 at a `super.x` access: a class FIELD the base class declares is not

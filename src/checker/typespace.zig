@@ -36,6 +36,7 @@ const FileId = checker_zig.FileId;
 
 const hasTypeMeaning = @import("names.zig").hasTypeMeaning;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
+const modvalue = @import("modvalue.zig");
 const static_tp_scope = @import("static_tp_scope.zig");
 const typeparams = @import("typeparams.zig");
 const indexOfAtom = @import("generics.zig").indexOfAtom;
@@ -127,7 +128,26 @@ pub fn typeFromTypeNameEx(c: *Checker, name_node: Node, args: []const TypeId, ou
             var sym = sym0;
             var f = c.symFlags(sym);
             if (f.import_binding) import_blk: {
-                const tgt0 = c.importTarget(sym) orelse return types.any_type; // unlinked
+                const tgt0 = c.importTarget(sym) orelse {
+                    // No import RECORD means the ENTITY-NAME form, `import
+                    // modes = _modes` — nothing for the linker to resolve, so
+                    // the right-hand side is walked here. An alias to a
+                    // NAMESPACE has the namespace's meanings, and tsc's
+                    // `SymbolFlags.Type` excludes them: naming it as a type is
+                    // the same TS2709 the namespace's own name earns. A merged
+                    // namespace that also declares a type is a type, and every
+                    // other target stays the lenient `any` it was.
+                    if (try c.importEqualsEntityContainer(sym)) |cont| {
+                        switch (cont) {
+                            .ns => |ns| if (!hasTypeMeaning(nonNsFlags(c.symFlags(ns)))) {
+                                try c.diagFmt(2709, c.tokSpan(tok), "Cannot use namespace '{s}' as a type.", .{c.atomText(a)});
+                                return types.error_type;
+                            },
+                            .module => {},
+                        }
+                    }
+                    return types.any_type;
+                };
                 // A dual binding's TYPE half is the member of the exported
                 // entity; its value half is a property and has none.
                 const tgt = c.typeMeaningTarget(tgt0);
@@ -803,7 +823,149 @@ fn qualifierHasProp(c: *Checker, sym: SymbolId, tok: TokenIndex, member_tok: Tok
     return (try c.propOfTypeEx(declared, try c.memberAtom(member_tok), false)) != null;
 }
 
+/// The same flags with the `namespace_decl` (and `import_binding`) bits
+/// cleared, so `hasTypeMeaning` answers "does this symbol declare a TYPE?"
+/// rather than "could it stand for one?". tsc's `SymbolFlags.Type` excludes
+/// `NamespaceModule` / `ValueModule`, which is what makes a bare namespace name
+/// in type position TS2709.
+fn nonNsFlags(f: binder.SymbolFlags) binder.SymbolFlags {
+    var out = f;
+    out.namespace_decl = false;
+    out.import_binding = false;
+    return out;
+}
+
+/// Where a dotted ENTITY NAME stopped resolving: the namespace container that
+/// could not answer, the qualifier node that named it (for the message, which
+/// quotes the whole dotted path) and the segment it could not answer.
+pub const NsBreak = struct {
+    ns: SymbolId,
+    qualifier: Node,
+    name_tok: TokenIndex,
+    /// The container declares the name but does not EXPORT it — the certain
+    /// half of the failure. A name the container does not declare at all is the
+    /// half a ztsc resolution gap can also produce, so a caller that is not
+    /// tsc's own `resolveEntityName` site screens on this.
+    unexported: bool,
+};
+
+/// tsc's `resolveEntityName` reports at the FIRST segment its container cannot
+/// answer, not at the last one written: `D.inner.Class1` with `inner`
+/// unexported is a TS2694 about `inner`. This walks a dotted name left to
+/// right and returns that segment.
+///
+/// Null when every segment resolves, when the chain's ROOT is not a container
+/// at all (a different diagnostic, and a different caller's business), and —
+/// deliberately — when the failure is inside a whole-MODULE container, where
+/// ztsc's re-export modelling is incomplete and the documented policy is
+/// silence rather than a spurious TS2694 (`typeFromQualifiedName`'s `.module`
+/// arm draws the same line).
+pub fn nsChainBreak(c: *Checker, node: Node) Error!?NsBreak {
+    switch (c.nodeTag(node)) {
+        .qualified_name, .member_expr => {},
+        else => return null,
+    }
+    const d = c.tree.nodeData(node);
+    // The leftmost failure wins, so the qualifier is asked first.
+    if (try nsChainBreak(c, d.lhs)) |b| return b;
+    const outer = (try c.resolveNsContainer(d.lhs)) orelse return null;
+    const ns = switch (outer) {
+        .ns => |s| s,
+        .module => return null,
+    };
+    const name = try c.memberAtom(d.rhs);
+    if (c.containerMemberSym(outer, name) != null) return null;
+    return .{
+        .ns = ns,
+        .qualifier = d.lhs,
+        .name_tok = d.rhs,
+        .unexported = c.namespaceMemberSym(ns, name) != null,
+    };
+}
+
+/// The TS2694 / TS2724 pair for one `nsChainBreak`, spelled as tsc spells it:
+/// the namespace is named by the WHOLE dotted qualifier (tsc's
+/// `getFullyQualifiedName`), not by its last segment.
+pub fn reportNsChainBreak(c: *Checker, b: NsBreak) Error!void {
+    const name = try c.memberAtom(b.name_tok);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(c.scratch());
+    try entityNameText(c, b.qualifier, &buf);
+    const sugg = try namespaceMemberSuggestion(c, b.ns, name);
+    if (sugg != 0) {
+        try c.diagFmt(2724, c.tokSpan(b.name_tok), "'{s}' has no exported member named '{s}'. Did you mean '{s}'?", .{ buf.items, c.atomText(name), c.atomText(sugg) });
+        return;
+    }
+    try c.diagFmt(2694, c.tokSpan(b.name_tok), "Namespace '{s}' has no exported member '{s}'.", .{ buf.items, c.atomText(name) });
+}
+
+/// tsc's `checkImportEqualsDeclaration` → `resolveAlias` for the ENTITY-NAME
+/// form `import X = A.B.C`, whose right-hand side is resolved with errors ON.
+/// The module form (`= require("m")`) is the linker's, and a bare identifier
+/// resolves in every meaning at once — only a DOTTED name has a container that
+/// can fail.
+///
+/// `exported` additionally earns TS2708 on the root when the chain broke: an
+/// `export import` alias whose target did not resolve keeps every meaning, so
+/// tsc's emit resolver treats it as a value reference and resolves the root in
+/// VALUE meaning — where a non-instantiated namespace is not a value. A
+/// RESOLVED chain never reaches that path (oracle-verified: `export import a =
+/// q.inner.k` through two type-only namespaces is silent, and the same
+/// declaration with an unexported final segment reports both).
+pub fn checkImportEqualsEntity(c: *Checker, entity: Node, exported: bool) Error!void {
+    var root = entity;
+    while (c.nodeTag(root) == .qualified_name or c.nodeTag(root) == .member_expr) {
+        root = c.tree.nodeData(root).lhs;
+    }
+    if (c.nodeTag(root) != .identifier) return;
+    const tok = c.tree.nodeMainToken(root);
+    // A literal or a reserved word where the entity should be is a PARSE
+    // error (`import n = 5`, `import q = null`), not a name to resolve.
+    if (c.tree.tokens.tag(tok) != .identifier) return;
+    // `globalThis` is in scope everywhere and has no declaration to find.
+    if (std.mem.eql(u8, c.tokenText(tok), "globalThis")) return;
+    const a = try c.atomOfToken(tok);
+    // A root that names NOTHING, in any space. tsc's `resolveEntityName` here
+    // carries `SymbolFlags.Namespace`, so the message is "Cannot find
+    // namespace" (TS2503/TS2833) and not the TS2304 an expression-position
+    // identifier would earn — oracle-verified for both the dotted and the bare
+    // form of the right-hand side.
+    const root_sym: SymbolId = switch (c.resolveNamespaceSpace(a, c.cur_scope)) {
+        .sym => |s| s,
+        else => {
+            if (c.resolveSpace(a, c.cur_scope, true) != .none) return;
+            if (c.resolveSpace(a, c.cur_scope, false) != .none) return;
+            if (c.suggestName(a, c.cur_scope, false)) |sugg| {
+                try c.diagFmt(2833, c.tokSpan(tok), "Cannot find namespace '{s}'. Did you mean '{s}'?", .{ c.tokenText(tok), c.atomText(sugg) });
+            } else {
+                try c.diagFmt(2503, c.tokSpan(tok), "Cannot find namespace '{s}'.", .{c.tokenText(tok)});
+            }
+            return;
+        },
+    };
+    const b = (try nsChainBreak(c, entity)) orelse return;
+    if (exported and modvalue.valuelessNamespace(c, root_sym)) {
+        try c.diagFmt(2708, c.tokSpan(tok), "Cannot use namespace '{s}' as a value.", .{c.tokenText(tok)});
+    }
+    try reportNsChainBreak(c, b);
+}
+
 fn reportBadNsQualifier(c: *Checker, node: Node, member_tok: TokenIndex) Error!bool {
+    // A qualifier whose own chain broke earlier reports there, not at its
+    // leftmost identifier: `D.inner.Class1` blames `inner`.
+    //
+    // Only the DECLARED-BUT-UNEXPORTED half is certain enough to report from a
+    // type name. A name the container does not declare at all can equally mean
+    // ztsc resolved the wrong container — sibling `namespace X.A.B.C` blocks
+    // share one members scope here where tsc keeps their locals apart, so
+    // `implements A.C.Z` next to a local `namespace A {}` finds the local one
+    // (`declFileWithInternalModuleNameConflictsInExtendsClause2`) — and the
+    // documented policy for a resolution gap is silence.
+    if (try nsChainBreak(c, node)) |b| {
+        if (!b.unexported) return false;
+        try reportNsChainBreak(c, b);
+        return true;
+    }
     var n = node;
     var member = member_tok;
     while (c.nodeTag(n) == .qualified_name or c.nodeTag(n) == .member_expr) {
@@ -1237,7 +1399,15 @@ pub fn typeofEntity(c: *Checker, node: Node) Error!TypeId {
     if (c.tree.tokens.tag(tok) == .keyword_undefined) return types.undefined_type;
     const a = try c.atomOfToken(tok);
     switch (c.resolveTypeQuerySpace(a, c.cur_scope)) {
-        .sym => |sym| return c.regularizeTypeQuery(try c.typeOfSymbol(sym)),
+        .sym => |sym| {
+            // `typeof M` names a VALUE, and a namespace with nothing but
+            // types in it is not one (see `valuelessNamespace`).
+            if (try modvalue.valuelessNamespaceRef(c, sym, c.symFlags(sym))) {
+                try c.diagFmt(2708, c.tokSpan(tok), "Cannot use namespace '{s}' as a value.", .{c.tokenText(tok)});
+                return types.error_type;
+            }
+            return c.regularizeTypeQuery(try c.typeOfSymbol(sym));
+        },
         .wrong_space => |sym| {
             // A type-only import binding is excluded from value space by
             // `hasValueMeaning` so that a *value* use reports TS1361 — but
