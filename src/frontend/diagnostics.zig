@@ -284,7 +284,11 @@ pub const Code = enum(u16) {
     /// so the same source is silent there. Reported on the name; grammar-class.
     quoted_module_name_needs_ambient,
     /// TS1437: `module { }` — a namespace declaration with no name at all.
-    /// Reported on the `{`; grammar-class.
+    /// Reported on the `{`. SYNTACTIC, not grammar: tsc raises it from
+    /// `parseModuleDeclaration`, so it lands in `parseDiagnostics` and arms the
+    /// program-wide gate. Oracle-probed against tsgo 7.0.2 — a `var q: number =
+    /// "s"` in the same file, and a TS2322 in a SIBLING file, are both silent
+    /// once any file spells `module { }`.
     namespace_needs_a_name,
     /// TS1107: `while (c) { function f() { break; } }` — a `break`/`continue`
     /// whose target lies outside the function it sits in. tsc walks out of the
@@ -750,7 +754,6 @@ pub const Code = enum(u16) {
             .decorator_on_second_accessor,
             .module_keyword_for_namespace,
             .quoted_module_name_needs_ambient,
-            .namespace_needs_a_name,
             .const_class_member,
             .jump_crosses_function_boundary,
             .break_outside_iteration_or_switch,
