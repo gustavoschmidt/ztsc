@@ -3111,6 +3111,38 @@ pub fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
         // `Delta<unknown>` (`deleted: Partial<unknown>` = `{}`), a legal
         // `Delta<T>` inside `Delta.calculate<T>`.
         if (c.mappedAddsOptional(t) and c.isEmptyObjectType(try c.resolveStructural(s))) return true;
+        // tsc `structuredTypeRelatedTo`, the `includeOptional` half: "A source
+        // type `T` is related to a target type `{ [P in Q]?: X }` if SOME
+        // constituent `Q'` of `Q` is related to `keyof T` and `T[Q']` is
+        // related to `X`." tsc spells the "some constituent" test as
+        // `intersectTypes(targetKeys, sourceKeys)` not being `never`, and then
+        // indexes the SOURCE by that filtered key set rather than by the map's
+        // whole (still-deferred) one.
+        //
+        // Every key the map produces is optional, so the keys `S` does not
+        // have are simply absent — only the ones it DOES have have to match
+        // the template. `Errors<D> = { readonly [K in keyof D | "base"]?:
+        // string[] }` returned from `getErrors()` as `{ base: ["…"] }` is the
+        // shape: `keyof D` is deferred, so the required-key rule below
+        // rejected it outright even though `base` is the only key involved.
+        if (c.mappedAddsOptional(t) and c.ts.mappedAs(t) == 0) {
+            const skeys = try c.keyofType(try c.resolveStructural(s));
+            var applicable: std.ArrayList(TypeId) = .empty;
+            defer applicable.deinit(c.scratch());
+            const tkeys = try c.mappedKeySet(t);
+            const tk_res = try c.resolveStructural(tkeys);
+            const constituents: []const TypeId = if (c.ts.kind(tk_res) == .union_type)
+                try c.memberList(tk_res)
+            else
+                &.{tkeys};
+            for (constituents) |q| {
+                if (try c.isAssignable(q, skeys)) try applicable.append(c.scratch(), q);
+            }
+            if (applicable.items.len == 0) return null;
+            const filtered = try c.ts.makeUnion(c.scratch(), applicable.items);
+            const access = try c.reduceIndexedAccess(s, filtered);
+            return if (try c.isAssignable(access, c.ts.mappedValue(t))) true else null;
+        }
         // tsc `structuredTypeRelatedTo`: `S` is related to `{ [P in C]: X }`
         // when `keyof S` is related to `C` and `S[P]` is related to `X`.
         // Guarded, as tsc guards it, on the target not adding `?` — that
