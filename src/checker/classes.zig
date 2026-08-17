@@ -1425,22 +1425,21 @@ fn baseCtorClassSym(c: *Checker, expr: Node, targ_count: usize) Error!?SymbolId 
 /// Deliberately narrow, because this arm is also where every base ztsc could
 /// NOT model lands — a mixin factory, an entity alias, an unmodeled
 /// construct — and staying silent there is the documented policy
-/// (`hasUnresolvedBase`). So the verdict is taken from the base's TYPE and
-/// only for types that are positively wrong:
+/// (`hasUnresolvedBase`). So the verdict is taken from the base's TYPE, and
+/// only for a PRIMITIVE (`var C = 1; class D extends C`), where nothing about
+/// ztsc's modelling is in question.
 ///
-///   - a PRIMITIVE (`var C = 1; class D extends C`), where nothing about
-///     ztsc's modelling is in question;
-///   - an OBJECT with no construct signature, which is what an
-///     `import C = require("./m")` namespace object is
-///     (`importAsBaseClass`).
-///
-/// `any` / `unknown` / `error` / a type parameter / a union / an intersection
-/// / a callable-but-not-constructable object all stay silent: each is either
-/// tsc's own escape hatch or a shape ztsc may be approximating.
+/// An OBJECT without construct signatures is tsc's error too, and NOT admitted
+/// here: `class C extends Iterator<number>` is exactly that shape whenever the
+/// value half of a lib global is modelled without its `new` signature, and
+/// `builtinIterator` earns five false TS2507s from it. That costs the one
+/// genuine object case in the corpus (`importAsBaseClass`'s
+/// `import C = require("./m")` namespace object) — the safe direction, and the
+/// arm becomes admissible the moment a construct-signature-less object can be
+/// told from an under-modelled one.
 fn reportNonConstructorBase(c: *Checker, expr: Node) Error!void {
     const t = try c.checkExprCached(expr, types.no_type);
-    const r = try c.resolveStructural(t);
-    switch (c.ts.kind(r)) {
+    switch (c.ts.kind(try c.resolveStructural(t))) {
         .string,
         .number,
         .boolean,
@@ -1454,7 +1453,6 @@ fn reportNonConstructorBase(c: *Checker, expr: Node) Error!void {
         .number_literal_fresh,
         .bigint_literal,
         => {},
-        .object => if (c.ts.objectConstructSigCount(r) != 0 or c.ts.objectCallSigCount(r) != 0) return,
         else => return,
     }
     try c.diagFmt(2507, c.nodeSpan(expr), "Type '{s}' is not a constructor function type.", .{
