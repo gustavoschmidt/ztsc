@@ -167,9 +167,39 @@ pub fn duplicateKey(keys: []const []const u8, i: usize) bool {
 /// `isModifierKind` is the same predicate the parser's own lookahead used to
 /// decide these tokens were modifiers of this member, so the two cannot drift.
 pub fn memberStartToken(tokens: *const scanner.Tokens, main_token: u32) u32 {
+    return memberStartTokenIn(tokens.tags, main_token);
+}
+
+/// `memberStartToken` over a bare tag slice, for the PARSER — which reports
+/// TS1071 while it is still building the token arrays and has no
+/// `scanner.Tokens` to hand. One walk, so the two callers cannot drift.
+pub fn memberStartTokenIn(tags: []const scanner.Tag, main_token: u32) u32 {
     var tok = main_token;
-    while (tok > 0 and isModifierKind(tokens.tag(tok - 1))) tok -= 1;
+    while (tok > 0 and isModifierKind(tags[tok - 1])) tok -= 1;
     return tok;
+}
+
+/// The first modifier an index signature may NOT carry, as an index into
+/// `tags`, or null when every modifier in `tags[first..sig]` is allowed.
+///
+/// tsc decides this per modifier, in `checkGrammarModifiers`, and returns on
+/// its first hit — so `readonly public [x: string]` answers for the `public`.
+/// Measured against tsgo for all eleven modifier keywords in a class and in an
+/// interface: `readonly` is always fine (an index signature is one of the four
+/// positions its arm allows), `static` is fine on a CLASS index signature and
+/// TS1071 on an interface's (tsc's arm asks `isClassLike(node.parent)`), and
+/// every other modifier is TS1071 wherever it appears.
+pub fn firstBadModifier(tags: []const scanner.Tag, first: u32, sig: u32, in_class: bool) ?u32 {
+    var tok = first;
+    while (tok < sig) : (tok += 1) {
+        const allowed = switch (tags[tok]) {
+            .keyword_readonly => true,
+            .keyword_static => in_class,
+            else => false,
+        };
+        if (!allowed) return tok;
+    }
+    return null;
 }
 
 /// tsc's `isModifierKind`, the lookahead's "is this the start of a parameter
@@ -316,6 +346,22 @@ test "an initializer earns TS2371 whatever else the chain answers" {
 
     // No initializer, nothing to say.
     try std.testing.expectEqual(@as(?Report, null), check(ok).initializer_outside_impl);
+}
+
+test "the modifiers an index signature may carry" {
+    const T = scanner.Tag;
+    const tags = [_]T{ .keyword_readonly, .keyword_static, .keyword_public, .l_bracket };
+    // `readonly` alone: fine anywhere.
+    try std.testing.expectEqual(@as(?u32, null), firstBadModifier(&tags, 0, 1, false));
+    // `static` is fine on a CLASS index signature and TS1071 on a type
+    // member's, which is the one verdict that depends on where it sits.
+    try std.testing.expectEqual(@as(?u32, null), firstBadModifier(&tags, 0, 2, true));
+    try std.testing.expectEqual(@as(?u32, 1), firstBadModifier(&tags, 0, 2, false));
+    // The walk stops at the FIRST offender, skipping the allowed ones before
+    // it: `readonly static public [x: string]` in a class answers for `public`.
+    try std.testing.expectEqual(@as(?u32, 2), firstBadModifier(&tags, 0, 3, true));
+    // No modifiers at all.
+    try std.testing.expectEqual(@as(?u32, null), firstBadModifier(&tags, 3, 3, false));
 }
 
 test "every signature of a duplicated key domain is reported, and only those" {

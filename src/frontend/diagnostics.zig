@@ -304,6 +304,11 @@ pub const Code = enum(u16) {
     /// syntactic, and the text still becomes a child either way.
     jsx_text_rbrace,
     jsx_text_gt,
+    /// TS1071: any modifier at all on an index signature, in a class or an
+    /// interface. One sentence over eleven keywords, and the word it wants is
+    /// the source text of the token it is reported on — so this one carries
+    /// `Diagnostic.arg` instead of an enum arm per keyword.
+    index_sig_modifier,
     /// TS1188/TS1091: a `for…of` / `for…in` head declares more than one
     /// variable. Reported on the SECOND declarator's first token, which is
     /// tsc's `grammarErrorOnFirstToken(declarations[1])`.
@@ -808,6 +813,7 @@ pub const Code = enum(u16) {
             .decorator_not_valid_here,
             .decorator_on_method_overload,
             .decorator_on_second_accessor,
+            .index_sig_modifier,
             .for_of_one_declaration,
             .for_in_one_declaration,
             .for_of_declaration_initializer,
@@ -1156,6 +1162,7 @@ pub const Code = enum(u16) {
             .jsx_needs_one_parent => "JSX expressions must have one parent element.",
             .jsx_text_rbrace => "Unexpected token. Did you mean `{'}'}` or `&rbrace;`?",
             .jsx_text_gt => "Unexpected token. Did you mean `{'>'}` or `&gt;`?",
+            .index_sig_modifier => "'{0}' modifier cannot appear on an index signature.",
             .for_of_one_declaration => "Only a single variable declaration is allowed in a 'for...of' statement.",
             .for_in_one_declaration => "Only a single variable declaration is allowed in a 'for...in' statement.",
             .for_of_declaration_initializer => "The variable declaration of a 'for...of' statement cannot have an initializer.",
@@ -1444,6 +1451,7 @@ pub const Code = enum(u16) {
             .jsx_needs_one_parent => 2657,
             .jsx_text_rbrace => 1381,
             .jsx_text_gt => 1382,
+            .index_sig_modifier => 1071,
             .for_of_one_declaration => 1188,
             .for_in_one_declaration => 1091,
             .for_of_declaration_initializer => 1190,

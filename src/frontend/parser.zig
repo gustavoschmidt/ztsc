@@ -3732,7 +3732,7 @@ const Parser = struct {
     const ModifierErr = struct { code: Code, token: u32 };
 
     fn parseIndexSignatureAsClassMember(p: *Parser, flags: u32) PE!Node {
-        return p.parseIndexSignature(flags);
+        return p.parseIndexSignature(flags, true);
     }
 
     /// Skip to the likely end of a malformed/unsupported class member.
@@ -7054,7 +7054,7 @@ const Parser = struct {
         var computed: ?ComputedName = null;
         if (p.curTag() == .l_bracket) {
             if (p.atIndexSignature()) {
-                return p.parseIndexSignature(flags);
+                return p.parseIndexSignature(flags, false);
             }
             const cn = try p.parseComputedMemberName();
             name_tok = cn.name_tok;
@@ -7143,8 +7143,26 @@ const Parser = struct {
     /// brackets as a PARAMETER LIST and leaves the judging to
     /// `checkGrammarIndexSignatureParameters`; `index_signature.check` is that
     /// function, and this collects the shape it needs.
-    fn parseIndexSignature(p: *Parser, flags: u32) PE!Node {
+    /// `in_class` distinguishes a CLASS index signature from a type member's:
+    /// `static` is legal on the former and TS1071 on the latter, which is the
+    /// one modifier whose verdict depends on where the signature sits.
+    fn parseIndexSignature(p: *Parser, flags: u32, in_class: bool) PE!Node {
         const lb = try p.bump(); // '['
+        // TS1071: the modifiers an index signature may not carry. tsc blames
+        // the FIRST offending one and names it, so this is the rule that pays
+        // for `Diagnostic.arg`: eleven keywords, one sentence, and the word
+        // wanted is the source text of the very token being reported on. (The
+        // fixed small families — TS1030's "modifier already seen", TS1044's
+        // module-element four — keep their comptime templates; what tips this
+        // one over is needing an enum arm per keyword to say one thing.)
+        if (p.spec == 0) {
+            const tags = p.tok_tags.items;
+            const first = index_signature.memberStartTokenIn(tags, lb);
+            if (index_signature.firstBadModifier(tags, first, lb, in_class)) |bad| {
+                const at = p.tokSpan(bad, bad);
+                try p.errAtSpanArg(.index_sig_modifier, at, at);
+            }
+        }
         var shape: index_signature.Shape = .{
             .bracket_token = lb,
             .parameters = 0,
