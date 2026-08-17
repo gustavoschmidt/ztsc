@@ -2870,6 +2870,27 @@ const Linker = struct {
         if (!flags.import_binding) {
             return .{ .kind = .binding, .file = file, .payload = local_sym, .type_only = type_only };
         }
+        // An alias MERGED with a value declaration of the same name is not a
+        // re-export of its target: tsc's export specifier names the local
+        // symbol, which carries both meanings, and a value use of it resolves
+        // through the local declaration.
+        //
+        //     // a.ts                 // b.ts
+        //     interface A {}          import { A } from "./a";
+        //     export type { A };      const A = 0;
+        //                             export { A };
+        //
+        // Following the alias here published b's `A` as a type-only export, so
+        // `import { A } from "./b"; A;` was TS2693 (`typeOnlyMerge1`,
+        // `exportNamespace9`) and `typeof import("./b")` was missing the
+        // member outright (`namespaceImportTypeQuery2`). Targeting the local
+        // symbol keeps BOTH meanings reachable — the checker follows the alias
+        // itself for the type-space half.
+        if (bind_result.effectiveBits(flags) & bind_result.mask_value &
+            ~bind_result.fbits(.{ .import_binding = true }) != 0)
+        {
+            return .{ .kind = .binding, .file = file, .payload = local_sym, .type_only = type_only };
+        }
         // An ENTITY-NAME `import X = A.B` is an import binding with no import
         // record — it names something already in the program, so there is no
         // module for the linker to follow and the loop below would fall out to

@@ -28,9 +28,12 @@ const indexOfAtom = @import("generics.zig").indexOfAtom;
 /// refined at use sites via the link tables) except that a type-only
 /// import never has value meaning (TS1361 at value uses).
 pub fn hasValueMeaning(f: binder.SymbolFlags) bool {
-    if (f.import_binding and f.type_only) return false;
+    // The type-only-ness belongs to the ALIAS, not to the name: a local
+    // declaration merged into it still carries its own value meaning
+    // (`import type { A } from "./z"; const A = 0;` is a value `A`).
+    if (f.import_binding and !f.type_only) return true;
     return f.var_decl or f.let_decl or f.const_decl or f.function or f.class or
-        f.param or f.catch_param or f.import_binding or f.enum_decl or f.namespace_decl or
+        f.param or f.catch_param or f.enum_decl or f.namespace_decl or
         f.enum_member;
 }
 
