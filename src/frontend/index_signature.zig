@@ -67,6 +67,14 @@ pub const Reports = struct {
     /// looks like a one-diagnostic case only because the rest of the chain
     /// passes).
     trailing_comma: ?Report = null,
+    /// tsc's `checkParameter` contributes TS2371 INDEPENDENTLY of everything
+    /// below — it is the general "a parameter initializer is only allowed in an
+    /// implementation" rule, not an index-signature rule at all, so it survives
+    /// whatever the chain answers. Measured against tsgo: `[a: string = 'x']`
+    /// answers TS1020 AND TS2371; `[a: string = 'x', b: number]` answers
+    /// TS1096 and still TS2371; `[public a: string = 'x']` answers TS1018 and
+    /// still TS2371. Always on the first parameter's NAME.
+    initializer_outside_impl: ?Report = null,
     /// The first hit of the return-chain proper.
     chain: ?Report = null,
 };
@@ -76,17 +84,28 @@ pub const Reports = struct {
 /// must be `string`/`number`/`symbol`/a template literal, tsc's TS1268, which
 /// needs the type resolved).
 pub fn check(s: Shape) Reports {
+    // Outside the chain entirely, and outside the one-parameter gate with it.
+    // Blamed on the whole PARAMETER (tsc's `error(parameter, …)`), so it starts
+    // at the `...` or the first modifier when there is one, not at the name:
+    // `[...a: string = 'x']` answers at the `...`, measured.
+    const init_report: ?Report = if (s.initializer)
+        .{
+            .code = .param_initializer_outside_impl,
+            .token = s.rest orelse s.modifier orelse s.name_token orelse s.bracket_token,
+        }
+    else
+        null;
     if (s.parameters != 1) {
         // The count check `return`s ahead of the trailing-comma one, so a
         // multi-parameter list with a trailing comma answers for the count only.
         // tsc blames the first parameter's NAME, or the whole node when the
         // brackets are empty.
-        return .{ .chain = .{
+        return .{ .initializer_outside_impl = init_report, .chain = .{
             .code = .index_sig_one_parameter,
             .token = s.name_token orelse s.bracket_token,
         } };
     }
-    var out: Reports = .{};
+    var out: Reports = .{ .initializer_outside_impl = init_report };
     if (s.trailing_comma) |t| out.trailing_comma = .{ .code = .index_sig_trailing_comma, .token = t };
     out.chain = chainOf(s);
     return out;
@@ -148,9 +167,39 @@ pub fn duplicateKey(keys: []const []const u8, i: usize) bool {
 /// `isModifierKind` is the same predicate the parser's own lookahead used to
 /// decide these tokens were modifiers of this member, so the two cannot drift.
 pub fn memberStartToken(tokens: *const scanner.Tokens, main_token: u32) u32 {
+    return memberStartTokenIn(tokens.tags, main_token);
+}
+
+/// `memberStartToken` over a bare tag slice, for the PARSER — which reports
+/// TS1071 while it is still building the token arrays and has no
+/// `scanner.Tokens` to hand. One walk, so the two callers cannot drift.
+pub fn memberStartTokenIn(tags: []const scanner.Tag, main_token: u32) u32 {
     var tok = main_token;
-    while (tok > 0 and isModifierKind(tokens.tag(tok - 1))) tok -= 1;
+    while (tok > 0 and isModifierKind(tags[tok - 1])) tok -= 1;
     return tok;
+}
+
+/// The first modifier an index signature may NOT carry, as an index into
+/// `tags`, or null when every modifier in `tags[first..sig]` is allowed.
+///
+/// tsc decides this per modifier, in `checkGrammarModifiers`, and returns on
+/// its first hit — so `readonly public [x: string]` answers for the `public`.
+/// Measured against tsgo for all eleven modifier keywords in a class and in an
+/// interface: `readonly` is always fine (an index signature is one of the four
+/// positions its arm allows), `static` is fine on a CLASS index signature and
+/// TS1071 on an interface's (tsc's arm asks `isClassLike(node.parent)`), and
+/// every other modifier is TS1071 wherever it appears.
+pub fn firstBadModifier(tags: []const scanner.Tag, first: u32, sig: u32, in_class: bool) ?u32 {
+    var tok = first;
+    while (tok < sig) : (tok += 1) {
+        const allowed = switch (tags[tok]) {
+            .keyword_readonly => true,
+            .keyword_static => in_class,
+            else => false,
+        };
+        if (!allowed) return tok;
+    }
+    return null;
 }
 
 /// tsc's `isModifierKind`, the lookahead's "is this the start of a parameter
@@ -272,6 +321,47 @@ test "each arm in tsc's order, and each on tsc's token" {
     s.value_type = false;
     try std.testing.expectEqual(Code.index_sig_type_annotation, check(s).chain.?.code);
     try std.testing.expectEqual(@as(u32, 10), check(s).chain.?.token); // the `[`
+}
+
+test "an initializer earns TS2371 whatever else the chain answers" {
+    var s = ok;
+    s.initializer = true;
+    // Alongside the chain's own TS1020, on the same token.
+    try std.testing.expectEqual(Code.param_initializer_outside_impl, check(s).initializer_outside_impl.?.code);
+    try std.testing.expectEqual(@as(u32, 11), check(s).initializer_outside_impl.?.token); // the NAME
+
+    // And it outlives the two `return`s that cut the chain short: the count
+    // check and the arms above `initializer` in `chainOf`.
+    s = ok;
+    s.initializer = true;
+    s.parameters = 2;
+    try std.testing.expectEqual(Code.index_sig_one_parameter, check(s).chain.?.code);
+    try std.testing.expectEqual(Code.param_initializer_outside_impl, check(s).initializer_outside_impl.?.code);
+
+    s = ok;
+    s.initializer = true;
+    s.question = 23;
+    try std.testing.expectEqual(Code.index_sig_question_mark, check(s).chain.?.code);
+    try std.testing.expectEqual(Code.param_initializer_outside_impl, check(s).initializer_outside_impl.?.code);
+
+    // No initializer, nothing to say.
+    try std.testing.expectEqual(@as(?Report, null), check(ok).initializer_outside_impl);
+}
+
+test "the modifiers an index signature may carry" {
+    const T = scanner.Tag;
+    const tags = [_]T{ .keyword_readonly, .keyword_static, .keyword_public, .l_bracket };
+    // `readonly` alone: fine anywhere.
+    try std.testing.expectEqual(@as(?u32, null), firstBadModifier(&tags, 0, 1, false));
+    // `static` is fine on a CLASS index signature and TS1071 on a type
+    // member's, which is the one verdict that depends on where it sits.
+    try std.testing.expectEqual(@as(?u32, null), firstBadModifier(&tags, 0, 2, true));
+    try std.testing.expectEqual(@as(?u32, 1), firstBadModifier(&tags, 0, 2, false));
+    // The walk stops at the FIRST offender, skipping the allowed ones before
+    // it: `readonly static public [x: string]` in a class answers for `public`.
+    try std.testing.expectEqual(@as(?u32, 2), firstBadModifier(&tags, 0, 3, true));
+    // No modifiers at all.
+    try std.testing.expectEqual(@as(?u32, null), firstBadModifier(&tags, 3, 3, false));
 }
 
 test "every signature of a duplicated key domain is reported, and only those" {

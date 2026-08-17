@@ -59,6 +59,7 @@ const diagnostics = @import("diagnostics.zig");
 const directives = @import("directives.zig");
 const literals = @import("literals.zig");
 const modifier_order = @import("modifier_order.zig");
+const param_modifiers = @import("param_modifiers.zig");
 const index_signature = @import("index_signature.zig");
 const computed_member = @import("computed_member.zig");
 const decorator_target = @import("decorator_target.zig");
@@ -69,6 +70,7 @@ const Node = ast.Node;
 const TokenIndex = ast.TokenIndex;
 const null_node = ast.null_node;
 const Code = diagnostics.Code;
+const Span = source.Span;
 
 /// Internal error set of the node-building helpers. NOT `parse`'s error set,
 /// which also carries `SourceTooLarge`.
@@ -685,13 +687,23 @@ const Parser = struct {
         };
     }
 
-    /// Where the eof token's leading trivia BEGAN — just past the last real
+    /// Where the CURRENT token's leading trivia BEGAN — just past the last real
     /// token, or the start of the file when there is none. tsc's
     /// `scanner.getTokenFullStart()`, which is `fullStartPos`, set at the top of
     /// `scan()` before the trivia loop runs.
-    fn eofFullStart(p: *Parser) u32 {
+    fn curFullStart(p: *Parser) u32 {
         if (p.tok_tags.items.len == 0) return 0;
         return p.lastTokEnd();
+    }
+
+    /// Report at the current token's FULL start, zero-width — tsc's
+    /// `parseErrorAtPosition(scanner.getTokenFullStart(), 0, …)`, which is what
+    /// `createMissingNode(…, reportAtCurrentPosition: true, …)` passes. The
+    /// difference from `errAtCur` is exactly the leading trivia: measured
+    /// against tsgo, `a[/*c*/]` blames the byte after the `[`, not the `]`.
+    fn errAtFullStart(p: *Parser, code: Code) Error!void {
+        const at = p.curFullStart();
+        try p.addDiag(code, .{ .code = code, .span = .{ .start = at, .end = at } });
     }
 
     fn errAtCur(p: *Parser, code: Code) Error!void {
@@ -707,7 +719,7 @@ const Parser = struct {
         // and `class D { m(` keep their TS1005 on the eof token — `parseExpected`
         // has no such rule.
         if (t.tag == .eof and missingNameNode(code)) {
-            const at = p.eofFullStart();
+            const at = p.curFullStart();
             return p.addDiag(code, .{ .code = code, .span = .{ .start = at, .end = at } });
         }
         const end = if (t.end > t.start) t.end else t.start + 1;
@@ -759,16 +771,32 @@ const Parser = struct {
         });
     }
 
+    /// Byte range of the consumed token run `from`..`to` inclusive — the
+    /// `node.pos`..`node.end` of a node that spans exactly those tokens. A
+    /// token START already has its leading trivia skipped, so this is tsc's
+    /// `skipTrivia(sourceText, node.pos)`..`node.end` too.
+    fn tokSpan(p: *Parser, from: TokenIndex, to: TokenIndex) Span {
+        const start = p.tok_starts.items[from] & scanner.Tokens.start_mask;
+        const to_start = p.tok_starts.items[to] & scanner.Tokens.start_mask;
+        return .{ .start = start, .end = scanner.tokenEnd(p.src, p.tok_tags.items[to], to_start) };
+    }
+
     /// A diagnostic spanning a whole consumed token run, `from`..`to`
     /// inclusive — the shape tsc's `parseErrorAt(node.pos, node.end)` gives a
     /// grammar error blamed on an entire expression rather than one token.
     fn errAtRange(p: *Parser, code: Code, from: u32, to: u32) Error!void {
-        const start = p.tok_starts.items[from] & scanner.Tokens.start_mask;
-        const to_start = p.tok_starts.items[to] & scanner.Tokens.start_mask;
-        const end = scanner.tokenEnd(p.src, p.tok_tags.items[to], to_start);
+        const s = p.tokSpan(from, to);
+        try p.errAtBytes(code, s.start, s.end);
+    }
+
+    /// A diagnostic over an explicit byte range that ALSO names a second range
+    /// whose source text fills the message's `{0}` — the JSX unclosed-tag
+    /// family, the only codes whose message interpolates.
+    fn errAtSpanArg(p: *Parser, code: Code, span: Span, arg: Span) Error!void {
         try p.addDiag(code, .{
             .code = code,
-            .span = .{ .start = start, .end = if (end > start) end else start + 1 },
+            .span = .{ .start = span.start, .end = if (span.end > span.start) span.end else span.start + 1 },
+            .arg = arg,
         });
     }
 
@@ -931,7 +959,7 @@ const Parser = struct {
     /// reports at it, then carries on with a missing node.
     fn parseElementAccessArgument(p: *Parser) PE!Node {
         if (p.curTag() != .r_bracket) return p.parseExpression(.{});
-        try p.errAtCur(.element_access_needs_argument);
+        try p.errAtFullStart(.element_access_needs_argument);
         return null_node;
     }
 
@@ -1016,6 +1044,21 @@ const Parser = struct {
 
     fn nodeDataAt(p: *const Parser, node: Node) ast.Data {
         return p.nodes.items(.data)[node];
+    }
+
+    /// One field of an extra record the parser itself wrote, by name — the
+    /// build-time counterpart of `Ast.extraData`, which cannot run until the
+    /// tree is finished. Reading a single field keeps the caller from having to
+    /// know the record's layout.
+    fn extraFieldAt(p: *const Parser, comptime T: type, comptime name: []const u8, index: u32) u32 {
+        const fields = @typeInfo(T).@"struct".fields;
+        const off = comptime blk: {
+            for (fields, 0..) |f, i| {
+                if (std.mem.eql(u8, f.name, name)) break :blk i;
+            }
+            @compileError("no field '" ++ name ++ "' in " ++ @typeName(T));
+        };
+        return p.extra.items[index + off];
     }
 
     fn addExtra(p: *Parser, extra: anytype) Error!u32 {
@@ -1120,6 +1163,18 @@ const Parser = struct {
     /// Tokens acceptable as a member/property name (any keyword works).
     fn isNameLike(tag: TokTag) bool {
         return tag == .identifier or tag == .private_identifier or tag.isKeyword();
+    }
+
+    /// tsc's `canFollowModifier`: what a modifier keyword must be followed by
+    /// for it to BE a modifier rather than the name itself. A destructuring
+    /// pattern, a rest `...`, or any literal property name — which is where
+    /// RESERVED words count too, so `constructor(static export a)` reads both
+    /// as modifiers and answers once, for the `static`.
+    fn canFollowModifier(tag: TokTag) bool {
+        return switch (tag) {
+            .l_bracket, .l_brace, .dot_dot_dot, .string_literal, .numeric_literal, .bigint_literal => true,
+            else => isNameLike(tag),
+        };
     }
 
     fn isAssignOp(tag: TokTag) bool {
@@ -2190,6 +2245,43 @@ const Parser = struct {
         return p.addNode(.{ .tag = .do_stmt, .main_token = kw, .data = .{ .lhs = body, .rhs = cond } });
     }
 
+    /// tsc's `checkGrammarForInOrForOfStatement`, the arm about the declaration
+    /// LIST: a `for…in`/`for…of` head takes exactly ONE declaration, and that
+    /// one may not have an initializer. tsc `return`s on its first hit, so a
+    /// head with two INITIALIZED declarations answers for the count alone.
+    ///
+    /// Positions are tsc's, measured: the count is blamed on the SECOND
+    /// declarator's first token (`grammarErrorOnFirstToken(declarations[1])`)
+    /// and the initializer on the declarator's NAME.
+    ///
+    /// The type-annotation arm below these two (TS2483/TS2404) is left out: it
+    /// needs no more than these do, but no corpus case is one key away from it
+    /// and ztsc already answers those heads with a checker diagnostic tsc's
+    /// `return` suppresses, so adding it would leave the excess in place.
+    fn checkForInOfHead(p: *Parser, init: Node, is_of: bool) Error!void {
+        if (p.spec != 0 or init == null_node) return;
+        switch (p.nodeTagAt(init)) {
+            .var_decl => {
+                const data = p.nodeDataAt(init);
+                const second = p.extra.items[data.lhs + 1];
+                const code: Code = if (is_of) .for_of_one_declaration else .for_in_one_declaration;
+                try p.errAtToken(code, p.nodeMainTokenAt(second));
+            },
+            .var_decl_one => {
+                const decl = p.nodeDataAt(init).lhs;
+                const has_init = switch (p.nodeTagAt(decl)) {
+                    .declarator_init => true,
+                    .declarator_full => p.extraFieldAt(ast.DeclaratorFull, "init", p.nodeDataAt(decl).rhs) != null_node,
+                    else => false,
+                };
+                if (!has_init) return;
+                const code: Code = if (is_of) .for_of_declaration_initializer else .for_in_declaration_initializer;
+                try p.errAtToken(code, p.nodeMainTokenAt(decl));
+            },
+            else => {},
+        }
+    }
+
     fn parseForStatement(p: *Parser) PE!Node {
         const kw = try p.bump();
         var is_await: u32 = 0;
@@ -2213,6 +2305,7 @@ const Parser = struct {
             // for-of / for-in?
             if (p.curTag() == .keyword_of or p.curTag() == .keyword_in) {
                 const is_of = p.curTag() == .keyword_of;
+                try p.checkForInOfHead(init, is_of);
                 _ = try p.bump();
                 const right = if (is_of) try p.parseAssignExpr(.{}) else try p.parseExpression(.{});
                 _ = try p.expect(.r_paren, .expected_r_paren);
@@ -2743,33 +2836,50 @@ const Parser = struct {
         }
         const start_tok = p.curIdx();
         var flags: u32 = 0;
-        var mod_reported = false;
-        // Constructor parameter properties: visibility/readonly/override.
-        while (true) {
-            const bit: u32 = switch (p.curTag()) {
-                .keyword_public => ast.Flags.public,
-                .keyword_private => ast.Flags.private,
-                .keyword_protected => ast.Flags.protected,
-                .keyword_readonly => ast.Flags.readonly,
-                .keyword_override => ast.Flags.override,
-                else => 0,
-            };
-            if (bit == 0) break;
+        // tsc's `parseModifiers` consumes EVERY modifier keyword here, the ones
+        // a parameter may not carry included, and leaves the complaint to
+        // `checkGrammarModifiers` — which stops at its first hit. Consuming them
+        // is what turns `constructor(static a: number)` from a cascade of "','
+        // expected" into the one TS1090 tsc answers. The first problem found is
+        // held back rather than reported on the spot, because a `this` parameter
+        // overrides all of them (see below).
+        var problem: ?struct { code: Code, tok: TokenIndex } = null;
+        var first_mod: ?TokenIndex = null;
+        var seen_static = false;
+        while (param_modifiers.role(p.curTag())) |role| {
+            // tsc's `hasSeenStaticModifier` guard: a SECOND `static` is not a
+            // modifier, so `constructor(static static a)` reads the second one
+            // as the parameter's NAME.
+            if (seen_static and p.curTag() == .keyword_static) break;
             // Only a modifier if a binding follows (else it's the name).
-            const t1 = p.peekTag(1);
-            if (!(isIdentLike(t1) or t1 == .l_bracket or t1 == .l_brace or t1 == .dot_dot_dot or t1 == .keyword_this)) break;
-            // Same walk as a class member's: `constructor(readonly readonly y)`
-            // is TS1030 and `constructor(override public foo)` is TS1029. A
-            // parameter is never in an abstract-member position, so the abstract
-            // pairs are unreachable here whatever the class is.
-            if (!mod_reported and p.spec == 0) {
-                if (modifier_order.check(flags, bit, false)) |code| {
-                    try p.errAtCur(code);
-                    mod_reported = true;
-                }
+            if (!canFollowModifier(p.peekTag(1))) break;
+            if (first_mod == null) first_mod = p.curIdx();
+            if (p.curTag() == .keyword_static) seen_static = true;
+            const code: ?Code = switch (role) {
+                // Same walk as a class member's: `constructor(readonly readonly
+                // y)` is TS1030 and `constructor(override public foo)` is
+                // TS1029. A parameter is never in an abstract-member position,
+                // so the abstract pairs are unreachable here whatever the class
+                // is.
+                .property => |bit| blk: {
+                    defer flags |= bit;
+                    break :blk modifier_order.check(flags, bit, false);
+                },
+                .rejected => |c| c,
+            };
+            if (problem == null) {
+                if (code) |c| problem = .{ .code = c, .tok = p.curIdx() };
             }
             _ = try p.bump();
-            flags |= bit;
+        }
+        // `checkGrammarModifiers` opens with the `this` parameter and returns
+        // there: any modifier on one is TS1433 and nothing else is said, so this
+        // replaces whatever the walk above found.
+        if (p.curTag() == .keyword_this) {
+            if (first_mod) |m| problem = .{ .code = .decorator_on_this_param, .tok = m };
+        }
+        if (p.spec == 0) {
+            if (problem) |it| try p.errAtToken(it.code, it.tok);
         }
         if (try p.eat(.dot_dot_dot) != null) flags |= ast.Flags.rest;
         var name: Node = null_node;
@@ -3613,7 +3723,7 @@ const Parser = struct {
     const ModifierErr = struct { code: Code, token: u32 };
 
     fn parseIndexSignatureAsClassMember(p: *Parser, flags: u32) PE!Node {
-        return p.parseIndexSignature(flags);
+        return p.parseIndexSignature(flags, true);
     }
 
     /// Skip to the likely end of a malformed/unsupported class member.
@@ -5282,14 +5392,90 @@ const Parser = struct {
         p.la_len = 0;
     }
 
+    /// The opening tag whose children are being parsed — tsc's `openingTag`
+    /// argument to `parseJsxChildren`/`parseJsxChild`, and the thing a closing
+    /// tag is matched against.
+    const JsxOpening = struct {
+        /// The tag NAME's byte range, or null when there is none to compare or
+        /// to quote: a fragment `<>`, or a name that failed to parse. Both stay
+        /// silent — the fragment because the TS17014/TS17015 pair speaks for it
+        /// instead, the unparsed name because the parse has already reported
+        /// there and there is no text to put in a message.
+        name: ?Span,
+        /// Where "has no corresponding closing tag" is blamed: the NAME for an
+        /// element (tsc: `parseErrorAt(skipTrivia(tag.pos), tag.end)`), the
+        /// whole `<>` for a fragment (tsc passes the opening NODE).
+        report: Span,
+        fragment: bool,
+    };
+
+    /// The byte range of a tag name that may not have parsed at all: a failed
+    /// `parseJsxTagName` consumes nothing, leaving `to` BEHIND `from`, and the
+    /// arithmetic in `tokSpan` would then quote an arbitrary stretch of the
+    /// file into the message.
+    fn jsxNameSpan(p: *Parser, from: TokenIndex, to: TokenIndex) ?Span {
+        if (to < from) return null;
+        const s = p.tokSpan(from, to);
+        return if (s.end > s.start) s else null;
+    }
+
+    /// tsc's `tagNamesAreEquivalent`, over source text rather than nodes: two
+    /// tag names match when they spell the same thing. tsc compares the parsed
+    /// entity-name structure, which also ignores the trivia a spaced
+    /// `< A . B >` carries, so ASCII whitespace is dropped from both sides.
+    ///
+    /// A name holding a `\` is ESCAPED (`<abc>`), which tsc resolves before
+    /// comparing and ztsc does not resolve at all. Comparing raw bytes there
+    /// would call `abc` and `abc` different and invent a mismatch, so an
+    /// escaped name is treated as equivalent to anything — tsc's own answer for
+    /// one is TS17021 on the escape, never a tag mismatch.
+    fn jsxTagNamesEquivalent(src: []const u8, a: Span, b: Span) bool {
+        if (jsxNameIsEscaped(src, a) or jsxNameIsEscaped(src, b)) return true;
+        var i = a.start;
+        var j = b.start;
+        while (true) {
+            while (i < a.end and std.ascii.isWhitespace(src[i])) i += 1;
+            while (j < b.end and std.ascii.isWhitespace(src[j])) j += 1;
+            if (i == a.end or j == b.end) return i == a.end and j == b.end;
+            if (src[i] != src[j]) return false;
+            i += 1;
+            j += 1;
+        }
+    }
+
+    fn jsxNameIsEscaped(src: []const u8, s: Span) bool {
+        return std.mem.indexOfScalar(u8, src[s.start..s.end], '\\') != null;
+    }
+
+    /// What `parseJsxElement` hands back to whoever parses its siblings.
+    const JsxElementResult = struct {
+        node: Node,
+        /// Token index of the `<` of the closing tag this element consumed
+        /// (0 when it consumed none).
+        close_lt: TokenIndex,
+        /// tsc's `lastChild` recovery signal: the closing tag consumed here
+        /// named the ENCLOSING element rather than this one
+        /// (`<div><span></div>`), so the enclosing element must take that tag
+        /// as its own instead of going looking for a second one.
+        closed_enclosing: bool,
+    };
+
     /// `<tag ...>children</tag>`, `<tag .../>`, or `<>children</>`.
-    /// Current token is `<`.
-    fn parseJsxElement(p: *Parser) PE!Node {
+    /// Current token is `<`. `enclosing` is the opening tag of the element
+    /// whose CHILD this is, or null in expression and attribute-value position
+    /// (tsc's `openingTag` parameter); it is what tells a stray `</div>` apart
+    /// from a genuinely mismatched one.
+    fn parseJsxElement(p: *Parser, enclosing: ?JsxOpening) PE!JsxElementResult {
         const lt = try p.bump(); // '<'
         var tag: Node = null_node;
         var targs: ast.SubRange = .{ .start = 0, .end = 0 };
+        const empty: Span = .{ .start = 0, .end = 0 };
+        var opening: JsxOpening = .{ .name = null, .report = empty, .fragment = true };
         if (p.curTag() != .gt) {
+            const name_from = p.curIdx();
             tag = try p.parseJsxTagName();
+            const name = p.jsxNameSpan(name_from, p.lastIdx());
+            opening = .{ .name = name, .report = name orelse empty, .fragment = false };
             // Explicit type arguments on a component tag: `<Select<string> …>`.
             // In a `.tsx` open tag this `<` is unambiguous (no cast ambiguity),
             // so parse it directly with the ordinary type-argument machinery —
@@ -5301,13 +5487,31 @@ const Parser = struct {
         const attrs = try p.parseJsxAttributes();
         var close_lt: TokenIndex = 0;
         var children: ast.SubRange = .{ .start = 0, .end = 0 };
-        if (p.curTag() == .slash) {
-            _ = try p.bump(); // '/'
+        var closed_enclosing = false;
+        // tsc's `parseJsxOpeningOrSelfClosingElementOrOpeningFragment`: ONLY a
+        // `>` opens a child list. Every other token is expected to be `/` and
+        // the element comes out SELF-CLOSING — so a broken attribute list
+        // (`<span a="x", b/>`) never swallows the rest of the file as children,
+        // which is where a whole family of invented "has no corresponding
+        // closing tag" reports came from. The "'/' expected" and the "'>'
+        // expected" behind it land on the same token, where tsc's
+        // one-per-position rule keeps the first.
+        if (p.curTag() == .slash or !isGtFamily(p.curTag())) {
+            _ = try p.expect(.slash, .expected_slash);
             _ = try p.expectJsxGt();
         } else {
-            const kids = try p.parseJsxChildren(try p.expectJsxGt());
+            const after_gt = try p.expectJsxGt();
+            // A fragment's `<>` is complete only now, and it is the range tsc
+            // blames for an unclosed one (there is no name to blame).
+            if (opening.fragment) opening.report = p.tokSpan(lt, p.lastIdx());
+            const kids = try p.parseJsxChildren(after_gt, opening);
             children = kids.range;
             close_lt = kids.close_lt;
+            if (kids.end == .closing_tag) {
+                const closing = try p.parseJsxClosingElement();
+                close_lt = closing.lt;
+                closed_enclosing = try p.checkJsxClosingTag(opening, closing.name, enclosing);
+            }
         }
         const data = try p.addExtra(ast.JsxElementData{
             .tag = tag,
@@ -5319,7 +5523,82 @@ const Parser = struct {
             .children_start = children.start,
             .children_end = children.end,
         });
-        return p.addNode(.{ .tag = .jsx_element, .main_token = lt, .data = .{ .lhs = data, .rhs = 0 } });
+        return .{
+            .node = try p.addNode(.{ .tag = .jsx_element, .main_token = lt, .data = .{ .lhs = data, .rhs = 0 } }),
+            .close_lt = close_lt,
+            .closed_enclosing = closed_enclosing,
+        };
+    }
+
+    /// The `<` token and NAME range of a `</tag>`. `name` is null when there
+    /// was no name to read — the fragment spelling `</>`, or no closing tag at
+    /// all — which is the case that reports nothing (see `checkJsxClosingTag`).
+    const JsxClosing = struct { lt: TokenIndex, name: ?Span };
+
+    /// `</tag>`, `</>`, or nothing at all — at end of file tsc's
+    /// `parseExpected(LessThanSlashToken)` consumes nothing and reports "'</'
+    /// expected" on the token that IS there, which is what the fall-through
+    /// arm does.
+    fn parseJsxClosingElement(p: *Parser) PE!JsxClosing {
+        if (p.curTag() != .lt or p.peekTag(1) != .slash) {
+            try p.fail(.expected_lt_slash);
+            return .{ .lt = 0, .name = null };
+        }
+        const lt = try p.bump(); // '<'
+        _ = try p.bump(); // '/'
+        var name: ?Span = null;
+        // No name means `</>`, the fragment closer. tsc reaches it through
+        // `parseJsxClosingFragment`, which never parses a name, so the
+        // "Identifier expected" a named element's closer would give here is
+        // not tsc's answer either.
+        if (!isGtFamily(p.curTag())) {
+            const from = p.curIdx();
+            _ = try p.parseJsxTagName();
+            name = p.tokSpan(from, p.lastIdx());
+        }
+        _ = try p.expectJsxGt();
+        return .{ .lt = lt, .name = name };
+    }
+
+    /// tsc's closing-tag check, the three-way arm at the bottom of
+    /// `parseJsxElementOrSelfClosingElementOrFragment`. Returns whether the
+    /// closing tag turned out to belong to the ENCLOSING element.
+    fn checkJsxClosingTag(p: *Parser, opening: JsxOpening, closing_name: ?Span, enclosing: ?JsxOpening) Error!bool {
+        if (opening.fragment) {
+            // `<>…</div>`: tsc's `parseJsxClosingFragment` blames the name it
+            // found where `</>` was due. A `</>` (no name) is the match, so
+            // nothing is reported for it.
+            if (closing_name) |n| {
+                if (p.spec == 0) try p.errAtBytes(.jsx_expected_fragment_closing, n.start, n.end);
+            }
+            return false;
+        }
+        // An element whose own name never parsed has nothing to compare or to
+        // quote. A named element closed by `</>`, or by nothing at all: tsc's
+        // `parseJsxElementName` leaves a MISSING identifier there and has
+        // already reported at that position ("Identifier expected" / "'</'
+        // expected"), so its one-per-position rule drops the mismatch message.
+        // Reporting nothing is the same observable answer for both.
+        const open_name = opening.name orelse return false;
+        const closing = closing_name orelse return false;
+        if (jsxTagNamesEquivalent(p.src, open_name, closing)) return false;
+        // `<div><span></div>`: the `</div>` closes the element OUTSIDE this
+        // one, so THIS element is the unclosed one and the enclosing element
+        // adopts the tag. tsc's `openingTag` test, and the reason the enclosing
+        // opening tag is threaded down here at all.
+        const belongs_to_enclosing = if (enclosing) |e|
+            if (e.name) |en| jsxTagNamesEquivalent(p.src, closing, en) else false
+        else
+            false;
+        if (p.spec != 0) return belongs_to_enclosing;
+        if (belongs_to_enclosing) {
+            try p.errAtSpanArg(.jsx_element_unclosed, opening.report, open_name);
+        } else {
+            // Reported on the CLOSING tag but naming the OPENING one — the one
+            // diagnostic whose message argument is not its own span.
+            try p.errAtSpanArg(.jsx_expected_closing_tag, closing, open_name);
+        }
+        return belongs_to_enclosing;
     }
 
     /// Tag name: `div`, `Foo`, or a member chain `A.B.C`, as a value
@@ -5419,7 +5698,10 @@ const Parser = struct {
                 _ = try p.expect(.r_brace, .expected_r_brace);
                 return p.addNode(.{ .tag = .jsx_expr_container, .main_token = lb, .data = .{ .lhs = expr, .rhs = 0 } });
             },
-            .lt => return p.parseJsxElement(),
+            // An attribute value is not a child, so no enclosing tag can claim
+            // its closing tag (tsc's `inExpressionContext: true` call, which
+            // passes no `openingTag`).
+            .lt => return (try p.parseJsxElement(null)).node,
             else => {
                 try p.fail(.expected_expression);
                 return p.errorNode();
@@ -5445,17 +5727,39 @@ const Parser = struct {
         }
     }
 
-    /// The children of one non-self-closing element plus the `<` token of the
-    /// `</tag>` that ended them (0 when the closing tag was never reached).
-    const JsxChildren = struct { range: ast.SubRange, close_lt: TokenIndex };
+    /// How a child list ended — which is what decides what the element does
+    /// about its closing tag.
+    const JsxChildrenEnd = enum {
+        /// A `</` is next (or the file ran out before one): the element parses
+        /// it as its own closing tag.
+        closing_tag,
+        /// tsc's `lastChild` recovery: the last child already consumed a
+        /// closing tag that named THIS opening, so `close_lt` is set and there
+        /// is no second closing tag to look for.
+        adopted,
+        /// A conflict marker ended the children and reported its own message;
+        /// nothing further is expected of the element.
+        reported,
+    };
 
-    /// Children of a non-self-closing element, up to the matching `</tag>`
-    /// (whose closing tag this consumes). `start` is the byte offset just past
-    /// the opening tag's `>`.
-    fn parseJsxChildren(p: *Parser, start: u32) PE!JsxChildren {
+    /// The children of one non-self-closing element, the `<` token of a closing
+    /// tag already adopted from a child (0 otherwise), and how the list ended.
+    const JsxChildren = struct {
+        range: ast.SubRange,
+        close_lt: TokenIndex,
+        end: JsxChildrenEnd,
+    };
+
+    /// Children of a non-self-closing element, up to but NOT including its
+    /// `</tag>` — tsc's `parseJsxChildren`, which likewise stops at `</` and
+    /// leaves the closing element to its caller. `start` is the byte offset
+    /// just past the opening tag's `>`; `opening` is that tag, which the end of
+    /// the file is blamed on.
+    fn parseJsxChildren(p: *Parser, start: u32, opening: JsxOpening) PE!JsxChildren {
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
         var close_lt: TokenIndex = 0;
+        var end: JsxChildrenEnd = .closing_tag;
         var pos = start;
         while (true) {
             const tok = p.scn.scanJsxChild(pos);
@@ -5488,29 +5792,41 @@ const Parser = struct {
                     // (`conflictMarkerTrivia3.tsx`).
                     p.noteConflictMarker(tok);
                     p.jsxResync(tok.end);
-                    try p.errAtBytes(.expected_gt, tok.start, tok.end);
+                    try p.errAtBytes(.expected_lt_slash, tok.start, tok.end);
+                    end = .reported;
                     break;
                 },
                 .lt => {
                     p.jsxResync(tok.start);
-                    if (p.peekTag(1) == .slash) {
-                        close_lt = try p.bump(); // '<'
-                        _ = try p.bump(); // '/'
-                        if (!isGtFamily(p.curTag())) _ = try p.parseJsxTagName();
-                        _ = try p.expectJsxGt();
+                    // `</` is the element's own closing tag; leave it for
+                    // `parseJsxClosingElement`, which checks its name.
+                    if (p.peekTag(1) == .slash) break;
+                    const child = try p.parseJsxElement(opening);
+                    try p.pushScratch(child.node);
+                    if (child.closed_enclosing) {
+                        close_lt = child.close_lt;
+                        end = .adopted;
                         break;
                     }
-                    try p.pushScratch(try p.parseJsxElement());
                     pos = p.lastTokEnd();
                 },
-                else => { // eof or unexpected
+                else => { // eof, or a token no JSX child can start
+                    // tsc's `parseJsxChild` blames the OPENING tag rather than
+                    // the end of the file ("which is useless"), then lets the
+                    // caller's `parseJsxClosingElement` add its "'</' expected".
                     p.jsxResync(tok.start);
-                    try p.fail(.expected_gt);
+                    if (p.spec == 0) {
+                        if (opening.fragment) {
+                            try p.errAtBytes(.jsx_fragment_unclosed, opening.report.start, opening.report.end);
+                        } else if (opening.name) |n| {
+                            try p.errAtSpanArg(.jsx_element_unclosed, opening.report, n);
+                        }
+                    }
                     break;
                 },
             }
         }
-        return .{ .range = try p.scratchToSpan(top), .close_lt = close_lt };
+        return .{ .range = try p.scratchToSpan(top), .close_lt = close_lt, .end = end };
     }
 
     /// A JSX element in EXPRESSION position, with tsc's adjacent-element
@@ -5545,11 +5861,11 @@ const Parser = struct {
         // element's and the recovery declines to guess. `<div></div>` runs, which
         // is every corpus case that wants a TS2657, are unaffected.
         const opens_fragment = p.peekTag(1) == .gt;
-        var node = try p.parseJsxElement();
+        var node = (try p.parseJsxElement(null)).node;
         if (p.curTag() != .lt or opens_fragment) return node;
         while (p.curTag() == .lt) {
             const lt = p.curIdx();
-            const next = try p.parseJsxElement();
+            const next = (try p.parseJsxElement(null)).node;
             node = try p.addNode(.{ .tag = .seq_expr, .main_token = lt, .data = .{ .lhs = node, .rhs = next } });
         }
         try p.errAtRange(.jsx_needs_one_parent, run_start, p.lastIdx());
@@ -6729,7 +7045,7 @@ const Parser = struct {
         var computed: ?ComputedName = null;
         if (p.curTag() == .l_bracket) {
             if (p.atIndexSignature()) {
-                return p.parseIndexSignature(flags);
+                return p.parseIndexSignature(flags, false);
             }
             const cn = try p.parseComputedMemberName();
             name_tok = cn.name_tok;
@@ -6818,8 +7134,26 @@ const Parser = struct {
     /// brackets as a PARAMETER LIST and leaves the judging to
     /// `checkGrammarIndexSignatureParameters`; `index_signature.check` is that
     /// function, and this collects the shape it needs.
-    fn parseIndexSignature(p: *Parser, flags: u32) PE!Node {
+    /// `in_class` distinguishes a CLASS index signature from a type member's:
+    /// `static` is legal on the former and TS1071 on the latter, which is the
+    /// one modifier whose verdict depends on where the signature sits.
+    fn parseIndexSignature(p: *Parser, flags: u32, in_class: bool) PE!Node {
         const lb = try p.bump(); // '['
+        // TS1071: the modifiers an index signature may not carry. tsc blames
+        // the FIRST offending one and names it, so this is the rule that pays
+        // for `Diagnostic.arg`: eleven keywords, one sentence, and the word
+        // wanted is the source text of the very token being reported on. (The
+        // fixed small families — TS1030's "modifier already seen", TS1044's
+        // module-element four — keep their comptime templates; what tips this
+        // one over is needing an enum arm per keyword to say one thing.)
+        if (p.spec == 0) {
+            const tags = p.tok_tags.items;
+            const first = index_signature.memberStartTokenIn(tags, lb);
+            if (index_signature.firstBadModifier(tags, first, lb, in_class)) |bad| {
+                const at = p.tokSpan(bad, bad);
+                try p.errAtSpanArg(.index_sig_modifier, at, at);
+            }
+        }
         var shape: index_signature.Shape = .{
             .bracket_token = lb,
             .parameters = 0,
@@ -6899,6 +7233,7 @@ const Parser = struct {
         if (p.curTag() != .comma) try p.expectSemicolon();
         const reports = index_signature.check(shape);
         if (reports.trailing_comma) |r| try p.errAtToken(r.code, r.token);
+        if (reports.initializer_outside_impl) |r| try p.errAtToken(r.code, r.token);
         if (reports.chain) |r| try p.errAtToken(r.code, r.token);
         // The checker wants a key and a value type; a missing one becomes an
         // error node rather than 0, which is what every other recovery path in

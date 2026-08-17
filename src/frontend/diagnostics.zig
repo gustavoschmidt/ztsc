@@ -1,12 +1,20 @@
 //! Shared diagnostic type.
 //!
-//! The parser reports parse errors as `Diagnostic { code, span }`; message
-//! text is a static string per code (no allocation). The checker will extend
-//! later (severity levels, related spans, argument interpolation) — for
-//! now a diagnostic is 12 bytes and lives in the per-file arena.
+//! The parser reports parse errors as `Diagnostic { code, span, arg }`. A
+//! message is a static string per code, so no diagnostic ever owns text. The
+//! handful of codes whose message INTERPOLATES a name spell it `{0}` in the
+//! template and carry `arg` — a second byte range into the SAME source file
+//! whose text fills the hole. Storing a range rather than a string keeps the
+//! parser allocation-free and sidesteps the lifetime question entirely: the
+//! substitution happens once, in `renderMessage`, at the point where the
+//! source buffer is provably still mapped. The checker will extend this later
+//! (severity levels, related spans) — for now a diagnostic is 20 bytes and
+//! lives in the per-file arena.
 
 const std = @import("std");
 const source = @import("source.zig");
+
+const Allocator = std.mem.Allocator;
 
 /// In-file alias only; consumers name `source.Span` / `span.Span`.
 const Span = source.Span;
@@ -71,6 +79,14 @@ pub const Code = enum(u16) {
     expected_r_bracket,
     expected_gt,
     expected_lt,
+    /// TS1005 for the JSX closing tag: tsc's `parseJsxClosingElement` expects
+    /// the single `</` token its scanner produces, so the message names `</`
+    /// and not the `<` and `/` ztsc lexes it as.
+    expected_lt_slash,
+    /// TS1005 for the `/` of a self-closing JSX tag: tsc's
+    /// `parseJsxOpeningOrSelfClosingElementOrOpeningFragment` expects one the
+    /// moment the opening tag is not closed by `>`.
+    expected_slash,
     expected_type,
     expected_type_member,
     expected_class_member,
@@ -205,6 +221,19 @@ pub const Code = enum(u16) {
     in_modifier_not_valid_here,
     /// TS1274: an `out` variance annotation in the same forbidden positions.
     out_modifier_not_valid_here,
+    /// TS1090: a modifier that is simply not a parameter modifier. tsc's
+    /// `checkGrammarModifiers` names the word, so the four spellings share one
+    /// comptime template (see `paramModMessage`) rather than an `arg` span —
+    /// the vocabulary is fixed, so a static string per word costs nothing.
+    param_mod_static,
+    param_mod_export,
+    param_mod_declare,
+    param_mod_async,
+    /// TS1242/TS1275: `abstract` and `accessor` in a position that is neither.
+    /// They do not use TS1090's sentence, so they never mention a parameter --
+    /// each names the positions where it WOULD be valid instead.
+    abstract_modifier_not_valid_here,
+    accessor_modifier_not_valid_here,
     /// TS1029: `<out in T>` — the two variance annotations are in the wrong
     /// order.
     in_must_precede_out,
@@ -268,6 +297,35 @@ pub const Code = enum(u16) {
     /// syntactic, and the text still becomes a child either way.
     jsx_text_rbrace,
     jsx_text_gt,
+    /// TS1071: any modifier at all on an index signature, in a class or an
+    /// interface. One sentence over eleven keywords, and the word it wants is
+    /// the source text of the token it is reported on — so this one carries
+    /// `Diagnostic.arg` instead of an enum arm per keyword.
+    index_sig_modifier,
+    /// TS1188/TS1091: a `for…of` / `for…in` head declares more than one
+    /// variable. Reported on the SECOND declarator's first token, which is
+    /// tsc's `grammarErrorOnFirstToken(declarations[1])`.
+    for_of_one_declaration,
+    for_in_one_declaration,
+    /// TS1190/TS1189: the one declaration a `for…of` / `for…in` head may have
+    /// carries an initializer. Reported on the declaration's NAME. tsc's chain
+    /// `return`s, so a head that is wrong about the count never reaches these.
+    for_of_declaration_initializer,
+    for_in_declaration_initializer,
+    /// TS17008: an opening tag whose element ran to end of file, or whose
+    /// closing tag turned out to belong to an ENCLOSING element
+    /// (`<div><span></div>` blames the `span`). tsc reports it on the OPENING
+    /// tag's name and interpolates that same name, so `arg` == `span`.
+    jsx_element_unclosed,
+    /// TS17002: a closing tag that names something other than the element it
+    /// closes, and that no enclosing element claims either. tsc reports it on
+    /// the CLOSING tag's name but interpolates the OPENING one, so `arg` and
+    /// `span` differ — the reason a `Diagnostic` carries `arg` at all.
+    jsx_expected_closing_tag,
+    /// TS17014/TS17015: the fragment spellings of the two above. A fragment
+    /// has no name, so neither message interpolates.
+    jsx_fragment_unclosed,
+    jsx_expected_fragment_closing,
     /// TS2566: `const { ...a: b } = o` — tsc's `parseObjectBindingElement`
     /// reads a PropertyName before it knows whether a `:` follows, so a rest
     /// element with one PARSES and `checkGrammarBindingElement` reports on the
@@ -752,6 +810,11 @@ pub const Code = enum(u16) {
             .decorator_not_valid_here,
             .decorator_on_method_overload,
             .decorator_on_second_accessor,
+            .index_sig_modifier,
+            .for_of_one_declaration,
+            .for_in_one_declaration,
+            .for_of_declaration_initializer,
+            .for_in_declaration_initializer,
             .module_keyword_for_namespace,
             .quoted_module_name_needs_ambient,
             .const_class_member,
@@ -779,6 +842,12 @@ pub const Code = enum(u16) {
             .export_as_namespace_not_at_top_level,
             .in_modifier_not_valid_here,
             .out_modifier_not_valid_here,
+            .param_mod_static,
+            .param_mod_export,
+            .param_mod_declare,
+            .param_mod_async,
+            .abstract_modifier_not_valid_here,
+            .accessor_modifier_not_valid_here,
             .in_must_precede_out,
             .const_modifier_not_valid_here,
             .nullish_mixed_with_logical,
@@ -966,6 +1035,8 @@ pub const Code = enum(u16) {
             .expected_r_bracket => "']' expected.",
             .expected_gt => "'>' expected.",
             .expected_lt => "'<' expected.",
+            .expected_lt_slash => "'</' expected.",
+            .expected_slash => "'/' expected.",
             .expected_type => "Type expected.",
             .expected_type_member => "Property or signature expected.",
             .expected_class_member => "Unexpected token. A constructor, method, accessor, or property was expected.",
@@ -1058,6 +1129,12 @@ pub const Code = enum(u16) {
             .export_as_namespace_not_at_top_level => "Global module exports may only appear at top level.",
             .in_modifier_not_valid_here => "'in' modifier can only appear on a type parameter of a class, interface or type alias",
             .out_modifier_not_valid_here => "'out' modifier can only appear on a type parameter of a class, interface or type alias",
+            .param_mod_static => paramModMessage("static"),
+            .param_mod_export => paramModMessage("export"),
+            .param_mod_declare => paramModMessage("declare"),
+            .param_mod_async => paramModMessage("async"),
+            .abstract_modifier_not_valid_here => "'abstract' modifier can only appear on a class, method, or property declaration.",
+            .accessor_modifier_not_valid_here => "'accessor' modifier can only appear on a property declaration.",
             .in_must_precede_out => "'in' modifier must precede 'out' modifier.",
             .const_modifier_not_valid_here => "'const' modifier can only appear on a type parameter of a function, method or class",
             .exp_lhs_plus => expLhsMessage("+"),
@@ -1078,6 +1155,15 @@ pub const Code = enum(u16) {
             .jsx_needs_one_parent => "JSX expressions must have one parent element.",
             .jsx_text_rbrace => "Unexpected token. Did you mean `{'}'}` or `&rbrace;`?",
             .jsx_text_gt => "Unexpected token. Did you mean `{'>'}` or `&gt;`?",
+            .index_sig_modifier => "'{0}' modifier cannot appear on an index signature.",
+            .for_of_one_declaration => "Only a single variable declaration is allowed in a 'for...of' statement.",
+            .for_in_one_declaration => "Only a single variable declaration is allowed in a 'for...in' statement.",
+            .for_of_declaration_initializer => "The variable declaration of a 'for...of' statement cannot have an initializer.",
+            .for_in_declaration_initializer => "The variable declaration of a 'for...in' statement cannot have an initializer.",
+            .jsx_element_unclosed => "JSX element '{0}' has no corresponding closing tag.",
+            .jsx_expected_closing_tag => "Expected corresponding JSX closing tag for '{0}'.",
+            .jsx_fragment_unclosed => "JSX fragment has no corresponding closing tag.",
+            .jsx_expected_fragment_closing => "Expected corresponding closing tag for JSX fragment.",
             .module_keyword_for_namespace => "A 'namespace' declaration should not be declared using the 'module' keyword. Please use the 'namespace' keyword instead.",
             .quoted_module_name_needs_ambient => "Only ambient modules can use quoted names.",
             .namespace_needs_a_name => "Namespace must be given a name.",
@@ -1191,6 +1277,8 @@ pub const Code = enum(u16) {
             .expected_r_bracket,
             .expected_gt,
             .expected_lt,
+            .expected_lt_slash,
+            .expected_slash,
             .expected_from,
             .expected_while,
             .expected_eq,
@@ -1327,6 +1415,13 @@ pub const Code = enum(u16) {
             .export_default_not_at_top_level => 1258,
             .export_as_namespace_not_at_top_level => 1316,
             .in_modifier_not_valid_here, .out_modifier_not_valid_here => 1274,
+            .param_mod_static,
+            .param_mod_export,
+            .param_mod_declare,
+            .param_mod_async,
+            => 1090,
+            .abstract_modifier_not_valid_here => 1242,
+            .accessor_modifier_not_valid_here => 1275,
             .in_must_precede_out => 1029,
             .const_modifier_not_valid_here => 1277,
             .exp_lhs_plus,
@@ -1346,6 +1441,15 @@ pub const Code = enum(u16) {
             .jsx_needs_one_parent => 2657,
             .jsx_text_rbrace => 1381,
             .jsx_text_gt => 1382,
+            .index_sig_modifier => 1071,
+            .for_of_one_declaration => 1188,
+            .for_in_one_declaration => 1091,
+            .for_of_declaration_initializer => 1190,
+            .for_in_declaration_initializer => 1189,
+            .jsx_element_unclosed => 17008,
+            .jsx_expected_closing_tag => 17002,
+            .jsx_fragment_unclosed => 17014,
+            .jsx_expected_fragment_closing => 17015,
             .module_keyword_for_namespace => 1540,
             .quoted_module_name_needs_ambient => 1035,
             .namespace_needs_a_name => 1437,
@@ -1441,6 +1545,11 @@ fn modOrderMessage(comptime first: []const u8, comptime second: []const u8) []co
 }
 
 /// TS1044's four modifiers share one sentence, differing only in the word.
+/// TS1090's four modifiers share one sentence, differing only in the word.
+fn paramModMessage(comptime word: []const u8) []const u8 {
+    return "'" ++ word ++ "' modifier cannot appear on a parameter.";
+}
+
 fn moduleElementModifierMessage(comptime word: []const u8) []const u8 {
     return "'" ++ word ++ "' modifier cannot appear on a module or namespace element.";
 }
@@ -1449,16 +1558,45 @@ fn expLhsMessage(comptime op: []const u8) []const u8 {
     return "An unary expression with the '" ++ op ++ "' operator is not allowed in the left-hand side of an exponentiation expression. Consider enclosing the expression in parentheses.";
 }
 
-/// A single diagnostic: error code plus source span. 8 bytes of span +
-/// 2 bytes of code (padded to 12 in arrays; fine for current volumes).
+/// The placeholder an interpolating message spells for its one argument, the
+/// same `{0}` tsc's `diagnosticMessages.json` uses.
+const arg_hole = "{0}";
+
+/// A single diagnostic: error code, the source span it is reported on, and —
+/// for the codes whose message interpolates — the source range whose text
+/// fills the template's `{0}`. 8 bytes of span + 8 of arg + 2 of code
+/// (padded to 20 in arrays; fine for current volumes).
 pub const Diagnostic = struct {
     code: Code,
     span: Span,
+    /// Empty for every non-interpolating code, which is nearly all of them —
+    /// hence the default, so only the JSX unclosed-tag family names it.
+    arg: Span = .{ .start = 0, .end = 0 },
 
+    /// The raw template. Interpolating codes still hold their `{0}` here; use
+    /// `renderMessage` to fill it.
     pub fn message(d: Diagnostic) []const u8 {
         return d.code.message();
     }
 };
+
+/// `d`'s message with the template's `{0}` replaced by the text of `d.arg` in
+/// `src`. Non-interpolating codes — every code but the JSX unclosed-tag
+/// family — return their static template and never allocate, so this is the
+/// one call site that has to hold the source buffer, and it holds it only
+/// while the substitution runs.
+pub fn renderMessage(arena: Allocator, d: Diagnostic, src: []const u8) Allocator.Error![]const u8 {
+    const template = d.code.message();
+    const hole = std.mem.indexOf(u8, template, arg_hole) orelse return template;
+    const start = @min(d.arg.start, src.len);
+    const end = @min(@max(d.arg.end, start), src.len);
+    const text = src[start..end];
+    const out = try arena.alloc(u8, template.len - arg_hole.len + text.len);
+    @memcpy(out[0..hole], template[0..hole]);
+    @memcpy(out[hole..][0..text.len], text);
+    @memcpy(out[hole + text.len ..], template[hole + arg_hole.len ..]);
+    return out;
+}
 
 test "diagnostic messages are non-empty" {
     inline for (@typeInfo(Code).@"enum".fields) |f| {
@@ -1471,4 +1609,51 @@ test "diagnostic carries code and span" {
     const d: Diagnostic = .{ .code = .expected_semicolon, .span = .{ .start = 3, .end = 4 } };
     try std.testing.expectEqualStrings("';' expected.", d.message());
     try std.testing.expectEqual(@as(u32, 1), d.span.len());
+}
+
+test "renderMessage fills {0} from the source, and only for the codes with one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src = "let x = <div><span></div>;";
+
+    const plain: Diagnostic = .{ .code = .expected_semicolon, .span = .{ .start = 0, .end = 1 } };
+    // No `{0}`: the static template comes back by identity, unallocated.
+    try std.testing.expectEqual(plain.code.message().ptr, (try renderMessage(a, plain, src)).ptr);
+
+    const unclosed: Diagnostic = .{
+        .code = .jsx_element_unclosed,
+        .span = .{ .start = 14, .end = 18 },
+        .arg = .{ .start = 14, .end = 18 },
+    };
+    try std.testing.expectEqualStrings(
+        "JSX element 'span' has no corresponding closing tag.",
+        try renderMessage(a, unclosed, src),
+    );
+
+    // TS17002 is the case that needs `arg` to be independent of `span`: it is
+    // reported on the CLOSING tag and names the OPENING one.
+    const expected_close: Diagnostic = .{
+        .code = .jsx_expected_closing_tag,
+        .span = .{ .start = 21, .end = 24 },
+        .arg = .{ .start = 9, .end = 12 },
+    };
+    try std.testing.expectEqualStrings(
+        "Expected corresponding JSX closing tag for 'div'.",
+        try renderMessage(a, expected_close, src),
+    );
+}
+
+test "renderMessage clamps an arg that runs past the source" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const d: Diagnostic = .{
+        .code = .jsx_element_unclosed,
+        .span = .{ .start = 0, .end = 3 },
+        .arg = .{ .start = 2, .end = 900 },
+    };
+    try std.testing.expectEqualStrings(
+        "JSX element 'c' has no corresponding closing tag.",
+        try renderMessage(arena.allocator(), d, "abc"),
+    );
 }

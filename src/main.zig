@@ -908,10 +908,14 @@ pub fn main(init: std.process.Init) !void {
                 if (cd.suppresses(d.span.start)) continue;
             }
             const ts = d.code.tsCode();
+            // A message that interpolates a name (the JSX unclosed-tag family)
+            // is rendered HERE, where the file's source buffer is in hand; the
+            // result lives in the program arena, which outlives the emit below.
+            const msg = try ztsc.diagnostics.renderMessage(arena, d, src.bytes);
             if (ts != 0) {
-                try merged.append(gpa, .{ .code = ts, .start = d.span.start, .end = d.span.end, .msg = d.message() });
+                try merged.append(gpa, .{ .code = ts, .start = d.span.start, .end = d.span.end, .msg = msg });
             } else {
-                try emitter.emit(path, &src, d.span, 0, d.message());
+                try emitter.emit(path, &src, d.span, 0, msg);
             }
         }
         // Bind, link and check diagnostics are *semantic*, so a `@ts-nocheck`
@@ -925,10 +929,11 @@ pub fn main(init: std.process.Init) !void {
                 if (syntactic_error) break;
                 if (cd.suppresses(d.span.start)) continue;
                 const ts = d.code.tsCode();
+                const msg = try ztsc.diagnostics.renderMessage(arena, d, src.bytes);
                 if (ts != 0) {
-                    try merged.append(gpa, .{ .code = ts, .start = d.span.start, .end = d.span.end, .msg = d.message() });
+                    try merged.append(gpa, .{ .code = ts, .start = d.span.start, .end = d.span.end, .msg = msg });
                 } else {
-                    try emitter.emit(path, &src, d.span, 0, d.message());
+                    try emitter.emit(path, &src, d.span, 0, msg);
                 }
             }
         }
@@ -957,7 +962,20 @@ pub fn main(init: std.process.Init) !void {
                 return x.code < y.code;
             }
         }.lessThan);
+        // tsc's `sortAndDeduplicateDiagnostics`: two diagnostics identical in
+        // position, code and text are one diagnostic. A recovering parser
+        // reaches the same dead end from two nesting levels (`<div><span>` at
+        // end of file wants "'</' expected" for each), and the
+        // one-per-position rule only compares against the LAST diagnostic, so
+        // it cannot catch the pair when a third lands between them. The list
+        // is already sorted by position, so the duplicates are adjacent.
+        var prev: ?Merged = null;
         for (merged.items) |d| {
+            if (prev) |q| {
+                if (q.start == d.start and q.end == d.end and q.code == d.code and
+                    std.mem.eql(u8, q.msg, d.msg)) continue;
+            }
+            prev = d;
             try emitter.emit(path, &src, .{ .start = d.start, .end = d.end }, d.code, d.msg);
         }
     }
