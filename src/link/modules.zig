@@ -2316,13 +2316,13 @@ const Linker = struct {
     /// side-effect-only import (`import "./x"`) is governed by
     /// `noUncheckedSideEffectImports` (TS 5.6+) instead: tsc's
     /// `checkImportDeclaration` only resolves the specifier of a *bare*
-    /// `import "m"` when that option is on, so with the option off (tsc's
-    /// default, and the dogfood project's) an unresolved side-effect specifier
-    /// is silently accepted — bundler plugins own specifiers like
-    /// `import "@fontsource-variable/inter"`, which is a CSS-only package.
-    /// When the option is on, ztsc reports TS2882, matching the pinned tsgo
-    /// oracle (tsc words the same condition as TS2307); tsgo 7.0.2 differs from
-    /// tsc only in defaulting the option ON.
+    /// `import "m"` when that option is on. With the option ON — ztsc's
+    /// default, following tsgo 7.0.2's; see `tsconfig.Config` for why that is
+    /// not TypeScript 5.x's — the unresolved specifier is TS2882, the same
+    /// condition tsc words as TS2307. With it explicitly off, the specifier is
+    /// silently accepted, which is what a project whose bundler plugins own
+    /// specifiers like `import "@fontsource-variable/inter"` (a CSS-only
+    /// package) needs.
     ///
     /// The same walk carries TS7016 for the module that resolved but has no
     /// declarations behind it — see `untypedJsModule`.

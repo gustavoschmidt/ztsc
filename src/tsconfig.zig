@@ -171,7 +171,7 @@ fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8) Lo
     // with the bundler algorithm. Only an explicit `false` makes a `*.json`
     // specifier TS2307 again.
     cfg.resolve_json_module = acc.resolve_json_module orelse true;
-    cfg.no_unchecked_side_effect_imports = acc.no_unchecked_side_effect_imports orelse false;
+    cfg.no_unchecked_side_effect_imports = acc.no_unchecked_side_effect_imports orelse true;
     // `resolvePackageJsonExports`/`resolvePackageJsonImports` default ON: tsc
     // derives them from `moduleResolution` (on for node16/nodenext/bundler) and
     // ztsc always resolves with the bundler algorithm, so only an explicit
@@ -439,13 +439,18 @@ pub const Config = struct {
     /// specifier ignores the importing package's `"imports"` map, leaving it
     /// unresolved (a `#` name is never a `node_modules` directory). Default true.
     resolve_pkg_json_imports: bool = true,
-    /// `compilerOptions.noUncheckedSideEffectImports` (TS 5.6+). tsc's default is
-    /// OFF: a side-effect-only `import "m"` whose specifier resolves to nothing
-    /// is silently accepted, because bundler plugins routinely own such
-    /// specifiers (`import "@fontsource-variable/inter"` is CSS). Only when the
-    /// option is on does the unresolved specifier become an error. Note the
-    /// pinned tsgo oracle defaults this ON — see `Linker.reportUnresolvedModules`.
-    no_unchecked_side_effect_imports: bool = false,
+    /// `compilerOptions.noUncheckedSideEffectImports` (TS 5.6+): when on, a
+    /// side-effect-only `import "m"` whose specifier resolves to nothing is
+    /// TS2882 rather than being silently accepted.
+    ///
+    /// Default ON, which is the pinned tsgo 7.0.2 oracle's default and NOT
+    /// TypeScript 5.x's — 5.x defaults it off so that bundler plugins can own
+    /// specifiers the type system knows nothing about (`import
+    /// "@fontsource-variable/inter"` is CSS). ztsc follows the oracle it is
+    /// measured against; an explicit `false` restores the 5.x behavior, and is
+    /// what a project relying on such plugin-owned specifiers wants. See
+    /// `Linker.reportUnresolvedModules`.
+    no_unchecked_side_effect_imports: bool = true,
     /// Effective `compilerOptions.allowSyntheticDefaultImports`, i.e.
     /// `allowSyntheticDefaultImports ?? esModuleInterop ?? (module is system ||
     /// moduleResolution is bundler)` (tsc's rule). ztsc always resolves with the
