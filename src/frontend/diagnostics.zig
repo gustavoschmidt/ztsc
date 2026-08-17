@@ -351,6 +351,15 @@ pub const Code = enum(u16) {
     /// bindings and cannot carry one name twice. Reported on every declaration's
     /// name. See `Binder.checkRedeclaredExports`.
     redeclared_exported_variable,
+    /// TS1194: an `export { … }` / `export * from …` statement in a NAMESPACE
+    /// body. A namespace's exports are its `export`ed members; an export
+    /// DECLARATION is module syntax. See `Binder.checkNamespaceExportDecl`.
+    export_decl_in_namespace,
+    /// TS1147: an import that names a MODULE, written in a namespace body —
+    /// tsc's `checkExternalImportOrExportDeclaration`, the import half of the
+    /// rule `export_decl_in_namespace` is the export half of. Reported at the
+    /// module specifier.
+    import_in_namespace_references_module,
     /// TS2391: a function/method whose LAST non-ambient declaration has no
     /// body, so the overload set has no implementation. See
     /// `impl_expected.zig`.
@@ -643,6 +652,8 @@ pub const Code = enum(u16) {
             .import_conflict,
             .merged_decl_export_mismatch,
             .redeclared_exported_variable,
+            .export_decl_in_namespace,
+            .import_in_namespace_references_module,
             .missing_function_implementation,
             .missing_constructor_implementation,
             .abstract_decls_not_consecutive,
@@ -1023,6 +1034,8 @@ pub const Code = enum(u16) {
             .import_conflict => "import declaration conflicts with local declaration",
             .merged_decl_export_mismatch => "Individual declarations in merged declaration must be all exported or all local.",
             .redeclared_exported_variable => "Cannot redeclare exported variable.",
+            .export_decl_in_namespace => "Export declarations are not permitted in a namespace.",
+            .import_in_namespace_references_module => "Import declarations in a namespace cannot reference a module.",
             .missing_function_implementation => "Function implementation is missing or not immediately following the declaration.",
             .missing_constructor_implementation => "Constructor implementation is missing.",
             .abstract_decls_not_consecutive => "All declarations of an abstract method must be consecutive.",
@@ -1170,6 +1183,8 @@ pub const Code = enum(u16) {
             .import_conflict => 2440,
             .merged_decl_export_mismatch => 2395,
             .redeclared_exported_variable => 2323,
+            .export_decl_in_namespace => 1194,
+            .import_in_namespace_references_module => 1147,
             .missing_function_implementation => 2391,
             .missing_constructor_implementation => 2390,
             .abstract_decls_not_consecutive => 2516,

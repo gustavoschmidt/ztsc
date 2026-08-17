@@ -1269,6 +1269,56 @@ const Binder = struct {
         return b.tree.nodeData(node).rhs != 0;
     }
 
+    /// TS1194: an `export { … }` / `export * from …` statement written in a
+    /// NAMESPACE body — tsc's `checkExportDeclaration`.
+    ///
+    /// A namespace's exports are its `export`ed members; an export DECLARATION
+    /// is module syntax, and belongs to a module's top level or to a `declare
+    /// module "spec"` block. The rule has two shapes, and tsc anchors them
+    /// differently (`error(node.moduleSpecifier, …)` vs `error(node, …)`):
+    ///
+    ///   * with a module specifier, it is rejected outright — in an ambient
+    ///     namespace too — and reported at the SPECIFIER;
+    ///   * without one, it is rejected only in a live namespace, and reported
+    ///     at the statement. `declare namespace Q { function _try(…): any;
+    ///     export { _try as try }; }` is the ambient re-export idiom, and
+    ///     legal (`exportDeclarationsInAmbientNamespaces`).
+    ///
+    /// `declare module "spec"` and `declare global` are ambient MODULES, not
+    /// namespaces, and take neither arm.
+    fn checkNamespaceExportDecl(b: *Binder, node: Node, module_token: TokenIndex) Error!void {
+        if (!b.inPlainNamespaceBody()) return;
+        if (module_token != 0) return b.diag(.export_decl_in_namespace, module_token);
+        if (b.ambient) return;
+        try b.diag(.export_decl_in_namespace, b.tree.nodeMainToken(node));
+    }
+
+    /// TS1147, the IMPORT half of the same rule
+    /// (`checkExternalImportOrExportDeclaration`): an import that names a
+    /// MODULE — `import … from "m"`, `import x = require("m")` — written in a
+    /// namespace body. Reported at the specifier, and in an ambient namespace
+    /// too: what tsc exempts is a `declare module "spec"` block, not ambience.
+    /// An entity-name alias (`import A = B.C`) names no module and is the
+    /// normal way to alias inside a namespace, so it carries no specifier here.
+    fn checkNamespaceImportDecl(b: *Binder, module_token: TokenIndex) Error!void {
+        if (module_token == 0) return;
+        if (!b.inPlainNamespaceBody()) return;
+        try b.diag(.import_in_namespace_references_module, module_token);
+    }
+
+    /// Is the statement being bound directly inside a `namespace`/`module`
+    /// body — as opposed to a file's top level, or a `declare module "spec"` /
+    /// `declare global` block, which are ambient MODULES and take module
+    /// syntax?
+    fn inPlainNamespaceBody(b: *const Binder) bool {
+        if (b.cur_scope == file_scope) return false;
+        if (b.scope_kinds.items[b.cur_scope] != .namespace) return false;
+        const owner = b.scope_owners.items[b.cur_scope];
+        if (owner == null_node or b.nodeTag(owner) != .namespace_decl) return false;
+        const data = b.tree.extraData(ast.NamespaceData, b.tree.nodeData(owner).lhs);
+        return data.flags & (ast.Flags.ambient_module | ast.Flags.global_aug) == 0;
+    }
+
     /// Does this declaration publish a module binding — either through an
     /// `export` modifier, or as the declaration form of `export default`?
     ///
@@ -2106,6 +2156,7 @@ const Binder = struct {
             // syntax nested in a namespace / `declare module` block does not.
             .import_decl => {
                 if (b.cur_scope == file_scope) b.saw_module_syntax = true;
+                try b.checkNamespaceImportDecl(d.rhs);
                 try b.bindImport(node);
             },
             .export_decl => {
@@ -2132,6 +2183,7 @@ const Binder = struct {
                     b.saw_module_syntax = true;
                     b.saw_export_declaration = true;
                 }
+                try b.checkNamespaceExportDecl(node, d.rhs);
                 try b.bindExportNamed(node);
             },
             .export_all => {
@@ -2139,6 +2191,7 @@ const Binder = struct {
                     b.saw_module_syntax = true;
                     b.saw_export_declaration = true;
                 }
+                try b.checkNamespaceExportDecl(node, d.rhs);
                 try b.bindExportAll(node);
             },
             .export_assign => {
@@ -3680,6 +3733,7 @@ const Binder = struct {
         const d = b.tree.nodeData(node);
         const data = b.tree.extraData(ast.ImportEquals, d.lhs);
         if (b.cur_scope == file_scope) b.saw_module_syntax = true;
+        try b.checkNamespaceImportDecl(data.module_token);
         const local = try b.atomOfToken(data.name_token);
         // `export import X = …` carries its `export` as a MODIFIER FLAG — the
         // parser does not wrap it in an `export_decl` — so `noteExport` has to
