@@ -292,6 +292,18 @@ pub const Code = enum(u16) {
     /// ever finds the loop, switch or label the jump names. Reported on the
     /// keyword; grammar-class.
     jump_crosses_function_boundary,
+    /// TS1105 / TS1104: an UNLABELED `break` / `continue` with nothing to jump
+    /// to — tsc's walk reached the source file without meeting an iteration
+    /// statement (or, for `break`, a `switch`). Reported on the keyword;
+    /// grammar-class.
+    break_outside_iteration_or_switch,
+    continue_outside_iteration,
+    /// TS1116 / TS1115: a LABELED `break` / `continue` whose label names no
+    /// enclosing statement — and, for `continue`, one whose label names a
+    /// statement that is not an iteration. Reported on the keyword;
+    /// grammar-class.
+    break_label_not_enclosing,
+    continue_label_not_iteration,
     /// TS1248: `class C { const x = 1 }` — `const` is not a class-member
     /// modifier. tsc's message names the keyword, and `const` is the only one
     /// that reaches it. Reported on the member NAME (measured against
@@ -705,6 +717,10 @@ pub const Code = enum(u16) {
             .namespace_needs_a_name,
             .const_class_member,
             .jump_crosses_function_boundary,
+            .break_outside_iteration_or_switch,
+            .continue_outside_iteration,
+            .break_label_not_enclosing,
+            .continue_label_not_iteration,
             .label_not_allowed,
             .public_not_on_module_element,
             .private_not_on_module_element,
@@ -1026,6 +1042,10 @@ pub const Code = enum(u16) {
             .namespace_needs_a_name => "Namespace must be given a name.",
             .const_class_member => "A class member cannot have the 'const' keyword.",
             .jump_crosses_function_boundary => "Jump target cannot cross function boundary.",
+            .break_outside_iteration_or_switch => "A 'break' statement can only be used within an enclosing iteration or switch statement.",
+            .continue_outside_iteration => "A 'continue' statement can only be used within an enclosing iteration statement.",
+            .break_label_not_enclosing => "A 'break' statement can only jump to a label of an enclosing statement.",
+            .continue_label_not_iteration => "A 'continue' statement can only jump to a label of an enclosing iteration statement.",
             .element_access_needs_argument => "An element access expression should take an argument.",
             .module_name_needs_quoted_string => "Module declaration names may only use ' or \" quoted strings.",
             .jsx_comma_operator => "JSX expressions may not use the comma operator. Did you mean to write an array?",
@@ -1281,6 +1301,10 @@ pub const Code = enum(u16) {
             .namespace_needs_a_name => 1437,
             .const_class_member => 1248,
             .jump_crosses_function_boundary => 1107,
+            .break_outside_iteration_or_switch => 1105,
+            .continue_outside_iteration => 1104,
+            .break_label_not_enclosing => 1116,
+            .continue_label_not_iteration => 1115,
             .element_access_needs_argument => 1011,
             .rest_must_be_last => 2462,
             .module_name_needs_quoted_string => 1443,

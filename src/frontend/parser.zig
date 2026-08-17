@@ -1920,7 +1920,7 @@ const Parser = struct {
         _ = try p.bump(); // ':'
         // The label is a jump target for everything inside it and for nothing
         // outside — a function nested in it starts its own slice of the stack.
-        try p.labels.append(p.gpa, label);
+        try p.labels.append(p.gpa, label | (if (p.labelTargetsIteration()) label_on_iteration else 0));
         defer p.labels.shrinkRetainingCapacity(p.labels.items.len - 1);
         const body = try p.parseSubstatement();
         if (isDeclarationTag(p.nodes.items(.tag)[body])) {
@@ -2380,13 +2380,8 @@ const Parser = struct {
         if (isIdentLike(p.curTag()) and !p.nlBefore()) {
             label = try p.bump();
         }
-        // TS1107: tsc walks out of the jump looking for its target and stops at
-        // the first function-like it reaches. Only the crossing is reported
-        // here — a jump that resolves to nothing at a file's top level earns one
-        // of four other codes ztsc does not answer yet, and guessing between
-        // them would invent diagnostics.
-        if (p.spec == 0 and p.jump.in_function and !p.jumpResolves(is_break, label)) {
-            try p.errAtToken(.jump_crosses_function_boundary, kw);
+        if (p.spec == 0) {
+            if (p.jumpTargetCode(is_break, label)) |code| try p.errAtToken(code, kw);
         }
         try p.expectSemicolon();
         return p.addNode(.{
@@ -2396,23 +2391,61 @@ const Parser = struct {
         });
     }
 
-    /// Does a `break`/`continue` find its target without leaving the function it
-    /// sits in? An unlabeled `break` takes an iteration statement or a `switch`,
-    /// an unlabeled `continue` an iteration statement, and a labeled one any
-    /// enclosing label of the same name.
+    /// What a `break`/`continue` earns where it stands, or null when it has a
+    /// target. tsc walks out of the statement and answers on the first thing it
+    /// meets: the target itself (silence), a FUNCTION-LIKE (TS1107 — a jump may
+    /// not cross one), or the source file (TS1104/TS1105 unlabeled,
+    /// TS1115/TS1116 labeled).
     ///
-    /// A labeled `continue` whose label is NOT on an iteration statement is
-    /// TS1115 in tsc; treating it as resolved here under-reports that one code
-    /// and never invents this one.
-    fn jumpResolves(p: *Parser, is_break: bool, label: u32) bool {
+    /// An unlabeled `break` takes an iteration statement or a `switch`, an
+    /// unlabeled `continue` an iteration statement only, and a labeled one any
+    /// enclosing label of the same name — except that a labeled `continue`
+    /// additionally needs that label to sit on an ITERATION statement, which is
+    /// its own TS1115 and the one answer that outranks the boundary.
+    fn jumpTargetCode(p: *Parser, is_break: bool, label: u32) ?Code {
         if (label == 0) {
-            return p.jump.loops > 0 or (is_break and p.jump.switches > 0);
+            if (p.jump.loops > 0 or (is_break and p.jump.switches > 0)) return null;
+        } else {
+            const name = p.tokenTextAt(label);
+            for (p.labels.items[p.jump.labels_base..]) |l| {
+                if (!std.mem.eql(u8, p.tokenTextAt(l & label_token_mask), name)) continue;
+                if (is_break or l & label_on_iteration != 0) return null;
+                return .continue_label_not_iteration;
+            }
         }
-        const name = p.tokenTextAt(label);
-        for (p.labels.items[p.jump.labels_base..]) |l| {
-            if (std.mem.eql(u8, p.tokenTextAt(l), name)) return true;
+        if (p.jump.in_function) return .jump_crosses_function_boundary;
+        if (label != 0) {
+            return if (is_break) .break_label_not_enclosing else .continue_label_not_iteration;
         }
-        return false;
+        return if (is_break) .break_outside_iteration_or_switch else .continue_outside_iteration;
+    }
+
+    /// `Parser.labels` packs "this label sits on an iteration statement" into
+    /// the top bit of the label's token index. Token indices are bounded by the
+    /// source-length limit, so the bit is free.
+    const label_on_iteration: u32 = 1 << 31;
+    const label_token_mask: u32 = label_on_iteration - 1;
+
+    /// Does the labeled statement about to be parsed carry an ITERATION
+    /// statement? tsc follows a chain of labels to find out
+    /// (`isIterationStatement(…, /*lookInLabeledStatements*/ true)`), which is
+    /// what `a: b: while (c) { continue a; }` needs. The chain is walked over
+    /// LOOKAHEAD, so a chain deeper than the window answers "iteration" and
+    /// under-reports rather than inventing a TS1115.
+    fn labelTargetsIteration(p: *Parser) bool {
+        var i: usize = 0;
+        while (i + 1 < max_la) {
+            switch (p.peekTag(i)) {
+                .keyword_while, .keyword_do, .keyword_for => return true,
+                else => {},
+            }
+            if (isIdentLike(p.peekTag(i)) and p.peekTag(i + 1) == .colon) {
+                i += 2;
+                continue;
+            }
+            return false;
+        }
+        return true;
     }
 
     /// Parse the body of an iteration statement: one more jump target for the
