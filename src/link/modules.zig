@@ -357,6 +357,13 @@ pub fn link(
     // With every export table final, the re-exports that could not find their
     // name in a still-growing one get their answer — and their diagnostic.
     try l.resolvePendingReexports();
+    // `export as namespace X` records, name-sorted for `umd.forName`. Needed
+    // here (before the tables seal) as well as by the global merge below: a
+    // `declare global { namespace X }` of a UMD name merges into the MODULE,
+    // so its members are exports of that module.
+    const umds = try umd.collect(scratch, gpa, io, interner, files);
+    umd.sortByName(umds);
+    try l.foldUmdGlobalMembers(umds);
     // TS2303: alias declarations that define each other. A pure diagnostic pass
     // over the sealed bind data — the export tables above are cycle-SAFE, which
     // keeps every name bound but erases the evidence this needs.
@@ -396,11 +403,6 @@ pub fn link(
     // every file's harvest slice and every `declare module` augmentation of a
     // resolved real module. Needs the sealed export tables (`out`).
     const sym_base = try computeSymBase(arena, files);
-    // `export as namespace X` records, name-sorted for `umd.forName`. The
-    // binder keeps only the name (and only for the shape it can resolve), so
-    // the declarations are harvested from the trees here.
-    const umds = try umd.collect(scratch, gpa, io, interner, files);
-    umd.sortByName(umds);
     const gm = try mergeGlobals(arena, scratch, files, sym_base, out, l.atom_export_equals, umds, l.diags);
     for (0..files.len) |i| out[i].diags = try arena.dupe(LinkDiag, l.diags[i].items);
 
@@ -618,6 +620,29 @@ fn globalSymFlags(files: []const ProgFile, sym_base: []const u32, sym: u32) bind
     return files[f].bind.symbol_flags[sym - sym_base[f]];
 }
 
+/// Does a SCRIPT file before `umd_file` already declare `name` at its top
+/// level? That is exactly when tsc's `if (!globals.has(id))` finds the slot
+/// taken and the `export as namespace name` entry never enters `globals` at
+/// all — so the UMD name merges with nothing, silently.
+///
+/// A module file's top-level harvest does not count: it is offered to the
+/// global table only through its own `export = <ident>` stand-in (umd.zig), and
+/// a module's locals are never folded into `globals` by
+/// `initializeTypeChecker`. Nor do `declare global { … }` members, which are
+/// merged in a LATER pass and therefore merge into the UMD entry rather than
+/// displacing it.
+fn scriptDeclaresBefore(files: []const ProgFile, name: Atom, umd_file: FileId) bool {
+    for (files[0..umd_file]) |*f| {
+        const b = f.bind;
+        if (b.is_module) continue;
+        const split = @min(b.global_aug_start, b.global_atoms.len);
+        for (b.global_atoms[0..split]) |atom| {
+            if (atom == name) return true;
+        }
+    }
+    return false;
+}
+
 /// One link of a global name's merge chain: a real declaration symbol, or the
 /// synthetic `export as namespace X` entry, which owns no symbol at all (the
 /// binder keeps only the name). See umd.zig.
@@ -670,6 +695,83 @@ fn buildChain(
     }
     while (i < parts.len) : (i += 1) chain.appendAssumeCapacity(.{ .real = parts[i] });
     return chain.items;
+}
+
+/// The member half of a UMD merge: a global `namespace X { export const c }`
+/// that merges into the module `export as namespace X` publishes brings its
+/// members with it, and one the module ALREADY exports meets `mergeSymbol`
+/// there — `exportAsNamespace_augment`'s three-way `conflict`.
+///
+/// The export table has already absorbed the members that were NEW
+/// (`Linker.foldUmdGlobalMembers`), so a name whose export target is the block
+/// member itself is that fold, not a duplicate; a name whose target is
+/// something else is the module's own export winning the collision, which is
+/// the pair to judge. Verdict and message are `global_dup.mergeClash`'s, the
+/// same rule the name itself was judged by one line above.
+fn reportUmdGlobalMemberDups(
+    arena: Allocator,
+    scratch: Allocator,
+    diags: []std.ArrayList(LinkDiag),
+    files: []const ProgFile,
+    sym_base: []const u32,
+    l: *const FileLinks,
+    chain: []const ChainLink,
+) Error!void {
+    for (chain) |ln| {
+        const p = switch (ln) {
+            .real => |r| r,
+            .umd => continue,
+        };
+        const fid = fileOfGlobal(sym_base, files.len, p);
+        const b = files[fid].bind;
+        const ns = b.namespaceScopeOf(p - sym_base[fid]) orelse continue;
+        const lo = b.scope_members_start[ns];
+        const hi = b.scope_members_start[ns + 1];
+        for (lo..hi) |i| {
+            const msym = b.member_syms[i];
+            if (!b.symbol_flags[msym].exported) continue;
+            const tgt = l.exportTarget(b.member_atoms[i]) orelse continue;
+            if (tgt.kind != .binding) continue;
+            const real = sym_base[tgt.file] + tgt.payload;
+            const mine = sym_base[fid] + msym;
+            if (real == mine) continue; // the fold, not a second declaration
+            const flags = [2]binder.SymbolFlags{
+                globalSymFlags(files, sym_base, real),
+                globalSymFlags(files, sym_base, mine),
+            };
+            const code = global_dup.mergeClash(&flags) orelse continue;
+            try reportContributors(arena, scratch, diags, files, sym_base, &.{ real, mine }, code);
+        }
+    }
+}
+
+/// The module a merge chain publishes from, when the chain is a UMD entry that
+/// a REAL declaration merges into — the shape `umdNamespace` is the symbol for.
+/// Null for every other chain: one with no UMD entry (the ordinary global
+/// merge), and one whose UMD entry stands alone, where `addUmdGlobals` supplies
+/// the module's exports and there is nothing to merge with.
+fn umdMergeTarget(chain: []const ChainLink) ?FileId {
+    var uf: ?FileId = null;
+    var any_real = false;
+    for (chain) |ln| switch (ln) {
+        .umd => |u| uf = uf orelse u.file,
+        .real => any_real = true,
+    };
+    return if (any_real) uf else null;
+}
+
+/// The `.real` links of a chain, in chain order.
+fn chainReals(scratch: Allocator, chain: []const ChainLink) Error![]const u32 {
+    const out = try scratch.alloc(u32, chain.len);
+    var n: usize = 0;
+    for (chain) |ln| switch (ln) {
+        .real => |p| {
+            out[n] = p;
+            n += 1;
+        },
+        .umd => {},
+    };
+    return out[0..n];
 }
 
 /// One global name's contributors, checked for a merge tsc rejects and reported
@@ -1162,15 +1264,36 @@ fn mergeGlobals(
         }.lt);
         const g_atoms = try arena.alloc(Atom, n);
         const g_syms = try arena.alloc(u32, n);
+        const linked = links.len == files.len;
         for (names, 0..) |atom, i| {
             const parts = acc.get(atom).?.items;
+            const us = umd.forName(umds, atom);
             g_atoms[i] = atom;
-            g_syms[i] = try m.mergeSet(parts);
+            // A name that a UMD entry and a real declaration BOTH reach is one
+            // symbol whose merge target is the module (see `umdNamespace`), so
+            // it is built from the module's export index rather than from the
+            // real parts alone. Every other name — including a UMD name the
+            // binder harvested through its own `export = <ident>` and nothing
+            // else declares — takes the plain merge.
+            const chain: []const ChainLink = if (us.len == 0 or !linked)
+                &.{}
+            else
+                try buildChain(scratch, files, sym_base, parts, us);
+            g_syms[i] = if (umdMergeTarget(chain)) |uf|
+                try m.umdNamespace(atom, uf, &links[uf], export_equals_atom, chainReals(scratch, chain) catch
+                    return Error.OutOfMemory)
+            else
+                try m.mergeSet(parts);
             // tsc's `mergeSymbol` reports the failed merge as it folds; the
             // fold itself is unchanged (the merged symbol still carries the OR
             // of every contributor's flags, so a duplicate name still resolves).
             if (dup_diags) |ds| {
-                try reportGlobalDup(arena, scratch, ds, files, sym_base, parts, umd.forName(umds, atom));
+                try reportGlobalDup(arena, scratch, ds, files, sym_base, parts, us);
+                // …and, when the name merged INTO a module, the member tables
+                // that merge with it.
+                if (umdMergeTarget(chain)) |uf| {
+                    try reportUmdGlobalMemberDups(arena, scratch, ds, files, sym_base, &links[uf], chain);
+                }
             }
         }
         globals = .{ .atoms = g_atoms, .syms = g_syms };
@@ -1246,7 +1369,7 @@ fn addUmdGlobals(
         if (u.name == prev) continue; // first module publishing the name wins
         prev = u.name;
         if (globals.lookup(u.name) != null) continue;
-        syms.append(scratch, try m.umdNamespace(u.name, u.file, &links[u.file], export_equals_atom)) catch
+        syms.append(scratch, try m.umdNamespace(u.name, u.file, &links[u.file], export_equals_atom, &.{})) catch
             return Error.OutOfMemory;
         try atoms.append(scratch, u.name);
     }
@@ -1569,7 +1692,21 @@ const Merger = struct {
     /// anonymous `export default <expr>`, a property of an `export =` value)
     /// resolve to something no symbol id can name, and the reserved `export=`
     /// key is not an export name at all.
-    fn umdNamespace(m: *Merger, name: Atom, file: FileId, l: *const FileLinks, export_equals_atom: Atom) Error!u32 {
+    ///
+    /// `reals` are the GLOBAL declarations of the same name that merge into the
+    /// UMD entry — empty for a name nothing else declares. tsc's `mergeSymbol`
+    /// resolves the UMD alias before merging, so the module is the merge
+    /// TARGET: it keeps `parts[0]` (and with it the file the merged symbol
+    /// reports as its own), its export wins a name collision, and the real
+    /// declarations fold in for their flags and declarations.
+    fn umdNamespace(
+        m: *Merger,
+        name: Atom,
+        file: FileId,
+        l: *const FileLinks,
+        export_equals_atom: Atom,
+        reals: []const u32,
+    ) Error!u32 {
         var atoms: std.ArrayListUnmanaged(Atom) = .empty;
         var syms: std.ArrayListUnmanaged(u32) = .empty;
         for (l.export_atoms, l.export_targets) |a, t| {
@@ -1577,18 +1714,61 @@ const Merger = struct {
             try atoms.append(m.scratch, a);
             try syms.append(m.scratch, m.sym_base[t.file] + t.payload);
         }
+        // Built before this symbol's own id so nested merged ids sit below it,
+        // the ordering `mergeSet` keeps.
+        var members: Globals = .{
+            // `export_atoms` is already atom-sorted, so the filtered copy is.
+            .atoms = try m.arena.dupe(Atom, atoms.items),
+            .syms = try m.arena.dupe(u32, syms.items),
+        };
+        var flags: binder.SymbolFlags = .{ .namespace_decl = true };
+        if (reals.len != 0) {
+            members = try m.unionMembers(members, try m.buildNsMembers(reals));
+            for (reals) |p| flags = binder.SymbolFlags.merge(flags, globalSymFlags(m.files, m.sym_base, p));
+        }
+        const parts = try m.arena.alloc(u32, 1 + reals.len);
+        parts[0] = m.sym_base[file];
+        @memcpy(parts[1..], reals);
         const id = m.totalSyms() + @as(u32, @intCast(m.merged.items.len));
         try m.merged.append(m.arena, .{
             .name = name,
-            .flags = .{ .namespace_decl = true },
-            .parts = try m.arena.dupe(u32, &.{m.sym_base[file]}),
-            // `export_atoms` is already atom-sorted, so the filtered copy is.
-            .members = .{
-                .atoms = try m.arena.dupe(Atom, atoms.items),
-                .syms = try m.arena.dupe(u32, syms.items),
-            },
+            .flags = flags,
+            .parts = parts,
+            .members = members,
         });
+        // The dummy `parts[0]` is deliberately absent: it is not a constituent
+        // of anything and must keep resolving to itself.
+        for (reals) |p| try m.constit.append(m.scratch, .{ .key = p, .val = id });
         return id;
+    }
+
+    /// Two atom-sorted member indexes as one, `a` winning a shared name. The
+    /// merge target's table is `a`, matching tsc's `mergeSymbolTable`, which
+    /// leaves the target's entry in place (and reports) when the source has
+    /// the same name.
+    fn unionMembers(m: *Merger, a: Globals, b: Globals) Error!Globals {
+        if (b.atoms.len == 0) return a;
+        if (a.atoms.len == 0) return b;
+        const atoms = try m.arena.alloc(Atom, a.atoms.len + b.atoms.len);
+        const syms = try m.arena.alloc(u32, atoms.len);
+        var i: usize = 0;
+        var j: usize = 0;
+        var k: usize = 0;
+        while (i < a.atoms.len or j < b.atoms.len) {
+            const take_a = j == b.atoms.len or (i < a.atoms.len and a.atoms[i] <= b.atoms[j]);
+            if (take_a) {
+                if (j < b.atoms.len and b.atoms[j] == a.atoms[i]) j += 1; // target wins
+                atoms[k] = a.atoms[i];
+                syms[k] = a.syms[i];
+                i += 1;
+            } else {
+                atoms[k] = b.atoms[j];
+                syms[k] = b.syms[j];
+                j += 1;
+            }
+            k += 1;
+        }
+        return .{ .atoms = atoms[0..k], .syms = syms[0..k] };
     }
 
     /// Build the merged member index over the namespace body scopes of the
@@ -2715,6 +2895,69 @@ const Linker = struct {
                 try l.put(t, p.exported, final);
             } else {
                 try l.diagNoExportedMember(p.file, p.mfile, p.module, p.local, l.nodeSpan(p.file, p.node));
+            }
+        }
+    }
+
+    /// Fold a GLOBAL declaration of a UMD name into the module that publishes
+    /// it — the export-table half of the merge `mergeGlobals` performs on the
+    /// symbol side.
+    ///
+    /// `export as namespace a` puts an ALIAS in tsc's `globals`; a later
+    /// `declare global { namespace a { export const y } }` merges into it, and
+    /// `mergeSymbol` resolves the alias first, so what the namespace really
+    /// merges into is the MODULE symbol (a clone of it, recorded as its merged
+    /// symbol). The members the global block adds are therefore exports of the
+    /// module itself:
+    ///
+    ///     import * as a2 from "./a";
+    ///     declare global { namespace a { export const y = 0 } }
+    ///     a2.y;   // OK — `y` is an export of "./a"
+    ///
+    /// so this is a fold into the export table, not a second table beside it.
+    /// The module's OWN export wins a name collision (tsc keeps the merge
+    /// target's entry and reports; `reportUmdGlobalDups` is the report).
+    ///
+    /// Skipped entirely when a SCRIPT file earlier in file order already
+    /// declares the name at its top level: tsc's copy step is `if
+    /// (!globals.has(id)) globals.set(id, sym)`, so the UMD name never enters
+    /// the table and nothing merges with it.
+    ///
+    /// A module file's own top level is not a global contribution here — for
+    /// the `export = <ident>` shape the binder harvests the exported entity as
+    /// the file's global (see umd.zig), and that entity IS the module, so
+    /// folding it back in would merge the module with itself. Only `declare
+    /// global { … }` members and script top levels are real second declarations.
+    fn foldUmdGlobalMembers(l: *Linker, umds: []const umd.Global) Error!void {
+        var prev: Atom = 0;
+        for (umds) |u| {
+            if (u.name == prev) continue; // first module publishing the name wins
+            prev = u.name;
+            if (scriptDeclaresBefore(l.files, u.name, u.file)) continue;
+            for (l.files, 0..) |*f, fi| {
+                if (fi == u.file) continue;
+                const b = f.bind;
+                const split = @min(b.global_aug_start, b.global_atoms.len);
+                for (b.global_atoms, b.global_syms, 0..) |atom, local, k| {
+                    if (atom != u.name) continue;
+                    // A module's own top level (the pre-augmentation half of
+                    // the harvest) is the `export = <ident>` stand-in, not a
+                    // second declaration.
+                    if (b.is_module and k < split) continue;
+                    if (!b.symbol_flags[local].namespace_decl) continue;
+                    const ns = b.namespaceScopeOf(local) orelse continue;
+                    const lo = b.scope_members_start[ns];
+                    const hi = b.scope_members_start[ns + 1];
+                    for (lo..hi) |mi| {
+                        const msym = b.member_syms[mi];
+                        if (!b.symbol_flags[msym].exported) continue;
+                        _ = try l.starPutFile(&l.tables[u.file], b.member_atoms[mi], .{
+                            .kind = .binding,
+                            .file = @intCast(fi),
+                            .payload = msym,
+                        }, false);
+                    }
+                }
             }
         }
     }

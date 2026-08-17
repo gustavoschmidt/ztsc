@@ -44,6 +44,7 @@ const intern = @import("../intern.zig");
 const program = @import("program.zig");
 const source = @import("../frontend/source.zig");
 const scanner = @import("../frontend/scanner.zig");
+const umd = @import("umd.zig");
 
 const Atom = intern.Atom;
 const Bind = bind_result.Bind;
@@ -80,6 +81,9 @@ const Kind = enum {
     export_equals,
     /// `export default ref`
     export_default,
+    /// `export as namespace name` — the module's own UMD global, whose target
+    /// is the module (and so its export assignment).
+    export_as_ns,
 };
 
 /// One alias declaration. `(file, node)` is its identity; `name` is what the
@@ -370,8 +374,52 @@ fn nextSite(c: *Ctx, s: Site) Error!?Site {
         .import_require, .import_ns => try equalsSite(c, s.file, s.module),
         .import_default => (try namedSite(c, s.file, s.module, c.atom_default)) orelse
             try equalsSite(c, s.file, s.module),
-        .import_entity, .export_spec, .export_equals, .export_default => localSite(c, s.file, s.scope, s.ref, s.sym),
+        .import_entity, .export_spec, .export_default => localSite(c, s.file, s.scope, s.ref, s.sym),
+        // An export assignment that names NOTHING in its own file may still
+        // name the file's own UMD global, which names the file.
+        .export_equals => localSite(c, s.file, s.scope, s.ref, s.sym) orelse
+            (if (resolvesLocally(c, s.file, s.scope, s.ref, s.sym)) null else umdSelfSite(c, s.file, s.ref)),
+        // The UMD global IS the module symbol (tsc's UMD alias resolves to it),
+        // and the module symbol of a file with an export assignment is that
+        // assignment — `resolveExternalModuleSymbol`, the same step
+        // `import x = require("m")` takes.
+        .export_as_ns => ownEqualsSite(c, s.file),
     };
+}
+
+/// Does `name` name a declaration of `file` at all? `localSite` answers null
+/// both for "resolved, and it is a real declaration rather than an alias" and
+/// for "did not resolve", and only the second may go on to the global table:
+/// `export = Lib` beside `declare namespace Lib` names that local namespace,
+/// whatever else the program calls `Lib`.
+fn resolvesLocally(c: *Ctx, file: FileId, scope: ScopeId, name: Atom, sym0: SymbolId) bool {
+    if (sym0 != bind_result.no_symbol) return true;
+    return c.files[file].bind.resolve(name, scope) != null;
+}
+
+/// `export = N` in a module that publishes `N` as its OWN UMD global and
+/// declares no local `N`. The name resolves through the program's globals,
+/// where `export as namespace N` put this very module — so the export
+/// assignment names the module whose export assignment it is, and the two
+/// declarations define each other (`exportAsNamespaceConflict`).
+///
+/// Asked only once local resolution has failed, which is what keeps the
+/// ordinary UMD `@types` package out of it: `declare namespace React; export =
+/// React; export as namespace React` resolves `React` to the file's own local
+/// namespace and never consults the global table at all.
+fn umdSelfSite(c: *Ctx, file: FileId, name: Atom) ?Site {
+    if (name == 0) return null;
+    const d = umd.declNaming(&c.files[file], c.interner.lookup(c.io, name)) orelse return null;
+    return .{ .file = file, .node = d.node, .kind = .export_as_ns, .name = name };
+}
+
+/// The export assignment of `file` itself.
+fn ownEqualsSite(c: *Ctx, file: FileId) ?Site {
+    for (c.files[file].bind.exports) |rec| {
+        if (rec.kind != .equals or rec.scope != bind_result.file_scope) continue;
+        if (exportSite(c, file, rec)) |s| return s;
+    }
+    return null;
 }
 
 /// The alias declaration that publishes `name` from `module`, as seen from

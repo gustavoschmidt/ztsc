@@ -98,6 +98,27 @@ pub fn collect(
     return out.items;
 }
 
+/// One `export as namespace <text>` declaration of `f`, or null when the file
+/// publishes no UMD global by that name.
+///
+/// The same three filters `collect` applies, then a byte compare on the name
+/// token: the caller arrives with the one name it is looking for, and a file
+/// declares at most a couple of these, so this is cheaper than interning and
+/// needs no allocator.
+pub fn declNaming(f: *const ProgFile, text: []const u8) ?Decl {
+    if (!f.bind.is_module) return null;
+    if (!paths.isDeclarationPath(f.path)) return null;
+    for (f.tree.nodeRange(ast.root_node)) |stmt| {
+        if (f.tree.nodeTag(stmt) != .export_as_ns) continue;
+        const tok: ast.TokenIndex = @intCast(f.tree.nodeData(stmt).lhs);
+        if (std.mem.eql(u8, f.tree.tokenSlice(f.src, tok), text)) return .{ .node = stmt, .tok = tok };
+    }
+    return null;
+}
+
+/// The statement node of one `export as namespace X;` and its name token.
+pub const Decl = struct { node: ast.Node, tok: ast.TokenIndex };
+
 /// The records naming `atom`, as a subslice of a `collect` result sorted by
 /// name. See `sortByName`.
 pub fn forName(sorted: []const Global, atom: Atom) []const Global {
