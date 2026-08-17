@@ -53,6 +53,35 @@ pub const EnumInitKind = enum { numeric, string, computed };
 // the syntactic constant evaluator (tsc's `createEvaluator`)
 // =====================================================================
 
+/// A syntactic-constant evaluation result. `.str` means the value's TEXT was
+/// appended to the caller's `out` buffer; `.num` and `.none` leave `out` at
+/// the length it had on entry. That convention makes string concatenation
+/// free — `a + b` evaluates both operands into the same buffer, back to back,
+/// and the concatenation is already there.
+const Const = union(enum) { num: f64, str, none };
+
+/// The enum-member walk an evaluation is running inside, if any. tsc's
+/// `evaluate(initializer, member)` resolves a name against the members the
+/// SAME walk has already evaluated (`enum E { A = 1, B = A + 1 }`) instead of
+/// re-entering the enum, which is what keeps the walk from recursing.
+const EnumScope = struct {
+    active: bool = false,
+    own: SymbolId = 0,
+    seen: []const checker_zig.EnumMemberEntry = &.{},
+
+    /// `.none` when the name is not a member evaluated so far — the caller
+    /// falls back to ordinary resolution; a member declared LATER in the same
+    /// enum resolves to a symbol with no foldable declaration, so it lands on
+    /// `.none` there too (tsc's forward-reference rule, minus its diagnostic).
+    fn lookup(self: EnumScope, name: Atom) ?TypeId {
+        if (!self.active) return null;
+        for (self.seen) |m| {
+            if (m.name == name) return m.value;
+        }
+        return null;
+    }
+};
+
 /// tsc evaluates a template EXPRESSION as a compile-time constant before it
 /// decides between `string` and a template-literal type
 /// (`checkTemplateExpression`: `const evaluated = node.parent.kind !==
@@ -63,63 +92,130 @@ pub const EnumInitKind = enum { numeric, string, computed };
 /// single string literal type `"feedgen|at://…"`, NOT `string`, and is
 /// therefore assignable to `` `feedgen|${string}` ``.
 ///
-/// This mirrors `utilities.ts`'s `createEvaluator` over the *syntax*, not
-/// over checked types: tsc only folds a name that resolves to an enum member
-/// or to a `const` variable with **no type annotation** and an initializer
-/// (`evaluateEntityNameExpression` -> `isConstantVariable(symbol) &&
-/// declaration && !declaration.type && declaration.initializer`). Folding on
-/// the checked type instead would also fold `declare const x: 'abc'`, which
-/// tsc leaves as `string` — a false NEGATIVE. The operator arms tsc supports
-/// on numbers (`|`, `&`, `<<`, `+`, …) are deliberately left out: omitting a
-/// case only under-folds, which can never turn a tsc error into silence.
+/// The enum member walk folds through the SAME evaluator, because tsc's is
+/// the same function (`utilities.ts`'s `createEvaluator`, one instance shared
+/// by `checkTemplateExpression` and `computeConstantValue`). Completeness
+/// matters in the enum direction: a form tsc folds and this does not turns
+/// tsc's silence into a false TS1061/TS1066/TS2474, so the operator arms are
+/// exactly tsc's set.
 ///
-/// Appends the value's string form to `out`; returns false when the
-/// expression is not a compile-time constant.
-pub fn evalConstToString(c: *Checker, node: Node, out: *std.ArrayList(u8), depth: u8) Error!bool {
-    if (depth > max_const_eval_depth or node == null_node) return false;
+/// This works over the *syntax*, not over checked types: tsc only folds a
+/// name that resolves to an enum member or to a `const` variable with **no
+/// type annotation** and an initializer (`evaluateEntityNameExpression` ->
+/// `isConstantVariable(symbol) && declaration && !declaration.type &&
+/// declaration.initializer`). Folding on the checked type instead would also
+/// fold `declare const x: 'abc'`, which tsc leaves as `string`.
+fn evalConst(c: *Checker, node: Node, out: *std.ArrayList(u8), es: EnumScope, depth: u8) Error!Const {
+    if (depth > max_const_eval_depth or node == null_node) return .none;
+    const mark = out.items.len;
     const d = c.tree.nodeData(node);
     const main_tok = c.tree.nodeMainToken(node);
     switch (c.nodeTag(node)) {
         .string_literal => {
             try out.appendSlice(c.scratch(), c.atomText(try c.memberAtom(main_tok)));
-            return true;
+            return .str;
         },
         // A no-substitution template is a string constant (tsc folds
         // `NoSubstitutionTemplateLiteral` to its cooked text).
         .template_literal => {
             try out.appendSlice(c.scratch(), c.atomText(try c.templateAtom(main_tok)));
-            return true;
+            return .str;
         },
-        .number_literal => {
-            try appendNumber(c, out, c.numberTokenValue(main_tok));
-            return true;
-        },
-        .paren_expr => return evalConstToString(c, d.lhs, out, depth + 1),
+        .number_literal => return .{ .num = c.numberTokenValue(main_tok) },
+        .paren_expr => return evalConst(c, d.lhs, out, es, depth + 1),
         .prefix_unary => {
             const op = c.tree.tokens.tag(main_tok);
-            if ((op == .minus or op == .plus) and d.lhs != null_node and c.nodeTag(d.lhs) == .number_literal) {
-                const v = c.numberTokenValue(c.tree.nodeMainToken(d.lhs));
-                try appendNumber(c, out, if (op == .minus) -v else v);
-                return true;
-            }
-            return false;
+            if (op != .minus and op != .plus and op != .tilde) return .none;
+            const r = try evalConst(c, d.lhs, out, es, depth + 1);
+            out.shrinkRetainingCapacity(mark);
+            const v = switch (r) {
+                .num => |n| n,
+                else => return .none,
+            };
+            return .{ .num = switch (op) {
+                .minus => -v,
+                .plus => v,
+                else => @floatFromInt(~toInt32(v)),
+            } };
         },
+        .binary => return evalConstBinary(c, node, out, es, depth),
         .template_expr => {
             try out.appendSlice(c.scratch(), c.templateHeadText(main_tok));
             for (c.tree.nodeRange(node)) |sub| {
-                if (sub == null_node) return false;
-                if (!try evalConstToString(c, sub, out, depth + 1)) return false;
+                switch (try evalConst(c, sub, out, es, depth + 1)) {
+                    .none => {
+                        out.shrinkRetainingCapacity(mark);
+                        return .none;
+                    },
+                    // A numeric substitution stringifies (tsc's
+                    // `evaluateTemplateExpression` does `result += value`).
+                    .num => |n| try appendNumber(c, out, n),
+                    .str => {},
+                }
                 const ctok = c.templateChunkTokAfter(main_tok, c.nodeSpan(sub).end);
                 try out.appendSlice(c.scratch(), c.templateChunkText(ctok));
             }
-            return true;
+            return .str;
         },
-        .identifier, .member_expr => return evalConstEntityName(c, node, out, depth),
-        else => return false,
+        .identifier, .member_expr, .index_expr => return evalConstEntity(c, node, out, es, depth),
+        else => return .none,
     }
 }
 
 const max_const_eval_depth: u8 = 16;
+
+/// JS `ToInt32`, the coercion every bitwise operator applies to its operands.
+fn toInt32(v: f64) i32 {
+    if (!std.math.isFinite(v)) return 0;
+    const wrapped = @mod(@trunc(v), 4294967296.0);
+    if (!(wrapped >= 0) or wrapped >= 4294967296.0) return 0;
+    return @bitCast(@as(u32, @intFromFloat(wrapped)));
+}
+
+fn toUint32(v: f64) u32 {
+    return @bitCast(toInt32(v));
+}
+
+/// tsc's `BinaryExpression` arm: the twelve arithmetic/bitwise operators over
+/// two numbers, plus `+` over two strings. Anything else is not a constant.
+fn evalConstBinary(c: *Checker, node: Node, out: *std.ArrayList(u8), es: EnumScope, depth: u8) Error!Const {
+    const mark = out.items.len;
+    const d = c.tree.nodeData(node);
+    const op = c.tree.tokens.tag(c.tree.nodeMainToken(node));
+    switch (op) {
+        .pipe, .amp, .caret, .lt_lt, .gt_gt, .gt_gt_gt, .asterisk, .slash, .plus, .minus, .percent, .asterisk_asterisk => {},
+        else => return .none,
+    }
+    const l = try evalConst(c, d.lhs, out, es, depth + 1);
+    if (l == .none) {
+        out.shrinkRetainingCapacity(mark);
+        return .none;
+    }
+    const r = try evalConst(c, d.rhs, out, es, depth + 1);
+    // `"a" + "b"`: both halves are already in `out`, back to back.
+    if (l == .str and r == .str and op == .plus) return .str;
+    if (l != .num or r != .num) {
+        out.shrinkRetainingCapacity(mark);
+        return .none;
+    }
+    const a = l.num;
+    const b = r.num;
+    const sh: u5 = @intCast(toUint32(b) & 31);
+    return .{ .num = switch (op) {
+        .pipe => @floatFromInt(toInt32(a) | toInt32(b)),
+        .amp => @floatFromInt(toInt32(a) & toInt32(b)),
+        .caret => @floatFromInt(toInt32(a) ^ toInt32(b)),
+        .lt_lt => @floatFromInt(@as(i32, @bitCast(@as(u32, @truncate(@as(u64, toUint32(a)) << sh))))),
+        .gt_gt => @floatFromInt(toInt32(a) >> sh),
+        .gt_gt_gt => @floatFromInt(toUint32(a) >> sh),
+        .asterisk => a * b,
+        .slash => a / b,
+        .plus => a + b,
+        .minus => a - b,
+        .percent => @rem(a, b),
+        else => std.math.pow(f64, a, b),
+    } };
+}
 
 fn appendNumber(c: *Checker, out: *std.ArrayList(u8), v: f64) Error!void {
     var buf: [64]u8 = undefined;
@@ -130,43 +226,142 @@ fn appendNumber(c: *Checker, out: *std.ArrayList(u8), v: f64) Error!void {
     try out.appendSlice(c.scratch(), s);
 }
 
-/// tsc's `evaluateEntityNameExpression`: an enum member folds to its constant
-/// value, a `const` variable with no annotation folds to its initializer's
-/// value, anything else is not a constant.
-fn evalConstEntityName(c: *Checker, node: Node, out: *std.ArrayList(u8), depth: u8) Error!bool {
-    // `E.M` / `NS.E.M` — the enum-member arm, shared with the enum walk.
-    if (c.nodeTag(node) == .member_expr) {
-        const d = c.tree.nodeData(node);
-        const saved_scope = c.cur_scope;
-        defer c.cur_scope = saved_scope;
-        if (try c.enumSymOfQualifier(d.lhs)) |esym| {
-            const v = (try c.enumMemberValue(esym, try c.memberAtom(d.rhs))) orelse return false;
-            switch (c.ts.kind(v)) {
-                .string_literal => try out.appendSlice(c.scratch(), c.atomText(c.ts.literalAtom(v))),
-                .number_literal, .number_literal_fresh => try appendNumber(c, out, c.ts.numberValue(v)),
-                else => return false,
-            }
-            return true;
-        }
-        return false;
-    }
-    const a = try c.atomOfToken(c.tree.nodeMainToken(node));
-    var sym = switch (c.resolveSpace(a, c.cur_scope, true)) {
-        .sym => |s| s,
-        else => return false,
+/// The literal type an enum member walk produced, back in evaluator terms.
+fn constOfType(c: *Checker, v: TypeId, out: *std.ArrayList(u8)) Error!Const {
+    if (v == types.no_type) return .none;
+    return switch (c.ts.kind(v)) {
+        .string_literal => blk: {
+            try out.appendSlice(c.scratch(), c.atomText(c.ts.literalAtom(v)));
+            break :blk .str;
+        },
+        .number_literal, .number_literal_fresh => .{ .num = c.ts.numberValue(v) },
+        else => .none,
     };
+}
+
+/// `Infinity` / `NaN` fold to their values only while they still name the lib
+/// globals — tsc's `isInfinityOrNaNString(text) && symbol === globalSymbol`,
+/// which `enumShadowedInfinityNaN` exercises by shadowing both with `{}`.
+fn globalNumberName(c: *Checker, a: Atom, sym: SymbolId) ?f64 {
+    const text = c.atomText(a);
+    const v: f64 = if (std.mem.eql(u8, text, "Infinity"))
+        std.math.inf(f64)
+    else if (std.mem.eql(u8, text, "NaN"))
+        std.math.nan(f64)
+    else
+        return null;
+    const g = c.prog.globals.lookup(a) orelse return null;
+    return if (g == sym) v else null;
+}
+
+/// tsc's `evaluateEntityNameExpression` / `evaluateElementAccessExpression`:
+/// an enum member folds to its constant value, a `const` variable with no
+/// annotation folds to its initializer's value.
+fn evalConstEntity(c: *Checker, node: Node, out: *std.ArrayList(u8), es: EnumScope, depth: u8) Error!Const {
+    const d = c.tree.nodeData(node);
+    switch (c.nodeTag(node)) {
+        .identifier => {
+            const a = try c.atomOfToken(c.tree.nodeMainToken(node));
+            if (es.lookup(a)) |v| return constOfType(c, v, out);
+            if (try forwardEnumMember(c, es, a)) |v| return v;
+            const sym = switch (c.resolveSpace(a, c.cur_scope, true)) {
+                .sym => |s| s,
+                else => return .none,
+            };
+            if (globalNumberName(c, a, sym)) |v| return .{ .num = v };
+            return evalConstSym(c, sym, out, depth);
+        },
+        // `E.M` / `NS.E.M` — the enum-member arm; `NS.Q` — a `const` reached
+        // through its namespace container.
+        .member_expr => {
+            const name = try c.memberAtom(d.rhs);
+            if (try evalEnumQualified(c, d.lhs, name, out, es)) |r| return r;
+            const saved_scope = c.cur_scope;
+            defer c.cur_scope = saved_scope;
+            const outer = (try c.resolveNsContainer(d.lhs)) orelse return .none;
+            const g = c.containerMemberSym(outer, name) orelse return .none;
+            return evalConstSym(c, g, out, depth);
+        },
+        // ``E["M"]`` / ``E[`M`]`` — tsc's `evaluateElementAccessExpression`,
+        // whose index must be `isStringLiteralLike` (a quoted literal or a
+        // no-substitution template) and whose root must name an enum.
+        .index_expr => {
+            const itok = c.tree.nodeMainToken(d.rhs);
+            const name = switch (c.nodeTag(d.rhs)) {
+                .string_literal => try c.memberAtom(itok),
+                .template_literal => try c.templateAtom(itok),
+                else => return .none,
+            };
+            return (try evalEnumQualified(c, d.lhs, name, out, es)) orelse .none;
+        },
+        else => return .none,
+    }
+}
+
+/// A name that the enum currently being walked declares but has NOT reached
+/// yet — `const enum E1 { X = Y, Y = 1 }`. tsc's `evaluateEnumMember` reports
+/// TS2651 for it and then returns **0**, not `undefined`, so the member does
+/// have a value: the following members keep auto-incrementing and a `const`
+/// enum gets no TS2474. (ztsc does not report the TS2651 itself yet; the walk
+/// is memoized and re-entrant, which is no place to emit a diagnostic.)
+///
+/// Read straight off the declaration, never through `enumMembersOf` — the
+/// enum's own walk is in progress, and re-entering it would recurse.
+fn forwardEnumMember(c: *Checker, es: EnumScope, name: Atom) Error!?Const {
+    if (!es.active) return null;
+    for (c.declsOf(es.own)) |decl| {
+        if (c.nodeTag(decl) != .enum_decl) continue;
+        const data = c.tree.extraData(ast.EnumData, c.tree.nodeData(decl).lhs);
+        for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
+            if (m == null_node or c.nodeTag(m) != .enum_member) continue;
+            if ((try c.memberAtom(c.tree.nodeMainToken(m))) == name) return Const{ .num = 0 };
+        }
+    }
+    return null;
+}
+
+/// `E.M` where `E` names an enum. Null when the qualifier is not an enum, so
+/// the caller can try the namespace-container reading of the same syntax.
+fn evalEnumQualified(c: *Checker, qual: Node, name: Atom, out: *std.ArrayList(u8), es: EnumScope) Error!?Const {
+    if (c.enum_alias_depth >= 8) return Const.none;
+    c.enum_alias_depth += 1;
+    defer c.enum_alias_depth -= 1;
+    const saved_scope = c.cur_scope;
+    defer c.cur_scope = saved_scope;
+    const esym = (try c.enumSymOfQualifier(qual)) orelse return null;
+    // A member of the enum being walked: answer from the members evaluated so
+    // far rather than re-entering the walk.
+    if (es.active and esym == es.own) {
+        if (es.lookup(name)) |v| return try constOfType(c, v, out);
+        return (try forwardEnumMember(c, es, name)) orelse Const.none;
+    }
+    const v = (try c.enumMemberValue(esym, name)) orelse return Const.none;
+    return try constOfType(c, v, out);
+}
+
+/// Fold a name that has already been resolved to a symbol.
+fn evalConstSym(c: *Checker, sym0: SymbolId, out: *std.ArrayList(u8), depth: u8) Error!Const {
+    var sym = sym0;
     // Follow import aliases to the declaration that carries the initializer
     // (tsc's `resolveEntityName` resolves through aliases before the test).
     var hops: u8 = 0;
     while (c.symFlags(sym).import_binding) : (hops += 1) {
-        if (hops >= 8) return false;
-        const tgt = c.importTarget(sym) orelse return false;
-        if (tgt.kind != .binding) return false;
+        if (hops >= 8) return .none;
+        const tgt = c.importTarget(sym) orelse return .none;
+        if (tgt.kind != .binding) return .none;
         sym = c.toGlobalIn(tgt.file, tgt.payload);
     }
-    if (!c.symFlags(sym).const_decl) return false;
+    if (c.symFlags(sym).enum_member) {
+        if (c.enum_alias_depth >= 8) return .none;
+        c.enum_alias_depth += 1;
+        defer c.enum_alias_depth -= 1;
+        const esym = enumOfMemberSym(c, sym) orelse return .none;
+        const v = (try c.enumMemberValue(esym, c.symNameAtom(sym))) orelse return .none;
+        return constOfType(c, v, out);
+    }
+    if (!c.symFlags(sym).const_decl) return .none;
     const decls = c.declsOf(sym);
-    if (decls.len != 1) return false;
+    if (decls.len != 1) return .none;
     const decl = decls[0];
     const saved = c.enterSymFile(sym);
     defer c.restoreCtx(saved);
@@ -174,10 +369,10 @@ fn evalConstEntityName(c: *Checker, node: Node, out: *std.ArrayList(u8), depth: 
     // `declarator_init` is exactly `!declaration.type && declaration.initializer`
     // with a plain name — a `declarator_full` carries an annotation (or is a
     // pattern), which tsc refuses to fold.
-    if (c.nodeTag(decl) != .declarator_init) return false;
+    if (c.nodeTag(decl) != .declarator_init) return .none;
     const dd = c.tree.nodeData(decl);
-    if (c.nodeTag(dd.lhs) != .identifier) return false;
-    return evalConstToString(c, dd.rhs, out, depth + 1);
+    if (c.nodeTag(dd.lhs) != .identifier) return .none;
+    return evalConst(c, dd.rhs, out, .{}, depth + 1);
 }
 
 /// The folded string value of a template expression, or null when it is not a
@@ -185,7 +380,11 @@ fn evalConstEntityName(c: *Checker, node: Node, out: *std.ArrayList(u8), depth: 
 pub fn constTemplateAtom(c: *Checker, node: Node) Error!?Atom {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(c.scratch());
-    if (!try evalConstToString(c, node, &out, 0)) return null;
+    switch (try evalConst(c, node, &out, .{}, 0)) {
+        .none => return null,
+        .num => |v| try appendNumber(c, &out, v),
+        .str => {},
+    }
     // `internText`, NOT `atom`: the folded value lives in a scratch buffer that
     // is freed on return, and `atom_cache` keeps its KEY as the caller's slice.
     // Caching it leaves a dangling key that the next rehash walks — a
@@ -194,154 +393,70 @@ pub fn constTemplateAtom(c: *Checker, node: Node) Error!?Atom {
     return try c.internText(out.items);
 }
 
-/// The constant value of an enum member initializer that REFERENCES another
-/// constant enum member — `Asc = AssetOrder.Asc`, or `B = A` naming a member
-/// of the same enum. tsc's `computeConstantValue` evaluates an entity-name
-/// expression against the enum member it resolves to, so such a member is a
-/// string (or numeric) constant like any other; ztsc classified it as
-/// `computed`, which cost the whole enum its `all_string` classification —
-/// `Aliased.Asc` was then not assignable to `string`, and immich's
-/// `z.enum(AssetOrderWithRandom)` (whose parameter is
-/// `Readonly<Record<string, string | number>>`) had no matching overload.
-///
-/// `own` is the enum being walked, so a self-reference resolves against its
-/// own members without going back through the scope chain.
-fn aliasedEnumInitValue(c: *Checker, own: SymbolId, init_node: Node) Error!?TypeId {
-    if (c.enum_alias_depth >= 8) return null;
-    c.enum_alias_depth += 1;
-    defer c.enum_alias_depth -= 1;
-    switch (c.nodeTag(init_node)) {
-        // `E.M` (or `NS.E.M`) — the qualifier names an enum, the member name
-        // is read off it exactly as the type-position form does.
-        .member_expr => {
-            const d = c.tree.nodeData(init_node);
-            // Both walks that call this run under `enterSymFile`, which
-            // switches the FILE but leaves `cur_scope` pointing into the
-            // requester's — an out-of-bounds scope id in the enum's own file.
-            // The qualifier is a top-level name in that file, so resolve it
-            // from the file scope.
-            const saved_scope = c.cur_scope;
-            c.cur_scope = binder.file_scope;
-            defer c.cur_scope = saved_scope;
-            const esym = (try c.enumSymOfQualifier(d.lhs)) orelse return null;
-            const name = try c.memberAtom(d.rhs);
-            if (esym == own) return null; // a member of THIS enum, mid-walk
-            return c.enumMemberValue(esym, name);
-        },
-        // The bare-name form (`B = A`, a member of the same enum) RESOLVES
-        // — `bindEnum` gives the body its own scope — but is not folded:
-        // `own` is mid-walk here, so re-entering `enumMembersOf` for it
-        // would recurse, and the values of the members already visited are
-        // not threaded through this call. The member is classified
-        // `computed`, exactly as it was before the scope existed, so this is
-        // a pure under-fold: a value tsc knows and ztsc does not.
-        else => return null,
-    }
-}
+/// The constant value of one enum member initializer, in the middle of a walk
+/// over the enum's members. `.computed` is tsc's `undefined` — the member has
+/// no constant value, which is what makes a FOLLOWING bare member TS1061 and
+/// (in an ambient or `const` enum) makes this initializer itself an error.
+const EnumInitValue = struct { kind: EnumInitKind, num: f64 = 0, str: Atom = 0 };
 
-/// Classify an enum member initializer for constant folding. Only literal
-/// numbers (incl. unary `-`/`+`) and string literals fold to constants;
-/// anything else is "computed".
-fn classifyEnumInit(c: *Checker, node: Node) struct { kind: EnumInitKind, value: f64 } {
-    switch (c.nodeTag(node)) {
-        .number_literal => return .{ .kind = .numeric, .value = c.numberTokenValue(c.tree.nodeMainToken(node)) },
-        .prefix_unary => {
-            const d = c.tree.nodeData(node);
-            const op = c.tree.tokens.tag(c.tree.nodeMainToken(node));
-            if ((op == .minus or op == .plus) and d.lhs != 0 and c.nodeTag(d.lhs) == .number_literal) {
-                const v = c.numberTokenValue(c.tree.nodeMainToken(d.lhs));
-                return .{ .kind = .numeric, .value = if (op == .minus) -v else v };
-            }
-            return .{ .kind = .computed, .value = 0 };
-        },
-        // A NO-SUBSTITUTION template literal is a string constant, the same
-        // as a quoted one: tsc's `computeConstantValue` folds
-        // `NoSubstitutionTemplateLiteral` to its cooked text. Treating it as
-        // computed instead made the member opaque, which cost the whole enum
-        // its `all_string` classification and turned every `case E.M:` on it
-        // into TS2678 (immich writes nine `ManualJobName` members in
-        // backticks).
-        .string_literal, .template_literal => return .{ .kind = .string, .value = 0 },
-        else => return .{ .kind = .computed, .value = 0 },
-    }
-}
-
-/// The cooked text of a constant string enum initializer — quoted or in
-/// backticks (see `classifyEnumInit`). The token spellings differ, so the
-/// atom has to be read through the matching accessor.
-fn enumInitAtom(c: *Checker, init_node: Node) Error!Atom {
+fn evalEnumInit(c: *Checker, es: EnumScope, init_node: Node) Error!EnumInitValue {
+    // The three literal shapes carry their value in a token, so the common
+    // case never touches the string buffer (or interns a second copy of an
+    // atom the scanner already made).
     const tok = c.tree.nodeMainToken(init_node);
-    if (c.nodeTag(init_node) == .template_literal) return c.templateAtom(tok);
-    return c.memberAtom(tok);
+    switch (c.nodeTag(init_node)) {
+        .number_literal => return .{ .kind = .numeric, .num = c.numberTokenValue(tok) },
+        .string_literal => return .{ .kind = .string, .str = try c.memberAtom(tok) },
+        .template_literal => return .{ .kind = .string, .str = try c.templateAtom(tok) },
+        else => {},
+    }
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(c.scratch());
+    return switch (try evalConst(c, init_node, &out, es, 0)) {
+        .none => .{ .kind = .computed },
+        .num => |v| .{ .kind = .numeric, .num = v },
+        // `internText`, not `atom` — see `constTemplateAtom`.
+        .str => .{ .kind = .string, .str = try c.internText(out.items) },
+    };
+}
+
+/// The scope a member initializer resolves names in: the enum's own body
+/// scope, where `bindEnum` put the members, so a bare `A` names the member
+/// and shadows an outer `A` (tsc's `resolveName` case for an
+/// EnumDeclaration location). The caller must already be in the enum's file.
+fn enumBodyScope(c: *Checker, sym: SymbolId) binder.ScopeId {
+    return c.bind.enumScopeOf(c.localOf(sym)) orelse binder.file_scope;
 }
 
 /// Const-ness, string/numeric nature, and numeric member values of an
 /// enum symbol (all declaration blocks merged). Pure computation, cached.
 pub fn enumInfo(c: *Checker, sym: SymbolId) Error!EnumInfo {
     if (c.enum_info_cache.get(sym)) |info| return info;
+    const members = try enumMembersOf(c, sym);
     const saved = c.enterSymFile(sym);
     defer c.restoreCtx(saved);
     var values: std.ArrayList(f64) = .empty;
     defer values.deinit(c.scratch());
-    var is_const = false;
     var has_string = false;
     var has_computed = false;
-    var member_count: u32 = 0;
-    var auto: f64 = 0;
-    var auto_ok = true;
+    for (members) |m| {
+        if (m.computed) has_computed = true;
+        if (m.value == types.no_type) continue;
+        switch (c.ts.kind(m.value)) {
+            .string_literal => has_string = true,
+            .number_literal, .number_literal_fresh => try values.append(c.scratch(), c.ts.numberValue(m.value)),
+            else => {},
+        }
+    }
+    var is_const = false;
     for (c.declsOf(sym)) |decl| {
         if (c.nodeTag(decl) != .enum_decl) continue;
-        const d = c.tree.nodeData(decl);
-        const data = c.tree.extraData(ast.EnumData, d.lhs);
+        const data = c.tree.extraData(ast.EnumData, c.tree.nodeData(decl).lhs);
         if (data.flags & ast.Flags.const_enum != 0) is_const = true;
-        for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
-            if (m == null_node or c.nodeTag(m) != .enum_member) continue;
-            member_count += 1;
-            const init_node = c.tree.nodeData(m).lhs;
-            if (init_node == null_node) {
-                if (auto_ok) {
-                    try values.append(c.scratch(), auto);
-                    auto += 1;
-                }
-                continue;
-            }
-            const ci = classifyEnumInit(c, init_node);
-            switch (ci.kind) {
-                .numeric => {
-                    try values.append(c.scratch(), ci.value);
-                    auto = ci.value + 1;
-                    auto_ok = true;
-                },
-                .string => {
-                    has_string = true;
-                    auto_ok = false;
-                },
-                .computed => {
-                    // A reference to another constant enum member is a
-                    // CONSTANT (see `aliasedEnumInitValue`): folding it is
-                    // what keeps a string enum's `all_string` classification
-                    // when one of its members aliases another enum's.
-                    if (try aliasedEnumInitValue(c, sym, init_node)) |v| {
-                        if (c.ts.kind(v) == .string_literal) {
-                            has_string = true;
-                            auto_ok = false;
-                        } else {
-                            const n = c.ts.numberValue(v);
-                            try values.append(c.scratch(), n);
-                            auto = n + 1;
-                            auto_ok = true;
-                        }
-                        continue;
-                    }
-                    has_computed = true;
-                    auto_ok = false;
-                },
-            }
-        }
     }
     const info: EnumInfo = .{
         .is_const = is_const,
-        .all_string = has_string and !has_computed and values.items.len == 0 and member_count > 0,
+        .all_string = has_string and !has_computed and values.items.len == 0 and members.len > 0,
         .all_numeric = !has_string,
         .has_computed = has_computed,
         .values = try c.ca().dupe(f64, values.items),
@@ -350,87 +465,80 @@ pub fn enumInfo(c: *Checker, sym: SymbolId) Error!EnumInfo {
     return info;
 }
 
-/// Walk every member of an enum symbol (all declaration blocks merged) in
-/// declaration order, handing the callback each member's name atom and the
-/// literal type of its constant value — `no_type` when the value is
-/// computed (or when auto-increment ran off a string/computed member, so
-/// the number is unknowable). The one place the auto-increment rules live.
+/// Evaluate every member of an enum symbol (all declaration blocks merged) in
+/// declaration order. The one place the auto-increment rules live: a member
+/// with no initializer continues the previous member's number, and the chain
+/// restarts at 0 in each declaration BLOCK — tsc's `computeEnumMemberValues`
+/// runs per `EnumDeclaration` with `autoValue = 0`, which is why
+/// `enum E { A = "x".length }` followed by `enum E { B }` is not an error.
+fn evalEnumMembers(c: *Checker, sym: SymbolId, out: *std.ArrayList(checker_zig.EnumMemberEntry)) Error!void {
+    const saved = c.enterSymFile(sym);
+    defer c.restoreCtx(saved);
+    c.cur_scope = enumBodyScope(c, sym);
+    for (c.declsOf(sym)) |decl| {
+        if (c.nodeTag(decl) != .enum_decl) continue;
+        const data = c.tree.extraData(ast.EnumData, c.tree.nodeData(decl).lhs);
+        var auto: f64 = 0;
+        var auto_ok = true;
+        for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
+            if (m == null_node or c.nodeTag(m) != .enum_member) continue;
+            const name = try c.memberAtom(c.tree.nodeMainToken(m));
+            const init_node = c.tree.nodeData(m).lhs;
+            var entry: checker_zig.EnumMemberEntry = .{ .name = name, .value = types.no_type };
+            if (init_node == null_node) {
+                if (auto_ok) {
+                    entry.value = try c.ts.makeNumberLiteral(auto, false);
+                    auto += 1;
+                }
+            } else {
+                const es: EnumScope = .{ .active = true, .own = sym, .seen = out.items };
+                const ci = try evalEnumInit(c, es, init_node);
+                switch (ci.kind) {
+                    .numeric => {
+                        entry.value = try c.ts.makeNumberLiteral(ci.num, false);
+                        auto = ci.num + 1;
+                        auto_ok = true;
+                    },
+                    .string => {
+                        entry.value = try c.ts.makeStringLiteral(ci.str, false);
+                        auto_ok = false;
+                    },
+                    .computed => {
+                        entry.computed = true;
+                        auto_ok = false;
+                    },
+                }
+            }
+            try out.append(c.ca(), entry);
+        }
+    }
+}
+
+/// Walk every member of an enum symbol in declaration order, handing the
+/// callback each member's name atom and the literal type of its constant
+/// value — `no_type` when the value is computed (or when auto-increment ran
+/// off a string/computed member, so the number is unknowable).
 pub fn eachEnumMember(
     c: *Checker,
     sym: SymbolId,
     ctx: anytype,
     comptime f: fn (@TypeOf(ctx), Atom, TypeId) Error!void,
 ) Error!void {
-    const saved = c.enterSymFile(sym);
-    defer c.restoreCtx(saved);
-    var auto: f64 = 0;
-    var auto_ok = true;
-    for (c.declsOf(sym)) |decl| {
-        if (c.nodeTag(decl) != .enum_decl) continue;
-        const data = c.tree.extraData(ast.EnumData, c.tree.nodeData(decl).lhs);
-        for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
-            if (m == null_node or c.nodeTag(m) != .enum_member) continue;
-            const name = try c.memberAtom(c.tree.nodeMainToken(m));
-            const init_node = c.tree.nodeData(m).lhs;
-            if (init_node == null_node) {
-                const v = if (auto_ok) try c.ts.makeNumberLiteral(auto, false) else types.no_type;
-                if (auto_ok) auto += 1;
-                try f(ctx, name, v);
-                continue;
-            }
-            const ci = classifyEnumInit(c, init_node);
-            switch (ci.kind) {
-                .string => {
-                    const av = try enumInitAtom(c, init_node);
-                    auto_ok = false;
-                    try f(ctx, name, try c.ts.makeStringLiteral(av, false));
-                },
-                .numeric => {
-                    auto = ci.value + 1;
-                    auto_ok = true;
-                    try f(ctx, name, try c.ts.makeNumberLiteral(ci.value, false));
-                },
-                .computed => {
-                    // A reference to another constant enum member folds to
-                    // that member's value (see `aliasedEnumInitValue`).
-                    if (try aliasedEnumInitValue(c, sym, init_node)) |v| {
-                        if (c.ts.kind(v) == .number_literal or c.ts.kind(v) == .number_literal_fresh) {
-                            auto = c.ts.numberValue(v) + 1;
-                            auto_ok = true;
-                        } else {
-                            auto_ok = false;
-                        }
-                        try f(ctx, name, v);
-                        continue;
-                    }
-                    auto_ok = false;
-                    try f(ctx, name, types.no_type);
-                },
-            }
-        }
-    }
+    for (try enumMembersOf(c, sym)) |m| try f(ctx, m.name, m.value);
 }
 
-/// `eachEnumMember`'s walk for one enum, memoized under its symbol — see
-/// `Checker.enum_members`. Every by-name consumer goes through here, so an
-/// enum's declaration is read once per checker instead of once per question.
+/// The evaluated members of one enum, memoized under its symbol — see
+/// `Checker.enum_members`. Every consumer goes through here, so an enum's
+/// declaration is read once per checker instead of once per question.
 ///
 /// The list is published only after the walk completes, so a re-entrant
-/// request for the SAME enum (an `aliasedEnumInitValue` cycle) falls through
-/// to a second walk exactly as it did before, and the depth cap in
-/// `enum_alias_depth` still bounds it.
+/// request for the SAME enum (a cross-enum reference cycle) falls through to
+/// a second walk, and the depth cap in `enum_alias_depth` still bounds it.
 pub fn enumMembersOf(c: *Checker, sym: SymbolId) Error![]const checker_zig.EnumMemberEntry {
     if (c.enum_members.get(sym)) |m| return m;
-    const Collect = struct {
-        c: *Checker,
-        list: std.ArrayList(checker_zig.EnumMemberEntry) = .empty,
-        fn visit(self: *@This(), name: Atom, value: TypeId) Error!void {
-            try self.list.append(self.c.ca(), .{ .name = name, .value = value });
-        }
-    };
-    var col: Collect = .{ .c = c };
-    try c.eachEnumMember(sym, &col, Collect.visit);
-    const out = col.list.items;
+    var list: std.ArrayList(checker_zig.EnumMemberEntry) = .empty;
+    try evalEnumMembers(c, sym, &list);
+    const out = list.items;
     try c.enum_members.put(c.cm(), sym, out);
     return out;
 }
@@ -537,23 +645,14 @@ pub fn enumMemberTypeUnion(c: *Checker, sym: SymbolId, skip: Atom) Error!?TypeId
     return try c.ts.makeUnion(c.scratch(), list.items);
 }
 
-/// Whether an enum has any string-valued member (non-allocating scan).
-/// A string enum is stringish; an all-numeric enum is numberish — this
-/// lets numeric enums take part in arithmetic/comparison like `number`.
+/// Whether an enum has any string-valued member. A string enum is stringish;
+/// an all-numeric enum is numberish — this lets numeric enums take part in
+/// arithmetic/comparison like `number`. Infallible so the two `expr.zig`
+/// union predicates can call it from a non-`Error` closure; the only failure
+/// `enumInfo` has is OOM, which every caller here would report as "numeric".
 pub fn enumHasStringMember(c: *Checker, sym: SymbolId) bool {
-    if (c.enum_info_cache.get(sym)) |info| return !info.all_numeric;
-    const saved = c.enterSymFile(sym);
-    defer c.restoreCtx(saved);
-    for (c.declsOf(sym)) |decl| {
-        if (c.nodeTag(decl) != .enum_decl) continue;
-        const data = c.tree.extraData(ast.EnumData, c.tree.nodeData(decl).lhs);
-        for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
-            if (m == null_node or c.nodeTag(m) != .enum_member) continue;
-            const init_node = c.tree.nodeData(m).lhs;
-            if (init_node != null_node and classifyEnumInit(c, init_node).kind == .string) return true;
-        }
-    }
-    return false;
+    const info = enumInfo(c, sym) catch return false;
+    return !info.all_numeric;
 }
 
 /// The value object of an enum (`typeof E`): one readonly property per
@@ -764,19 +863,9 @@ pub fn enumAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: typ
 /// literal equal to one of its member values, even though the literal is
 /// not assignable into the nominal enum.
 pub fn enumHasStringValue(c: *Checker, sym: SymbolId, val: Atom) Error!bool {
-    const saved = c.enterSymFile(sym);
-    defer c.restoreCtx(saved);
-    for (c.declsOf(sym)) |decl| {
-        if (c.nodeTag(decl) != .enum_decl) continue;
-        const d = c.tree.nodeData(decl);
-        const data = c.tree.extraData(ast.EnumData, d.lhs);
-        for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
-            if (m == null_node or c.nodeTag(m) != .enum_member) continue;
-            const init_node = c.tree.nodeData(m).lhs;
-            if (init_node == null_node) continue;
-            if (classifyEnumInit(c, init_node).kind != .string) continue;
-            if ((try enumInitAtom(c, init_node)) == val) return true;
-        }
+    for (try enumMembersOf(c, sym)) |m| {
+        if (m.value == types.no_type or c.ts.kind(m.value) != .string_literal) continue;
+        if (c.ts.literalAtom(m.value) == val) return true;
     }
     return false;
 }
@@ -786,28 +875,36 @@ pub fn enumHasStringValue(c: *Checker, sym: SymbolId, val: Atom) Error!bool {
 /// `stringEnumCastOverlap`); a numeric or mixed enum keeps the ordinary
 /// numeric-literal comparability and must not take it.
 pub fn enumIsStringValued(c: *Checker, sym: SymbolId) Error!bool {
-    const saved = c.enterSymFile(sym);
-    defer c.restoreCtx(saved);
-    var any = false;
-    for (c.declsOf(sym)) |decl| {
-        if (c.nodeTag(decl) != .enum_decl) continue;
-        const d = c.tree.nodeData(decl);
-        const data = c.tree.extraData(ast.EnumData, d.lhs);
-        for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
-            if (m == null_node or c.nodeTag(m) != .enum_member) continue;
-            const init_node = c.tree.nodeData(m).lhs;
-            // An uninitialized member is auto-numbered: the enum is not
-            // string-valued.
-            if (init_node == null_node) return false;
-            if (classifyEnumInit(c, init_node).kind != .string) return false;
-            any = true;
-        }
+    const members = try enumMembersOf(c, sym);
+    for (members) |m| {
+        // An uninitialized member is auto-numbered, and a computed one has no
+        // value at all: neither makes the enum string-valued.
+        if (m.value == types.no_type or c.ts.kind(m.value) != .string_literal) return false;
     }
-    return any;
+    return members.len > 0;
 }
 
-/// Type-check an enum declaration: validate member initializers (TS1061)
-/// and check any initializer expressions.
+/// The index into `enumMembersOf(sym)` at which declaration block `node`'s
+/// own members begin — the walk concatenates every block in declaration
+/// order, so this is just the count of members in the blocks before it.
+fn enumBlockBase(c: *Checker, sym: SymbolId, node: Node) usize {
+    var base: usize = 0;
+    for (c.declsOf(sym)) |decl| {
+        if (decl == node) break;
+        if (c.nodeTag(decl) != .enum_decl) continue;
+        const data = c.tree.extraData(ast.EnumData, c.tree.nodeData(decl).lhs);
+        for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
+            if (m != null_node and c.nodeTag(m) == .enum_member) base += 1;
+        }
+    }
+    return base;
+}
+
+/// Type-check an enum declaration: check the initializer expressions, and
+/// report tsc's `computeMemberValue`/`computeConstantValue` diagnostics for
+/// members the constant evaluator could not fold — TS1061 (a bare member with
+/// no numeric chain to continue), TS1066 (an ambient enum), TS2474 (a `const`
+/// enum), TS2477/TS2478 (a `const` enum member folded to Infinity/NaN).
 pub fn checkEnum(c: *Checker, node: Node) Error!void {
     const d = c.tree.nodeData(node);
     const data = c.tree.extraData(ast.EnumData, d.lhs);
@@ -818,30 +915,58 @@ pub fn checkEnum(c: *Checker, node: Node) Error!void {
     // because merged blocks share one scope owned by the first of them.
     const saved_scope = c.cur_scope;
     defer c.cur_scope = saved_scope;
+    var esym: SymbolId = binder.no_symbol;
     if (data.name_token != 0) {
         const a = try c.atomOfToken(data.name_token);
         if (c.bind.lookupInScope(c.cur_scope, a)) |local| {
             if (c.bind.enumScopeOf(local)) |s| c.cur_scope = s;
+            esym = c.toGlobal(local);
         }
     }
-    // A member with no initializer is only legal when the previous member
-    // (or the start of the enum) is a numeric constant it can continue.
-    var prev_numeric_const = true;
+    const is_const = data.flags & ast.Flags.const_enum != 0;
+    // tsc's `NodeFlags.Ambient`: `declare enum`, or any enum inside a `.d.ts`
+    // or a `declare namespace` body — which is what `ambient_ctx` tracks.
+    const ambient = c.ambient_ctx or data.flags & ast.Flags.declare != 0;
+    const empty: []const checker_zig.EnumMemberEntry = &.{};
+    const members = if (esym != binder.no_symbol) try enumMembersOf(c, esym) else empty;
+    const base = if (esym != binder.no_symbol) enumBlockBase(c, esym, node) else 0;
+
+    var i: usize = 0;
     for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
         if (m == null_node or c.nodeTag(m) != .enum_member) continue;
+        const value = if (base + i < members.len) members[base + i].value else types.no_type;
+        i += 1;
         const init_node = c.tree.nodeData(m).lhs;
         if (init_node == null_node) {
-            if (!prev_numeric_const) {
+            // In an ambient NON-const enum a member with no initializer is a
+            // computed member, not an auto-increment: tsc answers `undefined`
+            // before it ever consults the running value, so there is no
+            // TS1061 to report however the chain before it ended.
+            if (ambient and !is_const) continue;
+            if (value == types.no_type) {
                 try c.diagFmt(1061, c.tokSpan(c.tree.nodeMainToken(m)), "Enum member must have initializer.", .{});
             }
-            continue; // auto-increment continues the numeric chain
+            continue;
         }
         _ = try c.checkExprCached(init_node, types.no_type);
-        // Only a string-valued member blocks a following bare member. A
-        // non-literal ("computed") initializer may still be a constant
-        // enum expression (e.g. a reference to a `const`), which tsc lets
-        // a subsequent member continue — so we don't force TS1061 there.
-        prev_numeric_const = classifyEnumInit(c, init_node).kind != .string;
+        if (value != types.no_type) {
+            // A `const` enum inlines its members at every use, so a value
+            // that is not a finite number has nothing to inline.
+            if (is_const and c.ts.kind(value) != .string_literal) {
+                const n = c.ts.numberValue(value);
+                if (std.math.isNan(n)) {
+                    try c.diagFmt(2478, c.nodeSpan(init_node), "'const' enum member initializer was evaluated to disallowed value 'NaN'.", .{});
+                } else if (!std.math.isFinite(n)) {
+                    try c.diagFmt(2477, c.nodeSpan(init_node), "'const' enum member initializer was evaluated to a non-finite value.", .{});
+                }
+            }
+            continue;
+        }
+        if (is_const) {
+            try c.diagFmt(2474, c.nodeSpan(init_node), "const enum member initializers must be constant expressions.", .{});
+        } else if (ambient) {
+            try c.diagFmt(1066, c.nodeSpan(init_node), "In ambient enum declarations member initializer must be constant expression.", .{});
+        }
     }
 }
 
