@@ -2068,7 +2068,68 @@ fn checkObjectLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     // A destructuring ASSIGNMENT pattern is exempt and never arrives here — it
     // goes through `checkDestructuringElement`.
     try c.checkObjectLiteralDups(node);
+    try checkSpreadPropOverrides(c, node);
     return t;
+}
+
+/// tsc's `checkSpreadPropOverrides`: a property written BEFORE a spread whose
+/// source declares the same name NON-optionally is dead code — the spread
+/// always wins — so tsc reports TS2783 at the earlier property.
+///
+/// Only SYNTACTIC properties count, and only those written earlier: tsc keeps
+/// them in a side table (`allPropertiesTable`) that a spread's own properties
+/// never enter. That is what makes `{ ...ab, ...ab }` silent while
+/// `{ b: 1, ...ab }` is not, and what makes a property written BETWEEN two
+/// spreads count for the second one.
+///
+/// Reads the spread source out of the node-type memo (the type walk has
+/// already published it) rather than re-checking, so this adds no evaluation
+/// and cannot be the first to report anything inside the operand.
+fn checkSpreadPropOverrides(c: *Checker, node: Node) Error!void {
+    const members = c.tree.nodeRange(node);
+    // The overwhelming majority of literals carry no spread at all.
+    var has_spread = false;
+    for (members) |prop| {
+        if (prop != null_node and c.nodeTag(prop) == .spread_element) has_spread = true;
+    }
+    if (!has_spread) return;
+
+    const Seen = struct { name: Atom, node: Node };
+    var seen: std.ArrayList(Seen) = .empty;
+    defer seen.deinit(c.scratch());
+    for (members) |prop| {
+        if (prop == null_node) continue;
+        const pd = c.tree.nodeData(prop);
+        switch (c.nodeTag(prop)) {
+            .spread_element => {
+                if (seen.items.len == 0) continue;
+                const raw = c.nodeType(pd.lhs) orelse continue;
+                const st = try c.resolveStructural(raw);
+                switch (c.ts.kind(st)) {
+                    .any, .err, .unknown, .never => continue,
+                    else => {},
+                }
+                for (seen.items) |s| {
+                    // `allow_index = false`: tsc compares against
+                    // `getPropertiesOfType`, which an index signature is not a
+                    // member of — `{ a: 1, ...someRecord }` overwrites nothing
+                    // tsc can name.
+                    const p = (try c.propOfTypeEx(st, s.name, false)) orelse continue;
+                    if (p.optional()) continue;
+                    try c.diagFmt(2783, c.nodeSpan(s.node), "'{s}' is specified more than once, so this usage will be overwritten.", .{
+                        c.atomText(s.name),
+                    });
+                }
+            },
+            // A computed key names no property tsc can compare against the
+            // spread's, so only the statically-keyed forms are tracked.
+            .object_property, .object_method, .object_shorthand => {
+                if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) continue;
+                try seen.append(c.scratch(), .{ .name = try c.memberAtom(c.tree.nodeMainToken(prop)), .node = prop });
+            },
+            else => {},
+        }
+    }
 }
 
 fn objectLiteralWhole(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
@@ -3763,12 +3824,7 @@ fn maybeSymbolish(c: *Checker, t: TypeId, depth: u32) Error!bool {
     if (depth > 8) return false;
     switch (c.ts.kind(t)) {
         .symbol, .unique_symbol => return true,
-        .union_type, .intersection => {
-            for (try c.memberList(t)) |m| {
-                if (try maybeSymbolish(c, m, depth + 1)) return true;
-            }
-            return false;
-        },
+        .union_type, .intersection => {},
         .ref => {
             const rs = try c.resolveStructural(t);
             if (rs == t) return false;
@@ -3781,6 +3837,23 @@ fn maybeSymbolish(c: *Checker, t: TypeId, depth: u32) Error!bool {
         },
         else => return false,
     }
+    // This runs on EVERY `+`, `+=` and relational comparison, so the composite
+    // arm scans its members with the leaf test alone first — that settles
+    // `string | undefined` and friends without copying the member slice to
+    // scratch, exactly as `hasPrimitiveFacet` does.
+    var nested = false;
+    for (0..c.ts.memberCount(t)) |i| {
+        switch (c.ts.kind(c.ts.memberAt(t, i))) {
+            .symbol, .unique_symbol => return true,
+            .union_type, .intersection, .ref, .type_param => nested = true,
+            else => {},
+        }
+    }
+    if (!nested) return false;
+    for (try c.memberList(t)) |m| {
+        if (try maybeSymbolish(c, m, depth + 1)) return true;
+    }
+    return false;
 }
 
 /// tsc's `checkForDisallowedESSymbolOperand`: "symbols are not allowed at all
@@ -4494,26 +4567,28 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
                     // `class f {}; f -= 1` from ALSO reporting the operand as
                     // non-arithmetic and the result as unassignable, neither
                     // of which tsc says.
-                    if (!sf.var_decl and !sf.let_decl and !sf.param and !sf.catch_param) {
+                    if (!sf.var_decl and !sf.let_decl and !sf.param and !sf.catch_param and
+                        (sf.enum_decl or sf.class or sf.namespace_decl or sf.function))
+                    {
+                        // A namespace whose every block declares only types
+                        // emits no runtime object, so tsc never gets as far as
+                        // "cannot assign to a namespace": the name does not
+                        // resolve in value space at all (TS2708, "cannot use
+                        // as a value", which ztsc does not report yet). The
+                        // `errorType` still stands — it is what suppresses the
+                        // TS2322 cascade either way.
                         const what: ?struct { code: u16, text: []const u8 } = if (sf.enum_decl)
                             .{ .code = 2628, .text = "an enum" }
                         else if (sf.class)
                             .{ .code = 2629, .text = "a class" }
-                        else if (sf.namespace_decl and !sf.ns_uninstantiated)
-                            // A namespace whose every block declares only
-                            // types emits no runtime object, so tsc never gets
-                            // as far as "cannot assign to a namespace": the
-                            // name does not resolve in value space at all
-                            // (TS2708, "cannot use as a value").
-                            .{ .code = 2631, .text = "a namespace" }
-                        else if (sf.function)
-                            .{ .code = 2630, .text = "a function" }
+                        else if (sf.namespace_decl)
+                            if (sf.ns_uninstantiated) null else .{ .code = 2631, .text = "a namespace" }
                         else
-                            null;
+                            .{ .code = 2630, .text = "a function" };
                         if (what) |w| {
                             try c.diagFmt(w.code, c.tokSpan(tok), "Cannot assign to '{s}' because it is {s}.", .{ c.tokenText(tok), w.text });
-                            return types.error_type;
                         }
+                        return types.error_type;
                     }
                     return c.typeOfSymbol(sym);
                 },
