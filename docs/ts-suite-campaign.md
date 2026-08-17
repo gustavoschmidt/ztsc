@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-17, post wave 13 + lib-key scoping)
+## Standings (2026-08-17, post wave 14)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **6627 / 8627 (76.8%)** |
-| excess keys (false positives) | 3541 | 2208 |
-| missing keys (under-reports) | 8617 | 4640 |
+| exact-match cases | 4902 / 7815 (62.7%) | **6692 / 8627 (77.6%)** |
+| excess keys (false positives) | 3541 | 2156 |
+| missing keys (under-reports) | 8617 | 4511 |
 | bucketed (ztsc parse error, incomparable) | 825 | 13 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Thirteen waves landed (3–13), every one with ZERO match→non-match regressions in
+Fourteen waves landed (3–14), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -129,7 +129,72 @@ regular file, so `> file 2>&1` silently overwrites the stderr config-warning
 lines — capture apps exactly that way (as all baselines were), or diff will
 show phantom warning lines when you switch to a pipe.
 
-## Ranked next queue (wave 14) — distilled from wave-13 agent reports
+Wave 14 (+65 cases; social-app baseline stats line refreshed — 5028 files via
+the scoped-@types mangling rule, diagnostics unchanged): A landed
+class-expression typing (reserved-key self-symbol in bindClass; four latent
+base-class bugs fixed at source; assigned-name printing) and enum reverse
+mapping (identity-hidden numeric index a la tsc). B landed TS2694-on-import-
+equals, TS2708, TS2709-bare, TS18013 private-name access (+9), TS2488
+any-iterator rules (+5), TS2503-not-TS2304. C re-landed BOTH blocked items with
+witnesses surviving — templatesDefinitelyUnrelated (real blocker: probe (2) of
+bestMatchingUnionMember missed interface-derived array-likes) and
+`prop?: undefined` widening (real blocker: lenientOverlap compared optional
+property types without folding `| undefined`) — plus full
+stringMappingOverPatternLiterals (29/29) via deferred string mappings +
+isMemberOfStringMapping, and union-signature rest-param combining. D landed
+`export as namespace` UMD globals (merge-chain + synthetic namespace),
+ambient-module-body specifier resolution, scoped @types mangling
+(mangleScopedPackageName), TS2306.
+
+## Ranked next queue (wave 15) — distilled from wave-14 agent reports
+
+1. One-code-away clusters scanned by B: TS2403 (14 files, stmts.zig),
+   TS2449 (9), TS2440 (8), TS2488 leftovers (iteratorSpreadInArray8/10,
+   iterableArrayPattern23/24, for-of58 intersection).
+2. Generator yield contexts — mechanism now fully understood (wave-14 C):
+   needs a NEW fn_ctx field (contextual yield type that is NOT a check
+   target — reusing yield_type caused generatorTypeCheck63's false TS2322),
+   set in stmts.zig, read in expr.zig's .yield_expr arm; checkFunctionBody
+   re-checks yield operands after inference with yield_type=0 and
+   checkExprCached is (node, ctx)-keyed, so the inference-time thread alone
+   fixes nothing. generatorTypeCheck27-30 additionally need tsc's
+   getImmediatelyInvokedFunctionExpression contextual-return rule.
+3. UMD residue: TS2686 at the value-position identifier site (expr.zig);
+   umdNamespaceMergedWithGlobalAugmentationIsNotCircular's excess TS2448
+   (use-before-declaration position compared across files);
+   exportAsNamespace_augment (UMD namespace must MERGE with declare-global
+   namespace, member tables included); exportAsNamespaceConflict TS2303
+   (alias_cycle graph node for the UMD alias).
+4. binder.instantiated answers a different question than tsc's
+   getModuleInstanceState (const-enum-only and exported-import bodies).
+   modvalue.nonInstantiatedBlock now carries the exact rule;
+   typespace.memberNamesAValue and expr.zig's TS2631 arm still read the raw
+   flag. Unify.
+5. TS2694 residue: five remaining one-key cases, all in typespace.zig.
+6. unionTypeCallSignatures4: TS2555 vs tsc's TS2554 — combinedUnionSignature
+   lacks tsc getUnionSignatures' findMatchingSignatures bounded-arity pick.
+7. Enum constant folding: classifyEnumInit needs tsc's `evaluate` (folds
+   `1 << 1`) before TS1061/TS1066 can land without FPs.
+8. TS2536/TS2542 residue: needs a readonly bit on object index signatures in
+   types.zig (readonlyIndexWriteAt models only tuples/arrays); the ~21
+   mappedTypeRelationships unders are mostly type-node positions.
+9. Sibling `namespace X.A.B.C {}` blocks share one members scope where tsc
+   keeps locals apart (declFileWithInternalModuleNameConflictsInExtends2).
+10. tsxGenericAttributesType9: `declare module "react" { export = __React }`
+    does not link — pre-existing link gap, now FP-visible on class exprs.
+11. TS2564 bracketed-literal names (parser bit + initCandidate consumption,
+    ~3 keys — every candidate case also diverges elsewhere; only worth it
+    bundled with fixes for those cases' TS2454/TS2411/TS2300).
+12. isPastLastAssignment for the PLAIN auto type (6 keys / 2 cases;
+    redesign-sized — marker treatment + tsc's branch-label join shortcut).
+13. Determinism defect with a concrete witness: social-app `--checkers=1` and
+    `--file-order=reverse` diverge; `Navigation.tsx:778:29` prints
+    `NativeStackNavigationProp<{…}>` in one partition and the expanded shape
+    in the other. Pattern-matches the open instantiation-budget partition bug.
+14. Regex BODY validator (dedicated-wave-sized; wrong error is syntactic =
+    program-wide suppression).
+
+## Superseded queue (wave 14, kept for context)
 
 1. Class-expression typing — blocked one binder line: `bindClass`
    (binder.zig:2887) declares no self-symbol when `name_token == 0`; add the
