@@ -524,6 +524,13 @@ pub fn applyStringMapping(c: *Checker, kind_idx: u32, arg0: TypeId) Error!TypeId
             for (try c.memberList(arg)) |m| try parts.append(c.scratch(), try c.applyStringMapping(kind_idx, m));
             return s.makeUnion(c.scratch(), parts.items);
         },
+        // A PATTERN template distributes into its spans — tsc's
+        // `applyTemplateStringMapping`. `Uppercase<`aA${string}`>` is
+        // `` `AA${Uppercase<string>}` ``, not an opaque wrapper: without this
+        // every relation against such a type answered "unknown shape", so
+        // `"AA"` was rejected by `Uppercase<`aA${string}`>` and
+        // `` `AA${string}` `` was accepted by `Lowercase<`aA${string}`>`.
+        .template_literal_type => return distributeIntoTemplate(c, kind_idx, arg),
         else => {},
     }
     if (try c.stringLiteralOf(arg)) |atom_| {
@@ -536,6 +543,80 @@ pub fn applyStringMapping(c: *Checker, kind_idx: u32, arg0: TypeId) Error!TypeId
     // Still generic (type param / mapped_param / infer / nested template
     // pattern / another mapping) → defer.
     return s.makeStringMapping(kind_idx, arg);
+}
+
+/// `transformString` over an interned atom, re-interning the result.
+fn transformAtom(c: *Checker, kind_idx: u32, a: Atom) Error!Atom {
+    const src = c.atomText(a);
+    if (src.len == 0) return a;
+    const buf = try c.scratch().alloc(u8, src.len);
+    defer c.scratch().free(buf);
+    transformString(kind_idx, src, buf);
+    return c.internText(buf);
+}
+
+/// tsc's `applyTemplateStringMapping`: a string-transform intrinsic applied to
+/// a PATTERN template literal rewrites the template rather than wrapping it.
+///
+/// ```ts
+/// case Uppercase: case Lowercase:
+///     return [texts.map(t => applyStringMapping(symbol, t)),
+///             types.map(t => getStringMappingType(symbol, t))];
+/// case Capitalize: case Uncapitalize:
+///     return texts[0].length ? [[applyStringMapping(symbol, texts[0]), ...texts.slice(1)], types]
+///                            : [texts, [getStringMappingType(symbol, types[0]), ...types.slice(1)]];
+/// ```
+///
+/// Capitalize/Uncapitalize touch only the FIRST character of the whole string,
+/// so they transform the head when it has one and otherwise push into the
+/// leading span — which is what makes `Capitalize<`a${string}`>` and
+/// `Capitalize<`A${string}`>` both `` `A${string}` ``, the equivalence the
+/// conformance case asserts.
+///
+/// A numeric span is left alone: digits are case-invariant, so mapping one
+/// would manufacture a `Uppercase<number>` that relates to nothing. tsc keeps
+/// `Uppercase<`${number}`>` there, which denotes the same set of strings and
+/// reduces to `` `${number}` `` under this same rule.
+fn distributeIntoTemplate(c: *Checker, kind_idx: u32, tpl: TypeId) Error!TypeId {
+    const s = &c.ts;
+    const n = s.templateHoleCount(tpl);
+    const holes = try c.scratch().alloc(TypeId, n);
+    defer c.scratch().free(holes);
+    const chunks = try c.scratch().alloc(Atom, n);
+    defer c.scratch().free(chunks);
+    for (0..n) |i| {
+        holes[i] = s.templateHole(tpl, @intCast(i));
+        chunks[i] = s.templateChunk(tpl, @intCast(i));
+    }
+    var head = s.templateHead(tpl);
+    switch (kind_idx) {
+        types.string_mapping_uppercase, types.string_mapping_lowercase => {
+            head = try transformAtom(c, kind_idx, head);
+            for (0..n) |i| {
+                holes[i] = try mapSpan(c, kind_idx, holes[i]);
+                chunks[i] = try transformAtom(c, kind_idx, chunks[i]);
+            }
+        },
+        else => {
+            if (c.atomText(head).len != 0) {
+                head = try transformAtom(c, kind_idx, head);
+            } else if (n != 0) {
+                holes[0] = try mapSpan(c, kind_idx, holes[0]);
+            }
+        },
+    }
+    return c.reduceTemplateChunks(head, holes, chunks);
+}
+
+/// A template SPAN under a string-transform intrinsic. Case-invariant spans
+/// (numeric and boolean-literal placeholders carry no letters a transform
+/// could move — `false`/`true` are handled as string literals by the ordinary
+/// path) come back unchanged.
+fn mapSpan(c: *Checker, kind_idx: u32, hole: TypeId) Error!TypeId {
+    return switch (c.ts.kind(try c.resolveStructural(hole))) {
+        .number, .number_literal, .number_literal_fresh, .bigint, .bigint_literal => hole,
+        else => c.applyStringMapping(kind_idx, hole),
+    };
 }
 
 pub fn transformString(kind_idx: u32, src: []const u8, dst: []u8) void {
