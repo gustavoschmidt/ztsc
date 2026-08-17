@@ -1960,14 +1960,15 @@ const Linker = struct {
     fn put(l: *Linker, t: *std.AutoArrayHashMapUnmanaged(Atom, Target), name: Atom, tgt: Target) Error!void {
         // Later explicit exports of the same name overwrite (duplicate
         // export names are a bind-phase diagnostic concern, not ours) —
-        // unless the two carry disjoint meanings, which tsc merges.
-        if (t.get(name)) |old| {
-            if (try l.dualMerge(old, tgt)) |merged| {
-                try t.put(l.scratch, name, merged);
-                return;
-            }
-        }
-        try t.put(l.scratch, name, tgt);
+        // unless the two carry disjoint meanings, which tsc merges. One
+        // `getOrPut` rather than a probe plus a store: `put` runs once per
+        // export of every file in the program, and the collision it looks for
+        // is rare.
+        const gop = try t.getOrPut(l.scratch, name);
+        gop.value_ptr.* = if (gop.found_existing)
+            (try l.dualMerge(gop.value_ptr.*, tgt)) orelse tgt
+        else
+            tgt;
     }
 
     /// Final target of export-table lookup `name` in `file`.
