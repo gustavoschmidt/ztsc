@@ -829,6 +829,43 @@ pub fn inferTypeArgs(
             const con = try c.typeParamConstraint(c.ts.typeParamSymbol(try c.resolveStructural(pt)));
             if (con != types.no_type) arg_ctx = con;
         }
+        // The same substitution for an ARRAY-literal argument, but only when
+        // the parameter's constraint DEPENDS on a type parameter inferred to
+        // the left. tsc reaches it through `getInferredType`: reading a
+        // still-candidate-free inference variable answers `unknown`, which the
+        // variable's constraint — `instantiateType(constraint,
+        // context.nonFixingMapper)`, so the earlier parameters are already
+        // substituted — then clamps, and that clamped type is what
+        // `instantiateContextualType` hands the argument.
+        //
+        // `pick<R, K extends readonly (keyof R)[]>(source: R, keys: K)` is the
+        // shape (excalidraw's `colors.ts`). Contextually typing `["cyan",
+        // "blue"]` by the bare `K` leaves `isLiteralOfContextualType` reading
+        // an UNINSTANTIATED `readonly (keyof R)[]`, whose `keyof R` is still
+        // deferred over a free variable and so admits no literal: both keys
+        // widened to `string`, `string[]` failed the constraint, and `K` fell
+        // back to the whole `readonly (keyof R)[]` — making `Pick<R,
+        // K[number]>` the entire palette instead of the two keys asked for.
+        // Substituting `R` first turns the constraint into `readonly ("blue" |
+        // "cyan" | …)[]`, which keeps both literals.
+        //
+        // Gated on the substitution CHANGING the constraint so a self-contained
+        // one (`T extends readonly unknown[] | []`, the tuple-inferring shape
+        // the array-literal context exists for) still sees the bare parameter.
+        if (tag == .array_literal) {
+            const rp = try c.resolveStructural(pt);
+            if (c.ts.kind(rp) == .type_param) {
+                if (tpIndex(tp_syms, c.ts.typeParamSymbol(rp))) |pi| {
+                    if (candidates[pi] == types.no_type) {
+                        const con = try c.typeParamConstraint(c.ts.typeParamSymbol(rp));
+                        if (con != types.no_type) {
+                            const inst = try c.instantiateKnownParams(con, tp_syms, candidates, ret_seed);
+                            if (inst != con) arg_ctx = inst;
+                        }
+                    }
+                }
+            }
+        }
         // tsc's `instantiateContextualType`: substitute what this call
         // already knows — the Phase-0 return-context inferences plus the
         // arguments inferred to the left — into the contextual type. A param
