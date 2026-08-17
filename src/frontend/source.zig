@@ -206,7 +206,8 @@ pub const Source = struct {
     }
 
     /// Map a byte offset to zero-based line/column via binary search.
-    /// tsc's `getLineAndCharacterOfPosition`. A file ending in a line break has
+    /// tsc's `getLineAndCharacterOfPosition`. The COLUMN is in UTF-16 code
+    /// units, not bytes — see `utf16Units`. A file ending in a line break has
     /// one more LINE START than it has lines of text: tsc's `computeLineStarts`
     /// records the offset after every break unconditionally, so the end-of-file
     /// offset lands on a final empty line. `line_starts` deliberately omits that
@@ -222,7 +223,8 @@ pub const Source = struct {
             return .{ .line = @intCast(s.line_starts.len), .col = offset - @as(u32, @intCast(s.bytes.len)) };
         }
         const line = lineOfOffset(s.line_starts, offset);
-        return .{ .line = line, .col = offset - s.line_starts[line] };
+        const line_start = s.line_starts[line];
+        return .{ .line = line, .col = utf16Units(s.bytes[line_start..@min(offset, s.bytes.len)]) };
     }
 
     /// Bytes used by the line-offset table.
@@ -230,6 +232,46 @@ pub const Source = struct {
         return s.line_starts.len * @sizeOf(u32);
     }
 };
+
+/// Length of a UTF-8 slice measured in UTF-16 CODE UNITS — the unit a
+/// TypeScript column is counted in, because a `SourceFile`'s text is UTF-16 in
+/// the reference implementation and every position it reports is an index into
+/// that. ztsc stores UTF-8, so a column has to be converted or an astral-plane
+/// character (`𝕏`, an emoji) puts every later diagnostic on the line two
+/// columns off, and a BMP one (`é`, `日`) one or two.
+///
+/// The count is structural, not a decode: every byte is either a continuation
+/// (`0b10xxxxxx`, contributing nothing) or a lead. A lead contributes one unit,
+/// or TWO when it opens a 4-byte sequence — exactly the surrogate pair UTF-16
+/// needs for a code point above U+FFFF. Invalid UTF-8 is counted as if each
+/// stray byte were its own character, which is what keeps a column monotone in
+/// the offset for a file the scanner already refused.
+///
+/// The ASCII fast path is the point of the word-at-a-time loop: this runs per
+/// DIAGNOSTIC, not per token, but the slice it scans is a whole line's prefix,
+/// and a column near the end of a long minified line would otherwise be a
+/// byte-at-a-time walk over it.
+pub fn utf16Units(bytes: []const u8) u32 {
+    const W = usize;
+    const high: W = @bitCast([_]u8{0x80} ** @sizeOf(W));
+    var units: u32 = 0;
+    var i: usize = 0;
+    while (i < bytes.len) {
+        // A whole word of pure ASCII costs one test.
+        if (i + @sizeOf(W) <= bytes.len) {
+            const w: W = std.mem.readInt(W, bytes[i..][0..@sizeOf(W)], .little);
+            if (w & high == 0) {
+                units += @sizeOf(W);
+                i += @sizeOf(W);
+                continue;
+            }
+        }
+        const b = bytes[i];
+        if (b & 0xC0 != 0x80) units += if (b >= 0xF0) @as(u32, 2) else 1;
+        i += 1;
+    }
+    return units;
+}
 
 /// Greatest index i such that line_starts[i] <= offset. Public because
 /// diagnostic rendering walks a line table it holds directly, without a
@@ -284,6 +326,22 @@ test "line table: empty file" {
     var src = try Source.fromBytes(arena.allocator(), "empty.ts", "");
     try std.testing.expectEqual(@as(u32, 1), src.lineCount());
     try std.testing.expectEqual(LineCol{ .line = 0, .col = 0 }, src.lineCol(0));
+}
+
+test "utf16Units: a column counts UTF-16 code units, not bytes" {
+    const eq = std.testing.expectEqual;
+    try eq(@as(u32, 0), utf16Units(""));
+    try eq(@as(u32, 21), utf16Units("let averylongascii = 1"[0..21]));
+    // BMP: 2-byte `é` and 3-byte `日` are one unit each.
+    try eq(@as(u32, 2), utf16Units("aé"));
+    try eq(@as(u32, 3), utf16Units("日本語"));
+    // Astral: `𝕏` is 4 UTF-8 bytes and a SURROGATE PAIR — two units.
+    try eq(@as(u32, 2), utf16Units("𝕏"));
+    try eq(@as(u32, 7), utf16Units("𝕏𝕏𝕏a"));
+    // Past the word-at-a-time fast path, and resuming into it after a
+    // non-ASCII run.
+    try eq(@as(u32, 17), utf16Units("0123456789abcdefé0123456789abcdef"[0 .. 16 + 2]));
+    try eq(@as(u32, 33), utf16Units("0123456789abcdefé0123456789abcdef"));
 }
 
 test "line table: offsets and columns" {

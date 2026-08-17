@@ -51,6 +51,7 @@ const ast = @import("../frontend/ast.zig");
 const scanner = @import("../frontend/scanner.zig");
 const parser = @import("../frontend/parser.zig");
 const binder = @import("../frontend/binder.zig");
+const decl_spaces = @import("../frontend/decl_spaces.zig");
 const diagnostics = @import("../frontend/diagnostics.zig");
 const intern = @import("../intern.zig");
 const source = @import("../frontend/source.zig");
@@ -1450,29 +1451,73 @@ const Linker = struct {
         return atoms.items[idx];
     }
 
-    /// Emit TS2305, or TS2724 when the module has a close export name, or
-    /// TS2459 when the module DECLARES the name at its top level and simply
-    /// did not export it (tsc's `reportNonExportedMember`, which outranks the
-    /// spelling suggestion — the name is spelled right, it is just private).
+    /// The name `mfile` exports `local_sym` UNDER, when that is not the
+    /// declaration's own name — tsc's `find(symbolsToArray(exports), s =>
+    /// getSymbolIfSameReference(s, localSymbol))`, which turns "declares it
+    /// locally" into "declares it locally, but exports it as …". Table order
+    /// is insertion order, so the first `export { bar as baz }` wins, as it
+    /// does there. The reserved `export=`/`default` keys are skipped: neither
+    /// is a name the author could have written in the import's braces.
+    fn exportNameOfLocal(l: *Linker, mfile: FileId, local_sym: u32) ?Atom {
+        const t = l.table(mfile) catch return null;
+        var it = t.iterator();
+        while (it.next()) |e| {
+            const a = e.key_ptr.*;
+            if (a == l.atom_default or a == l.atom_export_equals) continue;
+            const tgt = e.value_ptr.*;
+            if (tgt.kind == .binding and tgt.file == mfile and tgt.payload == local_sym) return a;
+        }
+        return null;
+    }
+
+    /// The "no such named export" family, in tsc's own order
+    /// (`getExternalModuleMember`'s error tail):
+    ///
+    ///   1. TS2724 when a close export NAME exists — a misspelling outranks
+    ///      everything, because the name the author meant is right there;
+    ///   2. TS2614 when the module has a DEFAULT export — "did you mean
+    ///      `import X from "m"`?", the mistake an ES-module author makes
+    ///      against a `export default` module, and tsc offers it whether or
+    ///      not the name also happens to be declared locally;
+    ///   3. TS2460/TS2459 when the module DECLARES the name at its top level
+    ///      (tsc's `reportNonExportedMember`) — TS2460 when some export of the
+    ///      module names that very declaration under a DIFFERENT name
+    ///      (`declare function bar(); export { bar as baz }`), TS2459 when it
+    ///      is not exported at all;
+    ///   4. TS2305 otherwise.
     fn diagNoExportedMember(l: *Linker, file: FileId, mfile_opt: ?FileId, module: Atom, name: Atom, span: Span) Error!void {
         if (mfile_opt) |mfile| {
-            const mb = l.files[mfile].bind;
-            if (mb.is_module) {
-                if (mb.lookupInScope(binder.file_scope, name)) |local_sym| {
-                    if (!mb.symbol_flags[local_sym].import_binding) {
-                        try l.diag(file, 2459, span, "Module '\"{s}\"' declares '{s}' locally, but it is not exported.", .{
-                            l.atomText(module), l.atomText(name),
-                        });
-                        return;
-                    }
-                }
-            }
             const sugg = try l.moduleExportSuggestion(mfile, name);
             if (sugg != 0) {
                 try l.diag(file, 2724, span, "'\"{s}\"' has no exported member named '{s}'. Did you mean '{s}'?", .{
                     l.atomText(module), l.atomText(name), l.atomText(sugg),
                 });
                 return;
+            }
+            if (l.table(mfile) catch null) |et| {
+                if (et.contains(l.atom_default)) {
+                    try l.diag(file, 2614, span, "Module '\"{s}\"' has no exported member '{s}'. Did you mean to use 'import {s} from \"{s}\"' instead?", .{
+                        l.atomText(module), l.atomText(name), l.atomText(name), l.atomText(module),
+                    });
+                    return;
+                }
+            }
+            const mb = l.files[mfile].bind;
+            if (mb.is_module) {
+                if (mb.lookupInScope(binder.file_scope, name)) |local_sym| {
+                    if (!mb.symbol_flags[local_sym].import_binding) {
+                        if (l.exportNameOfLocal(mfile, local_sym)) |as_name| {
+                            try l.diag(file, 2460, span, "Module '\"{s}\"' declares '{s}' locally, but it is exported as '{s}'.", .{
+                                l.atomText(module), l.atomText(name), l.atomText(as_name),
+                            });
+                            return;
+                        }
+                        try l.diag(file, 2459, span, "Module '\"{s}\"' declares '{s}' locally, but it is not exported.", .{
+                            l.atomText(module), l.atomText(name),
+                        });
+                        return;
+                    }
+                }
             }
         }
         try l.diag(file, 2305, span, "Module '\"{s}\"' has no exported member '{s}'.", .{
@@ -1899,10 +1944,75 @@ const Linker = struct {
         };
     }
 
+    /// The declaration SPACES an export Target answers in, or null when the
+    /// link phase cannot say (an alias, whose spaces are its target's, and
+    /// every non-declaration kind). A module namespace object is tsc's
+    /// `ValueModule | NamespaceModule`: value and namespace, never type.
+    fn targetSpaces(l: *Linker, tgt: Target) ?decl_spaces.Spaces {
+        switch (tgt.kind) {
+            .binding => {
+                const f = &l.files[tgt.file];
+                const decls = f.bind.declsOf(tgt.payload);
+                if (decls.len == 0) return null;
+                var s: decl_spaces.Spaces = .{};
+                for (decls) |d| s = s.merge(decl_spaces.ofTag(f.tree.nodeTag(d)) orelse return null);
+                return s;
+            },
+            .namespace, .ambient_ns => return .{ .value = true, .namespace = true },
+            else => return null,
+        }
+    }
+
+    /// Two exports of the same NAME whose declaration spaces are disjoint are
+    /// ONE symbol in tsc, carrying both — the export table's half of
+    /// declaration merging:
+    ///
+    ///     export type Drink = 0 | 1;             // type space
+    ///     export * as Drink from "./constants";  // value/namespace space
+    ///
+    /// so a consumer's `const x: Drink = Drink.TEA` reads the alias in type
+    /// position and the module namespace object in value position. A plain
+    /// overwrite kept only the later declaration, and the *type* meaning it
+    /// dropped is exactly what a namespace-in-type-position diagnostic would
+    /// then misfire on (see `materializeTypeRef`'s TS2709 arm) — a collapse and
+    /// a genuine namespace-only export were indistinguishable.
+    ///
+    /// Null when the two share a space (the later declaration wins outright,
+    /// as before) or when either side is a kind `targetSpaces` declines.
+    fn dualMerge(l: *Linker, old: Target, new: Target) Error!?Target {
+        const os = targetSpaces(l, old) orelse return null;
+        const ns = targetSpaces(l, new) orelse return null;
+        if (decl_spaces.conflict(os, ns).any()) return null;
+        const val: Target, const typ: Target = if (os.value and ns.type_)
+            .{ old, new }
+        else if (ns.value and os.type_)
+            .{ new, old }
+        else
+            return null;
+        try l.duals.append(l.scratch, .{ .value_tgt = val, .type_tgt = typ });
+        return .{
+            .kind = .dual,
+            .payload = @intCast(l.duals.items.len - 1),
+            .name = val.name,
+            // Both halves are real declarations here (unlike the `export =`
+            // dual, whose value half is a property probe), so the entry is
+            // type-only only when neither meaning survives a value use.
+            .type_only = val.type_only and typ.type_only,
+        };
+    }
+
     fn put(l: *Linker, t: *std.AutoArrayHashMapUnmanaged(Atom, Target), name: Atom, tgt: Target) Error!void {
         // Later explicit exports of the same name overwrite (duplicate
-        // export names are a bind-phase diagnostic concern, not ours).
-        try t.put(l.scratch, name, tgt);
+        // export names are a bind-phase diagnostic concern, not ours) —
+        // unless the two carry disjoint meanings, which tsc merges. One
+        // `getOrPut` rather than a probe plus a store: `put` runs once per
+        // export of every file in the program, and the collision it looks for
+        // is rare.
+        const gop = try t.getOrPut(l.scratch, name);
+        gop.value_ptr.* = if (gop.found_existing)
+            (try l.dualMerge(gop.value_ptr.*, tgt)) orelse tgt
+        else
+            tgt;
     }
 
     /// Final target of export-table lookup `name` in `file`.
