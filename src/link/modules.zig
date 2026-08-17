@@ -2655,18 +2655,55 @@ const Linker = struct {
     /// file-wide scan.
     fn reportExportAssignMixing(l: *Linker, file: FileId, node: ast.Node, scope: u32) Error!void {
         const b = l.files[file].bind;
+        // tsc runs this from `checkExternalModuleExports`, which it calls for an
+        // external module's SourceFile and for an ambient module declaration —
+        // never for a plain block. `moduleElementsInWrongContext` writes the
+        // whole module-element zoo, `export = M` included, inside `{ … }`: the
+        // file is not an external module, so tsc's walk never reaches it and
+        // ztsc's file-wide scan invented a TS2309 on top of the TS1231 family
+        // that shape really earns.
+        const ambient_scope = for (b.ambient_modules) |am| {
+            if (am.scope == scope) break true;
+        } else false;
+        if (!ambient_scope and !(scope == binder.file_scope and b.is_module)) return;
+        var has_company = false;
         for (b.exports) |other| {
             if (other.scope != scope) continue;
-            const is_value = switch (other.kind) {
-                .default => true,
-                .named => other.module == 0 and other.sym != binder.no_symbol and
-                    b.symbol_flags[other.sym].hasValue(),
-                else => false,
-            };
-            if (!is_value) continue;
-            try l.diag(file, 2309, l.nodeSpan(file, node), "An export assignment cannot be used in a module with other exported elements.", .{});
-            return;
+            switch (other.kind) {
+                .default => has_company = true,
+                .named => has_company = has_company or (other.module == 0 and
+                    other.sym != binder.no_symbol and b.symbol_flags[other.sym].hasValue()),
+                else => {},
+            }
         }
+        // A declaration carrying the `export` MODIFIER files no export record at
+        // all — the binder marks the symbol instead — so an ambient block's
+        // members have to be read directly: `export namespace a { … }` beside
+        // `export = c` is `incompatibleExports1`. Only for a block, whose member
+        // list is exactly its exports; a file scope holds every local as well.
+        if (!has_company and ambient_scope) {
+            const lo = b.scope_members_start[scope];
+            const hi = b.scope_members_start[scope + 1];
+            for (lo..hi) |i| {
+                const f = b.symbol_flags[b.member_syms[i]];
+                if (!f.exported) continue;
+                // An `export import a = x.c` counts only when the alias TARGET
+                // has a value meaning: tsc resolves it and judges that, and
+                // `importDeclWithExportModifierAndExportAssignmentInAmbientContext`
+                // — an alias to an interface, beside `export = x` — is silent
+                // while the same shape over a value namespace is TS2309
+                // (measured both ways). The link phase resolves no alias here,
+                // so one is skipped outright: an under-report on the value half
+                // and no false report on the type half. `effectiveBits` covers
+                // the other type-only shape, a non-instantiated namespace.
+                if (bind_result.effectiveBits(f) & bind_result.mask_value &
+                    ~bind_result.fbits(.{ .import_binding = true }) == 0) continue;
+                has_company = true;
+                break;
+            }
+        }
+        if (!has_company) return;
+        try l.diag(file, 2309, l.nodeSpan(file, node), "An export assignment cannot be used in a module with other exported elements.", .{});
     }
 
     /// The `export = X` entity of a known module (on-disk file first, then an
