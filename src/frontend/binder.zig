@@ -4223,7 +4223,11 @@ const Binder = struct {
                 // `x.length` — the read-only half of tsc's
                 // `isEvolvingArrayOperationTarget` (`x.push`/`x.unshift` are
                 // recorded by the CALL arm, since tsc requires the call).
-                if (b.nodeTag(node) == .member_expr and b.isNamedMember(node, "length")) {
+                // `x?.length` counts too: tsc's test is `isPropertyAccess-
+                // Expression(parent)`, and a `?.` access is one
+                // (`narrowSwitchOptionalChainContainmentEvolvingArrayNoCrash1.ts`
+                // switches on exactly `foo?.length`).
+                if (b.isNamedMember(node, "length")) {
                     const recv = narrowableOperandIdent(b.tree, d.lhs);
                     if (recv != null_node) try b.noteArrayOpTarget(recv, null_node);
                 }

@@ -198,15 +198,18 @@ fn isEmptyArrayLiteral(c: *Checker, node: Node) bool {
 
 /// tsc's `finalizeEvolvingArrayType` + `createFinalArrayType`: the real array
 /// type an evolving one stands for. A `never` element means nothing was ever
-/// put in, and tsc answers its `autoArrayType` — an `any[]`; otherwise the
-/// accumulated union is subtype-reduced, exactly as an array literal's
-/// element type is.
+/// put in, and tsc answers its `autoArrayType` — an `any[]`.
+///
+/// tsc closes with a `UnionReduction.Subtype` over the accumulated element
+/// union; ztsc's `reduceSubtypes` is the stronger relation for regularized
+/// object types and collapses element types the oracle keeps apart
+/// (`x.push({a:1}); x.push({a:1,b:2})` is a two-member union in tsgo), so the
+/// union stands as gathered.
 fn finalizeEvolvingArray(c: *Checker, t: TypeId) Error!TypeId {
     if (c.ts.kind(t) != .evolving_array) return t;
     const elem = c.ts.arrayElem(t);
     if (elem == types.never_type) return c.ts.makeArray(types.any_type);
-    if (c.ts.kind(elem) != .union_type) return c.ts.makeArray(elem);
-    return c.ts.makeArray(try c.reduceSubtypes(elem));
+    return c.ts.makeArray(elem);
 }
 
 /// tsc's `isEvolvingArrayOperationTarget`: is this read the `x` of `x.length`,
@@ -766,14 +769,18 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
             // Use the declared type instead: there is no valid narrowing at an
             // unreachable definition point.
             if (ante == binder.unreachable_flow) return declared;
-            // An EVOLVING array never continues into an enclosing function:
-            // tsc's closure-crossing loop is guarded by `isConstantVariable(…)
-            // && type !== autoArrayType`, so the auto array is exactly the
-            // type it refuses to carry across. The declared type it answers
-            // with here is that same auto array, which is what makes
-            // `let x = []; x.push(5); function g() { x }` report TS7005 on the
-            // capture (`controlFlowArrayErrors.ts` f3/f8).
-            if (c.ts.kind(declared) == .evolving_array) return declared;
+            // A CONST evolving array never continues into an enclosing
+            // function: tsc's closure-crossing loop admits a constant only
+            // when `type !== autoArrayType`, so the auto array is exactly the
+            // type it refuses to carry across a closure on the const arm.
+            // That is what makes `const x = []; x.push(5); function g() { x }`
+            // report TS7005 on the capture (`controlFlowArrayErrors.ts` f8).
+            // A `let`/`var` one keeps the mutable-local arm below — never
+            // reassigned, it is past its last assignment, and tsgo does carry
+            // its evolved `number[]` into an arrow.
+            if (c.ts.kind(declared) == .evolving_array and c.symFlags(key.sym).const_decl) {
+                return declared;
+            }
             // Property paths and `this` never continue into an enclosing
             // function's flow — tsc's Start arm excludes exactly
             // PropertyAccess, ElementAccess and `this`.
@@ -2500,7 +2507,13 @@ fn evolveArray(c: *Checker, evolving: TypeId, node: Node) Error!TypeId {
 /// `getRegularTypeOfObjectLiteral(getBaseTypeOfLiteralType(getContextFreeTypeOfExpression(node)))`,
 /// unioned into what the array holds so far.
 fn addElementType(c: *Checker, elem: TypeId, node: Node) Error!TypeId {
-    const vt = c.nodeType(node) orelse try c.checkExprCached(node, types.no_type);
+    // tsc's `checkSpreadExpression`: `x.push(...ys)` puts the ELEMENTS of `ys`
+    // in the array, not `ys` itself. (excalidraw's `selectionColors.push(
+    // ...remoteClients.map(…))` evolved to `(string | string[])[]` without
+    // this, and the object built out of it stopped being assignable.)
+    const value: Node = if (c.nodeTag(node) == .spread_element) c.tree.nodeData(node).lhs else node;
+    var vt = c.nodeType(value) orelse try c.checkExprCached(value, types.no_type);
+    if (value != node) vt = (try c.iterationElementType(vt)) orelse types.any_type;
     const widened = try c.ts.regularLiteral(try c.widenLiteral(vt));
     if (widened == types.no_type) return elem;
     return c.ts.makeUnion(c.scratch(), &.{ elem, widened });
