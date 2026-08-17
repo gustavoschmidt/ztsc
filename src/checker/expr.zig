@@ -1258,6 +1258,21 @@ fn arrayLiteralElemType(c: *Checker, raw: []const TypeId, widened: []const TypeI
     return c.ts.makeUnion(c.scratch(), kept.items);
 }
 
+// An array literal's elements share ONE widening context in tsc, so each
+// object-literal element should gain `name?: undefined` for every name its
+// object-literal SIBLINGS declare (`getWidenedTypeWithContext` →
+// `getPropertiesOfContext` + `getUndefinedProperty`): `[{ a: 1 }, { b: 2 }]`
+// is `({ a: number; b?: undefined } | { a?: undefined; b: number })[]`. ztsc
+// does this for the arms of a `?:` (`normalizeFreshObjectSiblings`) but not
+// for array elements, because implementing it here — reading the sibling
+// names off the RAW element types, which still carry the object-literal
+// origin, and applying them to the positionally aligned widened entry —
+// produced two false TS2352 in excalidraw's `data/transform.test.ts`
+// (`elements as ExcalidrawElementSkeleton[]`, tsgo silent). The extra
+// optional-`undefined` members are correct; what fails is comparability
+// against the big skeleton union downstream, which lives in `assign.zig`.
+// Re-land with that fixed. (wave 13 B, measured.)
+
 /// The element type an array literal's elements should be contextually
 /// typed against, given a (structurally resolved) contextual type. A direct
 /// array yields its element type; a union contributes the element type of
@@ -2101,6 +2116,18 @@ fn checkSpreadPropOverrides(c: *Checker, node: Node) Error!void {
             .spread_element => {
                 if (seen.items.len == 0) continue;
                 const raw = c.nodeType(pd.lhs) orelse continue;
+                // A bare TYPE PARAMETER source is not evidence of an
+                // overwrite here, even though tsc — reading its apparent
+                // type — does report through one. ztsc's object-rest type
+                // for a generic receiver is the receiver ITSELF:
+                // `objectRestType` bails on a shape it cannot enumerate
+                // instead of building tsc's `Omit<T, "a">`. So inside
+                // `<T extends { a: string, b: string }>`, the `rest` of
+                // `let { a, ...rest } = obj` still claims to have `a`, and
+                // `{ a: 'hello', ...rest }` collected a false TS2783.
+                // Re-report through type parameters once the rest type
+                // learns to omit.
+                if (c.ts.kind(raw) == .type_param) continue;
                 const st = try c.resolveStructural(raw);
                 switch (c.ts.kind(st)) {
                     .any, .err, .unknown, .never => continue,
