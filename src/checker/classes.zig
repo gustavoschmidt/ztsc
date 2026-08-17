@@ -387,12 +387,6 @@ pub fn unionCallableSigs(c: *Checker, a: TypeId, b: TypeId) Error!?TypeId {
     return try s.makeOverloads(sigs.items);
 }
 
-/// Merge base-object members into `derived` (derived wins). When
-/// `union_overloads` is set (the cross-file interface-declaration Phase-1
-/// merge), a method declared in BOTH objects contributes its signatures to
-/// a single combined overload set (`derived`'s first) rather than the
-/// earlier declaration hiding the later's overloads — mirroring tsc's
-/// declaration-order overload concatenation across merged interface
 /// The index signatures one half of a class body declares. 0 = none.
 ///
 /// A `symbol`-keyed signature shares the `str` slot — the whole type store
@@ -464,6 +458,12 @@ pub fn classIndexInfos(c: *Checker, sym: SymbolId, statics: bool) Error!ClassInd
     return out;
 }
 
+/// Merge base-object members into `derived` (derived wins). When
+/// `union_overloads` is set (the cross-file interface-declaration Phase-1
+/// merge), a method declared in BOTH objects contributes its signatures to
+/// a single combined overload set (`derived`'s first) rather than the
+/// earlier declaration hiding the later's overloads — mirroring tsc's
+/// declaration-order overload concatenation across merged interface
 /// declarations, and the within-file reopened-block behavior already
 /// implemented in `objectTypeFromMembers`. Base/heritage merging keeps
 /// `union_overloads` false: an inherited member is shadowed, not unioned.
