@@ -28,6 +28,7 @@ const Error = checker_zig.Error;
 const RefKey = @import("flow.zig").RefKey;
 const baseTypeVariableOfClass = @import("classes.zig").baseTypeVariableOfClass;
 const checkExprCached = @import("expr.zig").checkExprCached;
+const contextualReturnType = @import("expr.zig").contextualReturnType;
 const containsTypeParam = @import("enums.zig").containsTypeParam;
 const destructure = @import("destructure.zig");
 const finalizeInferredReturn = @import("names.zig").finalizeInferredReturn;
@@ -35,6 +36,7 @@ const hasValueMeaning = @import("names.zig").hasValueMeaning;
 const implicit_any = @import("implicit_any.zig");
 const modvalue = @import("modvalue.zig");
 const narrowByCondition = @import("flow.zig").narrowByCondition;
+const contextualIteration = @import("stmts.zig").contextualIteration;
 const widenLiteral = @import("names.zig").widenLiteral;
 const widenReturnMember = @import("names.zig").widenReturnMember;
 const widenToContext = @import("names.zig").widenToContext;
@@ -210,10 +212,7 @@ pub fn signatureOfProtoCtx(
     // property position). Threaded into the body's return-type probe so
     // return expressions are contextually typed. An async body's returns are
     // typed by the *awaited* contextual type (`Promise<T>` context → `T`).
-    const ret_ctx: TypeId = if (ctx_sig != types.no_type and c.ts.kind(ctx_sig) == .function)
-        c.ts.fnReturn(ctx_sig)
-    else
-        types.no_type;
+    const ret_ctx: TypeId = contextualReturnType(c, node, ctx_sig);
     var ret: TypeId = types.any_type;
     var pred: ?types.Predicate = null;
     if (proto.return_type != 0 and c.nodeTag(proto.return_type) == .type_predicate) {
@@ -254,7 +253,7 @@ pub fn signatureOfProtoCtx(
             // Reserve the cache slot to break recursion, as the ordinary
             // inferred-return path does.
             try c.sig_cache.put(c.cm(), c.nodeKey(node), .{ .ty = try c.ts.makeFunction(params.items, types.any_type, tps.items, if (is_method) types.fn_flag_method else 0), .ctx = ctx_sig });
-            ret = try inferGeneratorReturn(c, node, c.tree.nodeData(node).rhs);
+            ret = try inferGeneratorReturn(c, node, c.tree.nodeData(node).rhs, ret_ctx);
         } else {
             // `async function*` and generator shapes with no body keep the
             // old `any`.
@@ -972,7 +971,14 @@ fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) Erro
 /// `any`, so this narrows the gap rather than trading it for a wrong
 /// answer. Same for `async function*` (`AsyncGenerator`'s own shape) and
 /// for a generator without a body.
-fn inferGeneratorReturn(c: *Checker, fn_node: Node, body: Node) Error!TypeId {
+///
+/// `ret_ctx` is the CONTEXTUAL return type (0 when there is none). Its
+/// generator arm supplies the yield and return contexts the operands are typed
+/// with — tsc's `getContextualIterationType` — so
+/// `const f: () => number | Generator<(arg: number) => void, any, void> =
+/// function*() { yield num => … }` types `num` here rather than leaving it
+/// implicitly `any`. Contextual only: nothing is related to either half.
+fn inferGeneratorReturn(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) Error!TypeId {
     const gen_sym = c.prog.globals.lookup(c.atom_Generator) orelse return types.any_type;
     if (!c.symFlags(gen_sym).interface) return types.any_type;
     if (c.nodeTag(body) != .block) return types.any_type;
@@ -982,6 +988,8 @@ fn inferGeneratorReturn(c: *Checker, fn_node: Node, body: Node) Error!TypeId {
     defer yields.deinit(c.scratch());
     if (yields.delegated) return types.any_type;
 
+    const iter_ctx = try contextualIteration(c, ret_ctx, false);
+    const yield_ctx: TypeId = if (iter_ctx) |it| it.yield else 0;
     var yield_ty: TypeId = types.never_type;
     {
         // Same body context `inferReturnType` establishes: a `yield`
@@ -994,6 +1002,8 @@ fn inferGeneratorReturn(c: *Checker, fn_node: Node, body: Node) Error!TypeId {
             .is_async = proto.flags & ast.Flags.async != 0,
             .is_generator = true,
             .yield_type = 0,
+            .yield_ctx = yield_ctx,
+            .gen_ret_ctx = ret_ctx,
         };
         const saved_scope = c.cur_scope;
         defer c.cur_scope = saved_scope;
@@ -1001,12 +1011,12 @@ fn inferGeneratorReturn(c: *Checker, fn_node: Node, body: Node) Error!TypeId {
         defer parts.deinit(c.scratch());
         for (yields.exprs.items, yields.scopes.items) |y, sc| {
             c.cur_scope = sc;
-            try parts.append(c.scratch(), try c.widenLiteral(try c.checkExprCached(y, types.no_type)));
+            try parts.append(c.scratch(), try c.widenLiteral(try c.checkExprCached(y, yield_ctx)));
         }
         if (yields.bare) try parts.append(c.scratch(), types.undefined_type);
         yield_ty = try c.ts.makeUnion(c.scratch(), parts.items);
     }
-    const ret_ty = try inferReturnType(c, fn_node, body, types.no_type);
+    const ret_ty = try inferReturnType(c, fn_node, body, if (iter_ctx) |it| it.ret else types.no_type);
     return c.ts.makeRef(gen_sym, &.{ yield_ty, ret_ty, types.unknown_type });
 }
 
