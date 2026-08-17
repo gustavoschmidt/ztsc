@@ -863,11 +863,12 @@ fn checkIdentifier(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
                     // (wave-10 A: one flagged guard.)
                     !c.in_computed_member_name)
                 {
-                    // A `const` reaches here only for the evolving-ARRAY half
-                    // of `checkEvolvingVarRead` — `const x = []` gets tsc's
-                    // auto array type just as a `let` does — and is never
-                    // "used before being assigned".
-                    if (!f.const_decl) try checkUseBeforeAssigned(c, sym, node, tok, declared);
+                    // A `const` is asked too: its initializer is what makes it
+                    // definitely assigned, and a read in its TEMPORAL DEAD ZONE
+                    // has not run that initializer yet — tsc reports TS2448 and
+                    // TS2454 together there (`exportBinding`'s `export default
+                    // x` ahead of `const x = 'x'`).
+                    try checkUseBeforeAssigned(c, sym, node, tok, declared);
                     try checkEvolvingVarRead(c, sym, node, tok, declared);
                 }
             }
@@ -1153,14 +1154,75 @@ fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: TokenInde
     if (valueDeclarator(c, decls)) |vd| {
         if (isAmbientDeclarator(c, vd)) return;
     }
+    // tsc's `isOuterVariable`, class-field half: `getControlFlowContainer`
+    // stops at a PropertyDeclaration, so a field initializer is its own flow
+    // region and anything declared outside it is OUTER — assumed initialized,
+    // static field included (`field_init_depth`).
+    //
+    // Only for a reference the field initializer itself owns. A function
+    // WRITTEN in that initializer is the innermost container of its own body,
+    // and takes the region back: `x = <U>(a: U) => { var y: T; return y }`
+    // still reports (`typeParametersAvailableInNestedScope`).
+    if (c.field_init_depth > 0 and
+        c.bind.scope_kinds[flowContainerOf(c, c.cur_scope)] != .function) return;
+    // tsc's `isOuterVariable`, namespace half. `getControlFlowContainer` stops
+    // at a MODULE BLOCK, and two blocks of one `namespace N` are two blocks
+    // with two flow graphs — while the binder folds their members into a
+    // single scope, so the `flowContainerOf` comparison below sees one
+    // container. A declaration in another block (or outside every block) is
+    // OUTER, and an outer variable is assumed initialized whatever this
+    // block's flow says: `namespace M { export var v = 10 } namespace M { v }`
+    // is clean (`mergedModuleDeclarationWithSharedExportedVar`,
+    // `moduleVariables`, `collisionCodeGenModuleWithModuleReopening`).
+    //
+    // "In another block" is asked of EVERY declaration, not just the first:
+    // ztsc folds the merged blocks into one scope, so two blocks that each
+    // write `var a` share one symbol where tsc has two (a non-exported member
+    // is a local of its own block). A block that declares the name again is
+    // that declaration's container, and the check applies normally
+    // (`mergeTwoInterfaces2`).
+    if (c.cur_ns_block != null_node and decls.len > 0) {
+        const blk = c.nodeSpan(c.cur_ns_block);
+        var in_block = false;
+        for (decls) |dn| {
+            const at = c.nodeSpanStart(dn);
+            if (at >= blk.start and at < blk.end) {
+                in_block = true;
+                break;
+            }
+        }
+        if (!in_block) return;
+    }
     // A use *before* the declaration (TDZ position) is also
     // definitely-unassigned even when the declarator has an
     // initializer (tsc reports 2448 + 2454 together).
     var before_decl = false;
     if (decls.len > 0) {
         if (c.tree.tokens.start(tok) < c.nodeSpanStart(decls[0])) before_decl = true;
+        // tsc's `isSameScopedBindingElement`: a DESTRUCTURED binding read from
+        // inside its own root declarator is assumed initialized. The default
+        // initializers of one pattern run left to right, and tsc models that
+        // as declaration order rather than as flow — `const { width = 512,
+        // height = width } = opts` and `const [p = 1, q = p] = arr` are both
+        // clean (oracle-verified). Only a pattern qualifies; `let z = z` on a
+        // plain identifier keeps its TS2454.
+        if (c.nodeTag(c.tree.nodeData(decls[0]).lhs) != .identifier) {
+            const span = c.nodeSpan(decls[0]);
+            const at = c.tree.tokens.start(tok);
+            if (at >= span.start and at < span.end) return;
+        }
     }
-    if ((has_init or has_definite) and !before_decl) return;
+    // An INITIALIZER is not an exemption: tsc's `assumeInitialized` never asks
+    // whether the declarator has one, only whether the flow reaching this
+    // reference passed it. `if (c) { var a = 1 } a;`, `try { var b = 1 } catch
+    // {} b;` and `while (c) { var d = 1 } d;` are all TS2454, and so is every
+    // read whose path bypasses the declaration statement
+    // (`controlFlowDestructuringVariablesInTryCatch`, `parserUnicode1`).
+    // `definitelyAssigned` below is what decides, and for the straight-line
+    // `const x = 1; … x` that is one memoized walk back to the declarator's own
+    // assign node. The `!` (definite assignment) modifier IS tsc's exemption
+    // (`declaration.exclamationToken`), and stays one.
+    if (has_definite and !before_decl) return;
     const dk = c.ts.kind(declared);
     if (dk == .any or dk == .err or dk == .unknown or dk == .void or dk == .none) return;
     if (c.containsUndefinedish(declared)) return;

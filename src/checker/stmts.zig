@@ -882,10 +882,16 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
     const saved_scope = c.cur_scope;
     const saved_ctx = c.fn_ctx;
     const saved_this = c.this_type;
+    // A function body is its own control-flow container, so it takes over from
+    // an enclosing class field's initializer — `x = <U>(a: U) => { var y: T;
+    // return y }` still reports TS2454 on `y` (see `field_init_depth`).
+    const saved_field_init = c.field_init_depth;
+    c.field_init_depth = 0;
     defer {
         c.cur_scope = saved_scope;
         c.fn_ctx = saved_ctx;
         c.this_type = saved_this;
+        c.field_init_depth = saved_field_init;
     }
     if (try c.scopeOf(node)) |s| c.cur_scope = s;
     // An explicit `this` parameter types `this` inside the body.
@@ -1097,6 +1103,10 @@ fn checkNamespace(c: *Checker, node: Node) Error!void {
     const saved_ambient = c.ambient_ctx;
     defer c.ambient_ctx = saved_ambient;
     if (data.flags & ast.Flags.declare != 0) c.ambient_ctx = true;
+    // This block is the body's control-flow container — see `cur_ns_block`.
+    const saved_block = c.cur_ns_block;
+    defer c.cur_ns_block = saved_block;
+    c.cur_ns_block = node;
     // The body scope is the one owned by this node, or — for a merged
     // block whose scope is owned by an earlier block — the namespace
     // symbol's members scope.
@@ -2137,6 +2147,10 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
                     defer if (!is_static) {
                         c.instance_field_init_depth -= 1;
                     };
+                    // …and the flow-container half, which the static case
+                    // shares (see `field_init_depth`).
+                    c.field_init_depth += 1;
+                    defer c.field_init_depth -= 1;
                     const it = try c.checkExprCached(e.init, ann);
                     if (ann != types.no_type and ann != types.error_type) {
                         _ = try c.checkAssignable(it, ann, e.init, c.tokSpan(c.tree.nodeMainToken(member)));

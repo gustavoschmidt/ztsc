@@ -2160,6 +2160,8 @@ pub fn memberTypeOf(c: *Checker, sym: SymbolId) Error!TypeId {
                     defer if (instance) {
                         c.instance_field_init_depth -= 1;
                     };
+                    c.field_init_depth += 1;
+                    defer c.field_init_depth -= 1;
                     return c.widenLiteral(try c.checkExprCached(e.init, types.no_type));
                 }
                 return types.any_type;

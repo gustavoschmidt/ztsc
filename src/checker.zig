@@ -1763,6 +1763,16 @@ pub const Checker = struct {
     /// tsgo 7.0.2 (`t/k9.ts`, and corpus `computedPropertyNames12`–`15`). Read by
     /// `checkUseBeforeAssigned`'s caller. (wave-10 A.)
     in_computed_member_name: bool = false,
+    /// The `namespace`/`declare module`/`declare global` BLOCK whose body is
+    /// being checked, or `null_node` at a file's top level.
+    ///
+    /// tsc's `getControlFlowContainer` stops at a MODULE BLOCK, and two blocks
+    /// of one `namespace N` are two blocks with two flow graphs even though the
+    /// binder folds their members into a single scope — so `flowContainerOf`
+    /// alone cannot tell them apart. `checkUseBeforeAssigned` compares the
+    /// declaration's position against this block to recover tsc's
+    /// `isOuterVariable` verdict. Set by `checkNamespace`.
+    cur_ns_block: ast.Node = ast.null_node,
     /// `infer V` binder identity: (conditional nodeKey, name atom) -> a
     /// dense id. Keyed by (conditional, name) so the *same* infer name used at
     /// several sites in one conditional's extends clause is one variable
@@ -1893,6 +1903,18 @@ pub const Checker = struct {
     /// function body. A *static* field initializer does run at definition time
     /// and is deliberately not counted here. Read by `checkTdz`.
     instance_field_init_depth: u32 = 0,
+    /// Depth of "checking ANY class field's initializer" frames — the static
+    /// half included, which is why it is not `instance_field_init_depth`.
+    ///
+    /// tsc's `getControlFlowContainer` stops at a PropertyDeclaration, so a
+    /// field initializer is its own flow region and every variable declared
+    /// outside it is an OUTER variable — assumed initialized whatever the
+    /// enclosing flow says. That is a separate question from the temporal dead
+    /// zone, which a static initializer still answers. Read by
+    /// `checkUseBeforeAssigned`. A function body nested in the initializer is
+    /// deferred (`defer_bodies`) and walked with this back at zero, so it keeps
+    /// its own definite-assignment analysis.
+    field_init_depth: u32 = 0,
     /// Re-entrancy guard for the syntactic key walk (`declaredKeyUnion`).
     /// Resolving a heritage clause's type ARGUMENTS is an ordinary type-node
     /// conversion, and one of them can be a `keyof` of the very class being
