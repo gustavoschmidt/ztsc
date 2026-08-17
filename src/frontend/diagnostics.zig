@@ -738,6 +738,70 @@ pub const Code = enum(u16) {
     eval_in_module,
     arguments_in_module,
 
+    // --- regular-expression body and flags (src/frontend/regexp.zig) ------------
+    // tsc validates a regex literal in `scanRegularExpressionWorker`, called
+    // from the CHECKER's grammar pass, not from the parse that produced the
+    // token — so every code here is grammar-class (measured: a sibling syntax
+    // error suppresses all of them, exactly as it suppresses a TS2322). The
+    // four `_expected` ones repeat TS1005 rather than reusing the syntactic
+    // `expected_*` codes for that reason.
+    /// TS1005 `'}' expected.` — a quantifier's `{2` or a `\p{L` with no brace.
+    regex_expected_r_brace,
+    /// TS1005 `']' expected.` — a `v`-mode nested class left open.
+    regex_expected_r_bracket,
+    /// TS1005 `')' expected.` — a group left open.
+    regex_expected_r_paren,
+    /// TS1005 `':' expected.` — `(?` with no `:` after the modifier run.
+    regex_expected_colon,
+    /// TS1125: `\xZ`, `\u12`, `\u{}` — a hex digit was required here.
+    regex_hex_digit_expected,
+    /// TS1126: the literal ended in the middle of a `\u{…}`.
+    regex_unexpected_end_of_text,
+    /// TS1198: `\u{110000}` — outside the Unicode range.
+    regex_unicode_escape_out_of_range,
+    /// TS1199: `\u{41 }` — no closing brace.
+    regex_unterminated_unicode_escape,
+    /// TS1499: a flag letter (or a subpattern-modifier letter) that is not one
+    /// of `dgimsuvy`.
+    regex_unknown_flag,
+    /// TS1500: the same flag twice.
+    regex_duplicate_flag,
+    /// TS1502: `u` and `v` together.
+    regex_u_and_v_flags,
+    /// TS1504: `(?-:a)` — a minus with no flags on either side of it.
+    regex_subpattern_flags_needed,
+    /// TS1505: `a{,3}` in unicode mode — the quantifier's minimum is missing.
+    regex_incomplete_quantifier,
+    /// TS1506: `a{3,2}` — the quantifier's bounds are reversed.
+    regex_quantifier_out_of_order,
+    /// TS1507: `{2}` with no preceding quantifiable term.
+    regex_nothing_to_repeat,
+    /// TS1508 `Unexpected '{0}'. Did you mean to escape it with backslash?` —
+    /// a stray `)`, or (in unicode mode only) a stray `{`, `}` or `]`.
+    regex_unexpected_char,
+    /// TS1509: `(?d:a)` — a real flag that a subpattern may not toggle.
+    regex_flag_not_toggleable,
+    /// TS1510: `\k` with no `<name>` after it, in unicode mode.
+    regex_k_needs_group_name,
+    /// TS1512: `\c1` in unicode mode.
+    regex_c_needs_letter,
+    /// TS1516: `[\d-\w]` in unicode mode — a range bounded by a class escape.
+    regex_range_bounded_by_class,
+    /// TS1514: `(?<1a>x)` / `\k<1a>` — the name is not an identifier.
+    regex_expected_group_name,
+    /// TS1530: `\p{L}` with neither `u` nor `v` set.
+    regex_property_needs_unicode_flag,
+    /// TS1531: `\pL` in unicode mode — `\p` needs braces.
+    regex_p_needs_braces,
+    /// TS1532 `There is no capturing group named '{0}' in this regular
+    /// expression.` — a `\k<name>` naming no group.
+    regex_no_group_named,
+    /// TS1535: `\a` in unicode mode — an escape that escapes nothing. Annex B
+    /// reads every one of these as the bare character and says nothing.
+    regex_char_cannot_be_escaped,
+    /// TS1538: `\u{41}` with neither `u` nor `v` set.
+    regex_unicode_escape_needs_flag,
+
     // --- subset boundary (explicit, never a wrong answer) ------------------------
     unsupported_syntax,
     unsupported_satisfies,
@@ -988,6 +1052,36 @@ pub const Code = enum(u16) {
             .mod_order_abstract_accessor,
             .mod_order_export_declare,
             .ctor_may_not_be_accessor,
+            // The regex family: tsc's `checkGrammarRegularExpressionLiteral`
+            // reaches the scanner's `scanRegularExpressionWorker`, so these are
+            // semantic despite their TS1xxx codes — measured, `let x = /a/gg`
+            // next to `let y: = 3` reports only the TS1110.
+            .regex_expected_r_brace,
+            .regex_expected_r_bracket,
+            .regex_expected_r_paren,
+            .regex_expected_colon,
+            .regex_hex_digit_expected,
+            .regex_unexpected_end_of_text,
+            .regex_unicode_escape_out_of_range,
+            .regex_unterminated_unicode_escape,
+            .regex_unknown_flag,
+            .regex_duplicate_flag,
+            .regex_u_and_v_flags,
+            .regex_subpattern_flags_needed,
+            .regex_incomplete_quantifier,
+            .regex_quantifier_out_of_order,
+            .regex_nothing_to_repeat,
+            .regex_unexpected_char,
+            .regex_flag_not_toggleable,
+            .regex_k_needs_group_name,
+            .regex_c_needs_letter,
+            .regex_range_bounded_by_class,
+            .regex_expected_group_name,
+            .regex_property_needs_unicode_flag,
+            .regex_p_needs_braces,
+            .regex_no_group_named,
+            .regex_char_cannot_be_escaped,
+            .regex_unicode_escape_needs_flag,
             => .grammar,
 
             else => .syntactic,
@@ -1251,6 +1345,33 @@ pub const Code = enum(u16) {
             .multiple_default_exports => "A module cannot have multiple default exports.",
             .super_before_this => "'super' must be called before accessing 'this' in the constructor of a derived class.",
             .super_before_super_property => "'super' must be called before accessing a property of 'super' in the constructor of a derived class.",
+            .regex_expected_r_brace => "'}' expected.",
+            .regex_expected_r_bracket => "']' expected.",
+            .regex_expected_r_paren => "')' expected.",
+            .regex_expected_colon => "':' expected.",
+            .regex_hex_digit_expected => "Hexadecimal digit expected.",
+            .regex_unexpected_end_of_text => "Unexpected end of text.",
+            .regex_unicode_escape_out_of_range => "An extended Unicode escape value must be between 0x0 and 0x10FFFF inclusive.",
+            .regex_unterminated_unicode_escape => "Unterminated Unicode escape sequence.",
+            .regex_unknown_flag => "Unknown regular expression flag.",
+            .regex_duplicate_flag => "Duplicate regular expression flag.",
+            .regex_u_and_v_flags => "The Unicode (u) flag and the Unicode Sets (v) flag cannot be set simultaneously.",
+            .regex_subpattern_flags_needed => "Subpattern flags must be present when there is a minus sign.",
+            .regex_incomplete_quantifier => "Incomplete quantifier. Digit expected.",
+            .regex_quantifier_out_of_order => "Numbers out of order in quantifier.",
+            .regex_nothing_to_repeat => "There is nothing available for repetition.",
+            .regex_unexpected_char => "Unexpected '{0}'. Did you mean to escape it with backslash?",
+            .regex_flag_not_toggleable => "This regular expression flag cannot be toggled within a subpattern.",
+            .regex_k_needs_group_name => "'\\k' must be followed by a capturing group name enclosed in angle brackets.",
+            .regex_c_needs_letter => "'\\c' must be followed by an ASCII letter.",
+            .regex_range_bounded_by_class => "A character class range must not be bounded by another character class.",
+            .regex_expected_group_name => "Expected a capturing group name.",
+            .regex_property_needs_unicode_flag => "Unicode property value expressions are only available when the Unicode (u) flag or the Unicode Sets (v) flag is set.",
+            .regex_p_needs_braces => "'\\p' must be followed by a Unicode property value expression enclosed in braces.",
+            .regex_no_group_named => "There is no capturing group named '{0}' in this regular expression.",
+            .regex_char_cannot_be_escaped => "This character cannot be escaped in a regular expression.",
+            .regex_unicode_escape_needs_flag => "Unicode escape sequences are only available when the Unicode (u) flag or the Unicode Sets (v) flag is set.",
+
             .unsupported_syntax => "syntax not yet supported by ztsc",
             .unsupported_satisfies => "'satisfies' is not yet supported by ztsc",
         };
@@ -1290,7 +1411,33 @@ pub const Code = enum(u16) {
             .expected_while,
             .expected_eq,
             .expected_export,
+            .regex_expected_r_brace,
+            .regex_expected_r_bracket,
+            .regex_expected_r_paren,
+            .regex_expected_colon,
             => 1005,
+            .regex_hex_digit_expected => 1125,
+            .regex_unexpected_end_of_text => 1126,
+            .regex_unicode_escape_out_of_range => 1198,
+            .regex_unterminated_unicode_escape => 1199,
+            .regex_unknown_flag => 1499,
+            .regex_duplicate_flag => 1500,
+            .regex_u_and_v_flags => 1502,
+            .regex_subpattern_flags_needed => 1504,
+            .regex_incomplete_quantifier => 1505,
+            .regex_quantifier_out_of_order => 1506,
+            .regex_nothing_to_repeat => 1507,
+            .regex_unexpected_char => 1508,
+            .regex_flag_not_toggleable => 1509,
+            .regex_k_needs_group_name => 1510,
+            .regex_c_needs_letter => 1512,
+            .regex_range_bounded_by_class => 1516,
+            .regex_expected_group_name => 1514,
+            .regex_property_needs_unicode_flag => 1530,
+            .regex_p_needs_braces => 1531,
+            .regex_no_group_named => 1532,
+            .regex_char_cannot_be_escaped => 1535,
+            .regex_unicode_escape_needs_flag => 1538,
             .expected_declaration_or_statement => 1128,
             .unexpected_keyword_or_identifier => 1434,
             .expected_statement => 1129,
