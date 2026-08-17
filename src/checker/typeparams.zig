@@ -606,6 +606,17 @@ fn checkOneTypeArgConstraint(c: *Checker, arg: TypeId, con0: TypeId, map: []cons
     // path): `Holder<{ s: string }>` against `T extends Shape` is
     // TS2741, not TS2344.
     if (try c.tryReportMissingProps(arg, con, c.nodeSpan(an))) return;
+    // Same substitution for the WEAK-type headline, which tsc's relation
+    // reports ahead of the structural walk and therefore ahead of any head
+    // message the caller supplied: `test<{t?: string}, bigint>()` is TS2559
+    // ("Type 'bigint' has no properties in common with type '{ t?: string; }'"),
+    // not TS2344.
+    if (try c.weakTypeMismatch(arg, con, c.ts.kind(arg), c.ts.kind(con), c.ts.objectIsFresh(arg))) {
+        try c.diagFmt(2559, c.nodeSpan(an), "Type '{s}' has no properties in common with type '{s}'.", .{
+            try c.typeToString(arg), try c.typeToString(con),
+        });
+        return;
+    }
     // A constraint violation elaborates like any other failed relation
     // (`elaborate.zig`): the argument and the constraint are the pair, and
     // tsc chains the same derivation under this head as under TS2322.

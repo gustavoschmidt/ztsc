@@ -468,6 +468,35 @@ fn callSigReturnUnion(c: *Checker, rt: TypeId) Error!?TypeId {
     }
 }
 
+/// tsc's split inside the weak-type headline: *"calls.length &&
+/// isRelatedTo(getReturnTypeOfSignature(calls[0]), target) || constructs.length
+/// && isRelatedTo(getReturnTypeOfSignature(constructs[0]), target)"*. A source
+/// that is callable and whose FIRST signature returns something the weak
+/// target would have accepted is a call the author forgot to write, and tsc
+/// says so (TS2560) instead of the flat "no properties in common" (TS2559).
+///
+/// Only the first signature of each list is consulted, as in tsc — an overload
+/// set whose later member happens to fit does not qualify.
+fn forgottenCall(c: *Checker, src_t: TypeId, target: TypeId) Error!bool {
+    const rs = try c.resolveStructural(src_t);
+    switch (c.ts.kind(rs)) {
+        .function => return c.isAssignable(c.ts.fnReturn(rs), target),
+        .overloads => {
+            const cands = try c.memberList(rs);
+            if (cands.len == 0) return false;
+            return c.isAssignable(c.ts.fnReturn(cands[0]), target);
+        },
+        .object => {
+            if (c.ts.objectCallSigCount(rs) != 0 and
+                try c.isAssignable(c.ts.fnReturn(c.ts.objectCallSig(rs, 0)), target)) return true;
+            if (c.ts.objectConstructSigCount(rs) != 0 and
+                try c.isAssignable(c.ts.fnReturn(c.ts.objectConstructSig(rs, 0)), target)) return true;
+            return false;
+        },
+        else => return false,
+    }
+}
+
 /// The DECLARED property `key` of an elaboration target, tsc's
 /// `getPropertyOfType` restricted to what `getIndexedAccessTypeOrUndefined`'s
 /// first step can see: a lone object's own member, or — over an INTERSECTION —
@@ -954,6 +983,17 @@ pub fn reportNotAssignable(c: *Checker, code: u16, src_t: TypeId, target: TypeId
     // the diagnostic comes out as 2559 rather than 2345.
     if (code == 2322 or code == 2345) {
         if (try c.weakTypeMismatch(src_t, target, c.ts.kind(src_t), c.ts.kind(target), c.ts.objectIsFresh(src_t))) {
+            // tsc splits the headline in two: a CALLABLE source whose first
+            // call (or construct) signature RETURNS something the weak target
+            // would have accepted is a forgotten call, and gets
+            // `Value_of_type_0_has_no_properties_in_common_with_type_1_Did_you_mean_to_call_it`
+            // instead. `doSomething(getDefaultSettings)` is the canonical one.
+            if (try forgottenCall(c, src_t, target)) {
+                try c.diagFmt(2560, span, "Value of type '{s}' has no properties in common with type '{s}'. Did you mean to call it?", .{
+                    try c.typeToString(src_t), try c.typeToString(target),
+                });
+                return;
+            }
             try c.diagFmt(2559, span, "Type '{s}' has no properties in common with type '{s}'.", .{
                 try c.typeToString(src_t), try c.typeToString(target),
             });

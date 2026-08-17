@@ -740,6 +740,26 @@ pub fn arrayApparentObject(c: *Checker, t: TypeId) Error!?TypeId {
     return if (c.ts.kind(iface) == .object) iface else null;
 }
 
+/// The apparent object type of a PRIMITIVE — the `String`/`Number`/`Boolean`/
+/// `BigInt`/`Symbol` instance whose members tsc's `getApparentType` lends the
+/// value. An ENUM bridges to `Number` or `String` depending on how its members
+/// are valued, which is what tsc's `getApparentType` does with an enum
+/// literal's `NumberLike`/`StringLike` flag. Null for anything else, and when
+/// no lib declares the interface — in which case the value apparently has no
+/// members at all, and a caller reasoning about them must say so.
+pub fn primitiveApparentObject(c: *Checker, t: TypeId) Error!?TypeId {
+    const base = switch (c.ts.kind(t)) {
+        .enum_type => if (try c.enumIsStringValued(c.ts.enumSymbol(t)))
+            types.string_type
+        else
+            types.number_type,
+        .array, .tuple => return null,
+        else => t,
+    };
+    const iface = (try primitiveInterfaceOf(c, base)) orelse return null;
+    return if (c.ts.kind(iface) == .object) iface else null;
+}
+
 // Promises, `await`, and generator yield types live in `iteration.zig`, next
 // to the `for..of` half they share a walk with; re-exported here because
 // `Checker`'s method aliases and `calls.zig` name this file.
