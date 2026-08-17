@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-17, post wave 12)
+## Standings (2026-08-17, post wave 13 + lib-key scoping)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **6535 / 8627 (75.8%)** |
-| excess keys (false positives) | 3541 | 2307 |
-| missing keys (under-reports) | 8617 | 4852 |
+| exact-match cases | 4902 / 7815 (62.7%) | **6627 / 8627 (76.8%)** |
+| excess keys (false positives) | 3541 | 2208 |
+| missing keys (under-reports) | 8617 | 4640 |
 | bucketed (ztsc parse error, incomparable) | 825 | 13 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Twelve waves landed (3–12), every one with ZERO match→non-match regressions in
+Thirteen waves landed (3–13), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -110,7 +110,81 @@ reverted (cost 3, gained 0 — blocked on `#!` scanning); TS2709-on-alias and
 `resolveNsContainer` alias-following backed out (blocked on dual export-table
 entries and the JSX hyphen-in-spread rule respectively).
 
-## Ranked next queue (wave 13) — distilled from wave-12 agent reports
+Wave 13 (+79 cases; conformance 1307→1309): A landed tsc's evolving-array
+protocol (binder FlowArrayMutation → flow-only marker kind finalized on exit —
+the marker never escapes flow.zig). B landed the TS2693 cluster (+18), TS2783
+re-land (excalidraw FP confirmed gone), module-scope `this` (script top-level =
+`typeof globalThis`), per-member `implements` blame TS2416/TS2720 (+16),
+TS2564-for-computed-names (+10). C landed strictBindCallApply
+(CallableFunction/NewableFunction; contravariant `this` inference; 0/26 →
+24/26 keys) and string-mapping distribution into pattern templates. D landed
+dual export-table entries + TS2709 re-land, the JSX hyphen-in-spread rule +
+resolveNsContainer re-land (both wave-12 backouts survived their witnesses),
+TS2713/TS2749, TS2614/TS2460 ordering, and UTF-16 diagnostic columns (0.00%
+measured cost). Harness afterwards: tsgo-bundle-internal `lib.*.d.ts` keys are
+structurally unmatchable (different lib text) and are now scoped out of the
+comparison (+13 cases, −58 missing keys, zero lost).
+NOTE for app-parity captures: ztsc's stdout positions from offset 0 in a
+regular file, so `> file 2>&1` silently overwrites the stderr config-warning
+lines — capture apps exactly that way (as all baselines were), or diff will
+show phantom warning lines when you switch to a pipe.
+
+## Ranked next queue (wave 14) — distilled from wave-13 agent reports
+
+1. Class-expression typing — blocked one binder line: `bindClass`
+   (binder.zig:2887) declares no self-symbol when `name_token == 0`; add the
+   `declare(cs, <reserved atom>, .class, …)` + the two member_scopes/
+   static_scopes registrations, make `checkClass` look the symbol up in the
+   class's OWN scope (today only `saved_scope`, so even named class exprs get
+   no_symbol), and return `classStaticType(sym)` from expr.zig's `.class_decl`
+   arm. Unlocks mixinClassesAnonymous residue, mixinAccessors3,
+   typeArgumentInferenceWithClassExpression1/3.
+2. Link/typespace mapped residue: TS2694 on the RHS of `import X = A.B.C`
+   (+5, right site is the import-equals declaration check in stmts.zig);
+   TS2708 "cannot use namespace as a value" (+6, expr.zig/classes.zig);
+   TS2709 for an entity-name alias used bare as a type (moduleVisibilityTest3,
+   `importTarget == null` arm of resolveTypeName returns `any`).
+3. `export as namespace` (UMD globals) — 18 cases, TS2686/TS2451/TS2303,
+   touches the global table.
+4. templatesDefinitelyUnrelated re-land: patch measured (−8 keys, sweep-clean);
+   blocked on object-literal elaboration through a GENERIC parameter anchoring
+   one line late (excalidraw @ts-expect-error at transform line 109 vs 110).
+   Fix the elaboration anchor, then re-land.
+5. `Uppercase<string>` stays deferred + `isMemberOfStringMapping` in the
+   relation (the other 14 stringMappingOverPatternLiterals keys).
+6. `checkIndexedAccessIndexType` on element-access EXPRESSIONS (TS2536 +
+   TS2542, ~21 keys of mappedTypeRelationships): decidable rule is small
+   (bare-type-param object + different-type-param keyof index → TS2536;
+   assignable index + readonly mapped object → TS2542); call sites in expr.zig.
+7. `prop?: undefined` union widening — implementation exists (wave-13 B
+   reverted at the app gate): members match tsgo, but comparability vs
+   excalidraw's ExcalidrawElementSkeleton union then produces 2 false TS2352
+   in assign.zig. Fix comparability first; gate must be the app.
+   Note the no-contextual-type gate (recursive-JSON conformance case).
+8. Flow residue: `isPastLastAssignment` for the PLAIN auto type (6 keys,
+   2 cases — needs the marker treatment + tsc's branch-label join shortcut;
+   redesign-sized); `controlFlowArrayErrors`'s last key (push signature read
+   off a UNION of array types — calls.zig); enum reverse-mapping numeric index
+   (`ENUM[1]` → `string`, enums.zig, 2+ cases).
+9. Generator yield contexts: `contextualTypeOnYield1/2` +
+   `generatorTypeCheck27-30` blocked in signatures.zig — an arrow as a yield
+   operand is typed during the enclosing generator's return-type inference
+   with a fresh fn_ctx whose yield_type = 0.
+10. TS2564 residue: bracketed LITERAL names (`[0]:`, `[""]:`) need an
+    l_bracket bit the parser computes and discards (~3 keys); TS7006
+    one-key-off contextual-IIFE/binding-pattern family (part of 28 cases).
+11. Regex BODY validator (dedicated wave-sized: quantifier braces, classes,
+    group modifiers; wrong error is syntactic = program-wide suppression).
+12. Determinism defect with a concrete witness: social-app `--checkers=1` and
+    `--file-order=reverse` diverge; `Navigation.tsx:778:29` prints
+    `NativeStackNavigationProp<{…}>` in one partition and the expanded shape in
+    the other — type identity, not printing. Pattern-matches the open
+    instantiation-budget partition bug (budget charges misses not hits).
+13. Cosmetic (keys match, text doesn't): bound signatures print
+    `(...args: [string]) => string` unexpanded; fresh literals not widened in
+    TS2345/TS2322 message text.
+
+## Superseded queue (wave 13, kept for context)
 
 1. expr.zig:365 types EVERY class expression as `any` — unlocks
    mixinClassesAnonymous residue, mixinAccessors3,

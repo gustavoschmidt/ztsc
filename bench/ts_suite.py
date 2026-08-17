@@ -425,6 +425,16 @@ GLOBAL_DIAG = re.compile(r"^error (TS\d+):")
 # expression"). They matter for bucketing, not for keys — see run_case.
 ZTSC_UNCODED = re.compile(r"^(.*?):(\d+):(\d+): error: ")
 
+# tsgo anchors some diagnostics (lib/global merge conflicts: TS2451, TS2428,
+# TS2300, TS2344/2430 on lib generics, ...) INSIDE its own bundled
+# lib.*.d.ts. ztsc checks its embedded lib too, but its lib is a different
+# text, so no position in it can ever equal a position in tsgo's bundle —
+# those keys are structurally unmatchable, not divergences. Drop the
+# tsgo-bundle-internal keys from the comparison (the user-site halves of the
+# same diagnostics still compare normally). The pattern matches only the
+# installed @typescript platform package, which no test fixture can shadow.
+TSGO_BUNDLE_LIB = re.compile(r"@typescript/typescript-[^/]+/lib/lib\.[^/]+\.d\.ts$")
+
 
 def keys_from(out: str, tsgo: bool):
     """-> (diagnostic keys, count of ztsc parse-phase/uncoded diagnostics)."""
@@ -437,6 +447,8 @@ def keys_from(out: str, tsgo: bool):
             path = m.group(1).replace("\\", "/")
             if path.startswith("./"):
                 path = path[2:]
+            if tsgo and TSGO_BUNDLE_LIB.search(path):
+                continue
             ks.add(f"{path}:{m.group(2)}:{m.group(3)}:{m.group(4)}")
             continue
         m = GLOBAL_DIAG.match(line)
