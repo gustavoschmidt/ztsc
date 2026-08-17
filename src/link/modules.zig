@@ -894,6 +894,96 @@ fn reportMergedMemberDups(
     try eachSharedMember(scratch, sym_base, segs, &r, MemberDupReporter.visit);
 }
 
+/// TS2451 / TS2300 / TS2567 for a module export that an AUGMENTATION of that
+/// module redeclares:
+///
+///     // a.d.ts                       // b.ts
+///     export const conflict = 0;      declare module "./a" {
+///                                         export const conflict = 0;
+///                                     }
+///
+/// tsc's `mergeModuleAugmentation` folds the block's symbol table into the real
+/// module's `exports` with `mergeSymbolTable`, so a name the module ALREADY
+/// exports meets `mergeSymbol` there exactly as two global declarations of one
+/// name do — same call, same verdict, same message. `mergeAugmentations` below
+/// folds the pairs that MERGE (interface into interface/class, namespace into
+/// namespace); this reports the pairs that do not.
+///
+/// The chain is (real export, then every augmenting block member in FileId
+/// order), which is the order the augmentations are merged in, and both the
+/// verdict and the message come from `global_dup.mergeClash` — the one
+/// implementation of tsc's rule, shared with the global name merge.
+///
+/// Only a module-context `declare module "spec"` whose `spec` resolves to a
+/// REAL file is an augmentation; a script's `declare module` is a standalone
+/// ambient module (`reportAmbientMemberDups` speaks to those), and an
+/// unresolved specifier declares a module of its own. A name whose export
+/// target is not a plain `.binding` — a namespace object, a property of an
+/// `export =` value — names no symbol whose flags could be judged, so it is
+/// skipped rather than guessed at.
+fn reportAugmentationExportDups(
+    arena: Allocator,
+    scratch: Allocator,
+    diags: []std.ArrayList(LinkDiag),
+    files: []const ProgFile,
+    sym_base: []const u32,
+    links: []const FileLinks,
+    export_equals_atom: Atom,
+) Error!void {
+    if (links.len != files.len) return; // unlinked path: no export tables
+
+    // real export global id → the augmenting block members redeclaring it, in
+    // FileId order. Scratch-owned accumulator, dropped with the pass.
+    var aug: std.AutoArrayHashMapUnmanaged(u32, std.ArrayListUnmanaged(u32)) = .empty;
+    for (files, 0..) |*f, fi| {
+        const b = f.bind;
+        if (!b.is_module or b.ambient_modules.len == 0) continue;
+        const base = sym_base[fi];
+        for (b.ambient_modules) |am| {
+            const mfile = f.specs.get(am.spec) orelse continue; // unresolved
+            const lo = b.scope_members_start[am.scope];
+            const hi = b.scope_members_start[am.scope + 1];
+            for (lo..hi) |i| {
+                const name = b.member_atoms[i];
+                const tgt = links[mfile].exportTarget(name) orelse
+                    exportEqualsMemberTarget(files, links, mfile, export_equals_atom, name) orelse
+                    continue;
+                if (tgt.kind != .binding) continue;
+                const real = sym_base[tgt.file] + tgt.payload;
+                const aug_id = base + b.member_syms[i];
+                // The linker's own fallback already routes an export a block
+                // ADDS back to that block; the name is then one declaration,
+                // not two.
+                if (real == aug_id) continue;
+                const gop = try aug.getOrPut(scratch, real);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(scratch, aug_id);
+            }
+        }
+    }
+    if (aug.count() == 0) return;
+
+    // Deterministic report order: ascending real id, as `mergeAugmentations`
+    // walks its own keys.
+    const keys = try scratch.alloc(u32, aug.count());
+    @memcpy(keys, aug.keys());
+    std.mem.sort(u32, keys, {}, struct {
+        fn lt(_: void, a: u32, b: u32) bool {
+            return a < b;
+        }
+    }.lt);
+    for (keys) |real| {
+        const augs = aug.get(real).?.items;
+        const parts = try scratch.alloc(u32, 1 + augs.len);
+        parts[0] = real;
+        @memcpy(parts[1..], augs);
+        const flags = try scratch.alloc(binder.SymbolFlags, parts.len);
+        for (parts, 0..) |p, i| flags[i] = globalSymFlags(files, sym_base, p);
+        const code = global_dup.mergeClash(flags) orelse continue;
+        try reportContributors(arena, scratch, diags, files, sym_base, parts, code);
+    }
+}
+
 /// The same treatment for the blocks of one AMBIENT MODULE / module
 /// augmentation: `declare module "someMod" { export interface TopLevel { … } }`
 /// in two files declares ONE interface `TopLevel`, whose member tables tsc
@@ -1090,6 +1180,11 @@ fn mergeGlobals(
     // (or one module augmentation), which never pass through the global name
     // merge above: they live in their own block scopes.
     if (dup_diags) |ds| try reportAmbientMemberDups(arena, scratch, ds, files, sym_base);
+
+    // …and the export table of a real module against the `declare module
+    // "spec" { … }` blocks that augment it, which is the same `mergeSymbol`
+    // again — one more table, not one more rule.
+    if (dup_diags) |ds| try reportAugmentationExportDups(arena, scratch, ds, files, sym_base, links, export_equals_atom);
 
     // Cross-file module augmentation merge: fold a `declare module
     // "spec" { interface I { … } }` block (in a MODULE-context file) into the

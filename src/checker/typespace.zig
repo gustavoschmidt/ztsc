@@ -704,9 +704,19 @@ fn memberNamesAType(f: binder.SymbolFlags) bool {
 /// is INSTANTIATED (tsc's `ValueModule` vs `NamespaceModule`): `namespace S {
 /// export var y = 1 }` is a value, `namespace R { export interface I {} }` is
 /// not. Both oracle-verified — the first is TS2749, the second TS2694.
-fn memberNamesAValue(f: binder.SymbolFlags) bool {
-    return f.var_decl or f.let_decl or f.const_decl or f.function or f.class or
-        f.enum_decl or f.enum_member or (f.namespace_decl and !f.ns_uninstantiated);
+///
+/// The instantiation question is `modvalue.valuelessNamespace`, NOT the raw
+/// `ns_uninstantiated` bit. The bit answers the binder's neighbouring question
+/// ("does this block emit a runtime object"), which calls a const-enum-only
+/// body and an exported-import body type-only where tsc's
+/// `getModuleInstanceState` does not; and it is a per-part flag, so a merge
+/// whose OR-ed flags say "uninstantiated" may still have one instantiated
+/// block. Both discrepancies turn a correct TS2749 into a wrong TS2694, so the
+/// one implementation of the rule is shared rather than re-spelled here.
+fn memberNamesAValue(c: *const Checker, sym: SymbolId, f: binder.SymbolFlags) bool {
+    if (f.var_decl or f.let_decl or f.const_decl or f.function or f.class or
+        f.enum_decl or f.enum_member) return true;
+    return f.namespace_decl and !modvalue.valuelessNamespace(c, sym);
 }
 
 /// Every EXPORTED member name declared in one namespace symbol's body scope.
@@ -1050,7 +1060,7 @@ pub fn typeFromQualifiedName(c: *Checker, node: Node, args: []const TypeId) Erro
                     // const c`, an INSTANTIATED `export namespace S`, and the
                     // fundule pair `export function B<T>() {} export namespace
                     // B { … }` — which was a silent `any` before.
-                    if (memberNamesAValue(mf)) {
+                    if (memberNamesAValue(c, g, mf)) {
                         var buf: std.ArrayList(u8) = .empty;
                         defer buf.deinit(c.scratch());
                         try entityNameText(c, node, &buf);
