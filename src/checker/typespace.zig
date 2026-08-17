@@ -860,26 +860,11 @@ pub fn resolveNsContainer(c: *Checker, node: Node) Error!?NsContainer {
                         if (c.importTarget(sym)) |tgt| return c.containerFromImportTarget(tgt);
                         // No import RECORD means the ENTITY-NAME form,
                         // `import booz = foo.bar.baz` — nothing to link, so
-                        // the right-hand side would have to be resolved in the
-                        // alias's own file and scope
-                        // (`importEqualsEntityContainer`, which jsx.zig
-                        // already does for `export import JSX = JSXInternal`).
-                        //
-                        // NOT done here, and the reason is measured: doing it
-                        // turns `declare namespace JSX { import React =
-                        // __React; interface IntrinsicAttributes extends
-                        // React.Attributes {} }` — the shape every bundled
-                        // `react.d.ts` fixture uses — from an empty interface
-                        // into a real one, and ztsc's JSX excess-property
-                        // check then rejects `<C {...{ "ignore-prop": 200 }}
-                        // />`. tsc accepts it: `isKnownProperty` treats a
-                        // HYPHENATED name as known when it is comparing JSX
-                        // attributes, and ztsc has that rule for a direct
-                        // attribute token only, not for a spread object
-                        // literal's string-literal key. Worth +3 exact
-                        // (aliasBug, innerAliases2,
-                        // tsxStatelessFunctionComponentsWithTypeArguments1)
-                        // once the hyphen rule reaches the spread path.
+                        // the right-hand side is resolved in the ALIAS's own
+                        // file and scope instead (`importEqualsEntityContainer`,
+                        // which jsx.zig already does for `export import JSX =
+                        // JSXInternal`).
+                        return try c.importEqualsEntityContainer(sym);
                     }
                     return null;
                 },

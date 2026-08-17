@@ -1015,7 +1015,10 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
         if (target_weak and (spread_non_object or provided.items.len > 0)) {
             var common = false;
             for (provided.items) |pp| {
-                if ((try c.propOfType(rt, pp.name)) != null or containsAtom(ia_names.items, pp.name)) {
+                if (isHyphenatedJsxName(c, pp.name) or
+                    (try c.propOfType(rt, pp.name)) != null or
+                    containsAtom(ia_names.items, pp.name))
+                {
                     common = true;
                     break;
                 }
@@ -1057,6 +1060,19 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     } else {
         try c.reportNotAssignable(2322, combined, props, span);
     }
+}
+
+/// tsc's `isHyphenatedJsxName`: an attribute name containing a `-` (`data-*`,
+/// `aria-*`, `ignore-prop`). `isKnownProperty` answers TRUE for such a name
+/// whenever it is comparing JSX attributes, whatever the target declares —
+/// the escape hatch that lets arbitrary DOM attributes through a props type.
+///
+/// The direct-attribute path recognizes the same names by TOKEN TAG
+/// (`.jsx_name`, which the scanner only produces for a hyphenated attribute
+/// name); a name arriving through a SPREAD is a string-literal key of an
+/// ordinary object type and has no token to read, so it is spelled out here.
+fn isHyphenatedJsxName(c: *Checker, name: Atom) bool {
+    return std.mem.indexOfScalar(u8, c.atomText(name), '-') != null;
 }
 
 /// Build the fresh object type standing in for the written attributes — the
