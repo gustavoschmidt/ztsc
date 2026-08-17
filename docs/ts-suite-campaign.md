@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-16, main @738db70)
+## Standings (2026-08-17, post wave 11)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **6255 / 8542 (73.2%)** |
-| excess keys (false positives) | 3541 | 2418 |
-| missing keys (under-reports) | 8617 | 5516 |
-| bucketed (ztsc parse error, incomparable) | 825 | 99 |
+| exact-match cases | 4902 / 7815 (62.7%) | **6476 / 8627 (75.1%)** |
+| excess keys (false positives) | 3541 | 2343 |
+| missing keys (under-reports) | 8617 | 4993 |
+| bucketed (ztsc parse error, incomparable) | 825 | 13 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Ten waves landed (3–10), every one with ZERO match→non-match regressions in
+Eleven waves landed (3–11), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -23,6 +23,19 @@ better. Excalidraw is at exact 17/17 key parity with tsgo (via
 `tsconfig.tsgo.json`, the shared config both compilers accept). The
 package-identity dedup (wave 10) also cut drizzle to 148 ms wall / 37 MB RSS —
 within a hair of its long-open ≤144 ms bar.
+
+Wave 11 (+221 cases, conformance 1290→1304 with new cases): A landed the
+decorator-grammar cluster (TS1206/1249/1207/1433, killed the false TS1166s),
+dotted/quoted/anonymous namespace names, break/continue placement (TS1104-16),
+and cut bucketed parse cases 99→13. B landed the per-constituent
+contextualCallSig arity filter (tsc's `getContextualSignature` shape) and the
+decorator context `& { name; private; static }` intersection. C landed the
+switch-clause exclusion chain, the entire `checkReferenceExpression` family
+(TS2357/2364/2406/2487/2701, TS2777-81, TS2628-31), optional-chain link types.
+D landed `[k: symbol]` class indexes, TS2882 (and flipped
+`noUncheckedSideEffectImports` default ON to match tsgo 7.0.2 — explicit
+`false` restores 5.x), TS2374/TS2323/TS1194/TS1147, TS1202-family spans, ctor
+param props vs index signatures.
 
 ## How to reconstruct the environment on a fresh machine
 
@@ -80,43 +93,69 @@ Everything gitignored is scripted:
   worktrees; scope any pkill to the worktree path; agents should commit early
   and often (machine sleeps have destroyed uncommitted worktrees).
 
-## Ranked next queue (wave 11)
+## Ranked next queue (wave 12) — distilled from wave-11 agent reports
 
-1. `contextualCallSig` arity filter done properly — filter INSIDE each union
-   constituent before combining (tsc `getContextualSignature`); the naive
-   post-selection filter causes an excalidraw FP (reactUtils.ts:14:5 TS7006).
-   Corpus-wide TS7006 payoff.
-2. Decorator context `& { name; private; static }` intersection (~20 lines,
-   removes a live FP risk on `context.name`).
-3. Flow round: switch-clause exclusion chain (narrow.zig, ~14 keys);
-   dependent rest-tuple params (11+; blockers: `propOfType` has no
-   numeric-index answer on `.tuple`; contextual sig not recoverable from the
-   param symbol — needs a per-function-node memo); optional-chain link types
-   (deleteChain, 8); object-literal union widening `prop?: undefined` (8);
-   evolving arrays `let x = []` (~10).
-4. TS2411 residue: type literals (forces annotation resolution — measure);
-   `[k: symbol]` class index dropped by `classIndexInfos`; ctor param props.
-5. Parser: 10 false TS1166 on decorated members; ~51 remaining false-parse
-   cases; TS1125-in-regex (17); TS1262; JSX recovery TS17008/1381/1382 (16+).
-6. Modules: TS2882 (side-effect import of missing module); `export import`
-   re-export decision (ImportData.flags); index-signature parameter modelling
-   (ast.IndexSig field) → TS2369/2371/7006; qualified-entity arm in
-   alias_cycle.zig.
-7. Relation: mixin residue (~6: `baseClassRef` returns null for a type-param
-   base and `hasUnresolvedBase` silences); strictBindCallApply (blocked on a
-   generic-method `.bind` inference leak — see the social-app FP at
-   analytics/index.tsx:314); stringMappingOverPatternLiterals (27);
-   mappedTypeRelationships (22).
-8. Determinism defect with a concrete witness: social-app `--checkers=1` and
-   `--file-order=reverse` diverge; `Navigation.tsx:778:29` prints
-   `NativeStackNavigationProp<{…}>` in one partition and the expanded shape in
-   the other — type identity, not printing. Pattern-matches the open
-   instantiation-budget partition bug (budget charges misses not hits).
-   Cheapest instrumentation point is that line.
-9. Structural harness item: ~58 missing keys / 12 cases point inside tsgo's
-   `lib.*.d.ts`; ztsc reports the same diagnostics at its own embedded lib
-   positions. Needs harness-side lib-position canonicalization, not checker
-   work.
+1. Contextual-type discrimination (tsc `discriminateContextualTypeByObjectMembers`
+   / `…ByJSXAttributes`, expr.zig). MEASURED unblock: B implemented the
+   "union constituents must agree" signature rule (`compareSignaturesIdentical`)
+   and it went -7/+2 *only* because ztsc never discriminates the union first;
+   land discrimination, then re-land the rule (commit `2470fc5` reverted it) —
+   gains `contextualTypeWithUnionTypeCallSignatures` +
+   `contextualOverloadListFromUnionWithPrimitiveNoImplicitAny` and the
+   discriminated-literal TS7006 family.
+2. Mixins (classes.zig/statics.zig, ~4-6 cases): tsc `getBaseTypeVariableOfClass`
+   — a class whose base ctor type is a type variable gets its STATIC type
+   intersected with that variable. Was diagnosed by B but blocked on file
+   ownership. Fixes mixinAbstractClasses{,.2}, mixinClassesAnnotated,
+   probably mixinClassesAnonymous.
+3. Generic inference leak, oracle-confirmed repro: `pick(COLOR_PALETTE,
+   ["cyan"])` with `<R, K extends readonly (keyof R)[]>(...) => Pick<R,
+   K[number]>` infers K as its CONSTRAINT, not the argument tuple (tsgo:
+   `Pick<…,"blue"|"cyan">`, ztsc: whole object). Blocks re-landing TS2783
+   (24 keys / 8 cases, C's revert `e65765f`; the check itself was
+   corpus-clean); likely the same root as the strictBindCallApply
+   generic-method `.bind` leak (social-app analytics/index.tsx:314 FP).
+4. Compound-assign/increment narrowing bug (flow.zig, oracle-confirmed,
+   pre-existing): `assignNarrows` increment arm returns
+   `assignmentReduced(declared, number)`; tsc returns
+   `getBaseTypeOfLiteralType(antecedentType)` (`let y: 1|2 = 1; y++` → tsc
+   `number`, ztsc `1|2`). Found by C, deliberately left unswept.
+5. Evolving arrays `let x = []` (~23+ keys with TS7034/7005): needs a
+   FlowArrayMutation-style node in binder.zig + flow.zig consumption —
+   cross-area, give one agent both files.
+6. Object-literal union widening `prop?: undefined` (~8 keys): each widened
+   object-literal constituent gains `prop?: undefined` for sibling-declared
+   props (tsc `getWidenedTypeOfObjectLiteral` + `getUndefinedProperty`);
+   needs sibling context threaded through widening. Real app risk — gate hard.
+7. Diagnostic text payload: `frontend.Diagnostic` carries a static Code only;
+   messages that interpolate (JSX TS17008/TS17002 family, 5 cases) need a text
+   field + source-buffer lifetime decision (touches parser/binder/bind_result).
+8. Index-signature parameter shape: parser computes `index_signature.Shape`
+   (modifier/initializer/`?`) then discards it; add the ast.IndexSig field the
+   parser FILLS, then TS2369/TS2371-specific/TS7006 land (needs parser +
+   binder in one agent's hands).
+9. Binder/modules residue from A: anonymous `module {}` should merge into the
+   enclosing container (innerModExport1/2 false TS2339); ambient-module import
+   not reaching a nested augmentation (moduleAugmentationInAmbientModule*
+   TS2304, now visible since those cases left the bucketed set).
+10. Scanner regex-body validator (tsc scanner.ts regex pass): TS1125/1512/
+    1535/1499 UNDER-reports (4 cases — wave-11 brief mislabeled these as FPs).
+11. Cheap parser wins A scouted: TS1090 (parameter modifiers, 3 cases),
+    TS1046 (.d.ts top-level, 1), remaining TS1011 position in newOperator.ts,
+    TS1308 for exportDefaultAsyncFunction2.
+12. TS2411 on type literals — needs a checker hook on every `.type_literal`
+    (stmts.zig); measure the annotation-resolution cost first (D skipped it
+    as the flagged perf risk).
+13. Determinism defect with a concrete witness: social-app `--checkers=1` and
+    `--file-order=reverse` diverge; `Navigation.tsx:778:29` prints
+    `NativeStackNavigationProp<{…}>` in one partition and the expanded shape in
+    the other — type identity, not printing. Pattern-matches the open
+    instantiation-budget partition bug (budget charges misses not hits).
+    Cheapest instrumentation point is that line.
+14. Structural harness item: ~58 missing keys / 12 cases point inside tsgo's
+    `lib.*.d.ts`; ztsc reports the same diagnostics at its own embedded lib
+    positions. Needs harness-side lib-position canonicalization, not checker
+    work.
 
 Skips (by design, per goal): 2154 strict:false cases, 801 JS cases, ~627
 unsupported-option cases, plus harness-only categories.
