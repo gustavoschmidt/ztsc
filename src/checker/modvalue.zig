@@ -353,8 +353,7 @@ pub fn namespaceObjectType(c: *Checker, file: FileId) Error!TypeId {
                     // `namespace control { sideBySide }`): use the merged
                     // view so `L.control.sideBySide` resolves.
                     const g = c.prog.mergedOf(g0) orelse g0;
-                    const f = c.symFlags(g);
-                    if (!hasValueMeaning(f)) continue;
+                    if (!bindingHasValue(c, g)) continue;
                     ty = try c.typeOfSymbol(g);
                 },
                 .namespace => ty = try c.namespaceObjectType(tgt.file),
@@ -369,7 +368,7 @@ pub fn namespaceObjectType(c: *Checker, file: FileId) Error!TypeId {
                     if (try c.dualValueType(d)) |vt| {
                         ty = vt;
                     } else if (c.targetTypeSym(d.type_tgt)) |g| {
-                        if (!hasValueMeaning(c.symFlags(g))) continue;
+                        if (!bindingHasValue(c, g)) continue;
                         ty = try c.typeOfSymbol(g);
                     } else {
                         ty = try c.targetValueType(d.type_tgt);
@@ -456,6 +455,10 @@ pub fn ambientNamespaceType(c: *Checker, idx: u32) Error!TypeId {
     for (ae.atoms, ae.targets) |name, tgt| {
         if (name == c.prog.export_equals_atom) continue; // reserved key
         if (tgt.type_only) continue;
+        if (tgt.kind == .binding) {
+            const g0 = c.toGlobalIn(tgt.file, tgt.payload);
+            if (!bindingHasValue(c, c.prog.mergedOf(g0) orelse g0)) continue;
+        }
         const ty = try c.targetValueType(tgt);
         try props.append(c.scratch(), .{ .name = name, .ty = ty, .flags = types.prop_flag_readonly });
     }

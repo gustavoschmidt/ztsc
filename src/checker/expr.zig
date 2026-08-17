@@ -892,6 +892,16 @@ fn checkIdentifier(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
                 }
                 return types.error_type;
             }
+            // The implicit `arguments` object outranks a declaration with no
+            // value meaning. tsc's `resolveNameHelper` answers `arguments` at
+            // the nearest function-like location, and it does so AFTER that
+            // location's own locals have been filtered by meaning — so an
+            // `interface arguments {}` is skipped at every level of the walk
+            // and never reaches the name
+            // (`functionDeclarationWithResolutionOfTypeNamedArguments01`).
+            if (std.mem.eql(u8, c.atomText(a), "arguments")) {
+                if (try c.implicitArgumentsType(c.nodeSpan(node))) |t| return t;
+            }
             try c.diagFmt(2693, c.tokSpan(tok), "'{s}' only refers to a type, but is being used as a value here.", .{c.tokenText(tok)});
             return types.error_type;
         },
