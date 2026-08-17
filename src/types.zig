@@ -470,6 +470,11 @@ pub const Prop = struct {
     pub fn nonPublic(p: Prop) bool {
         return p.flags & prop_flag_non_public != 0;
     }
+    /// `protected` specifically, as opposed to `private` — see
+    /// `prop_flag_protected`. Always implies `nonPublic`.
+    pub fn protectedMember(p: Prop) bool {
+        return p.flags & prop_flag_protected != 0;
+    }
     /// tsc's `getRestType`/`getSpreadType` filter: a `private`/`protected`
     /// member is skipped outright, and so is a class-declared method or
     /// accessor (`isSpreadableProperty`). Everything else copies.

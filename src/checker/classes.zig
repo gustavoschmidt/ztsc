@@ -45,6 +45,7 @@ const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 const prof_zig = checker_zig.prof_zig;
 
+const accessibility = @import("accessibility.zig");
 const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 
@@ -666,7 +667,7 @@ pub fn classInstanceGeneric(c: *Checker, sym0: SymbolId) Error!TypeId {
             if (mf.readonly_member) flags |= types.prop_flag_readonly;
             // A get-only accessor is a read-only property (TS2540 on write).
             if (mf.getter and !mf.setter) flags |= types.prop_flag_readonly;
-            if (mf.non_public) flags |= types.prop_flag_non_public;
+            flags |= visibilityPropFlags(c, msym, mf.non_public);
             if (mf.method or mf.getter or mf.setter) flags |= types.prop_flag_class_fn;
             try props.append(c.scratch(), .{
                 .name = name,
@@ -1058,7 +1059,7 @@ fn lazyRefPropRec(c: *Checker, ref: TypeId, name: Atom, depth: u32) Error!?types
             if (mf.optional_member) flags |= types.prop_flag_optional;
             if (mf.readonly_member) flags |= types.prop_flag_readonly;
             if (mf.getter and !mf.setter) flags |= types.prop_flag_readonly;
-            if (mf.non_public) flags |= types.prop_flag_non_public;
+            flags |= visibilityPropFlags(c, msym, mf.non_public);
             if (mf.method or mf.getter or mf.setter) flags |= types.prop_flag_class_fn;
             found = .{ .name = nm, .ty = try c.memberTypeOf(msym), .flags = flags };
             break;
@@ -1594,6 +1595,32 @@ pub fn hasUnresolvedBase(c: *Checker, sym: SymbolId) Error!bool {
         cur = base;
     }
     return false;
+}
+
+/// The visibility half of a class member's `Prop` flag word: `0` for a public
+/// member, `prop_flag_non_public` for a `private` one, and that bit plus
+/// `prop_flag_protected` for a `protected` one.
+///
+/// The binder records one `non_public` bit (its `SymbolFlags` has no room for
+/// a second), so WHICH modifier it was is rediscovered from the declaration —
+/// the same walk `accessibility.accessOfMember` runs for an access site, and
+/// the same answer, so the two cannot drift. It runs only for a member the
+/// binder already marked non-public, which is a rare member and never an
+/// ordinary public one.
+///
+/// The distinction has to reach the flag word because member tables are
+/// HASH-CONSED: `protected static x: string` and `private static x: string`
+/// were otherwise one identical table and therefore one type id, and
+/// `checkStaticSideExtends` answers `derived_static == base_static` before the
+/// nominal rule can run (`derivedClassWithPrivateStaticShadowingProtectedStatic`).
+/// See `types.prop_flag_protected`.
+pub fn visibilityPropFlags(c: *Checker, msym: SymbolId, non_public: bool) u32 {
+    if (!non_public) return 0;
+    const base = types.prop_flag_non_public;
+    return if (accessibility.accessOfMember(c, msym, false) == .protected)
+        base | types.prop_flag_protected
+    else
+        base;
 }
 
 /// Bound on the breadth-first heritage walks that answer a question about the

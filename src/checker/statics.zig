@@ -26,6 +26,7 @@ const hasValueMeaning = @import("names.zig").hasValueMeaning;
 const isCtorName = @import("instantiate.zig").isCtorName;
 const classIndexInfos = @import("classes.zig").classIndexInfos;
 const derivesFrom = @import("classes.zig").derivesFrom;
+const visibilityPropFlags = @import("classes.zig").visibilityPropFlags;
 
 /// One own static member of `cls`, resolved WITHOUT materializing its
 /// siblings — tsc's `getPropertyOfType` on the static side, which reaches
@@ -59,7 +60,7 @@ pub fn ownStaticMemberProp(c: *Checker, cls: SymbolId, name: Atom) Error!?types.
         var flags: u32 = 0;
         if (mf.readonly_member) flags |= types.prop_flag_readonly;
         if (mf.getter and !mf.setter) flags |= types.prop_flag_readonly;
-        if (mf.non_public) flags |= types.prop_flag_non_public;
+        flags |= visibilityPropFlags(c, msym, mf.non_public);
         if (mf.method or mf.getter or mf.setter) flags |= types.prop_flag_class_fn;
         // `this` inside a static member is the class's constructor type,
         // exactly as `classStaticType` sets it before resolving one.
@@ -280,7 +281,7 @@ pub fn classStaticType(c: *Checker, sym: SymbolId) Error!TypeId {
             var flags: u32 = 0;
             if (mf.readonly_member) flags |= types.prop_flag_readonly;
             if (mf.getter and !mf.setter) flags |= types.prop_flag_readonly;
-            if (mf.non_public) flags |= types.prop_flag_non_public;
+            flags |= visibilityPropFlags(c, msym, mf.non_public);
             if (mf.method or mf.getter or mf.setter) flags |= types.prop_flag_class_fn;
             try props.append(c.scratch(), .{
                 .name = try c.nominalizeComputedKey(c.bind.member_atoms[i], kscope),
