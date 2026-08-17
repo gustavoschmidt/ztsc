@@ -440,6 +440,15 @@ fn propsIdentical(c: *Checker, a: types.Prop, b: types.Prop, a_from: TypeId, b_f
     const at = if (a.optional()) try c.removeUndefined(a.ty) else a.ty;
     const bt = if (b.optional()) try c.removeUndefined(b.ty) else b.ty;
     if (at == bt) return true;
+    // The one place mutual assignability is not even close to identity: a
+    // GENERIC signature and a non-generic one relate both ways (the generic is
+    // instantiated to meet the other), but tsc's `compareSignaturesIdentical`
+    // rejects the pair on its type-parameter lists before it looks at a single
+    // parameter. `interface Hello extends Bar, Foo {}` over `f<T>(x: T): T` and
+    // `f(x: any): any` is TS2320 in tsgo for exactly that reason
+    // (`genericAndNonGenericInheritedSignature1`/`2`).
+    if (c.ts.kind(at) == .function and c.ts.kind(bt) == .function and
+        c.ts.fnTypeParamCount(at) != c.ts.fnTypeParamCount(bt)) return false;
     return (try c.isAssignable(at, bt)) and (try c.isAssignable(bt, at));
 }
 
@@ -459,6 +468,14 @@ fn propsIdentical(c: *Checker, a: types.Prop, b: types.Prop, a_from: TypeId, b_f
 /// here. Restricted to the multi-block generic case so that a single block's
 /// `extends A<string>, A<number>` — where tsc really does compare two
 /// different instantiations — keeps both.
+///
+/// And restricted, within that, to a repeat whose type ARGUMENTS differ only
+/// in which block's parameters they name (`argsSameUpToBlock`). Two blocks may
+/// name the same base at two DIFFERENT instantiations —
+/// `interface A<T> extends C<string> {}` beside `interface A<T> extends
+/// C<number> {}` — and there tsc really does compare the two and report the
+/// TS2320 (`mergedInterfacesWithMultipleBases4`), so unification has nothing
+/// to do.
 fn dropRepeatedBases(c: *Checker, sym: SymbolId, bases: *std.ArrayList(TypeId)) Error!void {
     if (bases.items.len < 2) return;
     var blocks: usize = 0;
@@ -476,13 +493,34 @@ fn dropRepeatedBases(c: *Checker, sym: SymbolId, bases: *std.ArrayList(TypeId)) 
         if (c.ts.kind(b) == .ref) {
             const s = c.ts.refSymbol(b);
             for (bases.items[0..kept]) |k| {
-                if (c.ts.kind(k) == .ref and c.ts.refSymbol(k) == s) continue :outer;
+                if (c.ts.kind(k) == .ref and c.ts.refSymbol(k) == s and argsSameUpToBlock(c, k, b)) continue :outer;
             }
         }
         bases.items[kept] = b;
         kept += 1;
     }
     bases.shrinkRetainingCapacity(kept);
+}
+
+/// Do two references to the SAME symbol denote the instantiation tsc's unified
+/// type-parameter list would have produced twice?
+///
+/// Position by position: the arguments are the same type, or they are both
+/// type PARAMETERS — the one difference two blocks of one interface can have
+/// that tsc does not (each block's `T` is its own symbol here, one symbol
+/// there). Anything else — `C<string>` against `C<number>`, `B<T[]>` against
+/// `B<T>` — is a real difference in what was written, and the two survive as
+/// two bases.
+fn argsSameUpToBlock(c: *Checker, a: TypeId, b: TypeId) bool {
+    const xa = c.ts.refArgs(a);
+    const xb = c.ts.refArgs(b);
+    if (xa.len != xb.len) return false;
+    for (xa, xb) |ta, tb| {
+        if (ta == tb) continue;
+        if (c.ts.kind(ta) == .type_param and c.ts.kind(tb) == .type_param) continue;
+        return false;
+    }
+    return true;
 }
 
 /// The member names the interface's own blocks declare — tsc's
