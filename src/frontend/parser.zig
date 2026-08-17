@@ -63,6 +63,7 @@ const param_modifiers = @import("param_modifiers.zig");
 const index_signature = @import("index_signature.zig");
 const computed_member = @import("computed_member.zig");
 const decorator_target = @import("decorator_target.zig");
+const regexp = @import("regexp.zig");
 
 const TokTag = scanner.Tag;
 const Token = scanner.Token;
@@ -816,6 +817,18 @@ const Parser = struct {
     }
 
     // --- rescanning (grammar-context lexing) -----------------------------
+
+    /// Read the current (terminated) regex token as a PATTERN and record what
+    /// its body and flags get wrong. tsc runs this from the checker's grammar
+    /// pass, not from the parse, so every code `regexp` reports is grammar-class
+    /// and is gated by the program's syntactic diagnostics like any other
+    /// semantic one; appending straight to `p.diags` is what `addDiag` would do
+    /// for a grammar code anyway, and keeps the walk's own
+    /// one-diagnostic-per-position rule the only one in play.
+    fn checkRegex(p: *Parser) Error!void {
+        const t = p.cur();
+        try regexp.validate(p.gpa, p.src, t.start, t.end, &p.diags);
+    }
 
     /// Current `/` or `/=` becomes a regex literal.
     fn rescanRegex(p: *Parser) void {
@@ -5882,7 +5895,10 @@ const Parser = struct {
                 try p.errAtCurEnd(.unterminated_string);
                 return p.leaf(.string_literal);
             },
-            .regexp_literal => return p.leaf(.regex_literal),
+            .regexp_literal => {
+                try p.checkRegex();
+                return p.leaf(.regex_literal);
+            },
             .unterminated_regexp_literal => {
                 try p.errAtCur(.unterminated_regexp);
                 return p.leaf(.regex_literal);
@@ -5891,6 +5907,8 @@ const Parser = struct {
                 p.rescanRegex();
                 if (p.curTag() == .unterminated_regexp_literal) {
                     try p.errAtCur(.unterminated_regexp);
+                } else {
+                    try p.checkRegex();
                 }
                 return p.leaf(.regex_literal);
             },

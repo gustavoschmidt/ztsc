@@ -313,16 +313,65 @@ fn checkVarDeclStatement(c: *Checker, node: Node) Error!void {
     const d = c.tree.nodeData(node);
     const is_const = c.tree.tokens.tag(c.tree.nodeMainToken(node)) == .keyword_const;
     const ambient = c.ambient_ctx or precededByDeclare(c, node);
+    const let_or_const = isLetOrConst(c, node);
     if (c.nodeTag(node) == .var_decl_one) {
         if (ambient) try checkAmbientInitializer(c, d.lhs, is_const);
+        if (is_const and !ambient) try checkConstInitialized(c, d.lhs);
+        if (let_or_const) try checkLetName(c, c.tree.nodeData(d.lhs).lhs);
         try checkDeclarator(c, d.lhs, is_const, ambient);
     } else {
         for (c.tree.nodeRange(node)) |decl| {
             if (decl == null_node) continue;
             if (ambient) try checkAmbientInitializer(c, decl, is_const);
+            if (is_const and !ambient) try checkConstInitialized(c, decl);
+            if (let_or_const) try checkLetName(c, c.tree.nodeData(decl).lhs);
             try checkDeclarator(c, decl, is_const, ambient);
         }
     }
+}
+
+fn isLetOrConst(c: *Checker, var_decl: Node) bool {
+    return switch (c.tree.tokens.tag(c.tree.nodeMainToken(var_decl))) {
+        .keyword_const, .keyword_let => true,
+        else => false,
+    };
+}
+
+/// tsc's `checkGrammarNameInLetOrConstDeclarations`: a `let`/`const` may not
+/// BIND the name `let`. Only the identifier form is answered — tsc recurses
+/// into binding patterns, and no corpus case needs that, so a pattern stays
+/// silent rather than guessing at an element's name node.
+fn checkLetName(c: *Checker, name: Node) Error!void {
+    if (name == null_node or c.nodeTag(name) != .identifier) return;
+    const tok = c.tree.nodeMainToken(name);
+    if (!std.mem.eql(u8, c.tokenText(tok), "let")) return;
+    try c.diagFmt(2480, c.tokSpan(tok), "'let' is not allowed to be used as a name in 'let' or 'const' declarations.", .{});
+}
+
+/// tsc's `checkGrammarVariableDeclaration` arm for an uninitialized `const`.
+/// Reported on the NAME, and only for a STATEMENT's declaration list — a
+/// `for…in`/`for…of` head is exempt (tsc's own guard) and never reaches here,
+/// because those heads are checked by `checkForInOfStatement`, while a C-style
+/// `for (const x;;)` does reach here and is reported, as tsc has it.
+///
+/// A binding PATTERN with no initializer is TS1182 in tsc ("a destructuring
+/// declaration must have an initializer"), which `return`s before this arm;
+/// ztsc does not answer TS1182 yet, so a pattern stays silent rather than
+/// borrowing the wrong code.
+fn checkConstInitialized(c: *Checker, decl: Node) Error!void {
+    const d = c.tree.nodeData(decl);
+    const name: Node = switch (c.nodeTag(decl)) {
+        .declarator => d.lhs,
+        .declarator_full => blk: {
+            const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
+            if (e.init != 0) return;
+            break :blk d.lhs;
+        },
+        // `.declarator_init` always has one; anything else is recovery.
+        else => return,
+    };
+    if (c.nodeTag(name) != .identifier) return;
+    try c.diagFmt(1155, c.tokSpan(c.tree.nodeMainToken(name)), "'const' declarations must be initialized.", .{});
 }
 
 /// tsc's `checkAmbientInitializer` for a variable declarator: an initializer
@@ -488,6 +537,12 @@ fn checkForInOf(c: *Checker, node: Node) Error!void {
                 const range = c.tree.nodeRange(e.left);
                 break :blk if (range.len > 0) range[0] else null_node;
             };
+            // `for (let let of …)` — the ForDeclaration arm of tsc's
+            // `checkGrammarNameInLetOrConstDeclarations`, which a `for` head
+            // reaches even though it skips the rest of the declaration checks.
+            if (decl != null_node and isLetOrConst(c, e.left)) {
+                try checkLetName(c, c.tree.nodeData(decl).lhs);
+            }
             if (decl != null_node) {
                 const dd = c.tree.nodeData(decl);
                 switch (c.nodeTag(decl)) {

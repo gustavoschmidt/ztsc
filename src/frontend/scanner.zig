@@ -242,7 +242,7 @@ pub fn tokenEnd(src: []const u8, tag: Tag, start: u32) u32 {
                 // as `next()` does, then fall into the same rest loop.
                 if (!s.consumeIdentifierEscape()) return s.next().end;
             } else if (start < src.len) {
-                s.index +|= identStepLen(src, start);
+                s.index +|= charStepLen(src, start);
             } else {
                 s.index +|= 1;
             }
@@ -918,7 +918,7 @@ pub const Scanner = struct {
         // UTF-8 sequence: `identifierRest` validates the byte it lands on, so
         // stepping one byte into a multi-byte character would leave it on a
         // continuation byte and end the identifier there.
-        s.index += identStepLen(s.src, s.index);
+        s.index += charStepLen(s.src, s.index);
         const has_escape = s.identifierRest();
         if (!has_escape) {
             if (keyword_map.get(s.src[start..s.index])) |kw| return kw;
@@ -1259,11 +1259,13 @@ fn isBinaryContent(src: []const u8, i: u32) bool {
         src[i + 1] == 0xBF and src[i + 2] == 0xBD;
 }
 
-/// How far to step over the FIRST character of an identifier: one byte for
-/// ASCII, the whole UTF-8 sequence for anything else, and one byte for a
-/// malformed sequence (so the caller still makes progress; `identifierRest`
-/// then ends the name and `next` reaches the binary-content arm).
-fn identStepLen(src: []const u8, i: u32) u32 {
+/// How far to step over ONE character: one byte for ASCII, the whole UTF-8
+/// sequence for anything else, and one byte for a malformed sequence (so the
+/// caller still makes progress; over an identifier's first character
+/// `identifierRest` then ends the name and `next` reaches the binary-content
+/// arm). `regexp.zig` steps flag letters and pattern characters with it, which
+/// is why a non-BMP flag is one diagnostic rather than four.
+pub fn charStepLen(src: []const u8, i: u32) u32 {
     if (src[i] < 0x80) return 1;
     const n = utf8SeqLen(src, i);
     return if (n == 0) 1 else n;
