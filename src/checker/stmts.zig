@@ -234,7 +234,7 @@ fn checkExportTarget(c: *Checker, expr: Node) Error!void {
             // `SymbolFlags.All` includes the namespace meaning, so a namespace
             // that emits no runtime object is a legal export target too — the
             // value-position TS2708 does not apply here.
-            .sym => |sym| if (try modvalue.valuelessNamespaceRef(c, sym)) return,
+            .sym => |sym| if (try modvalue.valuelessNamespaceRef(c, sym, c.symFlags(sym))) return,
             .none => {},
         }
     }

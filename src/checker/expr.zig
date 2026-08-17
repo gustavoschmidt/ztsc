@@ -579,7 +579,7 @@ fn checkIdentifier(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             const f = c.symFlags(sym);
             // A namespace with no value in it is not a value (tsc's
             // `checkAndReportErrorForUsingNamespaceAsTypeOrValue`).
-            if (try modvalue.valuelessNamespaceRef(c, sym)) {
+            if (modvalue.interesting(f) and try modvalue.valuelessNamespaceRef(c, sym, f)) {
                 try c.diagFmt(2708, c.tokSpan(tok), "Cannot use namespace '{s}' as a value.", .{c.tokenText(tok)});
                 return types.error_type;
             }
@@ -4725,7 +4725,7 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
                         else if (sf.class)
                             .{ .code = 2629, .text = "a class" }
                         else if (sf.namespace_decl) blk: {
-                            if (try modvalue.valuelessNamespaceRef(c, sym)) {
+                            if (try modvalue.valuelessNamespaceRef(c, sym, sf)) {
                                 try c.diagFmt(2708, c.tokSpan(tok), "Cannot use namespace '{s}' as a value.", .{c.tokenText(tok)});
                                 return types.error_type;
                             }

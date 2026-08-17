@@ -59,14 +59,26 @@ pub fn valuelessNamespace(c: *const Checker, sym: SymbolId) bool {
 /// `U.member` in value position are the same TS2708 the namespace's own name
 /// earns (`typeofInternalModules`). The `= require("m")` form has an import
 /// RECORD and is the linker's; only the entity form is walked here.
-pub fn valuelessNamespaceRef(c: *Checker, sym: SymbolId) Error!bool {
+///
+/// `f` is the caller's already-loaded `symFlags(sym)`: every call site has it,
+/// and `interesting(f)` — one branch on two bits — is what keeps this off the
+/// hot path for the identifiers that are neither.
+pub fn valuelessNamespaceRef(c: *Checker, sym: SymbolId, f: binder.SymbolFlags) Error!bool {
+    if (!interesting(f)) return false;
     if (valuelessNamespace(c, sym)) return true;
-    const f = c.symFlags(sym);
     if (!f.import_binding or c.importTarget(sym) != null) return false;
     return switch ((try c.importEqualsEntityContainer(sym)) orelse return false) {
         .ns => |ns| valuelessNamespace(c, ns),
         .module => false,
     };
+}
+
+/// Could `valuelessNamespaceRef` possibly say yes? A name that is neither a
+/// namespace nor an alias never can, and that is every identifier in ordinary
+/// code — so the screen is inlined at each call site's already-loaded flags
+/// rather than paid as a call.
+pub fn interesting(f: binder.SymbolFlags) bool {
+    return f.namespace_decl or f.import_binding;
 }
 
 /// One declaration: a namespace block with no value in it, merged with nothing

@@ -1402,7 +1402,7 @@ pub fn typeofEntity(c: *Checker, node: Node) Error!TypeId {
         .sym => |sym| {
             // `typeof M` names a VALUE, and a namespace with nothing but
             // types in it is not one (see `valuelessNamespace`).
-            if (try modvalue.valuelessNamespaceRef(c, sym)) {
+            if (try modvalue.valuelessNamespaceRef(c, sym, c.symFlags(sym))) {
                 try c.diagFmt(2708, c.tokSpan(tok), "Cannot use namespace '{s}' as a value.", .{c.tokenText(tok)});
                 return types.error_type;
             }
