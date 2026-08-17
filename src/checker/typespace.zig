@@ -147,9 +147,20 @@ pub fn typeFromTypeNameEx(c: *Checker, name_node: Node, args: []const TypeId, ou
                             return types.any_type;
                         }
                     },
-                    // Namespace-as-type / a property of an `export =` value
-                    // (value space only) / unresolved: any (documented).
-                    .namespace, .default_expr, .ambient_ns, .export_equals_prop, .dual, .any => return types.any_type,
+                    // A whole MODULE namespace object named as a type is the
+                    // same TS2709 `materializeTypeRef` reports for a
+                    // `namespace` block — `import WinJS = require("./m"); var
+                    // x: WinJS` and `import * as B from "./b"; const y: B`
+                    // both. tsc reaches it the same way too: the alias
+                    // resolves, its target carries `SymbolFlags.ValueModule`,
+                    // and `Type` does not include it.
+                    .namespace, .ambient_ns => {
+                        try c.diagFmt(2709, c.tokSpan(tok), "Cannot use namespace '{s}' as a type.", .{c.tokenText(tok)});
+                        return types.error_type;
+                    },
+                    // A property of an `export =` value (value space only) /
+                    // unresolved: any (documented).
+                    .default_expr, .export_equals_prop, .dual, .any => return types.any_type,
                 }
             }
             // TS2302: a class's type parameters do not reach its static
@@ -288,6 +299,23 @@ pub fn materializeTypeRef(c: *Checker, sym: SymbolId, args: []const TypeId, tok:
             return c.ts.makeArrayReadonly(fixed[0]);
         }
         return c.ts.makeRef(sym, fixed);
+    }
+    // TS2709. tsc's `SymbolFlags.Type` is `Class | Interface | Enum |
+    // EnumMember | TypeLiteral | TypeParameter | TypeAlias` — NAMESPACE is not
+    // in it — so `getTypeFromTypeReference` never lands on a namespace and the
+    // reference answers "Cannot use namespace 'A' as a type." ztsc's
+    // `hasTypeMeaning` DOES admit `namespace_decl`, because a qualified
+    // `A.B.T` has to walk through `A`; the exclusion belongs here, where the
+    // walk is over and the namespace itself is what the type node named.
+    //
+    // Every arm above has already claimed the merged shapes, so reaching here
+    // with the flag set means nothing else in the merge carries a type: a bare
+    // `namespace A {}`, and a `function f() {} namespace f {}` pair, both
+    // report, while `enum E {} namespace E {}` and `class K {} namespace K {}`
+    // do not. All four oracle-verified against tsgo 7.0.2.
+    if (f.namespace_decl) {
+        try c.diagFmt(2709, c.tokSpan(tok), "Cannot use namespace '{s}' as a type.", .{c.atomText(a)});
+        return types.error_type;
     }
     return types.any_type;
 }
@@ -730,6 +758,17 @@ pub fn enumSymFromImportTarget(c: *Checker, tgt: modules.Target) ?SymbolId {
 /// to `any`, so heritage `extends ns.Base` inherited zero members). Null for
 /// a non-namespace or unresolvable qualifier.
 pub fn resolveNsContainer(c: *Checker, node: Node) Error!?NsContainer {
+    return resolveNsContainerAt(c, node, 0);
+}
+
+/// `resolveNsContainer` with the alias-chain depth carried along. An
+/// entity-name alias resolves by resolving ANOTHER qualifier
+/// (`importEqualsEntityContainerAt`), and `import A = B; import B = A;` is a
+/// legal parse — alias_cycle.zig reports TS2303 for it, which means the corpus
+/// contains the shape — so the walk needs a bound. 16 is far past any real
+/// `import x = a.b.c` chain and costs one comparison per hop.
+fn resolveNsContainerAt(c: *Checker, node: Node, depth: u32) Error!?NsContainer {
+    if (depth > 16) return null;
     switch (c.nodeTag(node)) {
         .identifier => {
             const a = try c.atomOfToken(c.tree.nodeMainToken(node));
@@ -742,6 +781,13 @@ pub fn resolveNsContainer(c: *Checker, node: Node) Error!?NsContainer {
                     if (c.symFlags(sym).namespace_decl) return .{ .ns = sym };
                     if (c.symFlags(sym).import_binding) {
                         if (c.importTarget(sym)) |tgt| return c.containerFromImportTarget(tgt);
+                        // No import RECORD means the ENTITY-NAME form,
+                        // `import booz = foo.bar.baz` — nothing to link, so
+                        // the right-hand side is resolved in the alias's own
+                        // file and scope instead. Without it the qualifier
+                        // answered "not a container" and `booz.bar` silently
+                        // degraded to `any` rather than reporting TS2694.
+                        return importEqualsEntityContainerAt(c, sym, depth);
                     }
                     return null;
                 },
@@ -756,7 +802,7 @@ pub fn resolveNsContainer(c: *Checker, node: Node) Error!?NsContainer {
                 const m = (try c.resolveImportTypeModule(d.lhs, true)) orelse return null;
                 return c.nestNsContainer(.{ .module = m }, name);
             }
-            const outer = (try c.resolveNsContainer(d.lhs)) orelse return null;
+            const outer = (try resolveNsContainerAt(c, d.lhs, depth)) orelse return null;
             return c.nestNsContainer(outer, name);
         },
         else => return null,
@@ -799,6 +845,12 @@ pub fn containerFromImportTarget(c: *Checker, tgt0: modules.Target) ?NsContainer
 /// import JSX = JSXInternal }`), which left `JSX.Element` /
 /// `JSX.IntrinsicElements` resolving to nothing at all.
 pub fn importEqualsEntityContainer(c: *Checker, sym0: SymbolId) Error!?NsContainer {
+    return importEqualsEntityContainerAt(c, sym0, 0);
+}
+
+/// `importEqualsEntityContainer` with the alias-chain depth (see
+/// `resolveNsContainerAt`).
+fn importEqualsEntityContainerAt(c: *Checker, sym0: SymbolId, depth: u32) Error!?NsContainer {
     const sym = c.reprSym(sym0);
     if (!c.symFlags(sym).import_binding) return null;
     if (c.importTarget(sym) != null) return null; // module form: not ours
@@ -809,7 +861,7 @@ pub fn importEqualsEntityContainer(c: *Checker, sym0: SymbolId) Error!?NsContain
         c.cur_scope = c.symScope(sym);
         const e = c.tree.extraData(ast.ImportEquals, c.tree.nodeData(decl).lhs);
         if (e.module_token != 0 or e.entity == null_node) return null;
-        return try c.resolveNsContainer(e.entity);
+        return try resolveNsContainerAt(c, e.entity, depth + 1);
     }
     return null;
 }
