@@ -279,7 +279,7 @@ pub fn classStaticType(c: *Checker, sym: SymbolId) Error!TypeId {
     // `classIndexInfos` reads with `statics` set. Inherited signatures arrive
     // through the base merge below.
     const own_index = try classIndexInfos(c, sym, true);
-    var result = try c.ts.makeObject(props.items, own_index.str, own_index.num, 0);
+    var result = try c.ts.makeObject(props.items, own_index.str, own_index.num, own_index.objFlags(0));
     // Static members are inherited: `typeof D` includes `typeof Base`'s
     // statics (own members win over inherited). This is how leaflet's
     // `Map.include`/`GridLayer.extend` reach the static `extend`/`include`

@@ -393,9 +393,25 @@ pub fn unionCallableSigs(c: *Checker, a: TypeId, b: TypeId) Error!?TypeId {
 /// a single combined overload set (`derived`'s first) rather than the
 /// earlier declaration hiding the later's overloads — mirroring tsc's
 /// declaration-order overload concatenation across merged interface
-/// The `string`/`number` index signatures one half of a class body declares.
-/// 0 = none.
-pub const ClassIndexInfos = struct { str: TypeId = 0, num: TypeId = 0 };
+/// The index signatures one half of a class body declares. 0 = none.
+///
+/// A `symbol`-keyed signature shares the `str` slot — the whole type store
+/// models it that way (`obj_flag_symbol_index`) — so `sym_only` is what tells
+/// the two apart, and `objFlags` folds it back into the flag word every
+/// `makeObject` caller has to pass anyway.
+pub const ClassIndexInfos = struct {
+    str: TypeId = 0,
+    num: TypeId = 0,
+    /// The `str` slot holds a `[k: symbol]` signature and nothing else claims
+    /// the domain — the exact condition `typenode`'s interface/type-literal
+    /// builder sets `obj_flag_symbol_index` on.
+    sym_only: bool = false,
+
+    /// `base` plus the symbol-index flag when this half earned it.
+    pub fn objFlags(i: ClassIndexInfos, base: u32) u32 {
+        return if (i.sym_only) base | types.obj_flag_symbol_index else base;
+    }
+};
 
 /// The index signatures written in a class BODY. tsc resolves
 /// `[k: string]: T` onto the INSTANCE side and `static [k: string]: T` onto
@@ -410,6 +426,11 @@ pub const ClassIndexInfos = struct { str: TypeId = 0, num: TypeId = 0 };
 /// and `D[42]` through a base's `static [s: number]:` answered `any`.
 pub fn classIndexInfos(c: *Checker, sym: SymbolId, statics: bool) Error!ClassIndexInfos {
     var out: ClassIndexInfos = .{};
+    // Which of the two writers of the shared `str` slot won, decided once at
+    // the end: a `[k: string]` signature written alongside a `[k: symbol]` one
+    // takes the domain back, and either of them may come first in the body.
+    var str_index = false;
+    var sym_index = false;
     const saved_ctx = c.enterSymFile(sym);
     defer c.restoreCtx(saved_ctx);
     const saved_scope = c.cur_scope;
@@ -431,10 +452,15 @@ pub fn classIndexInfos(c: *Checker, sym: SymbolId, statics: bool) Error!ClassInd
             if (key == types.number_type) {
                 out.num = val;
             } else if (key == types.string_type) {
+                str_index = true;
+                out.str = val;
+            } else if (key == types.symbol_type) {
+                sym_index = true;
                 out.str = val;
             }
         }
     }
+    out.sym_only = sym_index and !str_index and out.num == 0;
     return out;
 }
 
@@ -470,10 +496,11 @@ pub fn mergeBaseObjectPlain(c: *Checker, derived: TypeId, base: TypeId, union_ov
     }
     const sidx = if (c.ts.objectStringIndex(derived) != 0) c.ts.objectStringIndex(derived) else c.ts.objectStringIndex(base);
     const nidx = if (c.ts.objectNumberIndex(derived) != 0) c.ts.objectNumberIndex(derived) else c.ts.objectNumberIndex(base);
+    const merged_flags = mergedIndexFlags(c, derived, base, nidx);
     // Preserve call/construct signatures from both sides: a callable
     // interface extending another accumulates every signature.
     if (!c.ts.objectHasSigs(derived) and !c.ts.objectHasSigs(base)) {
-        const m = try c.ts.makeObject(props.items, sidx, nidx, c.ts.objectFlags(derived) & ~types.obj_flag_has_sigs);
+        const m = try c.ts.makeObject(props.items, sidx, nidx, merged_flags & ~types.obj_flag_has_sigs);
         try c.carryKeyNameTypes(m, &.{ derived, base });
         return m;
     }
@@ -485,9 +512,27 @@ pub fn mergeBaseObjectPlain(c: *Checker, derived: TypeId, base: TypeId, union_ov
         for (0..c.ts.objectCallSigCount(o)) |i| try calls.append(c.scratch(), c.ts.objectCallSig(o, @intCast(i)));
         for (0..c.ts.objectConstructSigCount(o)) |i| try constructs.append(c.scratch(), c.ts.objectConstructSig(o, @intCast(i)));
     }
-    const merged = try c.ts.makeObjectSigs(props.items, sidx, nidx, c.ts.objectFlags(derived) & ~types.obj_flag_has_sigs, calls.items, constructs.items);
+    const merged = try c.ts.makeObjectSigs(props.items, sidx, nidx, merged_flags & ~types.obj_flag_has_sigs, calls.items, constructs.items);
     try c.carryKeyNameTypes(merged, &.{ derived, base });
     return merged;
+}
+
+/// `derived`'s flag word, corrected for the one flag the index merge above can
+/// change: `obj_flag_symbol_index`.
+///
+/// The flag says "the string slot holds a `[k: symbol]` signature, and nothing
+/// else claims the key domain", so it belongs to whichever side actually
+/// supplied the slot. A derived class that declares no index of its own and
+/// inherits a base's symbol signature (`class D extends C {}` where `C` writes
+/// `[s: symbol]: V`) would otherwise read that value type back as a STRING
+/// index — turning every inherited member into an index-signature violation.
+fn mergedIndexFlags(c: *const Checker, derived: TypeId, base: TypeId, nidx: TypeId) u32 {
+    const flags = c.ts.objectFlags(derived);
+    if (c.ts.objectStringIndex(derived) != 0) return flags;
+    const from_base = c.ts.objectFlags(base) & types.obj_flag_symbol_index != 0;
+    // A number index — from either side — takes the domain back.
+    if (from_base and nidx == 0) return flags | types.obj_flag_symbol_index;
+    return flags & ~types.obj_flag_symbol_index;
 }
 
 /// Carry `key_name_types` entries from the tables an object was BUILT from
@@ -570,7 +615,7 @@ pub fn classInstanceGeneric(c: *Checker, sym0: SymbolId) Error!TypeId {
     // fail assignment to `{[k:string]:T}`) — but a body that WRITES one has
     // it (`class C { [k: string]: number }`).
     const own_index = try classIndexInfos(c, sym, false);
-    var result: TypeId = try c.ts.makeObject(&.{}, own_index.str, own_index.num, types.obj_flag_not_inferable);
+    var result: TypeId = try c.ts.makeObject(&.{}, own_index.str, own_index.num, own_index.objFlags(types.obj_flag_not_inferable));
     if (c.bind.membersScopeOf(c.localOf(sym))) |ms| {
         const kscope = c.symScope(sym);
         const lo = c.bind.scope_members_start[ms];
@@ -593,7 +638,7 @@ pub fn classInstanceGeneric(c: *Checker, sym0: SymbolId) Error!TypeId {
                 .flags = flags,
             });
         }
-        result = try c.ts.makeObject(props.items, own_index.str, own_index.num, types.obj_flag_not_inferable);
+        result = try c.ts.makeObject(props.items, own_index.str, own_index.num, own_index.objFlags(types.obj_flag_not_inferable));
     }
     // Same-file class+interface declaration merge. tsc binds the pair to ONE
     // symbol whose declarations share a single member table, and whose base

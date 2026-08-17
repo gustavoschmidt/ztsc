@@ -409,7 +409,7 @@ fn gatherClassMembers(c: *Checker, node: Node, statics: bool, out: *Own) Error!v
                 const tok = c.tree.nodeMainToken(m);
                 const name = try c.memberKey(tok, flags);
                 if (c.isCtorName(name)) continue;
-                try addProp(c, out, name, tok);
+                try addProp(c, out, name, tok, flags);
             },
             .index_signature => {
                 if ((md.rhs & ast.Flags.static != 0) != statics) continue;
@@ -436,7 +436,7 @@ fn gatherInterfaceBlocks(c: *Checker, sym: SymbolId, out: *Own) Error!void {
             switch (c.nodeTag(m)) {
                 .property_signature, .method_signature => {
                     const tok = c.tree.nodeMainToken(m);
-                    try addProp(c, out, try c.memberKey(tok, md.rhs), tok);
+                    try addProp(c, out, try c.memberKey(tok, md.rhs), tok, md.rhs);
                 },
                 .index_signature => try addIndex(c, out, m, md.lhs),
                 // Call and construct signatures name no member.
@@ -446,9 +446,34 @@ fn gatherInterfaceBlocks(c: *Checker, sym: SymbolId, out: *Own) Error!void {
     }
 }
 
-fn addProp(c: *Checker, out: *Own, name: Atom, tok: TokenIndex) Error!void {
+fn addProp(c: *Checker, out: *Own, name: Atom, tok: TokenIndex, flags: u32) Error!void {
     const gop = try out.props.getOrPut(c.scratch(), name);
-    if (!gop.found_existing) gop.value_ptr.* = .{ .file = c.cur_file, .span = c.tokSpan(tok) };
+    if (!gop.found_existing) gop.value_ptr.* = .{ .file = c.cur_file, .span = nameSpan(c, tok, flags) };
+}
+
+/// tsc's `getNameOfDeclaration(prop.valueDeclaration)` as a span. A member's
+/// name token is the identifier that NAMES it, which for a computed key
+/// (`[Symbol.toStringTag]`, `[k]`) sits INSIDE the brackets — but tsc's name
+/// node is the whole `ComputedPropertyName`, so it anchors the diagnostic at
+/// the `[`, and ztsc's own member NODE starts at that inner token too.
+///
+/// The bracket is recovered by walking back over the key's entity name — the
+/// only shape a computed key that NAMES a member can have, since the name is
+/// what `memberKey` resolved (`Symbol.iterator`, or an identifier path denoting
+/// a `unique symbol`). Anything else ends the walk and keeps the name token, so
+/// an unanticipated spelling costs the old position rather than a wrong one.
+fn nameSpan(c: *Checker, tok: TokenIndex, flags: u32) Span {
+    const name_span = c.tokSpan(tok);
+    if (flags & (ast.Flags.computed | ast.Flags.computed_sym) == 0) return name_span;
+    var i = tok;
+    while (i > 0) : (i -= 1) {
+        switch (c.tree.tokens.tag(i)) {
+            .l_bracket => return c.tokSpan(i),
+            .identifier, .dot => {},
+            else => return name_span,
+        }
+    }
+    return name_span;
 }
 
 fn addIndex(c: *Checker, out: *Own, node: Node, extra: ast.ExtraIndex) Error!void {
