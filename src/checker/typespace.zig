@@ -664,10 +664,18 @@ pub fn importTypeMember(c: *Checker, import_node: Node, name_tok: TokenIndex, ar
 /// Does this symbol's whole meaning consist of being a namespace? tsc's
 /// `SymbolFlags.Type` excludes `Namespace`, so such a symbol names no type —
 /// see `materializeTypeRef`'s TS2709 arm and the qualified-member test.
+///
+/// A VALUE meaning is excluded too, and not because it makes the name a type:
+/// tsc answers a different diagnostic for that shape. `namespace A { export
+/// function B<T>(x: T) {} export namespace B { … } }` with `var b: A.B` is
+/// TS2749 ("refers to a value … did you mean 'typeof A.B'?"), spanning the
+/// WHOLE dotted name, not the TS2694 this predicate leads to. Until that
+/// message is spelled, such a member keeps its pre-existing silent `any`.
 fn pureNamespace(f: binder.SymbolFlags) bool {
     if (!f.namespace_decl) return false;
     return !(f.class or f.interface or f.type_alias or f.type_param or
-        f.enum_decl or f.import_binding);
+        f.enum_decl or f.import_binding or
+        f.function or f.var_decl or f.let_decl or f.const_decl);
 }
 
 /// The qualifier of a dotted type name reached no container. tsc splits that
@@ -695,6 +703,12 @@ fn reportBadNsQualifier(c: *Checker, node: Node) Error!bool {
     }
     if (c.nodeTag(n) != .identifier) return false;
     const tok = c.tree.nodeMainToken(n);
+    // `globalThis` is in scope everywhere and has no declaration for the walk
+    // above to find, so it would read as "cannot find namespace". tsc's
+    // `globalThisSymbol` carries `Module` meaning and resolves:
+    // `T extends globalThis.Function` is silent (the lib's own
+    // instanceofOperatorWithRHSHasSymbolHasInstance test).
+    if (std.mem.eql(u8, c.tokenText(tok), "globalThis")) return false;
     const a = try c.atomOfToken(tok);
     const type_only_entity = switch (c.resolveNamespaceSpace(a, c.cur_scope)) {
         .sym => return false,
@@ -704,6 +718,13 @@ fn reportBadNsQualifier(c: *Checker, node: Node) Error!bool {
     if ((try c.augmentModuleTypeSym(c.cur_scope, a)) != null) return false;
     if (type_only_entity) {
         try c.diagFmt(2702, c.tokSpan(tok), "'{s}' only refers to a type, but is being used as a namespace here.", .{c.tokenText(tok)});
+        return true;
+    }
+    // tsc's "not found" pair, exactly as the bare-name arm above spells it:
+    // a close name in scope turns the message into the suggestion variant
+    // (TS2833 rather than TS2503).
+    if (c.suggestName(a, c.cur_scope, false)) |sugg| {
+        try c.diagFmt(2833, c.tokSpan(tok), "Cannot find namespace '{s}'. Did you mean '{s}'?", .{ c.tokenText(tok), c.atomText(sugg) });
         return true;
     }
     try c.diagFmt(2503, c.tokSpan(tok), "Cannot find namespace '{s}'.", .{c.tokenText(tok)});
