@@ -34,6 +34,7 @@ const checkFunctionBody = @import("stmts.zig").checkFunctionBody;
 const containerOf = Checker.containerOf;
 const ctxWantsTemplate = @import("generics.zig").ctxWantsTemplate;
 const diagFmt = Checker.diagFmt;
+const discriminate_ctx = @import("discriminate_ctx.zig");
 const flowContainerOf = @import("flow.zig").flowContainerOf;
 const flowTypeOfReference = @import("flow.zig").flowTypeOfReference;
 const gatherSpreadProps = @import("typenode.zig").gatherSpreadProps;
@@ -43,6 +44,7 @@ const names_zig = @import("names.zig");
 const narrowable = @import("narrowable.zig");
 const hasTypeMeaning = @import("names.zig").hasTypeMeaning;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
+const identity = @import("identity.zig");
 const indexableConstituent = @import("typenode.zig").indexableConstituent;
 const init = Checker.init;
 const instantiate = @import("enums.zig").instantiate;
@@ -1929,58 +1931,6 @@ fn constraintKeepsLiteralKind(c: *Checker, constraint: TypeId, lk: types.Kind) E
     }
 }
 
-/// The literal type an object-literal property value denotes *syntactically*
-/// — a string/number/boolean literal — for use as a discriminant when the
-/// contextual type is a union. `no_type` for anything else (no full check).
-fn discriminantLiteralOf(c: *Checker, node: Node) Error!TypeId {
-    if (node == null_node) return types.no_type;
-    return switch (c.nodeTag(node)) {
-        .string_literal => try c.ts.makeStringLiteral(try c.memberAtom(c.tree.nodeMainToken(node)), false),
-        .number_literal => try c.ts.makeNumberLiteral(c.numberTokenValue(c.tree.nodeMainToken(node)), false),
-        .true_literal => types.true_type,
-        .false_literal => types.false_type,
-        else => types.no_type,
-    };
-}
-
-/// Discriminant-guided contextual typing: when an object literal is typed by
-/// a union, filter the union to the constituents whose properties accept the
-/// literal-valued properties of the source (tsc's
-/// `discriminateTypeByDiscriminantProperties`). Typing each property against
-/// the surviving constituent(s) keeps its literal discriminant instead of
-/// widening it against a union-wide property type (`'X' | string` = `string`)
-/// that no arm's literal discriminant would then match. Only ever *narrows*
-/// the union (each removed member has a discriminant that rejects the source
-/// literal, so it can never be the target) — an empty result means no arm
-/// matched, so the original union stands and the mismatch is reported.
-fn discriminateCtxUnion(c: *Checker, node: Node, rctx: TypeId) Error!TypeId {
-    var surviving = try c.memberList(rctx);
-    var narrowed = false;
-    for (c.tree.nodeRange(node)) |prop| {
-        if (prop == null_node or c.nodeTag(prop) != .object_property) continue;
-        const pd = c.tree.nodeData(prop);
-        if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) continue;
-        const lit = try discriminantLiteralOf(c, pd.rhs);
-        if (lit == types.no_type) continue;
-        const key = try c.memberAtom(c.tree.nodeMainToken(prop));
-        var keep: std.ArrayList(TypeId) = .empty;
-        defer keep.deinit(c.scratch());
-        for (surviving) |m| {
-            if (try c.propOfType(try c.resolveStructural(m), key)) |p| {
-                if (try c.isAssignable(lit, p.ty)) try keep.append(c.scratch(), m);
-            } else {
-                try keep.append(c.scratch(), m); // member does not constrain `key`
-            }
-        }
-        if (keep.items.len > 0 and keep.items.len < surviving.len) {
-            surviving = try c.scratch().dupe(TypeId, keep.items);
-            narrowed = true;
-        }
-    }
-    if (!narrowed) return rctx;
-    return c.ts.makeUnion(c.scratch(), surviving);
-}
-
 /// Upper bound on the constituents of a distributed union spread (see
 /// `checkObjectLiteral`). The work is linear in this number, and the unions
 /// that need it are hand-written discriminated unions an order of magnitude
@@ -2117,13 +2067,59 @@ fn objectLiteralWhole(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
 /// constituent of a distributed object literal (see `checkObjectLiteral`).
 pub const Subst = struct { node: Node, ty: TypeId };
 
+/// tsc's `instantiateContextualType(…, ContextFlags.Signature)`: before a
+/// nested expression reads a still-generic contextual type, tsc re-instantiates
+/// it with the inferences made SO FAR (`inferenceContext.nonFixingMapper`), so
+/// `Props<C> = { as?: C } & Elements[C]` is already `Props<"bar">` by the time
+/// the `callback` property asks for its contextual signature.
+///
+/// ztsc has no inference context in hand here, so this recovers the one shape
+/// that matters and nothing else: a property of the literal whose contextual
+/// type is a BARE type parameter binds that parameter to the property's own
+/// (context-free) value type. Only the value forms discrimination already
+/// trusts are read, and only a value satisfying the parameter's constraint
+/// binds it — an unconstrained guess would substitute a type tsc's inference
+/// would have widened or discarded.
+///
+/// Without it the contextual type stays generic, ztsc reads `Elements[C]`
+/// through its base constraint — a union of every element's props — and the
+/// callback's contextual signature is a disagreeing union: TS7006.
+fn resolveCtxTypeParams(c: *Checker, node: Node, rctx: TypeId) Error!TypeId {
+    if (!try c.containsFreeTypeParam(rctx, &.{})) return rctx;
+    var map: std.ArrayList(TpMap) = .empty;
+    defer map.deinit(c.scratch());
+    props: for (c.tree.nodeRange(node)) |prop| {
+        if (prop == null_node) continue;
+        const pd = c.tree.nodeData(prop);
+        const value: Node = switch (c.nodeTag(prop)) {
+            .object_property => if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) continue else pd.rhs,
+            .object_shorthand => pd.lhs,
+            else => continue,
+        };
+        if (!discriminate_ctx.possiblyDiscriminantValue(c, value)) continue;
+        const key = try c.memberAtom(c.tree.nodeMainToken(prop));
+        const pctx = try c.ctxPropType(rctx, rctx, key);
+        if (pctx == types.no_type or c.ts.kind(pctx) != .type_param) continue;
+        const sym = c.ts.typeParamSymbol(pctx);
+        // First binding wins, as tsc's first inference candidate does.
+        for (map.items) |m| if (m.sym == sym) continue :props;
+        const vt = try c.checkExprCached(value, types.no_type);
+        const con = try c.typeParamConstraint(sym);
+        if (con != types.no_type and !try c.isAssignable(vt, con)) continue;
+        try map.append(c.scratch(), .{ .sym = sym, .ty = vt });
+    }
+    if (map.items.len == 0) return rctx;
+    return c.resolveStructural(try c.instantiate(rctx, map.items));
+}
+
 /// One constituent of an object literal's type. `dist` names the spread
 /// elements whose source types are replaced for this constituent (see
 /// `checkObjectLiteral`); it is empty for an undistributed literal.
 fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) Error!TypeId {
     var rctx = if (ctx != types.no_type) try c.resolveStructural(ctx) else types.no_type;
+    if (rctx != types.no_type) rctx = try resolveCtxTypeParams(c, node, rctx);
     if (rctx != types.no_type and c.ts.kind(rctx) == .union_type) {
-        rctx = try discriminateCtxUnion(c, node, rctx);
+        rctx = try discriminate_ctx.byObjectMembers(c, node, rctx);
     }
     var props: std.ArrayList(types.Prop) = .empty;
     defer props.deinit(c.scratch());
@@ -2572,7 +2568,11 @@ pub fn ctxPropType(c: *Checker, rctx: TypeId, ctx: TypeId, key: Atom) Error!Type
             return c.ts.makeIntersection(c.scratch(), parts.items);
         },
         else => {
-            if (try c.propOfType(rctx, key)) |p| return p.ty;
+            // `ctxPropOfType`, not `propOfType`: tsc looks a contextual
+            // property up with `skipObjectFunctionPropertyAugment`, so the
+            // members `Function` and `Object` lend every value never become
+            // one — see `ctxPropOfType`.
+            if (try c.ctxPropOfType(rctx, key)) |p| return p.ty;
             return types.no_type;
         },
     }
@@ -5217,52 +5217,30 @@ pub fn contextualCallSig(c: *Checker, ctx: TypeId, fn_node: Node) Error!TypeId {
         // — is one signature list, and answers with its sole survivor or
         // their combination.
         if (c.ts.kind(rctx) == .union_type) {
-            // Each constituent is asked separately, and the arity filter runs
-            // INSIDE each — so a constituent whose signatures are all too
-            // narrow drops out and the NEXT one still answers. That order is
-            // the whole point of the filter living in
-            // `contextualCallSigOfType`: `((event: any) => void) | (() => void)`
-            // must answer with its one-parameter constituent for
-            // `(event) => …`.
+            // Every constituent that offers a signature must offer the SAME
+            // one; a union whose constituents disagree hands over NOTHING and
+            // the expression's parameters are implicit `any`:
             //
-            // tsc goes one step further and requires every constituent that
-            // answers to answer with the SAME signature
-            // (`compareSignaturesIdentical`, return types and `this`
-            // ignored), handing over nothing when they disagree. That step
-            // is NOT taken here yet, and cannot be until the contextual type
-            // of an object literal / JSX attribute list is DISCRIMINATED
-            // first (tsc's `discriminateContextualTypeByObjectMembers` /
-            // `…ByJSXAttributes`, which run before `getContextualSignature`
-            // ever sees the union). Without discrimination the disagreement
-            // test fires on unions tsc has already narrowed to one
-            // constituent, and every callback in a discriminated-union
-            // literal reports TS7006 (measured: 7 corpus cases lost, 2
-            // gained). The two it would gain —
-            // `contextualTypeWithUnionTypeCallSignatures` and
-            // `contextualOverloadListFromUnionWithPrimitiveNoImplicitAny` —
-            // are waiting on that.
+            // ```ts
+            // else if (!compareSignaturesIdentical(signatureList[0], signature, …)) {
+            //     return undefined;  // Signatures aren't identical, do not use
+            // }
+            // ```
             //
-            // Overload sets and multi-signature objects are likewise left
-            // alone inside a union: combining them here is what let
-            // `String.prototype.normalize` type a `normalize` property
-            // written against `string | FullRule`.
+            // Taking the first that answers instead typed a callback from
+            // whichever constituent came first: an object literal written
+            // against `string | FullRule` took its `normalize` property from
+            // `String.prototype.normalize` and cascaded three errors out of a
+            // parameter tsc simply reports as implicitly `any`.
             for (try c.memberList(rctx)) |m| {
-                const rm = try c.resolveStructural(m);
-                const sig: TypeId = switch (c.ts.kind(rm)) {
-                    .function => rm,
-                    .object => if (c.ts.objectCallSigCount(rm) == 1)
-                        c.ts.objectCallSig(rm, 0)
-                    else
-                        types.no_type,
-                    // An optional property whose declared type is an
-                    // intersection of callables arrives as `(A & B) | undefined`.
-                    .intersection => try contextualCallSigOfType(c, rm, required),
-                    else => types.no_type,
-                };
+                const sig = try contextualCallSigOfType(c, try c.resolveStructural(m), required);
                 if (sig == types.no_type) continue;
-                if (required) |n| if (sig_zig.arityIsSmaller(c, sig, n)) continue;
-                ctx_sig = sig;
-                break;
+                if (ctx_sig == types.no_type) {
+                    ctx_sig = sig;
+                } else if (!try identity.signatureParamsIdentical(c, ctx_sig, sig)) {
+                    ctx_sig = types.no_type;
+                    break;
+                }
             }
         } else {
             ctx_sig = try contextualCallSigOfType(c, rctx, required);

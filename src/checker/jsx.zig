@@ -42,6 +42,7 @@ const Error = checker_zig.Error;
 const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const containsAtom = @import("expr.zig").containsAtom;
+const discriminate_ctx = @import("discriminate_ctx.zig");
 const hasTypeMeaning = @import("names.zig").hasTypeMeaning;
 const NsContainer = @import("typespace.zig").NsContainer;
 const tpIndex = @import("calls.zig").tpIndex;
@@ -105,6 +106,24 @@ pub fn checkJsxElement(c: *Checker, node: Node) Error!TypeId {
         const chosen = try c.jsxComponentProps(tag_ty, targs.items, node);
         props = chosen.props orelse types.no_type;
         overloads_exhausted = chosen.overloads_exhausted;
+    }
+    // tsc's `discriminateContextualTypeByJSXAttributes`, the JSX half of the
+    // step an object literal gets in `objectLiteralType`: a props type that is
+    // a UNION is collapsed to the constituent the attributes themselves select
+    // BEFORE anything reads it — each attribute's contextual type, the
+    // children's, and so every render prop's contextual signature. Placed here
+    // rather than inside `checkJsxAttributes` so the children below share the
+    // one answer.
+    if (props != types.no_type) {
+        const rp = try c.resolveStructural(props);
+        if (c.ts.kind(rp) == .union_type) {
+            props = try discriminate_ctx.byJsxAttributes(
+                c,
+                c.tree.extraRange(e.attrs_start, e.attrs_end),
+                rp,
+                c.jsxChildrenPresent(e),
+            );
+        }
     }
     if (overloads_exhausted) {
         try reportJsxOverloadFailure(c, node, e, props);
@@ -854,13 +873,20 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
             break :blk try c.ctxPropType(rt, rt, nm);
         } else types.no_type;
         const vty = try c.jsxAttributeValueType(ad.lhs, vctx);
-        // Hyphenated names (`data-*`, `aria-*`) are exempt from excess and
-        // assignability checks (tsc), but their value expressions are still
-        // checked — `jsxAttributeValueType` above did that.
-        if (c.tree.tokens.tag(name_tok) == .jsx_name) continue;
         const name = try c.memberAtom(name_tok);
-        try built.append(c.scratch(), .{ .name = name, .ty = vty, .value = ad.lhs, .name_tok = name_tok });
+        // A hyphenated name (`data-*`, `aria-*`) IS a property of the
+        // attributes object tsc builds — `createJsxAttributesType` puts every
+        // attribute in it — and it is only `isKnownProperty` that waives it
+        // (`isComparingJsxAttributes && isHyphenatedJsxName(name)`), i.e. the
+        // EXCESS check. So it stays out of the per-attribute assignability
+        // walk below but counts as PROVIDED: `<ToolButton type="button"
+        // aria-label={…} />` satisfies a required `"aria-label": string`, and
+        // dropping it reported TS2322 on 38 excalidraw elements the moment
+        // discrimination narrowed their props union to the one arm.
+        // Its value expression was checked either way, just above.
         try provided.append(c.scratch(), .{ .name = name, .ty = vty });
+        if (c.tree.tokens.tag(name_tok) == .jsx_name) continue;
+        try built.append(c.scratch(), .{ .name = name, .ty = vty, .value = ad.lhs, .name_tok = name_tok });
     }
 
     if (rt == types.no_type) return;

@@ -44,14 +44,37 @@ pub fn propOfType(c: *Checker, t: TypeId, name: Atom) Error!?types.Prop {
 /// not assignable to `Date`/`{ x: number }`. Only the relation callers pass
 /// false; the index signature is related separately (indexSignaturesRelatedTo).
 pub fn propOfTypeEx(c: *Checker, t: TypeId, name: Atom, allow_index: bool) Error!?types.Prop {
-    return propOfTypeIdx(c, t, name, allow_index, null);
+    return propOfTypeIdx(c, t, name, .{ .allow_index = allow_index });
 }
 
-/// `propOfTypeEx` with the provenance of the answer reported back: when
-/// `from_index` is non-null it is set whenever the property came from a string
-/// INDEX SIGNATURE rather than from a declared/apparent member. Only the
-/// intersection arm asks — see the note there.
-fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, allow_index: bool, from_index: ?*bool) Error!?types.Prop {
+/// tsc's `getPropertyOfType(t, name, /*skipObjectFunctionPropertyAugment*/ true)`
+/// — the lookup CONTEXTUAL typing runs. A property's contextual type is what
+/// the target DECLARES for that name, never what the global `Function` and
+/// `Object` interfaces lend every value: an object literal written against
+/// `WebpackPluginInstance | ((c: Compiler) => void)` must take `apply` from the
+/// interface alone, because reading `CallableFunction.apply` off the function
+/// constituent puts a second, disagreeing signature into a union that
+/// `contextualCallSig` then refuses outright (TS7006 on the callback).
+pub fn ctxPropOfType(c: *Checker, t: TypeId, name: Atom) Error!?types.Prop {
+    return propOfTypeIdx(c, t, name, .{ .skip_augment = true });
+}
+
+/// What a property lookup should answer beyond the name itself.
+const PropLookup = struct {
+    /// `true` (the member-access default) lets a string index signature stand
+    /// in for any name; see `propOfTypeEx`.
+    allow_index: bool = true,
+    /// Skip the apparent members every value inherits from the global
+    /// `Function`/`Object` interfaces (tsc's `skipObjectFunctionPropertyAugment`).
+    skip_augment: bool = false,
+    /// Set when the answer came from a string INDEX SIGNATURE rather than from
+    /// a declared/apparent member. Only the intersection arm asks — see there.
+    from_index: ?*bool = null,
+};
+
+fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, o: PropLookup) Error!?types.Prop {
+    const allow_index = o.allow_index;
+    const from_index = o.from_index;
     const s = &c.ts;
     switch (s.kind(t)) {
         .object => {
@@ -81,7 +104,7 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, allow_index: bool, from_ind
             // apparent members of the global `Function` interface
             // (`.bind`/`.call`/`.apply`/`.name`/`.length`/…). Plain
             // (non-callable) objects do NOT — an absent member stays TS2339.
-            if (s.objectCallSigCount(t) > 0 or s.objectConstructSigCount(t) > 0) {
+            if (!o.skip_augment and (s.objectCallSigCount(t) > 0 or s.objectConstructSigCount(t) > 0)) {
                 if (try functionInterfaceProp(c, name)) |p| return p;
             }
             if (!allow_index) {
@@ -111,7 +134,9 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, allow_index: bool, from_ind
             // *target*'s own property list, and `isKnownProperty` (the
             // excess-property check) deliberately does not consult the
             // global object type.
-            if (try c.objectInterfaceProp(name)) |p| return p;
+            if (!o.skip_augment) {
+                if (try c.objectInterfaceProp(name)) |p| return p;
+            }
             // The string index signature is the LAST resort, after the
             // apparent members — tsc's `getPropertyOfType` never consults
             // an index signature at all, and
@@ -146,7 +171,7 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, allow_index: bool, from_ind
             defer found.deinit(c.scratch());
             for (members) |m| {
                 const r = try c.resolveStructural(m);
-                const p = (try propOfTypeIdx(c, r, name, allow_index, from_index)) orelse return null;
+                const p = (try propOfTypeIdx(c, r, name, o)) orelse return null;
                 try found.append(c.scratch(), p);
                 try parts.append(c.scratch(), p.ty);
                 flags |= p.flags;
@@ -222,7 +247,9 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, allow_index: bool, from_ind
                     }
                 }
                 var via_index = false;
-                if (try propOfTypeIdx(c, lookup, name, allow_index, &via_index)) |p| {
+                var sub_index = o;
+                sub_index.from_index = &via_index;
+                if (try propOfTypeIdx(c, lookup, name, sub_index)) |p| {
                     for ([_]*?types.Prop{ if (via_index) &idx_found else &found, &all }) |slot| {
                         if (slot.* == null) {
                             slot.* = p;
@@ -322,7 +349,7 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, allow_index: bool, from_ind
                 const next = try c.resolveStructural(constraint);
                 if (next == cur) return null;
                 if (s.kind(next) != .type_param) {
-                    return propOfTypeIdx(c, next, name, allow_index, from_index);
+                    return propOfTypeIdx(c, next, name, o);
                 }
                 cur = next;
             }
@@ -361,7 +388,7 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, allow_index: bool, from_ind
                 );
                 // key set still generic
                 if (s.kind(inst) == .mapped) return c.objectInterfaceProp(name);
-                return propOfTypeIdx(c, inst, name, allow_index, from_index);
+                return propOfTypeIdx(c, inst, name, o);
             }
             // A NON-homomorphic map (`Pick`/`Omit`/`Record` applied to a
             // generic) defers on its *constraint*, not a source, so the
@@ -375,7 +402,7 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, allow_index: bool, from_ind
             const rbc = try c.resolveStructural(bc);
             // key set still generic
             if (s.kind(rbc) == .mapped) return c.objectInterfaceProp(name);
-            return propOfTypeIdx(c, rbc, name, allow_index, from_index);
+            return propOfTypeIdx(c, rbc, name, o);
         },
         // A still-deferred conditional has the apparent members of its
         // DEFAULT CONSTRAINT — tsc's `getDefaultConstraintOfConditionalType`,
@@ -388,20 +415,20 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, allow_index: bool, from_ind
         .conditional => {
             const u = try c.makeUnion2(try c.condTrueUnderExtends(t), s.condFalse(t));
             if (u == t) return null;
-            return propOfTypeIdx(c, u, name, allow_index, from_index);
+            return propOfTypeIdx(c, u, name, o);
         },
-        .ref => return propOfTypeIdx(c, try c.resolveStructural(t), name, allow_index, from_index),
-        .class_value => return classValueProp(c, s.classSymbol(t), name, allow_index, from_index),
+        .ref => return propOfTypeIdx(c, try c.resolveStructural(t), name, o),
+        .class_value => return classValueProp(c, s.classSymbol(t), name, o),
         .enum_type => {
             // A value of enum type borrows its base primitive's members.
             const info = try c.enumInfo(s.enumSymbol(t));
             const base: TypeId = if (info.all_string) types.string_type else types.number_type;
-            return propOfTypeIdx(c, base, name, allow_index, from_index);
+            return propOfTypeIdx(c, base, name, o);
         },
         // A bare function type or overload set (arrow/normal function,
         // `(x) => y`, an overloaded signature) has the apparent members of
         // the global `Function` interface.
-        .function, .overloads => return functionInterfaceProp(c, name),
+        .function, .overloads => return if (o.skip_augment) null else functionInterfaceProp(c, name),
         else => return null,
     }
 }
@@ -520,9 +547,9 @@ fn functionInterfaceProp(c: *Checker, name: Atom) Error!?types.Prop {
 /// Source 3 is what a bare `.class_value` arm was missing: `Class.name` — the
 /// idiom every DI container, test factory and log line in a Nest/Angular
 /// codebase is built on — was TS2339 on every class in the program.
-fn classValueProp(c: *Checker, cls: SymbolId, name: Atom, allow_index: bool, from_index: ?*bool) Error!?types.Prop {
+fn classValueProp(c: *Checker, cls: SymbolId, name: Atom, o: PropLookup) Error!?types.Prop {
     if (try c.ownStaticMemberProp(cls, name)) |p| return p;
-    if (try propOfTypeIdx(c, try c.classStaticType(cls), name, allow_index, from_index)) |p| return p;
+    if (try propOfTypeIdx(c, try c.classStaticType(cls), name, o)) |p| return p;
     if (name == c.atom_prototype and name != 0) {
         var tps: std.ArrayList(checker_zig.Checker.TypeParamInfo) = .empty;
         defer tps.deinit(c.scratch());
@@ -536,6 +563,7 @@ fn classValueProp(c: *Checker, cls: SymbolId, name: Atom, allow_index: bool, fro
             .flags = types.prop_flag_readonly,
         };
     }
+    if (o.skip_augment) return null;
     return functionInterfaceProp(c, name);
 }
 

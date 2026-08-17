@@ -733,16 +733,25 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
             // antecedent has to happen back in the query's own scope, exactly
             // as the fall-through below does.
             var strip_nullish = false;
+            // A COMPOUND write answers with the antecedent's type (see
+            // `AssignResult`), and that walk belongs below, outside the
+            // assignment's scope.
+            var base_of_ante = false;
             {
                 const saved = c.cur_scope;
                 defer c.cur_scope = saved;
                 c.cur_scope = b.flowScope(flow);
                 if (try assignNarrows(c, target, key, declared)) |narrowed| {
-                    return narrowed;
+                    switch (narrowed) {
+                        .ty => |t| return t,
+                        .base_of_antecedent => base_of_ante = true,
+                    }
+                } else {
+                    strip_nullish = try forInSubjectMatches(c, flow, target, key);
                 }
-                strip_nullish = try forInSubjectMatches(c, flow, target, key);
             }
             const before = try flowType(c, ante, key, declared, depth + 1);
+            if (base_of_ante) return try c.baseTypeOfLiteral(before);
             // The tail of tsc's `getTypeAtFlowAssignment`: the assignment that
             // binds a `for..in` KEY strips nullish from the object being
             // enumerated, for the whole body. `for (const k in
@@ -1049,6 +1058,23 @@ fn definiteAssignOp(op: scanner.Tag) bool {
     };
 }
 
+/// tsc's `isLogicalOrCoalescingAssignmentOperator`. These three are DEFINITE
+/// writes there (`getAssignmentTargetKind`), not compound ones: each writes
+/// its right-hand side outright, on the branch where it runs at all.
+///
+/// ztsc's binder gives them one unconditional assign-flow node rather than
+/// tsc's branch-and-join, so the narrowing arm answers with the whole
+/// expression's type — `x ??= s` is `NonNullable<x> | typeof s`, which is
+/// exactly what the join would have produced. What matters here is that they
+/// stay OFF the compound path: `getBaseTypeOfLiteralType(antecedent)` would
+/// leave `session.startSegment ??= i` at `number | null`.
+fn logicalAssignOp(op: scanner.Tag) bool {
+    return switch (op) {
+        .amp_amp_eq, .pipe_pipe_eq, .question_question_eq => true,
+        else => false,
+    };
+}
+
 /// Does the destructuring-assignment target `node` write the reference `key`
 /// anywhere inside it? Every element target of an object/array cover-grammar
 /// pattern is its own definite write in tsc's flow graph, and nesting, defaults
@@ -1254,30 +1280,52 @@ pub fn isNullishUnion(c: *Checker, t: TypeId) bool {
     return false;
 }
 
+/// What an assign-flow node hands the reference it writes — the two arms of
+/// tsc's `getTypeAtFlowAssignment`.
+const AssignResult = union(enum) {
+    /// A DEFINITE write (`=` and the logical assignments): the type the
+    /// reference has afterwards, already reduced against its declared type.
+    ty: TypeId,
+    /// A COMPOUND write (`+=`, `x++`, `--x`, …). tsc reads the type the
+    /// reference already had and only strips literal-ness from it:
+    ///
+    /// ```ts
+    /// if (getAssignmentTargetKind(node) === AssignmentKind.Compound) {
+    ///     const flowType = getTypeAtFlowNode(flow.antecedent);
+    ///     return createFlowType(getBaseTypeOfLiteralType(getTypeFromFlowType(flowType)), …);
+    /// }
+    /// ```
+    ///
+    /// The antecedent is not walked here — that has to happen back in the
+    /// QUERY's scope, not the assignment's — so this arm only says which
+    /// answer to build, and `flowType`'s `.assign` case builds it.
+    base_of_antecedent,
+};
+
 /// If the assign-flow node writes the reference (or invalidates a
-/// property path by writing its root), the type after the assignment;
-/// null when it is unrelated.
-fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) Error!?TypeId {
+/// property path by writing its root), what the reference is worth after the
+/// assignment; null when it is unrelated.
+fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) Error!?AssignResult {
     if (target == null_node) return null;
     const root_sym = key.sym;
     switch (c.nodeTag(target)) {
         .declarator_init => {
             const d = c.tree.nodeData(target);
             if (!try patternBindsSym(c, d.lhs, root_sym)) return null;
-            if (key.len != 0) return declared; // root re-init: reset path
-            if (c.nodeTag(d.lhs) != .identifier) return declared;
-            if (!assignmentRefines(c, declared)) return declared;
+            if (key.len != 0) return .{ .ty = declared }; // root re-init: reset path
+            if (c.nodeTag(d.lhs) != .identifier) return .{ .ty = declared };
+            if (!assignmentRefines(c, declared)) return .{ .ty = declared };
             const vt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
-            return try assignmentReduced(c, declared, vt);
+            return .{ .ty = try assignmentReduced(c, declared, vt) };
         },
         .declarator_full => {
             const d = c.tree.nodeData(target);
             if (!try patternBindsSym(c, d.lhs, root_sym)) return null;
             const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
-            if (key.len != 0) return declared;
-            if (e.init == 0) return declared;
-            if (c.nodeTag(d.lhs) != .identifier) return declared;
-            if (!assignmentRefines(c, declared)) return declared;
+            if (key.len != 0) return .{ .ty = declared };
+            if (e.init == 0) return .{ .ty = declared };
+            if (c.nodeTag(d.lhs) != .identifier) return .{ .ty = declared };
+            if (!assignmentRefines(c, declared)) return .{ .ty = declared };
             // Reading this variable can reach its declaration's flow node
             // BEFORE the declaration statement itself is checked — a JSX
             // attribute referring to a `const cb: CB = (props) => …`
@@ -1297,7 +1345,7 @@ fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) Error
             else
                 types.no_type;
             const vt = c.nodeType(e.init) orelse try c.checkExprCached(e.init, ctx);
-            return try assignmentReduced(c, declared, vt);
+            return .{ .ty = try assignmentReduced(c, declared, vt) };
         },
         .assign => {
             const d = c.tree.nodeData(target);
@@ -1315,22 +1363,23 @@ fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) Error
                 if (key.opt_init and !definiteAssignOp(op)) return null;
                 // A compound assignment writes a PATH exactly as it writes a
                 // variable, and tsc narrows both (a property access is a
-                // reference in the flow graph). `session.startSegment ??= i`
-                // leaves a `number`, and giving up here left it `number |
-                // null` for the rest of the function — immich's
+                // reference in the flow graph). Giving up here left
+                // `session.startSegment ??= i` at `number | null` for the rest
+                // of the function — immich's
                 // `TranscodingService.onSegmentRequest`.
-                if (op != .eq) {
+                if (logicalAssignOp(op)) {
                     const vt = c.nodeType(target) orelse
                         try c.checkExprCached(target, types.no_type);
-                    return try assignmentReduced(c, declared, vt);
+                    return .{ .ty = try assignmentReduced(c, declared, vt) };
                 }
-                if (!assignmentRefines(c, declared)) return declared;
+                if (op != .eq) return .base_of_antecedent;
+                if (!assignmentRefines(c, declared)) return .{ .ty = declared };
                 const vt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
-                return try assignmentReduced(c, declared, vt);
+                return .{ .ty = try assignmentReduced(c, declared, vt) };
             }
             // Writing any proper prefix of the path (its root, or an
             // intermediate member) invalidates the whole subtree.
-            if (try refPrefixWritten(c, d.lhs, key)) return declared;
+            if (try refPrefixWritten(c, d.lhs, key)) return .{ .ty = declared };
             if (c.nodeTag(d.lhs) == .identifier) {
                 if (!try c.identIsSym(d.lhs, root_sym)) return null;
                 // key.len != 0 was caught above by refPrefixWritten.
@@ -1347,8 +1396,8 @@ fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) Error
                 // type outright — there is no declared type to reduce it
                 // against (tsc `getTypeAtFlowAssignment`, autoType branch).
                 const evolving = key.len == 0 and c.isEvolvingVar(root_sym);
-                if (op != .eq) {
-                    // A compound assignment's post-value is the whole
+                if (logicalAssignOp(op)) {
+                    // A logical assignment's post-value is the whole
                     // expression's type (`x ??= s` leaves `NonNullable<x> |
                     // typeof s`), so it has to be CHECKED, not read
                     // opportunistically out of the node cache. A reference can
@@ -1363,13 +1412,17 @@ fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) Error
                     // its right-hand side for exactly this reason.
                     const vt = c.nodeType(target) orelse
                         try c.checkExprCached(target, types.no_type);
-                    if (evolving) return try c.widenLiteral(vt);
-                    return try assignmentReduced(c, declared, vt);
+                    if (evolving) return .{ .ty = try c.widenLiteral(vt) };
+                    return .{ .ty = try assignmentReduced(c, declared, vt) };
                 }
-                if (!evolving and !assignmentRefines(c, declared)) return declared;
+                // tsc tests for a compound write BEFORE it tests for an
+                // evolving (`auto`-typed) variable, so `let x; x = 1; x += 1`
+                // takes the compound arm and leaves `number` either way.
+                if (op != .eq) return .base_of_antecedent;
+                if (!evolving and !assignmentRefines(c, declared)) return .{ .ty = declared };
                 const vt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
-                if (evolving) return try c.widenLiteral(vt);
-                return try assignmentReduced(c, declared, vt);
+                if (evolving) return .{ .ty = try c.widenLiteral(vt) };
+                return .{ .ty = try assignmentReduced(c, declared, vt) };
             }
             if (try patternBindsSym(c, d.lhs, root_sym)) {
                 // `[, width, height] = match` assigns a *position* of the
@@ -1381,10 +1434,10 @@ fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) Error
                 if (key.len == 0 and assignmentRefines(c, declared)) {
                     const rt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
                     if (try destructuredAssignType(c, d.lhs, c.symNameAtom(root_sym), rt)) |vt| {
-                        return try assignmentReduced(c, declared, vt);
+                        return .{ .ty = try assignmentReduced(c, declared, vt) };
                     }
                 }
-                return declared;
+                return .{ .ty = declared };
             }
             // A destructuring assignment can write a `this` property —
             // `({ a: this.a } = o)`, `[this.a] = arr`, `({ a: this.a = d } = o)`.
@@ -1398,7 +1451,7 @@ fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) Error
                 const op = c.tree.tokens.tag(c.tree.nodeMainToken(target));
                 switch (c.nodeTag(d.lhs)) {
                     .object_literal, .array_literal, .object_pattern, .array_pattern => {
-                        if (try patternWritesRef(c, d.lhs, key)) return declared;
+                        if (try patternWritesRef(c, d.lhs, key)) return .{ .ty = declared };
                     },
                     // `this["x"] = v` writes the same property as `this.x = v`
                     // — tsc's `isMatchingReference` compares accesses through
@@ -1410,7 +1463,7 @@ fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) Error
                     // narrowing for every reference; the initialization query
                     // needs only to see the WRITE, so the widening is here.
                     .index_expr, .optional_index_expr => {
-                        if (definiteAssignOp(op) and try writesThisStringIndex(c, d.lhs, key)) return declared;
+                        if (definiteAssignOp(op) and try writesThisStringIndex(c, d.lhs, key)) return .{ .ty = declared };
                     },
                     else => {},
                 }
@@ -1424,27 +1477,33 @@ fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) Error
                 // `.assign` arm. It reads before it writes, so it neither
                 // initializes the property nor hides TS2565.
                 if (key.opt_init) return null;
-                return try assignmentReduced(c, declared, types.number_type);
+                // `getAssignmentTargetKind` calls every `++`/`--` compound, so
+                // the write leaves the type the reference already had with its
+                // literals widened — NOT `number`. `let y: 1 | 2 = 1; y++`
+                // leaves `number` because the antecedent `1` widens; `x!++` on
+                // a `number | undefined` leaves it `number | undefined`,
+                // because a compound write refines nothing.
+                return .base_of_antecedent;
             }
-            if (try refPrefixWritten(c, d.lhs, key)) return declared;
+            if (try refPrefixWritten(c, d.lhs, key)) return .{ .ty = declared };
             return null;
         },
         // for-of / for-in left (var decl or expression).
         .var_decl_one, .var_decl => {
             if (try varDeclBindsSym(c, target, root_sym)) {
-                if (key.len != 0) return declared;
+                if (key.len != 0) return .{ .ty = declared };
                 // The element type was computed when the statement was
                 // checked; the symbol type already reflects it.
-                return try c.typeOfSymbol(root_sym);
+                return .{ .ty = try c.typeOfSymbol(root_sym) };
             }
             return null;
         },
         .identifier => {
             if (!try c.identIsSym(target, root_sym)) return null;
-            return declared;
+            return .{ .ty = declared };
         },
         else => {
-            if (try patternBindsSym(c, target, root_sym)) return declared;
+            if (try patternBindsSym(c, target, root_sym)) return .{ .ty = declared };
             return null;
         },
     }
