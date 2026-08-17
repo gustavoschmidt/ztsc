@@ -34,6 +34,7 @@ const containsTypeParam = @import("enums.zig").containsTypeParam;
 const destructure = @import("destructure.zig");
 const finalizeInferredReturn = @import("names.zig").finalizeInferredReturn;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
+const hasOwnValueMeaning = @import("names.zig").hasOwnValueMeaning;
 const implicit_any = @import("implicit_any.zig");
 const modvalue = @import("modvalue.zig");
 const narrowByCondition = @import("flow.zig").narrowByCondition;
@@ -1275,7 +1276,14 @@ fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
         return types.any_type;
     }
     const f = c.symFlags(sym);
-    if (f.import_binding) return importedSymbolType(c, sym);
+    // tsc's `getTypeOfSymbol` tests `Alias` LAST, after every declaration
+    // form below. A merged `import { A } from "./a"; const A = 0;` is the
+    // local `const` as a value — the alias only supplies the TYPE meaning —
+    // so the alias arm yields to any own value meaning (`hasOwnValueMeaning`).
+    // Kept HERE rather than moved past the `enterSymFile` below because
+    // `importedSymbolType`'s TS2307 report is gated on the alias's own file
+    // being the current one.
+    if (f.import_binding and !hasOwnValueMeaning(f)) return importedSymbolType(c, sym);
     // A namespace is a value object of its exported members, modeled as a
     // `class_value` anchored to the namespace symbol (so it prints
     // `typeof N` and resolves members via classStaticType). When merged
@@ -1788,11 +1796,8 @@ pub fn widenInitializer(c: *Checker, init_t: TypeId, is_const: bool) Error!TypeI
 /// the element type `checkForInOf` later tries to set — every use of the
 /// loop variable in the body silently becomes `any`, taking with it the
 /// narrowings and the contextual types that would have come from it.
-fn forHeadBindingType(c: *Checker, sym: SymbolId) Error!?TypeId {
-    const scope = c.symScope(sym);
-    if (c.bind.scope_kinds[scope] != .for_head) return null;
-    const owner = c.bind.scope_owners[scope];
-    if (owner == null_node) return null;
+fn forHeadBindingType(c: *Checker, sym: SymbolId, decl: Node) Error!?TypeId {
+    const owner = forHeadOwner(c, sym, decl) orelse return null;
     const is_of = switch (c.nodeTag(owner)) {
         .for_of_stmt => true,
         .for_in_stmt => false,
@@ -1805,6 +1810,53 @@ fn forHeadBindingType(c: *Checker, sym: SymbolId) Error!?TypeId {
     // `checkForInOf`, in source order — not from whatever demanded the
     // binding first.
     return try c.forOfElementType(rt, null_node, e.is_await != 0);
+}
+
+/// The `for..in` / `for..of` statement whose HEAD declares `decl`, or null when
+/// the declarator is an ordinary `let x;` / `var x;`.
+///
+/// A `let`/`const` head binding lives in the head's own `.for_head` scope, so
+/// the symbol's scope answers straight away. A `var` does not: it is HOISTED to
+/// the enclosing function or file scope, and its symbol then remembers nothing
+/// about the head it was written in — which typed every `for (var x of xs)`
+/// binding `any` (so `for (var q of [0]) { const s: string = q }` was silent,
+/// and a use of `q` before the loop missed its TS2454). The declarator's
+/// POSITION finds the head instead: the innermost `for..in`/`for..of` whose
+/// LEFT-HAND SIDE — not whose body — encloses it.
+///
+/// The scan is over `scope_kinds`, and only for a hoisted `var` whose
+/// declarator carries neither annotation nor initializer; `typeOfSymbol`
+/// memoizes, so each such symbol pays it once.
+fn forHeadOwner(c: *Checker, sym: SymbolId, decl: Node) ?Node {
+    const b = c.bind;
+    const scope = c.symScope(sym);
+    if (b.scope_kinds[scope] == .for_head) {
+        const owner = b.scope_owners[scope];
+        return if (owner == null_node) null else owner;
+    }
+    if (!c.symFlags(sym).var_decl) return null;
+    const at = c.nodeSpanStart(decl);
+    var best: ?Node = null;
+    var best_len: u32 = std.math.maxInt(u32);
+    for (b.scope_kinds, 0..) |kind, s| {
+        if (kind != .for_head) continue;
+        const owner = b.scope_owners[s];
+        if (owner == null_node) continue;
+        switch (c.nodeTag(owner)) {
+            .for_in_stmt, .for_of_stmt => {},
+            else => continue,
+        }
+        const e = c.tree.extraData(ast.ForInOf, c.tree.nodeData(owner).lhs);
+        if (e.left == null_node) continue;
+        const span = c.nodeSpan(e.left);
+        if (at < span.start or at >= span.end) continue;
+        const len = span.end - span.start;
+        if (len < best_len) {
+            best_len = len;
+            best = owner;
+        }
+    }
+    return best;
 }
 
 /// tsc's `getESSymbolLikeTypeForNode` / `isValidESSymbolDeclaration`: a
@@ -1857,7 +1909,7 @@ pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Er
         .declarator => {
             // No initializer and no annotation: either a loop head binding
             // (typed by what is iterated) or a bare `let x;`.
-            const et = (try forHeadBindingType(c, sym)) orelse return types.any_type;
+            const et = (try forHeadBindingType(c, sym, decl)) orelse return types.any_type;
             if (c.nodeTag(d.lhs) == .identifier) return et;
             return c.bindingElementType(sym, decl, et);
         },
@@ -1927,6 +1979,70 @@ const optionalizePatternDefaults = destructure.optionalizePatternDefaults;
 pub const patternDefaultsProp = destructure.patternDefaultsProp;
 pub const pinBindingSym = destructure.pinBindingSym;
 pub const pinPatternParamSyms = destructure.pinPatternParamSyms;
+
+/// TS2394 — tsc's `checkFunctionOrConstructorSymbol`, overload-vs-implementation
+/// half: every overload signature of an implemented function must be one the
+/// implementation can stand in for. `overloads` are the bodiless declarations in
+/// source order, `impl_node` the one that carries the body; the FIRST
+/// incompatible overload is reported and the rest are left alone, exactly as
+/// tsc's loop `break`s.
+///
+/// Reported from the implementation's own check so it runs once per function,
+/// wherever the demand-driven `functionSymbolType` happened to build the
+/// signatures first.
+pub fn checkOverloadImplementation(c: *Checker, overloads: []const Node, impl_node: Node) Error!void {
+    if (overloads.len == 0) return;
+    const impl = try c.signatureOfProto(impl_node, c.tree.nodeData(impl_node).lhs, false, false);
+    if (c.ts.kind(impl) != .function) return;
+    for (overloads) |ov| {
+        const sig = try c.signatureOfProto(ov, c.tree.nodeData(ov).lhs, false, false);
+        if (c.ts.kind(sig) != .function) continue;
+        if (try implementationCompatible(c, impl, sig)) continue;
+        const name_tok = c.tree.extraData(ast.FnProto, c.tree.nodeData(ov).lhs).name_token;
+        const span = if (name_tok != 0) c.tokSpan(name_tok) else c.nodeSpan(ov);
+        try c.diagFmt(2394, span, "This overload signature is not compatible with its implementation signature.", .{});
+        return;
+    }
+}
+
+/// tsc's `isImplementationCompatibleWithOverload`: the return types must relate
+/// in SOME direction (or the overload's be `void`, which accepts anything), and
+/// the parameter lists must relate with the returns ignored.
+///
+/// Both signatures are erased — tsc compares `getErasedSignature` of each — and
+/// "ignore the return types" is spelled by giving the target a `void` return,
+/// which is what the relation already treats as accepting anything.
+fn implementationCompatible(c: *Checker, impl0: TypeId, ovl0: TypeId) Error!bool {
+    // `getErasedSignature` on BOTH sides first, and before the RETURN test:
+    // each declaration owns its own `T`, so `function f<T>(x: T[]): A<T>` and
+    // its identically-written implementation return two UNRELATED type
+    // variables until both are erased to `any` — and `A<T>` carrying a private
+    // member leaves no structural way back (`overloadGenericFunctionWithRest-
+    // Args`, `functionOverloadsRecursiveGenericReturnType`).
+    const impl = try c.eraseParamsToAny(impl0);
+    const ovl = try c.eraseParamsToAny(ovl0);
+    const sret = c.ts.fnReturn(impl);
+    const tret = c.ts.fnReturn(ovl);
+    if (c.ts.kind(tret) != .void and
+        !try c.isAssignable(tret, sret) and !try c.isAssignable(sret, tret)) return false;
+    return c.signatureAssignableErased(impl, try voidReturnOf(c, ovl));
+}
+
+/// `sig` with its return type replaced by `void` — the relation's stand-in for
+/// tsc's `ignoreReturnTypes` flag (see `implementationCompatible`). A predicate
+/// is dropped with the return it belongs to.
+fn voidReturnOf(c: *Checker, sig: TypeId) Error!TypeId {
+    if (c.ts.fnReturn(sig) == types.void_type) return sig;
+    const n = c.ts.fnParamCount(sig);
+    var params: std.ArrayList(types.Param) = .empty;
+    defer params.deinit(c.scratch());
+    try params.ensureTotalCapacity(c.scratch(), n);
+    for (0..n) |i| params.appendAssumeCapacity(c.ts.fnParam(sig, @intCast(i)));
+    const tps = try c.scratch().dupe(u32, c.ts.fnTypeParams(sig));
+    defer c.scratch().free(tps);
+    const flags = c.ts.fnFlags(sig) & ~types.fn_flag_predicate;
+    return c.ts.makeFunction(params.items, types.void_type, tps, flags);
+}
 
 fn functionSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
     const saved = c.enterSymFile(sym);
@@ -2108,6 +2224,8 @@ pub fn memberTypeOf(c: *Checker, sym: SymbolId) Error!TypeId {
                     defer if (instance) {
                         c.instance_field_init_depth -= 1;
                     };
+                    c.field_init_depth += 1;
+                    defer c.field_init_depth -= 1;
                     return c.widenLiteral(try c.checkExprCached(e.init, types.no_type));
                 }
                 return types.any_type;

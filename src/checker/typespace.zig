@@ -1452,6 +1452,15 @@ pub fn typeofEntity(c: *Checker, node: Node) Error!TypeId {
             const wf = c.symFlags(sym);
             if (wf.import_binding and wf.type_only)
                 return c.regularizeTypeQuery(try c.typeOfSymbol(sym));
+            // Anything else that reached here carries a TYPE meaning and no
+            // value meaning — an `interface`, a `type` alias, a type
+            // parameter. `typeof` names a VALUE, so tsc reports TS2693
+            // (`typeofSimple`'s `typeof J`, `typeofTypeParameter`'s
+            // `typeof T`), the same message a value position gives.
+            if (hasTypeMeaning(wf)) {
+                try c.diagFmt(2693, c.tokSpan(tok), "'{s}' only refers to a type, but is being used as a value here.", .{c.tokenText(tok)});
+                return types.error_type;
+            }
             return types.any_type;
         },
         .none => {

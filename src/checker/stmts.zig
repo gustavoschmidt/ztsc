@@ -46,7 +46,8 @@ const iteration = @import("iteration.zig");
 const reachability = @import("reachability.zig");
 const reserved_names = @import("reserved_names.zig");
 const static_block = @import("static_block.zig");
-const typeOfSymbol = @import("signatures.zig").typeOfSymbol;
+const signatures = @import("signatures.zig");
+const typeOfSymbol = signatures.typeOfSymbol;
 const typespace = @import("typespace.zig");
 
 // =====================================================================
@@ -238,8 +239,15 @@ fn checkExportTarget(c: *Checker, expr: Node, is_export_equals: bool) Error!void
             .wrong_space => return,
             // `SymbolFlags.All` includes the namespace meaning, so a namespace
             // that emits no runtime object is a legal export target too — the
-            // value-position TS2708 does not apply here.
-            .sym => |sym| if (try modvalue.valuelessNamespaceRef(c, sym, c.symFlags(sym))) return,
+            // value-position TS2708 does not apply here. An import binding is
+            // RESOLVED (tsc's `resolveEntityName` follows the alias): one whose
+            // target is a pure type is a legal export target as well, not the
+            // value-position TS2693 (`exportDefaultImportedType`).
+            .sym => |sym| {
+                const sf = c.symFlags(sym);
+                if (try modvalue.valuelessNamespaceRef(c, sym, sf)) return;
+                if (try modvalue.aliasValueVerdict(c, sym, sf) == .type_target) return;
+            },
             .none => {},
         }
     }
@@ -744,9 +752,34 @@ fn checkFunctionDecl(c: *Checker, node: Node) Error!void {
     // Builds the signature (reports 7006 etc. once).
     _ = try c.signatureOfProto(node, d.lhs, false, true);
     if (d.rhs != 0) {
+        try checkOverloadSet(c, node);
         const sig = try c.signatureOfProto(node, d.lhs, false, true);
         try c.checkFunctionBody(node, d.lhs, d.rhs, sig, types.no_type);
     }
+}
+
+/// TS2394 for the overload set `node` implements — see
+/// `signatures.checkOverloadImplementation`. Driven from the IMPLEMENTATION so
+/// it runs once per function symbol, in source order, whichever declaration a
+/// type demand happened to reach first.
+fn checkOverloadSet(c: *Checker, node: Node) Error!void {
+    const name_tok = c.tree.extraData(ast.FnProto, c.tree.nodeData(node).lhs).name_token;
+    if (name_tok == 0) return;
+    const a = try c.atomOfToken(name_tok);
+    const local = c.bind.lookupInScope(c.cur_scope, a) orelse return;
+    const sym = c.toGlobal(local);
+    // A merged symbol's parts come from other files, which declare their own
+    // overload sets; only this file's declarations are this check's business.
+    if (c.prog.isMergedId(sym)) return;
+    var overloads: std.ArrayList(Node) = .empty;
+    defer overloads.deinit(c.scratch());
+    for (c.declsOf(sym)) |decl| {
+        if (c.nodeTag(decl) != .function_decl) continue;
+        // A second implementation is TS2393's business, not this one's.
+        if (decl != node and c.tree.nodeData(decl).rhs != 0) return;
+        if (decl != node) try overloads.append(c.scratch(), decl);
+    }
+    try signatures.checkOverloadImplementation(c, overloads.items, node);
 }
 
 /// Walk every function body postponed by `defer_bodies`, in queue order.
@@ -875,10 +908,16 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
     const saved_scope = c.cur_scope;
     const saved_ctx = c.fn_ctx;
     const saved_this = c.this_type;
+    // A function body is its own control-flow container, so it takes over from
+    // an enclosing class field's initializer — `x = <U>(a: U) => { var y: T;
+    // return y }` still reports TS2454 on `y` (see `field_init_depth`).
+    const saved_field_init = c.field_init_depth;
+    c.field_init_depth = 0;
     defer {
         c.cur_scope = saved_scope;
         c.fn_ctx = saved_ctx;
         c.this_type = saved_this;
+        c.field_init_depth = saved_field_init;
     }
     if (try c.scopeOf(node)) |s| c.cur_scope = s;
     // An explicit `this` parameter types `this` inside the body.
@@ -1090,6 +1129,10 @@ fn checkNamespace(c: *Checker, node: Node) Error!void {
     const saved_ambient = c.ambient_ctx;
     defer c.ambient_ctx = saved_ambient;
     if (data.flags & ast.Flags.declare != 0) c.ambient_ctx = true;
+    // This block is the body's control-flow container — see `cur_ns_block`.
+    const saved_block = c.cur_ns_block;
+    defer c.cur_ns_block = saved_block;
+    c.cur_ns_block = node;
     // The body scope is the one owned by this node, or — for a merged
     // block whose scope is owned by an earlier block — the namespace
     // symbol's members scope.
@@ -2130,6 +2173,10 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
                     defer if (!is_static) {
                         c.instance_field_init_depth -= 1;
                     };
+                    // …and the flow-container half, which the static case
+                    // shares (see `field_init_depth`).
+                    c.field_init_depth += 1;
+                    defer c.field_init_depth -= 1;
                     const it = try c.checkExprCached(e.init, ann);
                     if (ann != types.no_type and ann != types.error_type) {
                         _ = try c.checkAssignable(it, ann, e.init, c.tokSpan(c.tree.nodeMainToken(member)));
