@@ -154,6 +154,13 @@ const EsShape = struct {
     /// for a method, and the PROPERTY type (a getter's return, a setter's
     /// parameter, a field's declared type) for every other position.
     ctx_value: TypeId,
+    /// The literal type of the member's NAME, or `no_type` for a name that has
+    /// none to spell — a computed key, where the interface's own
+    /// `string | symbol` is left to answer. `#x` spells as the string literal
+    /// `"#x"`, as tsc's `getStringLiteralType(idText(node.name))` does.
+    name_ty: TypeId,
+    is_private: bool,
+    is_static: bool,
 };
 
 /// Classify a decorated member for the standard dialect. Null for a member
@@ -164,8 +171,10 @@ fn esMemberShape(c: *Checker, target: Node, this_t: TypeId, class_sym: SymbolId)
     switch (c.nodeTag(target)) {
         .class_field => {
             const e = c.tree.extraData(ast.Field, md.lhs);
-            const this_side = decoThisSide(c, e.flags & ast.Flags.static != 0, this_t, class_sym);
+            const is_static = e.flags & ast.Flags.static != 0;
+            const this_side = decoThisSide(c, is_static, this_t, class_sym);
             const prop = try memberPropType(c, this_side, try memberKeyAtom(c, target, e.flags));
+            const nm = try memberNameType(c, target, e.flags);
             if (e.flags & ast.Flags.accessor != 0) {
                 // `accessor x` decorators receive a
                 // `ClassAccessorDecoratorTarget<This, Value>`.
@@ -174,6 +183,9 @@ fn esMemberShape(c: *Checker, target: Node, this_t: TypeId, class_sym: SymbolId)
                     .value = decoFamilyRef(c, "ClassAccessorDecoratorTarget", &.{ this_side, prop }),
                     .this_side = this_side,
                     .ctx_value = prop,
+                    .name_ty = nm.ty,
+                    .is_private = nm.private,
+                    .is_static = is_static,
                 };
             }
             return .{
@@ -182,24 +194,32 @@ fn esMemberShape(c: *Checker, target: Node, this_t: TypeId, class_sym: SymbolId)
                 .value = types.undefined_type,
                 .this_side = this_side,
                 .ctx_value = prop,
+                .name_ty = nm.ty,
+                .is_private = nm.private,
+                .is_static = is_static,
             };
         },
         .class_method => {
             const proto = c.tree.extraData(ast.FnProto, md.lhs);
             const is_get = proto.flags & ast.Flags.get != 0;
             const is_set = proto.flags & ast.Flags.set != 0;
-            const this_side = decoThisSide(c, proto.flags & ast.Flags.static != 0, this_t, class_sym);
+            const is_static = proto.flags & ast.Flags.static != 0;
+            const this_side = decoThisSide(c, is_static, this_t, class_sym);
             const saved = c.this_type;
             c.this_type = this_side;
             // The value is the member's own function type. Suppress TS7006
             // here — the member's own pass reports implicit-any.
             const fn_ty = c.signatureOfProto(target, md.lhs, true, false) catch types.any_type;
             c.this_type = saved;
+            const nm = try memberNameType(c, target, proto.flags);
             return .{
                 .pos = if (is_get) .getter else if (is_set) .setter else .method,
                 .value = fn_ty,
                 .this_side = this_side,
                 .ctx_value = memberValueType(c, fn_ty, is_get, is_set),
+                .name_ty = nm.ty,
+                .is_private = nm.private,
+                .is_static = is_static,
             };
         },
         else => return null,
@@ -253,11 +273,49 @@ fn memberValueType(c: *Checker, fn_ty: TypeId, is_get: bool, is_set: bool) TypeI
 fn esDecoCallSignature(c: *Checker, s: EsShape) Error!TypeId {
     return c.ts.makeFunction(&.{
         .{ .name = try c.atom("target"), .ty = s.value },
-        .{
-            .name = try c.atom("context"),
-            .ty = decoFamilyRef(c, decoContextName(s.pos), &.{ s.this_side, s.ctx_value }),
-        },
+        .{ .name = try c.atom("context"), .ty = try esDecoContextType(c, s) },
     }, try esDecoReturnType(c, s), &.{}, 0);
+}
+
+/// tsc's `createClassMemberDecoratorContextTypeForNode`: the member's context
+/// interface INTERSECTED with what the runtime actually knows about this
+/// member —
+///
+/// ```ts
+/// const overrideType = getDecoratorContextOverrideType(nameType, isPrivate, isStatic);
+/// return getIntersectionType([contextType, overrideType]);
+/// ```
+///
+/// — so `context.name` reads as the member's own literal name rather than the
+/// interface's `string | symbol`, and `context.static` / `context.private` as
+/// `true`/`false` rather than `boolean`. Anything that reads those, or
+/// switches on them, sees a strictly more precise type than the interface
+/// alone offers.
+///
+/// A degraded context (`any`, from `--noLib` or an unreadable member) is left
+/// alone: intersecting `any` with the override would turn it into an object
+/// that rejects the very reads the degradation exists to permit.
+fn esDecoContextType(c: *Checker, s: EsShape) Error!TypeId {
+    const ctx = decoFamilyRef(c, decoContextName(s.pos), &.{ s.this_side, s.ctx_value });
+    if (ctx == types.any_type) return ctx;
+    var props: [3]types.Prop = undefined;
+    var n: usize = 0;
+    if (s.name_ty != types.no_type) {
+        props[n] = .{ .name = try c.atom("name"), .ty = s.name_ty };
+        n += 1;
+    }
+    props[n] = .{
+        .name = try c.atom("private"),
+        .ty = if (s.is_private) types.true_type else types.false_type,
+    };
+    n += 1;
+    props[n] = .{
+        .name = try c.atom("static"),
+        .ty = if (s.is_static) types.true_type else types.false_type,
+    };
+    n += 1;
+    const override = try c.ts.makeObject(props[0..n], types.no_type, types.no_type, 0);
+    return c.ts.makeIntersection(c.scratch(), &.{ ctx, override });
 }
 
 /// What a standard decorator may RETURN, per position — and so the contextual
@@ -443,6 +501,32 @@ fn memberKeyAtom(c: *Checker, target: Node, flags: u32) Error!intern.Atom {
         else => if (!scanner.Tag.isKeyword(c.tree.tokens.tag(tok))) return 0,
     }
     return c.memberAtom(tok);
+}
+
+/// The member's NAME as the standard context type spells it, plus whether it
+/// is a private one — the two facts tsc reads in
+/// `createClassMemberDecoratorContextTypeForNode`:
+///
+/// ```ts
+/// const isPrivate = isPrivateIdentifier(node.name);
+/// const nameType = isPrivate ? getStringLiteralType(idText(node.name)) : getLiteralTypeFromPropertyName(node.name);
+/// ```
+///
+/// `#x` keeps its hash — `idText` of a private identifier includes it. A
+/// COMPUTED key answers `no_type`: its literal type is whatever the key
+/// expression evaluates to, and inventing one where the context interface
+/// already declares `string | symbol` could only narrow it wrongly.
+fn memberNameType(c: *Checker, target: Node, flags: u32) Error!struct { ty: TypeId, private: bool } {
+    const tok = c.tree.nodeMainToken(target);
+    if (c.tree.tokens.tag(tok) == .private_identifier) {
+        return .{ .ty = try c.ts.makeStringLiteral(try c.atomOfToken(tok), false), .private = true };
+    }
+    // A NUMERIC name is a number literal type to tsc, not a string one, and
+    // the member table spells it as text; leave it to the interface.
+    if (c.tree.tokens.tag(tok) == .numeric_literal) return .{ .ty = types.no_type, .private = false };
+    const key = try memberKeyAtom(c, target, flags);
+    if (key == 0) return .{ .ty = types.no_type, .private = false };
+    return .{ .ty = try c.ts.makeStringLiteral(key, false), .private = false };
 }
 
 /// The `propertyKey` argument: the string-literal type of the member's name
