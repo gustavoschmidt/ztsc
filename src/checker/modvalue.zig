@@ -33,11 +33,16 @@ pub fn importedSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
     return c.targetValueType(tgt);
 }
 
-/// The VALUE half of a `.dual` binding: property `name` of the export-assigned
-/// value's type, or null when that value's type has no such property (the
-/// binding then has only the meanings its `type_tgt` carries).
+/// The VALUE half of a `.dual` binding, or null when it turns out not to exist.
+///
+/// Only the `export =` flavour of a dual can miss: its value half is the
+/// *question* "property `name` of the export-assigned value's type", which the
+/// link phase could not answer. Every other value half (the module namespace
+/// object of an `export * as X` merged with a local `export type X`, a plain
+/// declaration) is a resolved target and always has a type.
 pub fn dualValueType(c: *Checker, d: modules.DualTarget) Error!?TypeId {
     const v = d.value_tgt;
+    if (v.kind != .export_equals_prop) return try c.targetValueType(v);
     const base = try c.typeOfSymbol(c.toGlobalIn(v.file, v.payload));
     const p = (try c.propOfType(base, v.name)) orelse return null;
     return p.ty;

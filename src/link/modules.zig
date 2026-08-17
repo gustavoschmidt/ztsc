@@ -51,6 +51,7 @@ const ast = @import("../frontend/ast.zig");
 const scanner = @import("../frontend/scanner.zig");
 const parser = @import("../frontend/parser.zig");
 const binder = @import("../frontend/binder.zig");
+const decl_spaces = @import("../frontend/decl_spaces.zig");
 const diagnostics = @import("../frontend/diagnostics.zig");
 const intern = @import("../intern.zig");
 const source = @import("../frontend/source.zig");
@@ -1899,9 +1900,73 @@ const Linker = struct {
         };
     }
 
+    /// The declaration SPACES an export Target answers in, or null when the
+    /// link phase cannot say (an alias, whose spaces are its target's, and
+    /// every non-declaration kind). A module namespace object is tsc's
+    /// `ValueModule | NamespaceModule`: value and namespace, never type.
+    fn targetSpaces(l: *Linker, tgt: Target) ?decl_spaces.Spaces {
+        switch (tgt.kind) {
+            .binding => {
+                const f = &l.files[tgt.file];
+                const decls = f.bind.declsOf(tgt.payload);
+                if (decls.len == 0) return null;
+                var s: decl_spaces.Spaces = .{};
+                for (decls) |d| s = s.merge(decl_spaces.ofTag(f.tree.nodeTag(d)) orelse return null);
+                return s;
+            },
+            .namespace, .ambient_ns => return .{ .value = true, .namespace = true },
+            else => return null,
+        }
+    }
+
+    /// Two exports of the same NAME whose declaration spaces are disjoint are
+    /// ONE symbol in tsc, carrying both — the export table's half of
+    /// declaration merging:
+    ///
+    ///     export type Drink = 0 | 1;             // type space
+    ///     export * as Drink from "./constants";  // value/namespace space
+    ///
+    /// so a consumer's `const x: Drink = Drink.TEA` reads the alias in type
+    /// position and the module namespace object in value position. A plain
+    /// overwrite kept only the later declaration, and the *type* meaning it
+    /// dropped is exactly what a namespace-in-type-position diagnostic would
+    /// then misfire on (see `materializeTypeRef`'s TS2709 arm) — a collapse and
+    /// a genuine namespace-only export were indistinguishable.
+    ///
+    /// Null when the two share a space (the later declaration wins outright,
+    /// as before) or when either side is a kind `targetSpaces` declines.
+    fn dualMerge(l: *Linker, old: Target, new: Target) Error!?Target {
+        const os = targetSpaces(l, old) orelse return null;
+        const ns = targetSpaces(l, new) orelse return null;
+        if (decl_spaces.conflict(os, ns).any()) return null;
+        const val: Target, const typ: Target = if (os.value and ns.type_)
+            .{ old, new }
+        else if (ns.value and os.type_)
+            .{ new, old }
+        else
+            return null;
+        try l.duals.append(l.scratch, .{ .value_tgt = val, .type_tgt = typ });
+        return .{
+            .kind = .dual,
+            .payload = @intCast(l.duals.items.len - 1),
+            .name = val.name,
+            // Both halves are real declarations here (unlike the `export =`
+            // dual, whose value half is a property probe), so the entry is
+            // type-only only when neither meaning survives a value use.
+            .type_only = val.type_only and typ.type_only,
+        };
+    }
+
     fn put(l: *Linker, t: *std.AutoArrayHashMapUnmanaged(Atom, Target), name: Atom, tgt: Target) Error!void {
         // Later explicit exports of the same name overwrite (duplicate
-        // export names are a bind-phase diagnostic concern, not ours).
+        // export names are a bind-phase diagnostic concern, not ours) —
+        // unless the two carry disjoint meanings, which tsc merges.
+        if (t.get(name)) |old| {
+            if (try l.dualMerge(old, tgt)) |merged| {
+                try t.put(l.scratch, name, merged);
+                return;
+            }
+        }
         try t.put(l.scratch, name, tgt);
     }
 

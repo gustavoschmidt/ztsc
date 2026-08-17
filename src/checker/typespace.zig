@@ -125,7 +125,7 @@ pub fn typeFromTypeNameEx(c: *Checker, name_node: Node, args: []const TypeId, ou
         .sym => |sym0| {
             var sym = sym0;
             var f = c.symFlags(sym);
-            if (f.import_binding) {
+            if (f.import_binding) import_blk: {
                 const tgt0 = c.importTarget(sym) orelse return types.any_type; // unlinked
                 // A dual binding's TYPE half is the member of the exported
                 // entity; its value half is a property and has none.
@@ -147,21 +147,28 @@ pub fn typeFromTypeNameEx(c: *Checker, name_node: Node, args: []const TypeId, ou
                             return types.any_type;
                         }
                     },
-                    // Namespace-as-type / a property of an `export =` value
-                    // (value space only) / unresolved: any (documented).
+                    // A whole MODULE namespace object named as a type is the
+                    // same TS2709 `materializeTypeRef` reports for a
+                    // `namespace` block: tsc's `SymbolFlags.Type` excludes
+                    // both. `import WinJS = require("./m"); (w: WinJS) => {}`.
                     //
-                    // A whole MODULE namespace object named as a type IS the
-                    // TS2709 `materializeTypeRef` reports for a `namespace`
-                    // block, and reporting it here fixes moduleInTypePosition1
-                    // and staticInstanceResolution5 — but it also fires where
-                    // the name has a second, TYPE meaning that ztsc's export
-                    // table drops on the floor: `export type Drink = 0 | 1;
-                    // export * as Drink from "./constants";` keeps only the
-                    // namespace, and `import * as B from "./b"` merged with a
-                    // local `interface B` reaches the import branch on the
-                    // binding's import half. Both are one export table entry
-                    // where tsc has a dual, so the diagnostic waits on that.
-                    .namespace, .default_expr, .ambient_ns, .export_equals_prop, .dual, .any => return types.any_type,
+                    // Both ways a name can carry a SECOND, type meaning that
+                    // the import half does not are handled rather than
+                    // suppressed: `export type Drink = 0|1; export * as Drink
+                    // from "./c"` is one `.dual` export-table entry, so
+                    // `typeMeaningTarget` above already unwrapped it to the
+                    // alias and never reaches here; and a LOCAL merge (`import
+                    // * as B from "./b"` beside `interface B`) leaves the type
+                    // declaration's own flag on the merged symbol, so the walk
+                    // resumes at the ordinary materialization below.
+                    .namespace => {
+                        if (f.interface or f.class or f.type_alias or f.enum_decl) break :import_blk;
+                        try c.diagFmt(2709, c.tokSpan(tok), "Cannot use namespace '{s}' as a type.", .{c.atomText(a)});
+                        return types.error_type;
+                    },
+                    // A property of an `export =` value (value space only) /
+                    // an ambient module's namespace object / unresolved: any.
+                    .default_expr, .ambient_ns, .export_equals_prop, .dual, .any => return types.any_type,
                 }
             }
             // TS2302: a class's type parameters do not reach its static
