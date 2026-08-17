@@ -27,6 +27,40 @@ const FileId = checker_zig.FileId;
 
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
 
+/// tsc's `checkAndReportErrorForUsingNamespaceAsTypeOrValue`, value half:
+/// does this name denote a NON-INSTANTIATED namespace and nothing else?
+///
+/// `namespace M { export interface P {} }` declares no value at all, so tsc
+/// gives its symbol `SymbolFlags.NamespaceModule` — which is outside
+/// `SymbolFlags.Value` — and a value-position use of `M` is TS2708 rather
+/// than a type. ztsc's `hasValueMeaning` accepts every `namespace_decl` so
+/// that the lexical walk still *finds* the name (stopping there is what makes
+/// the diagnostic specific instead of "Cannot find name"); the use sites ask
+/// this instead of resolving differently.
+///
+/// A MERGED id reports the OR of its parts' flags, and `ns_uninstantiated` has
+/// to be an AND (one instantiated block makes the whole merge a value), so the
+/// merge is walked part by part.
+pub fn valuelessNamespace(c: *const Checker, sym: SymbolId) bool {
+    if (!c.symFlags(sym).namespace_decl) return false;
+    if (!c.prog.isMergedId(sym)) return uninstantiatedPart(c.symFlags(sym));
+    const m = c.prog.mergedSym(sym);
+    for (m.parts) |p| {
+        if (!uninstantiatedPart(c.symFlags(p))) return false;
+    }
+    return m.parts.len != 0;
+}
+
+/// One declaration's flags: a namespace block with no value in it, merged with
+/// nothing that carries a value meaning of its own. An import binding counts
+/// as a value here — an alias's own meaning is the target's, which this
+/// syntactic screen cannot see.
+fn uninstantiatedPart(f: binder.SymbolFlags) bool {
+    if (!f.namespace_decl or !f.ns_uninstantiated) return false;
+    return !(f.var_decl or f.let_decl or f.const_decl or f.function or f.class or
+        f.param or f.catch_param or f.enum_decl or f.enum_member or f.import_binding);
+}
+
 /// Value type of an import binding, via the sealed link tables.
 pub fn importedSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
     const tgt = c.importTarget(sym) orelse return types.any_type; // unlinked

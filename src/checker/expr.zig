@@ -49,6 +49,7 @@ const indexableConstituent = @import("typenode.zig").indexableConstituent;
 const init = Checker.init;
 const instantiate = @import("enums.zig").instantiate;
 const isNonPrimitiveKind = @import("assign.zig").isNonPrimitiveKind;
+const modvalue = @import("modvalue.zig");
 const props_zig = @import("props.zig");
 const propOfType = props_zig.propOfType;
 const pushChainGuards = @import("flow.zig").pushChainGuards;
@@ -576,6 +577,12 @@ fn checkIdentifier(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     switch (c.resolveSpace(a, c.cur_scope, true)) {
         .sym => |sym| {
             const f = c.symFlags(sym);
+            // A namespace with no value in it is not a value (tsc's
+            // `checkAndReportErrorForUsingNamespaceAsTypeOrValue`).
+            if (modvalue.valuelessNamespace(c, sym)) {
+                try c.diagFmt(2708, c.tokSpan(tok), "Cannot use namespace '{s}' as a value.", .{c.tokenText(tok)});
+                return types.error_type;
+            }
             if (f.import_binding) {
                 if (c.importTarget(sym)) |tgt0| {
                     // A dual binding (tsc's combined value-and-type symbol)
@@ -4702,21 +4709,20 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
                         // A namespace whose every block declares only types
                         // emits no runtime object, so tsc never gets as far as
                         // "cannot assign to a namespace": the name does not
-                        // resolve in value space at all (TS2708, "cannot use
-                        // as a value", which ztsc does not report yet). The
-                        // `errorType` still stands — it is what suppresses the
-                        // TS2322 cascade either way.
-                        const what: ?struct { code: u16, text: []const u8 } = if (sf.enum_decl)
+                        // resolve in value space at all, and the verdict is
+                        // TS2708 ("cannot use as a value") instead.
+                        const what: struct { code: u16, text: []const u8 } = if (sf.enum_decl)
                             .{ .code = 2628, .text = "an enum" }
                         else if (sf.class)
                             .{ .code = 2629, .text = "a class" }
-                        else if (sf.namespace_decl)
-                            if (sf.ns_uninstantiated) null else .{ .code = 2631, .text = "a namespace" }
-                        else
-                            .{ .code = 2630, .text = "a function" };
-                        if (what) |w| {
-                            try c.diagFmt(w.code, c.tokSpan(tok), "Cannot assign to '{s}' because it is {s}.", .{ c.tokenText(tok), w.text });
-                        }
+                        else if (sf.namespace_decl) blk: {
+                            if (modvalue.valuelessNamespace(c, sym)) {
+                                try c.diagFmt(2708, c.tokSpan(tok), "Cannot use namespace '{s}' as a value.", .{c.tokenText(tok)});
+                                return types.error_type;
+                            }
+                            break :blk .{ .code = 2631, .text = "a namespace" };
+                        } else .{ .code = 2630, .text = "a function" };
+                        try c.diagFmt(what.code, c.tokSpan(tok), "Cannot assign to '{s}' because it is {s}.", .{ c.tokenText(tok), what.text });
                         return types.error_type;
                     }
                     return c.typeOfSymbol(sym);

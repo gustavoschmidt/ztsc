@@ -46,6 +46,7 @@ const reachability = @import("reachability.zig");
 const reserved_names = @import("reserved_names.zig");
 const static_block = @import("static_block.zig");
 const typeOfSymbol = @import("signatures.zig").typeOfSymbol;
+const typespace = @import("typespace.zig");
 
 // =====================================================================
 // statements & declarations
@@ -176,6 +177,19 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
         .enum_decl => try c.checkEnum(node),
         .namespace_decl => try checkNamespace(c, node),
         .import_decl => {}, // module graph
+        .import_equals => {
+            const e = c.tree.extraData(ast.ImportEquals, d.lhs);
+            // `import X = require("m")` is the linker's; the ENTITY-NAME form
+            // resolves here (tsc's `checkImportEqualsDeclaration`). Without
+            // this arm the declaration fell to `checkExprCached`'s recovery
+            // walk, which checked the entity name as if it were a value
+            // expression.
+            if (e.module_token == 0 and e.entity != null_node) {
+                const exported = e.flags & ast.Flags.exported != 0 and
+                    e.flags & ast.Flags.declare == 0 and !c.ambient_ctx;
+                try typespace.checkImportEqualsEntity(c, e.entity, exported);
+            }
+        },
         .export_named, .export_all => {},
         .export_decl => try c.checkStatement(d.lhs),
         .export_default, .export_assign => {
