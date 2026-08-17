@@ -2068,68 +2068,7 @@ fn checkObjectLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     // A destructuring ASSIGNMENT pattern is exempt and never arrives here — it
     // goes through `checkDestructuringElement`.
     try c.checkObjectLiteralDups(node);
-    try checkSpreadPropOverrides(c, node);
     return t;
-}
-
-/// tsc's `checkSpreadPropOverrides`: a property written BEFORE a spread whose
-/// source declares the same name NON-optionally is dead code — the spread
-/// always wins — so tsc reports TS2783 at the earlier property.
-///
-/// Only SYNTACTIC properties count, and only those written earlier: tsc keeps
-/// them in a side table (`allPropertiesTable`) that a spread's own properties
-/// never enter. That is what makes `{ ...ab, ...ab }` silent while
-/// `{ b: 1, ...ab }` is not, and what makes a property written BETWEEN two
-/// spreads count for the second one.
-///
-/// Reads the spread source out of the node-type memo (the type walk has
-/// already published it) rather than re-checking, so this adds no evaluation
-/// and cannot be the first to report anything inside the operand.
-fn checkSpreadPropOverrides(c: *Checker, node: Node) Error!void {
-    const members = c.tree.nodeRange(node);
-    // The overwhelming majority of literals carry no spread at all.
-    var has_spread = false;
-    for (members) |prop| {
-        if (prop != null_node and c.nodeTag(prop) == .spread_element) has_spread = true;
-    }
-    if (!has_spread) return;
-
-    const Seen = struct { name: Atom, node: Node };
-    var seen: std.ArrayList(Seen) = .empty;
-    defer seen.deinit(c.scratch());
-    for (members) |prop| {
-        if (prop == null_node) continue;
-        const pd = c.tree.nodeData(prop);
-        switch (c.nodeTag(prop)) {
-            .spread_element => {
-                if (seen.items.len == 0) continue;
-                const raw = c.nodeType(pd.lhs) orelse continue;
-                const st = try c.resolveStructural(raw);
-                switch (c.ts.kind(st)) {
-                    .any, .err, .unknown, .never => continue,
-                    else => {},
-                }
-                for (seen.items) |s| {
-                    // `allow_index = false`: tsc compares against
-                    // `getPropertiesOfType`, which an index signature is not a
-                    // member of — `{ a: 1, ...someRecord }` overwrites nothing
-                    // tsc can name.
-                    const p = (try c.propOfTypeEx(st, s.name, false)) orelse continue;
-                    if (p.optional()) continue;
-                    try c.diagFmt(2783, c.nodeSpan(s.node), "'{s}' is specified more than once, so this usage will be overwritten.", .{
-                        c.atomText(s.name),
-                    });
-                }
-            },
-            // A computed key names no property tsc can compare against the
-            // spread's, so only the statically-keyed forms are tracked.
-            .object_property, .object_method, .object_shorthand => {
-                if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) continue;
-                try seen.append(c.scratch(), .{ .name = try c.memberAtom(c.tree.nodeMainToken(prop)), .node = prop });
-            },
-            else => {},
-        }
-    }
 }
 
 fn objectLiteralWhole(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
