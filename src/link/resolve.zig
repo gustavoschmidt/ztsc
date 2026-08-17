@@ -1287,6 +1287,17 @@ fn resolveSelfName(f: Fs, alloc: Allocator, importer_dir: []const u8, spec: []co
     return resolveOwnExports(f, alloc, scope.dir, exports_val, subpath);
 }
 
+/// The DefinitelyTyped package holding `pkg`'s typings, allocated in `alloc`,
+/// or null when `pkg` names no package. tsc's `mangleScopedPackageName`: the
+/// `@types` scope is one level deep, so a scoped name folds its scope into the
+/// package name with a double underscore (`@babel/core` → `babel__core`).
+fn typesPackageName(alloc: Allocator, pkg: []const u8) Error!?[]u8 {
+    if (pkg.len == 0) return null;
+    if (pkg[0] != '@') return try std.fmt.allocPrint(alloc, "@types/{s}", .{pkg});
+    const slash = std.mem.indexOfScalar(u8, pkg, '/') orelse return null;
+    return try std.fmt.allocPrint(alloc, "@types/{s}__{s}", .{ pkg[1..slash], pkg[slash + 1 ..] });
+}
+
 /// Resolve a bare (package) specifier by walking `node_modules` up from
 /// the importer's directory.
 pub fn resolvePackage(f: Fs, alloc: Allocator, importer_dir: []const u8, spec: []const u8, allow_js: bool, use_exports: bool) Error!?[]u8 {
@@ -1294,14 +1305,15 @@ pub fn resolvePackage(f: Fs, alloc: Allocator, importer_dir: []const u8, spec: [
     const pkg = spec[0..pkg_len];
     const sub = if (pkg_len < spec.len) spec[pkg_len + 1 ..] else "";
 
-    // For an unscoped bare package, tsc also resolves its typings from
-    // `@types/<pkg>` (the DefinitelyTyped fallback) when the real package has
-    // no types — e.g. `import … from "react"` → `node_modules/@types/react`.
-    // We probe `@types/<pkg>` right after `<pkg>` at each directory level.
-    const types_pkg: ?[]const u8 = if (pkg.len > 0 and pkg[0] != '@')
-        try std.fmt.allocPrint(alloc, "@types/{s}", .{pkg})
-    else
-        null;
+    // tsc also resolves a bare package's typings from `@types/<pkg>` (the
+    // DefinitelyTyped fallback) when the real package has no types — e.g.
+    // `import … from "react"` → `node_modules/@types/react`. We probe
+    // `@types/<pkg>` right after `<pkg>` at each directory level.
+    //
+    // A SCOPED name is mangled first (tsc's `mangleScopedPackageName`): the
+    // `@types` scope can hold only one level, so `@babel/core`'s types live at
+    // `@types/babel__core`, not at a nested `@types/@babel/core`.
+    const types_pkg = try typesPackageName(alloc, pkg);
     defer if (types_pkg) |tp| alloc.free(tp);
 
     // Three-phase walk: declarations beat JavaScript at ANY depth. Phase 1
@@ -2863,4 +2875,24 @@ test "paths: the real package's types pin beats the @types sibling, node_modules
         "node_modules/orm-decorators/dist/index.d.ts",
         (try resolvePathsCandidate(io, alloc, d, dec[0])).?,
     );
+}
+
+test "typesPackageName: tsc's mangleScopedPackageName" {
+    const alloc = testing.allocator;
+    const name = struct {
+        fn of(a: std.mem.Allocator, pkg: []const u8) !?[]u8 {
+            return typesPackageName(a, pkg);
+        }
+    }.of;
+    // Unscoped: the package name straight into the `@types` scope.
+    const react = (try name(alloc, "react")).?;
+    defer alloc.free(react);
+    try testing.expectEqualStrings("@types/react", react);
+    // Scoped: the scope folds into the name, because `@types` is one level deep.
+    const babel = (try name(alloc, "@babel/core")).?;
+    defer alloc.free(babel);
+    try testing.expectEqualStrings("@types/babel__core", babel);
+    // A bare `@scope` names no package, and neither does the empty specifier.
+    try testing.expectEqual(@as(?[]u8, null), try name(alloc, "@scope"));
+    try testing.expectEqual(@as(?[]u8, null), try name(alloc, ""));
 }
