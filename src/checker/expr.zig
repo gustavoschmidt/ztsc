@@ -3624,6 +3624,7 @@ fn checkPrefixUnary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // screen contributes a diagnostic and nothing else.
             const ot = try c.checkExprCached(d.lhs, types.no_type);
             _ = try checkNonNullType(c, ot, d.lhs);
+            _ = try reportSymbolOperand(c, node, d.lhs, d.lhs, ot, ot);
             const rl = try c.ts.regularLiteral(ot);
             if (c.ts.kind(rl) == .number_literal) {
                 return c.ts.makeNumberLiteral(-c.ts.numberValue(rl), c.ts.isFreshLiteral(ot));
@@ -3642,6 +3643,7 @@ fn checkPrefixUnary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         .plus, .tilde => {
             const ot = try c.checkExprCached(d.lhs, types.no_type);
             _ = try checkNonNullType(c, ot, d.lhs);
+            _ = try reportSymbolOperand(c, node, d.lhs, d.lhs, ot, ot);
             return types.number_type;
         },
         .plus_plus, .minus_minus => {
@@ -3754,12 +3756,116 @@ fn isArithmeticOperand(c: *Checker, t: TypeId) Error!bool {
     return (try isNumberish(c, t)) or (try isBigintish(c, t));
 }
 
+/// tsc's `maybeTypeOfKindConsideringBaseConstraint(t, ESSymbolLike)`: does ANY
+/// constituent of `t` — or of its base constraint, which is what catches
+/// `S extends symbol` — carry `symbol` or a `unique symbol`?
+fn maybeSymbolish(c: *Checker, t: TypeId, depth: u32) Error!bool {
+    if (depth > 8) return false;
+    switch (c.ts.kind(t)) {
+        .symbol, .unique_symbol => return true,
+        .union_type, .intersection => {
+            for (try c.memberList(t)) |m| {
+                if (try maybeSymbolish(c, m, depth + 1)) return true;
+            }
+            return false;
+        },
+        .ref => {
+            const rs = try c.resolveStructural(t);
+            if (rs == t) return false;
+            return maybeSymbolish(c, rs, depth + 1);
+        },
+        .type_param => {
+            const con = try c.baseConstraintOf(t);
+            if (con == t or con == types.no_type) return false;
+            return maybeSymbolish(c, con, depth + 1);
+        },
+        else => return false,
+    }
+}
+
+/// tsc's `checkForDisallowedESSymbolOperand`: "symbols are not allowed at all
+/// in arithmetic expressions" — TS2469, reported at the FIRST offending
+/// operand and naming the operator as written (`+=`, not `+`). Answers whether
+/// it reported, which is what stops the caller from also running its own
+/// comparability check or a compound assignment's write-back.
+fn reportSymbolOperand(c: *Checker, node: Node, lhs: Node, rhs: Node, lt: TypeId, rt: TypeId) Error!bool {
+    const offending: Node = if (try maybeSymbolish(c, lt, 0))
+        lhs
+    else if (try maybeSymbolish(c, rt, 0))
+        rhs
+    else
+        return false;
+    try c.diagFmt(2469, c.nodeSpan(offending), "The '{s}' operator cannot be applied to type 'symbol'.", .{
+        c.tokenText(c.tree.nodeMainToken(node)),
+    });
+    return true;
+}
+
 /// Answers whether the operand passed — tsc's `checkArithmeticOperandType`
 /// return value gates the reference check that follows it.
 fn checkArithmeticOperand(c: *Checker, t: TypeId, node: Node) Error!bool {
     if (try isArithmeticOperand(c, t)) return true;
     try c.diagFmt(2356, c.nodeSpan(node), "An arithmetic operand must be of type 'any', 'number', 'bigint' or an enum type.", .{});
     return false;
+}
+
+/// TS2358 gate: tsc refuses an `instanceof` left operand every constituent of
+/// which is a PRIMITIVE (`allTypesAssignableToKind(leftType, TypeFlags.
+/// Primitive)`) — nothing that is not an object can be an instance of
+/// anything. `any` and `unknown` are exempt (the related error was already
+/// reported elsewhere), and so is `never`, which tsc technically refuses via
+/// vacuous assignability but which only ever arrives here already reported.
+///
+/// A type parameter answers through its CONSTRAINT — tsc's kind test is
+/// assignability-based, so `T extends string` is refused while a bare `T` is
+/// not — a union iff every constituent is primitive, and an intersection iff
+/// ANY is (a branded `number & { _brand }` is still a number).
+fn instanceofLhsIsPrimitive(c: *Checker, t: TypeId, depth: u32) Error!bool {
+    if (depth > 8) return false; // give up conservatively — never over-report
+    switch (c.ts.kind(t)) {
+        .void,
+        .undefined,
+        .null,
+        .string,
+        .number,
+        .boolean,
+        .bigint,
+        .symbol,
+        .bool_true,
+        .bool_false,
+        .string_literal,
+        .number_literal,
+        .number_literal_fresh,
+        .bigint_literal,
+        .enum_type,
+        .unique_symbol,
+        .template_literal_type,
+        .string_mapping,
+        => return true,
+        .union_type => {
+            for (try c.memberList(t)) |m| {
+                if (!try instanceofLhsIsPrimitive(c, m, depth + 1)) return false;
+            }
+            return c.ts.memberCount(t) != 0;
+        },
+        .intersection => {
+            for (try c.memberList(t)) |m| {
+                if (try instanceofLhsIsPrimitive(c, m, depth + 1)) return true;
+            }
+            return false;
+        },
+        .type_param => {
+            const con = try c.typeParamConstraint(c.ts.typeParamSymbol(t));
+            if (con == types.no_type or con == t) return false;
+            return instanceofLhsIsPrimitive(c, con, depth + 1);
+        },
+        .ref => {
+            const rs = try c.resolveStructural(t);
+            if (rs == t) return false;
+            return instanceofLhsIsPrimitive(c, rs, depth + 1);
+        },
+        else => return false,
+    }
 }
 
 /// TS2359 gate: is `t` a valid `instanceof` right-hand side — i.e. `any`,
@@ -3886,6 +3992,9 @@ fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         .lt, .gt, .lt_eq, .gt_eq => {
             const lt = try c.checkExprCached(d.lhs, types.no_type);
             const rt = try c.checkExprCached(d.rhs, types.no_type);
+            // A `symbol` operand is refused outright, and tsc runs NONE of the
+            // comparison checks below when it reports.
+            if (try reportSymbolOperand(c, node, d.lhs, d.rhs, lt, rt)) return types.boolean_type;
             // tsc's relational rule (checkBinaryLikeExpressionWorker): strip
             // null/undefined (checkNonNullType), then the pair is legal iff
             // BOTH sides are number/bigint-like, OR NEITHER side is
@@ -3938,8 +4047,11 @@ fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             return types.boolean_type;
         },
         .keyword_instanceof => {
-            _ = try c.checkExprCached(d.lhs, types.no_type);
+            const lt = try c.checkExprCached(d.lhs, types.no_type);
             const rt = try c.checkExprCached(d.rhs, types.no_type);
+            if (try instanceofLhsIsPrimitive(c, lt, 0)) {
+                try c.diagFmt(2358, c.nodeSpan(d.lhs), "The left-hand side of an 'instanceof' expression must be of type 'any', an object type or a type parameter.", .{});
+            }
             if (!try instanceofRhsIsFunctionLike(c, rt, 0)) {
                 try c.diagFmt(2359, c.nodeSpan(d.rhs), "The right-hand side of an 'instanceof' expression must be of type 'any' or of a type assignable to the 'Function' interface type.", .{});
             }
@@ -4105,11 +4217,18 @@ fn checkPlusOperands(c: *Checker, node: Node, lt0: TypeId, rt0: TypeId, lhs: Nod
     // `any` fails, and lands on the `isTypeAny` arm instead. Reading `any`
     // as string-like retyped every evolving `var a; a += n` as `string`, and
     // every later `a << 1` became a spurious TS2362.
-    if (lk == .any or rk == .any or lk == .err or rk == .err) return .{ .ty = types.any_type, .ok = true };
+    // Whichever arm answers, tsc screens the pair for a `symbol` operand
+    // (TS2469) before handing the result back — the RESULT type still stands,
+    // but a `+=`'s write-back is skipped, which is what `ok` carries.
+    if (lk == .any or rk == .any or lk == .err or rk == .err)
+        return .{ .ty = types.any_type, .ok = !try reportSymbolOperand(c, node, lhs, rhs, lt, rt) };
     // string + anything stringifiable
-    if (try isStringish(c, lt) or try isStringish(c, rt)) return .{ .ty = types.string_type, .ok = true };
-    if (try isNumberish(c, lt) and try isNumberish(c, rt)) return .{ .ty = types.number_type, .ok = true };
-    if (try isBigintish(c, lt) and try isBigintish(c, rt)) return .{ .ty = types.bigint_type, .ok = true };
+    if (try isStringish(c, lt) or try isStringish(c, rt))
+        return .{ .ty = types.string_type, .ok = !try reportSymbolOperand(c, node, lhs, rhs, lt, rt) };
+    if (try isNumberish(c, lt) and try isNumberish(c, rt))
+        return .{ .ty = types.number_type, .ok = !try reportSymbolOperand(c, node, lhs, rhs, lt, rt) };
+    if (try isBigintish(c, lt) and try isBigintish(c, rt))
+        return .{ .ty = types.bigint_type, .ok = !try reportSymbolOperand(c, node, lhs, rhs, lt, rt) };
     try c.diagFmt(2365, c.nodeSpan(node), "Operator '{s}' cannot be applied to types '{s}' and '{s}'.", .{
         c.tokenText(c.tree.nodeMainToken(node)), try c.typeToString(lt), try c.typeToString(rt),
     });
@@ -4380,7 +4499,12 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
                             .{ .code = 2628, .text = "an enum" }
                         else if (sf.class)
                             .{ .code = 2629, .text = "a class" }
-                        else if (sf.namespace_decl)
+                        else if (sf.namespace_decl and !sf.ns_uninstantiated)
+                            // A namespace whose every block declares only
+                            // types emits no runtime object, so tsc never gets
+                            // as far as "cannot assign to a namespace": the
+                            // name does not resolve in value space at all
+                            // (TS2708, "cannot use as a value").
                             .{ .code = 2631, .text = "a namespace" }
                         else if (sf.function)
                             .{ .code = 2630, .text = "a function" }
