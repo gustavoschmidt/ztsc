@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-17, post wave 11)
+## Standings (2026-08-17, post wave 12)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **6476 / 8627 (75.1%)** |
-| excess keys (false positives) | 3541 | 2343 |
-| missing keys (under-reports) | 8617 | 4993 |
+| exact-match cases | 4902 / 7815 (62.7%) | **6535 / 8627 (75.8%)** |
+| excess keys (false positives) | 3541 | 2307 |
+| missing keys (under-reports) | 8617 | 4852 |
 | bucketed (ztsc parse error, incomparable) | 825 | 13 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Eleven waves landed (3–11), every one with ZERO match→non-match regressions in
+Twelve waves landed (3–12), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -93,7 +93,79 @@ Everything gitignored is scripted:
   worktrees; scope any pkill to the worktree path; agents should commit early
   and often (machine sleeps have destroyed uncommitted worktrees).
 
-## Ranked next queue (wave 12) — distilled from wave-11 agent reports
+Wave 12 (+59 cases, perfectly additive; conformance 1304→1307): A landed the
+`Diagnostic.arg` span payload (interpolated messages; JSX TS17008/17002/17014/
+17015), the TS1090 parameter-modifier family, for-in/of head grammar, lone-CR
+line-table fix, emit-time dedup. B fixed the generic inference leak
+(constraint-substituted contextual type for array-literal args — `pick()` now
+matches tsgo) and mixins (`getBaseTypeVariableOfClass`). C landed contextual
+union discrimination (`discriminate_ctx.zig`, object literals + JSX) and
+re-landed the union-agreement rule (all 7 wave-11 losses recovered), plus the
+compound-assign `getBaseTypeOfLiteralType` narrowing fix. D fixed ambient-block
+scope parenting + `mergeAmbientBlocks`, TS1437-as-syntactic, and a +20
+typespace/link haul (TS2709/2503/2702/2833/2661). Combined perf: packages and
+excalidraw flat; social-app +1.66% wall (staged app, under the 2% bar).
+Wave-12 residue notes (with in-code documentation): regex FLAGS validator
+reverted (cost 3, gained 0 — blocked on `#!` scanning); TS2709-on-alias and
+`resolveNsContainer` alias-following backed out (blocked on dual export-table
+entries and the JSX hyphen-in-spread rule respectively).
+
+## Ranked next queue (wave 13) — distilled from wave-12 agent reports
+
+1. expr.zig:365 types EVERY class expression as `any` — unlocks
+   mixinClassesAnonymous residue, mixinAccessors3,
+   typeArgumentInferenceWithClassExpression1/3, and removes the one FP risk
+   B's mixin fix noted. Related: `contextAdmitsLiteral` (expr.zig:1810) has no
+   `.index_type` arm (tsc's mask includes `TypeFlags.Index`) — the generic fix
+   for the `[...K]` variadic `pick` shape.
+2. TS2693 cluster (~20 cases, exactly one extra key each): `export default
+   interface` falls into stmts.zig:180's `else => checkExprCached(d.lhs)` and
+   checks the interface body as an expression; `export default <type>` /
+   `export = <interface>` need checkIdentifier to resolve in all meanings.
+3. Evolving arrays — to the expr.zig owner (D mapped it precisely): binder
+   FlowArrayMutation (~40 lines: `bindCallExpressionFlow` push/unshift arm +
+   `=` on ElementAccessExpression in bindBinaryExpressionFlow), flow
+   `getTypeAtFlowArrayMutation`, expr `checkArrayLiteral` autoArrayType +
+   checkIdentifier auto arm + a new "final flow type still auto" predicate for
+   TS7034/TS7005 (the existing checkEvolvingVarRead predicate is closure-gated
+   and CANNOT express it).
+4. TS2783 re-land (24 keys / 8 cases; the check was corpus-clean) — now
+   unblocked by B's inference fix. See wave-11 C's reverted commit.
+5. Object-literal union widening `prop?: undefined` (~8 keys) — still queued,
+   twice deferred.
+6. strictBindCallApply: model the CallableFunction/NewableFunction
+   bind/call/apply overload family (pure under-report, 26 keys in
+   strictBindCallApply1 alone).
+7. Dual export-table entries (`export type Drink` + `export * as Drink`)
+   — unblocks re-landing TS2709-on-alias (+2 measured).
+8. JSX hyphen rule for spread string-literal keys (jsx.zig:529 has the direct
+   arm; assign.zig's excess check misses the spread path) — unblocks
+   re-landing `resolveNsContainer` alias-following (+3 measured).
+9. typespace/link residue: TS2713 where the qualifier type has the property
+   (guarded propOfType from reportBadNsQualifier); TS2749 over a whole dotted
+   name (genericFunduleInModule 1/2); TS1046 one-line arm in
+   checkDeclFileTopLevel for quoted ambient modules in .d.ts; TS1308.
+10. discriminate_ctx spread-element bail (conservative vs tsc) — revisit for
+    gains.
+11. stringMappingOverPatternLiterals (27 keys); mappedTypeRelationships
+    remaining ~20 keys (TS2536 in index_constraints, TS2542 readonly writes);
+    module-scope `this` typing + TS2356-before-TS2357 ordering (2 cases).
+12. Local classes parameterized by enclosing generic function's type params
+    (tsc outerTypeParameters) — large, perf-sensitive; measure first.
+13. Non-BMP columns: ztsc reports byte offsets where tsgo reports UTF-16 code
+    units (regularExpressionWithNonBMPFlags.ts).
+14. Determinism defect with a concrete witness: social-app `--checkers=1` and
+    `--file-order=reverse` diverge; `Navigation.tsx:778:29` prints
+    `NativeStackNavigationProp<{…}>` in one partition and the expanded shape in
+    the other — type identity, not printing. Pattern-matches the open
+    instantiation-budget partition bug (budget charges misses not hits).
+    Cheapest instrumentation point is that line.
+15. Structural harness item: ~58 missing keys / 12 cases point inside tsgo's
+    `lib.*.d.ts`; ztsc reports the same diagnostics at its own embedded lib
+    positions. Needs harness-side lib-position canonicalization, not checker
+    work.
+
+## Superseded queue (wave 12, kept for context)
 
 1. Contextual-type discrimination (tsc `discriminateContextualTypeByObjectMembers`
    / `…ByJSXAttributes`, expr.zig). MEASURED unblock: B implemented the
