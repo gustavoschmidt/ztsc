@@ -35,6 +35,18 @@ const Node = ast.Node;
 /// `InternalSymbolName.Constructor`, in ztsc's synthetic-key spelling.
 pub const ctor_member_name = "__@ctor";
 
+/// tsc's `ModifierFlags.ParameterPropertyModifier`: the modifiers whose
+/// presence on a constructor parameter makes it declare a class MEMBER.
+///
+/// Lives beside `isCtorMethod` because it answers the same kind of question —
+/// which syntax declares which class member — and because its two readers sit
+/// in different phases: the binder declares the member (and rejects the
+/// modifier outside a constructor implementation, TS2369), while the checker's
+/// index-constraint walk has to count the parameter as an own declaration of
+/// the class (TS2411).
+pub const param_property_mask: u32 = ast.Flags.public | ast.Flags.private |
+    ast.Flags.protected | ast.Flags.readonly | ast.Flags.override;
+
 /// True when a `.class_method` member is the class's CONSTRUCTOR: the name
 /// token is the `constructor` keyword and the member is neither `static` nor an
 /// accessor. A `static constructor()` is an ordinary static member of that name

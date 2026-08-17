@@ -2316,13 +2316,13 @@ const Linker = struct {
     /// side-effect-only import (`import "./x"`) is governed by
     /// `noUncheckedSideEffectImports` (TS 5.6+) instead: tsc's
     /// `checkImportDeclaration` only resolves the specifier of a *bare*
-    /// `import "m"` when that option is on, so with the option off (tsc's
-    /// default, and the dogfood project's) an unresolved side-effect specifier
-    /// is silently accepted — bundler plugins own specifiers like
-    /// `import "@fontsource-variable/inter"`, which is a CSS-only package.
-    /// When the option is on, ztsc reports TS2882, matching the pinned tsgo
-    /// oracle (tsc words the same condition as TS2307); tsgo 7.0.2 differs from
-    /// tsc only in defaulting the option ON.
+    /// `import "m"` when that option is on. With the option ON — ztsc's
+    /// default, following tsgo 7.0.2's; see `tsconfig.Config` for why that is
+    /// not TypeScript 5.x's — the unresolved specifier is TS2882, the same
+    /// condition tsc words as TS2307. With it explicitly off, the specifier is
+    /// silently accepted, which is what a project whose bundler plugins own
+    /// specifiers like `import "@fontsource-variable/inter"` (a CSS-only
+    /// package) needs.
     ///
     /// The same walk carries TS7016 for the module that resolved but has no
     /// declarations behind it — see `untypedJsModule`.
@@ -2336,12 +2336,25 @@ const Linker = struct {
             var side_effect = false;
             var mod_tok: ast.TokenIndex = tree.nodeData(stmt).rhs;
             if (tag == .import_decl) {
-                const data = tree.extraData(ast.ImportData, tree.nodeData(stmt).lhs);
-                side_effect = data.default_name_token == 0 and data.ns_name_token == 0 and
-                    data.spec_start == data.spec_end;
+                // A SIDE-EFFECT import is `import "m"` with no import CLAUSE at
+                // all — not merely one that binds no name. `import {} from "m"`
+                // has an (empty) clause, and tsc treats it like any other
+                // named import: TS2307, not TS2882. The clause is what sits
+                // between the `import` keyword and the specifier, so its
+                // absence is exactly "the specifier came next"
+                // (`ImportData`'s token fields cannot tell empty braces from no
+                // braces).
+                side_effect = mod_tok == tree.nodeMainToken(stmt) + 1;
             } else if (tag == .import_equals) {
                 // `import x = require("m")`: the specifier is in the extra data.
                 mod_tok = tree.extraData(ast.ImportEquals, tree.nodeData(stmt).lhs).module_token;
+            } else if (tag == .export_named) {
+                // `export {} from "m"` re-exports nothing, and tsc never
+                // resolves the specifier: no name asks for the module, so a
+                // missing one is silent (measured — `export { a } from "m"` and
+                // `export * as ns from "m"` both still answer TS2307).
+                const e = tree.extraData(ast.ExportNamed, tree.nodeData(stmt).lhs);
+                if (e.spec_start == e.spec_end) continue;
             }
             if (mod_tok == 0) continue;
             const text = tree.tokenSlice(f.src, mod_tok);
@@ -2425,13 +2438,42 @@ const Linker = struct {
                 .import_equals => {
                     const e = tree.extraData(ast.ImportEquals, tree.nodeData(stmt).lhs);
                     if (e.module_token != 0) {
-                        try l.diag(file, 1202, l.nodeSpan(file, stmt), "Import assignment cannot be used when targeting ECMAScript modules. Consider using 'import * as ns from \"mod\"', 'import {{a}} from \"mod\"', 'import d from \"mod\"', or another module format instead.", .{});
+                        var span = l.nodeSpan(file, stmt);
+                        // `export import x = require("m")`: tsc's declaration
+                        // node starts at the MODIFIER, and `main_token` is the
+                        // `import` keyword after it. `ImportEquals.flags` is
+                        // what records the modifier (the parser folds it away),
+                        // so the `export` token is the one before the keyword.
+                        if (e.flags & ast.Flags.exported != 0) {
+                            const kw = tree.nodeMainToken(stmt);
+                            if (kw > 0 and tree.tokens.tag(kw - 1) == .keyword_export) {
+                                span.start = l.tokSpan(file, kw - 1).start;
+                            }
+                        }
+                        try l.diag(file, 1202, span, "Import assignment cannot be used when targeting ECMAScript modules. Consider using 'import * as ns from \"mod\"', 'import {{a}} from \"mod\"', 'import d from \"mod\"', or another module format instead.", .{});
                     }
                 },
                 .export_assign => try l.diag(file, 1203, l.nodeSpan(file, stmt), "Export assignment cannot be used when targeting ECMAScript modules. Consider using 'export default' or another module format instead.", .{}),
                 else => {},
             }
         }
+    }
+
+    /// Where a complaint about a DEFAULT import goes: the local name the
+    /// default was bound to (`import d from "m"` → `d`), which is tsc's
+    /// `ImportClause.name` and where it anchors TS1192 and TS2613 — not the
+    /// statement, and not the `export` modifier a malformed `export import d,
+    /// * as ns from "m"` puts in front of it.
+    ///
+    /// Falls back to the statement for a shape with no default name token,
+    /// which the `.default` arm's own record kind makes unreachable.
+    fn defaultBindingSpan(l: *Linker, file: FileId, node: ast.Node) source.Span {
+        const tree = l.files[file].tree;
+        if (node != ast.null_node and tree.nodeTag(node) == .import_decl) {
+            const data = tree.extraData(ast.ImportData, tree.nodeData(node).lhs);
+            if (data.default_name_token != 0) return l.tokSpan(file, data.default_name_token);
+        }
+        return l.nodeSpan(file, node);
     }
 
     /// Link one file's import bindings. A named/default import resolves first
@@ -2580,11 +2622,11 @@ const Linker = struct {
                         } else if ((mfile_opt != null and (try l.lookupExport(mfile_opt.?, rec.local, 0)) != null) or
                             l.lookupAmbient(rec.module, rec.local) != null)
                         {
-                            try l.diag(file, 2613, l.nodeSpan(file, rec.node), "Module '\"{s}\"' has no default export. Did you mean to use 'import {{ {s} }} from \"{s}\"' instead?", .{
+                            try l.diag(file, 2613, l.defaultBindingSpan(file, rec.node), "Module '\"{s}\"' has no default export. Did you mean to use 'import {{ {s} }} from \"{s}\"' instead?", .{
                                 l.atomText(rec.module), l.atomText(rec.local), l.atomText(rec.module),
                             });
                         } else {
-                            try l.diag(file, 1192, l.nodeSpan(file, rec.node), "Module '\"{s}\"' has no default export.", .{l.atomText(rec.module)});
+                            try l.diag(file, 1192, l.defaultBindingSpan(file, rec.node), "Module '\"{s}\"' has no default export.", .{l.atomText(rec.module)});
                         }
                     },
                     .side_effect => unreachable,

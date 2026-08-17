@@ -345,6 +345,21 @@ pub const Code = enum(u16) {
     /// for the rule and for why the duplicate-identifier diagnostic that would
     /// otherwise cover the pair is deliberately absent.
     merged_decl_export_mismatch,
+    /// TS2323: a module's exported binding declared more than once — `export
+    /// var Foo` twice, or two `export function f` bodies. The declarations MERGE
+    /// (no duplicate identifier), but a module's export list is a set of
+    /// bindings and cannot carry one name twice. Reported on every declaration's
+    /// name. See `Binder.checkRedeclaredExports`.
+    redeclared_exported_variable,
+    /// TS1194: an `export { … }` / `export * from …` statement in a NAMESPACE
+    /// body. A namespace's exports are its `export`ed members; an export
+    /// DECLARATION is module syntax. See `Binder.checkNamespaceExportDecl`.
+    export_decl_in_namespace,
+    /// TS1147: an import that names a MODULE, written in a namespace body —
+    /// tsc's `checkExternalImportOrExportDeclaration`, the import half of the
+    /// rule `export_decl_in_namespace` is the export half of. Reported at the
+    /// module specifier.
+    import_in_namespace_references_module,
     /// TS2391: a function/method whose LAST non-ambient declaration has no
     /// body, so the overload set has no implementation. See
     /// `impl_expected.zig`.
@@ -385,6 +400,13 @@ pub const Code = enum(u16) {
     /// constructor whose body would do the assigning (tsc's `checkParameter`).
     /// Reported over the parameter's first token, which is the modifier.
     param_property_outside_ctor_impl,
+    /// TS2371: a parameter initializer where there is no BODY to run it — an
+    /// overload signature, a `declare`d or `abstract` signature, a method /
+    /// call / construct signature, or a bare function type. tsc reports it from
+    /// `checkVariableLikeDeclaration`, which runs for the parameter AND for
+    /// every binding element inside its pattern, so `({ a = 1 } = {}) => void`
+    /// as a TYPE answers twice — once at the parameter, once at `a`.
+    param_initializer_outside_impl,
     /// TS2398: a parameter property named `constructor`. The modifier turns the
     /// parameter into a class member, and `constructor` is the one member name
     /// a class cannot have — the constructor itself already owns that slot in
@@ -457,6 +479,16 @@ pub const Code = enum(u16) {
     index_sig_parameter_type_annotation,
     /// TS1021: `[k: string]` with no value type. Reported on the whole node.
     index_sig_type_annotation,
+    /// TS2374: two index signatures in one member list claim the same key
+    /// domain (`index_signature.duplicateKey`). Reported on EVERY signature of
+    /// the duplicated set, at the member's first token — its modifiers
+    /// included, which is where tsc's declaration node starts.
+    ///
+    /// tsc names the domain ("… for type 'string'"); a bind diagnostic is a
+    /// code plus a span with no payload to carry it, and the spelling is on the
+    /// line the diagnostic points at, so the invariant half is what is
+    /// reported — the policy `duplicate_identifier` already follows.
+    duplicate_index_signature,
     /// TS2452: `enum E { 1, 2 }` — a numeric literal as an enum member name.
     /// The grammar ACCEPTS it (it is a PropertyName), so this is a check on a
     /// parsed member, not a parse failure; rejecting it in the parser instead
@@ -619,6 +651,9 @@ pub const Code = enum(u16) {
             .function_merge_needs_ambient_class,
             .import_conflict,
             .merged_decl_export_mismatch,
+            .redeclared_exported_variable,
+            .export_decl_in_namespace,
+            .import_in_namespace_references_module,
             .missing_function_implementation,
             .missing_constructor_implementation,
             .abstract_decls_not_consecutive,
@@ -629,6 +664,7 @@ pub const Code = enum(u16) {
             .overload_must_be_static,
             .overload_must_not_be_static,
             .param_property_outside_ctor_impl,
+            .param_initializer_outside_impl,
             .ctor_as_param_property_name,
             .multiple_default_exports,
             .super_before_this,
@@ -679,6 +715,7 @@ pub const Code = enum(u16) {
             .index_sig_initializer,
             .index_sig_parameter_type_annotation,
             .index_sig_type_annotation,
+            .duplicate_index_signature,
             .enum_member_numeric_name,
             .enum_member_private_name,
             .computed_name_in_enum,
@@ -879,6 +916,7 @@ pub const Code = enum(u16) {
             .index_sig_initializer => "An index signature parameter cannot have an initializer.",
             .index_sig_parameter_type_annotation => "An index signature parameter must have a type annotation.",
             .index_sig_type_annotation => "An index signature must have a type annotation.",
+            .duplicate_index_signature => "Duplicate index signature.",
             .enum_member_numeric_name => "An enum member cannot have a numeric name.",
             .enum_member_private_name => "An enum member cannot be named with a private identifier.",
             .computed_name_in_enum => "Computed property names are not allowed in enums.",
@@ -995,6 +1033,9 @@ pub const Code = enum(u16) {
             .function_merge_needs_ambient_class => "Function with bodies can only merge with classes that are ambient.",
             .import_conflict => "import declaration conflicts with local declaration",
             .merged_decl_export_mismatch => "Individual declarations in merged declaration must be all exported or all local.",
+            .redeclared_exported_variable => "Cannot redeclare exported variable.",
+            .export_decl_in_namespace => "Export declarations are not permitted in a namespace.",
+            .import_in_namespace_references_module => "Import declarations in a namespace cannot reference a module.",
             .missing_function_implementation => "Function implementation is missing or not immediately following the declaration.",
             .missing_constructor_implementation => "Constructor implementation is missing.",
             .abstract_decls_not_consecutive => "All declarations of an abstract method must be consecutive.",
@@ -1005,6 +1046,7 @@ pub const Code = enum(u16) {
             .overload_must_be_static => "Function overload must be static.",
             .overload_must_not_be_static => "Function overload must not be static.",
             .param_property_outside_ctor_impl => "A parameter property is only allowed in a constructor implementation.",
+            .param_initializer_outside_impl => "A parameter initializer is only allowed in a function or constructor implementation.",
             .ctor_as_param_property_name => "'constructor' cannot be used as a parameter property name.",
             .ctor_may_not_be_accessor => "Class constructor may not be an accessor.",
             .multiple_default_exports => "A module cannot have multiple default exports.",
@@ -1104,6 +1146,7 @@ pub const Code = enum(u16) {
             .index_sig_initializer => 1020,
             .index_sig_parameter_type_annotation => 1022,
             .index_sig_type_annotation => 1021,
+            .duplicate_index_signature => 2374,
             .enum_member_numeric_name => 2452,
             .enum_member_private_name => 18024,
             .computed_name_in_enum => 1164,
@@ -1139,6 +1182,9 @@ pub const Code = enum(u16) {
             .function_merge_needs_ambient_class => 2814,
             .import_conflict => 2440,
             .merged_decl_export_mismatch => 2395,
+            .redeclared_exported_variable => 2323,
+            .export_decl_in_namespace => 1194,
+            .import_in_namespace_references_module => 1147,
             .missing_function_implementation => 2391,
             .missing_constructor_implementation => 2390,
             .abstract_decls_not_consecutive => 2516,
@@ -1149,6 +1195,7 @@ pub const Code = enum(u16) {
             .overload_must_be_static => 2387,
             .overload_must_not_be_static => 2388,
             .param_property_outside_ctor_impl => 2369,
+            .param_initializer_outside_impl => 2371,
             .ctor_as_param_property_name => 2398,
             .ctor_may_not_be_accessor => 1341,
             .multiple_default_exports => 2528,

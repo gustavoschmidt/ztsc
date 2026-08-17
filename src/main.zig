@@ -242,8 +242,9 @@ const Effective = struct {
     // --- link / program semantics ---
     allow_synthetic_default: bool = true,
     no_implicit_any: bool = true,
-    /// tsconfig noUncheckedSideEffectImports (tsc's default is off).
-    no_unchecked_side_effect_imports: bool = false,
+    /// tsconfig noUncheckedSideEffectImports (default on, as tsgo 7.0.2 has it
+    /// — see `tsconfig.Config`).
+    no_unchecked_side_effect_imports: bool = true,
     /// tsconfig `types: [… "*" …]` — TS2580 instead of TS2591 (see LinkOpts).
     types_wildcard: bool = false,
     /// tsconfig experimentalDecorators (legacy decorator dialect; grammar +

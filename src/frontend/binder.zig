@@ -76,6 +76,7 @@ const default_exports = @import("default_exports.zig");
 const member_names = @import("member_names.zig");
 const decl_spaces = @import("decl_spaces.zig");
 const impl_expected = @import("impl_expected.zig");
+const index_signature = @import("index_signature.zig");
 const source = @import("source.zig");
 
 const Ast = ast.Ast;
@@ -283,6 +284,7 @@ pub fn bind(
     // property of the set rather than of any single declaration, so each runs
     // once the last declaration is in.
     try b.checkMergedExports();
+    try b.checkRedeclaredExports();
     try b.checkMissingImplementations();
     try b.checkEnumFirstMembers();
     try b.checkNamespacePriorToMerge();
@@ -1196,6 +1198,145 @@ const Binder = struct {
         }
     }
 
+    /// TS2323: a MODULE's exported binding declared more than once.
+    ///
+    /// `var v` twice, or two `function f` overloads with two bodies, MERGE into
+    /// one symbol and earn no duplicate-identifier error — but a module's export
+    /// list is a set of bindings, and it cannot carry the same name twice, so
+    /// tsc rejects the merge at the module boundary instead:
+    ///
+    ///     export var Foo = 2;
+    ///     export var Foo = 42;   // TS2323, on BOTH names
+    ///
+    /// Three conditions, each measured against tsgo:
+    ///
+    ///   * the MODULE's top level only. A `namespace N` merges the same pair
+    ///     silently (`export var nv` twice inside one is legal), and a script
+    ///     has no export list at all.
+    ///   * a symbol that is ONLY `var`, or ONLY `function` — the two meanings
+    ///     that merge into a single emitted binding. `let`/`const` are TS2451
+    ///     and a `var` beside a `function` is TS2300, so neither is a merge at
+    ///     all; `interface`, `enum` and `namespace` merge into one binding and
+    ///     are legal; a `class` is a duplicate identifier. Reading it off the
+    ///     symbol's own meaning bits is what makes every one of those fall out
+    ///     of the same test, and is why the check does not consult
+    ///     `sym_reported` — TS2393 ("duplicate function implementation") rides
+    ///     ALONGSIDE this diagnostic, and a rejected merge never has a single
+    ///     meaning bit to begin with.
+    ///   * every declaration `export`ed by a MODIFIER. A mixed set is TS2395,
+    ///     and a name exported by an `export { … }` specifier is one binding
+    ///     however many times its target was declared.
+    ///
+    /// A FUNCTION additionally counts only its IMPLEMENTATIONS: an overload set
+    /// is many declarations of one binding, so `export function f(a: number):
+    /// number; export function f(a: any): any { … }` is legal and common. What
+    /// collides is a second BODY, and tsc reports only on the bodies —
+    /// `f(sig); f(){}; f(){}` answers TS2393 three times and TS2323 twice
+    /// (measured).
+    fn checkRedeclaredExports(b: *Binder) Error!void {
+        if (!b.saw_module_syntax) return;
+        const var_only = bind_result.fbits(.{ .var_decl = true });
+        const fn_only = bind_result.fbits(.{ .function = true });
+        for (1..b.sym_names.items.len) |i| {
+            const sym: SymbolId = @intCast(i);
+            if (b.sym_decl_count.items[sym] < 2) continue;
+            if (b.sym_scopes.items[sym] != file_scope) continue;
+            const meaning = b.sym_flags.items[sym].bits() &
+                (bind_result.mask_value | bind_result.mask_type);
+            const fns = meaning == fn_only;
+            if (meaning != var_only and !fns) continue;
+            var bindings: u32 = 0;
+            var link = b.sym_decl_head.items[sym];
+            while (link != 0) : (link = b.decl_links.items[link].next) {
+                if (!b.declIsExported(link)) break;
+                if (!fns or b.functionHasBody(b.decl_links.items[link].value)) bindings += 1;
+            } else {
+                if (bindings < 2) continue;
+                link = b.sym_decl_head.items[sym];
+                while (link != 0) : (link = b.decl_links.items[link].next) {
+                    const l = b.decl_links.items[link];
+                    if (fns and !b.functionHasBody(l.value)) continue;
+                    try b.diag(.redeclared_exported_variable, b.dupDiagTok(l.value, b.decl_name_toks.items[link]));
+                }
+            }
+        }
+    }
+
+    /// Is this declaration a function WITH a body — an implementation rather
+    /// than an overload signature?
+    fn functionHasBody(b: *const Binder, node: Node) bool {
+        if (node == null_node or b.nodeTag(node) != .function_decl) return false;
+        return b.tree.nodeData(node).rhs != 0;
+    }
+
+    /// TS1194: an `export { … }` / `export * from …` statement written in a
+    /// NAMESPACE body — tsc's `checkExportDeclaration`.
+    ///
+    /// A namespace's exports are its `export`ed members; an export DECLARATION
+    /// is module syntax, and belongs to a module's top level or to a `declare
+    /// module "spec"` block. The rule has two shapes, and tsc anchors them
+    /// differently (`error(node.moduleSpecifier, …)` vs `error(node, …)`):
+    ///
+    ///   * with a module specifier, it is rejected outright — in an ambient
+    ///     namespace too — and reported at the SPECIFIER;
+    ///   * without one, it is rejected only in a live namespace, and reported
+    ///     at the statement. `declare namespace Q { function _try(…): any;
+    ///     export { _try as try }; }` is the ambient re-export idiom, and
+    ///     legal (`exportDeclarationsInAmbientNamespaces`).
+    ///
+    /// `declare module "spec"` and `declare global` are ambient MODULES, not
+    /// namespaces, and take neither arm.
+    fn checkNamespaceExportDecl(b: *Binder, node: Node, module_token: TokenIndex) Error!void {
+        if (!b.inPlainNamespaceBody()) return;
+        if (module_token != 0) return b.diag(.export_decl_in_namespace, module_token);
+        if (b.ambient) return;
+        try b.diag(.export_decl_in_namespace, b.tree.nodeMainToken(node));
+    }
+
+    /// TS1147, the IMPORT half of the same rule
+    /// (`checkExternalImportOrExportDeclaration`): an import that names a
+    /// MODULE — `import … from "m"`, `import x = require("m")` — written in a
+    /// namespace body. Reported at the specifier, and in an ambient namespace
+    /// too: what tsc exempts is a `declare module "spec"` block, not ambience.
+    /// An entity-name alias (`import A = B.C`) names no module and is the
+    /// normal way to alias inside a namespace, so it carries no specifier here.
+    fn checkNamespaceImportDecl(b: *Binder, module_token: TokenIndex) Error!void {
+        if (module_token == 0) return;
+        if (!b.inPlainNamespaceBody()) return;
+        try b.diag(.import_in_namespace_references_module, module_token);
+    }
+
+    /// Is the statement being bound directly inside a `namespace`/`module`
+    /// body — as opposed to a file's top level, or a `declare module "spec"` /
+    /// `declare global` block, which are ambient MODULES and take module
+    /// syntax?
+    fn inPlainNamespaceBody(b: *const Binder) bool {
+        if (b.cur_scope == file_scope) return false;
+        if (b.scope_kinds.items[b.cur_scope] != .namespace) return false;
+        const owner = b.scope_owners.items[b.cur_scope];
+        if (owner == null_node or b.nodeTag(owner) != .namespace_decl) return false;
+        const data = b.tree.extraData(ast.NamespaceData, b.tree.nodeData(owner).lhs);
+        return data.flags & (ast.Flags.ambient_module | ast.Flags.global_aug) == 0;
+    }
+
+    /// Does this declaration publish a module binding — either through an
+    /// `export` modifier, or as the declaration form of `export default`?
+    ///
+    /// `decl_origins.exported` covers only the first: `export default function
+    /// f() {}` leaves `exporting_node` clear because the name it publishes is
+    /// `default`, not `f` (see `in_export_default`). The binding is a binding
+    /// all the same, and two of them collide exactly as two `export var` do —
+    /// tsc answers TS2323 for `default` at each function's NAME. Recognized off
+    /// the token before the declaration's own first token, which is where the
+    /// modifier that would otherwise have set the flag sits.
+    fn declIsExported(b: *const Binder, link: u32) bool {
+        if (b.decl_origins.items[link].exported) return true;
+        const node = b.decl_links.items[link].value;
+        if (node == null_node) return false;
+        const main = b.tree.nodeMainToken(node);
+        return main > 0 and b.tree.tokens.tag(main - 1) == .keyword_default;
+    }
+
     /// The per-symbol half. Declarations are grouped by the BLOCK they were
     /// bound in: each `namespace N { … }` block has its own `locals` table, so a
     /// local declaration in one block and an `export`ed one in another never
@@ -2015,6 +2156,7 @@ const Binder = struct {
             // syntax nested in a namespace / `declare module` block does not.
             .import_decl => {
                 if (b.cur_scope == file_scope) b.saw_module_syntax = true;
+                try b.checkNamespaceImportDecl(d.rhs);
                 try b.bindImport(node);
             },
             .export_decl => {
@@ -2041,6 +2183,7 @@ const Binder = struct {
                     b.saw_module_syntax = true;
                     b.saw_export_declaration = true;
                 }
+                try b.checkNamespaceExportDecl(node, d.rhs);
                 try b.bindExportNamed(node);
             },
             .export_all => {
@@ -2048,6 +2191,7 @@ const Binder = struct {
                     b.saw_module_syntax = true;
                     b.saw_export_declaration = true;
                 }
+                try b.checkNamespaceExportDecl(node, d.rhs);
                 try b.bindExportAll(node);
             },
             .export_assign => {
@@ -2470,12 +2614,7 @@ const Binder = struct {
         b.in_derived_ctor = ctor == .derived_ctor;
 
         try b.bindTypeParams(proto.tp_start, proto.tp_end);
-        const home: ParamHome = if (!is_ctor)
-            .other
-        else if (body != 0)
-            .ctor_impl
-        else
-            .ctor_signature;
+        const home: ParamHome = .{ .ctor = is_ctor, .body = body != 0 };
         for (b.tree.extraRange(proto.params_start, proto.params_end)) |param| {
             try b.bindParam(param, home);
         }
@@ -2558,30 +2697,25 @@ const Binder = struct {
         }
     }
 
-    /// Where a parameter list lives, as far as parameter properties go.
-    /// `public`/`private`/`protected`/`readonly`/`override` on a parameter
-    /// DECLARES a class member, so the position decides both whether the
-    /// member appears and whether the modifier is legal at all.
-    const ParamHome = enum {
-        /// `constructor(public x: T) { }` — the one legal position.
-        ctor_impl,
-        /// A bodyless `constructor(public x: T);` — an overload signature or an
-        /// ambient `declare class` constructor. tsc still BINDS the member
-        /// (`isParameterPropertyDeclaration` asks only about the parent's
-        /// kind), and reports TS2369 on the modifier.
-        ctor_signature,
-        /// Anything else: function, method, accessor, arrow, function type.
-        other,
-
-        fn isCtor(h: ParamHome) bool {
-            return h != .other;
-        }
+    /// Where a parameter list lives, on the two axes the parameter rules read.
+    ///
+    /// Both rules are really "is there a body to do the work": a parameter
+    /// property has nothing to assign the member from without one, and an
+    /// initializer has nothing to run. `ctor` is the extra condition on the
+    /// first — a parameter property declares a CLASS member, so only a
+    /// constructor can carry it.
+    const ParamHome = struct {
+        /// The list belongs to a `constructor`. A bodyless one still BINDS its
+        /// parameter properties as members (tsc's
+        /// `isParameterPropertyDeclaration` asks only about the parent's kind)
+        /// and reports TS2369 on top.
+        ctor: bool = false,
+        /// The function-like has a body: a declaration or method with a block,
+        /// an arrow. False for every signature-only position — an overload, an
+        /// `abstract`/`declare`d member, a method/call/construct signature, and
+        /// every function TYPE.
+        body: bool = false,
     };
-
-    /// tsc's `ModifierFlags.ParameterPropertyModifier` — the modifiers whose
-    /// presence on a parameter makes it a parameter property.
-    const param_prop_mask = ast.Flags.public | ast.Flags.private |
-        ast.Flags.protected | ast.Flags.readonly | ast.Flags.override;
 
     fn bindParam(b: *Binder, node: Node, home: ParamHome) Error!void {
         if (node == null_node) return;
@@ -2590,6 +2724,7 @@ const Binder = struct {
             .param => {
                 try b.bindPattern(d.lhs, .param, node);
                 try b.bindType(d.rhs);
+                if (!home.body) try b.reportPatternInitializers(d.lhs);
             },
             .param_full => {
                 const e = b.tree.extraData(ast.ParamFull, d.rhs);
@@ -2601,13 +2736,21 @@ const Binder = struct {
                 // every other position rejects the modifier. `main_token` on a
                 // `.param_full` is the parameter's first token — the modifier
                 // itself, which is where tsc's parameter-node span starts.
-                if (e.flags & param_prop_mask != 0 and home != .ctor_impl) {
+                if (e.flags & member_names.param_property_mask != 0 and !(home.ctor and home.body)) {
                     try b.diag(.param_property_outside_ctor_impl, b.tree.nodeMainToken(node));
+                }
+                // TS2371, the same rule for the other thing a body is needed
+                // for. The parameter's OWN initializer answers at the parameter
+                // (`main_token`); the ones inside its pattern answer at their
+                // own binding elements.
+                if (!home.body) {
+                    if (e.init != null_node) try b.diag(.param_initializer_outside_impl, b.tree.nodeMainToken(node));
+                    try b.reportPatternInitializers(d.lhs);
                 }
                 // Constructor parameter property: also a class member.
                 const prop_mask = ast.Flags.public | ast.Flags.private |
                     ast.Flags.protected | ast.Flags.readonly;
-                if (home.isCtor() and e.flags & prop_mask != 0 and
+                if (home.ctor and e.flags & prop_mask != 0 and
                     b.nodeTag(d.lhs) == .identifier)
                 {
                     const class_scope = b.scope_parents.items[b.cur_scope];
@@ -2629,8 +2772,74 @@ const Binder = struct {
                     }
                 }
             },
-            else => try b.bindPattern(node, .param, node),
+            else => {
+                try b.bindPattern(node, .param, node);
+                if (!home.body) try b.reportPatternInitializers(node);
+            },
         }
+    }
+
+    /// TS2371 for every `= …` inside a parameter's binding pattern, when the
+    /// signature it belongs to has no body to run them (see
+    /// `param_initializer_outside_impl`).
+    ///
+    /// tsc's `checkVariableLikeDeclaration` anchors this on the element's NAME
+    /// — its binding TARGET, not the element's first token. The two differ only
+    /// for a renamed element, and there they differ visibly: `({ key: [y] = [1]
+    /// })` answers at the `[`, not at `key`.
+    ///
+    /// That same function returns EARLY, before this rule, for a renamed
+    /// element whose target is a plain identifier in a parameter of a bodyless
+    /// function — `({ key: target = 1 }) => …` as a TYPE is the shape tsc
+    /// answers TS2842 ("unused renaming … did you mean a type annotation?")
+    /// for, and it gets that instead of this.
+    ///
+    /// Walked separately from `bindPattern` because that walk is shared with
+    /// variable, catch and implementation-parameter bindings, none of which
+    /// this rule touches.
+    fn reportPatternInitializers(b: *Binder, node: Node) Error!void {
+        if (node == null_node) return;
+        const d = b.tree.nodeData(node);
+        switch (b.nodeTag(node)) {
+            .array_pattern, .object_pattern => {
+                for (b.tree.nodeRange(node)) |el| try b.reportPatternInitializers(el);
+            },
+            .binding_default => {
+                try b.diag(.param_initializer_outside_impl, b.tree.nodeMainToken(d.lhs));
+                try b.reportPatternInitializers(d.lhs);
+            },
+            // `key`, `key: target` or `key: target = init` — `lhs` is the
+            // target, 0 for the shorthand whose key IS the target.
+            .binding_property => {
+                if (isRenamedToIdent(b, d.lhs)) return;
+                const anchor = if (d.lhs != null_node) b.tree.nodeMainToken(d.lhs) else b.tree.nodeMainToken(node);
+                if (d.rhs != 0) try b.diag(.param_initializer_outside_impl, anchor);
+                try b.reportPatternInitializers(d.lhs);
+            },
+            // `[expr]: target`, where a defaulted target is a `binding_default`.
+            .binding_property_computed => {
+                if (isRenamedToIdent(b, bindingTargetOf(b, d.rhs))) return;
+                try b.reportPatternInitializers(d.rhs);
+            },
+            .rest_element => try b.reportPatternInitializers(d.lhs),
+            else => {},
+        }
+    }
+
+    /// Is this element's binding target a plain identifier written out beside
+    /// a property name — the TS2842 shape `checkVariableLikeDeclaration`
+    /// returns on? A shorthand (`target == 0`) is not renamed, and a target
+    /// that is itself a pattern is not an identifier.
+    fn isRenamedToIdent(b: *const Binder, target: Node) bool {
+        return target != null_node and b.nodeTag(target) == .identifier;
+    }
+
+    /// The binding TARGET under an optional `= default` — tsc's
+    /// `BindingElement.name`. Every pattern tag's `main_token` is its own first
+    /// token, so the target's names the position to report.
+    fn bindingTargetOf(b: *const Binder, node: Node) Node {
+        if (node != null_node and b.nodeTag(node) == .binding_default) return b.tree.nodeData(node).lhs;
+        return node;
     }
 
     /// Find the class_members scope hanging off a class scope.
@@ -2815,6 +3024,7 @@ const Binder = struct {
                 else => {},
             }
         }
+        try b.checkDuplicateIndexSignatures(b.tree.extraRange(data.members_start, data.members_end));
         b.restoreState(saved);
     }
 
@@ -3135,11 +3345,78 @@ const Binder = struct {
             ms = try b.newScope(.interface_members, node, is);
         }
 
-        for (b.tree.extraRange(data.members_start, data.members_end)) |member| {
+        const members = b.tree.extraRange(data.members_start, data.members_end);
+        for (members) |member| {
             if (member == null_node) continue;
             try b.bindTypeMember(member, ms);
         }
+        try b.checkDuplicateIndexSignatures(members);
         b.popScope(saved_scope);
+    }
+
+    /// TS2374 for the index signatures of ONE member list — a class body, an
+    /// `interface` block, or an object-type literal — that share a key domain
+    /// with a sibling (`index_signature.duplicateKey`).
+    ///
+    /// Only INSTANCE signatures: `static [k: string]` lives on the class value's
+    /// type, which tsc's `getIndexSymbol(classSymbol)` never reads, so two
+    /// static signatures are silently accepted (measured) and a static beside an
+    /// instance one is not a pair at all.
+    ///
+    /// One list at a time, so signatures pooled across a merged declaration
+    /// (`interface A {…} interface A {…}`, or a class beside its `interface`
+    /// half) go unreported — an under-report, and the only part of the rule that
+    /// would need symbol-level index-signature identity to answer.
+    fn checkDuplicateIndexSignatures(b: *Binder, members: []const Node) Error!void {
+        // Two parallel scratch lists rather than a struct: `duplicateKey` takes
+        // the keys as a slice, and every member list in real code has zero or
+        // one index signature, so the loop below usually appends nothing.
+        var keys: std.ArrayList([]const u8) = .empty;
+        defer keys.deinit(b.scratch);
+        var sites: std.ArrayList(Node) = .empty;
+        defer sites.deinit(b.scratch);
+        for (members) |member| {
+            if (member == null_node or b.nodeTag(member) != .index_signature) continue;
+            const md = b.tree.nodeData(member);
+            if (md.rhs & ast.Flags.static != 0) continue;
+            const e = b.tree.extraData(ast.IndexSig, md.lhs);
+            // tsc reads `declaration.parameters.length === 1 &&
+            // declaration.parameters[0].type` before anything else, so a
+            // signature the grammar already rejected for its parameter COUNT
+            // claims no key domain — `[a: string, b: string]` beside
+            // `[c: string]` is not a duplicate pair. The parser decided that
+            // (`index_signature.check`) and reported it at this very token, so
+            // the answer is read back rather than recomputed.
+            if (b.indexSigParamCountRejected(e.name_token)) continue;
+            if (e.key_type == null_node or b.nodeTag(e.key_type) == .error_node) continue;
+            const span = b.tree.span(b.src, e.key_type);
+            try keys.append(b.scratch, b.src[span.start..span.end]);
+            try sites.append(b.scratch, member);
+        }
+        if (keys.items.len < 2) return;
+        for (sites.items, 0..) |member, i| {
+            if (!index_signature.duplicateKey(keys.items, i)) continue;
+            const start = index_signature.memberStartToken(&b.tree.tokens, b.tree.nodeMainToken(member));
+            try b.diag(.duplicate_index_signature, start);
+        }
+    }
+
+    /// Did the parser answer TS1096 ("An index signature must have exactly one
+    /// parameter") for the signature whose first parameter is `name_token`?
+    ///
+    /// That diagnostic is anchored on exactly this token (`index_signature`'s
+    /// chain reports `shape.name_token`, which is what the parser stores as
+    /// `IndexSig.name_token`), so the match is a span-start equality rather than
+    /// a containment test. Almost every file carries no parse diagnostics at
+    /// all, and this is only reached for a member list with two or more index
+    /// signatures.
+    fn indexSigParamCountRejected(b: *const Binder, name_token: TokenIndex) bool {
+        if (b.tree.diagnostics.len == 0) return false;
+        const start = b.tree.tokens.start(name_token);
+        for (b.tree.diagnostics) |d| {
+            if (d.code == .index_sig_one_parameter and d.span.start == start) return true;
+        }
+        return false;
     }
 
     /// A member of an interface or object-type literal.
@@ -3441,6 +3718,7 @@ const Binder = struct {
         const d = b.tree.nodeData(node);
         const data = b.tree.extraData(ast.ImportEquals, d.lhs);
         if (b.cur_scope == file_scope) b.saw_module_syntax = true;
+        try b.checkNamespaceImportDecl(data.module_token);
         const local = try b.atomOfToken(data.name_token);
         // `export import X = …` carries its `export` as a MODIFIER FLAG — the
         // parser does not wrap it in an `export_decl` — so `noteExport` has to
@@ -4193,6 +4471,7 @@ const Binder = struct {
                 for (b.tree.nodeRange(node)) |member| {
                     if (member != null_node) try b.bindTypeMember(member, ms);
                 }
+                try b.checkDuplicateIndexSignatures(b.tree.nodeRange(node));
             },
             .number_literal,
             .string_literal,
@@ -4321,7 +4600,7 @@ const Binder = struct {
         _ = try b.pushScope(.function, node);
         try b.bindTypeParams(proto.tp_start, proto.tp_end);
         for (b.tree.extraRange(proto.params_start, proto.params_end)) |param| {
-            try b.bindParam(param, .other);
+            try b.bindParam(param, .{});
         }
         try b.bindType(proto.return_type);
         b.popScope(saved_scope);
