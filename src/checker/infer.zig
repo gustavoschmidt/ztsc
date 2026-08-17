@@ -319,7 +319,7 @@ fn ctxSensitiveLosesSignature(c: *Checker, node: Node, ctx2: TypeId, depth: u8) 
             .arrow_fn, .function_expr => {
                 if (!c.fnExprIsContextSensitive(val)) continue;
                 if (prop_ty == types.no_type) return true;
-                if (try c.contextualCallSig(prop_ty) == types.no_type) return true;
+                if (try c.contextualCallSig(prop_ty, val) == types.no_type) return true;
             },
             .object_literal => {
                 if (prop_ty == types.no_type) continue;
@@ -462,7 +462,7 @@ fn markCtxSensitiveFixed(
         switch (c.nodeTag(val)) {
             .arrow_fn, .function_expr => {
                 if (!c.fnExprIsContextSensitive(val)) continue;
-                const sig = try c.contextualCallSig(prop_ty);
+                const sig = try c.contextualCallSig(prop_ty, val);
                 if (sig == types.no_type or c.ts.kind(sig) != .function) continue;
                 const mine = try c.scratch().alloc(bool, tp_syms.len);
                 defer c.scratch().free(mine);
@@ -1346,7 +1346,7 @@ pub fn inferTypeArgs(
         //
         // An ANNOTATED function argument is not context sensitive — its type
         // is the same whatever it is handed — so it stays an inference source.
-        if (try c.contextualCallSig(pt_partial) == types.no_type and
+        if (try c.contextualCallSig(pt_partial, an) == types.no_type and
             c.fnExprIsContextSensitive(an)) continue;
         const at = try c.checkExprCached(an, pt_partial);
         try c.unify(pt0, at, tp_syms, candidates, 0);

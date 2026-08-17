@@ -481,7 +481,7 @@ fn thisParamAnn(c: *Checker, pn: Node) ?Node {
 /// Syntactic on purpose: the question is asked BEFORE the signature is built,
 /// because the answer decides whether a contextual signature is supplied to
 /// build it with at all.
-fn syntacticRequiredParams(c: *Checker, fn_node: Node) u32 {
+pub fn syntacticRequiredParams(c: *Checker, fn_node: Node) u32 {
     const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(fn_node).lhs);
     var n: u32 = 0;
     var seen_param = false;
@@ -506,21 +506,37 @@ fn syntacticRequiredParams(c: *Checker, fn_node: Node) u32 {
 /// dropped entirely, so every unannotated parameter is implicit `any` rather
 /// than taking a type from a shape that does not reach it.
 ///
-/// `no_type` in, `no_type` out. A contextual signature with a rest parameter
-/// can absorb any arity and is never smaller (tsc's
-/// `!hasEffectiveRestParameter` conjunct).
+/// A signature with a rest parameter can absorb any arity and is never
+/// smaller (tsc's `!hasEffectiveRestParameter` conjunct). Anything that is not
+/// a plain signature is left alone.
 ///
-/// Only the SYNTHESIZED contextual signatures consult this today — a
-/// decorator's runtime call shape (`decorators.zig`), which is built from the
-/// decorated declaration and can therefore be the wrong width for the
-/// decorator someone wrote. Every other contextual type in ztsc comes from a
-/// declaration and reaches `contextualCallSig`, which does not apply the rule
-/// yet; doing so there is a corpus-wide change and a separate item.
+/// `required` is `syntacticRequiredParams` of the function expression the
+/// signature is a candidate contextual signature FOR. The two halves are
+/// separate because `getContextualCallSignature` filters a whole LIST of
+/// signatures against one expression, and the count is read off the syntax
+/// once.
+pub fn arityIsSmaller(c: *Checker, sig: TypeId, required: u32) bool {
+    if (c.ts.kind(sig) != .function) return false;
+    const n = c.ts.fnParamCount(sig);
+    if (n > 0 and c.ts.fnParam(sig, n - 1).rest()) return false;
+    return n < required;
+}
+
+/// `arityIsSmaller` applied to a single already-chosen contextual signature:
+/// `no_type` in, `no_type` out, and `no_type` back out when the signature is
+/// too narrow for the expression.
+///
+/// The SYNTHESIZED contextual signatures consult this — a decorator's runtime
+/// call shape (`decorators.zig`), which is built from the decorated
+/// declaration and can therefore be the wrong width for the decorator someone
+/// wrote. Contextual types that come from a declaration are filtered inside
+/// `contextualCallSig`, per constituent, where tsc filters them.
 pub fn contextSigForFnExpr(c: *Checker, fn_node: Node, ctx_sig: TypeId) TypeId {
     if (ctx_sig == types.no_type or c.ts.kind(ctx_sig) != .function) return ctx_sig;
-    const n = c.ts.fnParamCount(ctx_sig);
-    if (n > 0 and c.ts.fnParam(ctx_sig, n - 1).rest()) return ctx_sig;
-    return if (n < syntacticRequiredParams(c, fn_node)) types.no_type else ctx_sig;
+    return if (arityIsSmaller(c, ctx_sig, syntacticRequiredParams(c, fn_node)))
+        types.no_type
+    else
+        ctx_sig;
 }
 
 /// Resolve a `.type_predicate` return-type node into a `Predicate`:
