@@ -894,6 +894,16 @@ const Parser = struct {
         return p.lastTokEnd();
     }
 
+    /// The expression between the brackets of an element access. An EMPTY one
+    /// (`a[]`) is TS1011 rather than the generic "Expression expected": tsc's
+    /// `parseElementAccessExpression` special-cases the closing bracket and
+    /// reports at it, then carries on with a missing node.
+    fn parseElementAccessArgument(p: *Parser) PE!Node {
+        if (p.curTag() != .r_bracket) return p.parseExpression(.{});
+        try p.errAtCur(.element_access_needs_argument);
+        return null_node;
+    }
+
     /// Consume an opening `<` of type args/params, splitting `<<`.
     fn expectLt(p: *Parser) PE!u32 {
         switch (p.curTag()) {
@@ -3250,15 +3260,27 @@ const Parser = struct {
         // decorator's TS1206 alone. `reportMemberGrammar` decides between them
         // once the member's shape (and so the decorator's verdict) is known.
         var mod_err: ?ModifierErr = null;
+        // `const` in a class-member modifier list is TS1248 and nothing else —
+        // it carries no flag because it means nothing. tsc's parser accepts it
+        // as a modifier so the member behind it still parses (`static const H =
+        // 1` declares `H`), and `checkGrammarModifiers` then rejects it on the
+        // member NAME.
+        var saw_const = false;
         while (true) {
+            const is_const = p.curTag() == .keyword_const;
             const bit = classMemberModifierBit(p.curTag());
-            if (bit == 0) break;
+            if (bit == 0 and !is_const) break;
             // A modifier only if a member name (or `*`/`[`) follows on any
             // line (get/set/async additionally require same-line names).
             const t1 = p.peekTag(1);
             const name_follows = isNameLike(t1) or t1 == .string_literal or
                 t1 == .numeric_literal or t1 == .l_bracket or t1 == .asterisk;
             if (!name_follows) break;
+            if (is_const) {
+                saw_const = true;
+                _ = try p.bump();
+                continue;
+            }
             if ((bit == ast.Flags.get or bit == ast.Flags.set or bit == ast.Flags.async) and p.peekNewline(1)) break;
             // Repeated or out-of-order modifiers: tsc's `checkGrammarModifiers`
             // returns on its FIRST hit, so `public private static x` answers
@@ -3307,6 +3329,12 @@ const Parser = struct {
                 }
             },
         }
+
+        // TS1248 joins the modifier list's one diagnostic, blamed on the NAME.
+        // `const` is never the FIRST error of a list that already has one:
+        // tsc stops at the earliest modifier it rejects, and a repeated or
+        // out-of-order one ahead of the `const` gets there first.
+        if (saw_const and mod_err == null) mod_err = .{ .code = .const_class_member, .token = name_tok };
 
         // Optional method `m?(): T` / `m?<K>(): T` (ambient/overload members).
         if (p.curTag() == .question) {
@@ -4062,8 +4090,11 @@ const Parser = struct {
             // `import d ...` — but `import x = require(...)` is out of subset.
             default_name = try p.bump();
             if (p.curTag() == .eq) {
-                // The ImportEqualsDeclaration arm — `export` belongs here.
-                return p.finishImportEquals(kw, default_name, if (export_kw != null) ast.Flags.exported else 0);
+                // The ImportEqualsDeclaration arm — `export` belongs here, and
+                // it anchors the node: a declaration's span starts at its first
+                // MODIFIER, which is what puts TS1202 on the `export` of
+                // `export import a = require("m")` rather than on the `import`.
+                return p.finishImportEquals(export_kw orelse kw, default_name, if (export_kw != null) ast.Flags.exported else 0);
             }
             _ = try p.eat(.comma);
         }
@@ -4099,9 +4130,10 @@ const Parser = struct {
 
     /// `import <name> = require("m");` or `import <name> = A.B;` (CommonJS /
     /// TS-namespace alias). Positioned just before the `=`; `name_tok` is the
-    /// local binding, `import_kw` anchors the node span. `flags` carries
-    /// `Flags.exported` for the `export import` form.
-    fn finishImportEquals(p: *Parser, import_kw: u32, name_tok: u32, flags: u32) PE!Node {
+    /// local binding, `anchor_kw` the declaration's FIRST token — the `export`
+    /// when there is one, else the `import` — which is where the node's span
+    /// begins. `flags` carries `Flags.exported` for the `export import` form.
+    fn finishImportEquals(p: *Parser, anchor_kw: u32, name_tok: u32, flags: u32) PE!Node {
         _ = try p.bump(); // '='
         var module_token: u32 = 0;
         var entity: Node = 0;
@@ -4120,7 +4152,7 @@ const Parser = struct {
             .entity = entity,
             .flags = flags,
         });
-        return p.addNode(.{ .tag = .import_equals, .main_token = import_kw, .data = .{ .lhs = extra, .rhs = 0 } });
+        return p.addNode(.{ .tag = .import_equals, .main_token = anchor_kw, .data = .{ .lhs = extra, .rhs = 0 } });
     }
 
     fn parseImportSpecifiers(p: *Parser) PE!ast.SubRange {
@@ -4855,7 +4887,7 @@ const Parser = struct {
                         },
                         .l_bracket => {
                             _ = try p.bump();
-                            const index = try p.parseExpression(.{});
+                            const index = try p.parseElementAccessArgument();
                             _ = try p.expect(.r_bracket, .expected_r_bracket);
                             lhs = try p.addNode(.{ .tag = .optional_index_expr, .main_token = qd, .data = .{ .lhs = lhs, .rhs = index } });
                         },
@@ -4885,7 +4917,7 @@ const Parser = struct {
                     // computed name, not an element access. See `in_decorator`.
                     if (ctx.in_decorator) return lhs;
                     const lb = try p.bump();
-                    const index = try p.parseExpression(.{});
+                    const index = try p.parseElementAccessArgument();
                     _ = try p.expect(.r_bracket, .expected_r_bracket);
                     lhs = try p.addNode(.{ .tag = .index_expr, .main_token = lb, .data = .{ .lhs = lhs, .rhs = index } });
                 },
