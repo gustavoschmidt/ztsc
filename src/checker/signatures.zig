@@ -1796,11 +1796,8 @@ pub fn widenInitializer(c: *Checker, init_t: TypeId, is_const: bool) Error!TypeI
 /// the element type `checkForInOf` later tries to set — every use of the
 /// loop variable in the body silently becomes `any`, taking with it the
 /// narrowings and the contextual types that would have come from it.
-fn forHeadBindingType(c: *Checker, sym: SymbolId) Error!?TypeId {
-    const scope = c.symScope(sym);
-    if (c.bind.scope_kinds[scope] != .for_head) return null;
-    const owner = c.bind.scope_owners[scope];
-    if (owner == null_node) return null;
+fn forHeadBindingType(c: *Checker, sym: SymbolId, decl: Node) Error!?TypeId {
+    const owner = forHeadOwner(c, sym, decl) orelse return null;
     const is_of = switch (c.nodeTag(owner)) {
         .for_of_stmt => true,
         .for_in_stmt => false,
@@ -1813,6 +1810,53 @@ fn forHeadBindingType(c: *Checker, sym: SymbolId) Error!?TypeId {
     // `checkForInOf`, in source order — not from whatever demanded the
     // binding first.
     return try c.forOfElementType(rt, null_node, e.is_await != 0);
+}
+
+/// The `for..in` / `for..of` statement whose HEAD declares `decl`, or null when
+/// the declarator is an ordinary `let x;` / `var x;`.
+///
+/// A `let`/`const` head binding lives in the head's own `.for_head` scope, so
+/// the symbol's scope answers straight away. A `var` does not: it is HOISTED to
+/// the enclosing function or file scope, and its symbol then remembers nothing
+/// about the head it was written in — which typed every `for (var x of xs)`
+/// binding `any` (so `for (var q of [0]) { const s: string = q }` was silent,
+/// and a use of `q` before the loop missed its TS2454). The declarator's
+/// POSITION finds the head instead: the innermost `for..in`/`for..of` whose
+/// LEFT-HAND SIDE — not whose body — encloses it.
+///
+/// The scan is over `scope_kinds`, and only for a hoisted `var` whose
+/// declarator carries neither annotation nor initializer; `typeOfSymbol`
+/// memoizes, so each such symbol pays it once.
+fn forHeadOwner(c: *Checker, sym: SymbolId, decl: Node) ?Node {
+    const b = c.bind;
+    const scope = c.symScope(sym);
+    if (b.scope_kinds[scope] == .for_head) {
+        const owner = b.scope_owners[scope];
+        return if (owner == null_node) null else owner;
+    }
+    if (!c.symFlags(sym).var_decl) return null;
+    const at = c.nodeSpanStart(decl);
+    var best: ?Node = null;
+    var best_len: u32 = std.math.maxInt(u32);
+    for (b.scope_kinds, 0..) |kind, s| {
+        if (kind != .for_head) continue;
+        const owner = b.scope_owners[s];
+        if (owner == null_node) continue;
+        switch (c.nodeTag(owner)) {
+            .for_in_stmt, .for_of_stmt => {},
+            else => continue,
+        }
+        const e = c.tree.extraData(ast.ForInOf, c.tree.nodeData(owner).lhs);
+        if (e.left == null_node) continue;
+        const span = c.nodeSpan(e.left);
+        if (at < span.start or at >= span.end) continue;
+        const len = span.end - span.start;
+        if (len < best_len) {
+            best_len = len;
+            best = owner;
+        }
+    }
+    return best;
 }
 
 /// tsc's `getESSymbolLikeTypeForNode` / `isValidESSymbolDeclaration`: a
@@ -1865,7 +1909,7 @@ pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Er
         .declarator => {
             // No initializer and no annotation: either a loop head binding
             // (typed by what is iterated) or a bare `let x;`.
-            const et = (try forHeadBindingType(c, sym)) orelse return types.any_type;
+            const et = (try forHeadBindingType(c, sym, decl)) orelse return types.any_type;
             if (c.nodeTag(d.lhs) == .identifier) return et;
             return c.bindingElementType(sym, decl, et);
         },
