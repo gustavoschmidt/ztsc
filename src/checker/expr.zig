@@ -53,7 +53,8 @@ const pushChainGuards = @import("flow.zig").pushChainGuards;
 const reduceSubtypes = @import("typenode.zig").reduceSubtypes;
 const resolveStructural = @import("instantiate.zig").resolveStructural;
 const scratch = Checker.scratch;
-const signatureOfProtoCtx = @import("signatures.zig").signatureOfProtoCtx;
+const sig_zig = @import("signatures.zig");
+const signatureOfProtoCtx = sig_zig.signatureOfProtoCtx;
 const templateExprType = @import("generics.zig").templateExprType;
 const tuple_relate = @import("tuple_relate.zig");
 const tupleElemTypeAt = @import("assign.zig").tupleElemTypeAt;
@@ -4108,7 +4109,7 @@ pub fn reportIndexImplicitAny(c: *Checker, node: Node, recv: Node, idx_t: TypeId
     // through to TS7053 on a read. The one documented gap is a `set`-only
     // object in WRITE position, which tsc calls TS7052 and this calls TS7053.
     if (try c.propOfType(r, try c.atom("get"))) |prop| accessor: {
-        const sig = try c.contextualCallSig(prop.ty);
+        const sig = try c.contextualCallSig(prop.ty, null_node);
         if (sig == types.no_type or c.ts.kind(sig) != .function) break :accessor;
         if (c.ts.fnParamCount(sig) == 0) break :accessor;
         if (!try c.isAssignable(idx_t, c.ts.fnParam(sig, 0).ty)) break :accessor;
@@ -4697,54 +4698,110 @@ fn checkDestructuringTarget(c: *Checker, el0: Node, src: TypeId) Error!void {
 /// `this` type makes the combination ambiguous, so the whole set answers
 /// `no_type` and the arrow keeps its context-free check (the prior behaviour
 /// for every intersection).
-fn intersectedCallSignature(c: *Checker, rctx: TypeId) Error!TypeId {
+/// tsc's `getSignaturesOfType(type, SignatureKind.Call)`, appended to `out`:
+/// a lone function type is its own signature, an overload set and a callable
+/// object hand over each of theirs, and an INTERSECTION concatenates its
+/// constituents'.
+fn collectCallSigs(c: *Checker, rctx: TypeId, out: *std.ArrayList(TypeId)) Error!void {
     const s = &c.ts;
-    var sigs: std.ArrayList(TypeId) = .empty;
-    defer sigs.deinit(c.scratch());
     switch (s.kind(rctx)) {
-        .function => try sigs.append(c.scratch(), rctx),
+        .function => try out.append(c.scratch(), rctx),
         .overloads => for (try c.memberList(rctx)) |ov| {
-            try sigs.append(c.scratch(), ov);
+            try out.append(c.scratch(), ov);
         },
         .object => {
             for (0..s.objectCallSigCount(rctx)) |i| {
-                try sigs.append(c.scratch(), s.objectCallSig(rctx, @intCast(i)));
+                try out.append(c.scratch(), s.objectCallSig(rctx, @intCast(i)));
             }
         },
-        else => for (try c.memberList(rctx)) |m| {
-            const rm = try c.resolveStructural(m);
-            switch (s.kind(rm)) {
-                .function => try sigs.append(c.scratch(), rm),
-                .overloads => for (try c.memberList(rm)) |ov| {
-                    try sigs.append(c.scratch(), ov);
-                },
-                // Every call signature of the constituent, including an
-                // overload set's: `getSignaturesOfType` concatenates them all
-                // and the combination below is what tsc applies to the result.
-                .object => {
-                    for (0..s.objectCallSigCount(rm)) |i| {
-                        try sigs.append(c.scratch(), s.objectCallSig(rm, @intCast(i)));
-                    }
-                },
-                else => {},
-            }
+        .intersection => for (try c.memberList(rctx)) |m| {
+            try collectCallSigs(c, try c.resolveStructural(m), out);
         },
+        else => {},
+    }
+}
+
+/// tsc's `getContextualCallSignature`: the signatures a NON-union contextual
+/// type offers, minus the ones too narrow for the function expression they
+/// would type (`isAritySmaller`), reduced to the sole survivor or their
+/// combination.
+///
+/// ```ts
+/// const signatures = getSignaturesOfType(type, SignatureKind.Call);
+/// const applicableByArity = filter(signatures, s => !isAritySmaller(s, node));
+/// return applicableByArity.length === 1 ? applicableByArity[0] : getIntersectedSignatures(applicableByArity);
+/// ```
+///
+/// `required` is the expression's syntactic required-parameter count, or null
+/// when the caller has no function expression in hand and the arity question
+/// therefore does not arise.
+///
+/// The filter runs HERE, before the combination — not on the combined result.
+/// `TFunction extends ((event: any) => void) | (() => void)` (excalidraw's
+/// `withBatchedUpdates`) is the witness: the one-parameter constituent is the
+/// contextual signature for `(event) => …`, and filtering afterwards would
+/// have thrown it away along with the zero-parameter one and reported TS7006.
+fn contextualCallSigOfType(c: *Checker, rctx: TypeId, required: ?u32) Error!TypeId {
+    // A contextual type with AT MOST ONE call signature — a function type, or
+    // an object with zero or one — is the overwhelmingly common shape, and it
+    // is answered without a list: this runs once per contextually typed
+    // function expression in the program, and the list path allocates.
+    switch (c.ts.kind(rctx)) {
+        .function => return arityFiltered(c, rctx, required),
+        .object => {
+            const n = c.ts.objectCallSigCount(rctx);
+            if (n == 0) return types.no_type;
+            if (n == 1) return arityFiltered(c, c.ts.objectCallSig(rctx, 0), required);
+        },
+        .overloads, .intersection => {},
+        else => return types.no_type,
+    }
+    var sigs: std.ArrayList(TypeId) = .empty;
+    defer sigs.deinit(c.scratch());
+    try collectCallSigs(c, rctx, &sigs);
+    if (required) |n| {
+        var kept: usize = 0;
+        for (sigs.items) |sig| {
+            if (sig_zig.arityIsSmaller(c, sig, n)) continue;
+            sigs.items[kept] = sig;
+            kept += 1;
+        }
+        sigs.shrinkRetainingCapacity(kept);
     }
     if (sigs.items.len == 0) return types.no_type;
     if (sigs.items.len == 1) return sigs.items[0];
+    return combineCallSignatures(c, sigs.items);
+}
+
+/// `isAritySmaller` as a filter over a single signature: the signature, or
+/// `no_type` when it is too narrow for the expression.
+fn arityFiltered(c: *Checker, sig: TypeId, required: ?u32) TypeId {
+    const n = required orelse return sig;
+    return if (sig_zig.arityIsSmaller(c, sig, n)) types.no_type else sig;
+}
+
+/// tsc's `getIntersectedSignatures` ->
+/// `combineSignaturesOfIntersectionMembers`: union the parameter types
+/// position-wise, intersect the return types.
+///
+/// Deliberately conservative: a signature with its own type parameters or a
+/// `this` type makes the combination ambiguous, so the whole set answers
+/// `no_type` and the expression keeps its context-free check.
+fn combineCallSignatures(c: *Checker, sigs: []const TypeId) Error!TypeId {
+    const s = &c.ts;
     // Per signature: how many LEADING fixed parameters it declares, and the
     // element type of its trailing rest parameter (`no_type` when it has
     // none). tsc's `combineIntersectionParameters` reads a position through
     // `tryGetTypeAtPosition`, which answers a rest parameter's element type
     // for every position it covers — the reason `(...data: any[]) => void`
     // combines with `(message?: any, …rest) => void` instead of aborting.
-    const fixed = try c.scratch().alloc(usize, sigs.items.len);
+    const fixed = try c.scratch().alloc(usize, sigs.len);
     defer c.scratch().free(fixed);
-    const rest_elem = try c.scratch().alloc(TypeId, sigs.items.len);
+    const rest_elem = try c.scratch().alloc(TypeId, sigs.len);
     defer c.scratch().free(rest_elem);
     var max_fixed: usize = 0;
     var any_rest = false;
-    for (sigs.items, 0..) |sig, si| {
+    for (sigs, 0..) |sig, si| {
         if (s.fnTypeParams(sig).len != 0 or s.fnThisType(sig) != 0) return types.no_type;
         fixed[si] = s.fnParamCount(sig);
         rest_elem[si] = types.no_type;
@@ -4769,7 +4826,7 @@ fn intersectedCallSignature(c: *Checker, rctx: TypeId) Error!TypeId {
         parts.clearRetainingCapacity();
         var name: Atom = 0;
         var opt = false;
-        for (sigs.items, 0..) |sig, si| {
+        for (sigs, 0..) |sig, si| {
             if (i >= fixed[si]) {
                 if (rest_elem[si] != types.no_type) {
                     // Covered by the rest parameter, and a rest position is
@@ -4797,7 +4854,7 @@ fn intersectedCallSignature(c: *Checker, rctx: TypeId) Error!TypeId {
     }
     if (any_rest) {
         parts.clearRetainingCapacity();
-        for (sigs.items, 0..) |sig, si| {
+        for (sigs, 0..) |sig, si| {
             _ = sig;
             if (rest_elem[si] != types.no_type) try parts.append(c.scratch(), rest_elem[si]);
         }
@@ -4808,7 +4865,7 @@ fn intersectedCallSignature(c: *Checker, rctx: TypeId) Error!TypeId {
         });
     }
     parts.clearRetainingCapacity();
-    for (sigs.items) |sig| try parts.append(c.scratch(), s.fnReturn(sig));
+    for (sigs) |sig| try parts.append(c.scratch(), s.fnReturn(sig));
     const ret = try s.makeIntersection(c.scratch(), parts.items);
     return s.makeFunction(params.items, ret, &.{}, 0);
 }
@@ -4820,8 +4877,18 @@ fn intersectedCallSignature(c: *Checker, rctx: TypeId) Error!TypeId {
 /// the function: `instantiateSigForCall` needs to know whether an overload
 /// candidate is about to type a callback's parameters as `any` before it lets
 /// that walk happen at all.
-pub fn contextualCallSig(c: *Checker, ctx: TypeId) Error!TypeId {
+pub fn contextualCallSig(c: *Checker, ctx: TypeId, fn_node: Node) Error!TypeId {
     var ctx_sig: TypeId = types.no_type;
+    // tsc's `isAritySmaller` compares every candidate against the arity the
+    // function expression REQUIRES; with no expression in hand — a caller
+    // asking what shape a contextual type has, not typing one — there is
+    // nothing to compare and no filtering happens.
+    const required: ?u32 = if (fn_node == null_node)
+        null
+    else switch (c.nodeTag(fn_node)) {
+        .arrow_fn, .function_expr => sig_zig.syntacticRequiredParams(c, fn_node),
+        else => null,
+    };
     if (ctx != types.no_type) {
         var rctx = try c.resolveStructural(ctx);
         // tsc's `getContextualSignature` reads the contextual type's
@@ -4837,66 +4904,71 @@ pub fn contextualCallSig(c: *Checker, ctx: TypeId) Error!TypeId {
             },
             else => {},
         }
-        switch (c.ts.kind(rctx)) {
-            .function => ctx_sig = rctx,
-            // A callable-INTERFACE contextual type — a call signature plus
-            // ordinary properties (`FunctionComponent<P>` with its
-            // `displayName?`, `ForwardRefRenderFunction<T, P>`). tsc's
-            // `getContextualSignature` reads the type's call signatures and
-            // uses the SOLE one; SEVERAL are combined the same way an
-            // intersection's are (`getIntersectedSignatures`). Without this an
-            // arrow annotated with such an interface (`const Base: FC<Props> =
-            // (props) => …`) got no contextual parameter types and reported
-            // TS7006.
-            .object => {
-                if (c.ts.objectCallSigCount(rctx) == 1) {
-                    ctx_sig = c.ts.objectCallSig(rctx, 0);
-                } else if (c.ts.objectCallSigCount(rctx) > 1) {
-                    ctx_sig = try intersectedCallSignature(c, rctx);
-                }
-            },
-            // An OVERLOAD SET. `getSignaturesOfType` treats it exactly as it
-            // treats an intersection of callables — several signatures — and
-            // `getContextualCallSignature` combines them. A name declared by
-            // both `lib.dom` and `@types/node` (`fetch`, `Console.trace`)
-            // arrives here, and leaving it alone reported TS7006 on every
-            // parameter of the arrow written for it.
-            .overloads => ctx_sig = try intersectedCallSignature(c, rctx),
-            .union_type => {
-                for (try c.memberList(rctx)) |m| {
-                    const rm = try c.resolveStructural(m);
-                    if (c.ts.kind(rm) == .function) {
-                        ctx_sig = rm;
-                        break;
-                    }
-                    if (c.ts.kind(rm) == .object and c.ts.objectCallSigCount(rm) == 1) {
-                        ctx_sig = c.ts.objectCallSig(rm, 0);
-                        break;
-                    }
+        // A UNION asks each constituent separately — `getContextualSignature`
+        // maps `getContextualCallSignature` over `(type as UnionType).types`
+        // — so a constituent whose signatures are all too narrow drops out
+        // and the NEXT one still answers. That per-constituent order is the
+        // whole point of the arity filter living in
+        // `contextualCallSigOfType`: `((event: any) => void) | (() => void)`
+        // must answer with the one-parameter constituent for `(event) => …`.
+        //
+        // Everything else — a lone function type, a callable INTERFACE
+        // (`FunctionComponent<P>` with its `displayName?`), an OVERLOAD SET
+        // (`fetch` declared by both `lib.dom` and `@types/node`), an
+        // INTERSECTION of callables (a JSX attribute of a component whose
+        // props are `Omit<TriggerProps, "name"> & React.HTMLAttributes<…>`)
+        // — is one signature list, and answers with its sole survivor or
+        // their combination.
+        if (c.ts.kind(rctx) == .union_type) {
+            // Each constituent is asked separately, and the arity filter runs
+            // INSIDE each — so a constituent whose signatures are all too
+            // narrow drops out and the NEXT one still answers. That order is
+            // the whole point of the filter living in
+            // `contextualCallSigOfType`: `((event: any) => void) | (() => void)`
+            // must answer with its one-parameter constituent for
+            // `(event) => …`.
+            //
+            // tsc goes one step further and requires every constituent that
+            // answers to answer with the SAME signature
+            // (`compareSignaturesIdentical`, return types and `this`
+            // ignored), handing over nothing when they disagree. That step
+            // is NOT taken here yet, and cannot be until the contextual type
+            // of an object literal / JSX attribute list is DISCRIMINATED
+            // first (tsc's `discriminateContextualTypeByObjectMembers` /
+            // `…ByJSXAttributes`, which run before `getContextualSignature`
+            // ever sees the union). Without discrimination the disagreement
+            // test fires on unions tsc has already narrowed to one
+            // constituent, and every callback in a discriminated-union
+            // literal reports TS7006 (measured: 7 corpus cases lost, 2
+            // gained). The two it would gain —
+            // `contextualTypeWithUnionTypeCallSignatures` and
+            // `contextualOverloadListFromUnionWithPrimitiveNoImplicitAny` —
+            // are waiting on that.
+            //
+            // Overload sets and multi-signature objects are likewise left
+            // alone inside a union: combining them here is what let
+            // `String.prototype.normalize` type a `normalize` property
+            // written against `string | FullRule`.
+            for (try c.memberList(rctx)) |m| {
+                const rm = try c.resolveStructural(m);
+                const sig: TypeId = switch (c.ts.kind(rm)) {
+                    .function => rm,
+                    .object => if (c.ts.objectCallSigCount(rm) == 1)
+                        c.ts.objectCallSig(rm, 0)
+                    else
+                        types.no_type,
                     // An optional property whose declared type is an
-                    // intersection of callables arrives as
-                    // `(A & B) | undefined`.
-                    if (c.ts.kind(rm) == .intersection) {
-                        const isig = try intersectedCallSignature(c, rm);
-                        if (isig != types.no_type) {
-                            ctx_sig = isig;
-                            break;
-                        }
-                    }
-                }
-            },
-            // An INTERSECTION of callables. `getSignaturesOfType` on an
-            // intersection is the concatenation of its constituents', and
-            // `getContextualCallSignature` then either takes the sole one
-            // or COMBINES them (tsc's `getIntersectedSignatures`). A JSX
-            // attribute of a component whose props are
-            // `Omit<TriggerProps, "name"> & React.HTMLAttributes<…>` is
-            // exactly this: both constituents declare `onToggle`, so the
-            // attribute value's contextual type is
-            // `((open: boolean) => void) & ReactEventHandler<…>` and the
-            // arrow written for it reported TS7006 on every parameter.
-            .intersection => ctx_sig = try intersectedCallSignature(c, rctx),
-            else => {},
+                    // intersection of callables arrives as `(A & B) | undefined`.
+                    .intersection => try contextualCallSigOfType(c, rm, required),
+                    else => types.no_type,
+                };
+                if (sig == types.no_type) continue;
+                if (required) |n| if (sig_zig.arityIsSmaller(c, sig, n)) continue;
+                ctx_sig = sig;
+                break;
+            }
+        } else {
+            ctx_sig = try contextualCallSigOfType(c, rctx, required);
         }
     }
     return ctx_sig;
@@ -4928,7 +5000,7 @@ fn checkFunctionLikeExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     c.const_ctx = false;
     defer c.const_ctx = prev_cc;
     const d = c.tree.nodeData(node);
-    const ctx_sig = try c.contextualCallSig(ctx);
+    const ctx_sig = try c.contextualCallSig(ctx, node);
     // tsc's `getContextualThisParameterType`: a contextually typed function
     // EXPRESSION whose own proto declares no `this` parameter takes `this`
     // from the contextual signature's. An arrow is excluded there and here —

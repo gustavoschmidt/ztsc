@@ -1180,7 +1180,7 @@ pub fn instantiateSigForCall(c: *Checker, sig: TypeId, explicit_targs: []const T
 ///
 /// That intersection is what makes a callback argument work. `(A[] | B[])
 /// .map(x => …)` hands the arrow `((x: A, …) => U) & ((x: B, …) => U)`, an
-/// intersection of two call signatures, which `intersectedCallSignature`
+/// intersection of two call signatures, which `contextualCallSigOfType`
 /// then turns back into one parameter typed `A | B`. Resolving the lists as
 /// overloads instead picked the FIRST constituent's signature and typed `x`
 /// as `A` alone — every use of a `B`-only property was a false TS2339, and a
