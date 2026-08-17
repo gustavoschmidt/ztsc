@@ -160,7 +160,21 @@ pub fn typeFromTypeNameEx(c: *Checker, name_node: Node, args: []const TypeId, ou
                         // (cross-file augmentation).
                         sym = c.prog.mergedOf(g) orelse g;
                         f = c.symFlags(sym);
-                        if (!hasTypeMeaning(f) or f.import_binding) {
+                        // The target may itself be an alias: a re-export of an
+                        // import, or an import MERGED with a local value
+                        // declaration (`import { A } from "./a"; const A = 0;
+                        // export { A }` — a value export whose TYPE meaning is
+                        // still the import's). tsc's `resolveAlias` keeps
+                        // walking in exactly that case, and stops as soon as
+                        // the symbol declares a type of its own.
+                        if (f.import_binding and !declaresType(f)) {
+                            const next = aliasDeclSym(c, sym);
+                            if (next != sym) {
+                                sym = next;
+                                f = c.symFlags(sym);
+                            }
+                        }
+                        if (!hasTypeMeaning(f) or (f.import_binding and !declaresType(f))) {
                             if (hasValueMeaning(f)) {
                                 try c.diagFmt(2749, c.tokSpan(tok), "'{s}' refers to a value, but is being used as a type here. Did you mean 'typeof {s}'?", .{ c.tokenText(tok), c.tokenText(tok) });
                                 return types.error_type;
@@ -439,6 +453,13 @@ fn nsReexportMemberSym(c: *Checker, ns_sym: SymbolId, name: Atom) ?SymbolId {
 /// members of its own). Stops at the first non-`binding` target — a whole
 /// module-namespace object has no single declaration symbol — and at a fixed
 /// hop count, so a re-export cycle terminates.
+/// Does the symbol declare a TYPE of its own — as opposed to borrowing one
+/// through an alias? tsc's `SymbolFlags.Type` minus the alias bit; a namespace
+/// is excluded on purpose (naming one as a type is TS2709, not a resolution).
+fn declaresType(f: binder.SymbolFlags) bool {
+    return f.class or f.interface or f.type_alias or f.type_param or f.enum_decl;
+}
+
 fn aliasDeclSym(c: *Checker, sym0: SymbolId) SymbolId {
     var sym = c.prog.mergedOf(sym0) orelse sym0;
     var hops: u8 = 0;
