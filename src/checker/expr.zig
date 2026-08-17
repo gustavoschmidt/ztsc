@@ -647,9 +647,25 @@ fn checkPrivateName(c: *Checker, tok: TokenIndex, a: Atom) Error!TypeId {
 /// behind them walks ONE file's top-level statement tags — reached only by a
 /// value name that resolves across a file boundary into a declaration module,
 /// which apart from this pattern means a `declare global { … }` contribution.
+/// tsc's `every(merged.declarations, …)` is what makes a name that ALSO has a
+/// non-UMD declaration legal: `declare global { const React: typeof
+/// import("./module") }` beside `export as namespace React` gives the merged
+/// symbol a real global `const`, and a module may read that (it is a global
+/// like any other). So every contributor has to be a publisher of this name.
 fn isUmdGlobalRef(c: *Checker, a: Atom, sym: SymbolId) bool {
     if (!c.bind.is_module) return false; // a script may use the global freely
-    const file = c.symFile(sym);
+    if (c.prog.isMergedId(sym)) {
+        const parts = c.prog.mergedSym(sym).parts;
+        if (parts.len == 0) return false;
+        for (parts) |p| if (!publishesUmdName(c, c.symFile(p), a)) return false;
+        return true;
+    }
+    return publishesUmdName(c, c.symFile(sym), a);
+}
+
+/// Does `file` — some file other than the one being checked — carry
+/// `export as namespace <a>`?
+fn publishesUmdName(c: *Checker, file: modules.FileId, a: Atom) bool {
     if (file == c.cur_file) return false;
     const f = &c.prog.files[file];
     if (!f.bind.is_module or !paths.isDeclarationPath(f.path)) return false;
