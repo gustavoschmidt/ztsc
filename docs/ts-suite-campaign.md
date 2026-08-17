@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-17, post wave 16)
+## Standings (2026-08-17, post wave 17)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **6789 / 8627 (78.7%)** |
-| excess keys (false positives) | 3541 | 2062 |
-| missing keys (under-reports) | 8617 | 4360 |
+| exact-match cases | 4902 / 7815 (62.7%) | **6858 / 8628 (79.5%)** |
+| excess keys (false positives) | 3541 | 2027 |
+| missing keys (under-reports) | 8617 | 4026 |
 | bucketed (ztsc parse error, incomparable) | 825 | 13 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Sixteen waves landed (3–16), every one with ZERO match→non-match regressions in
+Seventeen waves landed (3–17), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -173,7 +173,72 @@ TS2507 primitive arm. Mid-wave the social-app checkout lost its node_modules
 hard-links (4778 files loading instead of 5028) — `pnpm install` repairs it;
 check the stats line if link errors drop to 0.
 
-## Ranked next queue (wave 17) — distilled from wave-16 agent reports
+Wave 17 (+69 cases; conformance 1317→1319): A landed readonly index
+signatures end-to-end (types.zig obj_flag_readonly_{string,number}_index;
+TS2542 does NOT suppress assignability), TS2683/TS7041/TS2331/TS2332 (zero app
+fallout — measured), and interface-extends-typeof-class. B relocated TS2440 to
+checkAliasSymbol semantics (new alias_conflict.zig; AliasExcludes=Alias), both
+TS2649 mechanisms, use-site TS2307 for dead require aliases. C landed TS2417
+static origins (class_static_owner reverse index; poisoned on hash-cons
+ambiguity), the distributive-conditional constraint with its every-instantiation
+restriction, non-array instantiable rests (one-sided rule — the two-sided form
+produced 5 excalidraw FPs, caught by the app gate), abstract-ctor
+assignability. D landed the regex body+flags validator (new regexp.zig,
+oracle-probed Annex-B rules; the wave-12 blocker was that tsc's regex
+diagnostics are SEMANTIC-class, not the shebang), TS1155, TS2480.
+IMPORTANT clarification from D: the recurring "social-app loads 4778 files /
+0 link errors" symptom is the WRONG CONFIG — agents must use tsconfig.json,
+not tsconfig.check.json; the checkout was fine.
+
+## Ranked next queue (wave 18) — distilled from wave-17 agent reports
+
+1. heritage.zig `untrustworthyOverride` — the single biggest mapped blocker:
+   it declines EVERY TS2430 when the interface redeclares any base member with
+   method syntax; its docstring scopes the real gap to optional-method
+   bivariance + unrelated `this` params. Narrow it to that shape; ≥9 TS2430
+   cases are behind it (the overload-replacement machinery is already right).
+2. expr.zig alias-guard order (from B): `symbolMergeValueAndImportedType` —
+   expr.zig ~715 tests `f.import_binding` BEFORE the symbol's own value
+   meaning (tsc checks merged value first); `exportDefaultImportedType` —
+   `export default <type-only import>` is legal (checkExportAssignment
+   resolves all meanings; stmts.zig .export_default arm); signatures.zig:1262
+   types a merged alias by the alias target (tsc checks Alias LAST) — type
+   wrong, diagnostics right.
+3. TS2403 cross-file (module_augmentExistingVariable ×2): two `var`s of one
+   global in different files merge silently; needs
+   redeclare.checkSubsequentVarDecl's cross-file twin.
+4. private vs protected as distinct Prop bits in types.zig
+   (derivedClassWithPrivateStaticShadowingProtectedStatic — today they
+   hash-cons to the same type id and the static-extends check short-circuits).
+5. narrowable.constraintOrSelf erases conditional parameter types to their
+   branch union before the relation runs — every conditional-source relation
+   rule is unreachable for parameters (last distributive key,
+   conditionalTypesExcessProperties, etc.). Investigate keeping the
+   conditional and printing the constraint.
+6. TS2454 cluster (9 one-key cases): the funnel is expr.zig:1090.
+7. Regex leftovers: RegExp arithmetic TS2362/2363 (`/a/ ** /b/` — expr.zig),
+   RegExp.foo TS2339; unicode property names TS1523-29, v-mode set operators
+   TS1518-22, backrefs TS1533/34, octal TS1487/1536 (all mapped as clean
+   extensions of regexp.zig).
+8. staticIndexSignature4/5: would flip if `static` on an INTERFACE index
+   signature reported TS1071 alone instead of TS1071 + binder TS2300.
+9. TS2769 anchor via candidate-diagnostic spans (calls.zig; strictBindCallApply1
+   now anchors right, generalize).
+10. objectTypesIdentityWithPrivates3 (TS2352 accepted where type argument
+    should fail — nominal-heritage fast path ignoring variance?); importType*
+    TS2741 cluster (3, link/modvalue).
+11. The overload-probe suppression: a failing generic type-predicate candidate
+    swallows every diagnostic inside a callback argument's body
+    (thisInFunctionCall.ts, 2 keys — pre-existing, now documented).
+12. The TS2322/TS2345 census pools (still the largest); TS2693 residue via
+    names.zig/expr.zig.
+13. nestedExcessPropertyChecking per-frame weak rule (risky; flow/062).
+14. resolution-mode import attributes (deep, 2 cases).
+15. Determinism defect with a concrete witness: social-app `--checkers=1` and
+    `--file-order=reverse` diverge; `Navigation.tsx:778:29`. Pattern-matches
+    the open instantiation-budget partition bug.
+
+## Superseded queue (wave 17, kept for context)
 
 1. TS2440 re-diagnosed (8 keys): tsc emits from checkAliasSymbol using the
    alias TARGET's meanings (cross-file; a non-instantiated namespace target is
