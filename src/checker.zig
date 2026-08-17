@@ -3442,6 +3442,7 @@ pub const Checker = struct {
         c.key_name_gen += 1;
     }
     pub const classInstanceGeneric = instantiate_zig.classInstanceGeneric;
+    pub const classSymbolOf = instantiate_zig.classSymbolOf;
     pub const isCtorName = instantiate_zig.isCtorName;
     pub const isCtorMember = instantiate_zig.isCtorMember;
     pub const refExpansionActive = instantiate_zig.refExpansionActive;

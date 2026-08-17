@@ -723,6 +723,7 @@ pub const classTableProvisional = classes.classTableProvisional;
 pub const baseRefProvisional = classes.baseRefProvisional;
 pub const baseRefCut = classes.baseRefCut;
 pub const classInterfaceHalfBases = classes.classInterfaceHalfBases;
+pub const classSymbolOf = classes.classSymbolOf;
 pub const isCtorName = classes.isCtorName;
 pub const isCtorMember = classes.isCtorMember;
 pub const classGenericInProgress = classes.classGenericInProgress;

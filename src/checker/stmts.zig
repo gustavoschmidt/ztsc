@@ -1692,13 +1692,8 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
     }
     if (try c.scopeOf(node)) |s| c.cur_scope = s;
 
-    var class_sym: SymbolId = binder.no_symbol;
-    if (data.name_token != 0) {
-        const a = try c.atomOfToken(data.name_token);
-        if (c.bind.lookupInScope(saved_scope, a)) |sym| {
-            if (c.bind.symbol_flags[sym].class) class_sym = c.toGlobal(sym);
-        }
-    }
+    // Declaration or expression, named or not — see `classes.classSymbolOf`.
+    const class_sym = try c.classSymbolOf(node, saved_scope);
 
     // Instance type for `this` (generic: tp refs as args).
     var this_t: TypeId = types.any_type;

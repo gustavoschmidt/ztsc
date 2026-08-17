@@ -396,8 +396,16 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         },
         .arrow_fn, .function_expr => return checkFunctionLikeExpr(c, node, ctx),
         .class_decl => {
+            // A class EXPRESSION. Its type is its class value (`typeof C`),
+            // exactly what a reference to a class DECLARATION's name resolves
+            // to — `typeOfSymbol` is the shared path, so a mixin's
+            // base-type-variable intersection comes along for free. The symbol
+            // lives in the class's own scope (`classes.classSymbolOf`); before
+            // there was one, every class expression was `any`.
             try c.checkClass(node);
-            return types.any_type; // class expressions: minimal support
+            const sym = try c.classSymbolOf(node, c.cur_scope);
+            if (sym == binder.no_symbol) return types.any_type;
+            return c.typeOfSymbol(sym);
         },
         .yield_expr => {
             // `yield x`: relate `x` to the generator's yield type `T`

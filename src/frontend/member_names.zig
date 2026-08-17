@@ -35,6 +35,21 @@ const Node = ast.Node;
 /// `InternalSymbolName.Constructor`, in ztsc's synthetic-key spelling.
 pub const ctor_member_name = "__@ctor";
 
+/// The reserved scope key an ANONYMOUS class-like declaration is filed
+/// under, in its own class scope — tsc's `InternalSymbolName.Class`
+/// (`"__class"`), same synthetic-key spelling as the constructor's.
+///
+/// Every class needs a symbol: the member and static tables, the instance
+/// shape, the `this` type and the static (`typeof C`) type are all keyed by
+/// SymbolId. A NAMED class expression already got one from its own name;
+/// `const K = class { … }` got none at all, so the checker saw `no_symbol`,
+/// skipped every member check, and typed the expression `any`. Filing the
+/// anonymous class under this key gives it the same symbol every other class
+/// has. The key cannot collide with source: `__@` is not writable in an
+/// identifier, and the symbol lives in the class's own scope, so it shadows
+/// nothing and is unreachable by name.
+pub const class_expr_name = "__@class";
+
 /// tsc's `ModifierFlags.ParameterPropertyModifier`: the modifiers whose
 /// presence on a constructor parameter makes it declare a class MEMBER.
 ///

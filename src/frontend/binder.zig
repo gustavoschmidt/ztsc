@@ -2174,7 +2174,7 @@ const Binder = struct {
             .labeled_stmt => try b.bindLabeled(node),
 
             .function_decl => try b.bindFunctionDecl(node),
-            .class_decl => try b.bindClass(node, true),
+            .class_decl => try b.bindClass(node, true, 0),
             .interface_decl => try b.bindInterface(node),
             .type_alias => try b.bindTypeAlias(node),
             .enum_decl => try b.bindEnum(node),
@@ -2534,7 +2534,7 @@ const Binder = struct {
             .declarator => try b.bindPattern(d.lhs, kind, node),
             .declarator_init => {
                 try b.bindPattern(d.lhs, kind, node);
-                try b.bindExpr(d.rhs);
+                try b.bindNamedExpr(d.rhs, b.assignedNameToken(d.lhs));
                 b.cur_flow = try b.addFlow(.assign, b.cur_flow, node);
             },
             .declarator_full => {
@@ -2542,7 +2542,7 @@ const Binder = struct {
                 try b.bindPattern(d.lhs, kind, node);
                 try b.bindType(e.type_ann);
                 if (e.init != 0) {
-                    try b.bindExpr(e.init);
+                    try b.bindNamedExpr(e.init, b.assignedNameToken(d.lhs));
                     b.cur_flow = try b.addFlow(.assign, b.cur_flow, node);
                 }
             },
@@ -2888,7 +2888,52 @@ const Binder = struct {
         return null;
     }
 
-    fn bindClass(b: *Binder, node: Node, declare_name: bool) Error!void {
+    /// What diagnostics print for a class expression the syntax gives no name
+    /// to at all — tsc's `getNameOfSymbolAsWritten` fallback, verbatim.
+    const anonymous_class_display = "(Anonymous class)";
+
+    /// Bind an expression that is being GIVEN a name by the syntax around it —
+    /// tsc's `getAssignedName`. An anonymous class expression has no name of
+    /// its own, so `getNameOfSymbolAsWritten` falls back to the name it is
+    /// assigned to: `const K = class { … }` prints as `typeof K`, `{ c: class
+    /// { … } }` as `typeof c`, and only a class with no such parent prints
+    /// `typeof (Anonymous class)`.
+    ///
+    /// The name is passed DOWN from the parent because the binder walks
+    /// top-down and the ast carries no parent links. Every other expression
+    /// ignores it, so this is `bindExpr` with one extra argument.
+    fn bindNamedExpr(b: *Binder, expr: Node, name_tok: TokenIndex) Error!void {
+        if (expr != null_node and name_tok != 0 and b.nodeTag(expr) == .class_decl) {
+            const data = b.tree.extraData(ast.ClassData, b.tree.nodeData(expr).lhs);
+            if (data.name_token == 0) return b.bindClass(expr, false, name_tok);
+        }
+        return b.bindExpr(expr);
+    }
+
+    /// An identifier-shaped name token, or 0 — a quoted or numeric property key
+    /// is left to the `(Anonymous class)` fallback rather than printed with its
+    /// punctuation.
+    fn plainNameToken(b: *Binder, tok: TokenIndex) TokenIndex {
+        if (tok == 0) return 0;
+        const tag = b.tree.tokens.tag(tok);
+        return if (tag == .identifier or tag.isKeyword()) tok else 0;
+    }
+
+    /// The name token `bindNamedExpr` should carry for an assignment target:
+    /// tsc's `getAssignedName` takes the identifier of `x = <expr>` and the
+    /// property name of `o.x = <expr>`, and nothing at all from a computed or
+    /// call-rooted target.
+    fn assignedNameToken(b: *Binder, target: Node) TokenIndex {
+        if (target == null_node) return 0;
+        return switch (b.nodeTag(target)) {
+            .identifier => b.tree.nodeMainToken(target),
+            // `.member_expr`'s main token is the dot; `rhs` is the name token.
+            .member_expr => @intCast(b.tree.nodeData(target).rhs),
+            else => 0,
+        };
+    }
+
+    fn bindClass(b: *Binder, node: Node, declare_name: bool, anon_name_tok: TokenIndex) Error!void {
         const d = b.tree.nodeData(node);
         const data = b.tree.extraData(ast.ClassData, d.lhs);
         var class_sym: SymbolId = no_symbol;
@@ -2919,11 +2964,39 @@ const Binder = struct {
         // {} }` names the class (tsc gives the ClassExpression a local
         // symbol in its own scope). Declared here, in the class scope, so it
         // shadows nothing outside.
+        //
+        // A class with no name at all (`const K = class { … }`, and
+        // `export default class { … }`, whose name is `default` and never its
+        // own text) gets the same local symbol under the reserved
+        // `member_names.class_expr_name` key. Everything downstream of a class
+        // is SymbolId-keyed — the member and static tables below, the instance
+        // shape, `this`, and `typeof C` — so a class without a symbol has no
+        // members to check and no type to be: the checker typed every class
+        // expression `any`.
         var self_sym: SymbolId = no_symbol;
-        if (!declare_name and data.name_token != 0) {
-            self_sym = try b.declare(cs, try b.atomOfToken(data.name_token), .class, node, data.name_token, .{
+        if (class_sym == no_symbol) {
+            const named = data.name_token != 0;
+            const atom = if (named)
+                try b.atomOfToken(data.name_token)
+            else
+                try b.atomOf(member_names.class_expr_name);
+            // The reported position of a nameless class is its `class` keyword.
+            const tok = if (named) data.name_token else b.tree.nodeMainToken(node);
+            self_sym = try b.declare(cs, atom, .class, node, tok, .{
                 .nonambient_class = !b.ambient,
             });
+            // The SCOPE key stays reserved — nothing may reach this symbol by
+            // name — but the symbol's DISPLAY name is what diagnostics print,
+            // and tsc prints the name the syntax assigns the class
+            // (`bindNamedExpr`), or `(Anonymous class)` when there is none.
+            // The two are stored separately: `members` is keyed by the atom
+            // passed to `declare`, `sym_names` holds the printed spelling.
+            if (!named) {
+                b.sym_names.items[self_sym] = if (anon_name_tok != 0)
+                    try b.atomOfToken(anon_name_tok)
+                else
+                    try b.atomOf(anonymous_class_display);
+            }
         }
         try b.bindTypeParams(data.tp_start, data.tp_end);
 
@@ -4253,7 +4326,14 @@ const Binder = struct {
             },
             .assign => {
                 try b.bindExpr(d.lhs);
-                try b.bindExpr(d.rhs);
+                // `x = class { … }` / `o.x = class { … }` name the class too,
+                // but only a plain `=` does — a compound assignment is a read
+                // and a write of an already-named binding.
+                if (b.tree.tokens.tag(b.tree.nodeMainToken(node)) == .eq) {
+                    try b.bindNamedExpr(d.rhs, b.plainNameToken(b.assignedNameToken(d.lhs)));
+                } else {
+                    try b.bindExpr(d.rhs);
+                }
                 b.cur_flow = try b.addFlow(.assign, b.cur_flow, node);
                 // tsc's `bindBinaryExpressionFlow`: `x[i] = v` can GROW an
                 // evolving array, so it gets its own flow node on top of the
@@ -4338,8 +4418,10 @@ const Binder = struct {
                             // Non-computed keys are names, not references.
                             if (pd.lhs != 0 and b.nodeTag(pd.lhs) == .computed_name) {
                                 try b.bindExpr(pd.lhs);
+                                try b.bindExpr(pd.rhs);
+                            } else {
+                                try b.bindNamedExpr(pd.rhs, b.plainNameToken(b.tree.nodeMainToken(prop)));
                             }
-                            try b.bindExpr(pd.rhs);
                         },
                         .object_shorthand => {
                             try b.bindExpr(pd.lhs); // shorthand *is* a reference
@@ -4356,7 +4438,7 @@ const Binder = struct {
                 }
             },
             .arrow_fn, .function_expr => try b.bindFunctionLike(node, d.lhs, d.rhs, .not_ctor),
-            .class_decl => try b.bindClass(node, false), // class expression
+            .class_decl => try b.bindClass(node, false, 0), // class expression
             .function_decl => try b.bindFunctionDecl(node), // recovery
             .interface_decl => try b.bindInterface(node),
             .type_alias => try b.bindTypeAlias(node),

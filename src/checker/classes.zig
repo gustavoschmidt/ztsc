@@ -801,6 +801,46 @@ pub fn classInterfaceHalfBases(c: *Checker, sym: SymbolId, acc: TypeId) Error!Ha
     return .{ .ty = own, .provisional = provisional };
 }
 
+/// The symbol a class-like node declares — the one every SymbolId-keyed view
+/// of the class is filed under (`classInstanceGeneric`, `classStaticType`,
+/// `baseClassRef`, the member and static scopes).
+///
+/// Where it lives depends on the form, and the two places must both be asked:
+///
+///   * a class DECLARATION names itself in the ENCLOSING scope, so
+///     `outer_scope` finds it;
+///   * a class EXPRESSION does not. Its self-name — or, when it has no name,
+///     `member_names.class_expr_name` — is declared in the class's OWN scope
+///     instead (`Binder.bindClass`), which is also where the binder hangs the
+///     member and static tables.
+///
+/// Asking only the enclosing scope answered `no_symbol` for every class
+/// expression, named ones included: no `this` type inside the body, no member
+/// checks, and `any` for the expression itself.
+pub fn classSymbolOf(c: *Checker, node: Node, outer_scope: binder.ScopeId) Error!SymbolId {
+    const data = c.tree.extraData(ast.ClassData, c.tree.nodeData(node).lhs);
+    if (data.name_token != 0) {
+        const a = try c.atomOfToken(data.name_token);
+        if (c.bind.lookupInScope(outer_scope, a)) |sym| {
+            if (c.bind.symbol_flags[sym].class) return c.toGlobal(sym);
+        }
+        const cs = try c.scopeOf(node) orelse return binder.no_symbol;
+        if (c.bind.lookupInScope(cs, a)) |sym| {
+            if (c.bind.symbol_flags[sym].class) return c.toGlobal(sym);
+        }
+        return binder.no_symbol;
+    }
+    // Nameless: only the reserved key, and only in the class's own scope.
+    // Interning the reserved text here cannot mint a new atom — reaching this
+    // line means the binder already declared the symbol under it.
+    const cs = try c.scopeOf(node) orelse return binder.no_symbol;
+    const a = try c.atom(member_names.class_expr_name);
+    if (c.bind.lookupInScope(cs, a)) |sym| {
+        if (c.bind.symbol_flags[sym].class) return c.toGlobal(sym);
+    }
+    return binder.no_symbol;
+}
+
 /// Is this member-table key the class's constructor? The constructor is keyed
 /// under a reserved name (`member_names.ctor_member_name`) precisely so that no
 /// source-spelled member can answer yes — `constructor(public constructor: T)`
