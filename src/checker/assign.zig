@@ -3335,6 +3335,27 @@ pub fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
             c.ts.indexAccessIndex(val) == c.ts.mappedKeyParam(s) and
             try c.isAssignable(try c.keyofType(t), try c.mappedKeySet(s))) return true;
     }
+    // tsc's `getBaseConstraintOfType` for a still-generic HOMOMORPHIC map,
+    // asked of an ARRAY-ish target: `{ [P in keyof T]: X }` over a `T` bounded
+    // by an array or tuple type is an array for EVERY instantiation —
+    // `instantiateMappedType` maps an array source to an array and a tuple
+    // source element-wise — so the base constraint (the map applied to `T`'s
+    // own constraint) is what says whether the family fits.
+    //
+    // It is also what carries the READONLY-ness through:
+    // `mappedTypeUnionConstrainTupleTreatedAsArrayLike` is a map over
+    // `T extends [number] | [string]`, which is a legal `any[]`, beside one
+    // over `T extends [number] | readonly [string]`, which is only a
+    // `readonly any[]` — and tsgo reports exactly that one line.
+    //
+    // Restricted to an array-ish target and a bare type-parameter source, so
+    // an ordinary object-shaped map pays nothing: two kind reads on a pair
+    // that has already failed every rule above.
+    if (sk == .mapped and (tk == .array or tk == .tuple) and c.ts.mappedHomomorphic(s)) {
+        if (try homomorphicConstraintInstantiation(c, s)) |inst| {
+            if (try c.isAssignable(inst, t)) return true;
+        }
+    }
     // A homomorphic identity map with only modifier changes IS its source
     // (`Readonly<P>` → `P`). A map that adds `?` is not, and one that
     // rewrites the template is not.
@@ -3349,6 +3370,39 @@ pub fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
         }
     }
     return null;
+}
+
+/// A still-generic HOMOMORPHIC map applied to its source parameter's own
+/// CONSTRAINT — tsc's `getBaseConstraintOfType` for a mapped type. Null when
+/// the source is not a bare constrained parameter, or when the map does not
+/// materialize into something new.
+///
+/// A UNION constraint is distributed member-wise, because that is what
+/// `instantiateMappedType` does ("if T is a union type we distribute the
+/// mapped type over the union") and ztsc's `materializeMapped` does not: it
+/// would otherwise fold the whole union into one object and lose the very
+/// array-ness the caller is asking about.
+fn homomorphicConstraintInstantiation(c: *Checker, m: TypeId) Error!?TypeId {
+    const s = &c.ts;
+    const src = s.mappedSource(m);
+    if (s.kind(src) != .type_param) return null;
+    const sym = s.typeParamSymbol(src);
+    const cons = try c.typeParamConstraint(sym);
+    if (cons == types.no_type or cons == src) return null;
+    if (s.kind(cons) != .union_type) {
+        const map = [_]TpMap{.{ .sym = sym, .ty = cons }};
+        const inst = try c.instantiate(m, &map);
+        return if (inst == m) null else inst;
+    }
+    var parts: std.ArrayList(TypeId) = .empty;
+    defer parts.deinit(c.scratch());
+    for (try c.memberList(cons)) |member| {
+        const map = [_]TpMap{.{ .sym = sym, .ty = member }};
+        const inst = try c.instantiate(m, &map);
+        if (inst == m) return null;
+        try parts.append(c.scratch(), inst);
+    }
+    return try s.makeUnion(c.scratch(), parts.items);
 }
 
 /// The base-constraint reduction of a deferred indexed-access TARGET `T[K]`
