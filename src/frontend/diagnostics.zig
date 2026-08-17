@@ -255,6 +255,11 @@ pub const Code = enum(u16) {
     /// comma sequence so its `checkGrammarJsxExpression` can say this instead
     /// of "'}' expected". Reported on the expression; grammar-class.
     jsx_comma_operator,
+    /// TS1381/TS1382: a bare `}` or `>` in JSX CHILD TEXT. tsc's `scanJsxToken`
+    /// reports one per byte as it walks the text — a scanner diagnostic, so
+    /// syntactic, and the text still becomes a child either way.
+    jsx_text_rbrace,
+    jsx_text_gt,
     /// TS2566: `const { ...a: b } = o` — tsc's `parseObjectBindingElement`
     /// reads a PropertyName before it knows whether a `:` follows, so a rest
     /// element with one PARSES and `checkGrammarBindingElement` reports on the
@@ -968,6 +973,8 @@ pub const Code = enum(u16) {
             .super_needs_call_or_member => "'super' must be followed by an argument list or member access.",
             .destructuring_assignment_needs_parens => "Declaration or statement expected. This '=' follows a block of statements, so if you intended to write a destructuring assignment, you might need to wrap the whole assignment in parentheses.",
             .jsx_needs_one_parent => "JSX expressions must have one parent element.",
+            .jsx_text_rbrace => "Unexpected token. Did you mean `{'}'}` or `&rbrace;`?",
+            .jsx_text_gt => "Unexpected token. Did you mean `{'>'}` or `&gt;`?",
             .jsx_comma_operator => "JSX expressions may not use the comma operator. Did you mean to write an array?",
             .rest_element_property_name => "A rest element cannot have a property name.",
             .mod_seen_static => modSeenMessage("static"),
@@ -1214,6 +1221,8 @@ pub const Code = enum(u16) {
             .super_needs_call_or_member => 1034,
             .destructuring_assignment_needs_parens => 2809,
             .jsx_needs_one_parent => 2657,
+            .jsx_text_rbrace => 1381,
+            .jsx_text_gt => 1382,
             .jsx_comma_operator => 18007,
             .rest_element_property_name => 2566,
             .mod_seen_static,

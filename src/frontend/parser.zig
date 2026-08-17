@@ -863,6 +863,37 @@ const Parser = struct {
         }
     }
 
+    /// Does this token START with a `>`? The maximal-munch scanner is wrong
+    /// wherever the grammar wants a single `>`: type-argument lists say so with
+    /// `expectGt`, and a JSX tag has the same problem — `<div>>` scans as
+    /// `<`, `div`, `>>`, and the second `>` is CHILD TEXT (TS1382), not part of
+    /// the tag.
+    fn isGtFamily(t: TokTag) bool {
+        return switch (t) {
+            .gt, .gt_gt, .gt_gt_gt, .gt_eq, .gt_gt_eq, .gt_gt_gt_eq => true,
+            else => false,
+        };
+    }
+
+    /// Consume the `>` that closes a JSX tag, splitting a munched `>`-family
+    /// token so the remainder falls back into the child text. Unlike `expectGt`
+    /// the failure is reported at the CURRENT token, which is where a JSX tag's
+    /// "'>' expected" has always landed.
+    ///
+    /// Returns the byte offset just past the `>` — where the children begin.
+    /// `lastTokEnd` cannot answer that for a split token: it RESCANS from the
+    /// token's start, so the `>` of a split `>>` measures two bytes wide and the
+    /// second `>` would vanish out of the child text it belongs to.
+    fn expectJsxGt(p: *Parser) PE!u32 {
+        if (isGtFamily(p.curTag())) {
+            const start = p.cur().start;
+            _ = if (p.curTag() == .gt) try p.bump() else try p.splitGt();
+            return start + 1;
+        }
+        _ = try p.expect(.gt, .expected_gt);
+        return p.lastTokEnd();
+    }
+
     /// Consume an opening `<` of type args/params, splitting `<<`.
     fn expectLt(p: *Parser) PE!u32 {
         switch (p.curTag()) {
@@ -4993,10 +5024,9 @@ const Parser = struct {
         var children: ast.SubRange = .{ .start = 0, .end = 0 };
         if (p.curTag() == .slash) {
             _ = try p.bump(); // '/'
-            _ = try p.expect(.gt, .expected_gt);
+            _ = try p.expectJsxGt();
         } else {
-            _ = try p.expect(.gt, .expected_gt);
-            const kids = try p.parseJsxChildren();
+            const kids = try p.parseJsxChildren(try p.expectJsxGt());
             children = kids.range;
             close_lt = kids.close_lt;
         }
@@ -5060,7 +5090,7 @@ const Parser = struct {
     fn parseJsxAttributes(p: *Parser) PE!ast.SubRange {
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
-        while (p.curTag() != .gt and p.curTag() != .slash and p.curTag() != .eof) {
+        while (!isGtFamily(p.curTag()) and p.curTag() != .slash and p.curTag() != .eof) {
             const before = p.curIdx();
             if (p.curTag() == .l_brace) {
                 const lb = try p.bump(); // '{'
@@ -5118,17 +5148,36 @@ const Parser = struct {
         }
     }
 
+    /// A bare `}` or `>` in JSX child text is TS1381 / TS1382 — the two
+    /// characters that would have ended a container or a tag, and that JSX makes
+    /// the author write as `{'}'}` / `&rbrace;` or `{'>'}` / `&gt;`. tsc reports
+    /// them from `scanJsxToken`, one per byte, as it walks the text; the text is
+    /// still a child either way. Byte-wise is correct: both are ASCII, so they
+    /// can never be a continuation byte of a UTF-8 sequence.
+    fn reportJsxTextPunctuation(p: *Parser, start: u32, end: u32) Error!void {
+        if (p.spec != 0) return;
+        for (p.src[start..end], start..) |c, i| {
+            const code: Code = switch (c) {
+                '}' => .jsx_text_rbrace,
+                '>' => .jsx_text_gt,
+                else => continue,
+            };
+            try p.errAtBytes(code, @intCast(i), @intCast(i + 1));
+        }
+    }
+
     /// The children of one non-self-closing element plus the `<` token of the
     /// `</tag>` that ended them (0 when the closing tag was never reached).
     const JsxChildren = struct { range: ast.SubRange, close_lt: TokenIndex };
 
     /// Children of a non-self-closing element, up to the matching `</tag>`
-    /// (whose closing tag this consumes).
-    fn parseJsxChildren(p: *Parser) PE!JsxChildren {
+    /// (whose closing tag this consumes). `start` is the byte offset just past
+    /// the opening tag's `>`.
+    fn parseJsxChildren(p: *Parser, start: u32) PE!JsxChildren {
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
         var close_lt: TokenIndex = 0;
-        var pos = p.lastTokEnd(); // just past the opening '>'
+        var pos = start;
         while (true) {
             const tok = p.scn.scanJsxChild(pos);
             switch (tok.tag) {
@@ -5136,6 +5185,7 @@ const Parser = struct {
                     const idx = p.curIdx();
                     try p.appendTok(.{ .tag = .jsx_text, .start = tok.start, .end = tok.end, .newline_before = false });
                     try p.pushScratch(try p.addNode(.{ .tag = .jsx_text, .main_token = idx, .data = .{ .lhs = 0, .rhs = 0 } }));
+                    try p.reportJsxTextPunctuation(tok.start, tok.end);
                     pos = tok.end;
                 },
                 .l_brace => {
@@ -5167,8 +5217,8 @@ const Parser = struct {
                     if (p.peekTag(1) == .slash) {
                         close_lt = try p.bump(); // '<'
                         _ = try p.bump(); // '/'
-                        if (p.curTag() != .gt) _ = try p.parseJsxTagName();
-                        _ = try p.expect(.gt, .expected_gt);
+                        if (!isGtFamily(p.curTag())) _ = try p.parseJsxTagName();
+                        _ = try p.expectJsxGt();
                         break;
                     }
                     try p.pushScratch(try p.parseJsxElement());
