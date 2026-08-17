@@ -116,19 +116,45 @@ pub const Code = enum(u16) {
     /// Multiple default clauses, default in wrong place, etc.
     multiple_default_clauses,
     /// Rest parameter/element not in last position.
+    /// TS2462: `var [...a, x] = …` / `var { ...r, a } = …` — a rest element is
+    /// the LAST element of a destructuring pattern or nothing. tsc blames the
+    /// bound NAME, not the `...` (measured against tsgo 7.0.2). Grammar-class,
+    /// so the rest of the file is still checked.
     rest_must_be_last,
     /// Line break not allowed here (e.g. after `throw`).
     line_break_not_allowed,
     /// Trailing comma or elision where the grammar forbids it.
     argument_expected,
+    /// TS1011: `a[]` — an element access with nothing between the brackets.
+    /// tsc's `parseElementAccessExpression` says so where the generic
+    /// "Expression expected" would otherwise land, on the `]`. Syntactic.
+    element_access_needs_argument,
     /// TS1185: a `git`-style merge conflict marker (`<<<<<<< HEAD`, `=======`,
     /// `|||||||`, `>>>>>>> branch`). Reported by the scanner over the seven
     /// marker bytes; the marker and the losing side of the conflict are trivia,
     /// so the file otherwise parses as the winning side alone.
     merge_conflict_marker,
-    /// TS1206: a decorator in a position the grammar forbids (parameter
-    /// decorator under TC39 standard decorators).
+    /// TS1206: a decorator in a position the grammar forbids — see
+    /// `decorator_target.zig` for which positions those are.
     decorator_not_valid_here,
+    /// TS1249: `@dec m(): void;` — a decorator on a method OVERLOAD, which tsc
+    /// separates out of TS1206 with its own wording.
+    decorator_on_method_overload,
+    /// TS1207: `@a get x() {} @b set x(v) {}` — only ONE of a get/set pair may
+    /// carry modifiers, and tsc reports on the second.
+    decorator_on_second_accessor,
+    /// TS1433: `m(@dec this: C) {}` — a decorator on a `this` parameter, which
+    /// answers ahead of TS1206 in both decorator dialects.
+    ///
+    /// SYNTACTIC, not grammatical, unlike every other TS12xx decorator rule:
+    /// tsc raises it from the PARSER (`parseErrorAtRange(modifiers, …)`), which
+    /// shows in two ways measured against tsgo 7.0.2 — it is blamed on the
+    /// parameter's FULL start, the offset just past the previous token with
+    /// leading trivia included rather than the `@` itself
+    /// (`m(a: C,    @dec this: C)` answers at the column right after the comma),
+    /// and it silences every grammar diagnostic in the file behind it, since
+    /// `grammarErrorOnNode` gives up once `hasParseDiagnostics(sourceFile)`.
+    decorator_on_this_param,
     /// TS1344: `label: var x = 1` — a label on a DECLARATION. tsc's grammar
     /// pass, so it is gated rather than gating.
     label_not_allowed,
@@ -237,11 +263,61 @@ pub const Code = enum(u16) {
     /// comma sequence so its `checkGrammarJsxExpression` can say this instead
     /// of "'}' expected". Reported on the expression; grammar-class.
     jsx_comma_operator,
+    /// TS1381/TS1382: a bare `}` or `>` in JSX CHILD TEXT. tsc's `scanJsxToken`
+    /// reports one per byte as it walks the text — a scanner diagnostic, so
+    /// syntactic, and the text still becomes a child either way.
+    jsx_text_rbrace,
+    jsx_text_gt,
     /// TS2566: `const { ...a: b } = o` — tsc's `parseObjectBindingElement`
     /// reads a PropertyName before it knows whether a `:` follows, so a rest
     /// element with one PARSES and `checkGrammarBindingElement` reports on the
     /// bound NAME. Grammar-class.
     rest_element_property_name,
+    /// TS1540: `module M { }` — the `module` keyword spelling of a NAMESPACE is
+    /// deprecated, and only the `declare module "spec" { }` ambient form may
+    /// still use it. Reported on the NAME, once per segment of a dotted one
+    /// (`module not.ok {}` answers twice). Grammar-class.
+    module_keyword_for_namespace,
+    /// TS1035: `module "M" { }` with no `declare` and outside an ambient
+    /// context — a QUOTED module name declares an external module, which only
+    /// an ambient declaration may do. A `.d.ts` is ambient from its first token,
+    /// so the same source is silent there. Reported on the name; grammar-class.
+    quoted_module_name_needs_ambient,
+    /// TS1437: `module { }` — a namespace declaration with no name at all.
+    /// Reported on the `{`; grammar-class.
+    namespace_needs_a_name,
+    /// TS1107: `while (c) { function f() { break; } }` — a `break`/`continue`
+    /// whose target lies outside the function it sits in. tsc walks out of the
+    /// statement and answers as soon as it reaches a function-like, before it
+    /// ever finds the loop, switch or label the jump names. Reported on the
+    /// keyword; grammar-class.
+    jump_crosses_function_boundary,
+    /// TS1105 / TS1104: an UNLABELED `break` / `continue` with nothing to jump
+    /// to — tsc's walk reached the source file without meeting an iteration
+    /// statement (or, for `break`, a `switch`). Reported on the keyword;
+    /// grammar-class.
+    break_outside_iteration_or_switch,
+    continue_outside_iteration,
+    /// TS1116 / TS1115: a LABELED `break` / `continue` whose label names no
+    /// enclosing statement — and, for `continue`, one whose label names a
+    /// statement that is not an iteration. Reported on the keyword;
+    /// grammar-class.
+    break_label_not_enclosing,
+    continue_label_not_iteration,
+    /// TS1248: `class C { const x = 1 }` — `const` is not a class-member
+    /// modifier. tsc's message names the keyword, and `const` is the only one
+    /// that reaches it. Reported on the member NAME (measured against
+    /// tsgo 7.0.2, which blames the `H` of `static const H = 1`);
+    /// grammar-class.
+    const_class_member,
+    /// TS1443: ``declare module `M` { }`` — a module name is a `'`/`"` string,
+    /// never a template. Reported on the template.
+    ///
+    /// SYNTACTIC, like TS1433 and unlike its TS1035 neighbour: tsc raises it
+    /// from the PARSER, so it silences every grammar diagnostic in the file
+    /// behind it. Measured — ``module "M" { }`` beside a templated one loses
+    /// both its TS1035 and the TS1155 of an uninitialized `const` inside it.
+    module_name_needs_quoted_string,
 
     // --- modifier order and repetition (tsc's `checkGrammarModifiers`) -------
     /// TS1030 `'{0}' modifier already seen.` — the same modifier twice on one
@@ -670,6 +746,17 @@ pub const Code = enum(u16) {
             .super_before_this,
             .super_before_super_property,
             .decorator_not_valid_here,
+            .decorator_on_method_overload,
+            .decorator_on_second_accessor,
+            .module_keyword_for_namespace,
+            .quoted_module_name_needs_ambient,
+            .namespace_needs_a_name,
+            .const_class_member,
+            .jump_crosses_function_boundary,
+            .break_outside_iteration_or_switch,
+            .continue_outside_iteration,
+            .break_label_not_enclosing,
+            .continue_label_not_iteration,
             .label_not_allowed,
             .public_not_on_module_element,
             .private_not_on_module_element,
@@ -901,7 +988,7 @@ pub const Code = enum(u16) {
             .tagged_template_in_optional_chain => "Tagged template expressions are not permitted in an optional chain.",
             .newline_before_arrow => "Line terminator not permitted before arrow.",
             .multiple_default_clauses => "A 'default' clause cannot appear more than once in a 'switch' statement.",
-            .rest_must_be_last => "a rest element must be last",
+            .rest_must_be_last => "A rest element must be last in a destructuring pattern.",
             .line_break_not_allowed => "Line break not permitted here.",
             .argument_expected => "Argument expression expected.",
             .statement_not_allowed_in_ambient => "Statements are not allowed in ambient contexts.",
@@ -949,6 +1036,9 @@ pub const Code = enum(u16) {
             .eval_in_module => evalModuleMessage("eval"),
             .arguments_in_module => evalModuleMessage("arguments"),
             .decorator_not_valid_here => "Decorators are not valid here.",
+            .decorator_on_method_overload => "A decorator can only decorate a method implementation, not an overload.",
+            .decorator_on_second_accessor => "Decorators cannot be applied to multiple get/set accessors of the same name.",
+            .decorator_on_this_param => "Neither decorators nor modifiers may be applied to 'this' parameters.",
             .label_not_allowed => "A label is not allowed here.",
             .public_not_on_module_element => moduleElementModifierMessage("public"),
             .private_not_on_module_element => moduleElementModifierMessage("private"),
@@ -983,6 +1073,19 @@ pub const Code = enum(u16) {
             .super_needs_call_or_member => "'super' must be followed by an argument list or member access.",
             .destructuring_assignment_needs_parens => "Declaration or statement expected. This '=' follows a block of statements, so if you intended to write a destructuring assignment, you might need to wrap the whole assignment in parentheses.",
             .jsx_needs_one_parent => "JSX expressions must have one parent element.",
+            .jsx_text_rbrace => "Unexpected token. Did you mean `{'}'}` or `&rbrace;`?",
+            .jsx_text_gt => "Unexpected token. Did you mean `{'>'}` or `&gt;`?",
+            .module_keyword_for_namespace => "A 'namespace' declaration should not be declared using the 'module' keyword. Please use the 'namespace' keyword instead.",
+            .quoted_module_name_needs_ambient => "Only ambient modules can use quoted names.",
+            .namespace_needs_a_name => "Namespace must be given a name.",
+            .const_class_member => "A class member cannot have the 'const' keyword.",
+            .jump_crosses_function_boundary => "Jump target cannot cross function boundary.",
+            .break_outside_iteration_or_switch => "A 'break' statement can only be used within an enclosing iteration or switch statement.",
+            .continue_outside_iteration => "A 'continue' statement can only be used within an enclosing iteration statement.",
+            .break_label_not_enclosing => "A 'break' statement can only jump to a label of an enclosing statement.",
+            .continue_label_not_iteration => "A 'continue' statement can only jump to a label of an enclosing iteration statement.",
+            .element_access_needs_argument => "An element access expression should take an argument.",
+            .module_name_needs_quoted_string => "Module declaration names may only use ' or \" quoted strings.",
             .jsx_comma_operator => "JSX expressions may not use the comma operator. Did you mean to write an array?",
             .rest_element_property_name => "A rest element cannot have a property name.",
             .mod_seen_static => modSeenMessage("static"),
@@ -1202,6 +1305,9 @@ pub const Code = enum(u16) {
             .super_before_this => 17009,
             .super_before_super_property => 17011,
             .decorator_not_valid_here => 1206,
+            .decorator_on_method_overload => 1249,
+            .decorator_on_second_accessor => 1207,
+            .decorator_on_this_param => 1433,
             .label_not_allowed => 1344,
             .public_not_on_module_element,
             .private_not_on_module_element,
@@ -1235,6 +1341,20 @@ pub const Code = enum(u16) {
             .super_needs_call_or_member => 1034,
             .destructuring_assignment_needs_parens => 2809,
             .jsx_needs_one_parent => 2657,
+            .jsx_text_rbrace => 1381,
+            .jsx_text_gt => 1382,
+            .module_keyword_for_namespace => 1540,
+            .quoted_module_name_needs_ambient => 1035,
+            .namespace_needs_a_name => 1437,
+            .const_class_member => 1248,
+            .jump_crosses_function_boundary => 1107,
+            .break_outside_iteration_or_switch => 1105,
+            .continue_outside_iteration => 1104,
+            .break_label_not_enclosing => 1116,
+            .continue_label_not_iteration => 1115,
+            .element_access_needs_argument => 1011,
+            .rest_must_be_last => 2462,
+            .module_name_needs_quoted_string => 1443,
             .jsx_comma_operator => 18007,
             .rest_element_property_name => 2566,
             .mod_seen_static,

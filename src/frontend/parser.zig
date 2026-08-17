@@ -61,6 +61,7 @@ const literals = @import("literals.zig");
 const modifier_order = @import("modifier_order.zig");
 const index_signature = @import("index_signature.zig");
 const computed_member = @import("computed_member.zig");
+const decorator_target = @import("decorator_target.zig");
 
 const TokTag = scanner.Tag;
 const Token = scanner.Token;
@@ -166,6 +167,25 @@ const FnCtx = enum {
     }
 };
 
+/// What a `break`/`continue` may jump to WITHOUT crossing a function boundary.
+/// See `Parser.jump`; a jump that resolves to none of these from inside a
+/// function is TS1107.
+const JumpCtx = struct {
+    /// Enclosing iteration statements — the target of an unlabeled
+    /// `break`/`continue`.
+    loops: u32 = 0,
+    /// Enclosing `switch` statements — the target of an unlabeled `break`.
+    switches: u32 = 0,
+    /// Where this function's own labels start in `Parser.labels`. A label
+    /// outside a function is invisible inside it, which is the whole point of
+    /// resetting here.
+    labels_base: usize = 0,
+    /// Is there a function-like ancestor at all? A jump that resolves to
+    /// nothing at a source file's top level is a DIFFERENT diagnostic (TS1104 /
+    /// TS1105 / TS1115 / TS1116), so TS1107 only ever fires inside one.
+    in_function: bool = false,
+};
+
 const Parser = struct {
     /// Transient arena: all growable lists live here during the parse.
     gpa: Allocator,
@@ -255,6 +275,14 @@ const Parser = struct {
     /// declaration restores the enclosing one's answer on the way out.
     abstract_class: bool = false,
 
+    /// Is the class whose body is being parsed a class DECLARATION rather than a
+    /// class expression? Read only by `decorator_target.zig`, for which legacy
+    /// decorators reject every member of a class EXPRESSION. A flag rather than
+    /// a counter for the same reason as `abstract_class`: it describes the
+    /// innermost class body, and each nested class restores the enclosing
+    /// answer on the way out.
+    in_class_decl: bool = false,
+
     /// The innermost function-like boundary being parsed. tsc keeps the same
     /// information in two context bits (`NodeFlags.AwaitContext` plus the
     /// container kind); one enum is enough here because every rule that reads it
@@ -276,6 +304,18 @@ const Parser = struct {
     /// initializer, which tsc parses outside the await context because the
     /// initializer runs as its own implicit function.
     fn_ctx: FnCtx = .none,
+
+    /// What a `break`/`continue` at this point may jump to, for TS1107. tsc
+    /// walks out of the statement looking for an iteration statement, a
+    /// `switch` or a matching label, and stops the moment it reaches a
+    /// FUNCTION-LIKE — a jump may not cross one. Saved and restored at every
+    /// function boundary, exactly where `fn_ctx` is.
+    jump: JumpCtx = .{},
+
+    /// The label names of the enclosing labeled statements, innermost last —
+    /// the stack `JumpCtx.labels_base` slices. Mutable state because it is a
+    /// scope stack, pushed and popped around each labeled statement's body.
+    labels: std.ArrayList(u32) = .empty,
 
     /// tsc's `NodeFlags.DisallowConditionalTypesContext`: true while parsing a
     /// type position where a conditional type may not appear unparenthesized —
@@ -854,6 +894,47 @@ const Parser = struct {
         }
     }
 
+    /// Does this token START with a `>`? The maximal-munch scanner is wrong
+    /// wherever the grammar wants a single `>`: type-argument lists say so with
+    /// `expectGt`, and a JSX tag has the same problem — `<div>>` scans as
+    /// `<`, `div`, `>>`, and the second `>` is CHILD TEXT (TS1382), not part of
+    /// the tag.
+    fn isGtFamily(t: TokTag) bool {
+        return switch (t) {
+            .gt, .gt_gt, .gt_gt_gt, .gt_eq, .gt_gt_eq, .gt_gt_gt_eq => true,
+            else => false,
+        };
+    }
+
+    /// Consume the `>` that closes a JSX tag, splitting a munched `>`-family
+    /// token so the remainder falls back into the child text. Unlike `expectGt`
+    /// the failure is reported at the CURRENT token, which is where a JSX tag's
+    /// "'>' expected" has always landed.
+    ///
+    /// Returns the byte offset just past the `>` — where the children begin.
+    /// `lastTokEnd` cannot answer that for a split token: it RESCANS from the
+    /// token's start, so the `>` of a split `>>` measures two bytes wide and the
+    /// second `>` would vanish out of the child text it belongs to.
+    fn expectJsxGt(p: *Parser) PE!u32 {
+        if (isGtFamily(p.curTag())) {
+            const start = p.cur().start;
+            _ = if (p.curTag() == .gt) try p.bump() else try p.splitGt();
+            return start + 1;
+        }
+        _ = try p.expect(.gt, .expected_gt);
+        return p.lastTokEnd();
+    }
+
+    /// The expression between the brackets of an element access. An EMPTY one
+    /// (`a[]`) is TS1011 rather than the generic "Expression expected": tsc's
+    /// `parseElementAccessExpression` special-cases the closing bracket and
+    /// reports at it, then carries on with a missing node.
+    fn parseElementAccessArgument(p: *Parser) PE!Node {
+        if (p.curTag() != .r_bracket) return p.parseExpression(.{});
+        try p.errAtCur(.element_access_needs_argument);
+        return null_node;
+    }
+
     /// Consume an opening `<` of type args/params, splitting `<<`.
     fn expectLt(p: *Parser) PE!u32 {
         switch (p.curTag()) {
@@ -1231,7 +1312,22 @@ const Parser = struct {
         // prevent noisiness"), which is exactly one flag per call of this
         // function — every block, module block and source file gets its own.
         var reported_ambient_stmt = ambient_reported;
+        // The first `@` of the decorator run currently open, for TS1206. A
+        // statement-position decorator run may only decorate a CLASS
+        // declaration; the run is judged where it ENDS, once the token after it
+        // is known, and reports once on its first `@` (`decorator_target.zig`).
+        var deco_at: ?u32 = null;
         while (p.curTag() != terminator and p.curTag() != .eof) {
+            if (p.curTag() == .at) {
+                if (deco_at == null) deco_at = p.curIdx();
+            } else if (deco_at) |at| {
+                deco_at = null;
+                if (p.spec == 0 and !p.decoratedStatementIsClass()) {
+                    if (decorator_target.diagnose(p.experimental_decorators, .{ .kind = .other })) |code| {
+                        try p.errAtToken(code, at);
+                    }
+                }
+            }
             // tsc's `parseList` gate: a token that starts no statement is
             // reported and skipped, never parsed.
             if (!p.atStartOfStatement()) {
@@ -1265,6 +1361,24 @@ const Parser = struct {
                 p.synchronize();
             }
         }
+    }
+
+    /// Does a CLASS declaration follow the decorator run that just closed? tsc
+    /// parses decorators as part of the modifier list, so every modifier that
+    /// may precede `class` in statement position is transparent here:
+    /// `@dec export class C {}`, `@dec declare class C {}` and
+    /// `@dec export default class C {}` are all silent, measured against
+    /// tsgo 7.0.2. Anything else the run precedes is TS1206.
+    fn decoratedStatementIsClass(p: *Parser) bool {
+        var i: usize = 0;
+        while (i < 4) : (i += 1) {
+            switch (p.peekTag(i)) {
+                .keyword_class => return true,
+                .keyword_export, .keyword_default, .keyword_declare, .keyword_abstract => {},
+                else => return false,
+            }
+        }
+        return false;
     }
 
     /// A statement that RUNS, as opposed to one that only declares. The
@@ -1589,11 +1703,11 @@ const Parser = struct {
                 return p.addNode(.{ .tag = .debugger_stmt, .main_token = tok, .data = .{ .lhs = 0, .rhs = 0 } });
             },
             .keyword_function => return p.parseFunctionDecl(0, false),
-            .keyword_class => return p.parseClassDecl(0),
+            .keyword_class => return p.parseClassDecl(0, .declaration),
             .keyword_abstract => {
                 if (p.peekTag(1) == .keyword_class and !p.peekNewline(1)) {
                     _ = try p.bump();
-                    return p.parseClassDecl(ast.Flags.abstract);
+                    return p.parseClassDecl(ast.Flags.abstract, .declaration);
                 }
                 return p.parseExpressionStatement();
             },
@@ -1660,7 +1774,7 @@ const Parser = struct {
                         const was_ambient = p.ambient;
                         p.ambient = true;
                         defer p.ambient = was_ambient;
-                        return p.parseClassDecl(ast.Flags.declare);
+                        return p.parseClassDecl(ast.Flags.declare, .declaration);
                     },
                     .keyword_abstract => {
                         _ = try p.bump();
@@ -1668,7 +1782,7 @@ const Parser = struct {
                         const was_ambient = p.ambient;
                         p.ambient = true;
                         defer p.ambient = was_ambient;
-                        return p.parseClassDecl(ast.Flags.declare | ast.Flags.abstract);
+                        return p.parseClassDecl(ast.Flags.declare | ast.Flags.abstract, .declaration);
                     },
                     .keyword_interface => {
                         _ = try p.bump();
@@ -1690,8 +1804,11 @@ const Parser = struct {
                         if (isIdentLike(p.peekTag(1)) and !p.peekNewline(1)) {
                             return p.parseNamespaceDecl(ast.Flags.declare);
                         }
-                        if (p.peekTag(1) == .string_literal and !p.peekNewline(1)) {
-                            return p.parseAmbientModule();
+                        if (isModuleNameLiteral(p.peekTag(1)) and !p.peekNewline(1)) {
+                            return p.parseAmbientModule(true);
+                        }
+                        if (p.peekTag(1) == .l_brace and !p.peekNewline(1)) {
+                            return p.parseAnonymousNamespace(true);
                         }
                         const start = p.curIdx();
                         _ = try p.bump();
@@ -1758,13 +1875,12 @@ const Parser = struct {
                 if (isIdentLike(t1) and !p.peekNewline(1)) {
                     return p.parseNamespaceDecl(0);
                 }
-                if (t1 == .string_literal and !p.peekNewline(1)) {
-                    // String-module name (`module "x" {}`) is augmentation:
-                    // still out of subset.
-                    const start = try p.bump();
-                    p.skipUnsupportedBlockish();
-                    return p.unsupportedFrom(start);
+                if (isModuleNameLiteral(t1) and !p.peekNewline(1)) {
+                    // `module "x" { }` with no `declare`: the same declaration
+                    // an ambient one makes, plus the TS1035 that says so.
+                    return p.parseAmbientModule(false);
                 }
+                if (t1 == .l_brace and !p.peekNewline(1)) return p.parseAnonymousNamespace(false);
                 return p.parseExpressionStatement();
             },
             .at => return p.parseDecorator(),
@@ -1802,6 +1918,10 @@ const Parser = struct {
     fn parseLabeledStatement(p: *Parser) PE!Node {
         const label = try p.bump();
         _ = try p.bump(); // ':'
+        // The label is a jump target for everything inside it and for nothing
+        // outside — a function nested in it starts its own slice of the stack.
+        try p.labels.append(p.gpa, label | (if (p.labelTargetsIteration()) label_on_iteration else 0));
+        defer p.labels.shrinkRetainingCapacity(p.labels.items.len - 1);
         const body = try p.parseSubstatement();
         if (isDeclarationTag(p.nodes.items(.tag)[body])) {
             try p.errAtToken(.label_not_allowed, label);
@@ -2055,13 +2175,13 @@ const Parser = struct {
         _ = try p.expect(.l_paren, .expected_l_paren);
         const cond = try p.parseExpression(.{});
         _ = try p.expect(.r_paren, .expected_r_paren);
-        const body = try p.parseSubstatement();
+        const body = try p.parseLoopBody();
         return p.addNode(.{ .tag = .while_stmt, .main_token = kw, .data = .{ .lhs = cond, .rhs = body } });
     }
 
     fn parseDoStatement(p: *Parser) PE!Node {
         const kw = try p.bump();
-        const body = try p.parseSubstatement();
+        const body = try p.parseLoopBody();
         _ = try p.expect(.keyword_while, .expected_while);
         _ = try p.expect(.l_paren, .expected_l_paren);
         const cond = try p.parseExpression(.{});
@@ -2096,7 +2216,7 @@ const Parser = struct {
                 _ = try p.bump();
                 const right = if (is_of) try p.parseAssignExpr(.{}) else try p.parseExpression(.{});
                 _ = try p.expect(.r_paren, .expected_r_paren);
-                const body = try p.parseSubstatement();
+                const body = try p.parseLoopBody();
                 const extra = try p.addExtra(ast.ForInOf{ .left = init, .right = right, .is_await = is_await });
                 return p.addNode(.{
                     .tag = if (is_of) .for_of_stmt else .for_in_stmt,
@@ -2112,7 +2232,7 @@ const Parser = struct {
         var update: Node = null_node;
         if (p.curTag() != .r_paren and p.curTag() != .eof) update = try p.parseExpression(.{});
         _ = try p.expect(.r_paren, .expected_r_paren);
-        const body = try p.parseSubstatement();
+        const body = try p.parseLoopBody();
         const extra = try p.addExtra(ast.For{ .init = init, .cond = cond, .update = update });
         return p.addNode(.{ .tag = .for_stmt, .main_token = kw, .data = .{ .lhs = extra, .rhs = body } });
     }
@@ -2123,6 +2243,9 @@ const Parser = struct {
         const disc = try p.parseExpression(.{});
         _ = try p.expect(.r_paren, .expected_r_paren);
         _ = try p.expect(.l_brace, .expected_l_brace);
+        // An unlabeled `break` inside the clauses targets the switch.
+        p.jump.switches += 1;
+        defer p.jump.switches -= 1;
 
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
@@ -2257,12 +2380,85 @@ const Parser = struct {
         if (isIdentLike(p.curTag()) and !p.nlBefore()) {
             label = try p.bump();
         }
+        // An AMBIENT context skips the whole family: tsc guards
+        // `checkGrammarBreakOrContinueStatement` behind
+        // `checkGrammarStatementInAmbientContext`, which has already answered
+        // TS1036 for the statement and returns true. Measured — `break;` alone
+        // in a `.d.ts` is TS1036 and nothing else.
+        if (p.spec == 0 and !p.ambient) {
+            if (p.jumpTargetCode(is_break, label)) |code| try p.errAtToken(code, kw);
+        }
         try p.expectSemicolon();
         return p.addNode(.{
             .tag = if (is_break) .break_stmt else .continue_stmt,
             .main_token = kw,
             .data = .{ .lhs = label, .rhs = 0 },
         });
+    }
+
+    /// What a `break`/`continue` earns where it stands, or null when it has a
+    /// target. tsc walks out of the statement and answers on the first thing it
+    /// meets: the target itself (silence), a FUNCTION-LIKE (TS1107 — a jump may
+    /// not cross one), or the source file (TS1104/TS1105 unlabeled,
+    /// TS1115/TS1116 labeled).
+    ///
+    /// An unlabeled `break` takes an iteration statement or a `switch`, an
+    /// unlabeled `continue` an iteration statement only, and a labeled one any
+    /// enclosing label of the same name — except that a labeled `continue`
+    /// additionally needs that label to sit on an ITERATION statement, which is
+    /// its own TS1115 and the one answer that outranks the boundary.
+    fn jumpTargetCode(p: *Parser, is_break: bool, label: u32) ?Code {
+        if (label == 0) {
+            if (p.jump.loops > 0 or (is_break and p.jump.switches > 0)) return null;
+        } else {
+            const name = p.tokenTextAt(label);
+            for (p.labels.items[p.jump.labels_base..]) |l| {
+                if (!std.mem.eql(u8, p.tokenTextAt(l & label_token_mask), name)) continue;
+                if (is_break or l & label_on_iteration != 0) return null;
+                return .continue_label_not_iteration;
+            }
+        }
+        if (p.jump.in_function) return .jump_crosses_function_boundary;
+        if (label != 0) {
+            return if (is_break) .break_label_not_enclosing else .continue_label_not_iteration;
+        }
+        return if (is_break) .break_outside_iteration_or_switch else .continue_outside_iteration;
+    }
+
+    /// `Parser.labels` packs "this label sits on an iteration statement" into
+    /// the top bit of the label's token index. Token indices are bounded by the
+    /// source-length limit, so the bit is free.
+    const label_on_iteration: u32 = 1 << 31;
+    const label_token_mask: u32 = label_on_iteration - 1;
+
+    /// Does the labeled statement about to be parsed carry an ITERATION
+    /// statement? tsc follows a chain of labels to find out
+    /// (`isIterationStatement(…, /*lookInLabeledStatements*/ true)`), which is
+    /// what `a: b: while (c) { continue a; }` needs. The chain is walked over
+    /// LOOKAHEAD, so a chain deeper than the window answers "iteration" and
+    /// under-reports rather than inventing a TS1115.
+    fn labelTargetsIteration(p: *Parser) bool {
+        var i: usize = 0;
+        while (i + 1 < max_la) {
+            switch (p.peekTag(i)) {
+                .keyword_while, .keyword_do, .keyword_for => return true,
+                else => {},
+            }
+            if (isIdentLike(p.peekTag(i)) and p.peekTag(i + 1) == .colon) {
+                i += 2;
+                continue;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    /// Parse the body of an iteration statement: one more jump target for the
+    /// `break`/`continue` inside it.
+    fn parseLoopBody(p: *Parser) PE!Node {
+        p.jump.loops += 1;
+        defer p.jump.loops -= 1;
+        return p.parseSubstatement();
     }
 
     // =====================================================================
@@ -2291,6 +2487,9 @@ const Parser = struct {
         // once the name is behind us.
         const saved_fn_ctx = p.fn_ctx;
         defer p.fn_ctx = saved_fn_ctx;
+        const saved_jump = p.jump;
+        defer p.jump = saved_jump;
+        p.jump = .{ .labels_base = p.labels.items.len, .in_function = true };
         const inner: FnCtx = if (flags & ast.Flags.async != 0) .async_fn else .sync;
         if (is_expr and inner == .async_fn) p.fn_ctx = inner;
         var name_tok: u32 = 0;
@@ -2495,7 +2694,8 @@ const Parser = struct {
     fn parseParam(p: *Parser) PE!Node {
         // Parameter decorators (`@dec x: T`) are a grammar error under TC39
         // standard decorators: consume them (so the parameter itself still
-        // parses cleanly, no cascade) and report TS1206 per decorator.
+        // parses cleanly, no cascade) and report ONCE on the run's first `@`,
+        // which is where tsc's `checkGrammarModifiers` stops.
         //
         // Under `experimentalDecorators` they are legal, so the diagnostic is
         // dropped. The expression is still consumed and then DISCARDED rather
@@ -2505,11 +2705,41 @@ const Parser = struct {
         // AST edge. Skipping it under-reports (an undefined name inside
         // `@Inject(Nope)` goes unnamed) and can never invent a diagnostic —
         // the trade the flag is documented to make.
+        var deco_at: ?u32 = null;
+        // The parameter's FULL start — the offset just past the previous token,
+        // leading trivia and all. TS1433 is blamed there where TS1206 is blamed
+        // on the `@` itself; measured against tsgo 7.0.2 on
+        // `m(a: C,    @dec this: C)`, which answers at the column right after
+        // the comma for the one and at the `@` for the other.
+        var deco_start: u32 = 0;
         while (p.curTag() == .at) {
             if (p.spec > 0) return error.Backtrack;
+            if (deco_at == null) deco_start = p.lastTokEnd();
             const at = try p.bump(); // `@`
+            if (deco_at == null) deco_at = at;
             if (canStartExpression(p.curTag())) _ = try p.parseLhsExpression(.{});
-            if (!p.experimental_decorators) try p.errAtToken(.decorator_not_valid_here, at);
+        }
+        if (deco_at) |at| {
+            // A `this` parameter is TS1433 whichever dialect is in force, and it
+            // answers ahead of TS1206. Otherwise the only rule ztsc applies here
+            // is the dialect one: legacy decorators allow a parameter decorator,
+            // TC39 ones do not. tsc narrows the legacy side further (the owner
+            // must be a constructor, method or setter WITH A BODY, in a class
+            // DECLARATION) — a deliberate under-report, since the owner's body
+            // is not parsed yet and no measured case in the suite needs it.
+            const site: decorator_target.Site = .{
+                .kind = .parameter,
+                .this_param = p.curTag() == .keyword_this,
+                .param_owner_decoratable = true,
+                .has_body = true,
+                .in_class_decl = true,
+            };
+            if (decorator_target.diagnose(p.experimental_decorators, site)) |code| {
+                if (code == .decorator_on_this_param)
+                    try p.errAtBytes(code, deco_start, deco_start + 1)
+                else
+                    try p.errAtToken(code, at);
+            }
         }
         const start_tok = p.curIdx();
         var flags: u32 = 0;
@@ -2627,7 +2857,8 @@ const Parser = struct {
                 const dots = try p.bump();
                 const target = try p.parseBindingName(.private_name_outside_class);
                 try p.pushScratch(try p.addNode(.{ .tag = .rest_element, .main_token = dots, .data = .{ .lhs = target, .rhs = 0 } }));
-                if (p.curTag() == .comma) try p.errAtCur(.rest_must_be_last);
+                // TS2462 is blamed on the bound NAME, not on the `...`.
+                if (p.curTag() == .comma) try p.errAtToken(.rest_must_be_last, p.nodes.items(.main_token)[target]);
             } else {
                 try p.pushScratch(try p.parseBindingElement());
             }
@@ -2675,7 +2906,8 @@ const Parser = struct {
                     target = bound;
                 }
                 try p.pushScratch(try p.addNode(.{ .tag = .rest_element, .main_token = dots, .data = .{ .lhs = target, .rhs = 0 } }));
-                if (p.curTag() == .comma) try p.errAtCur(.rest_must_be_last);
+                // TS2462 is blamed on the bound NAME, not on the `...`.
+                if (p.curTag() == .comma) try p.errAtToken(.rest_must_be_last, p.nodes.items(.main_token)[target]);
             } else if (isNameLike(p.curTag()) or p.curTag() == .string_literal or
                 p.curTag() == .numeric_literal or p.curTag() == .bigint_literal)
             {
@@ -2732,7 +2964,12 @@ const Parser = struct {
 
     // --- classes ------------------------------------------------------------
 
-    fn parseClassDecl(p: *Parser, flags_in: u32) PE!Node {
+    /// Is the `class` being parsed a DECLARATION or an EXPRESSION? The two share
+    /// every production; only legacy decorators tell them apart, and they do it
+    /// member by member (`decorator_target.zig`).
+    const ClassForm = enum { declaration, expression };
+
+    fn parseClassDecl(p: *Parser, flags_in: u32, form: ClassForm) PE!Node {
         const kw = try p.bump(); // `class`
         var name_tok: u32 = 0;
         if (isIdentLike(p.curTag()) and p.curTag() != .keyword_implements) {
@@ -2769,13 +3006,28 @@ const Parser = struct {
         const was_abstract_class = p.abstract_class;
         p.abstract_class = flags_in & ast.Flags.abstract != 0;
         defer p.abstract_class = was_abstract_class;
+        const was_class_decl = p.in_class_decl;
+        p.in_class_decl = form == .declaration;
+        defer p.in_class_decl = was_class_decl;
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
+        // The first `@` of the decorator run currently open. The run is judged
+        // against the member that closes it (`decorator_target.zig`), so the
+        // member itself needs it — a decorated member that is a grammar error
+        // suppresses the TS116x its computed name would otherwise earn, exactly
+        // as tsc's `checkGrammarModifiers` short-circuits `checkGrammarProperty`.
+        var deco_at: ?u32 = null;
         while (p.curTag() != .r_brace and p.curTag() != .eof) {
             const before = p.curIdx();
             const diags_before = p.diags.items.len;
             if (try p.eat(.semicolon) != null) continue;
-            try p.pushScratch(try p.parseClassMember());
+            if (p.curTag() == .at) {
+                if (deco_at == null) deco_at = p.curIdx();
+                try p.pushScratch(try p.parseDecorator());
+                continue;
+            }
+            try p.pushScratch(try p.parseClassMember(deco_at, top));
+            deco_at = null;
             try p.dropDecoratorsOnStaticBlock(top);
             if (p.curIdx() == before) {
                 // The member parse consumed nothing. If it already said why
@@ -3060,14 +3312,21 @@ const Parser = struct {
 
     /// Finish a member whose name was computed: report the TS116x its home and
     /// shape earn, and retain the key expression against the member node.
+    ///
+    /// `modifiers_reported` is tsc's short-circuit — `checkGrammarProperty` and
+    /// `checkGrammarMethod` never run on a member whose modifier list already
+    /// answered, so `@dec [foo()]: any` in a class expression is TS1206 alone
+    /// and `public private [foo()]: any` is TS1028 alone. The key is retained
+    /// either way: the diagnostic is suppressed, the AST edge is not.
     fn finishComputedName(
         p: *Parser,
         cn: ComputedName,
         member: Node,
         home: computed_member.Home,
         kind: computed_member.MemberKind,
+        modifiers_reported: bool,
     ) Error!void {
-        if (cn.non_bindable) {
+        if (cn.non_bindable and !modifiers_reported) {
             if (computed_member.grammarCode(home, kind, p.ambient)) |code| {
                 try p.errAtToken(code, cn.l_bracket);
             }
@@ -3075,11 +3334,10 @@ const Parser = struct {
         if (cn.key != null_node) try p.computed_keys.append(p.gpa, .{ .member = member, .key = cn.key });
     }
 
-    fn parseClassMember(p: *Parser) PE!Node {
-        // Decorators on members: a `.decorator` node preceding the decorated
-        // member (the body loop re-enters for the member itself).
-        if (p.curTag() == .at) return p.parseDecorator();
-
+    /// `deco_at` is the first `@` of the decorator run this member closes, if
+    /// any, and `members_top` the scratch base of the member list — the members
+    /// already parsed, which a decorated accessor consults for its pair.
+    fn parseClassMember(p: *Parser, deco_at: ?u32, members_top: usize) PE!Node {
         // `static { … }` — a class static initialization block. Parsed as a
         // plain `.block` member so the statements inside land in the tree with
         // real spans instead of derailing the member loop (which read `static`
@@ -3104,29 +3362,49 @@ const Parser = struct {
             _ = try p.bump(); // `static`
             const saved_fn_ctx = p.fn_ctx;
             defer p.fn_ctx = saved_fn_ctx;
+            const saved_jump = p.jump;
+            defer p.jump = saved_jump;
+            p.jump = .{ .labels_base = p.labels.items.len, .in_function = true };
             p.fn_ctx = .static_block;
             return p.parseBlock();
         }
 
         var flags: u32 = 0;
-        var mod_reported = false;
+        // The first modifier-order hit, HELD rather than reported: tsc walks one
+        // modifier list per member, decorators and keywords together, and
+        // `return`s on its first error — and a decorator sits ahead of every
+        // keyword, so `@dec public private x` in a class expression is the
+        // decorator's TS1206 alone. `reportMemberGrammar` decides between them
+        // once the member's shape (and so the decorator's verdict) is known.
+        var mod_err: ?ModifierErr = null;
+        // `const` in a class-member modifier list is TS1248 and nothing else —
+        // it carries no flag because it means nothing. tsc's parser accepts it
+        // as a modifier so the member behind it still parses (`static const H =
+        // 1` declares `H`), and `checkGrammarModifiers` then rejects it on the
+        // member NAME.
+        var saw_const = false;
         while (true) {
+            const is_const = p.curTag() == .keyword_const;
             const bit = classMemberModifierBit(p.curTag());
-            if (bit == 0) break;
+            if (bit == 0 and !is_const) break;
             // A modifier only if a member name (or `*`/`[`) follows on any
             // line (get/set/async additionally require same-line names).
             const t1 = p.peekTag(1);
             const name_follows = isNameLike(t1) or t1 == .string_literal or
                 t1 == .numeric_literal or t1 == .l_bracket or t1 == .asterisk;
             if (!name_follows) break;
+            if (is_const) {
+                saw_const = true;
+                _ = try p.bump();
+                continue;
+            }
             if ((bit == ast.Flags.get or bit == ast.Flags.set or bit == ast.Flags.async) and p.peekNewline(1)) break;
             // Repeated or out-of-order modifiers: tsc's `checkGrammarModifiers`
             // returns on its FIRST hit, so `public private static x` answers
             // once, for `private`, and never mentions `static`.
-            if (!mod_reported and p.spec == 0) {
+            if (mod_err == null) {
                 if (modifier_order.check(flags, bit, p.abstract_class)) |code| {
-                    try p.errAtCur(code);
-                    mod_reported = true;
+                    mod_err = .{ .code = code, .token = p.curIdx() };
                 }
             }
             _ = try p.bump();
@@ -3142,6 +3420,7 @@ const Parser = struct {
             .l_bracket => {
                 // Computed member name / index signature in class.
                 if (p.atIndexSignature()) {
+                    _ = try p.reportMemberGrammar(deco_at, .{ .kind = .other }, mod_err);
                     return p.parseIndexSignatureAsClassMember(flags);
                 }
                 const cn = try p.parseComputedMemberName();
@@ -3161,11 +3440,18 @@ const Parser = struct {
                 } else {
                     // A CLASS member name: tsc's `parseClassElement` answers
                     // TS1068 here, not the object-literal TS1136.
+                    _ = try p.reportMemberGrammar(deco_at, .{ .kind = .other }, mod_err);
                     try p.fail(.expected_class_member);
                     return p.errorNode();
                 }
             },
         }
+
+        // TS1248 joins the modifier list's one diagnostic, blamed on the NAME.
+        // `const` is never the FIRST error of a list that already has one:
+        // tsc stops at the earliest modifier it rejects, and a repeated or
+        // out-of-order one ahead of the `const` gets there first.
+        if (saw_const and mod_err == null) mod_err = .{ .code = .const_class_member, .token = name_tok };
 
         // Optional method `m?(): T` / `m?<K>(): T` (ambient/overload members).
         if (p.curTag() == .question) {
@@ -3181,6 +3467,9 @@ const Parser = struct {
             // Method / constructor / accessor.
             const saved_fn_ctx = p.fn_ctx;
             defer p.fn_ctx = saved_fn_ctx;
+            const saved_jump = p.jump;
+            defer p.jump = saved_jump;
+            p.jump = .{ .labels_base = p.labels.items.len, .in_function = true };
             p.fn_ctx = if (flags & ast.Flags.async != 0) .async_fn else .sync;
             const proto = try p.parseFnProtoRest(flags, name_tok);
             var body: Node = null_node;
@@ -3190,17 +3479,31 @@ const Parser = struct {
                 try p.expectSemicolon(); // overload signature / abstract
             }
             const member = try p.addNode(.{ .tag = .class_method, .main_token = name_tok, .data = .{ .lhs = proto, .rhs = body } });
+            const is_accessor = flags & (ast.Flags.get | ast.Flags.set) != 0;
+            const grammar_err = try p.reportMemberGrammar(deco_at, .{
+                .kind = if (is_accessor)
+                    .accessor
+                else if (computed == null and p.tokTagAt(name_tok) == .keyword_constructor)
+                    .constructor
+                else
+                    .method,
+                .private_name = computed == null and p.tokTagAt(name_tok) == .private_identifier,
+                .has_body = body != null_node,
+                .in_class_decl = p.in_class_decl,
+                .second_accessor_of_modified_pair = is_accessor and computed == null and
+                    p.isSecondAccessorOfModifiedPair(members_top, name_tok, flags),
+            }, mod_err);
             if (computed) |cn| {
                 // An accessor is judged by neither `checkGrammarProperty` nor
                 // `checkGrammarMethod`; a method is, and what it earns turns on
                 // whether it has a BODY.
-                const kind: computed_member.MemberKind = if (flags & (ast.Flags.get | ast.Flags.set) != 0)
+                const kind: computed_member.MemberKind = if (is_accessor)
                     .accessor
                 else if (body != null_node)
                     .method_impl
                 else
                     .method_signature;
-                try p.finishComputedName(cn, member, .class_body, kind);
+                try p.finishComputedName(cn, member, .class_body, kind, grammar_err);
             }
             return member;
         }
@@ -3222,15 +3525,92 @@ const Parser = struct {
             // class written in a static block names the outer `await` binding.
             const saved_fn_ctx = p.fn_ctx;
             defer p.fn_ctx = saved_fn_ctx;
+            const saved_jump = p.jump;
+            defer p.jump = saved_jump;
+            p.jump = .{ .labels_base = p.labels.items.len, .in_function = true };
             p.fn_ctx = .sync;
             init = try p.parseAssignExpr(.{});
         }
         try p.expectSemicolon();
         const extra = try p.addExtra(ast.Field{ .flags = flags, .type_ann = type_ann, .init = init });
         const member = try p.addNode(.{ .tag = .class_field, .main_token = name_tok, .data = .{ .lhs = extra, .rhs = 0 } });
-        if (computed) |cn| try p.finishComputedName(cn, member, .class_body, .property);
+        const grammar_err = try p.reportMemberGrammar(deco_at, .{
+            .kind = .property,
+            .private_name = computed == null and p.tokTagAt(name_tok) == .private_identifier,
+            .abstract = flags & ast.Flags.abstract != 0,
+            .declare = flags & ast.Flags.declare != 0,
+            .in_class_decl = p.in_class_decl,
+        }, mod_err);
+        if (computed) |cn| try p.finishComputedName(cn, member, .class_body, .property, grammar_err);
         return member;
     }
+
+    /// The one grammar diagnostic a class member's modifier list earns, if any.
+    /// tsc walks decorators and keyword modifiers as ONE list and `return`s on
+    /// its first hit, and a decorator always precedes the keywords, so the
+    /// decorator's verdict wins over a repeated/out-of-order modifier. True when
+    /// something was reported — tsc's
+    /// `if (!checkGrammarModifiers(node) && !checkGrammarProperty(node))`, which
+    /// is what keeps the TS116x of a decorated computed name quiet.
+    fn reportMemberGrammar(
+        p: *Parser,
+        deco_at: ?u32,
+        site: decorator_target.Site,
+        mod_err: ?ModifierErr,
+    ) Error!bool {
+        if (p.spec != 0) return false;
+        if (deco_at) |at| {
+            if (decorator_target.diagnose(p.experimental_decorators, site)) |code| {
+                try p.errAtToken(code, at);
+                return true;
+            }
+        }
+        if (mod_err) |m| {
+            try p.errAtToken(m.code, m.token);
+            return true;
+        }
+        return false;
+    }
+
+    /// Is the accessor being finished the SECOND `get`/`set` of its name in this
+    /// class body, with the first DECORATED? tsc's `getAllAccessorDeclarations`
+    /// pairs by property name and matching `static`-ness and skips dynamic names
+    /// entirely; only the second of the pair may be told off (TS1207).
+    ///
+    /// tsc's own wording for the first accessor's side of the test is "has
+    /// modifiers", but tsgo 7.0.2 answers as though it read "has decorators":
+    /// `static get x() {}` followed by `@dec static set x(v) {}` is silent,
+    /// where `@a get x() {}` followed by `@b set x(v) {}` is TS1207.
+    ///
+    /// `members_top` is the scratch base of the member list, whose entries are
+    /// the members already parsed plus the decorator nodes between them.
+    fn isSecondAccessorOfModifiedPair(p: *Parser, members_top: usize, name_tok: u32, flags: u32) bool {
+        const items = p.scratch.items[members_top..];
+        const tags = p.nodes.items(.tag);
+        const data = p.nodes.items(.data);
+        const main = p.nodes.items(.main_token);
+        const name = p.tokenTextAt(name_tok);
+        const is_static = flags & ast.Flags.static != 0;
+        var seen: u32 = 0;
+        var first_modified = false;
+        for (items, 0..) |m, i| {
+            if (tags[m] != .class_method) continue;
+            // `flags` is `ast.FnProto`'s first field, so it is the first word of
+            // the method's extra data.
+            const proto_flags = p.extra.items[data[m].lhs];
+            if (proto_flags & (ast.Flags.get | ast.Flags.set) == 0) continue;
+            if ((proto_flags & ast.Flags.static != 0) != is_static) continue;
+            if (main[m] == 0 or !std.mem.eql(u8, p.tokenTextAt(main[m]), name)) continue;
+            seen += 1;
+            if (seen > 1) return false; // this member is the third or later
+            first_modified = i > 0 and tags[items[i - 1]] == .decorator;
+        }
+        return seen == 1 and first_modified;
+    }
+
+    /// A modifier-order diagnostic held back until the member's whole modifier
+    /// list has been judged. See `reportMemberGrammar`.
+    const ModifierErr = struct { code: Code, token: u32 };
 
     fn parseIndexSignatureAsClassMember(p: *Parser, flags: u32) PE!Node {
         return p.parseIndexSignature(flags);
@@ -3552,23 +3932,17 @@ const Parser = struct {
         return p.addNode(.{ .tag = .enum_member, .main_token = name_tok, .data = .{ .lhs = init, .rhs = 0 } });
     }
 
-    /// `namespace N { ... }` / `module N { ... }`. The `namespace`/`module`
-    /// keyword must not yet be consumed. Only identifier-named namespaces are
-    /// in subset; a string-module name (`module "x" {}`, augmentation) or a
-    /// dotted name (`namespace A.B {}`) falls back to unsupported.
+    /// `namespace N { ... }` / `module N { ... }`, dotted names included. The
+    /// `namespace`/`module` keyword must not yet be consumed. A string-module
+    /// name (`module "x" {}`) is `parseAmbientModule` and a missing one
+    /// (`module {}`) is `parseAnonymousNamespace`; both are dispatched before
+    /// this is reached.
     fn parseNamespaceDecl(p: *Parser, flags: u32) PE!Node {
         const kw = try p.bump(); // `namespace` / `module`
-        const name_tok = try p.expectIdentLike();
-        // Dotted namespace name (`namespace A.B { ... }`) is deferred.
-        if (p.curTag() == .dot) {
-            p.skipUnsupportedBlockish();
-            return p.unsupportedFrom(kw);
-        }
-        _ = try p.expect(.l_brace, .expected_l_brace);
-        const top = p.scratchTop();
-        defer p.scratch.shrinkRetainingCapacity(top);
         // `declare namespace N { ... }` makes the whole body ambient; a plain
-        // `namespace` nested in an ambient one inherits it.
+        // `namespace` nested in an ambient one inherits it. Set here rather than
+        // inside `parseNamespaceName` so a dotted name sets it once, for the one
+        // body all its segments share.
         const was_ambient = p.ambient;
         p.ambient = was_ambient or flags & ast.Flags.declare != 0;
         defer p.ambient = was_ambient;
@@ -3576,12 +3950,91 @@ const Parser = struct {
         const was_module_body = p.module_body;
         p.module_body = true;
         defer p.module_body = was_module_body;
-        try p.parseStatementList(top, .r_brace, false);
-        _ = try p.expect(.r_brace, .expected_r_brace);
+        return p.parseNamespaceName(kw, flags, false);
+    }
+
+    /// One segment of a namespace name, plus everything to its right.
+    ///
+    /// A DOTTED name is sugar: `namespace A.B.C { … }` declares `A`, whose sole
+    /// member is `B`, whose sole member is `C`, which holds the body — which is
+    /// exactly the tree tsc's `parseModuleOrNamespaceDeclaration` builds, one
+    /// recursive call per `.`. Desugaring here means the binder, the linker and
+    /// the checker never learn that dotted names exist.
+    ///
+    /// Each inner segment is wrapped in an `export_decl`: `A.B.C` is reachable
+    /// from outside as `A.B.C`, so every segment but the outermost is an export
+    /// of the one before it. tsc gets there by a different route (the nested
+    /// declaration is a member of a namespace whose only body is that
+    /// declaration) and the observable answer is the same.
+    fn parseNamespaceName(p: *Parser, kw: u32, flags: u32, nested: bool) PE!Node {
+        // A segment behind a `.` is an IdentifierName, so a reserved word is a
+        // legal name there and only there — tsc's `parseIdentifierName()` for
+        // the nested case against `parseIdentifier()` for the first, which is
+        // what makes `declare namespace chrome.debugger { }` parse while
+        // `declare namespace debugger { }` does not.
+        const name_tok = if (nested and isNameLike(p.curTag()) and p.curTag() != .private_identifier)
+            try p.bump()
+        else
+            try p.expectIdentLike();
+        // TS1540: `module M { }` is the deprecated spelling of `namespace M { }`
+        // — only `declare module "spec" { }` may still say `module`, and that
+        // form never reaches here. tsc blames the NAME, so a dotted name
+        // answers once per segment.
+        if (p.spec == 0 and p.tokTagAt(kw) == .keyword_module) {
+            try p.errAtToken(.module_keyword_for_namespace, name_tok);
+        }
+        const top = p.scratchTop();
+        defer p.scratch.shrinkRetainingCapacity(top);
+        if (try p.eat(.dot) != null) {
+            // The inner segments carry neither `declare` nor `export`: the
+            // outermost one already answered for both, and repeating `declare`
+            // would re-enter the ambient bookkeeping this body has entered once.
+            const inner = try p.parseNamespaceName(kw, flags & ~ast.Flags.declare, true);
+            try p.pushScratch(try p.addNode(.{
+                .tag = .export_decl,
+                .main_token = kw,
+                .data = .{ .lhs = inner, .rhs = 0 },
+            }));
+        } else {
+            _ = try p.expect(.l_brace, .expected_l_brace);
+            try p.parseStatementList(top, .r_brace, false);
+            _ = try p.expect(.r_brace, .expected_r_brace);
+        }
         const body = try p.scratchToSpan(top);
         const extra = try p.addExtra(ast.NamespaceData{
             .flags = flags,
             .name_token = name_tok,
+            .body_start = body.start,
+            .body_end = body.end,
+        });
+        return p.addNode(.{ .tag = .namespace_decl, .main_token = kw, .data = .{ .lhs = extra, .rhs = 0 } });
+    }
+
+    /// `module { … }` / `namespace { … }` — a namespace with NO NAME, which is
+    /// TS1437 on the `{`. tsc parses it as a namespace whose name node is
+    /// missing, so the body still parses and its declarations still bind;
+    /// ztsc models "declares no namespace symbol, contributes its body outward"
+    /// with the same `global_aug` flag `declare global { … }` uses, which is
+    /// what keeps `declare module { class XDate … }` followed by
+    /// `new XDate()` from inventing a TS2304 the oracle does not report.
+    fn parseAnonymousNamespace(p: *Parser, declared: bool) PE!Node {
+        const kw = try p.bump(); // `module` / `namespace`
+        if (p.spec == 0) try p.errAtCur(.namespace_needs_a_name);
+        _ = try p.expect(.l_brace, .expected_l_brace);
+        const top = p.scratchTop();
+        defer p.scratch.shrinkRetainingCapacity(top);
+        const was_ambient = p.ambient;
+        p.ambient = was_ambient or declared;
+        defer p.ambient = was_ambient;
+        const was_module_body = p.module_body;
+        p.module_body = true;
+        defer p.module_body = was_module_body;
+        try p.parseStatementList(top, .r_brace, false);
+        _ = try p.expect(.r_brace, .expected_r_brace);
+        const body = try p.scratchToSpan(top);
+        const extra = try p.addExtra(ast.NamespaceData{
+            .flags = ast.Flags.global_aug | (if (declared) ast.Flags.declare else 0),
+            .name_token = kw,
             .body_start = body.start,
             .body_end = body.end,
         });
@@ -3617,11 +4070,27 @@ const Parser = struct {
         return p.addNode(.{ .tag = .namespace_decl, .main_token = kw, .data = .{ .lhs = extra, .rhs = 0 } });
     }
 
+    /// Can this token start the NAME of a `module "…" { }`? A quoted string is
+    /// the only legal spelling, but a template is taken too so it can be
+    /// rejected with TS1443 instead of derailing the declaration behind it.
+    fn isModuleNameLiteral(t: TokTag) bool {
+        return switch (t) {
+            .string_literal, .no_substitution_template_literal, .template_head => true,
+            else => false,
+        };
+    }
+
     /// `declare module "spec" { ... }` (the `declare` already consumed).
     /// Modeled as a `namespace_decl` flagged `ambient_module`; `name_token`
     /// is the specifier string literal. The block's exports become an ambient
     /// module the linker resolves imports of `"spec"` against, and merges into
     /// a real module's exports when `"spec"` also resolves (augmentation).
+    ///
+    /// `declared` is whether a `declare` modifier introduced this declaration.
+    /// TS1035: a QUOTED module name declares an EXTERNAL module, which only an
+    /// ambient declaration may do — `module "M" { }` on its own is an error,
+    /// while the same source in a `.d.ts` is silent because the whole file is
+    /// ambient from its first token.
     ///
     /// The *shorthand* form has no block at all — `declare module "*.scss";`
     /// — and declares a module whose every export is `any`. That is exactly
@@ -3632,9 +4101,21 @@ const Parser = struct {
     /// file: a project `global.d.ts` that opens with `declare module "*.scss";`
     /// and then augments an interface lost the augmentation to error recovery,
     /// and under `skipLibCheck` the parse error itself was invisible.
-    fn parseAmbientModule(p: *Parser) PE!Node {
+    fn parseAmbientModule(p: *Parser, declared: bool) PE!Node {
         const kw = try p.bump(); // `module`
-        const spec_tok = try p.bump(); // string literal
+        const spec_tok = p.curIdx();
+        if (p.curTag() == .no_substitution_template_literal or p.curTag() == .template_head) {
+            // TS1443: a module name is a `'`/`"` string, never a template. tsc
+            // parses the template anyway — substitutions and all — so the body
+            // behind it still parses; only the name is rejected.
+            _ = try p.parseTemplateExpr(false);
+            if (p.spec == 0) try p.errAtToken(.module_name_needs_quoted_string, spec_tok);
+        } else {
+            _ = try p.bump(); // string literal
+            if (!declared and !p.ambient and p.spec == 0) {
+                try p.errAtToken(.quoted_module_name_needs_ambient, spec_tok);
+            }
+        }
         if (p.curTag() != .l_brace) {
             _ = try p.eat(.semicolon);
             const empty = try p.scratchToSpan(p.scratchTop());
@@ -3732,8 +4213,11 @@ const Parser = struct {
             // `import d ...` — but `import x = require(...)` is out of subset.
             default_name = try p.bump();
             if (p.curTag() == .eq) {
-                // The ImportEqualsDeclaration arm — `export` belongs here.
-                return p.finishImportEquals(kw, default_name, if (export_kw != null) ast.Flags.exported else 0);
+                // The ImportEqualsDeclaration arm — `export` belongs here, and
+                // it anchors the node: a declaration's span starts at its first
+                // MODIFIER, which is what puts TS1202 on the `export` of
+                // `export import a = require("m")` rather than on the `import`.
+                return p.finishImportEquals(export_kw orelse kw, default_name, if (export_kw != null) ast.Flags.exported else 0);
             }
             _ = try p.eat(.comma);
         }
@@ -3769,9 +4253,10 @@ const Parser = struct {
 
     /// `import <name> = require("m");` or `import <name> = A.B;` (CommonJS /
     /// TS-namespace alias). Positioned just before the `=`; `name_tok` is the
-    /// local binding, `import_kw` anchors the node span. `flags` carries
-    /// `Flags.exported` for the `export import` form.
-    fn finishImportEquals(p: *Parser, import_kw: u32, name_tok: u32, flags: u32) PE!Node {
+    /// local binding, `anchor_kw` the declaration's FIRST token — the `export`
+    /// when there is one, else the `import` — which is where the node's span
+    /// begins. `flags` carries `Flags.exported` for the `export import` form.
+    fn finishImportEquals(p: *Parser, anchor_kw: u32, name_tok: u32, flags: u32) PE!Node {
         _ = try p.bump(); // '='
         var module_token: u32 = 0;
         var entity: Node = 0;
@@ -3790,7 +4275,7 @@ const Parser = struct {
             .entity = entity,
             .flags = flags,
         });
-        return p.addNode(.{ .tag = .import_equals, .main_token = import_kw, .data = .{ .lhs = extra, .rhs = 0 } });
+        return p.addNode(.{ .tag = .import_equals, .main_token = anchor_kw, .data = .{ .lhs = extra, .rhs = 0 } });
     }
 
     fn parseImportSpecifiers(p: *Parser) PE!ast.SubRange {
@@ -3879,7 +4364,7 @@ const Parser = struct {
                         try p.expectSemicolon();
                         break :blk e;
                     },
-                    .keyword_class => try p.parseClassDecl(0),
+                    .keyword_class => try p.parseClassDecl(0, .declaration),
                     // `export default interface I { … }` — legal, and the only
                     // TYPE-side default export form.
                     // `export default interface I { … }` — the declaration
@@ -3889,7 +4374,7 @@ const Parser = struct {
                     .keyword_abstract => blk: {
                         if (p.peekTag(1) == .keyword_class) {
                             _ = try p.bump();
-                            break :blk try p.parseClassDecl(ast.Flags.abstract);
+                            break :blk try p.parseClassDecl(ast.Flags.abstract, .declaration);
                         }
                         const e = try p.parseAssignExpr(.{});
                         try p.expectSemicolon();
@@ -3976,6 +4461,22 @@ const Parser = struct {
             .keyword_namespace,
             .keyword_module,
             => {
+                const decl = try p.parseStatementUnchecked();
+                return p.addNode(.{ .tag = .export_decl, .main_token = kw, .data = .{ .lhs = decl, .rhs = 0 } });
+            },
+            .at => {
+                // `export @dec class C { }` — tsc parses decorators and
+                // modifiers as ONE list, in either order, so the decorators may
+                // follow the `export`. Both orders are silent.
+                //
+                // The decorator nodes are parsed (so a malformed one still
+                // reports) but not retained: a `.decorator` node is checked as a
+                // sibling STATEMENT, and this one has no place in the statement
+                // list — the `export` already claimed it. Deliberate
+                // under-report of the decorator's own name resolution, the same
+                // trade a decorated class EXPRESSION makes, and never a false
+                // positive.
+                while (p.curTag() == .at) _ = try p.parseDecorator();
                 const decl = try p.parseStatementUnchecked();
                 return p.addNode(.{ .tag = .export_decl, .main_token = kw, .data = .{ .lhs = decl, .rhs = 0 } });
             },
@@ -4289,6 +4790,9 @@ const Parser = struct {
     fn parseArrowBody(p: *Parser, ctx: ExprCtx, flags: u32) PE!Node {
         const saved_fn_ctx = p.fn_ctx;
         defer p.fn_ctx = saved_fn_ctx;
+        const saved_jump = p.jump;
+        defer p.jump = saved_jump;
+        p.jump = .{ .labels_base = p.labels.items.len, .in_function = true };
         p.fn_ctx = if (flags & ast.Flags.async != 0) .async_fn else .sync;
         if (p.curTag() == .l_brace) return p.parseFunctionBody();
         return p.parseAssignExpr(.{ .no_in = ctx.no_in });
@@ -4509,7 +5013,7 @@ const Parser = struct {
                         },
                         .l_bracket => {
                             _ = try p.bump();
-                            const index = try p.parseExpression(.{});
+                            const index = try p.parseElementAccessArgument();
                             _ = try p.expect(.r_bracket, .expected_r_bracket);
                             lhs = try p.addNode(.{ .tag = .optional_index_expr, .main_token = qd, .data = .{ .lhs = lhs, .rhs = index } });
                         },
@@ -4539,7 +5043,7 @@ const Parser = struct {
                     // computed name, not an element access. See `in_decorator`.
                     if (ctx.in_decorator) return lhs;
                     const lb = try p.bump();
-                    const index = try p.parseExpression(.{});
+                    const index = try p.parseElementAccessArgument();
                     _ = try p.expect(.r_bracket, .expected_r_bracket);
                     lhs = try p.addNode(.{ .tag = .index_expr, .main_token = lb, .data = .{ .lhs = lhs, .rhs = index } });
                 },
@@ -4799,10 +5303,9 @@ const Parser = struct {
         var children: ast.SubRange = .{ .start = 0, .end = 0 };
         if (p.curTag() == .slash) {
             _ = try p.bump(); // '/'
-            _ = try p.expect(.gt, .expected_gt);
+            _ = try p.expectJsxGt();
         } else {
-            _ = try p.expect(.gt, .expected_gt);
-            const kids = try p.parseJsxChildren();
+            const kids = try p.parseJsxChildren(try p.expectJsxGt());
             children = kids.range;
             close_lt = kids.close_lt;
         }
@@ -4866,7 +5369,7 @@ const Parser = struct {
     fn parseJsxAttributes(p: *Parser) PE!ast.SubRange {
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
-        while (p.curTag() != .gt and p.curTag() != .slash and p.curTag() != .eof) {
+        while (!isGtFamily(p.curTag()) and p.curTag() != .slash and p.curTag() != .eof) {
             const before = p.curIdx();
             if (p.curTag() == .l_brace) {
                 const lb = try p.bump(); // '{'
@@ -4924,17 +5427,36 @@ const Parser = struct {
         }
     }
 
+    /// A bare `}` or `>` in JSX child text is TS1381 / TS1382 — the two
+    /// characters that would have ended a container or a tag, and that JSX makes
+    /// the author write as `{'}'}` / `&rbrace;` or `{'>'}` / `&gt;`. tsc reports
+    /// them from `scanJsxToken`, one per byte, as it walks the text; the text is
+    /// still a child either way. Byte-wise is correct: both are ASCII, so they
+    /// can never be a continuation byte of a UTF-8 sequence.
+    fn reportJsxTextPunctuation(p: *Parser, start: u32, end: u32) Error!void {
+        if (p.spec != 0) return;
+        for (p.src[start..end], start..) |c, i| {
+            const code: Code = switch (c) {
+                '}' => .jsx_text_rbrace,
+                '>' => .jsx_text_gt,
+                else => continue,
+            };
+            try p.errAtBytes(code, @intCast(i), @intCast(i + 1));
+        }
+    }
+
     /// The children of one non-self-closing element plus the `<` token of the
     /// `</tag>` that ended them (0 when the closing tag was never reached).
     const JsxChildren = struct { range: ast.SubRange, close_lt: TokenIndex };
 
     /// Children of a non-self-closing element, up to the matching `</tag>`
-    /// (whose closing tag this consumes).
-    fn parseJsxChildren(p: *Parser) PE!JsxChildren {
+    /// (whose closing tag this consumes). `start` is the byte offset just past
+    /// the opening tag's `>`.
+    fn parseJsxChildren(p: *Parser, start: u32) PE!JsxChildren {
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
         var close_lt: TokenIndex = 0;
-        var pos = p.lastTokEnd(); // just past the opening '>'
+        var pos = start;
         while (true) {
             const tok = p.scn.scanJsxChild(pos);
             switch (tok.tag) {
@@ -4942,6 +5464,7 @@ const Parser = struct {
                     const idx = p.curIdx();
                     try p.appendTok(.{ .tag = .jsx_text, .start = tok.start, .end = tok.end, .newline_before = false });
                     try p.pushScratch(try p.addNode(.{ .tag = .jsx_text, .main_token = idx, .data = .{ .lhs = 0, .rhs = 0 } }));
+                    try p.reportJsxTextPunctuation(tok.start, tok.end);
                     pos = tok.end;
                 },
                 .l_brace => {
@@ -4973,8 +5496,8 @@ const Parser = struct {
                     if (p.peekTag(1) == .slash) {
                         close_lt = try p.bump(); // '<'
                         _ = try p.bump(); // '/'
-                        if (p.curTag() != .gt) _ = try p.parseJsxTagName();
-                        _ = try p.expect(.gt, .expected_gt);
+                        if (!isGtFamily(p.curTag())) _ = try p.parseJsxTagName();
+                        _ = try p.expectJsxGt();
                         break;
                     }
                     try p.pushScratch(try p.parseJsxElement());
@@ -5095,7 +5618,7 @@ const Parser = struct {
                 }
                 return p.leaf(.identifier);
             },
-            .keyword_class => return p.parseClassDecl(0),
+            .keyword_class => return p.parseClassDecl(0, .expression),
             .at => {
                 // A decorated class EXPRESSION: `({ x: @dec class {} })`,
                 // `f(@dec class {})`. TC39 standard decorators put the
@@ -5106,12 +5629,23 @@ const Parser = struct {
                 // TS1206, exactly as at statement level.
                 //
                 // The decorator nodes are parsed (so a malformed one still
-                // reports) but not attached: `pending_class_decos` is a
-                // STATEMENT-list protocol, and a class expression is not in
-                // one. Deliberate under-report — the decorator's own signature
-                // check is skipped for this form, never a false positive.
+                // reports) but not attached to the class: a class EXPRESSION has
+                // nowhere to hang them. Deliberate under-report — the
+                // decorator's own signature check is skipped for this form,
+                // never a false positive.
+                const at = p.curIdx();
                 while (p.curTag() == .at) _ = try p.parseDecorator();
-                if (p.curTag() == .keyword_class) return p.parseClassDecl(0);
+                if (p.curTag() == .keyword_class) {
+                    // Legacy decorators decorate a class DECLARATION only, so
+                    // `var v = @dec class C {}` is TS1206 where the same source
+                    // under TC39 decorators is silent.
+                    if (p.spec == 0) {
+                        if (decorator_target.diagnose(p.experimental_decorators, .{ .kind = .class_expr })) |code| {
+                            try p.errAtToken(code, at);
+                        }
+                    }
+                    return p.parseClassDecl(0, .expression);
+                }
                 try p.errAtToken(.decorator_not_valid_here, p.lastIdx());
                 return p.parseAssignExpr(ctx);
             },
@@ -5349,6 +5883,9 @@ const Parser = struct {
                 // Method shorthand: value is a function_expr.
                 const saved_fn_ctx = p.fn_ctx;
                 defer p.fn_ctx = saved_fn_ctx;
+                const saved_jump = p.jump;
+                defer p.jump = saved_jump;
+                p.jump = .{ .labels_base = p.labels.items.len, .in_function = true };
                 p.fn_ctx = if (flags & ast.Flags.async != 0) .async_fn else .sync;
                 const proto = try p.parseFnProtoRest(flags, key_tok);
                 var body: Node = null_node;
@@ -6236,13 +6773,13 @@ const Parser = struct {
                 _ = try p.parseFunctionBody();
             }
             const member = try p.addNode(.{ .tag = .method_signature, .main_token = name_tok, .data = .{ .lhs = proto, .rhs = flags } });
-            if (computed) |cn| try p.finishComputedName(cn, member, p.typeMemberHome(), .method_signature);
+            if (computed) |cn| try p.finishComputedName(cn, member, p.typeMemberHome(), .method_signature, false);
             return member;
         }
         var type_ann: Node = null_node;
         if (try p.eat(.colon) != null) type_ann = try p.parseType();
         const member = try p.addNode(.{ .tag = .property_signature, .main_token = name_tok, .data = .{ .lhs = type_ann, .rhs = flags } });
-        if (computed) |cn| try p.finishComputedName(cn, member, p.typeMemberHome(), .property);
+        if (computed) |cn| try p.finishComputedName(cn, member, p.typeMemberHome(), .property, false);
         return member;
     }
 
