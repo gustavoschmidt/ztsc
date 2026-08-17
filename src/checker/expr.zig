@@ -43,6 +43,7 @@ const names_zig = @import("names.zig");
 const narrowable = @import("narrowable.zig");
 const hasTypeMeaning = @import("names.zig").hasTypeMeaning;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
+const identity = @import("identity.zig");
 const indexableConstituent = @import("typenode.zig").indexableConstituent;
 const init = Checker.init;
 const instantiate = @import("enums.zig").instantiate;
@@ -4899,10 +4900,28 @@ pub fn contextualCallSig(c: *Checker, ctx: TypeId, fn_node: Node) Error!TypeId {
         // — is one signature list, and answers with its sole survivor or
         // their combination.
         if (c.ts.kind(rctx) == .union_type) {
+            // Every constituent that offers a signature must offer the SAME
+            // one; a union whose constituents disagree hands over NOTHING and
+            // the expression's parameters are implicit `any`:
+            //
+            // ```ts
+            // else if (!compareSignaturesIdentical(signatureList[0], signature, …)) {
+            //     return undefined;  // Signatures aren't identical, do not use
+            // }
+            // ```
+            //
+            // Taking the first that answers instead typed a callback from
+            // whichever constituent came first: an object literal written
+            // against `string | FullRule` took its `normalize` property from
+            // `String.prototype.normalize` and cascaded three errors out of a
+            // parameter tsc simply reports as implicitly `any`.
             for (try c.memberList(rctx)) |m| {
                 const sig = try contextualCallSigOfType(c, try c.resolveStructural(m), required);
-                if (sig != types.no_type) {
+                if (sig == types.no_type) continue;
+                if (ctx_sig == types.no_type) {
                     ctx_sig = sig;
+                } else if (!try identity.signatureParamsIdentical(c, ctx_sig, sig)) {
+                    ctx_sig = types.no_type;
                     break;
                 }
             }

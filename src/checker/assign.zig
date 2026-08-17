@@ -3084,6 +3084,24 @@ pub fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
             if (c.ts.kind(val) == .index_access and
                 c.ts.indexAccessObj(val) == s and
                 c.ts.indexAccessIndex(val) == c.ts.mappedKeyParam(t)) return true;
+            // The same shape indexed by the map's whole KEY SET rather than
+            // its key parameter — `{ [P in keyof S]: S[keyof S] }`. Every key
+            // the map produces is a key of `S`, and the value it gives that
+            // key is the union of ALL of `S`'s values, which each one is a
+            // member of. tsc reaches this through the key parameter's own
+            // constraint (`getTypeParameterFromMappedType` carries
+            // `getConstraintTypeFromMappedType`), which ztsc's `.mapped_param`
+            // does not have — so `function f<U>(a: U): MyMap<U> { return a; }`
+            // was a phantom TS2322.
+            //
+            // Gated on the map iterating no key `S` has not got: a key set
+            // written WIDER than `keyof S` (`{ [P in "a" | "b"]: S["a" | "b"] }`
+            // over `S = { a: string }`) produces a required `b` the source
+            // cannot supply.
+            if (c.ts.kind(val) == .index_access and
+                c.ts.indexAccessObj(val) == s and
+                c.ts.indexAccessIndex(val) == try c.mappedKeySet(t) and
+                try c.isAssignable(try c.mappedKeySet(t), try c.keyofType(s))) return true;
         }
         // tsc `structuredTypeRelatedTo`, verbatim: "An empty object type is
         // related to any mapped type that includes a '?' modifier." Every
@@ -3482,9 +3500,6 @@ pub fn structuralAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
                     if (!try c.isAssignable(c.ts.tupleElem(s, @intCast(i)).ty, nidx)) return false;
                 }
             },
-            .string => {
-                if (!try c.isAssignable(types.string_type, nidx)) return false;
-            },
             .object => {
                 if (c.ts.objectNumberIndex(s) != 0) {
                     if (!try c.isAssignable(c.ts.objectNumberIndex(s), nidx)) return false;
@@ -3498,7 +3513,20 @@ pub fn structuralAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
                     }
                 } else return false; // interface / class instance, no index sig
             },
-            else => return false,
+            // tsc reads the SOURCE's own index infos here
+            // (`indexSignaturesRelatedTo` → `getIndexInfoOfType(source, …)`),
+            // and those come off its APPARENT type: every string-like
+            // primitive's is `String`, whose one index signature is
+            // `readonly [index: number]: string`. Covering only the `string`
+            // type itself missed the type a string expression actually HAS —
+            // a string literal — and with it `` `a${string}` `` and
+            // `Uppercase<T>`. `var s: String = "x"` was TS2322 on that
+            // account, and so was `z = "foo"` for
+            // `z: { [index: number]: any }`.
+            else => {
+                if (c.ts.kind(s) != .string and c.ts.literalBase(s) != types.string_type) return false;
+                if (!try c.isAssignable(types.string_type, nidx)) return false;
+            },
         }
     }
     // Target call / construct signatures: the source must supply a
