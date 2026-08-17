@@ -294,6 +294,36 @@ pub fn bind(
 
 const Link = struct { value: u32, next: u32 };
 
+/// The IDENTIFIER an evolving-array operation is rooted at, or `null_node`.
+///
+/// tsc's `isNarrowableOperand` read in the `getReferenceRoot` direction: a
+/// parenthesized expression, the left of an `=` and the right of a comma all
+/// stand for the reference inside them, so `(x = [], x).push(5)` and
+/// `((x))[3] = v` mutate the same `x` a bare `x.push(5)` does
+/// (`controlFlowArrays.ts` f16). Narrowed to a plain identifier root because
+/// only a variable ever holds an evolving array.
+///
+/// Shared: the binder decides which reads to record and which calls advance
+/// the flow, and the checker has to find the same identifier again from the
+/// mutation node it stored.
+pub fn narrowableOperandIdent(tree: *const Ast, expr: Node) Node {
+    var e = expr;
+    while (e != null_node) {
+        const d = tree.nodeData(e);
+        switch (tree.nodeTag(e)) {
+            .identifier => return e,
+            .paren_expr => e = d.lhs,
+            .assign => {
+                if (tree.tokens.tag(tree.nodeMainToken(e)) != .eq) return null_node;
+                e = d.lhs;
+            },
+            .seq_expr => e = d.rhs,
+            else => return null_node,
+        }
+    }
+    return null_node;
+}
+
 /// Where one declaration of a symbol was bound: which `cur_block` it sat in,
 /// whether it carried an `export` modifier, and whether it was in an AMBIENT
 /// context. Packed into one word because there is one per declaration of every
@@ -415,6 +445,12 @@ const Binder = struct {
     pendings: std.ArrayList(Pending) = .empty,
     ante_links: std.ArrayList(Link) = .empty,
     flow_pairs: std.ArrayList(Link) = .empty, // value=node, next=flow
+    /// tsc's `isEvolvingArrayOperationTarget` reads, recorded while the PARENT
+    /// is bound (the AST has no parent links). value = the identifier node,
+    /// next = the index expression of an `x[i] = v` target or `null_node` for
+    /// the `.length` / `.push` / `.unshift` property forms. See
+    /// `Bind.array_op_nodes`.
+    array_ops: std.ArrayList(Link) = .empty,
     /// Short-circuit tests of the optional chains currently being bound
     /// (`bindOptionalChain`); a nested chain occupies a suffix of the stack.
     chain_sc: std.ArrayList(ChainTest) = .empty,
@@ -1843,7 +1879,7 @@ const Binder = struct {
                         for (ps.super_flows) |s| if (s == f) return true;
                         f = ps.a[f];
                     },
-                    .assign, .cond_true, .cond_false, .switch_clause, .switch_no_match => f = ps.a[f],
+                    .assign, .cond_true, .cond_false, .switch_clause, .switch_no_match, .array_mutation => f = ps.a[f],
                     .branch_label, .loop_label => {
                         // `flow_a` holds the pending id until seal() flattens
                         // the list into `flow_extra`.
@@ -4184,6 +4220,13 @@ const Binder = struct {
                 try b.noteSuperProperty(d.lhs);
                 // Narrowable reference (`x.y` discriminants): attach flow.
                 try b.attachFlow(node);
+                // `x.length` — the read-only half of tsc's
+                // `isEvolvingArrayOperationTarget` (`x.push`/`x.unshift` are
+                // recorded by the CALL arm, since tsc requires the call).
+                if (b.nodeTag(node) == .member_expr and b.isNamedMember(node, "length")) {
+                    const recv = narrowableOperandIdent(b.tree, d.lhs);
+                    if (recv != null_node) try b.noteArrayOpTarget(recv, null_node);
+                }
             },
             .non_null => {
                 if (b.isOptionalChain(node) and b.chainHasRest(node)) return b.bindOptionalChainValue(node);
@@ -4208,6 +4251,19 @@ const Binder = struct {
                 try b.bindExpr(d.lhs);
                 try b.bindExpr(d.rhs);
                 b.cur_flow = try b.addFlow(.assign, b.cur_flow, node);
+                // tsc's `bindBinaryExpressionFlow`: `x[i] = v` can GROW an
+                // evolving array, so it gets its own flow node on top of the
+                // assignment one (which stands for the write to `x[i]`).
+                if (b.tree.tokens.tag(b.tree.nodeMainToken(node)) == .eq and
+                    b.nodeTag(d.lhs) == .index_expr)
+                {
+                    const idx = b.tree.nodeData(d.lhs);
+                    const recv = narrowableOperandIdent(b.tree, idx.lhs);
+                    if (recv != null_node) {
+                        try b.noteArrayOpTarget(recv, idx.rhs);
+                        b.cur_flow = try b.addFlow(.array_mutation, b.cur_flow, node);
+                    }
+                }
             },
             .prefix_unary, .postfix_unary => {
                 try b.bindExpr(d.lhs);
@@ -4262,6 +4318,7 @@ const Binder = struct {
                 const info = b.tree.extraData(ast.CallInfo, d.rhs);
                 for (b.tree.extraRange(info.targs_start, info.targs_end)) |t| try b.bindType(t);
                 for (b.tree.extraRange(info.args_start, info.args_end)) |a| try b.bindExpr(a);
+                if (b.nodeTag(node) != .new_expr_targs) try b.bindArrayMutationCall(node, d.lhs);
             },
             .instantiation_expr => {
                 try b.bindExpr(d.lhs);
@@ -4358,6 +4415,7 @@ const Binder = struct {
                     b.cur_flow = try b.addFlow(.call_stmt, b.cur_flow, node);
                     try b.super_call_flows.append(b.scratch, b.cur_flow);
                 }
+                try b.bindArrayMutationCall(node, d.lhs);
             },
 
             // Everything else: recurse over expression children generically.
@@ -4366,6 +4424,39 @@ const Binder = struct {
                 while (it.next()) |child| try b.bindExpr(child);
             },
         }
+    }
+
+    /// Is `node` a (non-optional) `obj.<name>` member access?
+    fn isNamedMember(b: *Binder, node: Node, name: []const u8) bool {
+        const rhs = b.tree.nodeData(node).rhs;
+        if (rhs == 0) return false;
+        return std.mem.eql(u8, b.tokenText(rhs), name);
+    }
+
+    /// tsc's `bindCallExpressionFlow` array-mutation arm: `x.push(…)` and
+    /// `x.unshift(…)` grow an EVOLVING array, so the call advances the flow
+    /// with a node the checker reads the pushed element types off
+    /// (`getTypeAtFlowArrayMutation`), and the receiver read is exempt from
+    /// the type the array has evolved to so far.
+    ///
+    /// tsc admits any narrowable operand as the receiver; this is restricted
+    /// to a plain IDENTIFIER, because only a variable of the auto/auto-array
+    /// type ever evolves — a dotted receiver would build a flow node that no
+    /// query can ever match, and pay for it in every walk that passes through.
+    fn bindArrayMutationCall(b: *Binder, node: Node, callee: Node) Error!void {
+        if (b.nodeTag(callee) != .member_expr) return;
+        const recv = narrowableOperandIdent(b.tree, b.tree.nodeData(callee).lhs);
+        if (recv == null_node) return;
+        if (!b.isNamedMember(callee, "push") and !b.isNamedMember(callee, "unshift")) return;
+        try b.noteArrayOpTarget(recv, null_node);
+        b.cur_flow = try b.addFlow(.array_mutation, b.cur_flow, node);
+    }
+
+    /// Record `node` as an evolving-array operation target (see
+    /// `Bind.array_op_nodes`). `index` is the index expression whose type the
+    /// checker still has to find number-like, or `null_node`.
+    fn noteArrayOpTarget(b: *Binder, node: Node, index: Node) Error!void {
+        try b.array_ops.append(b.scratch, .{ .value = node, .next = index });
     }
 
     /// An intrinsic JSX tag is a simple lowercase-initial identifier (`div`);
@@ -4839,6 +4930,27 @@ const Binder = struct {
             flow_map_ids[i] = pair.next;
         }
 
+        // Evolving-array operation targets, sorted by node id and deduped (a
+        // node can be visited twice — an optional chain re-binds its value
+        // form — and the entries for one node are identical anyway).
+        std.mem.sort(Link, b.array_ops.items, {}, struct {
+            fn lessThan(_: void, x: Link, y: Link) bool {
+                return x.value < y.value;
+            }
+        }.lessThan);
+        var n_ops: usize = 0;
+        for (b.array_ops.items) |pair| {
+            if (n_ops != 0 and b.array_ops.items[n_ops - 1].value == pair.value) continue;
+            b.array_ops.items[n_ops] = pair;
+            n_ops += 1;
+        }
+        const array_op_nodes = try arena.alloc(Node, n_ops);
+        const array_op_indexes = try arena.alloc(Node, n_ops);
+        for (b.array_ops.items[0..n_ops], 0..) |pair, i| {
+            array_op_nodes[i] = pair.value;
+            array_op_indexes[i] = pair.next;
+        }
+
         var result: Bind = .{
             .symbol_names = symbol_names,
             .symbol_flags = symbol_flags,
@@ -4868,6 +4980,8 @@ const Binder = struct {
             .flow_extra = flow_extra,
             .flow_map_nodes = flow_map_nodes,
             .flow_map_ids = flow_map_ids,
+            .array_op_nodes = array_op_nodes,
+            .array_op_indexes = array_op_indexes,
             .imports = &.{},
             .exports = &.{},
             .unresolved = &.{},
@@ -5155,7 +5269,7 @@ test "golden: var hoists out of blocks to the function scope" {
         \\    y: var
         \\    scope 2: block
         \\      z: let
-        \\flow: nodes=5 attach=0 (start=2 assign=3 cond=0 branch=0 loop=0 switch=0 call=0)
+        \\flow: nodes=5 attach=0 (start=2 assign=3 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0)
         \\
     );
 }
@@ -5166,7 +5280,7 @@ test "golden: function declaration in a block is block-scoped (modern semantics)
         \\  scope 1: block
         \\    g: function impl
         \\    scope 2: function g
-        \\flow: nodes=2 attach=0 (start=2 assign=0 cond=0 branch=0 loop=0 switch=0 call=0)
+        \\flow: nodes=2 attach=0 (start=2 assign=0 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0)
         \\
     );
 }
@@ -5179,7 +5293,7 @@ test "golden: let shadowing chain (TDZ names, one symbol per scope)" {
         \\    a: let
         \\    scope 2: block
         \\      a: let
-        \\flow: nodes=4 attach=3 (start=1 assign=3 cond=0 branch=0 loop=0 switch=0 call=0)
+        \\flow: nodes=4 attach=3 (start=1 assign=3 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0)
         \\
     );
 }
@@ -5203,7 +5317,7 @@ test "golden: class members vs statics, parameter properties" {
         \\    scope 5: function s
         \\    scope 6: function constructor
         \\      z: param
-        \\flow: nodes=4 attach=1 (start=4 assign=0 cond=0 branch=0 loop=0 switch=0 call=0)
+        \\flow: nodes=4 attach=1 (start=4 assign=0 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0)
         \\
     );
 }
@@ -5219,7 +5333,7 @@ test "golden: params, destructured params, defaults referencing earlier params" 
         \\    d: param
         \\    f2: param
         \\    g2: param
-        \\flow: nodes=2 attach=3 (start=2 assign=0 cond=0 branch=0 loop=0 switch=0 call=0)
+        \\flow: nodes=2 attach=3 (start=2 assign=0 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0)
         \\
     );
     // The defaults' references to earlier params resolve in-file.
@@ -5234,7 +5348,7 @@ test "golden: catch parameter gets its own scope shared with the body" {
         \\  scope 1: block
         \\  scope 2: catch_clause
         \\    e: catch
-        \\flow: nodes=4 attach=3 (start=1 assign=0 cond=0 branch=1 loop=0 switch=0 call=2)
+        \\flow: nodes=4 attach=3 (start=1 assign=0 cond=0 branch=1 loop=0 switch=0 call=2 arraymut=0)
         \\unresolved: f(1) g(1)
         \\
     );
@@ -5249,7 +5363,7 @@ test "golden: for and for-of heads scope their declarations" {
         \\  scope 3: for_head
         \\    x: const
         \\    scope 4: block
-        \\flow: nodes=8 attach=5 (start=1 assign=3 cond=2 branch=0 loop=2 switch=0 call=0)
+        \\flow: nodes=8 attach=5 (start=1 assign=3 cond=2 branch=0 loop=2 switch=0 call=0 arraymut=0)
         \\unresolved: xs(1)
         \\
     );
@@ -5264,7 +5378,7 @@ test "golden: import records incl. type-only, namespace, side-effect" {
         \\  T: import type-only
         \\  ns: import
         \\  X: import type-only
-        \\flow: nodes=1 attach=0 (start=1 assign=0 cond=0 branch=0 loop=0 switch=0 call=0)
+        \\flow: nodes=1 attach=0 (start=1 assign=0 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0)
         \\import local=d imported=default from="./m" default
         \\import local=a imported=a from="./m" named
         \\import local=c imported=b from="./m" named
@@ -5282,7 +5396,7 @@ test "golden: export records (decl, alias, re-export, star, default)" {
         \\  k: const exported
         \\  ef: function exported impl
         \\  scope 1: function ef
-        \\flow: nodes=3 attach=0 (start=2 assign=1 cond=0 branch=0 loop=0 switch=0 call=0)
+        \\flow: nodes=3 attach=0 (start=2 assign=1 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0)
         \\export exported=k local=k named
         \\export exported=ef local=ef named
         \\export exported=kk local=k named
@@ -5303,7 +5417,7 @@ test "golden: overload signatures group into one symbol" {
         \\    a: param
         \\  scope 3: function ov
         \\    a: param
-        \\flow: nodes=2 attach=0 (start=2 assign=0 cond=0 branch=0 loop=0 switch=0 call=0)
+        \\flow: nodes=2 attach=0 (start=2 assign=0 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0)
         \\
     );
 }
@@ -5319,7 +5433,7 @@ test "golden: interface-interface merge shares one members scope" {
         \\      b: property
         \\    scope 3: function m
         \\  scope 4: interface I
-        \\flow: nodes=1 attach=0 (start=1 assign=0 cond=0 branch=0 loop=0 switch=0 call=0)
+        \\flow: nodes=1 attach=0 (start=1 assign=0 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0)
         \\
     );
 }
@@ -5331,7 +5445,7 @@ test "golden: type alias with type params" {
         \\  v: let
         \\  scope 1: type_alias Alias
         \\    T: type-param
-        \\flow: nodes=1 attach=0 (start=1 assign=0 cond=0 branch=0 loop=0 switch=0 call=0)
+        \\flow: nodes=1 attach=0 (start=1 assign=0 cond=0 branch=0 loop=0 switch=0 call=0 arraymut=0)
         \\
     );
 }
@@ -5799,7 +5913,7 @@ fn checkBinderOnArbitraryBytes(alloc: Allocator, interner: *Interner, input: []c
                     try testing.expect(a < n_flows);
                 }
             },
-            .assign, .cond_true, .cond_false, .switch_clause, .switch_no_match, .call_stmt => {
+            .assign, .cond_true, .cond_false, .switch_clause, .switch_no_match, .call_stmt, .array_mutation => {
                 try testing.expect(b.flow_a[f] < n_flows);
                 try testing.expect(b.flow_b[f] < tree.nodes.len);
             },

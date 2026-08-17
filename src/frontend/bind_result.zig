@@ -283,6 +283,13 @@ pub const FlowTag = enum(u8) {
     /// call is a plain pass-through; the binder's `this`-before-`super` walk is
     /// the only reader that cares which it is.
     call_stmt,
+    /// A mutation that can grow an EVOLVING array: `x.push(…)`, `x.unshift(…)`
+    /// or `x[i] = v`. a = antecedent, b = the call / assignment node. tsc's
+    /// `FlowFlags.ArrayMutation`, created by `bindCallExpressionFlow` and
+    /// `bindBinaryExpressionFlow`. Only a query for the mutated variable's own
+    /// bare reference reads it (see `getTypeAtFlowArrayMutation`); for every
+    /// other reference it is a pass-through.
+    array_mutation,
 };
 
 pub const ImportKind = enum(u8) { default, namespace, named, side_effect, equals };
@@ -421,6 +428,23 @@ pub const Bind = struct {
     flow_map_nodes: []const Node,
     flow_map_ids: []const FlowId,
 
+    /// tsc's `isEvolvingArrayOperationTarget`: the identifier reads that are
+    /// `x` in `x.length`, `x.push(…)`, `x.unshift(…)` or `x[i] = v`. Such a
+    /// read of an evolving array answers with the *auto* array type rather
+    /// than with the evolved one — the operation is what BUILDS the array, so
+    /// it must not be checked against what has been put in it so far — and it
+    /// is exempt from the TS7034/TS7005 pair.
+    ///
+    /// Only the binder can answer it: the predicate is about the read's
+    /// PARENT, and the AST carries no parent links. Sorted by node; empty for
+    /// the overwhelming majority of files.
+    array_op_nodes: []const Node = &.{},
+    /// Positionally aligned with `array_op_nodes`: the INDEX expression of an
+    /// `x[i] = v` target (whose type still has to be number-like for tsc's
+    /// predicate to hold — a type question the binder cannot answer), or
+    /// `null_node` for the three property forms, which qualify outright.
+    array_op_indexes: []const Node = &.{},
+
     /// Remapped post-seal (atom ids).
     imports: []ImportRec,
     /// Remapped post-seal (atom ids).
@@ -480,9 +504,10 @@ pub const Bind = struct {
     /// strings.
     ///
     /// internal: read by the binder test that enforces the reminder.
-    /// (39 includes `enum_scope_syms`/`enum_scope_ids`, which hold symbol and
-    /// scope ids — no atoms — so they need no rewrite.)
-    pub const remap_field_count = 39;
+    /// (41 includes `enum_scope_syms`/`enum_scope_ids`, which hold symbol and
+    /// scope ids, and `array_op_nodes`/`array_op_indexes`, which hold node
+    /// ids — no atoms — so they need no rewrite.)
+    pub const remap_field_count = 41;
 
     /// Rewrite every atom this file stored through `map` (old atom -> new
     /// atom), restoring the atom-sorted order of the tables that have one.
@@ -686,9 +711,25 @@ pub const Bind = struct {
     /// The AST node a flow node references (assign/condition/switch), or 0.
     pub fn flowNode(b: *const Bind, flow: FlowId) Node {
         return switch (b.flow_tags[flow]) {
-            .assign, .cond_true, .cond_false, .switch_clause, .switch_no_match, .start, .call_stmt => b.flow_b[flow],
+            .assign, .cond_true, .cond_false, .switch_clause, .switch_no_match, .start, .call_stmt, .array_mutation => b.flow_b[flow],
             else => 0,
         };
+    }
+
+    /// Is `node` one of tsc's evolving-array operation targets, and if so what
+    /// index expression (if any) still has to be number-like? See
+    /// `array_op_nodes`. The outer optional is "is a target at all"; the
+    /// payload is `null_node` for the property forms.
+    pub fn arrayOpTarget(b: *const Bind, node: Node) ?Node {
+        var lo: usize = 0;
+        var hi: usize = b.array_op_nodes.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const n = b.array_op_nodes[mid];
+            if (n == node) return b.array_op_indexes[mid];
+            if (n < node) lo = mid + 1 else hi = mid;
+        }
+        return null;
     }
 
     /// Lexical scope in which `flow`'s expression node was bound.

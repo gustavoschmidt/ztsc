@@ -138,7 +138,109 @@ fn patternRootDecl(c: *const Checker, sym: SymbolId) u64 {
 }
 
 pub fn flowTypeOfReference(c: *Checker, node: Node, sym: SymbolId, declared: TypeId) Error!TypeId {
+    // tsc's `autoArrayType`: a variable initialized with a bare `[]` has no
+    // declared type at all — the walk starts from an EVOLVING array that
+    // `x.push(v)` / `x[i] = v` grow, and finalizes it on the way out (see
+    // `Kind.evolving_array`). The cheap type test comes first: ztsc types a
+    // bare `[]` as `any[]`, so nothing else can be one.
+    if (c.ts.kind(declared) == .array and c.ts.arrayElem(declared) == types.any_type and
+        isEvolvingArrayVar(c, sym))
+    {
+        return c.flowTypeOfKey(node, .{ .sym = sym }, try c.ts.makeEvolvingArray(types.never_type));
+    }
     return c.flowTypeOfKey(node, .{ .sym = sym }, declared);
+}
+
+/// The autoArrayType half of tsc's `getTypeForVariableLikeDeclaration`: a
+/// `var`/`let`/`const` with no annotation whose initializer is a bare `[]`
+/// gets a control-flow tracked array type instead of a declared one.
+///
+/// Unlike the plain auto type (`signatures.isEvolvingVar`) this admits
+/// `const`: tsc's `NodeFlags.Constant` guard sits on the null/undefined branch
+/// only, and `controlFlowArrayErrors.ts`'s `f8` — `const x = []; x.push(5);`
+/// — is oracle proof that a `const` evolves too. Exported and ambient
+/// declarations are excluded exactly as they are there.
+///
+/// Purely syntactic, so it is safe to ask from inside `typeOfSymbol`'s own
+/// callers, and restricted to the current file (a cross-file reference is
+/// never flow-narrowed anyway).
+pub fn isEvolvingArrayVar(c: *Checker, sym: SymbolId) bool {
+    if (isPseudoRoot(sym) or sym == binder.no_symbol) return false;
+    const f = c.symFlags(sym);
+    if (!(f.let_decl or f.var_decl or f.const_decl)) return false;
+    if (f.param or f.catch_param or f.exported) return false;
+    if (c.symFile(sym) != c.cur_file) return false;
+    const decls = c.declsOf(sym);
+    if (decls.len != 1) return false;
+    const decl = decls[0];
+    const d = c.tree.nodeData(decl);
+    const init_node: Node = switch (c.nodeTag(decl)) {
+        .declarator_init => d.rhs,
+        .declarator_full => blk: {
+            const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
+            if (e.type_ann != 0 or e.flags & ast.Flags.declare != 0) return false;
+            break :blk e.init;
+        },
+        else => return false,
+    };
+    if (c.nodeTag(d.lhs) != .identifier) return false;
+    return isEmptyArrayLiteral(c, init_node);
+}
+
+/// tsc's `isEmptyArrayLiteral` — a `[]` with no elements at all.
+fn isEmptyArrayLiteral(c: *Checker, node: Node) bool {
+    if (node == null_node or c.nodeTag(node) != .array_literal) return false;
+    for (c.tree.nodeRange(node)) |el| {
+        if (el != null_node) return false;
+    }
+    return true;
+}
+
+/// tsc's `finalizeEvolvingArrayType` + `createFinalArrayType`: the real array
+/// type an evolving one stands for. A `never` element means nothing was ever
+/// put in, and tsc answers its `autoArrayType` — an `any[]`; otherwise the
+/// accumulated union is subtype-reduced, exactly as an array literal's
+/// element type is.
+fn finalizeEvolvingArray(c: *Checker, t: TypeId) Error!TypeId {
+    if (c.ts.kind(t) != .evolving_array) return t;
+    const elem = c.ts.arrayElem(t);
+    if (elem == types.never_type) return c.ts.makeArray(types.any_type);
+    if (c.ts.kind(elem) != .union_type) return c.ts.makeArray(elem);
+    return c.ts.makeArray(try c.reduceSubtypes(elem));
+}
+
+/// tsc's `isEvolvingArrayOperationTarget`: is this read the `x` of `x.length`,
+/// `x.push(…)`, `x.unshift(…)` or `x[i] = v`? Such a read answers with the
+/// AUTO array type rather than with what the array has evolved to — the
+/// operation is what builds the array, so checking it against the elements
+/// already in it would report the `x.push("s")` that follows an `x.push(5)`.
+///
+/// The shape is a question about the read's PARENT, which only the binder can
+/// answer (see `Bind.array_op_nodes`); the number-like index of the
+/// element-assignment form is the one half that is a TYPE question and is
+/// settled here.
+fn isEvolvingArrayOperationTarget(c: *Checker, node: Node) Error!bool {
+    const index = c.bind.arrayOpTarget(node) orelse return false;
+    if (index == null_node) return true; // `.length` / `.push` / `.unshift`
+    const it = c.nodeType(index) orelse try c.checkExprCached(index, types.no_type);
+    return indexIsNumberLike(c, it);
+}
+
+/// tsc's `isTypeAssignableToKind(indexType, TypeFlags.NumberLike)` for an
+/// element-access index: `x["k"] = v` writes a PROPERTY and never grows the
+/// array, so it is not an evolving-array operation.
+fn indexIsNumberLike(c: *Checker, t0: TypeId) Error!bool {
+    const t = try c.resolveStructural(t0);
+    switch (c.ts.kind(t)) {
+        .number, .number_literal, .number_literal_fresh, .any, .err, .enum_type => return true,
+        .union_type => {
+            for (try c.memberList(t)) |m| {
+                if (!try indexIsNumberLike(c, m)) return false;
+            }
+            return true;
+        },
+        else => return false,
+    }
 }
 
 /// The object binding pattern a declaration binds through, or null.
@@ -357,7 +459,40 @@ pub fn flowTypeOfKey(c: *Checker, node: Node, key: RefKey, declared: TypeId) Err
             if (c.ts.kind(t) == .never and !try flowReachable(c, flow)) t = declared;
         }
     }
+    // The rest of tsc's `getFlowTypeOfReference` tail: an evolving array
+    // leaves the walk as a real array type — or, in an operation-target
+    // position, as the auto array (see `isEvolvingArrayOperationTarget`).
+    if (c.ts.kind(t) == .evolving_array) {
+        t = if (try isEvolvingArrayOperationTarget(c, node))
+            try c.ts.makeArray(types.any_type)
+        else
+            try finalizeEvolvingArray(c, t);
+    }
     return applyChainGuards(c, key, t);
+}
+
+/// tsc's auto-type arm of `checkIdentifier`, asked of a read: is the flow type
+/// at `node` STILL the auto array — i.e. did no `x.push(…)`, `x[i] = v` or
+/// non-empty assignment ever reach it? That is exactly the state
+/// `finalizeEvolvingArrayType` turns into an implicit `any[]`, and the state
+/// tsc reports TS7034/TS7005 for (see `expr.checkEvolvingVarRead`).
+///
+/// A separate entry point rather than a second return value because the walk
+/// is memoized: the answer costs a cache probe on top of the type the caller
+/// already asked for, and asking it is gated on the declaration being
+/// syntactically an evolving one.
+pub fn evolvingArrayStillAuto(c: *Checker, node: Node, sym: SymbolId, declared: TypeId) Error!bool {
+    if (try isEvolvingArrayOperationTarget(c, node)) return false;
+    const start: TypeId = if (isEvolvingArrayVar(c, sym))
+        try c.ts.makeEvolvingArray(types.never_type)
+    else
+        declared;
+    const flow = c.bind.flowAt(node) orelse return false;
+    const saved_ref = c.flow_ref_node;
+    defer c.flow_ref_node = saved_ref;
+    c.flow_ref_node = node;
+    const t = try flowType(c, flow, .{ .sym = sym }, start, 0);
+    return c.ts.kind(t) == .evolving_array and c.ts.arrayElem(t) == types.never_type;
 }
 
 /// tsc's `isReachableFlowNode`. Only asked on a `never` answer (a fraction of
@@ -631,6 +766,14 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
             // Use the declared type instead: there is no valid narrowing at an
             // unreachable definition point.
             if (ante == binder.unreachable_flow) return declared;
+            // An EVOLVING array never continues into an enclosing function:
+            // tsc's closure-crossing loop is guarded by `isConstantVariable(…)
+            // && type !== autoArrayType`, so the auto array is exactly the
+            // type it refuses to carry across. The declared type it answers
+            // with here is that same auto array, which is what makes
+            // `let x = []; x.push(5); function g() { x }` report TS7005 on the
+            // capture (`controlFlowArrayErrors.ts` f3/f8).
+            if (c.ts.kind(declared) == .evolving_array) return declared;
             // Property paths and `this` never continue into an enclosing
             // function's flow — tsc's Start arm excludes exactly
             // PropertyAccess, ElementAccess and `this`.
@@ -765,6 +908,27 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
             if (strip_nullish and isNullishUnion(c, before)) return try c.nonNullable(before);
             return before;
         },
+        // tsc's `getTypeAtFlowArrayMutation`. `x.push(v)` / `x[i] = v` grow the
+        // EVOLVING array a `let x = []` starts out as; every other reference
+        // (and every non-evolving antecedent type) passes straight through.
+        .array_mutation => {
+            const mutation = b.flowNode(flow);
+            const ante = b.flow_a[flow];
+            var matches = false;
+            if (key.len == 0 and !isPseudoRoot(key.sym)) {
+                const saved = c.cur_scope;
+                defer c.cur_scope = saved;
+                c.cur_scope = b.flowScope(flow);
+                const target = arrayMutationTarget(c, mutation);
+                matches = target != null_node and try identIsSym(c, target, key.sym);
+            }
+            const before = try flowType(c, ante, key, declared, depth + 1);
+            if (!matches or c.ts.kind(before) != .evolving_array) return before;
+            const saved = c.cur_scope;
+            defer c.cur_scope = saved;
+            c.cur_scope = b.flowScope(flow);
+            return evolveArray(c, before, mutation);
+        },
         .cond_true, .cond_false => {
             const cond = b.flowNode(flow);
             const ante = b.flow_a[flow];
@@ -790,7 +954,13 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
             const saved = c.cur_scope;
             defer c.cur_scope = saved;
             c.cur_scope = b.flowScope(flow);
-            return c.narrowByCondition(before, cond, sense, key, declared);
+            // tsc's `getTypeAtFlowCondition` narrows the FINALIZED type and,
+            // when the guard changed nothing, hands the original (still
+            // evolving) one back — which is what lets an array keep growing
+            // across `if (x.length === 0) { x.push(1) }`.
+            const solid = try finalizeEvolvingArray(c, before);
+            const narrowed = try c.narrowByCondition(solid, cond, sense, key, declared);
+            return if (narrowed == solid) before else narrowed;
         },
         .switch_clause => {
             const clause = b.flowNode(flow);
@@ -800,7 +970,9 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
             const saved = c.cur_scope;
             defer c.cur_scope = saved;
             c.cur_scope = b.flowScope(flow);
-            return narrowBySwitchClause(c, before, clause, key, declared);
+            const solid = try finalizeEvolvingArray(c, before);
+            const narrowed = try narrowBySwitchClause(c, solid, clause, key, declared);
+            return if (narrowed == solid) before else narrowed;
         },
         .switch_no_match => {
             const sw = b.flowNode(flow);
@@ -813,7 +985,9 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
             if (c.switchIsExhaustive(sw)) return types.never_type;
             const before = try flowType(c, ante, key, declared, depth + 1);
             if (before == types.never_type) return before;
-            return narrowBySwitchNoMatch(c, before, sw, key, declared);
+            const solid = try finalizeEvolvingArray(c, before);
+            const narrowed = try narrowBySwitchNoMatch(c, solid, sw, key, declared);
+            return if (narrowed == solid) before else narrowed;
         },
         .call_stmt => {
             const call = b.flowNode(flow);
@@ -846,7 +1020,9 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
             const saved = c.cur_scope;
             defer c.cur_scope = saved;
             c.cur_scope = b.flowScope(flow);
-            return narrowByAssertCall(c, before, call, key, declared);
+            const solid = try finalizeEvolvingArray(c, before);
+            const narrowed = try narrowByAssertCall(c, solid, call, key, declared);
+            return if (narrowed == solid) before else narrowed;
         },
         .branch_label, .loop_label => {
             const antes = b.flowAntecedents(flow);
@@ -981,6 +1157,15 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
                 if (c.flow_back_edge == 0) c.flow_tmp.clearRetainingCapacity();
             }
             if (parts.items.len == 0) return types.never_type;
+            // tsc's `getUnionOrEvolvingArrayType`: a join whose branches are
+            // ALL evolving arrays stays one evolving array over the union of
+            // their elements, so `if (c) { x.push(1) } else { x.push("s") }`
+            // keeps growing afterwards. As soon as one branch assigned a real
+            // array (`x = [true]`) the join is an ordinary union of the
+            // FINALIZED types — which is what makes the `x.push(99)` after
+            // `controlFlowArrayErrors.ts`'s `f6` report TS2345.
+            if (try joinEvolvingArrays(c, parts.items)) |ev| return ev;
+            for (parts.items) |*p| p.* = try finalizeEvolvingArray(c, p.*);
             // `recombineUnknown`: a join whose branches between them re-spell
             // `unknown` must hand `unknown` back, not its expansion.
             const joined = narrow.recombineUnknown(c, try c.ts.makeUnion(c.scratch(), parts.items));
@@ -1395,7 +1580,11 @@ fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) Error
                 // An evolving (`auto`-typed) variable takes the assigned
                 // type outright — there is no declared type to reduce it
                 // against (tsc `getTypeAtFlowAssignment`, autoType branch).
-                const evolving = key.len == 0 and c.isEvolvingVar(root_sym);
+                // A query already carrying the auto ARRAY is in the same
+                // branch: tsc's test is `declaredType === autoType ||
+                // declaredType === autoArrayType`.
+                const evolving = key.len == 0 and
+                    (c.isEvolvingVar(root_sym) or c.ts.kind(declared) == .evolving_array);
                 if (logicalAssignOp(op)) {
                     // A logical assignment's post-value is the whole
                     // expression's type (`x ??= s` leaves `NonNullable<x> |
@@ -1419,6 +1608,12 @@ fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) Error
                 // evolving (`auto`-typed) variable, so `let x; x = 1; x += 1`
                 // takes the compound arm and leaves `number` either way.
                 if (op != .eq) return .base_of_antecedent;
+                // tsc's `isEmptyArrayAssignment`: `x = []` into an auto-typed
+                // variable RESTARTS the evolving array rather than pinning it
+                // to `any[]` — `let x; x = []; x.push(5)` is `number[]`.
+                if (evolving and isEmptyArrayLiteral(c, d.rhs)) {
+                    return .{ .ty = try c.ts.makeEvolvingArray(types.never_type) };
+                }
                 if (!evolving and !assignmentRefines(c, declared)) return .{ .ty = declared };
                 const vt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
                 if (evolving) return .{ .ty = try c.widenLiteral(vt) };
@@ -2254,6 +2449,82 @@ fn reduceEvolvingJoin(c: *Checker, joined: TypeId) Error!TypeId {
     const reduced = try c.reduceSubtypes(try c.ts.makeUnion(c.scratch(), rest.items));
     try nullish.append(c.scratch(), reduced);
     return c.ts.makeUnion(c.scratch(), nullish.items);
+}
+
+/// The variable an array-mutation flow node mutates: the `x` of `x.push(v)`,
+/// `x.unshift(v)` or `x[i] = v`. The binder only builds such a node for a
+/// plain identifier receiver (see `bindArrayMutationCall`).
+fn arrayMutationTarget(c: *Checker, node: Node) Node {
+    if (node == null_node) return null_node;
+    const d = c.tree.nodeData(node);
+    const recv: Node = switch (c.nodeTag(node)) {
+        // `x.push(v)` / `x.unshift(v)`: the member access's object.
+        .call_expr, .call_expr_targs, .optional_call => c.tree.nodeData(d.lhs).lhs,
+        // `x[i] = v`: the element access's object.
+        .assign => c.tree.nodeData(d.lhs).lhs,
+        else => return null_node,
+    };
+    return binder.narrowableOperandIdent(c.tree, recv);
+}
+
+/// tsc's `addEvolvingArrayElementType` applied to one mutation: the pushed
+/// values (or the assigned element) join the evolving array's element type.
+///
+/// An `x[i] = v` whose index is not number-like writes a PROPERTY and grows
+/// nothing — tsc tests it here as well as in
+/// `isEvolvingArrayOperationTarget`, and the two answers have to agree or the
+/// read would be exempted from TS7005 by a mutation that never happened.
+fn evolveArray(c: *Checker, evolving: TypeId, node: Node) Error!TypeId {
+    var elem = c.ts.arrayElem(evolving);
+    switch (c.nodeTag(node)) {
+        .call_expr, .call_expr_targs, .optional_call => {
+            for (c.callShape(node).arg_nodes) |arg| {
+                if (arg == null_node) continue;
+                elem = try addElementType(c, elem, arg);
+            }
+        },
+        .assign => {
+            const d = c.tree.nodeData(node);
+            const index = c.tree.nodeData(d.lhs).rhs;
+            const it = c.nodeType(index) orelse try c.checkExprCached(index, types.no_type);
+            if (!try indexIsNumberLike(c, it)) return evolving;
+            elem = try addElementType(c, elem, d.rhs);
+        },
+        else => {},
+    }
+    if (elem == c.ts.arrayElem(evolving)) return evolving;
+    return c.ts.makeEvolvingArray(elem);
+}
+
+/// One element expression's contribution: tsc's
+/// `getRegularTypeOfObjectLiteral(getBaseTypeOfLiteralType(getContextFreeTypeOfExpression(node)))`,
+/// unioned into what the array holds so far.
+fn addElementType(c: *Checker, elem: TypeId, node: Node) Error!TypeId {
+    const vt = c.nodeType(node) orelse try c.checkExprCached(node, types.no_type);
+    const widened = try c.ts.regularLiteral(try c.widenLiteral(vt));
+    if (widened == types.no_type) return elem;
+    return c.ts.makeUnion(c.scratch(), &.{ elem, widened });
+}
+
+/// tsc's `isEvolvingArrayTypeList` + the evolving branch of
+/// `getUnionOrEvolvingArrayType`: when every non-`never` antecedent of a join
+/// is an evolving array (and at least one is), the join is a single evolving
+/// array over the union of their element types. `null` when it is not.
+fn joinEvolvingArrays(c: *Checker, parts: []const TypeId) Error!?TypeId {
+    var any_evolving = false;
+    for (parts) |p| {
+        if (c.ts.kind(p) == .never) continue;
+        if (c.ts.kind(p) != .evolving_array) return null;
+        any_evolving = true;
+    }
+    if (!any_evolving) return null;
+    var elems: std.ArrayList(TypeId) = .empty;
+    defer elems.deinit(c.scratch());
+    for (parts) |p| {
+        if (c.ts.kind(p) != .evolving_array) continue;
+        try elems.append(c.scratch(), c.ts.arrayElem(p));
+    }
+    return try c.ts.makeEvolvingArray(try c.ts.makeUnion(c.scratch(), elems.items));
 }
 
 fn assignmentReduced(c: *Checker, declared: TypeId, assigned0: TypeId) Error!TypeId {
@@ -3136,7 +3407,9 @@ fn definitelyAssignedInner(c: *Checker, flow: FlowId, sym: SymbolId) Error!bool 
             if (try assignTargetsSymForDa(c, target, sym)) return true;
             return c.definitelyAssigned(b.flow_a[flow], sym);
         },
-        .cond_true, .cond_false, .switch_clause, .call_stmt => {
+        // An array mutation writes an ELEMENT, never the variable itself, so
+        // it is a pass-through for both assignment questions.
+        .cond_true, .cond_false, .switch_clause, .call_stmt, .array_mutation => {
             return c.definitelyAssigned(b.flow_a[flow], sym);
         },
         .switch_no_match => {
@@ -3222,7 +3495,7 @@ fn saReaches(c: *Checker, flow: FlowId, sym: SymbolId, seen: []bool) Error!bool 
             if (try assignTargetsSymForDa(c, b.flowNode(flow), sym)) return true;
             return saReaches(c, b.flow_a[flow], sym, seen);
         },
-        .cond_true, .cond_false, .switch_clause, .call_stmt, .switch_no_match => {
+        .cond_true, .cond_false, .switch_clause, .call_stmt, .switch_no_match, .array_mutation => {
             return saReaches(c, b.flow_a[flow], sym, seen);
         },
         .branch_label, .loop_label => {

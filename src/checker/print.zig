@@ -111,6 +111,16 @@ fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!voi
             try printTypeParen(c, w, s.arrayElem(t), depth + 1, .array_elem);
             try w.writeAll("[]");
         },
+        // An evolving array never leaves the flow walk (see
+        // `Kind.evolving_array`); tsc prints one as its finalized form, and
+        // the still-empty state — its only reachable spelling here — is
+        // `any[]`.
+        .evolving_array => {
+            const elem = s.arrayElem(t);
+            if (elem == types.never_type) return w.writeAll("any[]");
+            try printTypeParen(c, w, elem, depth + 1, .array_elem);
+            try w.writeAll("[]");
+        },
         .tuple => {
             // Either provenance of a readonly tuple: the tuple-level modifier
             // (`readonly [A, B]`) or an every-element marking (`as const`).

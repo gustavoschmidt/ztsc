@@ -122,6 +122,15 @@ pub const Kind = enum(u8) {
     intersection,
     /// Array. a = element type.
     array,
+    /// tsc's evolving array (`ObjectFlags.EvolvingArray`). a = the element
+    /// type accumulated so far (`never` = nothing yet, tsc's `autoArrayType`
+    /// state). The transient type of a variable declared `= []` while control
+    /// flow analysis is still growing it from `x.push(v)` / `x[i] = v`; it
+    /// lives ONLY inside the flow walk, which finalizes it to a real `T[]`
+    /// (`any[]` when the element type is still `never`) before returning —
+    /// see `flow.finalizeEvolvingArray`. No other part of the checker ever
+    /// sees one, which is why no relation, printer or substitution handles it.
+    evolving_array,
     /// Tuple. a = extra index, b = element count.
     /// extra[a..]: per element [type, flags] (flags: 1 optional, 2 rest).
     tuple,
@@ -1286,6 +1295,11 @@ pub const Store = struct {
     /// guard's `any[]` rather than to `x`'s own type.
     pub fn makeArrayReadonly(s: *Store, elem: TypeId) Error!TypeId {
         return s.internType(.array, &.{ elem, 1 }, 0);
+    }
+
+    /// tsc's `getEvolvingArrayType`. See `Kind.evolving_array`.
+    pub fn makeEvolvingArray(s: *Store, elem: TypeId) Error!TypeId {
+        return s.internType(.evolving_array, &.{ elem, 0 }, 0);
     }
 
     pub fn arrayIsReadonly(s: *const Store, id: TypeId) bool {
