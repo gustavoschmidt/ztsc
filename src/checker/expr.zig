@@ -165,27 +165,30 @@ pub fn checkExprCached(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     return t;
 }
 
-/// Is the current scope the file's own top level — nothing between it and the
-/// file scope that tsc's `getThisContainer` would stop at? Only there does a
-/// bare `this` belong to the file rather than to a function, a class or a
-/// namespace body.
 /// Where a `this` expression's receiver comes from — tsc's `getThisContainer`
-/// with arrow functions skipped, which is the container `tryGetThisTypeAt`
-/// asks for a `this` type.
+/// with arrow functions skipped, which is both the container `tryGetThisTypeAt`
+/// asks for a type and the one `checkThisExpression` switches on to refuse the
+/// reference outright.
 const ThisFrame = struct {
-    /// The nearest enclosing NON-arrow function-like, or `null_node` when the
-    /// reference sits directly in a class body, a namespace or the file.
-    fn_node: Node = null_node,
+    kind: union(enum) {
+        /// The nearest enclosing NON-arrow function-like.
+        function: Node,
+        /// A class body — a field initializer, a static block, a computed key.
+        class_body,
+        /// A `namespace` / `module` body: TS2331.
+        namespace,
+        /// An `enum` body: TS2332.
+        enum_body,
+        /// The file itself.
+        file,
+    } = .file,
     /// Did the walk cross an arrow on the way out? tsc's
     /// `capturedByArrowFunction`, which turns the global `this` into TS7041.
     via_arrow: bool = false,
-    /// A class, namespace or enum body encloses the reference with no function
-    /// between — so `this` belongs to that, not to the file.
-    in_body: bool = false,
 };
 
 fn thisFrame(c: *const Checker) ThisFrame {
-    var out: ThisFrame = .{};
+    var via_arrow = false;
     var cur = c.cur_scope;
     while (cur != binder.file_scope) {
         switch (c.bind.scope_kinds[cur]) {
@@ -193,17 +196,18 @@ fn thisFrame(c: *const Checker) ThisFrame {
                 const owner = c.bind.scope_owners[cur];
                 // An arrow has no `this` of its own; the search continues out.
                 if (c.nodeTag(owner) != .arrow_fn) {
-                    out.fn_node = owner;
-                    return out;
+                    return .{ .kind = .{ .function = owner }, .via_arrow = via_arrow };
                 }
-                out.via_arrow = true;
+                via_arrow = true;
             },
-            .class, .class_members, .class_statics, .namespace, .enum_body => out.in_body = true,
+            .class, .class_members, .class_statics => return .{ .kind = .class_body, .via_arrow = via_arrow },
+            .namespace => return .{ .kind = .namespace, .via_arrow = via_arrow },
+            .enum_body => return .{ .kind = .enum_body, .via_arrow = via_arrow },
             else => {},
         }
         cur = c.bind.scope_parents[cur];
     }
-    return out;
+    return .{ .kind = .file, .via_arrow = via_arrow };
 }
 
 /// Does the function `this` resolves against have a receiver at all? tsc's
@@ -270,37 +274,53 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         .regex_literal => return types.any_type, // RegExp needs lib (documented)
         .this_expr => {
             const frame = thisFrame(c);
-            // tsc's `getThisContainer(node, /*includeArrowFunctions*/ false)`
-            // landed on a FUNCTION. That function owns `this`, and when it has
-            // none of its own the reference is implicitly `any` — TS2683.
-            // `c.this_type` is NOT the test: it is inherited by a nested plain
-            // function from whatever frame encloses it, which is exactly the
-            // shape tsc reports (`class C { m() { function inner() { this } } }`).
-            if (frame.fn_node != null_node) {
-                if (thisFrameOwnsThis(c, frame.fn_node)) return c.this_type;
-                try c.diagFmt(2683, c.nodeSpan(node), "'this' implicitly has type 'any' because it does not have a type annotation.", .{});
-                return types.any_type;
+            // tsc's `checkThisExpression` switches on the container FIRST: a
+            // namespace or enum body has no `this` at all, and says so before
+            // the implicit-`any` report — which then follows, since
+            // `tryGetThisTypeAt` has nothing to answer for either container.
+            switch (frame.kind) {
+                .namespace => try c.diagFmt(2331, c.nodeSpan(node), "'this' cannot be referenced in a module or namespace body.", .{}),
+                .enum_body => try c.diagFmt(2332, c.nodeSpan(node), "'this' cannot be referenced in current location.", .{}),
+                else => {},
             }
-            if (c.this_type != 0) return c.this_type;
-            // tsc's `tryGetThisTypeAt(node, /*includeGlobalThis*/ true)`: at
-            // the TOP LEVEL of a plain script — no enclosing function, class
-            // or namespace to own a `this` — `this` is the global object,
-            // `typeof globalThis`. That is what makes `++this` an arithmetic
-            // error (TS2356) rather than a reference error.
-            //
-            // Reaching it through an ARROW is TS7041 instead: the arrow closes
-            // over the *global* `this`, which is almost never what was meant
-            // (tsc's `capturedByArrowFunction` arm, which fires before the
-            // TS2683 one).
-            //
-            // The top level of a MODULE is `undefined` instead; that stays
-            // `any` here (documented gap).
-            if (!frame.in_body and c.bind.imports.len == 0 and c.bind.exports.len == 0) {
-                if (frame.via_arrow) {
-                    try c.diagFmt(7041, c.nodeSpan(node), "The containing arrow function captures the global value of 'this'.", .{});
-                }
-                return c.globalThisType();
+            switch (frame.kind) {
+                // The container is a FUNCTION. It owns `this`, and when it has
+                // none of its own the reference is implicitly `any` — TS2683.
+                // `c.this_type` is NOT the test: it is inherited by a nested
+                // plain function from whatever frame encloses it, which is
+                // exactly the shape tsc reports (`class C { m() { function
+                // inner() { this } } }`).
+                .function => |fn_node| {
+                    if (thisFrameOwnsThis(c, fn_node)) return c.this_type;
+                },
+                .namespace, .enum_body => {},
+                .class_body, .file => {
+                    if (c.this_type != 0) return c.this_type;
+                    // tsc's `tryGetThisTypeAt(node, /*includeGlobalThis*/
+                    // true)`: at the TOP LEVEL of a plain script — no enclosing
+                    // function, class or namespace to own a `this` — `this` is
+                    // the global object, `typeof globalThis`. That is what
+                    // makes `++this` an arithmetic error (TS2356) rather than a
+                    // reference error.
+                    //
+                    // Reaching it through an ARROW is TS7041 instead: the arrow
+                    // closes over the *global* `this`, which is almost never
+                    // what was meant (tsc's `capturedByArrowFunction` arm,
+                    // which fires before the TS2683 one).
+                    //
+                    // The top level of a MODULE is `undefined` instead; that
+                    // stays `any` here (documented gap), as does a class body
+                    // whose own `this` the walk did not install.
+                    if (frame.kind == .file and c.bind.imports.len == 0 and c.bind.exports.len == 0) {
+                        if (frame.via_arrow) {
+                            try c.diagFmt(7041, c.nodeSpan(node), "The containing arrow function captures the global value of 'this'.", .{});
+                        }
+                        return c.globalThisType();
+                    }
+                    return types.any_type;
+                },
             }
+            try c.diagFmt(2683, c.nodeSpan(node), "'this' implicitly has type 'any' because it does not have a type annotation.", .{});
             return types.any_type;
         },
         .super_expr => return types.any_type,
@@ -4788,18 +4808,35 @@ fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     }
 }
 
-/// The receiver an `obj.m = function () {…}` assignment lends the function as
-/// its `this` (tsc's `getContextualThisParameterType`), or null when the shape
-/// does not match: the target must be a property/element ACCESS and the value a
-/// plain function expression, since an arrow has no `this` of its own.
-fn assignedMethodThis(c: *Checker, target: Node, value: Node) Error!?TypeId {
-    if (value == null_node or c.nodeTag(value) != .function_expr) return null;
-    const recv: Node = switch (c.nodeTag(target)) {
-        .member_expr, .index_expr => c.tree.nodeData(target).lhs,
-        else => return null,
-    };
-    if (recv == null_node) return null;
-    return try c.checkExprCached(recv, types.no_type);
+/// An `obj.m = function () {…}` assignment, whose value tsc's
+/// `getContextualThisParameterType` lends `obj` as its `this` — the idiom that
+/// makes `Element.prototype.remove ??= function () { this.parentNode }` legal
+/// instead of TS2683. Null when the shape does not match: the target must be a
+/// property/element ACCESS and the value a plain function expression, since an
+/// arrow has no `this` of its own. Parentheses around the value are walked
+/// through, as tsc's `walkUpParenthesizedExpressions` does.
+///
+/// The `this_bound_fns` marking is why this is `pub`: it has to run wherever
+/// the right-hand side is TYPED, not only where the assignment is checked. The
+/// EXPANDO member pass walks the same function on its own
+/// (`signatures.expandoMemberType`), and the node-type memo means whichever
+/// route gets there first is the one the body's `this` saw.
+///
+/// Only the "has a receiver" fact is recorded, not the receiver's TYPE: asking
+/// for it is what tsc does, but `F.m = function () { return this }` would then
+/// resolve `this` through the very symbol whose expando type is being built,
+/// and the cycle answers `never`. `this` stays `any` — an under-report on the
+/// type, never a diagnostic.
+pub fn markAssignedMethodFn(c: *Checker, target: Node, value0: Node) Error!void {
+    var value = value0;
+    while (value != null_node and c.nodeTag(value) == .paren_expr) value = c.tree.nodeData(value).lhs;
+    if (value == null_node or c.nodeTag(value) != .function_expr) return;
+    switch (c.nodeTag(target)) {
+        .member_expr, .index_expr => {},
+        else => return,
+    }
+    if (c.tree.nodeData(target).lhs == null_node) return;
+    try markThisBound(c, value);
 }
 
 fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
@@ -4832,16 +4869,10 @@ fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
     var rhs_ctx: TypeId = if (op == .eq) target_t else types.no_type;
     if (target_t == types.error_type or unchecked) rhs_ctx = types.no_type;
     // tsc's `getContextualThisParameterType`, last arm: in `obj.m = function
-    // () {…}` (any assignment operator) the function's `this` is the type of
-    // `obj` — the idiom that makes `Element.prototype.remove ??= function () {
-    // this.parentNode }` legal instead of TS2683. A contextual signature with
-    // a `this` parameter of its own already won inside `checkFunctionLikeExpr`.
-    const saved_this = c.this_type;
-    defer c.this_type = saved_this;
-    if (try assignedMethodThis(c, d.lhs, d.rhs)) |recv| {
-        c.this_type = recv;
-        try markThisBound(c, d.rhs);
-    }
+    // () {…}` (any assignment operator) the function has a receiver — `obj` —
+    // so a `this` in its body is not TS2683. A contextual signature with a
+    // `this` parameter of its own already won inside `checkFunctionLikeExpr`.
+    try markAssignedMethodFn(c, d.lhs, d.rhs);
     const rt = try c.checkExprCached(d.rhs, rhs_ctx);
     switch (op) {
         .eq => {

@@ -27,6 +27,7 @@ const Error = checker_zig.Error;
 
 const RefKey = @import("flow.zig").RefKey;
 const baseTypeVariableOfClass = @import("classes.zig").baseTypeVariableOfClass;
+const expr_zig = @import("expr.zig");
 const checkExprCached = @import("expr.zig").checkExprCached;
 const contextualReturnType = @import("expr.zig").contextualReturnType;
 const containsTypeParam = @import("enums.zig").containsTypeParam;
@@ -1410,6 +1411,11 @@ fn expandoMemberType(c: *Checker, sym: SymbolId) Error!TypeId {
         if (c.nodeTag(decl) != .assign) continue;
         const rhs = c.tree.nodeData(decl).rhs;
         if (rhs == ast.null_node) continue;
+        // `F.m = function () { this }`: this pass types the right-hand side
+        // before the assignment walk reaches it, and the node-type memo makes
+        // that the walk the body's `this` sees — so the "has a receiver" mark
+        // has to be recorded here too, or the `this` is a false TS2683.
+        try expr_zig.markAssignedMethodFn(c, c.tree.nodeData(decl).lhs, rhs);
         const t = try c.widenLiteral(try c.checkExprCached(rhs, types.no_type));
         try parts.append(c.scratch(), t);
     }
