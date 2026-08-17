@@ -3534,7 +3534,6 @@ pub const Checker = struct {
     pub const substThis = enums_zig.substThis;
     pub const containsThisType = enums_zig.containsThisType;
     pub const EnumInfo = enums_zig.EnumInfo;
-    pub const EnumInitKind = enums_zig.EnumInitKind;
     pub const EnumMemberCollect = enums_zig.EnumMemberCollect;
     pub const TpMap = enums_zig.TpMap;
     pub const InferKey = enums_zig.InferKey;

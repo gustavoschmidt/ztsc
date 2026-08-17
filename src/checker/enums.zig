@@ -47,18 +47,28 @@ pub const EnumInfo = struct {
     }
 };
 
-pub const EnumInitKind = enum { numeric, string, computed };
+/// What one member initializer evaluated to. `computed` is tsc's `undefined`
+/// — no constant value — and is what the enum diagnostics fire on; `capped`
+/// is ztsc's own "gave up", which must fire NOTHING (see `Const.deep`).
+const EnumInitKind = enum { numeric, string, computed, capped };
 
 // =====================================================================
 // the syntactic constant evaluator (tsc's `createEvaluator`)
 // =====================================================================
 
 /// A syntactic-constant evaluation result. `.str` means the value's TEXT was
-/// appended to the caller's `out` buffer; `.num` and `.none` leave `out` at
-/// the length it had on entry. That convention makes string concatenation
-/// free — `a + b` evaluates both operands into the same buffer, back to back,
-/// and the concatenation is already there.
-const Const = union(enum) { num: f64, str, none };
+/// appended to the caller's `out` buffer; every other arm leaves `out` at the
+/// length it had on entry. That convention makes string concatenation free —
+/// `a + b` evaluates both operands into the same buffer, back to back, and the
+/// concatenation is already there.
+///
+/// `.deep` is NOT `.none`. `.none` is tsc's answer — this expression has no
+/// constant value — and the enum diagnostics fire on it; `.deep` is ztsc's own
+/// recursion cap giving up, which tsc has no equivalent of, so every caller
+/// has to fall silent rather than report. `1 + 1 + … + 1` thirty times over,
+/// or a chain of two dozen `const`s, is a perfectly ordinary constant that a
+/// fixed cap cannot fold, and reporting there would be a false TS1061.
+const Const = union(enum) { num: f64, str, none, deep };
 
 /// The enum-member walk an evaluation is running inside, if any. tsc's
 /// `evaluate(initializer, member)` resolves a name against the members the
@@ -105,8 +115,9 @@ const EnumScope = struct {
 /// `isConstantVariable(symbol) && declaration && !declaration.type &&
 /// declaration.initializer`). Folding on the checked type instead would also
 /// fold `declare const x: 'abc'`, which tsc leaves as `string`.
-fn evalConst(c: *Checker, node: Node, out: *std.ArrayList(u8), es: EnumScope, depth: u8) Error!Const {
-    if (depth > max_const_eval_depth or node == null_node) return .none;
+fn evalConst(c: *Checker, node: Node, out: *std.ArrayList(u8), es: EnumScope, depth: u16) Error!Const {
+    if (node == null_node) return .none;
+    if (depth > max_const_eval_depth) return .deep;
     const mark = out.items.len;
     const d = c.tree.nodeData(node);
     const main_tok = c.tree.nodeMainToken(node);
@@ -130,6 +141,7 @@ fn evalConst(c: *Checker, node: Node, out: *std.ArrayList(u8), es: EnumScope, de
             out.shrinkRetainingCapacity(mark);
             const v = switch (r) {
                 .num => |n| n,
+                .deep => return .deep,
                 else => return .none,
             };
             return .{ .num = switch (op) {
@@ -142,10 +154,11 @@ fn evalConst(c: *Checker, node: Node, out: *std.ArrayList(u8), es: EnumScope, de
         .template_expr => {
             try out.appendSlice(c.scratch(), c.templateHeadText(main_tok));
             for (c.tree.nodeRange(node)) |sub| {
-                switch (try evalConst(c, sub, out, es, depth + 1)) {
-                    .none => {
+                const r = try evalConst(c, sub, out, es, depth + 1);
+                switch (r) {
+                    .none, .deep => {
                         out.shrinkRetainingCapacity(mark);
-                        return .none;
+                        return if (r == .deep) .deep else .none;
                     },
                     // A numeric substitution stringifies (tsc's
                     // `evaluateTemplateExpression` does `result += value`).
@@ -162,7 +175,11 @@ fn evalConst(c: *Checker, node: Node, out: *std.ArrayList(u8), es: EnumScope, de
     }
 }
 
-const max_const_eval_depth: u8 = 16;
+/// Deep enough for any hand-written constant expression — the deepest in the
+/// TypeScript corpus is a dozen — and shallow enough that the recursion costs
+/// far less stack than the parse of the same expression did. Beyond it the
+/// answer is `.deep`, never `.none`, so overrunning it stays silent.
+const max_const_eval_depth: u16 = 200;
 
 /// JS `ToInt32`, the coercion every bitwise operator applies to its operands.
 fn toInt32(v: f64) i32 {
@@ -178,7 +195,7 @@ fn toUint32(v: f64) u32 {
 
 /// tsc's `BinaryExpression` arm: the twelve arithmetic/bitwise operators over
 /// two numbers, plus `+` over two strings. Anything else is not a constant.
-fn evalConstBinary(c: *Checker, node: Node, out: *std.ArrayList(u8), es: EnumScope, depth: u8) Error!Const {
+fn evalConstBinary(c: *Checker, node: Node, out: *std.ArrayList(u8), es: EnumScope, depth: u16) Error!Const {
     const mark = out.items.len;
     const d = c.tree.nodeData(node);
     const op = c.tree.tokens.tag(c.tree.nodeMainToken(node));
@@ -187,16 +204,16 @@ fn evalConstBinary(c: *Checker, node: Node, out: *std.ArrayList(u8), es: EnumSco
         else => return .none,
     }
     const l = try evalConst(c, d.lhs, out, es, depth + 1);
-    if (l == .none) {
+    if (l == .none or l == .deep) {
         out.shrinkRetainingCapacity(mark);
-        return .none;
+        return if (l == .deep) .deep else .none;
     }
     const r = try evalConst(c, d.rhs, out, es, depth + 1);
     // `"a" + "b"`: both halves are already in `out`, back to back.
     if (l == .str and r == .str and op == .plus) return .str;
     if (l != .num or r != .num) {
         out.shrinkRetainingCapacity(mark);
-        return .none;
+        return if (r == .deep) .deep else .none;
     }
     const a = l.num;
     const b = r.num;
@@ -257,7 +274,7 @@ fn globalNumberName(c: *Checker, a: Atom, sym: SymbolId) ?f64 {
 /// tsc's `evaluateEntityNameExpression` / `evaluateElementAccessExpression`:
 /// an enum member folds to its constant value, a `const` variable with no
 /// annotation folds to its initializer's value.
-fn evalConstEntity(c: *Checker, node: Node, out: *std.ArrayList(u8), es: EnumScope, depth: u8) Error!Const {
+fn evalConstEntity(c: *Checker, node: Node, out: *std.ArrayList(u8), es: EnumScope, depth: u16) Error!Const {
     const d = c.tree.nodeData(node);
     switch (c.nodeTag(node)) {
         .identifier => {
@@ -323,7 +340,10 @@ fn forwardEnumMember(c: *Checker, es: EnumScope, name: Atom) Error!?Const {
 /// `E.M` where `E` names an enum. Null when the qualifier is not an enum, so
 /// the caller can try the namespace-container reading of the same syntax.
 fn evalEnumQualified(c: *Checker, qual: Node, name: Atom, out: *std.ArrayList(u8), es: EnumScope) Error!?Const {
-    if (c.enum_alias_depth >= 8) return Const.none;
+    // ztsc's own cycle cap, not a fact about the code: `.deep`, so a chain
+    // of enum references longer than this stays SILENT instead of earning a
+    // false TS1061/TS2474.
+    if (c.enum_alias_depth >= 8) return Const.deep;
     c.enum_alias_depth += 1;
     defer c.enum_alias_depth -= 1;
     const saved_scope = c.cur_scope;
@@ -340,19 +360,19 @@ fn evalEnumQualified(c: *Checker, qual: Node, name: Atom, out: *std.ArrayList(u8
 }
 
 /// Fold a name that has already been resolved to a symbol.
-fn evalConstSym(c: *Checker, sym0: SymbolId, out: *std.ArrayList(u8), depth: u8) Error!Const {
+fn evalConstSym(c: *Checker, sym0: SymbolId, out: *std.ArrayList(u8), depth: u16) Error!Const {
     var sym = sym0;
     // Follow import aliases to the declaration that carries the initializer
     // (tsc's `resolveEntityName` resolves through aliases before the test).
     var hops: u8 = 0;
     while (c.symFlags(sym).import_binding) : (hops += 1) {
-        if (hops >= 8) return .none;
+        if (hops >= 8) return .deep;
         const tgt = c.importTarget(sym) orelse return .none;
         if (tgt.kind != .binding) return .none;
         sym = c.toGlobalIn(tgt.file, tgt.payload);
     }
     if (c.symFlags(sym).enum_member) {
-        if (c.enum_alias_depth >= 8) return .none;
+        if (c.enum_alias_depth >= 8) return .deep;
         c.enum_alias_depth += 1;
         defer c.enum_alias_depth -= 1;
         const esym = enumOfMemberSym(c, sym) orelse return .none;
@@ -381,7 +401,7 @@ pub fn constTemplateAtom(c: *Checker, node: Node) Error!?Atom {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(c.scratch());
     switch (try evalConst(c, node, &out, .{}, 0)) {
-        .none => return null,
+        .none, .deep => return null,
         .num => |v| try appendNumber(c, &out, v),
         .str => {},
     }
@@ -414,6 +434,7 @@ fn evalEnumInit(c: *Checker, es: EnumScope, init_node: Node) Error!EnumInitValue
     defer out.deinit(c.scratch());
     return switch (try evalConst(c, init_node, &out, es, 0)) {
         .none => .{ .kind = .computed },
+        .deep => .{ .kind = .capped },
         .num => |v| .{ .kind = .numeric, .num = v },
         // `internText`, not `atom` — see `constTemplateAtom`.
         .str => .{ .kind = .string, .str = try c.internText(out.items) },
@@ -507,6 +528,13 @@ fn evalEnumMembers(c: *Checker, sym: SymbolId, out: *std.ArrayList(checker_zig.E
                         entry.computed = true;
                         auto_ok = false;
                     },
+                    // ztsc gave up, tsc did not: the member has no value here
+                    // and the diagnostics must not fire on it (`computed`
+                    // stays false), and the auto-increment chain carries on so
+                    // a following bare member does not earn a false TS1061
+                    // either. Both are under-reports, which is the only
+                    // direction a cap of ours is allowed to move.
+                    .capped => {},
                 }
             }
             try out.append(c.ca(), entry);
@@ -934,7 +962,11 @@ pub fn checkEnum(c: *Checker, node: Node) Error!void {
     var i: usize = 0;
     for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
         if (m == null_node or c.nodeTag(m) != .enum_member) continue;
-        const value = if (base + i < members.len) members[base + i].value else types.no_type;
+        const entry: checker_zig.EnumMemberEntry = if (base + i < members.len)
+            members[base + i]
+        else
+            .{ .name = 0, .value = types.no_type };
+        const value = entry.value;
         i += 1;
         const init_node = c.tree.nodeData(m).lhs;
         if (init_node == null_node) {
@@ -962,6 +994,9 @@ pub fn checkEnum(c: *Checker, node: Node) Error!void {
             }
             continue;
         }
+        // No value AND not tsc's "computed": the evaluator hit one of ztsc's
+        // own caps (`Const.deep`). tsc has no such answer, so neither do we.
+        if (!entry.computed) continue;
         if (is_const) {
             try c.diagFmt(2474, c.nodeSpan(init_node), "const enum member initializers must be constant expressions.", .{});
         } else if (ambient) {
