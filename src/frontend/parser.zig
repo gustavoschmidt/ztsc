@@ -5303,11 +5303,12 @@ const Parser = struct {
     /// argument to `parseJsxChildren`/`parseJsxChild`, and the thing a closing
     /// tag is matched against.
     const JsxOpening = struct {
-        /// The tag NAME's byte range, EMPTY for a fragment `<>`. Name
-        /// equivalence compares exactly this, so two fragments match each other
-        /// and a fragment matches nothing named — which is tsc's rule, arrived
-        /// at there by giving fragments their own node kinds.
-        name: Span,
+        /// The tag NAME's byte range, or null when there is none to compare or
+        /// to quote: a fragment `<>`, or a name that failed to parse. Both stay
+        /// silent — the fragment because the TS17014/TS17015 pair speaks for it
+        /// instead, the unparsed name because the parse has already reported
+        /// there and there is no text to put in a message.
+        name: ?Span,
         /// Where "has no corresponding closing tag" is blamed: the NAME for an
         /// element (tsc: `parseErrorAt(skipTrivia(tag.pos), tag.end)`), the
         /// whole `<>` for a fragment (tsc passes the opening NODE).
@@ -5315,11 +5316,28 @@ const Parser = struct {
         fragment: bool,
     };
 
+    /// The byte range of a tag name that may not have parsed at all: a failed
+    /// `parseJsxTagName` consumes nothing, leaving `to` BEHIND `from`, and the
+    /// arithmetic in `tokSpan` would then quote an arbitrary stretch of the
+    /// file into the message.
+    fn jsxNameSpan(p: *Parser, from: TokenIndex, to: TokenIndex) ?Span {
+        if (to < from) return null;
+        const s = p.tokSpan(from, to);
+        return if (s.end > s.start) s else null;
+    }
+
     /// tsc's `tagNamesAreEquivalent`, over source text rather than nodes: two
     /// tag names match when they spell the same thing. tsc compares the parsed
     /// entity-name structure, which also ignores the trivia a spaced
     /// `< A . B >` carries, so ASCII whitespace is dropped from both sides.
+    ///
+    /// A name holding a `\` is ESCAPED (`<abc>`), which tsc resolves before
+    /// comparing and ztsc does not resolve at all. Comparing raw bytes there
+    /// would call `abc` and `abc` different and invent a mismatch, so an
+    /// escaped name is treated as equivalent to anything — tsc's own answer for
+    /// one is TS17021 on the escape, never a tag mismatch.
     fn jsxTagNamesEquivalent(src: []const u8, a: Span, b: Span) bool {
+        if (jsxNameIsEscaped(src, a) or jsxNameIsEscaped(src, b)) return true;
         var i = a.start;
         var j = b.start;
         while (true) {
@@ -5330,6 +5348,10 @@ const Parser = struct {
             i += 1;
             j += 1;
         }
+    }
+
+    fn jsxNameIsEscaped(src: []const u8, s: Span) bool {
+        return std.mem.indexOfScalar(u8, src[s.start..s.end], '\\') != null;
     }
 
     /// What `parseJsxElement` hands back to whoever parses its siblings.
@@ -5355,12 +5377,12 @@ const Parser = struct {
         var tag: Node = null_node;
         var targs: ast.SubRange = .{ .start = 0, .end = 0 };
         const empty: Span = .{ .start = 0, .end = 0 };
-        var opening: JsxOpening = .{ .name = empty, .report = empty, .fragment = true };
+        var opening: JsxOpening = .{ .name = null, .report = empty, .fragment = true };
         if (p.curTag() != .gt) {
             const name_from = p.curIdx();
             tag = try p.parseJsxTagName();
-            const name = p.tokSpan(name_from, p.lastIdx());
-            opening = .{ .name = name, .report = name, .fragment = false };
+            const name = p.jsxNameSpan(name_from, p.lastIdx());
+            opening = .{ .name = name, .report = name orelse empty, .fragment = false };
             // Explicit type arguments on a component tag: `<Select<string> …>`.
             // In a `.tsx` open tag this `<` is unambiguous (no cast ambiguity),
             // so parse it directly with the ordinary type-argument machinery —
@@ -5373,8 +5395,16 @@ const Parser = struct {
         var close_lt: TokenIndex = 0;
         var children: ast.SubRange = .{ .start = 0, .end = 0 };
         var closed_enclosing = false;
-        if (p.curTag() == .slash) {
-            _ = try p.bump(); // '/'
+        // tsc's `parseJsxOpeningOrSelfClosingElementOrOpeningFragment`: ONLY a
+        // `>` opens a child list. Every other token is expected to be `/` and
+        // the element comes out SELF-CLOSING — so a broken attribute list
+        // (`<span a="x", b/>`) never swallows the rest of the file as children,
+        // which is where a whole family of invented "has no corresponding
+        // closing tag" reports came from. The "'/' expected" and the "'>'
+        // expected" behind it land on the same token, where tsc's
+        // one-per-position rule keeps the first.
+        if (p.curTag() == .slash or !isGtFamily(p.curTag())) {
+            _ = try p.expect(.slash, .expected_slash);
             _ = try p.expectJsxGt();
         } else {
             const after_gt = try p.expectJsxGt();
@@ -5450,28 +5480,30 @@ const Parser = struct {
             }
             return false;
         }
-        // A named element closed by `</>`, or by nothing at all: tsc's
+        // An element whose own name never parsed has nothing to compare or to
+        // quote. A named element closed by `</>`, or by nothing at all: tsc's
         // `parseJsxElementName` leaves a MISSING identifier there and has
         // already reported at that position ("Identifier expected" / "'</'
         // expected"), so its one-per-position rule drops the mismatch message.
-        // Reporting nothing is the same observable answer.
+        // Reporting nothing is the same observable answer for both.
+        const open_name = opening.name orelse return false;
         const closing = closing_name orelse return false;
-        if (jsxTagNamesEquivalent(p.src, opening.name, closing)) return false;
+        if (jsxTagNamesEquivalent(p.src, open_name, closing)) return false;
         // `<div><span></div>`: the `</div>` closes the element OUTSIDE this
         // one, so THIS element is the unclosed one and the enclosing element
         // adopts the tag. tsc's `openingTag` test, and the reason the enclosing
         // opening tag is threaded down here at all.
         const belongs_to_enclosing = if (enclosing) |e|
-            !e.fragment and jsxTagNamesEquivalent(p.src, closing, e.name)
+            if (e.name) |en| jsxTagNamesEquivalent(p.src, closing, en) else false
         else
             false;
         if (p.spec != 0) return belongs_to_enclosing;
         if (belongs_to_enclosing) {
-            try p.errAtSpanArg(.jsx_element_unclosed, opening.report, opening.name);
+            try p.errAtSpanArg(.jsx_element_unclosed, opening.report, open_name);
         } else {
             // Reported on the CLOSING tag but naming the OPENING one — the one
             // diagnostic whose message argument is not its own span.
-            try p.errAtSpanArg(.jsx_expected_closing_tag, closing, opening.name);
+            try p.errAtSpanArg(.jsx_expected_closing_tag, closing, open_name);
         }
         return belongs_to_enclosing;
     }
@@ -5693,8 +5725,8 @@ const Parser = struct {
                     if (p.spec == 0) {
                         if (opening.fragment) {
                             try p.errAtBytes(.jsx_fragment_unclosed, opening.report.start, opening.report.end);
-                        } else {
-                            try p.errAtSpanArg(.jsx_element_unclosed, opening.report, opening.name);
+                        } else if (opening.name) |n| {
+                            try p.errAtSpanArg(.jsx_element_unclosed, opening.report, n);
                         }
                     }
                     break;

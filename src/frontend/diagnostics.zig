@@ -83,6 +83,10 @@ pub const Code = enum(u16) {
     /// the single `</` token its scanner produces, so the message names `</`
     /// and not the `<` and `/` ztsc lexes it as.
     expected_lt_slash,
+    /// TS1005 for the `/` of a self-closing JSX tag: tsc's
+    /// `parseJsxOpeningOrSelfClosingElementOrOpeningFragment` expects one the
+    /// moment the opening tag is not closed by `>`.
+    expected_slash,
     expected_type,
     expected_type_member,
     expected_class_member,
@@ -217,6 +221,19 @@ pub const Code = enum(u16) {
     in_modifier_not_valid_here,
     /// TS1274: an `out` variance annotation in the same forbidden positions.
     out_modifier_not_valid_here,
+    /// TS1090: a modifier that is simply not a parameter modifier. tsc's
+    /// `checkGrammarModifiers` names the word, so the four spellings share one
+    /// comptime template (see `paramModMessage`) rather than an `arg` span —
+    /// the vocabulary is fixed, so a static string per word costs nothing.
+    param_mod_static,
+    param_mod_export,
+    param_mod_declare,
+    param_mod_async,
+    /// TS1242/TS1275: `abstract` and `accessor` in a position that is neither.
+    /// They do not use TS1090's sentence, so they never mention a parameter --
+    /// each names the positions where it WOULD be valid instead.
+    abstract_modifier_not_valid_here,
+    accessor_modifier_not_valid_here,
     /// TS1029: `<out in T>` — the two variance annotations are in the wrong
     /// order.
     in_must_precede_out,
@@ -802,6 +819,12 @@ pub const Code = enum(u16) {
             .export_as_namespace_not_at_top_level,
             .in_modifier_not_valid_here,
             .out_modifier_not_valid_here,
+            .param_mod_static,
+            .param_mod_export,
+            .param_mod_declare,
+            .param_mod_async,
+            .abstract_modifier_not_valid_here,
+            .accessor_modifier_not_valid_here,
             .in_must_precede_out,
             .const_modifier_not_valid_here,
             .nullish_mixed_with_logical,
@@ -990,6 +1013,7 @@ pub const Code = enum(u16) {
             .expected_gt => "'>' expected.",
             .expected_lt => "'<' expected.",
             .expected_lt_slash => "'</' expected.",
+            .expected_slash => "'/' expected.",
             .expected_type => "Type expected.",
             .expected_type_member => "Property or signature expected.",
             .expected_class_member => "Unexpected token. A constructor, method, accessor, or property was expected.",
@@ -1082,6 +1106,12 @@ pub const Code = enum(u16) {
             .export_as_namespace_not_at_top_level => "Global module exports may only appear at top level.",
             .in_modifier_not_valid_here => "'in' modifier can only appear on a type parameter of a class, interface or type alias",
             .out_modifier_not_valid_here => "'out' modifier can only appear on a type parameter of a class, interface or type alias",
+            .param_mod_static => paramModMessage("static"),
+            .param_mod_export => paramModMessage("export"),
+            .param_mod_declare => paramModMessage("declare"),
+            .param_mod_async => paramModMessage("async"),
+            .abstract_modifier_not_valid_here => "'abstract' modifier can only appear on a class, method, or property declaration.",
+            .accessor_modifier_not_valid_here => "'accessor' modifier can only appear on a property declaration.",
             .in_must_precede_out => "'in' modifier must precede 'out' modifier.",
             .const_modifier_not_valid_here => "'const' modifier can only appear on a type parameter of a function, method or class",
             .exp_lhs_plus => expLhsMessage("+"),
@@ -1220,6 +1250,7 @@ pub const Code = enum(u16) {
             .expected_gt,
             .expected_lt,
             .expected_lt_slash,
+            .expected_slash,
             .expected_from,
             .expected_while,
             .expected_eq,
@@ -1356,6 +1387,13 @@ pub const Code = enum(u16) {
             .export_default_not_at_top_level => 1258,
             .export_as_namespace_not_at_top_level => 1316,
             .in_modifier_not_valid_here, .out_modifier_not_valid_here => 1274,
+            .param_mod_static,
+            .param_mod_export,
+            .param_mod_declare,
+            .param_mod_async,
+            => 1090,
+            .abstract_modifier_not_valid_here => 1242,
+            .accessor_modifier_not_valid_here => 1275,
             .in_must_precede_out => 1029,
             .const_modifier_not_valid_here => 1277,
             .exp_lhs_plus,
@@ -1474,6 +1512,11 @@ fn modOrderMessage(comptime first: []const u8, comptime second: []const u8) []co
 }
 
 /// TS1044's four modifiers share one sentence, differing only in the word.
+/// TS1090's four modifiers share one sentence, differing only in the word.
+fn paramModMessage(comptime word: []const u8) []const u8 {
+    return "'" ++ word ++ "' modifier cannot appear on a parameter.";
+}
+
 fn moduleElementModifierMessage(comptime word: []const u8) []const u8 {
     return "'" ++ word ++ "' modifier cannot appear on a module or namespace element.";
 }
