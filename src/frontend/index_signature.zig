@@ -67,6 +67,14 @@ pub const Reports = struct {
     /// looks like a one-diagnostic case only because the rest of the chain
     /// passes).
     trailing_comma: ?Report = null,
+    /// tsc's `checkParameter` contributes TS2371 INDEPENDENTLY of everything
+    /// below — it is the general "a parameter initializer is only allowed in an
+    /// implementation" rule, not an index-signature rule at all, so it survives
+    /// whatever the chain answers. Measured against tsgo: `[a: string = 'x']`
+    /// answers TS1020 AND TS2371; `[a: string = 'x', b: number]` answers
+    /// TS1096 and still TS2371; `[public a: string = 'x']` answers TS1018 and
+    /// still TS2371. Always on the first parameter's NAME.
+    initializer_outside_impl: ?Report = null,
     /// The first hit of the return-chain proper.
     chain: ?Report = null,
 };
@@ -76,17 +84,28 @@ pub const Reports = struct {
 /// must be `string`/`number`/`symbol`/a template literal, tsc's TS1268, which
 /// needs the type resolved).
 pub fn check(s: Shape) Reports {
+    // Outside the chain entirely, and outside the one-parameter gate with it.
+    // Blamed on the whole PARAMETER (tsc's `error(parameter, …)`), so it starts
+    // at the `...` or the first modifier when there is one, not at the name:
+    // `[...a: string = 'x']` answers at the `...`, measured.
+    const init_report: ?Report = if (s.initializer)
+        .{
+            .code = .param_initializer_outside_impl,
+            .token = s.rest orelse s.modifier orelse s.name_token orelse s.bracket_token,
+        }
+    else
+        null;
     if (s.parameters != 1) {
         // The count check `return`s ahead of the trailing-comma one, so a
         // multi-parameter list with a trailing comma answers for the count only.
         // tsc blames the first parameter's NAME, or the whole node when the
         // brackets are empty.
-        return .{ .chain = .{
+        return .{ .initializer_outside_impl = init_report, .chain = .{
             .code = .index_sig_one_parameter,
             .token = s.name_token orelse s.bracket_token,
         } };
     }
-    var out: Reports = .{};
+    var out: Reports = .{ .initializer_outside_impl = init_report };
     if (s.trailing_comma) |t| out.trailing_comma = .{ .code = .index_sig_trailing_comma, .token = t };
     out.chain = chainOf(s);
     return out;
@@ -272,6 +291,31 @@ test "each arm in tsc's order, and each on tsc's token" {
     s.value_type = false;
     try std.testing.expectEqual(Code.index_sig_type_annotation, check(s).chain.?.code);
     try std.testing.expectEqual(@as(u32, 10), check(s).chain.?.token); // the `[`
+}
+
+test "an initializer earns TS2371 whatever else the chain answers" {
+    var s = ok;
+    s.initializer = true;
+    // Alongside the chain's own TS1020, on the same token.
+    try std.testing.expectEqual(Code.param_initializer_outside_impl, check(s).initializer_outside_impl.?.code);
+    try std.testing.expectEqual(@as(u32, 11), check(s).initializer_outside_impl.?.token); // the NAME
+
+    // And it outlives the two `return`s that cut the chain short: the count
+    // check and the arms above `initializer` in `chainOf`.
+    s = ok;
+    s.initializer = true;
+    s.parameters = 2;
+    try std.testing.expectEqual(Code.index_sig_one_parameter, check(s).chain.?.code);
+    try std.testing.expectEqual(Code.param_initializer_outside_impl, check(s).initializer_outside_impl.?.code);
+
+    s = ok;
+    s.initializer = true;
+    s.question = 23;
+    try std.testing.expectEqual(Code.index_sig_question_mark, check(s).chain.?.code);
+    try std.testing.expectEqual(Code.param_initializer_outside_impl, check(s).initializer_outside_impl.?.code);
+
+    // No initializer, nothing to say.
+    try std.testing.expectEqual(@as(?Report, null), check(ok).initializer_outside_impl);
 }
 
 test "every signature of a duplicated key domain is reported, and only those" {

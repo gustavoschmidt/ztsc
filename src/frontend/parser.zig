@@ -59,6 +59,7 @@ const diagnostics = @import("diagnostics.zig");
 const directives = @import("directives.zig");
 const literals = @import("literals.zig");
 const modifier_order = @import("modifier_order.zig");
+const param_modifiers = @import("param_modifiers.zig");
 const index_signature = @import("index_signature.zig");
 const computed_member = @import("computed_member.zig");
 const decorator_target = @import("decorator_target.zig");
@@ -686,13 +687,23 @@ const Parser = struct {
         };
     }
 
-    /// Where the eof token's leading trivia BEGAN — just past the last real
+    /// Where the CURRENT token's leading trivia BEGAN — just past the last real
     /// token, or the start of the file when there is none. tsc's
     /// `scanner.getTokenFullStart()`, which is `fullStartPos`, set at the top of
     /// `scan()` before the trivia loop runs.
-    fn eofFullStart(p: *Parser) u32 {
+    fn curFullStart(p: *Parser) u32 {
         if (p.tok_tags.items.len == 0) return 0;
         return p.lastTokEnd();
+    }
+
+    /// Report at the current token's FULL start, zero-width — tsc's
+    /// `parseErrorAtPosition(scanner.getTokenFullStart(), 0, …)`, which is what
+    /// `createMissingNode(…, reportAtCurrentPosition: true, …)` passes. The
+    /// difference from `errAtCur` is exactly the leading trivia: measured
+    /// against tsgo, `a[/*c*/]` blames the byte after the `[`, not the `]`.
+    fn errAtFullStart(p: *Parser, code: Code) Error!void {
+        const at = p.curFullStart();
+        try p.addDiag(code, .{ .code = code, .span = .{ .start = at, .end = at } });
     }
 
     fn errAtCur(p: *Parser, code: Code) Error!void {
@@ -708,7 +719,7 @@ const Parser = struct {
         // and `class D { m(` keep their TS1005 on the eof token — `parseExpected`
         // has no such rule.
         if (t.tag == .eof and missingNameNode(code)) {
-            const at = p.eofFullStart();
+            const at = p.curFullStart();
             return p.addDiag(code, .{ .code = code, .span = .{ .start = at, .end = at } });
         }
         const end = if (t.end > t.start) t.end else t.start + 1;
@@ -948,7 +959,7 @@ const Parser = struct {
     /// reports at it, then carries on with a missing node.
     fn parseElementAccessArgument(p: *Parser) PE!Node {
         if (p.curTag() != .r_bracket) return p.parseExpression(.{});
-        try p.errAtCur(.element_access_needs_argument);
+        try p.errAtFullStart(.element_access_needs_argument);
         return null_node;
     }
 
@@ -1137,6 +1148,18 @@ const Parser = struct {
     /// Tokens acceptable as a member/property name (any keyword works).
     fn isNameLike(tag: TokTag) bool {
         return tag == .identifier or tag == .private_identifier or tag.isKeyword();
+    }
+
+    /// tsc's `canFollowModifier`: what a modifier keyword must be followed by
+    /// for it to BE a modifier rather than the name itself. A destructuring
+    /// pattern, a rest `...`, or any literal property name — which is where
+    /// RESERVED words count too, so `constructor(static export a)` reads both
+    /// as modifiers and answers once, for the `static`.
+    fn canFollowModifier(tag: TokTag) bool {
+        return switch (tag) {
+            .l_bracket, .l_brace, .dot_dot_dot, .string_literal, .numeric_literal, .bigint_literal => true,
+            else => isNameLike(tag),
+        };
     }
 
     fn isAssignOp(tag: TokTag) bool {
@@ -2760,33 +2783,50 @@ const Parser = struct {
         }
         const start_tok = p.curIdx();
         var flags: u32 = 0;
-        var mod_reported = false;
-        // Constructor parameter properties: visibility/readonly/override.
-        while (true) {
-            const bit: u32 = switch (p.curTag()) {
-                .keyword_public => ast.Flags.public,
-                .keyword_private => ast.Flags.private,
-                .keyword_protected => ast.Flags.protected,
-                .keyword_readonly => ast.Flags.readonly,
-                .keyword_override => ast.Flags.override,
-                else => 0,
-            };
-            if (bit == 0) break;
+        // tsc's `parseModifiers` consumes EVERY modifier keyword here, the ones
+        // a parameter may not carry included, and leaves the complaint to
+        // `checkGrammarModifiers` — which stops at its first hit. Consuming them
+        // is what turns `constructor(static a: number)` from a cascade of "','
+        // expected" into the one TS1090 tsc answers. The first problem found is
+        // held back rather than reported on the spot, because a `this` parameter
+        // overrides all of them (see below).
+        var problem: ?struct { code: Code, tok: TokenIndex } = null;
+        var first_mod: ?TokenIndex = null;
+        var seen_static = false;
+        while (param_modifiers.role(p.curTag())) |role| {
+            // tsc's `hasSeenStaticModifier` guard: a SECOND `static` is not a
+            // modifier, so `constructor(static static a)` reads the second one
+            // as the parameter's NAME.
+            if (seen_static and p.curTag() == .keyword_static) break;
             // Only a modifier if a binding follows (else it's the name).
-            const t1 = p.peekTag(1);
-            if (!(isIdentLike(t1) or t1 == .l_bracket or t1 == .l_brace or t1 == .dot_dot_dot or t1 == .keyword_this)) break;
-            // Same walk as a class member's: `constructor(readonly readonly y)`
-            // is TS1030 and `constructor(override public foo)` is TS1029. A
-            // parameter is never in an abstract-member position, so the abstract
-            // pairs are unreachable here whatever the class is.
-            if (!mod_reported and p.spec == 0) {
-                if (modifier_order.check(flags, bit, false)) |code| {
-                    try p.errAtCur(code);
-                    mod_reported = true;
-                }
+            if (!canFollowModifier(p.peekTag(1))) break;
+            if (first_mod == null) first_mod = p.curIdx();
+            if (p.curTag() == .keyword_static) seen_static = true;
+            const code: ?Code = switch (role) {
+                // Same walk as a class member's: `constructor(readonly readonly
+                // y)` is TS1030 and `constructor(override public foo)` is
+                // TS1029. A parameter is never in an abstract-member position,
+                // so the abstract pairs are unreachable here whatever the class
+                // is.
+                .property => |bit| blk: {
+                    defer flags |= bit;
+                    break :blk modifier_order.check(flags, bit, false);
+                },
+                .rejected => |c| c,
+            };
+            if (problem == null) {
+                if (code) |c| problem = .{ .code = c, .tok = p.curIdx() };
             }
             _ = try p.bump();
-            flags |= bit;
+        }
+        // `checkGrammarModifiers` opens with the `this` parameter and returns
+        // there: any modifier on one is TS1433 and nothing else is said, so this
+        // replaces whatever the walk above found.
+        if (p.curTag() == .keyword_this) {
+            if (first_mod) |m| problem = .{ .code = .decorator_on_this_param, .tok = m };
+        }
+        if (p.spec == 0) {
+            if (problem) |it| try p.errAtToken(it.code, it.tok);
         }
         if (try p.eat(.dot_dot_dot) != null) flags |= ast.Flags.rest;
         var name: Node = null_node;
@@ -7122,6 +7162,7 @@ const Parser = struct {
         if (p.curTag() != .comma) try p.expectSemicolon();
         const reports = index_signature.check(shape);
         if (reports.trailing_comma) |r| try p.errAtToken(r.code, r.token);
+        if (reports.initializer_outside_impl) |r| try p.errAtToken(r.code, r.token);
         if (reports.chain) |r| try p.errAtToken(r.code, r.token);
         // The checker wants a key and a value type; a missing one becomes an
         // error node rather than 0, which is what every other recovery path in
