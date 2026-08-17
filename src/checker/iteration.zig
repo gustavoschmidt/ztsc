@@ -205,8 +205,19 @@ pub fn iterationElementType(c: *Checker, rt: TypeId) Error!?TypeId {
     }
     // `[Symbol.iterator](): Iterator<E>` protocol.
     if (try c.propOfType(r, c.atom_sym_iterator)) |p| {
+        // An OPTIONAL `[Symbol.iterator]?()` is not the protocol: tsc reads the
+        // member's type with `| undefined` folded in, and a union with
+        // `undefined` has no call signatures at all — so `{ [Symbol.iterator]?():
+        // Iterator<string> }` is TS2488 (`for-of29`).
+        if (p.optional()) return null;
+        // A member of type `any` satisfies the protocol outright, at either
+        // hop: tsc's `getIterationTypesOfIterable` / `…OfMethod` answer
+        // `anyIterationTypes` the moment the method (or its return) is `any`,
+        // and never look for `next` (`for-of25`, `for-of27`).
+        if (isAnyLike(c, try c.resolveStructural(p.ty))) return types.any_type;
         const ret = try c.callableReturn(p.ty);
         if (ret != 0) {
+            if (isAnyLike(c, try c.resolveStructural(ret))) return types.any_type;
             // Lib iterables return `IterableIterator<E>`/`Iterator<E>`.
             const y2 = c.generatorYieldType(ret);
             if (y2 != 0) return y2;
@@ -215,6 +226,10 @@ pub fn iterationElementType(c: *Checker, rt: TypeId) Error!?TypeId {
         }
     }
     return null;
+}
+
+fn isAnyLike(c: *const Checker, t: TypeId) bool {
+    return c.ts.kind(t) == .any or c.ts.kind(t) == .err;
 }
 
 /// The type produced by `for await (x of rt)`: the
@@ -269,10 +284,14 @@ pub fn callableReturn(c: *Checker, ty: TypeId) Error!TypeId {
 pub fn iteratorNextValue(c: *Checker, iter: TypeId, is_async: bool) Error!?TypeId {
     const r = try c.resolveStructural(iter);
     const nextp = (try c.propOfType(r, c.atom_next)) orelse return null;
+    // `next: any` — or a `next()` that returns `any` — is tsc's
+    // `anyIterationTypes` (`for-of26`, `for-of28`), not a missing protocol.
+    if (isAnyLike(c, try c.resolveStructural(nextp.ty))) return types.any_type;
     var ret = try c.callableReturn(nextp.ty);
     if (ret == 0) return null;
     if (is_async) ret = try c.awaitedType(ret);
     const rr = try c.resolveStructural(ret);
+    if (isAnyLike(c, rr)) return types.any_type;
     if (c.ts.kind(rr) == .union_type) {
         // The lib's `next(): IteratorResult<T, TReturn>` is the union
         // `IteratorYieldResult<T> | IteratorReturnResult<TReturn>`,
