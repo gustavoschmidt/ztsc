@@ -209,9 +209,31 @@ fn nonPublicPropMismatch(
     // `isValidOverrideOf`: a `protected` target member accepts only a source
     // member declared by a class DERIVED from the declaring one. A source with
     // no declaring class at all supplies none.
+    //
+    // "class" is literal — tsc's `isPropertyInClassDerivedFrom` reads the
+    // source property's `getDeclaringClass`, which is `undefined` unless some
+    // declaration's parent `isClassLike`, and answers `false` for it:
+    //
+    // ```ts
+    // function isPropertyInClassDerivedFrom(prop: Symbol, baseClass: Type | undefined) {
+    //     return forEachProperty(prop, sp => {
+    //         const sourceClass = getDeclaringClass(sp);
+    //         return sourceClass ? hasBaseType(sourceClass, baseClass) : false;
+    //     });
+    // }
+    // ```
+    //
+    // So an INTERFACE that redeclares a base class's `protected` member as
+    // public does not override it, however faithfully the interface extends
+    // that class — `interface I extends Foo { x: string }` over
+    // `class Foo { protected x: string }` is TS2430
+    // (`interfaceExtendingClassWithProtecteds`,
+    // `interfaceExtendingClassWithProtecteds2`). `declaringMember` walks
+    // interfaces as well as classes because the property LOOKUP does, so the
+    // class-ness of what it landed on is asked here.
     if (t_access == .protected) {
         if (s) |sc| {
-            if (try derivesFrom(c, sc.cls, t.?.cls)) return null;
+            if (c.symFlags(sc.cls).class and try derivesFrom(c, sc.cls, t.?.cls)) return null;
         }
         return .{ .protected_not_derived = .{
             .src_cls = if (s) |sc| sc.cls else null,
@@ -243,6 +265,26 @@ pub fn firstMismatch(c: *Checker, src: TypeId, dst: TypeId, table: TypeId) Error
 }
 
 pub const Named = struct { name: Atom, why: Mismatch };
+
+/// tsc's `getTargetSymbol(sourceProp) === getTargetSymbol(targetProp)` half of
+/// `compareProperties`: for a NON-PUBLIC property the identity relation asks
+/// only whether the two sides name the same declaration — two `private a`
+/// declarations are never identical however identical their types, and one
+/// `protected a` reached from two different classes is the same member.
+///
+/// The direction-free counterpart of `nonPublicPropRelated`, which is the
+/// *assignability* rule and therefore asymmetric (`isValidOverrideOf` accepts a
+/// DERIVED source). `checkInheritedPropertiesIdentical` needs the symmetric one:
+/// its two operands are two of an interface's bases, neither the source.
+///
+/// A side whose declaration this walk cannot find concedes (`true`), the same
+/// under-report `nonPublicPropRelated` makes for the same shapes — a member
+/// folded in through a non-reference heritage clause, or a shared static side.
+pub fn sameNonPublicDeclaration(c: *Checker, a: TypeId, b: TypeId, name: Atom) Error!bool {
+    const sa = try declaringMember(c, a, name) orelse return true;
+    const sb = try declaringMember(c, b, name) orelse return true;
+    return sa.msym == sb.msym;
+}
 
 /// Does `ty` DECLARE a member named `name`, as opposed to ANSWERING that name
 /// through an index signature, through an `any` base, or through the global

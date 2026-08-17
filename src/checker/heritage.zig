@@ -32,6 +32,7 @@ const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
 const elaborate = @import("elaborate.zig");
+const nominal_members = @import("nominal_members.zig");
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 
 /// TS2430: `interface D extends B` where `D` is not assignable to `B`.
@@ -375,7 +376,7 @@ fn checkInheritedPropertiesIdentical(
             }
             const prev = gop.value_ptr.*;
             if (prev.from == base) continue;
-            if (try propsIdentical(c, prev.prop, prop)) continue;
+            if (try propsIdentical(c, prev.prop, prop, prev.from, base)) continue;
             ok = false;
             try c.diagFmt(2320, c.tokSpan(name_token), "Interface '{s}' cannot simultaneously extend types '{s}' and '{s}'.\n  Named property '{s}' of types '{s}' and '{s}' are not identical.", .{
                 try c.typeToString(self),
@@ -393,8 +394,39 @@ fn checkInheritedPropertiesIdentical(
 /// tsc's `isPropertyIdenticalTo` (`compareProperties` with
 /// `compareTypesIdentical`), with mutual assignability standing in for the
 /// identity relation — see `checkInheritedPropertiesIdentical`.
-fn propsIdentical(c: *Checker, a: types.Prop, b: types.Prop) Error!bool {
-    if (a.optional() != b.optional()) return false;
+///
+/// `a_from`/`b_from` are the two BASES the properties came off, which the
+/// non-public arm needs: tsc compares the two property SYMBOLS there, not their
+/// types.
+///
+/// ```ts
+/// const sourcePropAccessibility = getDeclarationModifierFlagsFromSymbol(sourceProp) & ModifierFlags.NonPublicAccessibilityModifier;
+/// const targetPropAccessibility = getDeclarationModifierFlagsFromSymbol(targetProp) & ModifierFlags.NonPublicAccessibilityModifier;
+/// if (sourcePropAccessibility !== targetPropAccessibility) return Ternary.False;
+/// if (sourcePropAccessibility) {
+///     if (getTargetSymbol(sourceProp) !== getTargetSymbol(targetProp)) return Ternary.False;
+/// } else {
+///     if ((sourceProp.flags & SymbolFlags.Optional) !== (targetProp.flags & SymbolFlags.Optional)) return Ternary.False;
+/// }
+/// ```
+///
+/// Both halves are load-bearing for an interface that extends two classes:
+/// a `public x` and a `private x` are not identical whatever their types
+/// (`inheritSameNamePropertiesWithDifferentVisibility`), and two separate
+/// `protected x` declarations are not identical either
+/// (`interfaceExtendingClassWithProtecteds2`,
+/// `inheritSameNamePrivatePropertiesFromDifferentOrigins`) — which is the whole
+/// point of the rule, since their types are the same `string`.
+///
+/// The ACCESSIBILITY comparison needs `private` and `protected` told apart on
+/// the resolved `Prop`, which is what `types.prop_flag_protected` carries; the
+/// SYMBOL comparison is `nominal_members.sameNonPublicDeclaration`. Note that
+/// optionality is compared only on the public side, exactly as above.
+fn propsIdentical(c: *Checker, a: types.Prop, b: types.Prop, a_from: TypeId, b_from: TypeId) Error!bool {
+    if (a.nonPublic() != b.nonPublic() or a.protectedMember() != b.protectedMember()) return false;
+    if (a.nonPublic()) {
+        if (!try nominal_members.sameNonPublicDeclaration(c, a_from, b_from, a.name)) return false;
+    } else if (a.optional() != b.optional()) return false;
     if (a.ty == b.ty) return true;
     // For an OPTIONAL property, `undefined` is part of what tsc reads out of
     // the symbol (`getTypeOfSymbol` adds it under `strictNullChecks`), but
