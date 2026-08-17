@@ -16,11 +16,15 @@
 //! SCOPE. The walk is complete (every construct is consumed structurally, so
 //! nothing downstream is misread), but only the diagnostics whose position and
 //! condition were verified against tsgo 7.0.2 are reported. Unicode property
-//! NAMES (`\p{Script=Greek}`), the `v`-mode set operators (`--`, `&&`, `\q{}`),
-//! character-class RANGE order, backreference numbering and the "this character
-//! cannot be escaped" family are consumed and not judged: an under-report is a
-//! missing key, while guessing at one of those manufactures a wrong key and a
-//! wrong syntactic answer suppresses a whole program's semantics.
+//! NAMES and VALUES (`\p{Script=Greek}`), the `v`-mode set operators (`--`,
+//! `&&`, `\q{…}`), backreference NUMBERING and the octal-escape family are
+//! consumed and not judged: an under-report is a missing key, while guessing at
+//! one of those manufactures a wrong key, and a wrong answer here suppresses a
+//! whole program's semantics.
+//!
+//! Nearly every rule below is measured rather than derived — the grammar and
+//! tsc's behaviour differ often enough that reading the spec is not a
+//! substitute. The comments say which, and what the probe was.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -819,4 +823,97 @@ fn hexValue(c: u8) u8 {
         'a'...'f' => c - 'a' + 10,
         else => c - 'A' + 10,
     };
+}
+
+// --- tests -------------------------------------------------------------------
+
+/// `src` is one regex literal and nothing else; answers its diagnostics as
+/// `code@offset` pairs so a test can name tsc's answer positionally.
+fn expectRegexDiags(src: []const u8, expected: []const []const u8) !void {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(Diagnostic) = .empty;
+    defer out.deinit(gpa);
+    try validate(gpa, src, 0, @intCast(src.len), &out);
+
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(gpa);
+    for (out.items, 0..) |d, i| {
+        if (i != 0) try got.append(gpa, ' ');
+        try got.print(gpa, "TS{d}@{d}", .{ d.code.tsCode(), d.span.start });
+    }
+    var want: std.ArrayList(u8) = .empty;
+    defer want.deinit(gpa);
+    for (expected, 0..) |e, i| {
+        if (i != 0) try want.append(gpa, ' ');
+        try want.appendSlice(gpa, e);
+    }
+    try std.testing.expectEqualStrings(want.items, got.items);
+}
+
+test "regexp: flags" {
+    try expectRegexDiags("/a/gimsuyd", &.{});
+    try expectRegexDiags("/a/gimsvyd", &.{});
+    try expectRegexDiags("/a/z", &.{"TS1499@3"});
+    try expectRegexDiags("/a/uu", &.{"TS1500@4"});
+    // `v` then `u` is TS1502 and does NOT record the flag, so a second `u`
+    // answers TS1502 again rather than "duplicate".
+    try expectRegexDiags("/a/vuu", &.{ "TS1502@4", "TS1502@5" });
+}
+
+test "regexp: quantifier braces" {
+    // Annex B reads a brace run as a quantifier only when the whole thing is
+    // there; unicode mode has no such fallback.
+    try expectRegexDiags("/a{2,3/", &.{});
+    try expectRegexDiags("/a{2,3/u", &.{"TS1005@6"});
+    try expectRegexDiags("/a{}/u", &.{ "TS1508@2", "TS1508@3" });
+    // A missing minimum reads as a quantifier only while what follows the comma
+    // could still finish one.
+    try expectRegexDiags("/a{,3}/u", &.{"TS1505@3"});
+    try expectRegexDiags("/a{,x}/u", &.{ "TS1508@2", "TS1508@5" });
+    try expectRegexDiags("/a{3,2}/", &.{"TS1506@3"});
+    try expectRegexDiags("/{2}/", &.{"TS1507@1"});
+}
+
+test "regexp: unicode escapes" {
+    try expectRegexDiags("/\\u{41}/u", &.{});
+    try expectRegexDiags("/\\u{41}/", &.{"TS1538@1"});
+    try expectRegexDiags("/\\u{110000}/u", &.{"TS1198@4"});
+    // With no digits tsc takes the `}` if it is there and says only TS1125;
+    // `\u{r}` leaves the `r` and the `}` to be read back as pattern characters.
+    try expectRegexDiags("/\\u{}/u", &.{"TS1125@4"});
+    try expectRegexDiags("/\\u{r}/u", &.{ "TS1125@4", "TS1508@5" });
+}
+
+test "regexp: class ranges" {
+    try expectRegexDiags("/[b-a]/", &.{"TS1517@2"});
+    try expectRegexDiags("/[a-b]/", &.{});
+    // A class escape bounds no range, so TS1516 is the whole answer.
+    try expectRegexDiags("/[\\d-\\w]/u", &.{ "TS1516@2", "TS1516@5" });
+    // A literal astral character is its two surrogates outside unicode mode, so
+    // it bounds a range with the LOW one on the left and the HIGH one on the
+    // right; an escape never splits.
+    try expectRegexDiags("/[\u{1D608}-\u{1D621}]/", &.{"TS1517@2"});
+    try expectRegexDiags("/[\u{1D608}-\u{1D621}]/u", &.{});
+    try expectRegexDiags("/[\\u{1D608}-\\u{1D621}]/", &.{ "TS1538@2", "TS1538@12" });
+}
+
+test "regexp: subpattern modifiers" {
+    try expectRegexDiags("/(?i-m:a)/u", &.{});
+    try expectRegexDiags("/(?med-ium:bar)/", &.{ "TS1499@4", "TS1509@5", "TS1509@8", "TS1500@9" });
+    // TS1504 is about the modifier TEXT: two letters that are no flags at all
+    // still count, a lone minus does not.
+    try expectRegexDiags("/(?z-z:a)/u", &.{ "TS1499@3", "TS1499@5" });
+    try expectRegexDiags("/(?-:a)/u", &.{"TS1504@3"});
+}
+
+test "regexp: group names and identity escapes" {
+    try expectRegexDiags("/(?<foo>)\\k<foo>/", &.{});
+    try expectRegexDiags("/(?<foo>)\\k<Foo>/", &.{"TS1532@12"});
+    try expectRegexDiags("/(?<1a>x)/u", &.{"TS1514@4"});
+    try expectRegexDiags("/\\-/", &.{});
+    try expectRegexDiags("/\\-/u", &.{"TS1535@1"});
+    try expectRegexDiags("/[\\-]/u", &.{});
+    // A `v`-mode class escapes the set notation's reserved punctuation.
+    try expectRegexDiags("/[\\`]/u", &.{"TS1535@2"});
+    try expectRegexDiags("/[\\`]/v", &.{});
 }
