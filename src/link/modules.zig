@@ -2821,8 +2821,18 @@ const Linker = struct {
         // `.ambient_ns` payloads (registry indices) while filling, and a
         // `declare module "node:x" { import x = require("x"); export = x; }`
         // block may be reached before the `"x"` block it names.
+        //
+        // A NESTED block seeds nothing. tsc's `isModuleAugmentationExternal`
+        // makes `declare module "Map" { module "Observable" { … } }` an
+        // *augmentation* of "Observable", and `mergeModuleAugmentation`
+        // resolves that name and gives up silently when nothing answers — it
+        // never brings a module into existence. So the nested block still
+        // CONTRIBUTES members (which is what moduleAugmentationInAmbientModule
+        // 1-4 need, alongside `mergeAmbientBlocks`), but a specifier only
+        // nested blocks name stays unknown, and an import of it is TS2307.
         for (l.files) |*f| {
             for (f.bind.ambient_modules) |am| {
+                if (f.bind.scope_parents[am.scope] != binder.file_scope) continue;
                 const gop = try l.ambient.getOrPut(l.scratch, am.spec);
                 if (!gop.found_existing) gop.value_ptr.* = .empty;
             }
@@ -2831,9 +2841,7 @@ const Linker = struct {
             const fid: FileId = @intCast(fi);
             const b = f.bind;
             for (b.ambient_modules) |am| {
-                const gop = try l.ambient.getOrPut(l.scratch, am.spec);
-                if (!gop.found_existing) gop.value_ptr.* = .empty;
-                const tbl = gop.value_ptr;
+                const tbl = l.ambient.getPtr(am.spec) orelse continue;
 
                 // Declaration exports (`export function/const/interface/…`):
                 // members with the `exported` flag. Default exports are handled
