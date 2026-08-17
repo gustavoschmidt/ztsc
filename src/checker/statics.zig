@@ -11,6 +11,8 @@ const intern = @import("../intern.zig");
 const types = @import("../types.zig");
 
 const Atom = intern.Atom;
+const Node = ast.Node;
+const null_node = ast.null_node;
 const SymbolId = binder.SymbolId;
 const TypeId = types.TypeId;
 
@@ -64,6 +66,69 @@ pub fn ownStaticMemberProp(c: *Checker, cls: SymbolId, name: Atom) Error!?types.
         defer c.this_type = saved_this;
         c.this_type = try c.ts.makeClassValue(cls);
         return .{ .name = name, .ty = try c.typeOfSymbol(msym), .flags = flags };
+    }
+    return null;
+}
+
+/// Contextually type the STATIC fields of a class EXPRESSION — tsc's
+/// `getContextualTypeForStaticPropertyDeclaration`, which takes the class
+/// expression's own contextual type and reads the same-named property off it.
+///
+///     interface I { x: { a: "a" } }
+///     let c: I = class { static x = { a: "a" } };
+///
+/// Without the context the initializer widens to `{ a: string }` and the class
+/// is not assignable to `I` — nine false TS2322s across
+/// `staticFieldWithInterfaceContext` alone, all of them invisible while a class
+/// expression was still typed `any`.
+///
+/// SEEDED rather than threaded: a member's type is computed on demand from its
+/// initializer with no contextual type, and the demand can arrive from
+/// anywhere. `setTypeOfSymbol` is first-writer-wins, so writing the contextual
+/// answer before the class is walked is what makes it the one every later
+/// reader sees. A member that already has a type (an annotation, an earlier
+/// demand) keeps it.
+///
+/// A no-op unless the class expression has a contextual type; only fields
+/// carrying an initializer and no annotation can be contextually typed at all.
+pub fn seedStaticFieldContext(c: *Checker, node: Node, cls: SymbolId, ctx: TypeId) Error!void {
+    if (ctx == types.no_type or ctx == types.any_type or ctx == types.error_type) return;
+    const ss = c.bind.staticsScopeOf(c.localOf(cls)) orelse return;
+    const kscope = c.symScope(cls);
+    const data = c.tree.extraData(ast.ClassData, c.tree.nodeData(node).lhs);
+    for (c.tree.extraRange(data.members_start, data.members_end)) |member| {
+        if (member == null_node or c.nodeTag(member) != .class_field) continue;
+        const f = c.tree.extraData(ast.Field, c.tree.nodeData(member).lhs);
+        if (f.flags & ast.Flags.static == 0) continue;
+        if (f.type_ann != 0 or f.init == 0) continue;
+        const m = staticMemberOfDecl(c, ss, member) orelse continue;
+        const name = try c.nominalizeComputedKey(m.name, kscope);
+        const p = try c.propOfTypeEx(ctx, name, false) orelse continue;
+        // Same guard the on-demand path uses: a function body inside the
+        // initializer must not be walked while the class's own type is still
+        // being built (see `DeferredBody`).
+        c.defer_bodies += 1;
+        defer c.defer_bodies -= 1;
+        const saved_this = c.this_type;
+        defer c.this_type = saved_this;
+        c.this_type = try c.ts.makeClassValue(cls);
+        c.setTypeOfSymbol(m.sym, try c.widenLiteral(try c.checkExprCached(f.init, p.ty)));
+    }
+}
+
+/// The static-scope entry a class member DECLARATION declares, or null when
+/// the member declares none (a nameless recovery member, a key the binder
+/// could not form).
+const StaticMember = struct { sym: SymbolId, name: Atom };
+
+fn staticMemberOfDecl(c: *Checker, ss: binder.ScopeId, member: Node) ?StaticMember {
+    const lo = c.bind.scope_members_start[ss];
+    const hi = c.bind.scope_members_start[ss + 1];
+    for (lo..hi) |i| {
+        const msym = c.toGlobal(c.bind.member_syms[i]);
+        for (c.declsOf(msym)) |d| {
+            if (d == member) return .{ .sym = msym, .name = c.bind.member_atoms[i] };
+        }
     }
     return null;
 }

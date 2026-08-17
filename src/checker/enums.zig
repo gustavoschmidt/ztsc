@@ -840,6 +840,7 @@ pub fn checkEnum(c: *Checker, node: Node) Error!void {
 
 const statics = @import("statics.zig");
 pub const ownStaticMemberProp = statics.ownStaticMemberProp;
+pub const seedStaticFieldContext = statics.seedStaticFieldContext;
 pub const classStaticType = statics.classStaticType;
 pub const classConstructType = statics.classConstructType;
 pub const sigWithReturn = statics.sigWithReturn;

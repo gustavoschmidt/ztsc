@@ -826,7 +826,7 @@ pub fn classSymbolOf(c: *Checker, node: Node, outer_scope: binder.ScopeId) Error
         }
         const cs = try c.scopeOf(node) orelse return binder.no_symbol;
         if (c.bind.lookupInScope(cs, a)) |sym| {
-            if (c.bind.symbol_flags[sym].class) return c.toGlobal(sym);
+            if (c.bind.symbol_flags[sym].class) return classExprSym(c, c.toGlobal(sym));
         }
         return binder.no_symbol;
     }
@@ -836,8 +836,45 @@ pub fn classSymbolOf(c: *Checker, node: Node, outer_scope: binder.ScopeId) Error
     const cs = try c.scopeOf(node) orelse return binder.no_symbol;
     const a = try c.atom(member_names.class_expr_name);
     if (c.bind.lookupInScope(cs, a)) |sym| {
-        if (c.bind.symbol_flags[sym].class) return c.toGlobal(sym);
+        if (c.bind.symbol_flags[sym].class) return classExprSym(c, c.toGlobal(sym));
     }
+    return binder.no_symbol;
+}
+
+/// A class EXPRESSION's symbol, withdrawn when its `extends` base resolves to
+/// nothing at all.
+///
+/// The symbol buys the checker a member table, a `this` type and a `typeof C`
+/// — all of which are WRONG when the base is invisible, because everything the
+/// base contributes is simply missing from them. Every `this.<inherited>` is
+/// then a TS2339 about ztsc's gap rather than about the code, which is the
+/// same reasoning `hasUnresolvedBase` already encodes for the "does not
+/// implement" verdicts. `class extends React.PureComponent<P, void>` is the
+/// live case: `declare module "react" { export = __React }` does not link, so
+/// the base is `any` and `this.props` inside the class expression became a
+/// false TS2339 (`tsxGenericAttributesType9`).
+///
+/// Narrower than `hasUnresolvedBase`, which asks about the whole chain and
+/// counts a mixin's constructor-valued base as unresolved: a mixin base IS
+/// resolvable (`baseExprConstructType`), and typing those classes is the
+/// entire point. Only a class expression is withdrawn; a class DECLARATION
+/// with an invisible base keeps whatever it reports today.
+fn classExprSym(c: *Checker, sym: SymbolId) Error!SymbolId {
+    var has_extends = false;
+    {
+        const saved_ctx = c.enterSymFile(sym);
+        defer c.restoreCtx(saved_ctx);
+        for (c.declsOf(sym)) |decl| {
+            if (c.nodeTag(decl) != .class_decl) continue;
+            if (c.tree.extraData(ast.ClassData, c.tree.nodeData(decl).lhs).extends != 0) {
+                has_extends = true;
+                break;
+            }
+        }
+    }
+    if (!has_extends) return sym;
+    if (try baseClassRef(c, sym) != null) return sym;
+    if (try baseExprConstructType(c, sym) != null) return sym;
     return binder.no_symbol;
 }
 
@@ -1000,6 +1037,22 @@ fn lazyRefPropRec(c: *Checker, ref: TypeId, name: Atom, depth: u32) Error!?types
             } else {
                 const b = try c.resolveStructural(base_ref);
                 found = try c.propOfTypeEx(b, name, false);
+            }
+        } else if (try c.baseExprConstructType(sym)) |base_ctor| {
+            // `extends <value with construct signatures>` — every mixin. The
+            // base instance is the construct signature's return type, the same
+            // fold `classInstanceGeneric` does; the lazy path had only the
+            // named-base arm, so a member inherited through a mixin base was
+            // simply not found here. `const M = <T extends
+            // Constructor<Point>>(B: T) => class extends B { m(): number {
+            // return this.x } }` is the shape: the ANNOTATED return type takes
+            // the lazy path, and `this.x` was TS2339.
+            for (0..c.ts.objectConstructSigCount(base_ctor)) |i| {
+                const ret = c.ts.fnReturn(c.ts.objectConstructSig(base_ctor, @intCast(i)));
+                if (try c.propOfTypeEx(try c.resolveStructural(ret), name, false)) |p| {
+                    found = p;
+                    break;
+                }
             }
         }
     }
@@ -1377,6 +1430,11 @@ fn heritageArgCount(c: *Checker, hd: ast.Data) usize {
 /// The `extends` base of a class as a ref (or null). The base name
 /// resolves in the class's own file (so imported bases work).
 pub fn baseClassRef(c: *Checker, sym: SymbolId) Error!?TypeId {
+    // The clause is an expression, and checking it can ask for this very
+    // class's base again — see `Checker.base_ref_active`.
+    if (c.base_ref_active.contains(sym)) return null;
+    try c.base_ref_active.put(c.cm(), sym, {});
+    defer _ = c.base_ref_active.remove(sym);
     const saved_ctx = c.enterSymFile(sym);
     defer c.restoreCtx(saved_ctx);
     for (c.declsOf(sym)) |decl| {
@@ -1603,6 +1661,13 @@ pub fn baseTypeVariableOfClass(c: *Checker, sym: SymbolId) Error!?TypeId {
 /// extends clause, the base resolves to a class symbol (handled by
 /// `baseClassRef`), or the base value has no construct signatures.
 pub fn baseExprConstructType(c: *Checker, sym: SymbolId) Error!?TypeId {
+    // The other half of the `extends`-clause resolution, and it checks the
+    // same expression — so it takes the same re-entry guard
+    // (`Checker.base_ref_active`). The two are called in sequence, never
+    // nested, so one set covers both.
+    if (c.base_ref_active.contains(sym)) return null;
+    try c.base_ref_active.put(c.cm(), sym, {});
+    defer _ = c.base_ref_active.remove(sym);
     const saved_ctx = c.enterSymFile(sym);
     defer c.restoreCtx(saved_ctx);
     for (c.declsOf(sym)) |decl| {
@@ -1633,6 +1698,12 @@ pub fn baseExprConstructType(c: *Checker, sym: SymbolId) Error!?TypeId {
 ///   * a `.class_value` (`declare const B: typeof C; class D extends B {}`),
 ///     ztsc's nominal shortcut for a static side — `classConstructType` is
 ///     the materialization of exactly that; and
+///   * a TYPE PARAMETER, which is how a mixin FACTORY is spelled: `<T extends
+///     Constructor<Point>>(Base: T) => class extends Base { … }`. tsc's
+///     `resolveBaseTypesOfClass` takes `getApparentType` of the base
+///     constructor type, so the parameter stands for its constraint; ztsc
+///     dropped the base entirely, and every member inherited from `Point` was
+///     TS2339 (`overrideBaseIntersectionMethod`, `mixinClassesAnnotated`); and
 ///   * an INTERSECTION of constructors, which is how every mixin is spelled.
 ///     react-native writes each host component that way —
 ///     `declare const ViewBase: Constructor<NativeMethods> & typeof
@@ -1646,8 +1717,19 @@ pub fn baseExprConstructType(c: *Checker, sym: SymbolId) Error!?TypeId {
 /// Members merge in written order and every constituent's construct
 /// signatures are kept, so the caller can intersect their return types into
 /// the base instance.
-fn baseCtorObject(c: *Checker, base0: TypeId) Error!TypeId {
+fn baseCtorObject(c: *Checker, base_in: TypeId) Error!TypeId {
     const s = &c.ts;
+    // A type parameter stands for its constraint here (tsc's `getApparentType`
+    // of the base constructor type). A chain of them narrows one link at a
+    // time; the bound keeps it finite even for a malformed `<T extends T>`,
+    // whose constraint resolution answers `no_type` on re-entry.
+    var base0 = base_in;
+    var hops: u8 = 0;
+    while (s.kind(base0) == .type_param and hops < 16) : (hops += 1) {
+        const con = try c.typeParamConstraint(s.typeParamSymbol(base0));
+        if (con == types.no_type or con == base0) break;
+        base0 = con;
+    }
     const base = if (s.kind(base0) == .class_value)
         try c.classConstructType(s.classSymbol(base0))
     else

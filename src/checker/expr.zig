@@ -402,9 +402,16 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // base-type-variable intersection comes along for free. The symbol
             // lives in the class's own scope (`classes.classSymbolOf`); before
             // there was one, every class expression was `any`.
-            try c.checkClass(node);
             const sym = try c.classSymbolOf(node, c.cur_scope);
-            if (sym == binder.no_symbol) return types.any_type;
+            if (sym == binder.no_symbol) {
+                try c.checkClass(node);
+                return types.any_type;
+            }
+            // Static fields are contextually typed by this expression's own
+            // contextual type, and the seeding has to happen before anything
+            // demands them — see `statics.seedStaticFieldContext`.
+            try c.seedStaticFieldContext(node, sym, ctx);
+            try c.checkClass(node);
             return c.typeOfSymbol(sym);
         },
         .yield_expr => {

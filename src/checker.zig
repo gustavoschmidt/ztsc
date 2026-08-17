@@ -812,37 +812,38 @@ pub const LazyStat = enum(u8) {
 };
 
 pub const map_containers = [_][]const u8{
-    "node_types",             "sig_cache",              "node_scopes",
-    "reassigned_syms",        "reassigned_in_loop",     "member_written_syms",
-    "member_written_in_loop", "ns_types",               "ambient_ns_types",
-    "relation",               "expansions",             "overload_groups",
-    "overload_group_pool",    "origin",                 "iface_generic",
-    "iface_stack",            "pending_class_decos",    "class_inst_generic",
-    "class_static_cache",     "class_static_stack",     "class_ctor_cache",
-    "enum_value_cache",       "enum_info_cache",        "enum_relation_cache",
-    "alias_generic",          "alias_state",            "alias_recursive",
-    "flow_same",              "flow_narrow",            "ref_keys",
-    "flow_loop_stack",        "flow_stack",             "flow_tmp",
-    "da_cache",               "ctp_cache",              "cmp_cache",
-    "ctt_cache",              "ci_cache",               "infer_visited",
-    "subst_this_cache",       "mmp_cache",              "arrayish_elem_cache",
-    "tp_constraint_cache",    "erase_cache",            "erase_any_cache",
-    "inst_map_ids",           "fresh_tp_ids",           "this_tp_ids",
-    "fresh_tp_info",          "type_node_cache",        "atom_cache",
-    "infer_ids",              "infer_constraints",      "infer_scopes",
-    "mapped_key_ids",         "mapped_key_scopes",      "inst_diag_at",
-    "infer_active",           "lazy_member_active",     "chain_guards",
-    "never_isect",            "deep_path_list",         "deep_path_ids",
-    "flow_reach",             "member_type_stack",      "lazy_index_objs",
-    "pending_type_args",      "pending_type_args_pool", "pending_type_args_seen",
-    "tp_constrained_cache",   "nominal_bases",          "nominal_base_pool",
-    "keyof_mapped_active",    "ctp_syms_seen",          "weak_types",
-    "lazy_member",            "trunc_lazy_member",      "lazy_map",
-    "pattern_root_decls",     "pattern_root_ids",       "pattern_narrow_busy",
-    "key_name_types",         "enum_members",           "keyof_obj_cache",
-    "trunc_expansions",       "inst_map_bytes",         "tp_mentions",
-    "smk_cache",              "rel_maybe",              "spec_sym_types",
-    "spec_tainted",           "last_assign_pos",        "definitely_assigned_syms",
+    "node_types",               "sig_cache",              "node_scopes",
+    "reassigned_syms",          "reassigned_in_loop",     "member_written_syms",
+    "member_written_in_loop",   "ns_types",               "ambient_ns_types",
+    "relation",                 "expansions",             "overload_groups",
+    "overload_group_pool",      "origin",                 "iface_generic",
+    "iface_stack",              "pending_class_decos",    "class_inst_generic",
+    "class_static_cache",       "class_static_stack",     "class_ctor_cache",
+    "enum_value_cache",         "enum_info_cache",        "enum_relation_cache",
+    "alias_generic",            "alias_state",            "alias_recursive",
+    "flow_same",                "flow_narrow",            "ref_keys",
+    "flow_loop_stack",          "flow_stack",             "flow_tmp",
+    "da_cache",                 "ctp_cache",              "cmp_cache",
+    "ctt_cache",                "ci_cache",               "infer_visited",
+    "subst_this_cache",         "mmp_cache",              "arrayish_elem_cache",
+    "tp_constraint_cache",      "erase_cache",            "erase_any_cache",
+    "inst_map_ids",             "fresh_tp_ids",           "this_tp_ids",
+    "fresh_tp_info",            "type_node_cache",        "atom_cache",
+    "infer_ids",                "infer_constraints",      "infer_scopes",
+    "mapped_key_ids",           "mapped_key_scopes",      "inst_diag_at",
+    "infer_active",             "lazy_member_active",     "chain_guards",
+    "never_isect",              "deep_path_list",         "deep_path_ids",
+    "flow_reach",               "member_type_stack",      "lazy_index_objs",
+    "pending_type_args",        "pending_type_args_pool", "pending_type_args_seen",
+    "tp_constrained_cache",     "nominal_bases",          "nominal_base_pool",
+    "keyof_mapped_active",      "ctp_syms_seen",          "weak_types",
+    "base_ref_active",          "lazy_member",            "trunc_lazy_member",
+    "lazy_map",                 "pattern_root_decls",     "pattern_root_ids",
+    "pattern_narrow_busy",      "key_name_types",         "enum_members",
+    "keyof_obj_cache",          "trunc_expansions",       "inst_map_bytes",
+    "tp_mentions",              "smk_cache",              "rel_maybe",
+    "spec_sym_types",           "spec_tainted",           "last_assign_pos",
+    "definitely_assigned_syms",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -1245,6 +1246,14 @@ pub const Checker = struct {
     /// C["a"] }`) is genuinely circular; re-entry returns null so the caller
     /// falls back to the ordinary not-found result instead of recursing.
     lazy_member_active: IntMap(SymbolId, void) = .empty,
+    /// Classes whose `extends` clause `baseClassRef` is presently resolving.
+    /// The clause is an EXPRESSION, so resolving it can run arbitrary checking
+    /// and come back around: `class Test { p: any = class extends this.p {} }`
+    /// asks for the anonymous class's base, which checks `this.p` under the
+    /// anonymous class's own `this`, which looks `p` up through its bases —
+    /// `baseClassRef` again, forever. Re-entry answers "no base", the same
+    /// answer a genuine `extends` cycle gets.
+    base_ref_active: IntMap(SymbolId, void) = .empty,
     /// Member symbols whose type `memberTypeOf` is computing, innermost last
     /// (both the eager whole-table walk and the lazy single-member lookup push
     /// here). A member that re-appears is one whose type demanded itself; the
@@ -3490,6 +3499,7 @@ pub const Checker = struct {
     pub const checkEnum = enums_zig.checkEnum;
     pub const ownStaticMemberProp = enums_zig.ownStaticMemberProp;
     pub const classStaticType = enums_zig.classStaticType;
+    pub const seedStaticFieldContext = enums_zig.seedStaticFieldContext;
     pub const classConstructType = enums_zig.classConstructType;
     pub const sigWithReturn = enums_zig.sigWithReturn;
     pub const ctorSignatures = enums_zig.ctorSignatures;
