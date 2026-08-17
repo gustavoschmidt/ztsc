@@ -2790,11 +2790,43 @@ const Linker = struct {
     /// The same walk carries TS7016 for the module that resolved but has no
     /// declarations behind it — see `untypedJsModule`.
     fn reportUnresolvedModules(l: *Linker, file: FileId) Error!void {
+        try l.reportUnresolvedIn(file, l.files[file].tree.nodeRange(ast.root_node));
+    }
+
+    /// `reportUnresolvedModules` over one statement list, recursing into the
+    /// AMBIENT MODULE bodies that may hold further import/export declarations.
+    ///
+    /// A specifier is not a top-level-only construct: `declare module "M" {
+    /// import { x } from "external" }` names a module and tsc resolves it. A
+    /// plain `namespace N { … }` does NOT: tsc's
+    /// `checkExternalImportOrExportDeclaration` reports the grammar error
+    /// (TS1147 / TS1194 — an import there may not reference a module) and
+    /// returns false, and the caller bails before it ever resolves the
+    /// specifier. Reporting TS2307 alongside the grammar error is exactly the
+    /// cascade tsc suppresses. Only a USE of the alias makes tsc resolve it
+    /// after all (`resolveAlias` at the use site), which is a checker question,
+    /// not a link one — and an under-report, the safe direction.
+    ///
+    /// The test is on the DIRECT parent, tsc's `node.parent.kind ===
+    /// ModuleBlock && isAmbientModule(node.parent.parent)`, so a plain
+    /// namespace nested inside an ambient module ends the walk too.
+    fn reportUnresolvedIn(l: *Linker, file: FileId, stmts: []const ast.Node) Error!void {
         const f = &l.files[file];
         const tree = f.tree;
-        for (tree.nodeRange(0)) |stmt| {
+        for (stmts) |stmt0| {
+            if (stmt0 == ast.null_node) continue;
+            // `export declare module "m" { … }` / `export import x =
+            // require("m")`: the modifier wraps the declaration it applies to.
+            const stmt = if (tree.nodeTag(stmt0) == .export_decl) tree.nodeData(stmt0).lhs else stmt0;
             if (stmt == ast.null_node) continue;
             const tag = tree.nodeTag(stmt);
+            if (tag == .namespace_decl) {
+                const e = tree.extraData(ast.NamespaceData, tree.nodeData(stmt).lhs);
+                if (e.flags & ast.Flags.ambient_module != 0) {
+                    try l.reportUnresolvedIn(file, tree.extraRange(e.body_start, e.body_end));
+                }
+                continue;
+            }
             if (tag != .import_decl and tag != .export_named and tag != .export_all and tag != .import_equals) continue;
             var side_effect = false;
             var mod_tok: ast.TokenIndex = tree.nodeData(stmt).rhs;
@@ -2822,30 +2854,12 @@ const Linker = struct {
             if (mod_tok == 0) continue;
             const text = tree.tokenSlice(f.src, mod_tok);
             const stripped = stripQuotes(text);
-            if (stripped.len == 0) continue;
-            const atom = l.interner.intern(l.io, l.gpa, stripped) catch return Error.OutOfMemory;
-            if (try l.effectiveModuleFile(f, atom)) |mfile| {
-                // An `exports`-blocked subpath is a RESOLUTION FAILURE wearing
-                // a resolution's clothes: the resolver hands back a synthetic
-                // opaque `any` module (`paths.blocked_subpath_suffix`) purely so
-                // every downstream symbol stays bound — dangling the specifier
-                // instead is not crash-safe under parallel resolution. The
-                // diagnostic is decoupled from that liveness decision here:
-                // liveness stays with the resolver's stand-in module, and the
-                // report falls through to the same unresolved-specifier arms
-                // below (ambient suppression included), so tsc's TS2307 lands
-                // at the specifier token. See `blockedSubpathReport`.
-                if (!l.blockedSubpathReport(mfile)) {
-                    // Resolved. The one thing left to say about it: a dependency
-                    // that turned out to be plain JavaScript has no types, and
-                    // under `noImplicitAny` that is an error at the specifier.
-                    if (l.no_implicit_any and !side_effect and untypedJsModule(l.files[mfile].path)) {
-                        try l.diag(file, 7016, l.tokSpan(file, mod_tok), "Could not find a declaration file for module '{s}'. '{s}' implicitly has an 'any' type.", .{ stripped, l.files[mfile].path });
-                    }
-                    continue;
-                }
+            // `import * as A from ""` resolves to nothing and is TS2307 like
+            // any other miss; it just has no atom to look anything up by (the
+            // empty string is not a name the interner hands out).
+            if (stripped.len != 0) {
+                if (try l.reportResolvedModule(file, f, stripped, mod_tok, side_effect)) continue;
             }
-            if (l.hasAmbient(atom)) continue; // resolved by a `declare module`
             if (side_effect) {
                 if (!l.no_unchecked_side_effect_imports) continue;
                 try l.diag(file, 2882, l.tokSpan(file, mod_tok), "Cannot find module or type declarations for side-effect import of '{s}'.", .{stripped});
@@ -2863,6 +2877,43 @@ const Linker = struct {
                 try l.diag(file, 2591, l.tokSpan(file, mod_tok), "Cannot find name '{s}'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node` and then add 'node' to the types field in your tsconfig.", .{stripped});
             }
         }
+    }
+
+    /// True when specifier `stripped` resolved (to a file or to a `declare
+    /// module`), leaving nothing for the caller's unresolved arms to say. The
+    /// one diagnostic a RESOLVED specifier can still carry — TS7016 for a
+    /// dependency that turned out to be plain JavaScript — is issued here.
+    fn reportResolvedModule(
+        l: *Linker,
+        file: FileId,
+        f: *const ProgFile,
+        stripped: []const u8,
+        mod_tok: ast.TokenIndex,
+        side_effect: bool,
+    ) Error!bool {
+        const atom = l.interner.intern(l.io, l.gpa, stripped) catch return Error.OutOfMemory;
+        if (try l.effectiveModuleFile(f, atom)) |mfile| {
+            // An `exports`-blocked subpath is a RESOLUTION FAILURE wearing
+            // a resolution's clothes: the resolver hands back a synthetic
+            // opaque `any` module (`paths.blocked_subpath_suffix`) purely so
+            // every downstream symbol stays bound — dangling the specifier
+            // instead is not crash-safe under parallel resolution. The
+            // diagnostic is decoupled from that liveness decision here:
+            // liveness stays with the resolver's stand-in module, and the
+            // report falls through to the caller's unresolved-specifier arms
+            // (ambient suppression included), so tsc's TS2307 lands at the
+            // specifier token. See `blockedSubpathReport`.
+            if (!l.blockedSubpathReport(mfile)) {
+                // Resolved. The one thing left to say about it: a dependency
+                // that turned out to be plain JavaScript has no types, and
+                // under `noImplicitAny` that is an error at the specifier.
+                if (l.no_implicit_any and !side_effect and untypedJsModule(l.files[mfile].path)) {
+                    try l.diag(file, 7016, l.tokSpan(file, mod_tok), "Could not find a declaration file for module '{s}'. '{s}' implicitly has an 'any' type.", .{ stripped, l.files[mfile].path });
+                }
+                return true;
+            }
+        }
+        return l.hasAmbient(atom); // resolved by a `declare module`
     }
 
     /// TS2688 for a `/// <reference types="X" />` whose target resolved to
