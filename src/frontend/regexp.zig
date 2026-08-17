@@ -229,7 +229,7 @@ const Walker = struct {
                         w.pos += 1;
                         quantifiable = false;
                     } else {
-                        try w.scanEscape(start, false);
+                        _ = try w.scanEscape(start, false);
                         quantifiable = true;
                     }
                 },
@@ -435,10 +435,9 @@ const Walker = struct {
         if (w.pos < w.end and w.src[w.pos] == '>') w.pos += 1;
     }
 
-    /// `[…]`, including the `v`-mode nested classes. Range ORDER (TS1517) and
-    /// the `v`-mode set operators are the part of tsc's class grammar this file
-    /// does not model; a range BOUND is judged, because that needs no character
-    /// values — only whether the bound is a character-class escape.
+    /// `[…]`, including the `v`-mode nested classes. The `v`-mode set operators
+    /// (`--`, `&&`) and `\q{…}` are the part of tsc's class grammar this file
+    /// does not model; ranges are, because a range needs only the two bounds.
     fn scanClass(w: *Walker) Error!void {
         w.pos += 1; // `[`
         if (w.pos < w.end and w.src[w.pos] == '^') w.pos += 1;
@@ -453,60 +452,106 @@ const Walker = struct {
                 w.depth -= 1;
                 continue;
             }
-            const lhs_start = w.pos;
-            const lhs_is_class = try w.scanClassAtom();
-            // A `-` between two members is a RANGE — except under `v`, where
-            // `--` is set difference and this file leaves the class alone.
-            if (w.unicode and !w.sets and w.pos + 1 < w.end and
-                w.src[w.pos] == '-' and w.src[w.pos + 1] != ']')
+            // `v`'s set-difference operator, taken whole so its second `-` is
+            // not read back as a class member (which would swallow the `[` of
+            // the nested class after it).
+            if (w.sets and w.src[w.pos] == '-' and w.at(w.pos + 1) == '-') {
+                w.pos += 2;
+                continue;
+            }
+            const lhs = try w.scanClassAtom();
+            // A `-` between two members is a RANGE — except under `v`, where a
+            // doubled `--` is set difference and a `[` opens a nested class.
+            if (w.pos + 1 < w.end and w.src[w.pos] == '-' and w.src[w.pos + 1] != ']' and
+                !(w.sets and (w.src[w.pos + 1] == '-' or w.src[w.pos + 1] == '[')))
             {
                 w.pos += 1;
-                if (lhs_is_class) try w.emit(.regex_range_bounded_by_class, lhs_start, 1);
-                const rhs_start = w.pos;
-                if (try w.scanClassAtom()) {
-                    try w.emit(.regex_range_bounded_by_class, rhs_start, 1);
+                // TS1516 is unicode-mode only, and `v` leaves it to the set
+                // grammar; TS1517 is answered in every mode (measured).
+                if (lhs.is_class and w.unicode and !w.sets) {
+                    try w.emit(.regex_range_bounded_by_class, lhs.start, 1);
+                }
+                const rhs = try w.scanClassAtom();
+                if (rhs.is_class and w.unicode and !w.sets) {
+                    try w.emit(.regex_range_bounded_by_class, rhs.start, 1);
+                }
+                const min = w.rangeBound(lhs, true);
+                const max = w.rangeBound(rhs, false);
+                if (min != null and max != null and min.? > max.?) {
+                    try w.emit(.regex_range_out_of_order, lhs.start, w.pos - lhs.start);
                 }
             }
         }
         try w.expect(']', .regex_expected_r_bracket);
     }
 
-    /// One class member; answers whether it is a character-CLASS escape (`\d`,
-    /// `\p{…}`, …), which is what may not bound a range.
-    fn scanClassAtom(w: *Walker) Error!bool {
+    /// A range bound's value. Outside unicode mode a LITERAL astral character
+    /// is really its two surrogates, so it bounds a range with its LOW
+    /// surrogate on the left and its HIGH surrogate on the right — which is why
+    /// `[𝘈-𝘡]` is out of order without `u` and in order with it. An escape
+    /// never splits: `[\u{1D608}-\u{1D621}]` is in order in both modes
+    /// (measured, `regularExpressionCharacterClassRangeOrder.ts`).
+    fn rangeBound(w: *const Walker, atom: ClassAtom, is_min: bool) ?u32 {
+        const v = atom.value orelse return null;
+        if (w.unicode or !atom.literal or v <= 0xFFFF) return v;
+        const rest = v - 0x10000;
+        return if (is_min) 0xDC00 + (rest & 0x3FF) else 0xD800 + (rest >> 10);
+    }
+
+    /// One class member.
+    const ClassAtom = struct {
+        start: u32,
+        /// The member's character value, or null when it stands for a SET —
+        /// `\d`, `\p{…}`, a backreference — and so bounds no range.
+        value: ?u32 = null,
+        /// A character-CLASS escape, which may not bound a range at all.
+        is_class: bool = false,
+        /// Written as a literal source character rather than an escape.
+        literal: bool = false,
+    };
+
+    fn scanClassAtom(w: *Walker) Error!ClassAtom {
+        const start = w.pos;
         if (w.src[w.pos] != '\\') {
+            const cp = codePointAt(w.src, w.pos);
             w.pos += w.charLen(w.pos);
-            return false;
+            return .{ .start = start, .value = cp, .literal = true };
         }
-        const escape_start = w.pos;
         const c = w.at(w.pos + 1);
         w.pos += 1;
-        try w.scanEscape(escape_start, true);
-        return switch (c) {
-            'd', 'D', 's', 'S', 'w', 'W', 'p', 'P' => true,
-            else => false,
+        const value = try w.scanEscape(start, true);
+        return .{
+            .start = start,
+            .value = value,
+            .is_class = switch (c) {
+                'd', 'D', 's', 'S', 'w', 'W', 'p', 'P' => true,
+                else => false,
+            },
         };
     }
 
     /// The escape after a `\` (`pos` is at the letter, `escape_start` at the
     /// backslash). Outside a class `\b`/`\B` never reach here — they are
     /// assertions, and the caller has to know that to get `\b*` right.
-    fn scanEscape(w: *Walker, escape_start: u32, in_class: bool) Error!void {
-        if (w.pos >= w.end) return;
+    fn scanEscape(w: *Walker, escape_start: u32, in_class: bool) Error!?u32 {
+        if (w.pos >= w.end) return null;
         switch (w.src[w.pos]) {
-            'u' => try w.scanUnicodeEscape(escape_start),
+            'u' => return w.scanUnicodeEscape(escape_start),
             'x' => {
                 w.pos += 1;
-                try w.scanHexDigits(2);
+                return w.scanHexDigits(2);
             },
             'c' => {
                 w.pos += 1;
                 if (w.pos < w.end and isAsciiLetter(w.src[w.pos])) {
+                    const letter = w.src[w.pos];
                     w.pos += 1;
+                    return letter % 32;
                 } else if (w.unicode) {
                     // Annex B keeps a bare `\c` as the two literal characters.
                     try w.emit(.regex_c_needs_letter, escape_start, w.pos - escape_start);
                 }
+                return null;
             },
             'p', 'P' => {
                 w.pos += 1;
@@ -532,6 +577,7 @@ const Walker = struct {
                 } else if (w.unicode) {
                     try w.emit(.regex_p_needs_braces, escape_start, w.pos - escape_start);
                 }
+                return null;
             },
             'k' => {
                 w.pos += 1;
@@ -547,17 +593,39 @@ const Walker = struct {
                         w.pos - escape_start,
                     );
                 }
+                return null;
             },
             // The escapes that mean something: the control escapes, the NUL, and
             // the character-class shorthands. `\b` reaches here only inside a
             // class, where it is a backspace; `\B` is not legal there and falls
             // to the identity-escape arm below, as tsc has it.
-            'f', 'n', 'r', 't', 'v', '0', 'b', 'd', 'D', 's', 'S', 'w', 'W' => w.pos += 1,
+            'f', 'n', 'r', 't', 'v', '0', 'b' => {
+                const value: u32 = switch (w.src[w.pos]) {
+                    'f' => 0x0C,
+                    'n' => 0x0A,
+                    'r' => 0x0D,
+                    't' => 0x09,
+                    'v' => 0x0B,
+                    'b' => 0x08,
+                    else => 0,
+                };
+                w.pos += 1;
+                return value;
+            },
+            'd', 'D', 's', 'S', 'w', 'W' => {
+                w.pos += 1;
+                return null;
+            },
             else => {
                 const c = w.src[w.pos];
+                const cp = codePointAt(w.src, w.pos);
                 w.pos += w.charLen(w.pos);
-                if (!w.unicode or w.escapable(c, in_class)) return;
+                // A decimal escape is a backreference (an octal one inside a
+                // class), neither of which has a character value here.
+                const value: ?u32 = if (c >= '1' and c <= '9') null else cp;
+                if (!w.unicode or w.escapable(c, in_class)) return value;
                 try w.emit(.regex_char_cannot_be_escaped, escape_start, w.pos - escape_start);
+                return value;
             },
         }
     }
@@ -584,9 +652,28 @@ const Walker = struct {
 
     /// `\uHHHH` or the extended `\u{H…}`. The extended form needs `u` or `v`
     /// (TS1538) but is still read — and still range-checked — without it.
-    fn scanUnicodeEscape(w: *Walker, escape_start: u32) Error!void {
+    fn scanUnicodeEscape(w: *Walker, escape_start: u32) Error!?u32 {
         w.pos += 1; // `u`
-        if (w.pos >= w.end or w.src[w.pos] != '{') return w.scanHexDigits(4);
+        if (w.pos >= w.end or w.src[w.pos] != '{') {
+            const unit = try w.scanHexDigits(4) orelse return null;
+            // In unicode mode a `\uD800`-`\uDBFF` followed by another `\u`
+            // escape in the trail range is ONE code point, which is what makes
+            // `[\uD835\uDE08-\uD835\uDE21]` an ordered range with `u` set and
+            // an unordered one without it.
+            if (w.unicode and unit >= 0xD800 and unit <= 0xDBFF and
+                w.pos + 1 < w.end and w.src[w.pos] == '\\' and w.src[w.pos + 1] == 'u')
+            {
+                const save = w.pos;
+                w.pos += 2;
+                if (try w.scanHexDigits(4)) |trail| {
+                    if (trail >= 0xDC00 and trail <= 0xDFFF) {
+                        return 0x10000 + ((unit - 0xD800) << 10) + (trail - 0xDC00);
+                    }
+                }
+                w.pos = save;
+            }
+            return unit;
+        }
         if (!w.unicode) {
             try w.emit(.regex_unicode_escape_needs_flag, escape_start, w.pos - escape_start);
         }
@@ -602,7 +689,7 @@ const Walker = struct {
             // and the `}` to be read back as pattern characters.
             try w.emit(.regex_hex_digit_expected, w.pos, 1);
             if (w.pos < w.end and w.src[w.pos] == '}') w.pos += 1;
-            return;
+            return null;
         }
         if (value > 0x10FFFF) {
             try w.emit(.regex_unicode_escape_out_of_range, digits_start, w.pos - digits_start);
@@ -614,18 +701,24 @@ const Walker = struct {
         } else {
             try w.emit(.regex_unterminated_unicode_escape, w.pos, 0);
         }
+        return if (value > 0x10FFFF) null else @intCast(value);
     }
 
-    fn scanHexDigits(w: *Walker, count: u32) Error!void {
+    /// Exactly `count` hex digits, answering their value (null once one was
+    /// missing, which is also when TS1125 is reported).
+    fn scanHexDigits(w: *Walker, count: u32) Error!?u32 {
+        var value: u32 = 0;
         var i: u32 = 0;
         while (i < count) : (i += 1) {
             if (w.pos < w.end and isHexDigit(w.src[w.pos])) {
+                value = value * 16 + hexValue(w.src[w.pos]);
                 w.pos += 1;
             } else {
                 try w.emit(.regex_hex_digit_expected, w.pos, 1);
-                return;
+                return null;
             }
         }
+        return value;
     }
 
     fn expect(w: *Walker, c: u8, code: Code) Error!void {
@@ -693,6 +786,23 @@ fn isIdentPart(c: u8) bool {
 /// A character of a `\p{…}` property name or value, `=` included.
 fn isPropertyChar(c: u8) bool {
     return isIdentPart(c) or c == '=';
+}
+
+/// The code point at `i`, or the byte itself when the bytes there are not a
+/// well-formed UTF-8 sequence (which keeps a malformed file from moving a
+/// range comparison).
+fn codePointAt(src: []const u8, i: u32) u32 {
+    const c0 = src[i];
+    if (c0 < 0x80) return c0;
+    const n = scanner.charStepLen(src, i);
+    return switch (n) {
+        2 => (@as(u32, c0 & 0x1F) << 6) | (src[i + 1] & 0x3F),
+        3 => (@as(u32, c0 & 0x0F) << 12) | (@as(u32, src[i + 1] & 0x3F) << 6) |
+            (src[i + 2] & 0x3F),
+        4 => (@as(u32, c0 & 0x07) << 18) | (@as(u32, src[i + 1] & 0x3F) << 12) |
+            (@as(u32, src[i + 2] & 0x3F) << 6) | (src[i + 3] & 0x3F),
+        else => c0,
+    };
 }
 
 fn isDigit(c: u8) bool {

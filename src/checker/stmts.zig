@@ -315,14 +315,42 @@ fn checkVarDeclStatement(c: *Checker, node: Node) Error!void {
     const ambient = c.ambient_ctx or precededByDeclare(c, node);
     if (c.nodeTag(node) == .var_decl_one) {
         if (ambient) try checkAmbientInitializer(c, d.lhs, is_const);
+        if (is_const and !ambient) try checkConstInitialized(c, d.lhs);
         try checkDeclarator(c, d.lhs, is_const, ambient);
     } else {
         for (c.tree.nodeRange(node)) |decl| {
             if (decl == null_node) continue;
             if (ambient) try checkAmbientInitializer(c, decl, is_const);
+            if (is_const and !ambient) try checkConstInitialized(c, decl);
             try checkDeclarator(c, decl, is_const, ambient);
         }
     }
+}
+
+/// tsc's `checkGrammarVariableDeclaration` arm for an uninitialized `const`.
+/// Reported on the NAME, and only for a STATEMENT's declaration list — a
+/// `for…in`/`for…of` head is exempt (tsc's own guard) and never reaches here,
+/// because those heads are checked by `checkForInOfStatement`, while a C-style
+/// `for (const x;;)` does reach here and is reported, as tsc has it.
+///
+/// A binding PATTERN with no initializer is TS1182 in tsc ("a destructuring
+/// declaration must have an initializer"), which `return`s before this arm;
+/// ztsc does not answer TS1182 yet, so a pattern stays silent rather than
+/// borrowing the wrong code.
+fn checkConstInitialized(c: *Checker, decl: Node) Error!void {
+    const d = c.tree.nodeData(decl);
+    const name: Node = switch (c.nodeTag(decl)) {
+        .declarator => d.lhs,
+        .declarator_full => blk: {
+            const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
+            if (e.init != 0) return;
+            break :blk d.lhs;
+        },
+        // `.declarator_init` always has one; anything else is recovery.
+        else => return,
+    };
+    if (c.nodeTag(name) != .identifier) return;
+    try c.diagFmt(1155, c.tokSpan(c.tree.nodeMainToken(name)), "'const' declarations must be initialized.", .{});
 }
 
 /// tsc's `checkAmbientInitializer` for a variable declarator: an initializer

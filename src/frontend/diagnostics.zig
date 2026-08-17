@@ -787,6 +787,8 @@ pub const Code = enum(u16) {
     regex_c_needs_letter,
     /// TS1516: `[\d-\w]` in unicode mode — a range bounded by a class escape.
     regex_range_bounded_by_class,
+    /// TS1517: `[b-a]` — the range's bounds are reversed.
+    regex_range_out_of_order,
     /// TS1514: `(?<1a>x)` / `\k<1a>` — the name is not an identifier.
     regex_expected_group_name,
     /// TS1530: `\p{L}` with neither `u` nor `v` set.
@@ -1076,6 +1078,7 @@ pub const Code = enum(u16) {
             .regex_k_needs_group_name,
             .regex_c_needs_letter,
             .regex_range_bounded_by_class,
+            .regex_range_out_of_order,
             .regex_expected_group_name,
             .regex_property_needs_unicode_flag,
             .regex_p_needs_braces,
@@ -1365,6 +1368,7 @@ pub const Code = enum(u16) {
             .regex_k_needs_group_name => "'\\k' must be followed by a capturing group name enclosed in angle brackets.",
             .regex_c_needs_letter => "'\\c' must be followed by an ASCII letter.",
             .regex_range_bounded_by_class => "A character class range must not be bounded by another character class.",
+            .regex_range_out_of_order => "Range out of order in character class.",
             .regex_expected_group_name => "Expected a capturing group name.",
             .regex_property_needs_unicode_flag => "Unicode property value expressions are only available when the Unicode (u) flag or the Unicode Sets (v) flag is set.",
             .regex_p_needs_braces => "'\\p' must be followed by a Unicode property value expression enclosed in braces.",
@@ -1432,6 +1436,7 @@ pub const Code = enum(u16) {
             .regex_k_needs_group_name => 1510,
             .regex_c_needs_letter => 1512,
             .regex_range_bounded_by_class => 1516,
+            .regex_range_out_of_order => 1517,
             .regex_expected_group_name => 1514,
             .regex_property_needs_unicode_flag => 1530,
             .regex_p_needs_braces => 1531,
