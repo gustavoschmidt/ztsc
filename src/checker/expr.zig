@@ -297,7 +297,7 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         },
         .prefix_unary => return checkPrefixUnary(c, node, ctx),
         .postfix_unary => {
-            const ot = try c.checkExprCached(d.lhs, types.no_type);
+            const ot = try incrementOperandType(c, d.lhs);
             if (try checkArithmeticOperand(c, try checkNonNullType(c, ot, d.lhs), d.lhs)) {
                 _ = try checkReferenceExpression(c, d.lhs, .increment);
             }
@@ -3430,6 +3430,33 @@ pub fn checkReferenceExpression(c: *Checker, expr: Node, site: RefSite) Error!bo
     return true;
 }
 
+/// `x++` / `--x` WRITES its operand, and tsc types it through `checkExpression`
+/// with the node's assignment kind set — so writing an enum/class/function/
+/// namespace name, a `const`, an import or a read-only property is refused
+/// here exactly as `x = v` refuses it. Answers whether the target was refused.
+///
+/// The refusal's `errorType` matters twice over: it is what keeps the
+/// arithmetic check from piling a TS2356 on top of `E++`, and what keeps the
+/// write-back from reporting an unassignable result.
+pub fn checkWriteTargetRefused(c: *Checker, target: Node) Error!bool {
+    var n = target;
+    while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+    switch (c.nodeTag(n)) {
+        .identifier, .member_expr, .index_expr => {},
+        // A pattern or a non-reference is somebody else's diagnostic
+        // (`checkReferenceExpression`, `checkDestructuringPattern`).
+        else => return false,
+    }
+    return (try checkAssignmentTarget(c, n)) == types.error_type;
+}
+
+fn incrementOperandType(c: *Checker, operand: Node) Error!TypeId {
+    if (try checkWriteTargetRefused(c, operand)) return types.error_type;
+    // Otherwise the operand's own value is the READ type, exactly as a
+    // compound assignment reads its target before writing it.
+    return c.checkExprCached(operand, types.no_type);
+}
+
 /// tsc's `checkDeleteExpression` (plus `checkGrammarDeleteExpression`) on an
 /// already-checked operand:
 ///
@@ -3618,7 +3645,7 @@ fn checkPrefixUnary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             return types.number_type;
         },
         .plus_plus, .minus_minus => {
-            const ot = try c.checkExprCached(d.lhs, types.no_type);
+            const ot = try incrementOperandType(c, d.lhs);
             // tsc runs the reference check only when the operand TYPED as a
             // valid arithmetic operand, to avoid cascading off one operand.
             if (try checkArithmeticOperand(c, try checkNonNullType(c, ot, d.lhs), d.lhs)) {
@@ -4321,6 +4348,10 @@ fn isDestructuringPattern(c: *Checker, node: Node) bool {
 /// (readonly property).
 fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
     switch (c.nodeTag(node)) {
+        // `(x) = v` writes `x`: tsc's `getAssignmentTargetKind` walks up
+        // through parentheses (and array literals, spreads and `!`), so the
+        // refusals below apply to a parenthesized target unchanged.
+        .paren_expr => return checkAssignmentTarget(c, c.tree.nodeData(node).lhs),
         .identifier => {
             const tok = c.tree.nodeMainToken(node);
             const a = try c.atomOfToken(tok);
@@ -4335,18 +4366,30 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
                         try c.diagFmt(2632, c.tokSpan(tok), "Cannot assign to '{s}' because it is an import.", .{c.tokenText(tok)});
                         return types.error_type;
                     }
-                    // Assigning to a name that is not a VARIABLE at all — a
-                    // class, enum, function or namespace — is refused by
-                    // tsc's `checkIdentifier`, which answers `errorType`
-                    // (TS2628-31; ztsc has none of those diagnostics yet).
-                    // The type answer is the load-bearing half: it is what
-                    // stops `class f {}; f -= 1` from ALSO reporting the
-                    // operand as non-arithmetic and the result as
-                    // unassignable, neither of which tsc says.
-                    if (!sf.var_decl and !sf.let_decl and !sf.param and !sf.catch_param and
-                        (sf.class or sf.enum_decl or sf.namespace_decl or sf.function))
-                    {
-                        return types.error_type;
+                    // Assigning to a name that is not a VARIABLE at all is
+                    // refused by tsc's `checkIdentifier` by WHAT IT IS, in
+                    // this order (enum before class before namespace before
+                    // function — a merged declaration reports the first that
+                    // fits), and answers `errorType`. The type answer is
+                    // load-bearing on its own: it is what stops
+                    // `class f {}; f -= 1` from ALSO reporting the operand as
+                    // non-arithmetic and the result as unassignable, neither
+                    // of which tsc says.
+                    if (!sf.var_decl and !sf.let_decl and !sf.param and !sf.catch_param) {
+                        const what: ?struct { code: u16, text: []const u8 } = if (sf.enum_decl)
+                            .{ .code = 2628, .text = "an enum" }
+                        else if (sf.class)
+                            .{ .code = 2629, .text = "a class" }
+                        else if (sf.namespace_decl)
+                            .{ .code = 2631, .text = "a namespace" }
+                        else if (sf.function)
+                            .{ .code = 2630, .text = "a function" }
+                        else
+                            null;
+                        if (what) |w| {
+                            try c.diagFmt(w.code, c.tokSpan(tok), "Cannot assign to '{s}' because it is {s}.", .{ c.tokenText(tok), w.text });
+                            return types.error_type;
+                        }
                     }
                     return c.typeOfSymbol(sym);
                 },

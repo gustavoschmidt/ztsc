@@ -449,6 +449,9 @@ fn checkForInOf(c: *Checker, node: Node) Error!void {
         },
         else => {
             const left_t = try c.checkExprCached(e.left, types.no_type);
+            // The head WRITES its target on every iteration, so the same
+            // refusals an assignment applies (TS2588/2628-32/2540/2542) apply.
+            _ = try expr_zig.checkWriteTargetRefused(c, e.left);
             if (is_of) {
                 _ = try expr_zig.checkReferenceExpression(c, e.left, .for_of);
             } else if (try c.isAssignable(types.string_type, left_t)) {
