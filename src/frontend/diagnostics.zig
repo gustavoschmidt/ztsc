@@ -24,13 +24,6 @@ pub const Code = enum(u16) {
     unterminated_string,
     unterminated_template,
     unterminated_regexp,
-    /// TS1499/TS1500/TS1502: the FLAGS of a regular expression literal. tsc's
-    /// scanner judges them one character at a time, so all three are syntactic.
-    /// `d g i m s u v y` are the flags; `u` and `v` both select Unicode mode
-    /// and only one of them may.
-    regexp_unknown_flag,
-    regexp_duplicate_flag,
-    regexp_unicode_and_unicode_sets,
     unterminated_comment,
     unexpected_character,
     /// TS18026: `#!` anywhere but the first line of the file.
@@ -1000,9 +993,6 @@ pub const Code = enum(u16) {
             // lowercase phrasing so the two groups stay visibly distinct.
             .unterminated_string => "Unterminated string literal.",
             .unterminated_template => "Unterminated template literal.",
-            .regexp_unknown_flag => "Unknown regular expression flag.",
-            .regexp_duplicate_flag => "Duplicate regular expression flag.",
-            .regexp_unicode_and_unicode_sets => "The Unicode (u) flag and the Unicode Sets (v) flag cannot be set simultaneously.",
             .unterminated_regexp => "Unterminated regular expression literal.",
             .unterminated_comment => "'*/' expected.",
             .unexpected_character => "Invalid character.",
@@ -1311,9 +1301,6 @@ pub const Code = enum(u16) {
             .unterminated_string => 1002,
             .unterminated_template => 1160,
             .unterminated_regexp => 1161,
-            .regexp_unknown_flag => 1499,
-            .regexp_duplicate_flag => 1500,
-            .regexp_unicode_and_unicode_sets => 1502,
             .unterminated_comment => 1010,
             .unexpected_character => 1127,
             .shebang_not_at_start => 18026,

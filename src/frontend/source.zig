@@ -254,6 +254,7 @@ pub fn lineOfOffset(line_starts: []const u32, offset: u32) u32 {
 /// falling through to `case lineFeed:` does) is what puts an end-of-file
 /// diagnostic on the same line tsc puts it on. The scanner has always treated
 /// a lone CR as a break; only this table did not.
+///
 /// This runs over every byte of every source file, so the fast path — the
 /// ~98% of bytes that end no line — is kept to the single comparison it was
 /// before CR joined LF: every line terminator is `<= '\r'`, so one test
@@ -310,6 +311,35 @@ test "line table: no trailing newline" {
     var src = try Source.fromBytes(arena.allocator(), "t.ts", text);
     try std.testing.expectEqual(@as(u32, 2), src.lineCount());
     try std.testing.expectEqual(LineCol{ .line = 1, .col = 0 }, src.lineCol(2));
+}
+
+test "line table: CRLF is one break and a LONE CR is one too" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // CRLF opens ONE line, not two: `b` is at line 1, column 0.
+    var crlf = try Source.fromBytes(a, "t.ts", "a\r\nb");
+    try std.testing.expectEqual(@as(u32, 2), crlf.lineCount());
+    try std.testing.expectEqual(LineCol{ .line = 1, .col = 0 }, crlf.lineCol(3));
+
+    // A lone CR is a break of its own — tsc's `case carriageReturn:` falls
+    // through to `case lineFeed:`. This is what the corpus hits: the harness
+    // splits CRLF multi-file cases on `\n`, so nearly every unit ends `…\r`.
+    var cr = try Source.fromBytes(a, "t.ts", "a\rb");
+    try std.testing.expectEqual(@as(u32, 2), cr.lineCount());
+    try std.testing.expectEqual(LineCol{ .line = 1, .col = 0 }, cr.lineCol(2));
+
+    // A file ending in a lone CR puts EOF on the line that CR opened, exactly
+    // as a trailing LF does — `let x3 = <div>;\r\n\r\n\r` is four lines, and
+    // tsgo reports its "'</' expected" at 4:1.
+    var trailing = try Source.fromBytes(a, "t.ts", "x\r\n\r\n\r");
+    try std.testing.expectEqual(LineCol{ .line = 3, .col = 0 }, trailing.lineCol(6));
+
+    // Mixed endings still count each break once.
+    var mixed = try Source.fromBytes(a, "t.ts", "a\r\nb\rc\nd");
+    try std.testing.expectEqual(@as(u32, 4), mixed.lineCount());
+    try std.testing.expectEqual(LineCol{ .line = 3, .col = 0 }, mixed.lineCol(7));
 }
 
 test "line table: the EOF offset of a newline-terminated file is its own line" {

@@ -593,15 +593,6 @@ const Parser = struct {
                     try p.addDiag(f.code, .{ .code = f.code, .span = f.span });
                 }
             },
-            // Only the FLAGS; see `literals.RegexFlagWalk` for why the body is
-            // left alone. `init` walks back over the flags run, so a literal
-            // with none costs one byte test.
-            .regexp_literal => {
-                var w: literals.RegexFlagWalk = .init(p.tokenText(t), t.start);
-                while (w.next()) |f| {
-                    try p.addDiag(f.code, .{ .code = f.code, .span = f.span });
-                }
-            },
             else => {},
         }
     }
