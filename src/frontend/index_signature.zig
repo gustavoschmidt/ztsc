@@ -138,6 +138,21 @@ pub fn duplicateKey(keys: []const []const u8, i: usize) bool {
     return false;
 }
 
+/// The first token of a class or type MEMBER — its `main_token` walked back
+/// over the modifier keywords the parser folded into the member's flag word.
+///
+/// That is where tsc's declaration node starts, and so where every diagnostic
+/// blamed on the whole member goes: `readonly [x: string]: T` answers TS2374
+/// and TS2413 at the `readonly`, not at the `[`. Modifiers leave no token in
+/// the node, so the only way back to them is the token stream — and
+/// `isModifierKind` is the same predicate the parser's own lookahead used to
+/// decide these tokens were modifiers of this member, so the two cannot drift.
+pub fn memberStartToken(tokens: *const scanner.Tokens, main_token: u32) u32 {
+    var tok = main_token;
+    while (tok > 0 and isModifierKind(tokens.tag(tok - 1))) tok -= 1;
+    return tok;
+}
+
 /// tsc's `isModifierKind`, the lookahead's "is this the start of a parameter
 /// modifier" test. Wider than the modifiers an index signature could sensibly
 /// carry, on purpose: the same predicate has to answer for

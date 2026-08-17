@@ -3401,7 +3401,8 @@ const Binder = struct {
         if (keys.items.len < 2) return;
         for (sites.items, 0..) |member, i| {
             if (!index_signature.duplicateKey(keys.items, i)) continue;
-            try b.diag(.duplicate_index_signature, b.memberStartToken(member));
+            const start = index_signature.memberStartToken(&b.tree.tokens, b.tree.nodeMainToken(member));
+            try b.diag(.duplicate_index_signature, start);
         }
     }
 
@@ -3421,17 +3422,6 @@ const Binder = struct {
             if (d.code == .index_sig_one_parameter and d.span.start == start) return true;
         }
         return false;
-    }
-
-    /// The first token of a class or type member — its `main_token` walked back
-    /// over the modifier keywords the parser folded into the member's flag word,
-    /// which is where tsc's declaration node starts and so where it anchors.
-    /// `index_signature.isModifierKind` is the same predicate the parser's own
-    /// lookahead used to decide those tokens were modifiers of this member.
-    fn memberStartToken(b: *const Binder, member: Node) TokenIndex {
-        var tok = b.tree.nodeMainToken(member);
-        while (tok > 0 and index_signature.isModifierKind(b.tree.tokens.tag(tok - 1))) tok -= 1;
-        return tok;
     }
 
     /// A member of an interface or object-type literal.

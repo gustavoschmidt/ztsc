@@ -48,7 +48,9 @@
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
 const binder = @import("../frontend/binder.zig");
+const index_signature = @import("../frontend/index_signature.zig");
 const intern = @import("../intern.zig");
+const member_names = @import("../frontend/member_names.zig");
 const modules = @import("../link/modules.zig");
 const numeric_lit = @import("../numeric_lit.zig");
 const source = @import("../frontend/source.zig");
@@ -405,11 +407,18 @@ fn gatherClassMembers(c: *Checker, node: Node, statics: bool, out: *Own) Error!v
                     c.tree.extraData(ast.Field, md.lhs).flags
                 else
                     c.tree.extraData(ast.FnProto, md.lhs).flags;
+                // The CONSTRUCTOR names no member of its own, but its
+                // parameter properties do. Asked of the DECLARATION
+                // (`member_names.isCtorMethod`), not of the name atom: the
+                // member-table key is the reserved `__@ctor`, and this walk
+                // reads syntax, where the name is the literal `constructor`.
+                if (tag == .class_method and member_names.isCtorMethod(c.tree, m, flags)) {
+                    if (!statics) try addParamProps(c, md.lhs, out);
+                    continue;
+                }
                 if ((flags & ast.Flags.static != 0) != statics) continue;
                 const tok = c.tree.nodeMainToken(m);
-                const name = try c.memberKey(tok, flags);
-                if (c.isCtorName(name)) continue;
-                try addProp(c, out, name, tok, flags);
+                try addProp(c, out, try c.memberKey(tok, flags), tok, flags);
             },
             .index_signature => {
                 if ((md.rhs & ast.Flags.static != 0) != statics) continue;
@@ -420,6 +429,36 @@ fn gatherClassMembers(c: *Checker, node: Node, statics: bool, out: *Own) Error!v
         }
     }
 }
+
+/// The instance members a CONSTRUCTOR declares through parameter properties.
+///
+/// `constructor(public bad: string)` declares `bad` as surely as a field does,
+/// and tsc's `localPropDeclaration` finds it the same way — through the
+/// property symbol's `valueDeclaration`, which for one of these is the
+/// PARAMETER. So it is an own declaration here too, and the diagnostic goes to
+/// the parameter's start, which is its modifier (`main_token` on a
+/// `.param_full`).
+fn addParamProps(c: *Checker, proto_idx: ast.ExtraIndex, out: *Own) Error!void {
+    const proto = c.tree.extraData(ast.FnProto, proto_idx);
+    for (c.tree.extraRange(proto.params_start, proto.params_end)) |p| {
+        if (p == null_node or c.nodeTag(p) != .param_full) continue;
+        const pd = c.tree.nodeData(p);
+        const e = c.tree.extraData(ast.ParamFull, pd.rhs);
+        if (e.flags & param_prop_mask == 0) continue;
+        // Only a plain identifier parameter names a member; a binding pattern
+        // with a modifier is TS1187 and declares nothing.
+        if (c.nodeTag(pd.lhs) != .identifier) continue;
+        const gop = try out.props.getOrPut(c.scratch(), try c.memberAtom(c.tree.nodeMainToken(pd.lhs)));
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{ .file = c.cur_file, .span = c.tokSpan(c.tree.nodeMainToken(p)) };
+        }
+    }
+}
+
+/// tsc's `ModifierFlags.ParameterPropertyModifier` — what makes a constructor
+/// parameter declare a class member (the binder's `param_prop_mask`).
+const param_prop_mask = ast.Flags.public | ast.Flags.private |
+    ast.Flags.protected | ast.Flags.readonly | ast.Flags.override;
 
 fn gatherInterfaceBlocks(c: *Checker, sym: SymbolId, out: *Own) Error!void {
     const saved_ctx = c.enterSymFile(sym);
@@ -478,6 +517,11 @@ fn nameSpan(c: *Checker, tok: TokenIndex, flags: u32) Span {
 
 fn addIndex(c: *Checker, out: *Own, node: Node, extra: ast.ExtraIndex) Error!void {
     const e = c.tree.extraData(ast.IndexSig, extra);
+    // tsc blames the whole DECLARATION, whose span starts at the member's
+    // modifiers (`static readonly [s: number]: T` answers at the `static`).
+    // `nodeSpan` starts at the `[`: the modifiers are a flag word on the node,
+    // with no child to widen the span.
+    const site = indexSite(c, node);
     const key = try c.typeFromTypeNode(e.key_type);
     const slot: Slot = if (key == types.number_type)
         .number
@@ -493,10 +537,18 @@ fn addIndex(c: *Checker, out: *Own, node: Node, extra: ast.ExtraIndex) Error!voi
         // `"ns:thing"` is not constrained by `` [key: `do-${string}`] ``).
         // Record the declared key so the property walk can ask.
         out.string_key = key;
-        out.setIdx(.string, .{ .file = c.cur_file, .span = c.nodeSpan(node) });
+        out.setIdx(.string, site);
         return;
     };
-    out.setIdx(slot, .{ .file = c.cur_file, .span = c.nodeSpan(node) });
+    out.setIdx(slot, site);
+}
+
+/// The site of an index-signature declaration, modifiers included.
+fn indexSite(c: *Checker, node: Node) Site {
+    const start = index_signature.memberStartToken(&c.tree.tokens, c.tree.nodeMainToken(node));
+    var span = c.nodeSpan(node);
+    span.start = c.tokSpan(start).start;
+    return .{ .file = c.cur_file, .span = span };
 }
 
 /// tsc's `getDeclarationOfKind(symbol, SyntaxKind.InterfaceDeclaration)`: is
