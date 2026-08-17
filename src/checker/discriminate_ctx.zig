@@ -274,11 +274,13 @@ pub fn byObjectMembers(c: *Checker, node: Node, rctx: TypeId) Error!TypeId {
                 if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) continue;
                 try present.append(c.scratch(), try c.memberAtom(c.tree.nodeMainToken(prop)));
             },
-            // A spread supplies names this step cannot enumerate cheaply;
-            // leaving them out of `present` can only add an omitted-optional
-            // discriminator, and that discriminator is `undefined` against a
-            // property the spread may well have supplied. Bail instead.
-            .spread_element => return rctx,
+            // A spread contributes NOTHING here, and does not stop the walk:
+            // tsc's omitted-optional set is keyed off `node.symbol.members`,
+            // the binder's table for the literal, and a `SpreadAssignment`
+            // has no name to put in it. So a name only a spread supplies is
+            // "omitted" for tsc too, and bailing out instead lost every
+            // discrimination for a literal that merely mentions a spread.
+            .spread_element => {},
             else => {},
         }
     }
@@ -295,8 +297,10 @@ pub fn byJsxAttributes(c: *Checker, attrs: []const Node, rctx: TypeId, has_child
     defer present.deinit(c.scratch());
     for (attrs) |attr| {
         if (attr == null_node) continue;
-        // Same reasoning as the object literal's spread element.
-        if (c.nodeTag(attr) == .jsx_spread_attribute) return rctx;
+        // Same reasoning as the object literal's spread element: a
+        // `JsxSpreadAttribute` has no symbol name, so it is invisible to
+        // tsc's omitted-optional filter rather than a reason to stop.
+        if (c.nodeTag(attr) == .jsx_spread_attribute) continue;
         const ad = c.tree.nodeData(attr);
         const name_tok = c.tree.nodeMainToken(attr);
         // A hyphenated name (`data-*`) is not an identifier tsc keys a union by.

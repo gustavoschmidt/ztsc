@@ -163,6 +163,22 @@ pub fn checkExprCached(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     return t;
 }
 
+/// Is the current scope the file's own top level — nothing between it and the
+/// file scope that tsc's `getThisContainer` would stop at? Only there does a
+/// bare `this` belong to the file rather than to a function, a class or a
+/// namespace body.
+fn atFileTopLevel(c: *const Checker) bool {
+    var cur = c.cur_scope;
+    while (cur != binder.file_scope) {
+        switch (c.bind.scope_kinds[cur]) {
+            .function, .class, .class_members, .class_statics, .namespace, .enum_body => return false,
+            else => {},
+        }
+        cur = c.bind.scope_parents[cur];
+    }
+    return true;
+}
+
 fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     const ewin = if (c.dprof.on) prof_zig.exprEnter(c, node) else prof_zig.DeclWin{};
     defer if (c.dprof.on) prof_zig.exprExit(c, ewin);
@@ -178,7 +194,22 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         .false_literal => return c.ts.makeBooleanLiteral(false, true),
         .null_literal => return types.null_type,
         .regex_literal => return types.any_type, // RegExp needs lib (documented)
-        .this_expr => return if (c.this_type != 0) c.this_type else types.any_type,
+        .this_expr => {
+            if (c.this_type != 0) return c.this_type;
+            // tsc's `tryGetThisTypeAt(node, /*includeGlobalThis*/ true)`: at
+            // the TOP LEVEL of a plain script — no enclosing function, class
+            // or namespace to own a `this` — `this` is the global object,
+            // `typeof globalThis`. That is what makes `++this` an arithmetic
+            // error (TS2356) rather than a reference error.
+            //
+            // The top level of a MODULE is `undefined` instead, and inside a
+            // function with no `this` parameter tsc raises TS2683 and falls
+            // back to `any`; both stay `any` here (documented gaps).
+            if (atFileTopLevel(c) and c.bind.imports.len == 0 and c.bind.exports.len == 0) {
+                return c.globalThisType();
+            }
+            return types.any_type;
+        },
         .super_expr => return types.any_type,
         // `new.target`: tsc types it as the enclosing constructor's own
         // type (the class's static side in a constructor, `typeof f` in a
@@ -1259,6 +1290,21 @@ fn arrayLiteralElemType(c: *Checker, raw: []const TypeId, widened: []const TypeI
     return c.ts.makeUnion(c.scratch(), kept.items);
 }
 
+// An array literal's elements share ONE widening context in tsc, so each
+// object-literal element should gain `name?: undefined` for every name its
+// object-literal SIBLINGS declare (`getWidenedTypeWithContext` →
+// `getPropertiesOfContext` + `getUndefinedProperty`): `[{ a: 1 }, { b: 2 }]`
+// is `({ a: number; b?: undefined } | { a?: undefined; b: number })[]`. ztsc
+// does this for the arms of a `?:` (`normalizeFreshObjectSiblings`) but not
+// for array elements, because implementing it here — reading the sibling
+// names off the RAW element types, which still carry the object-literal
+// origin, and applying them to the positionally aligned widened entry —
+// produced two false TS2352 in excalidraw's `data/transform.test.ts`
+// (`elements as ExcalidrawElementSkeleton[]`, tsgo silent). The extra
+// optional-`undefined` members are correct; what fails is comparability
+// against the big skeleton union downstream, which lives in `assign.zig`.
+// Re-land with that fixed. (wave 13 B, measured.)
+
 /// The element type an array literal's elements should be contextually
 /// typed against, given a (structurally resolved) contextual type. A direct
 /// array yields its element type; a union contributes the element type of
@@ -1894,6 +1940,15 @@ pub fn contextAdmitsLiteral(c: *Checker, ctx: TypeId, lit: TypeId) Error!bool {
         // field-name literal so the type param infers to it rather than
         // widening to `string`.
         .template_literal_type, .string_mapping => return lk == .string_literal and try c.isAssignable(lit, r),
+        // No `.keyof_op` arm, even though tsc's `isLiteralOfContextualType`
+        // final mask lists `TypeFlags.Index` beside `StringLiteral`: every
+        // shape that reaches it here arrives as the type PARAMETER whose
+        // constraint is the `keyof` (`K extends readonly (keyof R)[]`), and
+        // the `.type_param` arm below already keeps the literal for those.
+        // Adding the arm changed no corpus or probe output, so it stays out
+        // rather than being carried unexercised. What still clamps —
+        // `...keys: [...K]` inferring `K` as its constraint instead of the
+        // argument tuple — is a variadic-tuple inference gap, not this test.
         .type_param => {
             const constraint = try c.typeParamConstraint(c.ts.typeParamSymbol(r));
             if (constraint == types.no_type) return false;
@@ -2051,7 +2106,86 @@ fn checkObjectLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     // A destructuring ASSIGNMENT pattern is exempt and never arrives here — it
     // goes through `checkDestructuringElement`.
     try c.checkObjectLiteralDups(node);
+    try checkSpreadPropOverrides(c, node);
     return t;
+}
+
+/// tsc's `checkSpreadPropOverrides`: a property written BEFORE a spread whose
+/// source declares the same name NON-optionally is dead code — the spread
+/// always wins — so tsc reports TS2783 at the earlier property.
+///
+/// Only SYNTACTIC properties count, and only those written earlier: tsc keeps
+/// them in a side table (`allPropertiesTable`) that a spread's own properties
+/// never enter. That is what makes `{ ...ab, ...ab }` silent while
+/// `{ b: 1, ...ab }` is not, and what makes a property written BETWEEN two
+/// spreads count for the second one.
+///
+/// Reads the spread source out of the node-type memo (the type walk has
+/// already published it) rather than re-checking, so this adds no evaluation
+/// and cannot be the first to report anything inside the operand.
+///
+/// First landed in wave 11 and reverted the same wave: `pick(COLOR_PALETTE,
+/// ["cyan", …]): Pick<R, K[number]>` inferred `K` as its CONSTRAINT, so the
+/// spread source was the whole palette and excalidraw's `colors.ts` collected
+/// ten false positives. That inference gap was fixed in wave 12 (`78e8321`) —
+/// the check itself needed no change.
+fn checkSpreadPropOverrides(c: *Checker, node: Node) Error!void {
+    const members = c.tree.nodeRange(node);
+    // The overwhelming majority of literals carry no spread at all.
+    var has_spread = false;
+    for (members) |prop| {
+        if (prop != null_node and c.nodeTag(prop) == .spread_element) has_spread = true;
+    }
+    if (!has_spread) return;
+
+    const Seen = struct { name: Atom, node: Node };
+    var seen: std.ArrayList(Seen) = .empty;
+    defer seen.deinit(c.scratch());
+    for (members) |prop| {
+        if (prop == null_node) continue;
+        const pd = c.tree.nodeData(prop);
+        switch (c.nodeTag(prop)) {
+            .spread_element => {
+                if (seen.items.len == 0) continue;
+                const raw = c.nodeType(pd.lhs) orelse continue;
+                // A bare TYPE PARAMETER source is not evidence of an
+                // overwrite here, even though tsc — reading its apparent
+                // type — does report through one. ztsc's object-rest type
+                // for a generic receiver is the receiver ITSELF:
+                // `objectRestType` bails on a shape it cannot enumerate
+                // instead of building tsc's `Omit<T, "a">`. So inside
+                // `<T extends { a: string, b: string }>`, the `rest` of
+                // `let { a, ...rest } = obj` still claims to have `a`, and
+                // `{ a: 'hello', ...rest }` collected a false TS2783.
+                // Re-report through type parameters once the rest type
+                // learns to omit.
+                if (c.ts.kind(raw) == .type_param) continue;
+                const st = try c.resolveStructural(raw);
+                switch (c.ts.kind(st)) {
+                    .any, .err, .unknown, .never => continue,
+                    else => {},
+                }
+                for (seen.items) |s| {
+                    // `allow_index = false`: tsc compares against
+                    // `getPropertiesOfType`, which an index signature is not a
+                    // member of — `{ a: 1, ...someRecord }` overwrites nothing
+                    // tsc can name.
+                    const p = (try c.propOfTypeEx(st, s.name, false)) orelse continue;
+                    if (p.optional()) continue;
+                    try c.diagFmt(2783, c.nodeSpan(s.node), "'{s}' is specified more than once, so this usage will be overwritten.", .{
+                        c.atomText(s.name),
+                    });
+                }
+            },
+            // A computed key names no property tsc can compare against the
+            // spread's, so only the statically-keyed forms are tracked.
+            .object_property, .object_method, .object_shorthand => {
+                if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) continue;
+                try seen.append(c.scratch(), .{ .name = try c.memberAtom(c.tree.nodeMainToken(prop)), .node = prop });
+            },
+            else => {},
+        }
+    }
 }
 
 fn objectLiteralWhole(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
@@ -2334,13 +2468,36 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                         // its property key; `computedPropertyNames10`, all
                         // methods, answers nothing at all).
                         // (wave-8 D: one flagged call into `computed_key.zig`.)
-                        {
+                        const kt = blk: {
                             const saved_scope = c.cur_scope;
                             defer c.cur_scope = saved_scope;
                             if (try c.scopeOf(pd.rhs)) |s| c.cur_scope = s;
-                            _ = try computed_key.checkComputedName(c, pd.lhs);
-                        }
-                        _ = try c.checkExprCached(pd.rhs, types.no_type);
+                            break :blk try computed_key.checkComputedName(c, pd.lhs);
+                        };
+                        // tsc's `getContextualTypeForObjectLiteralElement`
+                        // ends with the arm for a member whose name is NOT
+                        // bindable: `mapType(type, t =>
+                        // findApplicableIndexInfo(getIndexInfosOfStructuredType(t),
+                        // getLiteralTypeFromPropertyName(element.name))?.type)`
+                        // — the contextual type's INDEX SIGNATURE that this
+                        // key applies to, exactly as the `key: value` form
+                        // above uses it. `var o: I = { ["" + 0](y) {…} }` with
+                        // `I`'s `[s: string]: (x: string) => number` is what
+                        // gives `y` its type instead of a TS7006.
+                        //
+                        // Gated on the literal HAVING a contextual type, which
+                        // is also why reading the key's type here reports
+                        // nothing tsc does not: `getApparentTypeOfContextualType`
+                        // returns undefined without one, so tsc never reaches
+                        // `getLiteralTypeFromPropertyName` and never evaluates
+                        // a method's key at all (the measurement in the note
+                        // above).
+                        const mctx: TypeId = if (rctx == types.no_type) types.no_type else switch (c.ts.kind(try c.resolveStructural(kt))) {
+                            .string, .string_literal, .template_literal_type, .string_mapping => try ctxIndexType(c, rctx, false),
+                            .number, .number_literal, .number_literal_fresh => try ctxIndexType(c, rctx, true),
+                            else => types.no_type,
+                        };
+                        _ = try c.checkExprCached(pd.rhs, mctx);
                         continue;
                     };
                     key = try c.atom(wk);

@@ -12,6 +12,7 @@ const ast = @import("../frontend/ast.zig");
 const implicit_any = @import("implicit_any.zig");
 const intern = @import("../intern.zig");
 const binder = @import("../frontend/binder.zig");
+const source = @import("../frontend/source.zig");
 const types = @import("../types.zig");
 
 const Node = ast.Node;
@@ -177,14 +178,45 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
         .import_decl => {}, // module graph
         .export_named, .export_all => {},
         .export_decl => try c.checkStatement(d.lhs),
-        .export_default => {
+        .export_default, .export_assign => {
             switch (c.nodeTag(d.lhs)) {
-                .function_decl, .class_decl => try c.checkStatement(d.lhs),
-                else => _ = try c.checkExprCached(d.lhs, types.no_type),
+                // A DECLARATION under `export default` is checked as the
+                // declaration it is. Without the type-space arms here,
+                // `export default interface A { value: number }` fell to
+                // `checkExprCached` and the interface BODY was checked as an
+                // expression — `value: number` read `number` as an
+                // identifier, for a phantom TS2693.
+                .function_decl,
+                .class_decl,
+                .interface_decl,
+                .type_alias,
+                .enum_decl,
+                .namespace_decl,
+                => try c.checkStatement(d.lhs),
+                else => try checkExportTarget(c, d.lhs),
             }
         },
         else => _ = try c.checkExprCached(node, types.no_type),
     }
+}
+
+/// tsc's `checkExportAssignment` for the operand of `export = <expr>` and
+/// `export default <expr>`: a BARE IDENTIFIER there is resolved in ALL
+/// meanings (`resolveEntityName(id, SymbolFlags.All, /*ignoreErrors*/ true)`)
+/// and is only handed to `checkExpressionCached` when the symbol it names
+/// actually has a VALUE meaning — or when it names nothing at all, which is
+/// how `export default nonexistent` still earns its TS2304.
+///
+/// So `export = SomeInterface` and `export default SomeTypeAlias` are legal
+/// export targets, not value-position uses, and neither is TS2693.
+/// Everything that is not a bare identifier is an ordinary expression.
+fn checkExportTarget(c: *Checker, expr: Node) Error!void {
+    if (c.nodeTag(expr) == .identifier) {
+        const a = try c.atomOfToken(c.tree.nodeMainToken(expr));
+        // Type or namespace meaning only: a legal export target, silent.
+        if (c.resolveSpace(a, c.cur_scope, true) == .wrong_space) return;
+    }
+    _ = try c.checkExprCached(expr, types.no_type);
 }
 
 /// tsc's `checkGrammarTopLevelElementsForRequiredDeclareModifier`: inside a
@@ -204,7 +236,16 @@ pub fn checkDeclFileTopLevel(c: *Checker) Error!void {
             .class_decl => !declFlagSet(c, ast.ClassData, stmt),
             .function_decl => !declFlagSet(c, ast.FnProto, stmt),
             .enum_decl => !declFlagSet(c, ast.EnumData, stmt),
-            .namespace_decl => !declFlagSet(c, ast.NamespaceData, stmt),
+            .namespace_decl => blk: {
+                const data = c.tree.extraData(ast.NamespaceData, c.tree.nodeData(stmt).lhs);
+                // A QUOTED-name module is only ever ambient, so the parser
+                // stamps `declare` on it whether or not the source wrote the
+                // modifier — the flag cannot answer for `module "Foo" {}` and
+                // the token stream has to. (`global { }` keeps the flag,
+                // since a global augmentation carries no name to modify.)
+                if (data.flags & ast.Flags.ambient_module != 0) break :blk !precededByDeclare(c, stmt);
+                break :blk data.flags & ast.Flags.declare == 0;
+            },
             else => false,
         };
         if (!needs) continue;
@@ -744,6 +785,19 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
         yield_type = c.generatorYieldType(ann);
         eff_ann = types.no_type;
     }
+    // No contextual fallback for an un-annotated generator's yield type.
+    // tsc's `getContextualIterationType` exists, but taking it here (plus a
+    // union arm in `generatorYieldType`, so
+    // `() => number | Generator<F, any, void>` answers) was measured to buy
+    // nothing and cost one false TS2322: `generatorTypeCheck63`'s
+    // `strategy("Nothing", function*(state: State) { yield 1; … })` earns a
+    // per-yield error ztsc would then report and tsgo does not — tsgo blames
+    // the ARGUMENT (TS2345) and leaves the yield alone. The family this was
+    // meant to fix (`contextualTypeOnYield1/2`, `generatorTypeCheck27-30`) is
+    // blocked elsewhere anyway: the parameters of an arrow written as a yield
+    // operand are typed while the enclosing generator's return type is
+    // INFERRED, and that walk builds its own `fn_ctx` with `yield_type = 0`
+    // in `signatures.zig`. (wave 13 B, measured.)
     // Contextual return type: only meaningful when nothing was written and
     // the function is not a generator. Async unwraps to the payload, as
     // `eff_ann` does for a written `Promise<T>`.
@@ -997,17 +1051,47 @@ fn checkInstanceSideExtends(c: *Checker, class_sym: SymbolId, members: []const N
     // Windowed and bounded — see `relatesToBase`.
     if (try relatesToBase(c, this_t, base_ref)) return true;
 
+    const issued = try issueMemberSpecificError(c, members, this_t, base_ref);
+    if (!issued and name_token != 0) {
+        try c.diagFmt(2415, c.tokSpan(name_token), "Class '{s}' incorrectly extends base class '{s}'.{s}", .{
+            c.symbolName(class_sym),
+            try c.typeToString(base_ref),
+            try elaborate.chainText(c, this_t, base_ref),
+        });
+    }
+    return false;
+}
+
+/// Does an `implements` clause name a CLASS? tsc's `checkClassLikeDeclaration`
+/// reads `t.symbol.flags & SymbolFlags.Class` to choose between TS2720 ("Did
+/// you mean to extend…?") and the plain TS2420, and a class instance type is
+/// exactly the `.ref` whose symbol carries the class flag.
+fn implementsTargetIsClass(c: *Checker, t: TypeId) bool {
+    if (c.ts.kind(t) != .ref) return false;
+    return c.symFlags(c.ts.refSymbol(t)).class;
+}
+
+/// tsc's `issueMemberSpecificError`: when a class fails to relate to its base
+/// class or to an `implements` target, the blame goes to the class's OWN
+/// instance members first. Every name the class and the target BOTH declare
+/// whose property types do not relate reports its own TS2416, and the broad
+/// class-level diagnostic (TS2415 / TS2420 / TS2720) is the caller's to emit
+/// — only when this pass reported nothing, i.e. when the mismatch is in an
+/// index signature, a call signature, or a member the class does not write.
+///
+/// Walks the SYNTAX members, in source order, exactly as tsc's
+/// `for (const member of node.members)` does. That is not just a convenient
+/// way to reach the names: it decides which members are candidates at all. A
+/// CONSTRUCTOR PARAMETER PROPERTY (`constructor(public a: string)`) declares
+/// `a` on the instance type but is not a member node, so tsc never blames it
+/// and reports the broad diagnostic instead — walking the member SCOPE, which
+/// does contain `a`, would report TS2416 where the oracle does not.
+///
+/// Returns whether any member reported.
+fn issueMemberSpecificError(c: *Checker, members: []const Node, this_t: TypeId, target: TypeId) Error!bool {
     const derived = try c.resolveStructural(this_t);
-    const base = try c.resolveStructural(base_ref);
+    const base = try c.resolveStructural(target);
     var issued = false;
-    // The per-member pass walks the SYNTAX members, in source order, exactly
-    // as tsc's `for (const member of node.members)` does. That is not just a
-    // convenient way to reach the names: it decides which members are
-    // candidates at all. A CONSTRUCTOR PARAMETER PROPERTY (`constructor(public
-    // a: string)`) declares `a` on the instance type but is not a member node,
-    // so tsc never blames it and reports the broad TS2415 instead — walking
-    // the member SCOPE, which does contain `a`, would report TS2416 where the
-    // oracle reports TS2415.
     for (members) |member| {
         if (member == null_node) continue;
         const md = c.tree.nodeData(member);
@@ -1035,20 +1119,13 @@ fn checkInstanceSideExtends(c: *Checker, class_sym: SymbolId, members: []const N
         try c.diagFmt(2416, c.tokSpan(c.tree.nodeMainToken(member)), "Property '{s}' in type '{s}' is not assignable to the same property in base type '{s}'.\n  Type '{s}' is not assignable to type '{s}'.{s}", .{
             c.atomText(name_atom),
             try c.typeToString(this_t),
-            try c.typeToString(base_ref),
+            try c.typeToString(target),
             try c.typeToString(prop.ty),
             try c.typeToString(base_prop.ty),
             try indentChain(c, try elaborate.chainText(c, prop.ty, base_prop.ty)),
         });
     }
-    if (!issued and name_token != 0) {
-        try c.diagFmt(2415, c.tokSpan(name_token), "Class '{s}' incorrectly extends base class '{s}'.{s}", .{
-            c.symbolName(class_sym),
-            try c.typeToString(base_ref),
-            try elaborate.chainText(c, this_t, base_ref),
-        });
-    }
-    return false;
+    return issued;
 }
 
 /// One extra indentation level for a derivation chain nested under a headline
@@ -1160,14 +1237,15 @@ const InitCand = struct { member: Node, ty: TypeId };
 ///     isComputedPropertyName(propName)` — so a QUOTED or numeric member name
 ///     (`"quoted": string`) is silently skipped, verified against the oracle.
 ///
-/// A computed name is skipped here rather than reported: ztsc keys such a
-/// member by a placeholder atom (`memberNameKey`) that a `this[k]` write does
-/// not produce, so the flow query could not see the write and would invent a
-/// TS2564. A documented under-report — the alternative manufactures errors.
+/// A COMPUTED name passes this filter (tsc's `isComputedPropertyName` arm) but
+/// is routed to `checkComputedPropertyInit` instead of the flow query: ztsc
+/// keys such a member by a placeholder atom (`memberNameKey`) that a
+/// `this[k] = v` write does not produce, so the flow graph cannot answer for it
+/// and only the syntactic question is safe to ask.
 fn initCandidate(c: *Checker, member: Node, e: ast.Field, ann: TypeId) bool {
     if (e.init != 0) return false;
     const exempt = ast.Flags.definite | ast.Flags.abstract | ast.Flags.declare |
-        ast.Flags.static | ast.Flags.optional | ast.Flags.computed;
+        ast.Flags.static | ast.Flags.optional;
     if (e.flags & exempt != 0) return false;
     switch (c.tree.tokens.tag(c.tree.nodeMainToken(member))) {
         .string_literal, .numeric_literal => return false,
@@ -1417,6 +1495,82 @@ fn checkPropertyInit(c: *Checker, ctor: Node, widened: bool, cands: []const Init
     }
 }
 
+/// TS2564 for a COMPUTED-name property (`[Symbol.unscopables]: number`).
+///
+/// ztsc keys such a member by a placeholder atom that no `this[k] = v` write
+/// reproduces, so `propAssignedInCtor`'s flow query cannot see a write and
+/// would invent the diagnostic. The question it CAN answer is the syntactic,
+/// conservative one: a computed member is only ever written through
+/// `this[…] = …`, so a constructor that performs no such write at all — and
+/// with no constructor there is nothing at all — initializes none of them, and
+/// every candidate reports. One such write anywhere in the body gives up on
+/// the whole class, which is the under-reporting direction.
+///
+/// Anchored and named like tsc's, at `member.name`: the whole `[…]` including
+/// its brackets, which is what `declarationNameToString` renders for a
+/// `ComputedPropertyName`.
+fn checkComputedPropertyInit(c: *Checker, ctor: Node, cands: []const Node) Error!void {
+    if (ctor != null_node and writesComputedThisProp(c, c.tree.nodeData(ctor).rhs)) return;
+    for (cands) |member| {
+        const span = computedNameSpan(c, member) orelse continue;
+        try c.diagFmt(2564, span, "Property '{s}' has no initializer and is not definitely assigned in the constructor.", .{
+            c.src[span.start..span.end],
+        });
+    }
+}
+
+/// The span of a member's computed NAME — tsc's `member.name`, which is the
+/// whole `[…]`, both brackets included, and the text `declarationNameToString`
+/// renders for it.
+///
+/// Two shapes reach here. The ordinary one keeps a `.computed_name` node whose
+/// span runs from the `[` to the end of the key expression. A WELL-KNOWN
+/// symbol name (`[Symbol.iterator]`) keeps none — the parser folds its four
+/// tokens `[ Symbol . <name>` into one synthetic atom and discards the key —
+/// so the `[` is found at its fixed offset from the member's main token, which
+/// for that shape is the `<name>`. Neither span covers the closing `]`, which
+/// is scanned for from just past the key.
+fn computedNameSpan(c: *Checker, member: Node) ?source.Span {
+    var start: u32 = undefined;
+    var after: u32 = undefined;
+    if (c.tree.computedKey(member)) |k| {
+        if (c.nodeTag(k) != .computed_name) return null;
+        const s = c.nodeSpan(k);
+        start = s.start;
+        after = s.end;
+    } else {
+        const tok = c.tree.nodeMainToken(member);
+        if (tok < 3 or c.tree.tokens.tag(tok - 3) != .l_bracket) return null;
+        start = c.tree.tokens.start(tok - 3);
+        after = c.tokSpan(tok).end;
+    }
+    var e = after;
+    while (e < c.src.len and c.src[e] != ']') e += 1;
+    return .{ .start = start, .end = if (e < c.src.len) e + 1 else after };
+}
+
+/// Does `node` contain ANY `this[…] = …` write? Nested function bodies count:
+/// a constructor may call them, and this walk exists to be conservative about
+/// a key it cannot evaluate.
+fn writesComputedThisProp(c: *Checker, node: Node) bool {
+    if (node == null_node) return false;
+    if (c.nodeTag(node) == .assign) {
+        var t = c.tree.nodeData(node).lhs;
+        while (c.nodeTag(t) == .paren_expr) t = c.tree.nodeData(t).lhs;
+        switch (c.nodeTag(t)) {
+            .index_expr, .optional_index_expr => {
+                if (c.nodeTag(c.tree.nodeData(t).lhs) == .this_expr) return true;
+            },
+            else => {},
+        }
+    }
+    var it = c.tree.childIterator(node);
+    while (it.next()) |child| {
+        if (writesComputedThisProp(c, child)) return true;
+    }
+    return false;
+}
+
 /// tsc's `isPropertyInitializedInConstructor`: does every path out of `ctor`
 /// write `this.<name>`? With no constructor at all, nothing was assigned.
 ///
@@ -1640,14 +1794,35 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
             const iface = try c.typeFromTypeName(hd.lhs, targs.items);
             if (iface != types.error_type and iface != types.any_type) {
                 if (!try c.isAssignable(this_t, iface)) {
-                    // tsc anchors the broad TS2420 at the class NAME
-                    // (`issueMemberSpecificError`'s `node.name || node`),
-                    // not at the heritage reference that failed — two
-                    // failing `implements` clauses report twice on the
-                    // same name.
-                    try c.diagFmt(2420, c.tokSpan(data.name_token), "Class '{s}' incorrectly implements interface '{s}'.", .{
-                        c.symbolName(class_sym), try c.typeToString(iface),
-                    });
+                    // Same shape as the `extends` side: the per-member pass
+                    // blames the offending member (TS2416), and the broad
+                    // class-level diagnostic fires only when none did.
+                    const members = c.tree.extraRange(data.members_start, data.members_end);
+                    if (!try issueMemberSpecificError(c, members, this_t, iface) and data.name_token != 0) {
+                        // tsc anchors the broad diagnostic at the class NAME
+                        // (`issueMemberSpecificError`'s `node.name || node`),
+                        // not at the heritage reference that failed — two
+                        // failing `implements` clauses report twice on the
+                        // same name. Which diagnostic it is depends on what
+                        // the clause NAMES: tsc picks
+                        // `Class_0_incorrectly_implements_class_1_Did_you_mean_to_extend_1…`
+                        // when the target symbol is a class, and only
+                        // otherwise the plain "implements interface" form.
+                        if (implementsTargetIsClass(c, iface)) {
+                            try c.diagFmt(2720, c.tokSpan(data.name_token), "Class '{s}' incorrectly implements class '{s}'. Did you mean to extend '{s}' and inherit its members as a subclass?{s}", .{
+                                c.symbolName(class_sym),
+                                try c.typeToString(iface),
+                                try c.typeToString(iface),
+                                try elaborate.chainText(c, this_t, iface),
+                            });
+                        } else {
+                            try c.diagFmt(2420, c.tokSpan(data.name_token), "Class '{s}' incorrectly implements interface '{s}'.{s}", .{
+                                c.symbolName(class_sym),
+                                try c.typeToString(iface),
+                                try elaborate.chainText(c, this_t, iface),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -1672,6 +1847,8 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
         c.owned_mask[c.cur_file];
     var init_cands: std.ArrayList(InitCand) = .empty;
     defer init_cands.deinit(c.scratch());
+    var computed_init_cands: std.ArrayList(Node) = .empty;
+    defer computed_init_cands.deinit(c.scratch());
 
     // Members.
     const members = c.tree.extraRange(data.members_start, data.members_end);
@@ -1720,7 +1897,12 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
                     try implicit_any.reportMemberImplicitAny(c, c.tree.nodeMainToken(member), e.flags);
                 }
                 if (check_prop_init and initCandidate(c, member, e, ann)) {
-                    try init_cands.append(c.scratch(), .{ .member = member, .ty = ann });
+                    // A computed name has no atom the flow graph (or TS2565's
+                    // read walk) can key on — see `checkComputedPropertyInit`.
+                    if (e.flags & ast.Flags.computed != 0)
+                        try computed_init_cands.append(c.scratch(), member)
+                    else
+                        try init_cands.append(c.scratch(), .{ .member = member, .ty = ann });
                 }
                 // A `unique symbol` static-readonly field, like a const,
                 // takes only a fresh `Symbol()` initializer without TS2322.
@@ -1815,7 +1997,7 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
     // needs as well, for the same two reasons (an ambient member emits no
     // field; a foreign file's flow is never built).
     const wants_2612 = class_sym != binder.no_symbol and check_prop_init and data.extends != 0;
-    if (init_cands.items.len != 0 or wants_2612) {
+    if (init_cands.items.len != 0 or computed_init_cands.items.len != 0 or wants_2612) {
         c.this_type = this_t;
         const ctor = constructorWithBody(c, members);
         const ctor_body = if (ctor == null_node) null_node else c.tree.nodeData(ctor).rhs;
@@ -1824,6 +2006,9 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
         if (init_cands.items.len != 0) {
             try checkPropertyInit(c, ctor, widened, init_cands.items);
             if (ctor != null_node) try checkPropertyUseBeforeAssigned(c, ctor_body, widened, init_cands.items);
+        }
+        if (computed_init_cands.items.len != 0) {
+            try checkComputedPropertyInit(c, ctor, computed_init_cands.items);
         }
         if (wants_2612) {
             try heritage.checkBasePropertyOverwrites(c, class_sym, this_t, members, ctor, widened);
