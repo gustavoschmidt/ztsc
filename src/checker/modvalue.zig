@@ -151,7 +151,46 @@ fn nonInstantiatedBlock(tree: *const ast.Ast, node: Node, depth: u8) bool {
 /// Value type of an import binding, via the sealed link tables.
 pub fn importedSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
     const tgt = c.importTarget(sym) orelse return types.any_type; // unlinked
+    if (tgt.kind == .any) try reportNamespaceRequireMiss(c, sym);
     return c.targetValueType(tgt);
+}
+
+/// TS2307 for `import x = require("missing")` written inside a PLAIN namespace,
+/// reported at the first READ of the alias.
+///
+/// The link phase declines that specifier on purpose (`reportUnresolvedIn`): an
+/// import naming a module in a namespace body is a grammar error (TS1147), and
+/// tsc's `checkExternalImportOrExportDeclaration` returns before resolving it,
+/// so a TS2307 at the declaration would be a cascade tsc does not emit. What
+/// tsc *does* do is resolve the alias when something reads it (`resolveAlias`)
+/// and report there — measured: the same declaration with no use of `x` earns
+/// TS1147 alone, and with a use earns both, at the specifier either way
+/// (`importInsideModule`). Reads after the first are deduplicated by span.
+fn reportNamespaceRequireMiss(c: *Checker, sym: SymbolId) Error!void {
+    // `diagFmt` files against the CURRENT file, and the scope/declaration
+    // lookups below read the current file's tables: a demand that has not
+    // entered the alias's own file says nothing rather than the wrong thing.
+    if (c.symFile(sym) != c.cur_file) return;
+    if (!plainNamespaceScope(c, c.symScope(sym))) return;
+    for (c.declsOf(sym)) |decl| {
+        if (c.nodeTag(decl) != .import_equals) continue;
+        const e = c.tree.extraData(ast.ImportEquals, c.tree.nodeData(decl).lhs);
+        if (e.module_token == 0) continue;
+        try c.reportModuleNotFound(e.module_token);
+    }
+}
+
+/// Is `scope` the body of a plain `namespace`/`module` block — as opposed to a
+/// file's top level or a `declare module "spec"` / `declare global` block,
+/// which are ambient MODULES and do take module syntax? The binder's
+/// `inPlainNamespaceBody` asks the same question of its unsealed arrays.
+fn plainNamespaceScope(c: *const Checker, scope: binder.ScopeId) bool {
+    if (scope == binder.file_scope) return false;
+    if (c.bind.scope_kinds[scope] != .namespace) return false;
+    const owner = c.bind.scope_owners[scope];
+    if (owner == null_node or c.tree.nodeTag(owner) != .namespace_decl) return false;
+    const data = c.tree.extraData(ast.NamespaceData, c.tree.nodeData(owner).lhs);
+    return data.flags & (ast.Flags.ambient_module | ast.Flags.global_aug) == 0;
 }
 
 /// The VALUE half of a `.dual` binding, or null when it turns out not to exist.

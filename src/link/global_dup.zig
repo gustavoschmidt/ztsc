@@ -48,39 +48,77 @@ const SymbolFlags = bind_result.SymbolFlags;
 
 const Error = error{OutOfMemory};
 
+/// What a failed merge is, in tsc's two flavours. Both name the SOURCE — the
+/// contributor that failed to fold into the accumulated target — because the
+/// two reports need it differently: the duplicate is reported at every
+/// declaration of every contributor, TS2649 only at the source's first one.
+pub const Clash = union(enum) {
+    /// tsc's duplicate-identifier arm: `code` at every declaration of every
+    /// contributor.
+    duplicate: Code,
+    /// tsc's `SymbolFlags.NamespaceModule` arm: TS2649 ("cannot augment module
+    /// 'A' … non-module entity") once, at the first declaration name of the
+    /// contributor at this index.
+    augment_non_module: u32,
+};
+
 /// The clash among the contributors of ONE global name, in merge order, or null
-/// when they all merge. Pure: flags in, diagnostic code out.
+/// when they all merge. Pure: flags in, verdict out.
 ///
 /// `flags[0]` is the merge target (the first visit of the name, which tsc's
 /// `mergeSymbolTable` keeps as the target for every later one); each later
 /// contributor is merged into the accumulated target the way `mergeSymbol`
 /// does, and a contributor whose merge FAILS is not folded in — tsc leaves the
 /// target untouched on the error path.
-pub fn mergeClash(flags: []const SymbolFlags) ?Code {
+pub fn mergeClash(flags: []const SymbolFlags) ?Clash {
     if (flags.len < 2) return null;
     var acc = flags[0];
-    for (flags[1..]) |f| {
+    for (flags[1..], 1..) |f, i| {
         if (bind_result.effectiveBits(acc) & bind_result.excludesOfFlags(f) != 0) {
             // tsc's `mergeSymbol` takes a DIFFERENT arm before the duplicate
-            // one when the target carries `SymbolFlags.NamespaceModule` — a
-            // namespace whose every block is type-only. That arm reports
-            // TS2649 ("cannot augment module 'A' … non-module entity") on the
-            // source, or nothing at all for `globalThis`; either way the name
-            // is not a duplicate. `interface A {} namespace A {}` in one file
-            // beside `type A = {}` in another is exactly that shape.
-            if (acc.ns_uninstantiated) return null;
+            // one when the TARGET carries `SymbolFlags.NamespaceModule` — a
+            // namespace whose every block is type-only. The name is not a
+            // duplicate then; the source is trying to augment a non-module
+            // entity. `interface A {} namespace A {}` in one file beside `type
+            // A = {}` in another is exactly that shape (`noSymbolForMergeCrash`).
+            if (acc.ns_uninstantiated) return .{ .augment_non_module = @intCast(i) };
             // tsc's `mergeSymbol` message order, which reads BOTH sides (unlike
             // `declareSymbol`, which reads the existing symbol alone): an `enum`
             // anywhere in the failing pair, then a block-scoped variable
             // anywhere in it, then the plain duplicate. `class` is not one of
             // tsc's `SymbolFlags.BlockScopedVariable` bits here either.
-            if (acc.enum_decl or f.enum_decl) return .enum_merge_conflict;
-            if (acc.let_decl or acc.const_decl or f.let_decl or f.const_decl) return .block_scoped_redeclare;
-            return .duplicate_identifier;
+            if (acc.enum_decl or f.enum_decl) return .{ .duplicate = .enum_merge_conflict };
+            if (acc.let_decl or acc.const_decl or f.let_decl or f.const_decl)
+                return .{ .duplicate = .block_scoped_redeclare };
+            return .{ .duplicate = .duplicate_identifier };
         }
         acc = acc.merge(f);
     }
     return null;
+}
+
+/// TS2649, at the name of `source`'s FIRST declaration — tsc reports it once,
+/// on `source.declarations[0]`, not at every declaration the way the duplicate
+/// arm does. A declaration with no single-identifier name is skipped, as in
+/// `reportAll`.
+pub fn reportAugmentNonModule(
+    arena: Allocator,
+    diags: []std.ArrayList(LinkDiag),
+    src: Contributor,
+    name: []const u8,
+) Error!void {
+    const decl = if (src.decls.len != 0) src.decls[0] else return;
+    const tok = src.tree.declNameToken(decl) orelse return;
+    const start = src.tree.tokens.start(tok);
+    try diags[src.file].append(arena, .{
+        .code = 2649,
+        .span = .{ .start = start, .end = scanner.tokenEnd(src.src, src.tree.tokens.tag(tok), start) },
+        .msg = try std.fmt.allocPrint(
+            arena,
+            "Cannot augment module '{s}' with value exports because it resolves to a non-module entity.",
+            .{name},
+        ),
+    });
 }
 
 /// The member-space bits of a symbol: which KIND of interface/class member it
@@ -257,46 +295,52 @@ test "mergeClash: the pairs tsc merges across files, and the codes it picks" {
     const clash = mergeClash;
     // Legal declaration merging: interface+interface, class+interface,
     // var+var, namespace+anything, function overloads, enum+enum.
-    try t.expectEqual(@as(?Code, null), clash(&.{ .{ .interface = true }, .{ .interface = true } }));
-    try t.expectEqual(@as(?Code, null), clash(&.{ .{ .class = true }, .{ .interface = true } }));
-    try t.expectEqual(@as(?Code, null), clash(&.{ .{ .interface = true }, .{ .class = true } }));
-    try t.expectEqual(@as(?Code, null), clash(&.{ .{ .var_decl = true }, .{ .var_decl = true } }));
-    try t.expectEqual(@as(?Code, null), clash(&.{ .{ .namespace_decl = true }, .{ .class = true } }));
-    try t.expectEqual(@as(?Code, null), clash(&.{ .{ .function = true }, .{ .function = true } }));
-    try t.expectEqual(@as(?Code, null), clash(&.{ .{ .enum_decl = true }, .{ .enum_decl = true } }));
+    try t.expectEqual(@as(?Clash, null), clash(&.{ .{ .interface = true }, .{ .interface = true } }));
+    try t.expectEqual(@as(?Clash, null), clash(&.{ .{ .class = true }, .{ .interface = true } }));
+    try t.expectEqual(@as(?Clash, null), clash(&.{ .{ .interface = true }, .{ .class = true } }));
+    try t.expectEqual(@as(?Clash, null), clash(&.{ .{ .var_decl = true }, .{ .var_decl = true } }));
+    try t.expectEqual(@as(?Clash, null), clash(&.{ .{ .namespace_decl = true }, .{ .class = true } }));
+    try t.expectEqual(@as(?Clash, null), clash(&.{ .{ .function = true }, .{ .function = true } }));
+    try t.expectEqual(@as(?Clash, null), clash(&.{ .{ .enum_decl = true }, .{ .enum_decl = true } }));
     // A non-instantiated namespace excludes nothing and is excluded by nothing.
-    try t.expectEqual(@as(?Code, null), clash(&.{
+    try t.expectEqual(@as(?Clash, null), clash(&.{
         .{ .namespace_decl = true, .ns_uninstantiated = true },
         .{ .const_decl = true },
     }));
     // Single contributor: never a duplicate, whatever it is.
-    try t.expectEqual(@as(?Code, null), clash(&.{.{ .let_decl = true }}));
+    try t.expectEqual(@as(?Clash, null), clash(&.{.{ .let_decl = true }}));
     // A target carrying tsc's `NamespaceModule` takes its own `mergeSymbol` arm
-    // (TS2649), never the duplicate one: `interface A {} namespace A {}` in one
-    // file beside `type A = {}` in another.
-    try t.expectEqual(@as(?Code, null), clash(&.{
+    // (TS2649 on the SOURCE), never the duplicate one: `interface A {}
+    // namespace A {}` in one file beside `type A = {}` in another.
+    try t.expectEqual(@as(?Clash, .{ .augment_non_module = 1 }), clash(&.{
         .{ .interface = true, .namespace_decl = true, .ns_uninstantiated = true },
         .{ .type_alias = true },
     }));
+    // The index is the failing SOURCE's, whichever contributor that is.
+    try t.expectEqual(@as(?Clash, .{ .augment_non_module = 2 }), clash(&.{
+        .{ .interface = true, .namespace_decl = true, .ns_uninstantiated = true },
+        .{ .interface = true },
+        .{ .type_alias = true },
+    }));
     // The three messages.
-    try t.expectEqual(@as(?Code, .duplicate_identifier), clash(&.{ .{ .class = true }, .{ .class = true } }));
-    try t.expectEqual(@as(?Code, .duplicate_identifier), clash(&.{ .{ .type_alias = true }, .{ .type_alias = true } }));
-    try t.expectEqual(@as(?Code, .block_scoped_redeclare), clash(&.{ .{ .let_decl = true }, .{ .let_decl = true } }));
+    try t.expectEqual(@as(?Clash, .{ .duplicate = .duplicate_identifier }), clash(&.{ .{ .class = true }, .{ .class = true } }));
+    try t.expectEqual(@as(?Clash, .{ .duplicate = .duplicate_identifier }), clash(&.{ .{ .type_alias = true }, .{ .type_alias = true } }));
+    try t.expectEqual(@as(?Clash, .{ .duplicate = .block_scoped_redeclare }), clash(&.{ .{ .let_decl = true }, .{ .let_decl = true } }));
     // Block-scoped on EITHER side (tsc's `mergeSymbol`, unlike `declareSymbol`).
-    try t.expectEqual(@as(?Code, .block_scoped_redeclare), clash(&.{ .{ .var_decl = true }, .{ .let_decl = true } }));
-    try t.expectEqual(@as(?Code, .block_scoped_redeclare), clash(&.{ .{ .let_decl = true }, .{ .var_decl = true } }));
-    try t.expectEqual(@as(?Code, .enum_merge_conflict), clash(&.{ .{ .enum_decl = true }, .{ .var_decl = true } }));
-    try t.expectEqual(@as(?Code, .enum_merge_conflict), clash(&.{ .{ .var_decl = true }, .{ .enum_decl = true } }));
+    try t.expectEqual(@as(?Clash, .{ .duplicate = .block_scoped_redeclare }), clash(&.{ .{ .var_decl = true }, .{ .let_decl = true } }));
+    try t.expectEqual(@as(?Clash, .{ .duplicate = .block_scoped_redeclare }), clash(&.{ .{ .let_decl = true }, .{ .var_decl = true } }));
+    try t.expectEqual(@as(?Clash, .{ .duplicate = .enum_merge_conflict }), clash(&.{ .{ .enum_decl = true }, .{ .var_decl = true } }));
+    try t.expectEqual(@as(?Clash, .{ .duplicate = .enum_merge_conflict }), clash(&.{ .{ .var_decl = true }, .{ .enum_decl = true } }));
     // An enum beats a block-scoped variable in the same failing pair.
-    try t.expectEqual(@as(?Code, .enum_merge_conflict), clash(&.{ .{ .const_decl = true }, .{ .enum_decl = true } }));
+    try t.expectEqual(@as(?Clash, .{ .duplicate = .enum_merge_conflict }), clash(&.{ .{ .const_decl = true }, .{ .enum_decl = true } }));
     // Three contributors: the first two merge, the third clashes with the fold.
-    try t.expectEqual(@as(?Code, .duplicate_identifier), clash(&.{
+    try t.expectEqual(@as(?Clash, .{ .duplicate = .duplicate_identifier }), clash(&.{
         .{ .var_decl = true },
         .{ .var_decl = true },
         .{ .class = true },
     }));
     // ...and a third that merges with the fold is still no error.
-    try t.expectEqual(@as(?Code, null), clash(&.{
+    try t.expectEqual(@as(?Clash, null), clash(&.{
         .{ .interface = true },
         .{ .interface = true },
         .{ .class = true },

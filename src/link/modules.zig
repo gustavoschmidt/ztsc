@@ -51,6 +51,7 @@ const ast = @import("../frontend/ast.zig");
 const scanner = @import("../frontend/scanner.zig");
 const parser = @import("../frontend/parser.zig");
 const binder = @import("../frontend/binder.zig");
+const bind_result = @import("../frontend/bind_result.zig");
 const decl_spaces = @import("../frontend/decl_spaces.zig");
 const diagnostics = @import("../frontend/diagnostics.zig");
 const intern = @import("../intern.zig");
@@ -403,7 +404,7 @@ pub fn link(
     // every file's harvest slice and every `declare module` augmentation of a
     // resolved real module. Needs the sealed export tables (`out`).
     const sym_base = try computeSymBase(arena, files);
-    const gm = try mergeGlobals(arena, scratch, files, sym_base, out, l.atom_export_equals, umds, l.diags);
+    const gm = try mergeGlobals(arena, scratch, files, sym_base, out, l.atom_export_equals, umds, .{ .diags = l.diags, .io = l.io, .interner = l.interner });
     for (0..files.len) |i| out[i].diags = try arena.dupe(LinkDiag, l.diags[i].items);
 
     // Seal the ambient module export tables in registry order, so
@@ -739,7 +740,14 @@ fn reportUmdGlobalMemberDups(
                 globalSymFlags(files, sym_base, real),
                 globalSymFlags(files, sym_base, mine),
             };
-            const code = global_dup.mergeClash(&flags) orelse continue;
+            const code = switch (global_dup.mergeClash(&flags) orelse continue) {
+                .duplicate => |c| c,
+                // The `NamespaceModule` arm's TS2649 is reported for the
+                // top-level global merge alone, where the oracle pins it
+                // (`reportGlobalDup`); a member-table target that takes it
+                // stays silent rather than guessing a second position.
+                .augment_non_module => continue,
+            };
             try reportContributors(arena, scratch, diags, files, sym_base, &.{ real, mine }, code);
         }
     }
@@ -774,19 +782,34 @@ fn chainReals(scratch: Allocator, chain: []const ChainLink) Error![]const u32 {
     return out[0..n];
 }
 
-/// One global name's contributors, checked for a merge tsc rejects and reported
-/// at every declaration of every contributor. The verdict and the reporting are
-/// global_dup.zig's; this is the bridge that turns program ids into the (flags,
-/// declarations) views it works on.
+/// Where the global merge files its diagnostics, plus what spelling a name in
+/// one takes. Bundled so `mergeGlobals` carries "report or not" as a single
+/// optional parameter rather than three.
+const DupSink = struct {
+    diags: []std.ArrayList(LinkDiag),
+    io: Io,
+    interner: *Interner,
+
+    fn text(s: DupSink, a: Atom) []const u8 {
+        return if (a == 0) "" else s.interner.lookup(s.io, a);
+    }
+};
+
+/// One global name's contributors, checked for a merge tsc rejects. The verdict
+/// and the reporting are global_dup.zig's; this is the bridge that turns
+/// program ids into the (flags, declarations) views it works on.
 fn reportGlobalDup(
     arena: Allocator,
     scratch: Allocator,
-    diags: []std.ArrayList(LinkDiag),
+    sink: DupSink,
     files: []const ProgFile,
     sym_base: []const u32,
     parts: []const u32,
     umds: []const umd.Global,
+    /// The merged name, for TS2649's message.
+    name: Atom,
 ) Error!void {
+    const diags = sink.diags;
     if (parts.len + umds.len < 2) return;
     const chain = try buildChain(scratch, files, sym_base, parts, umds);
     if (chain.len < 2) return;
@@ -802,7 +825,7 @@ fn reportGlobalDup(
             .umd => .{ .namespace_decl = true },
         };
     }
-    const code = global_dup.mergeClash(flags) orelse {
+    const clash = global_dup.mergeClash(flags) orelse {
         // The name itself merges. When it merges as an INTERFACE, tsc goes on to
         // merge the blocks' member tables, where a member-kind clash is its own
         // duplicate — `interface TopLevel { duplicate1: () => string }` in one
@@ -823,7 +846,29 @@ fn reportGlobalDup(
         }
         return;
     };
-    try reportChain(arena, scratch, diags, files, sym_base, chain, code);
+    switch (clash) {
+        .duplicate => |code| try reportChain(arena, scratch, diags, files, sym_base, chain, code),
+        // tsc's `mergeSymbol` reports this one on the SOURCE alone, at its
+        // first declaration's name — and says nothing at all when the target
+        // is `globalThis`, which is in the global table like any other name.
+        .augment_non_module => |i| {
+            const p = switch (chain[i]) {
+                .real => |r| r,
+                // A UMD entry is an alias to a module symbol, never a
+                // declaration this message can point at.
+                .umd => return,
+            };
+            const text = sink.text(name);
+            if (std.mem.eql(u8, text, "globalThis")) return;
+            const fid = fileOfGlobal(sym_base, files.len, p);
+            try global_dup.reportAugmentNonModule(arena, diags, .{
+                .file = fid,
+                .tree = files[fid].tree,
+                .src = files[fid].src,
+                .decls = files[fid].bind.declsOf(p - sym_base[fid]),
+            }, text);
+        },
+    }
 }
 
 /// Report `code` at every declaration of every link of `chain`.
@@ -1220,6 +1265,92 @@ const NsSplitWalker = struct {
 /// target is not a plain `.binding` — a namespace object, a property of an
 /// `export =` value — names no symbol whose flags could be judged, so it is
 /// skipped rather than guessed at.
+/// TS2649 for a `declare module "spec" { … }` block whose target module is
+/// `export = <entity>` and that entity is not a namespace.
+///
+///     // node_modules/lib/index.d.ts        // @types/lib-extender/index.d.ts
+///     declare var lib: () => void;          declare module "lib" {
+///     declare namespace lib {}                  export function fn(): void;
+///     export = lib;                         }
+///
+/// This is `mergeSymbol` again — the very arm `mergeClash` already models — one
+/// table over: tsc's `mergeModuleAugmentation` folds the block's exports into
+/// the module's, and the module's symbol here is what `export = lib` resolves
+/// to, a `var` merged with a type-only namespace. The block carries value
+/// exports, that `var` is in the way, and the target's `NamespaceModule` bit
+/// picks the augment-a-non-module message over the duplicate one — at the
+/// block's module NAME, which is where tsc puts `source.declarations[0]`
+/// (`augmentExportEquals7`).
+///
+/// Only the `export =` shape can reach it: a plain ES module's own symbol is a
+/// `ValueModule`, which merges with the block by definition.
+fn reportAugmentNonModule(
+    arena: Allocator,
+    sink: DupSink,
+    files: []const ProgFile,
+    sym_base: []const u32,
+    links: []const FileLinks,
+    export_equals_atom: Atom,
+) Error!void {
+    if (links.len != files.len) return; // unlinked path: no export tables
+    for (files, 0..) |*f, fi| {
+        const b = f.bind;
+        // A `declare module` is an augmentation only in a module context; in a
+        // script it is a standalone ambient module and augments nothing.
+        if (!b.is_module or b.ambient_modules.len == 0) continue;
+        var reported_spec: Atom = 0;
+        for (b.ambient_modules) |am| {
+            if (am.spec == reported_spec) continue; // one report per specifier
+            const mfile = f.specs.get(am.spec) orelse continue; // unresolved
+            const exeq = links[mfile].exportTarget(export_equals_atom) orelse continue;
+            if (exeq.kind != .binding) continue;
+            const target = globalSymFlags(files, sym_base, sym_base[exeq.file] + exeq.payload);
+            // The block as tsc's source symbol: a `ValueModule` when it exports
+            // any value, a `NamespaceModule` (which excludes nothing, so it
+            // never clashes) when it is types all the way down.
+            const block: binder.SymbolFlags = .{
+                .namespace_decl = true,
+                .ns_uninstantiated = !blockHasValueExport(b, am),
+            };
+            switch (global_dup.mergeClash(&.{ target, block }) orelse continue) {
+                .augment_non_module => {},
+                // The plain duplicate arm names declarations on both sides and
+                // is `reportAugmentationExportDups`'s per-NAME business, not
+                // this whole-module one.
+                .duplicate => continue,
+            }
+            const owner = b.scope_owners[am.scope];
+            if (owner == ast.null_node or f.tree.nodeTag(owner) != .namespace_decl) continue;
+            const tok = f.tree.extraData(ast.NamespaceData, f.tree.nodeData(owner).lhs).name_token;
+            if (tok == 0) continue;
+            const start = f.tree.tokens.start(tok);
+            reported_spec = am.spec;
+            try sink.diags[fi].append(arena, .{
+                .code = 2649,
+                .span = .{ .start = start, .end = scanner.tokenEnd(f.src, f.tree.tokens.tag(tok), start) },
+                .msg = try std.fmt.allocPrint(
+                    arena,
+                    "Cannot augment module '{s}' with value exports because it resolves to a non-module entity.",
+                    .{sink.text(am.spec)},
+                ),
+            });
+        }
+    }
+}
+
+/// Does an augmentation block export anything with a VALUE meaning? That is
+/// what makes its symbol tsc's `ValueModule` rather than `NamespaceModule`.
+fn blockHasValueExport(b: *const Bind, am: binder.AmbientModule) bool {
+    const lo = b.scope_members_start[am.scope];
+    const hi = b.scope_members_start[am.scope + 1];
+    for (lo..hi) |i| {
+        const f = b.symbol_flags[b.member_syms[i]];
+        if (!f.exported) continue;
+        if (bind_result.effectiveBits(f) & bind_result.mask_value != 0) return true;
+    }
+    return false;
+}
+
 fn reportAugmentationExportDups(
     arena: Allocator,
     scratch: Allocator,
@@ -1278,7 +1409,12 @@ fn reportAugmentationExportDups(
         @memcpy(parts[1..], augs);
         const flags = try scratch.alloc(binder.SymbolFlags, parts.len);
         for (parts, 0..) |p, i| flags[i] = globalSymFlags(files, sym_base, p);
-        const code = global_dup.mergeClash(flags) orelse continue;
+        const code = switch (global_dup.mergeClash(flags) orelse continue) {
+            .duplicate => |c| c,
+            // See `reportUmdGlobalMemberDups`: TS2649 belongs to the top-level
+            // global merge only.
+            .augment_non_module => continue,
+        };
         try reportContributors(arena, scratch, diags, files, sym_base, parts, code);
     }
 }
@@ -1425,10 +1561,10 @@ fn mergeGlobals(
     /// The program's `export as namespace X` declarations, sorted by name (see
     /// umd.zig). They join the global merge chain of the name they publish.
     umds: []const umd.Global,
-    /// Per-file diagnostic lists for the cross-file duplicate declarations the
-    /// merge finds (`global_dup.zig`), or null for a caller with no diagnostic
+    /// Where the cross-file duplicate declarations the merge finds
+    /// (`global_dup.zig`) are filed, or null for a caller with no diagnostic
     /// surface (`buildGlobals`, which builds a table for tests/tools).
-    dup_diags: ?[]std.ArrayList(LinkDiag),
+    dup_diags: ?DupSink,
 ) Error!GlobalMerge {
     // Accumulate name -> constituent global ids in the merge order
     // `eachGlobalDecl` documents.
@@ -1485,15 +1621,15 @@ fn mergeGlobals(
             // fold itself is unchanged (the merged symbol still carries the OR
             // of every contributor's flags, so a duplicate name still resolves).
             if (dup_diags) |ds| {
-                try reportGlobalDup(arena, scratch, ds, files, sym_base, parts, us);
+                try reportGlobalDup(arena, scratch, ds, files, sym_base, parts, us, atom);
                 // …the same merge, judged by tsc's other cross-file rule: a
                 // namespace that merges with a class or function in a
                 // DIFFERENT file (TS2433), at every nesting depth.
-                try reportNamespaceSplit(arena, scratch, ds, files, sym_base, parts, 0);
+                try reportNamespaceSplit(arena, scratch, ds.diags, files, sym_base, parts, 0);
                 // …and, when the name merged INTO a module, the member tables
                 // that merge with it.
                 if (umdMergeTarget(chain)) |uf| {
-                    try reportUmdGlobalMemberDups(arena, scratch, ds, files, sym_base, &links[uf], chain);
+                    try reportUmdGlobalMemberDups(arena, scratch, ds.diags, files, sym_base, &links[uf], chain);
                 }
             }
         }
@@ -1503,12 +1639,16 @@ fn mergeGlobals(
     // The same member-kind duplicate check for the blocks of one ambient module
     // (or one module augmentation), which never pass through the global name
     // merge above: they live in their own block scopes.
-    if (dup_diags) |ds| try reportAmbientMemberDups(arena, scratch, ds, files, sym_base);
+    if (dup_diags) |ds| try reportAmbientMemberDups(arena, scratch, ds.diags, files, sym_base);
 
     // …and the export table of a real module against the `declare module
     // "spec" { … }` blocks that augment it, which is the same `mergeSymbol`
     // again — one more table, not one more rule.
-    if (dup_diags) |ds| try reportAugmentationExportDups(arena, scratch, ds, files, sym_base, links, export_equals_atom);
+    if (dup_diags) |ds| try reportAugmentationExportDups(arena, scratch, ds.diags, files, sym_base, links, export_equals_atom);
+
+    // …and the whole-module version of the same merge: a block augmenting a
+    // module whose `export =` entity is not a namespace at all.
+    if (dup_diags) |ds| try reportAugmentNonModule(arena, ds, files, sym_base, links, export_equals_atom);
 
     // Cross-file module augmentation merge: fold a `declare module
     // "spec" { interface I { … } }` block (in a MODULE-context file) into the
