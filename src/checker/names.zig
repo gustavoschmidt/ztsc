@@ -32,6 +32,20 @@ pub fn hasValueMeaning(f: binder.SymbolFlags) bool {
     // declaration merged into it still carries its own value meaning
     // (`import type { A } from "./z"; const A = 0;` is a value `A`).
     if (f.import_binding and !f.type_only) return true;
+    return hasOwnValueMeaning(f);
+}
+
+/// The value meaning a symbol carries through its OWN declarations, with any
+/// import binding merged into it ignored.
+///
+/// tsc's `getTypeOfSymbol` tests `Alias` LAST — after Variable/Property,
+/// Function/Class/Enum/ValueModule, EnumMember and Accessor — and
+/// `checkIdentifier` likewise never resolves an alias whose merged symbol
+/// already answers the value meaning out of its own declarations. So for
+/// `import { A } from "./a"; const A = 0;` the local `const` is what `A`
+/// means as a value; the alias only decides the TYPE meaning. This predicate
+/// is that "the merged symbol answers on its own" test.
+pub fn hasOwnValueMeaning(f: binder.SymbolFlags) bool {
     return f.var_decl or f.let_decl or f.const_decl or f.function or f.class or
         f.param or f.catch_param or f.enum_decl or f.namespace_decl or
         f.enum_member;

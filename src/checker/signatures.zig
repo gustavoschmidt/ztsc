@@ -34,6 +34,7 @@ const containsTypeParam = @import("enums.zig").containsTypeParam;
 const destructure = @import("destructure.zig");
 const finalizeInferredReturn = @import("names.zig").finalizeInferredReturn;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
+const hasOwnValueMeaning = @import("names.zig").hasOwnValueMeaning;
 const implicit_any = @import("implicit_any.zig");
 const modvalue = @import("modvalue.zig");
 const narrowByCondition = @import("flow.zig").narrowByCondition;
@@ -1275,7 +1276,14 @@ fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
         return types.any_type;
     }
     const f = c.symFlags(sym);
-    if (f.import_binding) return importedSymbolType(c, sym);
+    // tsc's `getTypeOfSymbol` tests `Alias` LAST, after every declaration
+    // form below. A merged `import { A } from "./a"; const A = 0;` is the
+    // local `const` as a value — the alias only supplies the TYPE meaning —
+    // so the alias arm yields to any own value meaning (`hasOwnValueMeaning`).
+    // Kept HERE rather than moved past the `enterSymFile` below because
+    // `importedSymbolType`'s TS2307 report is gated on the alias's own file
+    // being the current one.
+    if (f.import_binding and !hasOwnValueMeaning(f)) return importedSymbolType(c, sym);
     // A namespace is a value object of its exported members, modeled as a
     // `class_value` anchored to the namespace symbol (so it prints
     // `typeof N` and resolves members via classStaticType). When merged

@@ -238,8 +238,15 @@ fn checkExportTarget(c: *Checker, expr: Node, is_export_equals: bool) Error!void
             .wrong_space => return,
             // `SymbolFlags.All` includes the namespace meaning, so a namespace
             // that emits no runtime object is a legal export target too — the
-            // value-position TS2708 does not apply here.
-            .sym => |sym| if (try modvalue.valuelessNamespaceRef(c, sym, c.symFlags(sym))) return,
+            // value-position TS2708 does not apply here. An import binding is
+            // RESOLVED (tsc's `resolveEntityName` follows the alias): one whose
+            // target is a pure type is a legal export target as well, not the
+            // value-position TS2693 (`exportDefaultImportedType`).
+            .sym => |sym| {
+                const sf = c.symFlags(sym);
+                if (try modvalue.valuelessNamespaceRef(c, sym, sf)) return;
+                if (try modvalue.aliasValueVerdict(c, sym, sf) == .type_target) return;
+            },
             .none => {},
         }
     }

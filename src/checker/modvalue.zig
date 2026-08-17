@@ -28,7 +28,8 @@ const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 const FileId = checker_zig.FileId;
 
-const hasValueMeaning = @import("names.zig").hasValueMeaning;
+const names = @import("names.zig");
+const hasValueMeaning = names.hasValueMeaning;
 
 /// tsc's `checkAndReportErrorForUsingNamespaceAsTypeOrValue`, value half:
 /// does this name denote a NON-INSTANTIATED namespace and nothing else?
@@ -146,6 +147,62 @@ fn nonInstantiatedBlock(tree: *const ast.Ast, node: Node, depth: u8) bool {
         }
     }
     return true;
+}
+
+/// Does an exported BINDING contribute a member to a module namespace object
+/// (`typeof import("m")`, `import * as ns`)?
+///
+/// tsc's `SymbolFlags.Value` test on the export. Beyond the flag screen it
+/// takes in the non-instantiated namespace: `export namespace Baz { export
+/// interface J {} }` emits no runtime object, so tsc gives it `NamespaceModule`
+/// rather than `ValueModule` and the module's namespace object has no `Baz`
+/// property at all — an object literal that omits it is complete, not a TS2741
+/// (`importTypeLocal`, `importTypeAmbient`, `importTypeGenericTypes`).
+fn bindingHasValue(c: *const Checker, g: SymbolId) bool {
+    return hasValueMeaning(c.symFlags(g)) and !valuelessNamespace(c, g);
+}
+
+/// Does a VALUE-position reference through an import binding have a value to
+/// refer to, and if not, why not?
+pub const AliasValueVerdict = enum {
+    /// Not an alias at all, or one whose target really is a value — and the
+    /// verdict for any merged symbol that already answers the value meaning
+    /// out of its own declarations, whose alias is never consulted.
+    has_value,
+    /// The alias names something with only a TYPE meaning: TS2693 in an
+    /// expression, but a legal `export =` / `export default` target.
+    type_target,
+    /// The alias reaches a value through an `export type { … }` re-export,
+    /// which strips the value meaning at the boundary: TS1362.
+    export_type,
+};
+
+/// tsc's `resolveAlias` + value-meaning test for a name that resolved to an
+/// import binding. Shared by the value-expression identifier arm (which turns
+/// the verdict into a diagnostic) and by `export =` / `export default`, whose
+/// operand tsc resolves in `SymbolFlags.All` and leaves alone when the alias
+/// has no value meaning.
+///
+/// The alias is consulted only when the merged symbol has no value meaning OF
+/// ITS OWN: tsc resolves the name in the Value meaning and stops at the symbol
+/// it finds, so a local `const X` merged with a type-only `import { X }` is a
+/// perfectly good value `X` (`symbolMergeValueAndImportedType`).
+pub fn aliasValueVerdict(c: *Checker, sym: SymbolId, f: binder.SymbolFlags) Error!AliasValueVerdict {
+    if (!f.import_binding or names.hasOwnValueMeaning(f)) return .has_value;
+    const tgt0 = c.importTarget(sym) orelse return .has_value;
+    // A dual binding (tsc's combined value-and-type symbol) has a value
+    // meaning as long as the export-assigned value's type really does carry
+    // the property; when it does not, only the member's meanings are left and
+    // the type-only verdict applies to it.
+    const tgt = if (try c.dualHasValue(tgt0)) tgt0 else c.typeMeaningTarget(tgt0);
+    if (tgt.kind == .binding) {
+        const tf = c.symFlags(c.toGlobalIn(tgt.file, tgt.payload));
+        // A pure type target is 2693 (matches tsc even through `export type`
+        // chains); a value target reached through `export type` is 1362.
+        if (!names.hasValueMeaning(tf) and names.hasTypeMeaning(tf)) return .type_target;
+    }
+    if (tgt.type_only) return .export_type;
+    return .has_value;
 }
 
 /// Value type of an import binding, via the sealed link tables.
