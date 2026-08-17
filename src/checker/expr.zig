@@ -43,7 +43,6 @@ const names_zig = @import("names.zig");
 const narrowable = @import("narrowable.zig");
 const hasTypeMeaning = @import("names.zig").hasTypeMeaning;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
-const identity = @import("identity.zig");
 const indexableConstituent = @import("typenode.zig").indexableConstituent;
 const init = Checker.init;
 const instantiate = @import("enums.zig").instantiate;
@@ -4900,30 +4899,52 @@ pub fn contextualCallSig(c: *Checker, ctx: TypeId, fn_node: Node) Error!TypeId {
         // — is one signature list, and answers with its sole survivor or
         // their combination.
         if (c.ts.kind(rctx) == .union_type) {
-            // Every constituent that offers a signature must offer the SAME
-            // one; a union whose constituents disagree hands over NOTHING and
-            // the expression's parameters are implicit `any`:
+            // Each constituent is asked separately, and the arity filter runs
+            // INSIDE each — so a constituent whose signatures are all too
+            // narrow drops out and the NEXT one still answers. That order is
+            // the whole point of the filter living in
+            // `contextualCallSigOfType`: `((event: any) => void) | (() => void)`
+            // must answer with its one-parameter constituent for
+            // `(event) => …`.
             //
-            // ```ts
-            // else if (!compareSignaturesIdentical(signatureList[0], signature, …)) {
-            //     return undefined;  // Signatures aren't identical, do not use
-            // }
-            // ```
+            // tsc goes one step further and requires every constituent that
+            // answers to answer with the SAME signature
+            // (`compareSignaturesIdentical`, return types and `this`
+            // ignored), handing over nothing when they disagree. That step
+            // is NOT taken here yet, and cannot be until the contextual type
+            // of an object literal / JSX attribute list is DISCRIMINATED
+            // first (tsc's `discriminateContextualTypeByObjectMembers` /
+            // `…ByJSXAttributes`, which run before `getContextualSignature`
+            // ever sees the union). Without discrimination the disagreement
+            // test fires on unions tsc has already narrowed to one
+            // constituent, and every callback in a discriminated-union
+            // literal reports TS7006 (measured: 7 corpus cases lost, 2
+            // gained). The two it would gain —
+            // `contextualTypeWithUnionTypeCallSignatures` and
+            // `contextualOverloadListFromUnionWithPrimitiveNoImplicitAny` —
+            // are waiting on that.
             //
-            // Taking the first that answers instead typed a callback from
-            // whichever constituent came first: an object literal written
-            // against `string | FullRule` took its `normalize` property from
-            // `String.prototype.normalize` and cascaded three errors out of a
-            // parameter tsc simply reports as implicitly `any`.
+            // Overload sets and multi-signature objects are likewise left
+            // alone inside a union: combining them here is what let
+            // `String.prototype.normalize` type a `normalize` property
+            // written against `string | FullRule`.
             for (try c.memberList(rctx)) |m| {
-                const sig = try contextualCallSigOfType(c, try c.resolveStructural(m), required);
+                const rm = try c.resolveStructural(m);
+                const sig: TypeId = switch (c.ts.kind(rm)) {
+                    .function => rm,
+                    .object => if (c.ts.objectCallSigCount(rm) == 1)
+                        c.ts.objectCallSig(rm, 0)
+                    else
+                        types.no_type,
+                    // An optional property whose declared type is an
+                    // intersection of callables arrives as `(A & B) | undefined`.
+                    .intersection => try contextualCallSigOfType(c, rm, required),
+                    else => types.no_type,
+                };
                 if (sig == types.no_type) continue;
-                if (ctx_sig == types.no_type) {
-                    ctx_sig = sig;
-                } else if (!try identity.signatureParamsIdentical(c, ctx_sig, sig)) {
-                    ctx_sig = types.no_type;
-                    break;
-                }
+                if (required) |n| if (sig_zig.arityIsSmaller(c, sig, n)) continue;
+                ctx_sig = sig;
+                break;
             }
         } else {
             ctx_sig = try contextualCallSigOfType(c, rctx, required);

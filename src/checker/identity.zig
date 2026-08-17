@@ -299,22 +299,7 @@ fn memberSetIdentical(c: *Checker, a: TypeId, b: TypeId, depth: u32) Error!bool 
 /// onto the target's before parameters and return types are compared. The
 /// mapping is what makes two separately written `<T>(x: T) => T` annotations
 /// identical even though each `T` is its own symbol.
-/// tsc's `compareSignaturesIdentical(a, b, partialMatch: false,
-/// ignoreThisTypes: true, ignoreReturnTypes: true, compareTypesIdentical)` —
-/// the comparison `getContextualSignature` runs across a union's
-/// constituents to decide whether they all offer the SAME signature. Only the
-/// parameter lists are in question there: two constituents that differ in
-/// what they RETURN still type the expression's parameters the same way.
-pub fn signatureParamsIdentical(c: *Checker, a: TypeId, b: TypeId) Error!bool {
-    if (c.ts.kind(a) != .function or c.ts.kind(b) != .function) return a == b;
-    return sigIdenticalAt(c, a, b, 0, true);
-}
-
 fn sigIdentical(c: *Checker, a: TypeId, b: TypeId, depth: u32) Error!bool {
-    return sigIdenticalAt(c, a, b, depth, false);
-}
-
-fn sigIdenticalAt(c: *Checker, a: TypeId, b: TypeId, depth: u32, ignore_return: bool) Error!bool {
     if (a == b) return true;
     const tpa = c.ts.fnTypeParams(a);
     const tpb = c.ts.fnTypeParams(b);
@@ -353,7 +338,6 @@ fn sigIdenticalAt(c: *Checker, a: TypeId, b: TypeId, depth: u32, ignore_return: 
             c.ts.fnParam(a, @intCast(i)).ty;
         if (!try identicalAt(c, sp, c.ts.fnParam(b, @intCast(i)).ty, depth + 1)) return false;
     }
-    if (ignore_return) return true;
     const ra = if (map.len > 0) try c.instantiate(c.ts.fnReturn(a), map) else c.ts.fnReturn(a);
     return identicalAt(c, ra, c.ts.fnReturn(b), depth + 1);
 }
