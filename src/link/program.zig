@@ -203,18 +203,22 @@ pub const ProgFile = struct {
     type_ref_misses: []const TypeRefMiss = &.{},
 };
 
-/// A `/// <reference types="X" />` in a program file whose type-reference
-/// directive resolved to nothing. `span` is the directive's name, quotes
-/// excluded — where tsc anchors TS2688.
-pub const TypeRefMiss = struct { name: []const u8, span: Span };
+/// A `/// <reference … />` in a program file that resolved to nothing. `span`
+/// is the directive's name, quotes excluded — where tsc anchors both wordings:
+/// TS2688 ("Cannot find type definition file for 'X'") for a `types=`
+/// directive, TS6053 ("File 'X' not found.") for a `path=` one. `kind` picks
+/// between them, and it is the directive's own kind rather than a code so the
+/// recorder never has to know what the reporter says.
+pub const TypeRefMiss = struct { name: []const u8, span: Span, kind: resolve.RefDirective.Kind };
 
-/// Turn an unresolved `types=` directive into its TS2688 record. `spec` and
-/// `pos` both come from `resolve.scanReferences`, which slices the live source
+/// Turn an unresolved reference directive into its record. `spec` and `pos`
+/// both come from `resolve.scanReferences`, which slices the live source
 /// buffer, so the name needs no copy: the buffer outlives the program.
 pub fn typeRefMiss(ref: resolve.RefDirective) TypeRefMiss {
     return .{
         .name = ref.spec,
         .span = .{ .start = ref.pos, .end = ref.pos + @as(u32, @intCast(ref.spec.len)) },
+        .kind = ref.kind,
     };
 }
 

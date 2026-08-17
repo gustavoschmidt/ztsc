@@ -222,9 +222,7 @@ pub fn buildProgram(
         var type_ref_misses: std.ArrayList(TypeRefMiss) = .empty;
         for (try resolve.scanReferences(scratch, bytes)) |ref| {
             const rfid = try disco.discoverReference(path, ref);
-            if (rfid == no_file and ref.kind == .types) {
-                try type_ref_misses.append(arena, typeRefMiss(ref));
-            }
+            if (rfid == no_file) try type_ref_misses.append(arena, typeRefMiss(ref));
         }
 
         // Resolve this file's specifiers; discover new files.
@@ -3649,8 +3647,34 @@ const Linker = struct {
     /// whole-file `.d.ts` suppression already delivers.
     fn reportUnresolvedTypeRefs(l: *Linker, file: FileId) Error!void {
         for (l.files[file].type_ref_misses) |miss| {
-            try l.diag(file, 2688, miss.span, "Cannot find type definition file for '{s}'.", .{miss.name});
+            switch (miss.kind) {
+                .types => try l.diag(file, 2688, miss.span, "Cannot find type definition file for '{s}'.", .{miss.name}),
+                // TS6053 names the specifier as WRITTEN, not the path resolution
+                // tried: `///<reference path='typescript.ts' />` in a directory
+                // without one reports `File 'typescript.ts' not found.`
+                // (`parserRealSource3`, measured).
+                .path => {
+                    // ztsc's path resolution is POSIX-only: it neither
+                    // normalizes `\` nor recognizes a Windows drive prefix,
+                    // while tsc does both (`normalizeSlashes`,
+                    // `isRootedDiskPath`). A directive spelled that way
+                    // resolves for the oracle and not here, so reporting would
+                    // blame the PROGRAM for ztsc's own gap —
+                    // `tripleSlashReferenceAbsoluteWindowsPath` is the corpus
+                    // case. An under-report until the resolver learns both.
+                    if (windowsSpelledPath(miss.name)) continue;
+                    try l.diag(file, 6053, miss.span, "File '{s}' not found.", .{miss.name});
+                },
+            }
         }
+    }
+
+    /// Is this reference path spelled the way Windows spells one — with `\`
+    /// separators, or behind a drive prefix? Both are ordinary path characters
+    /// to ztsc's POSIX-only resolver and structure to tsc's.
+    fn windowsSpelledPath(spec: []const u8) bool {
+        if (std.mem.indexOfScalar(u8, spec, '\\') != null) return true;
+        return spec.len >= 2 and spec[1] == ':' and std.ascii.isAlphabetic(spec[0]);
     }
 
     /// TS1202 / TS1203: `import x = require(...)` / `export = ...` are emit

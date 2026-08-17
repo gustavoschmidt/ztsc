@@ -606,12 +606,10 @@ pub fn build(
                 for (try resolve.scanReferences(resolve_scratch.allocator(), src.bytes)) |ref| {
                     const rfid = try disco.discoverReference(importer, ref);
                     try ref_files.append(arena, rfid);
-                    // An unresolvable `types=` directive is tsc's TS2688; the
-                    // linker reports it, since only this loop knows resolution
-                    // failed. `path=` misses are TS6053, not implemented.
-                    if (rfid == modules.no_file and ref.kind == .types) {
-                        try misses.append(arena, modules.typeRefMiss(ref));
-                    }
+                    // An unresolvable directive is tsc's TS2688 (`types=`) or
+                    // TS6053 (`path=`); the linker reports it, since only this
+                    // loop knows resolution failed.
+                    if (rfid == modules.no_file) try misses.append(arena, modules.typeRefMiss(ref));
                 }
                 tables.type_ref_misses.items[i] = misses.items;
             }
