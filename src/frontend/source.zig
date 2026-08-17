@@ -216,7 +216,9 @@ pub const Source = struct {
     /// `'catch' or 'finally' expected`, an unterminated comment) reports one
     /// line short of where tsc puts it.
     pub fn lineCol(s: *const Source, offset: u32) LineCol {
-        if (offset >= s.bytes.len and s.bytes.len > 0 and s.bytes[s.bytes.len - 1] == '\n') {
+        const ends_in_break = s.bytes.len > 0 and
+            (s.bytes[s.bytes.len - 1] == '\n' or s.bytes[s.bytes.len - 1] == '\r');
+        if (offset >= s.bytes.len and ends_in_break) {
             return .{ .line = @intCast(s.line_starts.len), .col = offset - @as(u32, @intCast(s.bytes.len)) };
         }
         const line = lineOfOffset(s.line_starts, offset);
@@ -244,14 +246,31 @@ pub fn lineOfOffset(line_starts: []const u32, offset: u32) u32 {
 }
 
 /// Compute byte offsets of line starts. Always contains at least offset 0.
+///
+/// The line terminators are tsc's `computeLineStarts`: LF, CRLF, and a LONE CR
+/// — the last one matters because the test corpus is CRLF and the harness
+/// splits its multi-file cases on `\n`, leaving a trailing `\r` as the final
+/// line of nearly every unit. Counting it (as tsc's `case carriageReturn:`
+/// falling through to `case lineFeed:` does) is what puts an end-of-file
+/// diagnostic on the same line tsc puts it on. The scanner has always treated
+/// a lone CR as a break; only this table did not.
 pub fn computeLineStarts(alloc: Allocator, bytes: []const u8) Allocator.Error![]u32 {
     var starts: std.ArrayList(u32) = .empty;
     errdefer starts.deinit(alloc);
     try starts.append(alloc, 0);
-    for (bytes, 0..) |b, i| {
-        if (b == '\n' and i + 1 < bytes.len) {
-            try starts.append(alloc, @intCast(i + 1));
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 1) {
+        switch (bytes[i]) {
+            '\r' => {
+                // CRLF is one break, not two.
+                if (i + 1 < bytes.len and bytes[i + 1] == '\n') i += 1;
+            },
+            '\n' => {},
+            else => continue,
         }
+        // The offset after a break that ENDS the file is the trailing empty
+        // line, which this table deliberately omits — see `lineCol`.
+        if (i + 1 < bytes.len) try starts.append(alloc, @intCast(i + 1));
     }
     return starts.toOwnedSlice(alloc);
 }
