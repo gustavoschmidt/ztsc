@@ -254,20 +254,22 @@ pub fn lineOfOffset(line_starts: []const u32, offset: u32) u32 {
 /// falling through to `case lineFeed:` does) is what puts an end-of-file
 /// diagnostic on the same line tsc puts it on. The scanner has always treated
 /// a lone CR as a break; only this table did not.
+/// This runs over every byte of every source file, so the fast path — the
+/// ~98% of bytes that end no line — is kept to the single comparison it was
+/// before CR joined LF: every line terminator is `<= '\r'`, so one test
+/// rejects the whole printable range before either of them is looked at.
 pub fn computeLineStarts(alloc: Allocator, bytes: []const u8) Allocator.Error![]u32 {
     var starts: std.ArrayList(u32) = .empty;
     errdefer starts.deinit(alloc);
     try starts.append(alloc, 0);
     var i: usize = 0;
     while (i < bytes.len) : (i += 1) {
-        switch (bytes[i]) {
-            '\r' => {
-                // CRLF is one break, not two.
-                if (i + 1 < bytes.len and bytes[i + 1] == '\n') i += 1;
-            },
-            '\n' => {},
-            else => continue,
-        }
+        const c = bytes[i];
+        if (c > '\r') continue;
+        if (c == '\r') {
+            // CRLF is one break, not two.
+            if (i + 1 < bytes.len and bytes[i + 1] == '\n') i += 1;
+        } else if (c != '\n') continue;
         // The offset after a break that ENDS the file is the trailing empty
         // line, which this table deliberately omits — see `lineCol`.
         if (i + 1 < bytes.len) try starts.append(alloc, @intCast(i + 1));
