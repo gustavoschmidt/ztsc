@@ -45,6 +45,12 @@ Everything gitignored is scripted:
      /tmp/pnpmroot pnpm@10` and `manage-package-manager-versions=false` in the
      checkout's `.npmrc` (the dirty `.npmrc`/lockfile in checkouts is the
      documented workaround, not contamination).
+   - Fresh-machine gotchas (2026-08-17 rebuild): brew `zig` (0.16.0) + `node`
+     suffice; excalidraw's engine pin rejects node 26 — `yarn install
+     --frozen-lockfile --ignore-engines`; social-app's postinstall shells out
+     to `pnpm intl:compile-if-needed`, so put pnpm's bin dir on PATH for the
+     install or it half-completes; excalidraw's `tsconfig.tsgo.json` is
+     gitignored — recreate it from the verbatim block in BENCHMARKS.md.
 3. Baseline sweep: run the harness once at HEAD to regenerate
    `bench/ts-suite/report.{md,tsv}` (~7 min at --jobs 10); expected numbers
    above.
