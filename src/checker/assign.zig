@@ -223,17 +223,31 @@ pub fn castComparableRec(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!
     if (depth > 8) return true; // under-report over false-reject, per policy
     const a = try c.resolveStructural(a0);
     const b = try c.resolveStructural(b0);
-    // Type parameter on either side → defer to its constraint; unconstrained
-    // (or unknown/any constraint) overlaps everything.
-    if (c.ts.kind(a) == .type_param) {
-        const con = try c.typeParamConstraint(c.ts.typeParamSymbol(a));
-        if (con == types.no_type or c.ts.kind(con) == .unknown or c.ts.kind(con) == .any or con == a) return true;
-        return c.castComparableRec(con, b0, depth + 1);
-    }
-    if (c.ts.kind(b) == .type_param) {
-        const con = try c.typeParamConstraint(c.ts.typeParamSymbol(b));
-        if (con == types.no_type or c.ts.kind(con) == .unknown or c.ts.kind(con) == .any or con == b) return true;
-        return c.castComparableRec(a0, con, depth + 1);
+    // Type parameter on either side. tsc's comparable relation treats one
+    // ASYMMETRICALLY: a parameter is related through its constraint only where
+    // it is the relation's SOURCE, and in TARGET position it relates to
+    // nothing but itself (and a parameter whose constraint chain reaches it).
+    // `checkAssertionWorker`'s `isTypeComparableTo(expr, target) ||
+    // isTypeComparableTo(target, expr)` therefore comes down to "the
+    // parameter's CONSTRAINT, as the source, relates to the other operand" —
+    // which is exactly `comparableOneWay`, carve-outs included.
+    //
+    // Swapping the constraint in and then asking the SYMMETRIC question
+    // accepted every cast whose operand merely extends the constraint:
+    // `<T>b` for `T extends A` and `b: B extends A` is TS2352 in tsgo
+    // ("'B' is assignable to the constraint of type 'T', but 'T' could be
+    // instantiated with a different subtype of constraint 'A'"), because `A`
+    // relates to `A` but not to `B`. Same for `{} as T` under
+    // `T extends null | undefined`.
+    //
+    // Held back from the DEFERRED families below — a `keyof`, an indexed
+    // access, a still-generic mapped type or an unresolved conditional next to
+    // a type parameter has no member set to decide on, and those arms concede
+    // the pair on purpose rather than risk a false rejection.
+    if ((c.ts.kind(a) == .type_param and !deferredCastPeer(c.ts.kind(b))) or
+        (c.ts.kind(b) == .type_param and !deferredCastPeer(c.ts.kind(a))))
+    {
+        return (try comparableOneWay(c, a0, b0, depth)) or (try comparableOneWay(c, b0, a0, depth));
     }
     // A deferred `keyof T` compares through the key domain. tsc relates an
     // `Index` operand via `keyofConstraintType` — `string | number |
@@ -349,6 +363,16 @@ pub fn stringEnumCastOverlap(c: *Checker, a: TypeId, b: TypeId) Error!bool {
 /// object type is the only thing a mapped type can ever instantiate to.
 pub fn mappedCastPeer(k: types.Kind) bool {
     return k == .object or k == .intersection or k == .mapped;
+}
+
+/// The kinds `castComparableRec` concedes outright rather than decide on
+/// members: a `keyof`, an indexed access, a still-generic mapped type and an
+/// unresolved conditional each stand for a member set that is not known here
+/// (see the arms below for the measurements behind each). A type parameter
+/// paired with one of them keeps that concession instead of taking the strict
+/// constraint rule, which would turn "no verdict available" into a rejection.
+fn deferredCastPeer(k: types.Kind) bool {
+    return k == .keyof_op or k == .index_access or k == .mapped or k == .conditional;
 }
 
 /// One direction of the lenient comparable relation: does source `s0`
@@ -908,6 +932,13 @@ fn computeIsWeakType(c: *Checker, t0: TypeId) Error!bool {
 
 /// tsc's `isKnownProperty` for a weak-type target: does `t` declare `name`,
 /// or an index signature that would cover it?
+///
+/// `getPropertyOfObjectType`, so the global `Object`/`Function` members every
+/// value apparently carries do NOT count as declared — `ctxPropOfType` is the
+/// lookup that skips them. With the ordinary lookup, `toString` (which the
+/// apparent `Object` lends the target too) was a property in common with every
+/// source that has one, which is every PRIMITIVE source: `doSomething(12)`
+/// against a weak `Settings` found `toString` on both sides and passed.
 pub fn weakTargetKnows(c: *Checker, t: TypeId, name: Atom) Error!bool {
     if (c.ts.kind(t) == .intersection or c.ts.kind(t) == .union_type) {
         for (try c.memberList(t)) |m| {
@@ -915,7 +946,7 @@ pub fn weakTargetKnows(c: *Checker, t: TypeId, name: Atom) Error!bool {
         }
         return false;
     }
-    return (try c.propOfTypeEx(t, name, true)) != null;
+    return (try c.ctxPropOfType(t, name)) != null;
 }
 
 /// tsc's common-property check for a weak target: the source and the target
@@ -964,6 +995,21 @@ pub fn isCallableSource(c: *Checker, s: TypeId, sk: types.Kind) Error!bool {
     return c.ts.objectCallSigCount(rs) != 0 and c.ts.objectPropCount(rs) == 0;
 }
 
+/// tsc's `source !== globalObjectType`: is this the lib's `Object` interface
+/// referenced with no arguments? Identity, not structure — a user type that
+/// happens to have the same members is not it.
+///
+/// Asked of the MATERIALIZED form too (through `refFacetOf`, the origin ref
+/// each materialization carries): the relation's `.ref` arm resolves an
+/// interface reference and re-enters with the object, so a check that only
+/// knew the reference would miss every frame that matters.
+fn isGlobalObjectType(c: *Checker, s: TypeId) Error!bool {
+    const sym = c.prog.globals.lookup(c.atom_Object) orelse return false;
+    if (!c.symFlags(sym).interface) return false;
+    const ref = c.refFacetOf(s, c.ts.kind(s)) orelse return false;
+    return c.ts.refSymbol(ref) == sym and c.ts.refArgs(ref).len == 0;
+}
+
 pub fn weakTypeMismatch(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: types.Kind, src_fresh: bool) Error!bool {
     if (c.rel_intersection_target != 0 or c.weak_rule_off != 0) return false;
     if (c.union_callable_sibling != 0 and try c.isCallableSource(s, sk)) return false;
@@ -981,6 +1027,12 @@ pub fn weakTypeMismatch(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
         .string, .number, .boolean, .bigint, .symbol, .string_literal, .number_literal, .number_literal_fresh, .bigint_literal, .bool_true, .bool_false, .enum_type, .unique_symbol => {},
         else => return false,
     }
+    // tsc's gate excludes the global `Object` type BY IDENTITY
+    // (`source !== globalObjectType`). Its members are the ones every value
+    // apparently has, so it shares none with a weak target by construction —
+    // and rejecting the pair made `hasWings(beast)` for `beast: Object` a
+    // false TS2559 against the guard's `x is Winged` parameter.
+    if (try isGlobalObjectType(c, s)) return false;
     // A FRESH object literal is the excess-property check's business, not this
     // one. tsc runs `isPerformingExcessPropertyChecks` first and it answers
     // for every fresh source — a literal with a property the weak target does
@@ -1022,10 +1074,24 @@ pub fn weakTypeMismatch(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
             }
             props = buf.items;
         },
-        // A primitive source has the apparent members of its wrapper
-        // interface, which never overlap a user weak type; tsc still runs the
-        // check on it (`string` is not assignable to `{ a?: X }`), and the
-        // structural walk already rejects those, so nothing is added here.
+        // A PRIMITIVE (or enum) source relates through its wrapper interface's
+        // apparent members, and tsc's gate admits it explicitly
+        // (`source.flags & (Primitive | Object | Intersection)`). The
+        // structural walk does NOT reject the pair on its own: a weak target's
+        // properties are all optional, so every one of them is vacuously
+        // satisfied and `doSomething(12)` against `Settings` passed silently
+        // where tsc answers TS2559. Reading the wrapper's members rather than
+        // assuming they never overlap keeps the one case that does — a weak
+        // type whose optional property is named after an `Object`/`String`/…
+        // member — accepted, as tsc accepts it.
+        .string, .number, .boolean, .bigint, .symbol, .unique_symbol, .string_literal, .number_literal, .number_literal_fresh, .bigint_literal, .bool_true, .bool_false, .enum_type, .template_literal_type, .string_mapping => {
+            // No lib: the value apparently has no members, and tsc's
+            // "source has at least one property" gate then declines.
+            const ap = (try c.primitiveApparentObject(rs)) orelse return false;
+            for (0..c.ts.objectPropCount(ap)) |i|
+                try buf.append(c.scratch(), c.ts.objectProp(ap, @intCast(i)).name);
+            props = buf.items;
+        },
         else => return false,
     }
     if (props.len == 0 and !has_sig) return false;

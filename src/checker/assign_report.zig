@@ -69,7 +69,13 @@ pub fn checkAssignable(c: *Checker, src_t: TypeId, target: TypeId, expr_node: No
         return false;
     }
     if (expr_node != 0 and try c.excessPropertyFailure(expr_node, src_t, target)) return false;
-    try c.reportNotAssignable(2322, src_t, target, span);
+    // `elaborateDidYouMeanToCallOrConstruct` moves the head onto the operand
+    // when the source is a function the author forgot to call — see there.
+    const anchor = if (expr_node != 0 and try didYouMeanToCall(c, src_t, target))
+        c.nodeSpan(expr_node)
+    else
+        span;
+    try c.reportNotAssignable(2322, src_t, target, anchor);
     return false;
 }
 
@@ -465,6 +471,80 @@ fn callSigReturnUnion(c: *Checker, rt: TypeId) Error!?TypeId {
             return acc;
         },
         else => return null,
+    }
+}
+
+/// tsc's split inside the weak-type headline: *"calls.length &&
+/// isRelatedTo(getReturnTypeOfSignature(calls[0]), target) || constructs.length
+/// && isRelatedTo(getReturnTypeOfSignature(constructs[0]), target)"*. A source
+/// that is callable and whose FIRST signature returns something the weak
+/// target would have accepted is a call the author forgot to write, and tsc
+/// says so (TS2560) instead of the flat "no properties in common" (TS2559).
+///
+/// Only the first signature of each list is consulted, as in tsc — an overload
+/// set whose later member happens to fit does not qualify.
+fn forgottenCall(c: *Checker, src_t: TypeId, target: TypeId) Error!bool {
+    var calls: std.ArrayList(TypeId) = .empty;
+    defer calls.deinit(c.scratch());
+    var ctors: std.ArrayList(TypeId) = .empty;
+    defer ctors.deinit(c.scratch());
+    try signaturesOf(c, src_t, &calls, &ctors);
+    if (calls.items.len != 0 and try c.isAssignable(c.ts.fnReturn(calls.items[0]), target)) return true;
+    if (ctors.items.len != 0 and try c.isAssignable(c.ts.fnReturn(ctors.items[0]), target)) return true;
+    return false;
+}
+
+/// tsc's `elaborateDidYouMeanToCallOrConstruct`: a source that is CALLABLE and
+/// has SOME signature whose return type the target would have accepted is a
+/// call the author forgot to write. tsc re-reports the head on the EXPRESSION
+/// (and hangs "Did you mean to call this expression?" off it as related
+/// information) rather than on the declaration name or the assignment target,
+/// so `var d: I1 = i2.m1` blames `i2.m1` and `x = f` blames `f`.
+///
+/// `any` and `never` returns are excluded, as in tsc: they fit every target and
+/// would move the blame on every failed assignment of an untyped function.
+///
+/// Sibling of `forgottenCall`, which is the WEAK-type branch's version of the
+/// same idea and — this is tsc's own asymmetry, not a simplification — consults
+/// only the FIRST signature of each list.
+fn didYouMeanToCall(c: *Checker, src_t: TypeId, target: TypeId) Error!bool {
+    var calls: std.ArrayList(TypeId) = .empty;
+    defer calls.deinit(c.scratch());
+    var ctors: std.ArrayList(TypeId) = .empty;
+    defer ctors.deinit(c.scratch());
+    try signaturesOf(c, src_t, &calls, &ctors);
+    for ([_][]const TypeId{ ctors.items, calls.items }) |list| {
+        for (list) |sig| {
+            const ret = c.ts.fnReturn(sig);
+            switch (c.ts.kind(ret)) {
+                .any, .err, .never => continue,
+                else => {},
+            }
+            if (try c.isAssignable(ret, target)) return true;
+        }
+    }
+    return false;
+}
+
+/// tsc's `getSignaturesOfType` on a source, split by kind. A bare function type
+/// is its own single call signature; an overload set contributes each member.
+fn signaturesOf(
+    c: *Checker,
+    src_t: TypeId,
+    calls: *std.ArrayList(TypeId),
+    ctors: *std.ArrayList(TypeId),
+) Error!void {
+    const rs = try c.resolveStructural(src_t);
+    switch (c.ts.kind(rs)) {
+        .function => try calls.append(c.scratch(), rs),
+        .overloads => try calls.appendSlice(c.scratch(), try c.memberList(rs)),
+        .object => {
+            for (0..c.ts.objectCallSigCount(rs)) |i|
+                try calls.append(c.scratch(), c.ts.objectCallSig(rs, @intCast(i)));
+            for (0..c.ts.objectConstructSigCount(rs)) |i|
+                try ctors.append(c.scratch(), c.ts.objectConstructSig(rs, @intCast(i)));
+        },
+        else => {},
     }
 }
 
@@ -954,6 +1034,17 @@ pub fn reportNotAssignable(c: *Checker, code: u16, src_t: TypeId, target: TypeId
     // the diagnostic comes out as 2559 rather than 2345.
     if (code == 2322 or code == 2345) {
         if (try c.weakTypeMismatch(src_t, target, c.ts.kind(src_t), c.ts.kind(target), c.ts.objectIsFresh(src_t))) {
+            // tsc splits the headline in two: a CALLABLE source whose first
+            // call (or construct) signature RETURNS something the weak target
+            // would have accepted is a forgotten call, and gets
+            // `Value_of_type_0_has_no_properties_in_common_with_type_1_Did_you_mean_to_call_it`
+            // instead. `doSomething(getDefaultSettings)` is the canonical one.
+            if (try forgottenCall(c, src_t, target)) {
+                try c.diagFmt(2560, span, "Value of type '{s}' has no properties in common with type '{s}'. Did you mean to call it?", .{
+                    try c.typeToString(src_t), try c.typeToString(target),
+                });
+                return;
+            }
             try c.diagFmt(2559, span, "Type '{s}' has no properties in common with type '{s}'.", .{
                 try c.typeToString(src_t), try c.typeToString(target),
             });

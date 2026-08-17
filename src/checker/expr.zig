@@ -407,7 +407,13 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             const tt = try c.typeFromTypeNode(d.rhs);
             const et = try c.checkExprCached(d.lhs, tt);
             if (tt == types.error_type) return et;
-            _ = try c.checkSatisfies(et, tt, d.lhs, c.nodeSpan(d.lhs));
+            // The HEAD diagnostic (TS1360, and whatever replaces it —
+            // TS2741/2739/2559) anchors on the `satisfies` KEYWORD, not on
+            // the operand: `checkSatisfiesExpressionWorker` passes the TYPE
+            // side as its error node, whose span tsgo 7.0.2 reports starting
+            // at the keyword. Per-property elaboration still blames the
+            // property inside the operand, which is why only this span moves.
+            _ = try c.checkSatisfies(et, tt, d.lhs, c.tokSpan(c.tree.nodeMainToken(node)));
             return et;
         },
         .arrow_fn, .function_expr => return checkFunctionLikeExpr(c, node, ctx),

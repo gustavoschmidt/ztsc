@@ -23,6 +23,7 @@ const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
 const ModuleRef = @import("typenode.zig").ModuleRef;
+const identity = @import("identity.zig");
 const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const tuple_relate = @import("tuple_relate.zig");
@@ -522,7 +523,19 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
         } else if (rk == .class_value) {
             const cls = c.ts.classSymbol(r);
             if (try c.classIsAbstract(cls)) {
+                // tsc's `resolveNewExpression` reports TS2511 and then
+                // `return resolveErrorCall(node)`: the arguments are checked
+                // with NO contextual type and the call resolves to the error
+                // signature, so no arity (TS2554) or per-argument (TS2345)
+                // diagnostic follows and the expression's type is the error
+                // type. Reporting the arity on top of TS2511 was a false
+                // positive wherever an abstract class is `new`-ed with
+                // arguments its (often implicit) constructor does not take.
                 try c.diagFmt(2511, c.nodeSpan(node), "Cannot create an instance of an abstract class.", .{});
+                for (shape.arg_nodes) |an| {
+                    if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+                }
+                return .{ .ty = types.error_type, .chained = chained };
             }
             var ctor_sigs: std.ArrayList(TypeId) = .empty;
             defer ctor_sigs.deinit(c.scratch());
@@ -575,8 +588,13 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
                 for (shape.arg_nodes) |an| {
                     if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
                 }
-                if (countArgs(shape.arg_nodes) > 0) {
-                    try c.diagFmt(2554, c.nodeSpan(node), "Expected 0 arguments, but got {d}.", .{countArgs(shape.arg_nodes)});
+                const nargs = countArgs(shape.arg_nodes);
+                if (nargs > 0) {
+                    // Same span rule as every other arity error: too MANY
+                    // arguments blames the surplus ARGUMENTS, not the callee
+                    // (`getArgumentArityError`'s `args.slice(maxCount)` node
+                    // array) — see `reportArityError`.
+                    try reportArityError(c, node, shape.arg_nodes, nargs, 0, 0, false);
                 }
                 return .{ .ty = instance_ret, .chained = chained };
             }
@@ -621,10 +639,7 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
                         return .{ .ty = types.any_type, .chained = chained };
                     }
                     if (ctor_starts.items.len > 1) {
-                        if (try combinedUnionSignature(c, sigs.items, ctor_starts.items)) |combined| {
-                            sigs.clearRetainingCapacity();
-                            try sigs.append(c.scratch(), combined);
-                        }
+                        try resolveUnionSignatures(c, &sigs, ctor_starts.items);
                     }
                 },
                 // A shape this arm does not model (a GENERIC class value,
@@ -765,10 +780,7 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
                     }
                 }
                 if (all_callable and !saw_any and starts.items.len > 1) {
-                    if (try combinedUnionSignature(c, sigs.items, starts.items)) |combined| {
-                        sigs.clearRetainingCapacity();
-                        try sigs.append(c.scratch(), combined);
-                    }
+                    try resolveUnionSignatures(c, &sigs, starts.items);
                 }
                 if (!all_callable) {
                     try c.diagFmt(2349, c.nodeSpan(shape.callee), "This expression is not callable.", .{});
@@ -1412,6 +1424,168 @@ fn isMixinCtorSig(c: *Checker, sig: TypeId) bool {
         .array => s.kind(s.arrayElem(p.ty)) == .any,
         else => false,
     };
+}
+
+/// The signature list of constituent `i` inside the flattened `sigs`.
+fn unionSigList(sigs: []const TypeId, starts: []const u32, i: usize) []const TypeId {
+    const lo = starts[i];
+    const hi = if (i + 1 < starts.len) starts[i + 1] else @as(u32, @intCast(sigs.len));
+    return sigs[lo..hi];
+}
+
+/// tsc's `findMatchingSignature`: the first member of `list` that
+/// `compareSignaturesIdentical` accepts against `probe`.
+fn findMatchingSignature(
+    c: *Checker,
+    list: []const TypeId,
+    probe: TypeId,
+    partial: bool,
+    ignore_ret: bool,
+) Error!?TypeId {
+    for (list) |s| {
+        if (try compareSignaturesIdentical(c, s, probe, partial, ignore_ret)) return s;
+    }
+    return null;
+}
+
+/// tsc's `compareSignaturesIdentical`, restricted to the NON-GENERIC pairs the
+/// union pass below admits (see `unionSignatures`), so the type-parameter
+/// mapping and constraint/default comparison have nothing to do.
+///
+/// `compareTypes` is tsc's `partialMatch ? compareTypesSubtypeOf :
+/// compareTypesIdentical`; ztsc has no separate subtype relation, so
+/// assignability stands in for the subtype half — a widening that can only
+/// make two signatures match, never split them.
+fn compareSignaturesIdentical(
+    c: *Checker,
+    source_sig: TypeId,
+    target: TypeId,
+    partial: bool,
+    ignore_ret: bool,
+) Error!bool {
+    if (source_sig == target) return true;
+    if (!try isMatchingSignature(c, source_sig, target, partial)) return false;
+    // `this` types are compared with `ignoreThisTypes: false`; a signature
+    // that declares one is rare enough that requiring equality is the
+    // conservative reading.
+    if (c.ts.fnThisType(source_sig) != c.ts.fnThisType(target)) return false;
+    const target_len = try unionSigPositions(c, target);
+    for (0..target_len) |i| {
+        const idx: u32 = @intCast(i);
+        const s: TypeId = (try c.paramTypeAt(source_sig, idx)) orelse types.any_type;
+        const t: TypeId = (try c.paramTypeAt(target, idx)) orelse types.any_type;
+        const ok = if (partial) try c.isAssignable(t, s) else try identity.identical(c, t, s);
+        if (!ok) return false;
+    }
+    if (!ignore_ret) {
+        const sr = c.ts.fnReturn(source_sig);
+        const tr = c.ts.fnReturn(target);
+        const ok = if (partial) try c.isAssignable(sr, tr) else try identity.identical(c, sr, tr);
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// tsc's `isMatchingSignature`: same position count, same required count and
+/// the same effective-rest answer — or, for a PARTIAL match, merely a source
+/// that requires no more arguments than the target does.
+fn isMatchingSignature(c: *Checker, source_sig: TypeId, target: TypeId, partial: bool) Error!bool {
+    const s_min = try c.requiredParams(source_sig);
+    const t_min = try c.requiredParams(target);
+    if ((try unionSigPositions(c, source_sig)) == (try unionSigPositions(c, target)) and
+        s_min == t_min and
+        (try unionSigEffectiveRest(c, source_sig)) == (try unionSigEffectiveRest(c, target)))
+    {
+        return true;
+    }
+    return partial and s_min <= t_min;
+}
+
+/// tsc's `getUnionSignatures`, FIRST pass: a signature survives into the
+/// union's call list when every constituent has one that partially matches it
+/// (same-or-fewer required parameters, its own positions all supertypes), and
+/// the survivor's return type is the union of the matched signatures' returns.
+///
+/// Without it, `(F1 | F2 | F3 | F4 | F5)("a")` fell through to the
+/// position-wise `combineSignaturesOfUnionMembers` fold, which turns a
+/// rest-carrying constituent into a rest-carrying combined signature and so
+/// answered TS2555 ("Expected at least 2 arguments") where tsc's first pass
+/// picks `F5`'s BOUNDED list and answers TS2554 ("Expected 2 arguments").
+///
+/// Restricted to non-generic candidates: tsc's generic path demands an exact
+/// match in every other list, and approximating the type-parameter mapping
+/// wrongly would silently re-resolve calls that are correct today. A generic
+/// candidate anywhere falls back to the fold, which is the status quo.
+fn unionSignatures(
+    c: *Checker,
+    sigs: []const TypeId,
+    starts: []const u32,
+    out: *std.ArrayList(TypeId),
+) Error!bool {
+    for (sigs) |sig| {
+        if (c.ts.kind(sig) != .function) return false;
+        if (c.ts.fnTypeParamCount(sig) != 0) return false;
+    }
+    // The matched-signature scratch is reused across probes; a union's
+    // constituent count is small, so one allocation covers the whole pass.
+    var matched: std.ArrayList(TypeId) = .empty;
+    defer matched.deinit(c.scratch());
+    for (0..starts.len) |i| {
+        for (unionSigList(sigs, starts, i)) |probe| {
+            // "Only process signatures with parameter lists that aren't
+            // already in the result list."
+            if (out.items.len != 0 and
+                (try findMatchingSignature(c, out.items, probe, false, true)) != null) continue;
+            matched.clearRetainingCapacity();
+            var all = true;
+            for (0..starts.len) |j| {
+                const m = if (j == i)
+                    probe
+                else
+                    (try findMatchingSignature(c, unionSigList(sigs, starts, j), probe, true, true)) orelse {
+                        all = false;
+                        break;
+                    };
+                // `appendIfUnique`.
+                for (matched.items) |x| {
+                    if (x == m) break;
+                } else try matched.append(c.scratch(), m);
+            }
+            if (!all) continue;
+            if (matched.items.len <= 1) {
+                try out.append(c.scratch(), probe);
+                continue;
+            }
+            // `createUnionSignature`: the probe's own parameter list, with the
+            // matched signatures' returns unioned (`getReturnTypeOfSignature`
+            // on a composite signature).
+            var rets = try c.scratch().alloc(TypeId, matched.items.len);
+            defer c.scratch().free(rets);
+            for (matched.items, 0..) |m, k| rets[k] = c.ts.fnReturn(m);
+            try out.append(c.scratch(), try c.sigWithReturn(probe, try c.ts.makeUnion(c.scratch(), rets)));
+        }
+    }
+    return out.items.len != 0;
+}
+
+/// tsc's `getUnionSignatures` over a union callee's per-constituent signature
+/// lists: the MATCHING pass first, and its position-wise
+/// `combineSignaturesOfUnionMembers` fold only when the matching pass came up
+/// empty — which is the order tsc runs them in. Rewrites `sigs` in place;
+/// leaving it untouched (both passes declining) keeps the concatenated
+/// candidate list callers resolved against before either pass existed.
+fn resolveUnionSignatures(c: *Checker, sigs: *std.ArrayList(TypeId), starts: []const u32) Error!void {
+    var picked: std.ArrayList(TypeId) = .empty;
+    defer picked.deinit(c.scratch());
+    if (try unionSignatures(c, sigs.items, starts, &picked)) {
+        sigs.clearRetainingCapacity();
+        try sigs.appendSlice(c.scratch(), picked.items);
+        return;
+    }
+    if (try combinedUnionSignature(c, sigs.items, starts)) |combined| {
+        sigs.clearRetainingCapacity();
+        try sigs.append(c.scratch(), combined);
+    }
 }
 
 fn combinedUnionSignature(c: *Checker, sigs: []const TypeId, starts: []const u32) Error!?TypeId {
