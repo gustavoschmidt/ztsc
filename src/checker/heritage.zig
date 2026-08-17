@@ -113,9 +113,9 @@ pub fn checkInterfaceExtends(c: *Checker, sym: SymbolId, node: Node, name_token:
     }
     try dropRepeatedBases(c, sym, &bases);
 
-    // The interface's OWN member names, read once: both checks below need
-    // them (`checkInheritedPropertiesIdentical` to seed, the generic-override
-    // screen to identify what this interface redeclares).
+    // The interface's OWN member names — what `checkInheritedPropertiesIdentical`
+    // seeds `seen` with, so a name the interface redeclares is its own problem
+    // (TS2430's) and not a disagreement between two bases.
     var own: std.AutoHashMapUnmanaged(Atom, void) = .empty;
     defer own.deinit(c.scratch());
     try ownMemberNames(c, sym, &own);
@@ -127,7 +127,6 @@ pub fn checkInterfaceExtends(c: *Checker, sym: SymbolId, node: Node, name_token:
         if (!try relatableBase(c, base) or base == self) continue;
         if (try inheritedVerbatim(c, derived, try c.resolveStructural(base))) continue;
         if (try c.isAssignable(self, base)) continue;
-        if (try untrustworthyOverride(c, sym, base, &own)) continue;
         try c.diagFmt(2430, c.tokSpan(name_token), "Interface '{s}' incorrectly extends interface '{s}'.{s}", .{
             try c.typeToString(self),
             try c.typeToString(base),
@@ -318,66 +317,6 @@ fn relatableBase(c: *Checker, base: TypeId) Error!bool {
     if (base == types.error_type or base == types.any_type) return false;
     if (c.ts.kind(base) == .err) return false;
     return c.ts.kind(try c.resolveStructural(base)) == .object;
-}
-
-/// The relation just said this interface does NOT extend its base. Is that
-/// verdict trustworthy? One override shape says no, and the check declines
-/// rather than report a TS2430 tsc does not.
-///
-/// (A second arm used to sit here: an own member with a GENERIC signature the
-/// base does not have, declined because ztsc's relation erased such a source's
-/// type parameters to their constraints instead of instantiating it in the
-/// target's context. `genericSourceRelatesByInference` now does the
-/// instantiation for a generic target too — and compares un-erased — so the
-/// arm's own "removing it is the observable test" is satisfied and it is
-/// gone: `callSignatureAssignabilityInInheritance3`,
-/// `constructSignatureAssignabilityInInheritance3` and
-/// `subtypingWithConstructSignatures6` report again, while
-/// `deeplyNestedCheck.ts`'s `child<U extends Extract<keyof T, string>>(path: U)`
-/// against `child(path: string)` stays silent because the inference now solves
-/// `U := string`.)
-///
-/// What remains is an own member written with METHOD syntax that redeclares a
-/// base member. tsc relates methods BIVARIANTLY — `strictFunctionTypes` exempts
-/// them, so a redeclaration only has to relate in one direction, either one.
-/// ztsc applies the exemption inside its signature relation but loses it where
-/// the member is reached through the optional form (`m?(…)`, stored as
-/// `((…) => …) | undefined`) and the two `this` parameters name classes its
-/// model does not relate. `@types/node`'s
-/// `DuplexOptions.construct?(this: Duplex, …)` over
-/// `WritableOptions.construct?(this: Writable, …)` is both at once, and it
-/// reported a TS2430 tsc does not.
-///
-/// The test is syntactic on purpose: what it needs is how the member was
-/// WRITTEN (method versus property-with-a-function-type), which is exactly the
-/// distinction tsc's bivariance rule keys on and which the resolved type no
-/// longer carries. Property-written members (`a: (x: T) => T`) are unaffected,
-/// which is what keeps the `subtypingWith…` and
-/// `callSignatureAssignabilityInInheritance` families reporting.
-///
-/// Removing it is the observable test that the bivariance gap is fixed.
-fn untrustworthyOverride(
-    c: *Checker,
-    sym: SymbolId,
-    base: TypeId,
-    own: *const std.AutoHashMapUnmanaged(Atom, void),
-) Error!bool {
-    if (own.count() == 0) return false;
-    const rb = try c.resolveStructural(base);
-    if (c.ts.kind(rb) != .object) return false;
-    const saved = c.enterSymFile(sym);
-    defer c.restoreCtx(saved);
-    for (c.declsOf(sym)) |decl| {
-        if (c.nodeTag(decl) != .interface_decl) continue;
-        const data = c.tree.extraData(ast.InterfaceData, c.tree.nodeData(decl).lhs);
-        for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
-            if (m == null_node or c.nodeTag(m) != .method_signature) continue;
-            const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(m).lhs);
-            const name = try c.memberKey(c.tree.nodeMainToken(m), proto.flags);
-            if (c.ts.objectPropByName(rb, name) != null) return true;
-        }
-    }
-    return false;
 }
 
 /// TS2320, tsc's `checkInheritedPropertiesAreIdentical`: two of an

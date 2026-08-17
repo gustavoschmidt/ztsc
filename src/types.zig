@@ -407,6 +407,26 @@ pub const prop_flag_non_public: u32 = 4;
 /// creates a fresh `SymbolFlags.Property` symbol, so `{ [K in keyof C]: C[K] }`
 /// has spreadable properties even where `C` did not (see `applyPropModifiers`).
 pub const prop_flag_class_fn: u32 = 8;
+/// The non-public member is `protected` rather than `private` (tsc's
+/// `ModifierFlags.Protected`). Always set TOGETHER with
+/// `prop_flag_non_public` — it refines that bit, it does not replace it, so
+/// every reader of `nonPublic()` is unaffected.
+///
+/// It exists because member tables are HASH-CONSED. tsc's nominal rule
+/// (`nominal_members.zig`) branches on which of the two modifiers a member
+/// carries, but a `protected static x: string` table and a `private static
+/// x: string` table were one flag word apart from identical and therefore ONE
+/// type id — so `class Derived extends Base` whose statics differ only in
+/// visibility had `derived_static == base_static`, and the static-side extends
+/// check answered by identity before the rule could run
+/// (`derivedClassWithPrivateStaticShadowingProtectedStatic`). Keeping the
+/// modifier in the flag word is what keeps the two tables apart.
+///
+/// Written only by the class member-table builders (`classes.zig`,
+/// `statics.zig`, via `classes.visibilityPropFlags`); the relation still reads
+/// the DECLARATION for its verdict, since an inherited member's declaring
+/// symbol is what tsc's `valueDeclaration` comparison observes.
+pub const prop_flag_protected: u32 = 16;
 pub const elem_flag_optional: u32 = 1;
 pub const elem_flag_rest: u32 = 2;
 /// A `readonly` tuple element (produced by `as const`). Ignored by the
