@@ -167,6 +167,25 @@ const FnCtx = enum {
     }
 };
 
+/// What a `break`/`continue` may jump to WITHOUT crossing a function boundary.
+/// See `Parser.jump`; a jump that resolves to none of these from inside a
+/// function is TS1107.
+const JumpCtx = struct {
+    /// Enclosing iteration statements — the target of an unlabeled
+    /// `break`/`continue`.
+    loops: u32 = 0,
+    /// Enclosing `switch` statements — the target of an unlabeled `break`.
+    switches: u32 = 0,
+    /// Where this function's own labels start in `Parser.labels`. A label
+    /// outside a function is invisible inside it, which is the whole point of
+    /// resetting here.
+    labels_base: usize = 0,
+    /// Is there a function-like ancestor at all? A jump that resolves to
+    /// nothing at a source file's top level is a DIFFERENT diagnostic (TS1104 /
+    /// TS1105 / TS1115 / TS1116), so TS1107 only ever fires inside one.
+    in_function: bool = false,
+};
+
 const Parser = struct {
     /// Transient arena: all growable lists live here during the parse.
     gpa: Allocator,
@@ -285,6 +304,18 @@ const Parser = struct {
     /// initializer, which tsc parses outside the await context because the
     /// initializer runs as its own implicit function.
     fn_ctx: FnCtx = .none,
+
+    /// What a `break`/`continue` at this point may jump to, for TS1107. tsc
+    /// walks out of the statement looking for an iteration statement, a
+    /// `switch` or a matching label, and stops the moment it reaches a
+    /// FUNCTION-LIKE — a jump may not cross one. Saved and restored at every
+    /// function boundary, exactly where `fn_ctx` is.
+    jump: JumpCtx = .{},
+
+    /// The label names of the enclosing labeled statements, innermost last —
+    /// the stack `JumpCtx.labels_base` slices. Mutable state because it is a
+    /// scope stack, pushed and popped around each labeled statement's body.
+    labels: std.ArrayList(u32) = .empty,
 
     /// tsc's `NodeFlags.DisallowConditionalTypesContext`: true while parsing a
     /// type position where a conditional type may not appear unparenthesized —
@@ -1887,6 +1918,10 @@ const Parser = struct {
     fn parseLabeledStatement(p: *Parser) PE!Node {
         const label = try p.bump();
         _ = try p.bump(); // ':'
+        // The label is a jump target for everything inside it and for nothing
+        // outside — a function nested in it starts its own slice of the stack.
+        try p.labels.append(p.gpa, label);
+        defer p.labels.shrinkRetainingCapacity(p.labels.items.len - 1);
         const body = try p.parseSubstatement();
         if (isDeclarationTag(p.nodes.items(.tag)[body])) {
             try p.errAtToken(.label_not_allowed, label);
@@ -2140,13 +2175,13 @@ const Parser = struct {
         _ = try p.expect(.l_paren, .expected_l_paren);
         const cond = try p.parseExpression(.{});
         _ = try p.expect(.r_paren, .expected_r_paren);
-        const body = try p.parseSubstatement();
+        const body = try p.parseLoopBody();
         return p.addNode(.{ .tag = .while_stmt, .main_token = kw, .data = .{ .lhs = cond, .rhs = body } });
     }
 
     fn parseDoStatement(p: *Parser) PE!Node {
         const kw = try p.bump();
-        const body = try p.parseSubstatement();
+        const body = try p.parseLoopBody();
         _ = try p.expect(.keyword_while, .expected_while);
         _ = try p.expect(.l_paren, .expected_l_paren);
         const cond = try p.parseExpression(.{});
@@ -2181,7 +2216,7 @@ const Parser = struct {
                 _ = try p.bump();
                 const right = if (is_of) try p.parseAssignExpr(.{}) else try p.parseExpression(.{});
                 _ = try p.expect(.r_paren, .expected_r_paren);
-                const body = try p.parseSubstatement();
+                const body = try p.parseLoopBody();
                 const extra = try p.addExtra(ast.ForInOf{ .left = init, .right = right, .is_await = is_await });
                 return p.addNode(.{
                     .tag = if (is_of) .for_of_stmt else .for_in_stmt,
@@ -2197,7 +2232,7 @@ const Parser = struct {
         var update: Node = null_node;
         if (p.curTag() != .r_paren and p.curTag() != .eof) update = try p.parseExpression(.{});
         _ = try p.expect(.r_paren, .expected_r_paren);
-        const body = try p.parseSubstatement();
+        const body = try p.parseLoopBody();
         const extra = try p.addExtra(ast.For{ .init = init, .cond = cond, .update = update });
         return p.addNode(.{ .tag = .for_stmt, .main_token = kw, .data = .{ .lhs = extra, .rhs = body } });
     }
@@ -2208,6 +2243,9 @@ const Parser = struct {
         const disc = try p.parseExpression(.{});
         _ = try p.expect(.r_paren, .expected_r_paren);
         _ = try p.expect(.l_brace, .expected_l_brace);
+        // An unlabeled `break` inside the clauses targets the switch.
+        p.jump.switches += 1;
+        defer p.jump.switches -= 1;
 
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
@@ -2342,12 +2380,47 @@ const Parser = struct {
         if (isIdentLike(p.curTag()) and !p.nlBefore()) {
             label = try p.bump();
         }
+        // TS1107: tsc walks out of the jump looking for its target and stops at
+        // the first function-like it reaches. Only the crossing is reported
+        // here — a jump that resolves to nothing at a file's top level earns one
+        // of four other codes ztsc does not answer yet, and guessing between
+        // them would invent diagnostics.
+        if (p.spec == 0 and p.jump.in_function and !p.jumpResolves(is_break, label)) {
+            try p.errAtToken(.jump_crosses_function_boundary, kw);
+        }
         try p.expectSemicolon();
         return p.addNode(.{
             .tag = if (is_break) .break_stmt else .continue_stmt,
             .main_token = kw,
             .data = .{ .lhs = label, .rhs = 0 },
         });
+    }
+
+    /// Does a `break`/`continue` find its target without leaving the function it
+    /// sits in? An unlabeled `break` takes an iteration statement or a `switch`,
+    /// an unlabeled `continue` an iteration statement, and a labeled one any
+    /// enclosing label of the same name.
+    ///
+    /// A labeled `continue` whose label is NOT on an iteration statement is
+    /// TS1115 in tsc; treating it as resolved here under-reports that one code
+    /// and never invents this one.
+    fn jumpResolves(p: *Parser, is_break: bool, label: u32) bool {
+        if (label == 0) {
+            return p.jump.loops > 0 or (is_break and p.jump.switches > 0);
+        }
+        const name = p.tokenTextAt(label);
+        for (p.labels.items[p.jump.labels_base..]) |l| {
+            if (std.mem.eql(u8, p.tokenTextAt(l), name)) return true;
+        }
+        return false;
+    }
+
+    /// Parse the body of an iteration statement: one more jump target for the
+    /// `break`/`continue` inside it.
+    fn parseLoopBody(p: *Parser) PE!Node {
+        p.jump.loops += 1;
+        defer p.jump.loops -= 1;
+        return p.parseSubstatement();
     }
 
     // =====================================================================
@@ -2376,6 +2449,9 @@ const Parser = struct {
         // once the name is behind us.
         const saved_fn_ctx = p.fn_ctx;
         defer p.fn_ctx = saved_fn_ctx;
+        const saved_jump = p.jump;
+        defer p.jump = saved_jump;
+        p.jump = .{ .labels_base = p.labels.items.len, .in_function = true };
         const inner: FnCtx = if (flags & ast.Flags.async != 0) .async_fn else .sync;
         if (is_expr and inner == .async_fn) p.fn_ctx = inner;
         var name_tok: u32 = 0;
@@ -3248,6 +3324,9 @@ const Parser = struct {
             _ = try p.bump(); // `static`
             const saved_fn_ctx = p.fn_ctx;
             defer p.fn_ctx = saved_fn_ctx;
+            const saved_jump = p.jump;
+            defer p.jump = saved_jump;
+            p.jump = .{ .labels_base = p.labels.items.len, .in_function = true };
             p.fn_ctx = .static_block;
             return p.parseBlock();
         }
@@ -3350,6 +3429,9 @@ const Parser = struct {
             // Method / constructor / accessor.
             const saved_fn_ctx = p.fn_ctx;
             defer p.fn_ctx = saved_fn_ctx;
+            const saved_jump = p.jump;
+            defer p.jump = saved_jump;
+            p.jump = .{ .labels_base = p.labels.items.len, .in_function = true };
             p.fn_ctx = if (flags & ast.Flags.async != 0) .async_fn else .sync;
             const proto = try p.parseFnProtoRest(flags, name_tok);
             var body: Node = null_node;
@@ -3405,6 +3487,9 @@ const Parser = struct {
             // class written in a static block names the outer `await` binding.
             const saved_fn_ctx = p.fn_ctx;
             defer p.fn_ctx = saved_fn_ctx;
+            const saved_jump = p.jump;
+            defer p.jump = saved_jump;
+            p.jump = .{ .labels_base = p.labels.items.len, .in_function = true };
             p.fn_ctx = .sync;
             init = try p.parseAssignExpr(.{});
         }
@@ -4667,6 +4752,9 @@ const Parser = struct {
     fn parseArrowBody(p: *Parser, ctx: ExprCtx, flags: u32) PE!Node {
         const saved_fn_ctx = p.fn_ctx;
         defer p.fn_ctx = saved_fn_ctx;
+        const saved_jump = p.jump;
+        defer p.jump = saved_jump;
+        p.jump = .{ .labels_base = p.labels.items.len, .in_function = true };
         p.fn_ctx = if (flags & ast.Flags.async != 0) .async_fn else .sync;
         if (p.curTag() == .l_brace) return p.parseFunctionBody();
         return p.parseAssignExpr(.{ .no_in = ctx.no_in });
@@ -5757,6 +5845,9 @@ const Parser = struct {
                 // Method shorthand: value is a function_expr.
                 const saved_fn_ctx = p.fn_ctx;
                 defer p.fn_ctx = saved_fn_ctx;
+                const saved_jump = p.jump;
+                defer p.jump = saved_jump;
+                p.jump = .{ .labels_base = p.labels.items.len, .in_function = true };
                 p.fn_ctx = if (flags & ast.Flags.async != 0) .async_fn else .sync;
                 const proto = try p.parseFnProtoRest(flags, key_tok);
                 var body: Node = null_node;

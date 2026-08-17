@@ -286,6 +286,12 @@ pub const Code = enum(u16) {
     /// TS1437: `module { }` — a namespace declaration with no name at all.
     /// Reported on the `{`; grammar-class.
     namespace_needs_a_name,
+    /// TS1107: `while (c) { function f() { break; } }` — a `break`/`continue`
+    /// whose target lies outside the function it sits in. tsc walks out of the
+    /// statement and answers as soon as it reaches a function-like, before it
+    /// ever finds the loop, switch or label the jump names. Reported on the
+    /// keyword; grammar-class.
+    jump_crosses_function_boundary,
     /// TS1248: `class C { const x = 1 }` — `const` is not a class-member
     /// modifier. tsc's message names the keyword, and `const` is the only one
     /// that reaches it. Reported on the member NAME (measured against
@@ -698,6 +704,7 @@ pub const Code = enum(u16) {
             .quoted_module_name_needs_ambient,
             .namespace_needs_a_name,
             .const_class_member,
+            .jump_crosses_function_boundary,
             .label_not_allowed,
             .public_not_on_module_element,
             .private_not_on_module_element,
@@ -1018,6 +1025,7 @@ pub const Code = enum(u16) {
             .quoted_module_name_needs_ambient => "Only ambient modules can use quoted names.",
             .namespace_needs_a_name => "Namespace must be given a name.",
             .const_class_member => "A class member cannot have the 'const' keyword.",
+            .jump_crosses_function_boundary => "Jump target cannot cross function boundary.",
             .element_access_needs_argument => "An element access expression should take an argument.",
             .module_name_needs_quoted_string => "Module declaration names may only use ' or \" quoted strings.",
             .jsx_comma_operator => "JSX expressions may not use the comma operator. Did you mean to write an array?",
@@ -1272,6 +1280,7 @@ pub const Code = enum(u16) {
             .quoted_module_name_needs_ambient => 1035,
             .namespace_needs_a_name => 1437,
             .const_class_member => 1248,
+            .jump_crosses_function_boundary => 1107,
             .element_access_needs_argument => 1011,
             .rest_must_be_last => 2462,
             .module_name_needs_quoted_string => 1443,
