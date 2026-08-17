@@ -177,14 +177,45 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
         .import_decl => {}, // module graph
         .export_named, .export_all => {},
         .export_decl => try c.checkStatement(d.lhs),
-        .export_default => {
+        .export_default, .export_assign => {
             switch (c.nodeTag(d.lhs)) {
-                .function_decl, .class_decl => try c.checkStatement(d.lhs),
-                else => _ = try c.checkExprCached(d.lhs, types.no_type),
+                // A DECLARATION under `export default` is checked as the
+                // declaration it is. Without the type-space arms here,
+                // `export default interface A { value: number }` fell to
+                // `checkExprCached` and the interface BODY was checked as an
+                // expression — `value: number` read `number` as an
+                // identifier, for a phantom TS2693.
+                .function_decl,
+                .class_decl,
+                .interface_decl,
+                .type_alias,
+                .enum_decl,
+                .namespace_decl,
+                => try c.checkStatement(d.lhs),
+                else => try checkExportTarget(c, d.lhs),
             }
         },
         else => _ = try c.checkExprCached(node, types.no_type),
     }
+}
+
+/// tsc's `checkExportAssignment` for the operand of `export = <expr>` and
+/// `export default <expr>`: a BARE IDENTIFIER there is resolved in ALL
+/// meanings (`resolveEntityName(id, SymbolFlags.All, /*ignoreErrors*/ true)`)
+/// and is only handed to `checkExpressionCached` when the symbol it names
+/// actually has a VALUE meaning — or when it names nothing at all, which is
+/// how `export default nonexistent` still earns its TS2304.
+///
+/// So `export = SomeInterface` and `export default SomeTypeAlias` are legal
+/// export targets, not value-position uses, and neither is TS2693.
+/// Everything that is not a bare identifier is an ordinary expression.
+fn checkExportTarget(c: *Checker, expr: Node) Error!void {
+    if (c.nodeTag(expr) == .identifier) {
+        const a = try c.atomOfToken(c.tree.nodeMainToken(expr));
+        // Type or namespace meaning only: a legal export target, silent.
+        if (c.resolveSpace(a, c.cur_scope, true) == .wrong_space) return;
+    }
+    _ = try c.checkExprCached(expr, types.no_type);
 }
 
 /// tsc's `checkGrammarTopLevelElementsForRequiredDeclareModifier`: inside a
@@ -204,7 +235,16 @@ pub fn checkDeclFileTopLevel(c: *Checker) Error!void {
             .class_decl => !declFlagSet(c, ast.ClassData, stmt),
             .function_decl => !declFlagSet(c, ast.FnProto, stmt),
             .enum_decl => !declFlagSet(c, ast.EnumData, stmt),
-            .namespace_decl => !declFlagSet(c, ast.NamespaceData, stmt),
+            .namespace_decl => blk: {
+                const data = c.tree.extraData(ast.NamespaceData, c.tree.nodeData(stmt).lhs);
+                // A QUOTED-name module is only ever ambient, so the parser
+                // stamps `declare` on it whether or not the source wrote the
+                // modifier — the flag cannot answer for `module "Foo" {}` and
+                // the token stream has to. (`global { }` keeps the flag,
+                // since a global augmentation carries no name to modify.)
+                if (data.flags & ast.Flags.ambient_module != 0) break :blk !precededByDeclare(c, stmt);
+                break :blk data.flags & ast.Flags.declare == 0;
+            },
             else => false,
         };
         if (!needs) continue;
