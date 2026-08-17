@@ -3264,11 +3264,21 @@ const Binder = struct {
     /// records `(spec, scope)`. Members need explicit `export` to be module
     /// exports — like an ambient namespace body, `exporting_node` is set per
     /// nested `export` statement, not pinned.
+    ///
+    /// The block scope's PARENT is the ENCLOSING scope, not the file scope. At
+    /// the top level those are the same thing; nested — `declare module "Map" {
+    /// import { Cls } from "M"; module "Observable" { interface Observable {
+    /// foo(): Cls } } }` — they are not, and tsc resolves `Cls` by walking the
+    /// node parent chain out through the enclosing module block, where the
+    /// import lives. Parenting to `file_scope` reported TS2304 for it
+    /// (moduleAugmentationInAmbientModule1-4); `bindGlobalAugmentation` already
+    /// parents its block the same way, which is why the `global { … }` spelling
+    /// of the same test (…5) was the one that passed.
     fn bindAmbientModule(b: *Binder, node: Node) Error!void {
         const d = b.tree.nodeData(node);
         const data = b.tree.extraData(ast.NamespaceData, d.lhs);
         const spec = try b.atomOf(stripModuleQuotes(b.tokenText(data.name_token)));
-        const ms = try b.newScope(.namespace, node, file_scope);
+        const ms = try b.newScope(.namespace, node, b.cur_scope);
         const export_start: u32 = @intCast(b.export_recs.items.len);
 
         const saved = b.saveState();

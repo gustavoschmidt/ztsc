@@ -149,6 +149,18 @@ pub fn typeFromTypeNameEx(c: *Checker, name_node: Node, args: []const TypeId, ou
                     },
                     // Namespace-as-type / a property of an `export =` value
                     // (value space only) / unresolved: any (documented).
+                    //
+                    // A whole MODULE namespace object named as a type IS the
+                    // TS2709 `materializeTypeRef` reports for a `namespace`
+                    // block, and reporting it here fixes moduleInTypePosition1
+                    // and staticInstanceResolution5 — but it also fires where
+                    // the name has a second, TYPE meaning that ztsc's export
+                    // table drops on the floor: `export type Drink = 0 | 1;
+                    // export * as Drink from "./constants";` keeps only the
+                    // namespace, and `import * as B from "./b"` merged with a
+                    // local `interface B` reaches the import branch on the
+                    // binding's import half. Both are one export table entry
+                    // where tsc has a dual, so the diagnostic waits on that.
                     .namespace, .default_expr, .ambient_ns, .export_equals_prop, .dual, .any => return types.any_type,
                 }
             }
@@ -288,6 +300,23 @@ pub fn materializeTypeRef(c: *Checker, sym: SymbolId, args: []const TypeId, tok:
             return c.ts.makeArrayReadonly(fixed[0]);
         }
         return c.ts.makeRef(sym, fixed);
+    }
+    // TS2709. tsc's `SymbolFlags.Type` is `Class | Interface | Enum |
+    // EnumMember | TypeLiteral | TypeParameter | TypeAlias` — NAMESPACE is not
+    // in it — so `getTypeFromTypeReference` never lands on a namespace and the
+    // reference answers "Cannot use namespace 'A' as a type." ztsc's
+    // `hasTypeMeaning` DOES admit `namespace_decl`, because a qualified
+    // `A.B.T` has to walk through `A`; the exclusion belongs here, where the
+    // walk is over and the namespace itself is what the type node named.
+    //
+    // Every arm above has already claimed the merged shapes, so reaching here
+    // with the flag set means nothing else in the merge carries a type: a bare
+    // `namespace A {}`, and a `function f() {} namespace f {}` pair, both
+    // report, while `enum E {} namespace E {}` and `class K {} namespace K {}`
+    // do not. All four oracle-verified against tsgo 7.0.2.
+    if (f.namespace_decl) {
+        try c.diagFmt(2709, c.tokSpan(tok), "Cannot use namespace '{s}' as a type.", .{c.atomText(a)});
+        return types.error_type;
     }
     return types.any_type;
 }
@@ -632,6 +661,76 @@ pub fn importTypeMember(c: *Checker, import_node: Node, name_tok: TokenIndex, ar
     return types.error_type;
 }
 
+/// Does this symbol's whole meaning consist of being a namespace? tsc's
+/// `SymbolFlags.Type` excludes `Namespace`, so such a symbol names no type —
+/// see `materializeTypeRef`'s TS2709 arm and the qualified-member test.
+///
+/// A VALUE meaning is excluded too, and not because it makes the name a type:
+/// tsc answers a different diagnostic for that shape. `namespace A { export
+/// function B<T>(x: T) {} export namespace B { … } }` with `var b: A.B` is
+/// TS2749 ("refers to a value … did you mean 'typeof A.B'?"), spanning the
+/// WHOLE dotted name, not the TS2694 this predicate leads to. Until that
+/// message is spelled, such a member keeps its pre-existing silent `any`.
+fn pureNamespace(f: binder.SymbolFlags) bool {
+    if (!f.namespace_decl) return false;
+    return !(f.class or f.interface or f.type_alias or f.type_param or
+        f.enum_decl or f.import_binding or
+        f.function or f.var_decl or f.let_decl or f.const_decl);
+}
+
+/// The qualifier of a dotted type name reached no container. tsc splits that
+/// into two diagnostics at the LEFTMOST identifier of the chain, and both were
+/// silent `any` here:
+///
+///   * the name resolves to nothing at all, or to something with only a VALUE
+///     meaning (`var vv; let x: vv.T`) — TS2503 "Cannot find namespace";
+///   * it resolves to a TYPE that is not a container (a class, an interface, a
+///     type alias) — TS2702 "only refers to a type, but is being used as a
+///     namespace here".
+///
+/// Both oracle-verified against tsgo 7.0.2, together with the two cases that
+/// must stay silent here: a resolved container whose deeper segment failed
+/// (`.sym`, left to the TS2694 arms) and a namespace-augmentation name that
+/// only the augmented module's exports declare (`augmentModuleTypeSym`, the
+/// same fallback the bare-name path consults before it reports).
+///
+/// Returns whether it reported, so the caller can answer `error` instead of
+/// `any` exactly when tsc does.
+fn reportBadNsQualifier(c: *Checker, node: Node) Error!bool {
+    var n = node;
+    while (c.nodeTag(n) == .qualified_name or c.nodeTag(n) == .member_expr) {
+        n = c.tree.nodeData(n).lhs;
+    }
+    if (c.nodeTag(n) != .identifier) return false;
+    const tok = c.tree.nodeMainToken(n);
+    // `globalThis` is in scope everywhere and has no declaration for the walk
+    // above to find, so it would read as "cannot find namespace". tsc's
+    // `globalThisSymbol` carries `Module` meaning and resolves:
+    // `T extends globalThis.Function` is silent (the lib's own
+    // instanceofOperatorWithRHSHasSymbolHasInstance test).
+    if (std.mem.eql(u8, c.tokenText(tok), "globalThis")) return false;
+    const a = try c.atomOfToken(tok);
+    const type_only_entity = switch (c.resolveNamespaceSpace(a, c.cur_scope)) {
+        .sym => return false,
+        .wrong_space => |sym| hasTypeMeaning(c.symFlags(sym)),
+        .none => false,
+    };
+    if ((try c.augmentModuleTypeSym(c.cur_scope, a)) != null) return false;
+    if (type_only_entity) {
+        try c.diagFmt(2702, c.tokSpan(tok), "'{s}' only refers to a type, but is being used as a namespace here.", .{c.tokenText(tok)});
+        return true;
+    }
+    // tsc's "not found" pair, exactly as the bare-name arm above spells it:
+    // a close name in scope turns the message into the suggestion variant
+    // (TS2833 rather than TS2503).
+    if (c.suggestName(a, c.cur_scope, false)) |sugg| {
+        try c.diagFmt(2833, c.tokSpan(tok), "Cannot find namespace '{s}'. Did you mean '{s}'?", .{ c.tokenText(tok), c.atomText(sugg) });
+        return true;
+    }
+    try c.diagFmt(2503, c.tokSpan(tok), "Cannot find namespace '{s}'.", .{c.tokenText(tok)});
+    return true;
+}
+
 /// Resolve a qualified type name `A.B.T` (in type position) by walking
 /// namespace containers left-to-right, then building the final member's
 /// type. Missing/non-exported members report TS2694 like tsc.
@@ -655,12 +754,22 @@ pub fn typeFromQualifiedName(c: *Checker, node: Node, args: []const TypeId) Erro
             return types.error_type;
         }
     }
-    const container = (try c.resolveNsContainer(d.lhs)) orelse return types.any_type;
+    const container = (try c.resolveNsContainer(d.lhs)) orelse {
+        if (try reportBadNsQualifier(c, d.lhs)) return types.error_type;
+        return types.any_type;
+    };
     switch (container) {
         .ns => |ns_sym| {
             if (c.namespaceMemberSym(ns_sym, name)) |g| {
                 const mf = c.symFlags(g);
-                if (mf.exported and hasTypeMeaning(mf)) {
+                // A member that is ONLY a namespace is not a type — the same
+                // `SymbolFlags.Type` exclusion `materializeTypeRef` draws for a
+                // bare name. `namespace P { export namespace R { … } }` with
+                // `var x: P.R` is TS2694 here (oracle-verified: tsc's message
+                // for it really is "has no exported member 'R'", not TS2709);
+                // without the test `namedTypeFromSymbol` silently answered
+                // `any`.
+                if (mf.exported and hasTypeMeaning(mf) and !pureNamespace(mf)) {
                     return c.namedTypeFromSymbol(g, args, name_tok);
                 }
             }
@@ -742,6 +851,28 @@ pub fn resolveNsContainer(c: *Checker, node: Node) Error!?NsContainer {
                     if (c.symFlags(sym).namespace_decl) return .{ .ns = sym };
                     if (c.symFlags(sym).import_binding) {
                         if (c.importTarget(sym)) |tgt| return c.containerFromImportTarget(tgt);
+                        // No import RECORD means the ENTITY-NAME form,
+                        // `import booz = foo.bar.baz` — nothing to link, so
+                        // the right-hand side would have to be resolved in the
+                        // alias's own file and scope
+                        // (`importEqualsEntityContainer`, which jsx.zig
+                        // already does for `export import JSX = JSXInternal`).
+                        //
+                        // NOT done here, and the reason is measured: doing it
+                        // turns `declare namespace JSX { import React =
+                        // __React; interface IntrinsicAttributes extends
+                        // React.Attributes {} }` — the shape every bundled
+                        // `react.d.ts` fixture uses — from an empty interface
+                        // into a real one, and ztsc's JSX excess-property
+                        // check then rejects `<C {...{ "ignore-prop": 200 }}
+                        // />`. tsc accepts it: `isKnownProperty` treats a
+                        // HYPHENATED name as known when it is comparing JSX
+                        // attributes, and ztsc has that rule for a direct
+                        // attribute token only, not for a spread object
+                        // literal's string-literal key. Worth +3 exact
+                        // (aliasBug, innerAliases2,
+                        // tsxStatelessFunctionComponentsWithTypeArguments1)
+                        // once the hyphen rule reaches the spread path.
                     }
                     return null;
                 },

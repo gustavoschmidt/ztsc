@@ -981,6 +981,10 @@ fn mergeGlobals(
     // interface `I` already exported by the real module `spec` resolves to.
     try mergeAugmentations(&m, files, sym_base, links, export_equals_atom);
 
+    // …and the same fold WITHIN one ambient specifier, whose blocks name no
+    // real file for the pass above to key off.
+    try mergeAmbientBlocks(&m, files, sym_base);
+
     if (m.merged.items.len == 0) return .{ .globals = globals };
 
     std.mem.sort(ConstitPair, m.constit.items, {}, struct {
@@ -1088,6 +1092,113 @@ fn mergeAugmentations(
         const parts = try m.scratch.alloc(u32, 1 + augs.len);
         parts[0] = real;
         @memcpy(parts[1..], augs);
+        _ = try m.mergeSet(parts);
+    }
+}
+
+/// Declaration merging WITHIN one ambient module specifier. Every `declare
+/// module "spec" { … }` block in the program declares the same module — tsc
+/// merges the blocks' symbol tables outright — so two blocks that both declare
+/// `X` are two declarations of ONE entity:
+///
+///     declare module "Observable" { class Observable {} }
+///     declare module "Observable" { interface Observable { foo(): number } }
+///
+/// is the ordinary interface-into-class merge, and `import {Observable} from
+/// "Observable"; x.foo()` needs it. `buildAmbient` keeps only the FIRST
+/// contributor per exported name, so without this the class alone answered and
+/// `foo` was a false TS2339 — moduleAugmentationInAmbientModule1-4, where the
+/// augmenting block is spelled `module "Observable" { … }` NESTED inside a
+/// second ambient module (`bindAmbientModule` records a nested block in
+/// `ambient_modules` exactly like a top-level one, so both shapes arrive here).
+///
+/// `mergeAugmentations` above cannot serve: it keys off the real FILE a
+/// specifier resolves to, and an ambient specifier resolves to no file at all.
+///
+/// The admitted shapes are that function's: the first contributor may be an
+/// interface, a class or a namespace, and every later one must be an interface
+/// or a namespace (interface↔interface, interface→class, namespace↔namespace).
+/// Anything else is a duplicate-identifier clash rather than a merge, and
+/// `reportAmbientMemberDups` is the pass that speaks to it.
+fn mergeAmbientBlocks(m: *Merger, files: []const ProgFile, sym_base: []const u32) Error!void {
+    const Block = struct { file: FileId, scope: u32 };
+    // specifier -> the (file, block scope) pairs declaring it, in FileId order.
+    var by_spec: std.AutoArrayHashMapUnmanaged(Atom, std.ArrayListUnmanaged(Block)) = .empty;
+    var any = false;
+    for (files, 0..) |*f, fi| {
+        for (f.bind.ambient_modules) |am| {
+            if (am.spec == 0) continue;
+            const gop = try by_spec.getOrPut(m.scratch, am.spec);
+            if (!gop.found_existing) gop.value_ptr.* = .empty else any = true;
+            try gop.value_ptr.append(m.scratch, .{ .file = @intCast(fi), .scope = am.scope });
+        }
+    }
+    if (!any) return;
+
+    // first contributor's real id -> the later contributors, in FileId order.
+    var sets: std.AutoArrayHashMapUnmanaged(u32, std.ArrayListUnmanaged(u32)) = .empty;
+    const Collect = struct {
+        m: *Merger,
+        sets: *std.AutoArrayHashMapUnmanaged(u32, std.ArrayListUnmanaged(u32)),
+
+        fn visit(g: @This(), _: Atom, hits: []const u32) Error!void {
+            const head = globalSymFlags(g.m.files, g.m.sym_base, hits[0]);
+            if (!head.interface and !head.class and !head.namespace_decl) return;
+            for (hits[1..]) |h| {
+                if (h == hits[0]) continue;
+                const hf = globalSymFlags(g.m.files, g.m.sym_base, h);
+                if (!hf.interface and !hf.namespace_decl) continue;
+                const gop = try g.sets.getOrPut(g.m.scratch, hits[0]);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(g.m.scratch, h);
+            }
+        }
+    };
+    const collect: Collect = .{ .m = m, .sets = &sets };
+
+    for (by_spec.values()) |blocks| {
+        if (blocks.items.len < 2) continue;
+        const segs = try m.scratch.alloc(MemberSeg, blocks.items.len);
+        var n: usize = 0;
+        for (blocks.items) |blk| {
+            const b = files[blk.file].bind;
+            const lo = b.scope_members_start[blk.scope];
+            const hi = b.scope_members_start[blk.scope + 1];
+            if (hi == lo) continue;
+            segs[n] = .{ .file = blk.file, .atoms = b.member_atoms[lo..hi], .syms = b.member_syms[lo..hi] };
+            n += 1;
+        }
+        try eachSharedMember(m.scratch, sym_base, segs[0..n], collect, Collect.visit);
+    }
+    if (sets.count() == 0) return;
+
+    // A real id may only ever fold into ONE merged id — `constit` is a
+    // key-sorted lookup, and a second entry under the same key would answer
+    // whichever the binary search landed on. `mergeAugmentations` has already
+    // run, so anything it claimed is off limits here (a specifier that names a
+    // real file AND carries ambient blocks is the shape that overlaps).
+    var claimed: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    for (m.constit.items) |pr| try claimed.put(m.scratch, pr.key, {});
+
+    // Deterministic merged-id assignment: ascending real ids, as above.
+    const keys = try m.scratch.alloc(u32, sets.count());
+    @memcpy(keys, sets.keys());
+    std.mem.sort(u32, keys, {}, struct {
+        fn lt(_: void, a: u32, b: u32) bool {
+            return a < b;
+        }
+    }.lt);
+    for (keys) |head| {
+        if (claimed.contains(head)) continue;
+        const rest = sets.get(head).?.items;
+        var clash = false;
+        for (rest) |r| {
+            if (claimed.contains(r)) clash = true;
+        }
+        if (clash) continue;
+        const parts = try m.scratch.alloc(u32, 1 + rest.len);
+        parts[0] = head;
+        @memcpy(parts[1..], rest);
         _ = try m.mergeSet(parts);
     }
 }
@@ -1439,6 +1550,34 @@ const Linker = struct {
         l.aug_blocks = ablocks;
     }
 
+    /// TS2661, tsc's `checkExportSpecifier` tail: an `export { X }` with no
+    /// module specifier whose name resolves to a declaration of a GLOBAL
+    /// source file cannot export it — the specifier form re-exports a
+    /// module-local, and a global is not one.
+    ///
+    ///     // a.d.ts (a script — its top level IS the global scope)
+    ///     declare class X {}
+    ///     // b.ts
+    ///     export { X };   // TS2661
+    ///
+    /// `is_global` is the caller's verdict, because the two arms know it
+    /// differently: a name with no local symbol that the program's global
+    /// table answered is global by construction, while a resolved local is
+    /// global exactly when its own scope is the file scope of a SCRIPT (a
+    /// module's file scope is module-local — `export { x }` next to
+    /// `let x` is the ordinary form and must stay silent).
+    ///
+    /// Restricted to a genuine `export_specifier` node: a `.named` record is
+    /// also how `export var x` is recorded, and tsc's check is on the
+    /// specifier syntax alone. Reported at the specifier's own name token,
+    /// which is `propertyName || name` — `export { x, x as y }` answers twice.
+    fn reportGlobalExportSpecifier(l: *Linker, file: FileId, rec: binder.ExportRec, is_global: bool) Error!void {
+        if (!is_global or rec.module != 0) return;
+        const tree = l.files[file].tree;
+        if (tree.nodeTag(rec.node) != .export_specifier) return;
+        try l.diag(file, 2661, l.tokSpan(file, tree.nodeMainToken(rec.node)), "Cannot export '{s}'. Only local declarations can be exported from a module.", .{l.atomText(rec.local)});
+    }
+
     /// The flattened export table of `file` (built on demand, cycle-safe).
     fn table(l: *Linker, file: FileId) Error!*std.AutoArrayHashMapUnmanaged(Atom, Target) {
         if (l.state[file] != .unvisited) return &l.tables[file];
@@ -1451,6 +1590,7 @@ const Linker = struct {
             switch (rec.kind) {
                 .named => {
                     if (rec.sym != binder.no_symbol) {
+                        try l.reportGlobalExportSpecifier(file, rec, f.bind.symbol_scopes[rec.sym] == binder.file_scope and !f.bind.is_module);
                         const tgt = try l.finalizeLocal(file, rec.sym, rec.local, rec.type_only, 0);
                         try l.put(t, rec.exported, tgt);
                     } else if (rec.local != 0) {
@@ -1460,6 +1600,7 @@ const Linker = struct {
                         // on into the global table rather than reporting
                         // TS2304.
                         if (l.global_decls.get(rec.local)) |tgt| {
+                            try l.reportGlobalExportSpecifier(file, rec, true);
                             try l.put(t, rec.exported, tgt);
                         } else {
                             try l.diag(file, 2304, l.nodeSpan(file, rec.node), "Cannot find name '{s}'.", .{l.atomText(rec.local)});
