@@ -4742,6 +4742,20 @@ fn collectCallSigs(c: *Checker, rctx: TypeId, out: *std.ArrayList(TypeId)) Error
 /// contextual signature for `(event) => …`, and filtering afterwards would
 /// have thrown it away along with the zero-parameter one and reported TS7006.
 fn contextualCallSigOfType(c: *Checker, rctx: TypeId, required: ?u32) Error!TypeId {
+    // A contextual type with AT MOST ONE call signature — a function type, or
+    // an object with zero or one — is the overwhelmingly common shape, and it
+    // is answered without a list: this runs once per contextually typed
+    // function expression in the program, and the list path allocates.
+    switch (c.ts.kind(rctx)) {
+        .function => return arityFiltered(c, rctx, required),
+        .object => {
+            const n = c.ts.objectCallSigCount(rctx);
+            if (n == 0) return types.no_type;
+            if (n == 1) return arityFiltered(c, c.ts.objectCallSig(rctx, 0), required);
+        },
+        .overloads, .intersection => {},
+        else => return types.no_type,
+    }
     var sigs: std.ArrayList(TypeId) = .empty;
     defer sigs.deinit(c.scratch());
     try collectCallSigs(c, rctx, &sigs);
@@ -4757,6 +4771,13 @@ fn contextualCallSigOfType(c: *Checker, rctx: TypeId, required: ?u32) Error!Type
     if (sigs.items.len == 0) return types.no_type;
     if (sigs.items.len == 1) return sigs.items[0];
     return combineCallSignatures(c, sigs.items);
+}
+
+/// `isAritySmaller` as a filter over a single signature: the signature, or
+/// `no_type` when it is too narrow for the expression.
+fn arityFiltered(c: *Checker, sig: TypeId, required: ?u32) TypeId {
+    const n = required orelse return sig;
+    return if (sig_zig.arityIsSmaller(c, sig, n)) types.no_type else sig;
 }
 
 /// tsc's `getIntersectedSignatures` ->
