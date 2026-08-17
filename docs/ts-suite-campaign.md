@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-17, post wave 15)
+## Standings (2026-08-17, post wave 16)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **6749 / 8627 (78.2%)** |
-| excess keys (false positives) | 3541 | 2103 |
-| missing keys (under-reports) | 8617 | 4428 |
+| exact-match cases | 4902 / 7815 (62.7%) | **6789 / 8627 (78.7%)** |
+| excess keys (false positives) | 3541 | 2062 |
+| missing keys (under-reports) | 8617 | 4360 |
 | bucketed (ztsc parse error, incomparable) | 825 | 13 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Fifteen waves landed (3–15), every one with ZERO match→non-match regressions in
+Sixteen waves landed (3–16), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -159,7 +159,70 @@ constraints one-way, and did-you-mean-to-call anchoring. D replaced
 classifyEnumInit with tsc's createEvaluator (TS1061/1066/2474/2477/2478),
 fixed intersection iteration, static-block flow scoping, TS2466.
 
-## Ranked next queue (wave 16) — distilled from wave-15 agent reports
+Wave 16 (+40 cases; conformance 1309→1317): A landed the spread/destructuring
+TS2488 arms, StrictArity union reduction, TS2507, TS2698, generator array-elem
+context — and measured-then-skipped the two zero-yield targets. B landed tsc's
+FlowFlags.ReduceLabel for try/finally (reduce depth carried in the RefKey so
+the sealed shared flow graph stays immutable), the blockScopedSameNameFunction
+fix (stmtTerminal scope tracking, not binder scoping), typeof-discriminant
+narrowing. C landed trivial-conditional simplification (getSimplifiedConditionalType,
+12 keys→0), infer-binder re-binding, check&extends substitution, homomorphic
+array-bounded maps. D landed TS18033 + TS2651/TS2565 (second non-memoized
+evaluator run), TS2433 cross-file merge, nested-ambient-module-as-augmentation,
+TS2507 primitive arm. Mid-wave the social-app checkout lost its node_modules
+hard-links (4778 files loading instead of 5028) — `pnpm install` repairs it;
+check the stats line if link errors drop to 0.
+
+## Ranked next queue (wave 17) — distilled from wave-16 agent reports
+
+1. TS2440 re-diagnosed (8 keys): tsc emits from checkAliasSymbol using the
+   alias TARGET's meanings (cross-file; a non-instantiated namespace target is
+   type-only and clashes with nothing). Needs alias resolution, i.e.
+   names.zig/link — NOT binder.zig where ztsc's emit sits today.
+2. TS2649 final state: one global_dup case (noSymbolForMergeCrash) needs
+   mergeClash to return the failing source INDEX (3 call sites in
+   link/modules.zig); augmentExportEquals7 is oracle-confirmed a different
+   mechanism (mergeModuleAugmentation's export=-to-non-namespace arm, reported
+   on the "lib" specifier).
+3. Readonly index signatures end-to-end (re-diagnosed): ztsc has NO readonly
+   bit on index signatures anywhere — `readonly [s: string]` + write reports
+   nothing (tsgo-verified). Needs a types.zig object flag, emission in
+   expr.zig/readonlyIndexWriteAt, and the static-index grammar arms;
+   staticIndexSignature2/4 (9 keys) plus mappedTypeRelationships f20/21.
+4. Interface-extends-class-value gap: `interface X extends Y` where Y is a
+   typeof-alias (IteratorObjectConstructor = typeof __ztscIteratorAbstract)
+   drops everything inherited — source of builtinIterator's excess TS2351 and
+   the withdrawn TS2507 object arm (which would also regain importAsBaseClass).
+5. importInsideModule (misfiled earlier): TS2307 at a USE of an
+   `import x = require()` alias inside a plain namespace — tsc's resolveAlias
+   at the use site; fix belongs in names.zig.
+6. TS2417 private/protected statics (4): nominal_members.declaringMember needs
+   a class-symbol origin on the static side (produced in classes.zig/
+   statics.zig, consumed in assign.zig).
+7. TS2430 residue (3): interface method-overload replacement, decided in
+   classes.zig's interfaceGeneric.
+8. distributiveConditionalTypeConstraints residue (4 keys):
+   getConstraintOfDistributiveConditionalType alone is too lenient (measured:
+   fixes 3, breaks 2 — IsArray<T> under T extends object must stay boolean);
+   needs whatever restriction tsc pairs it with.
+9. strictBindCallApply1 last 2 keys: ztsc's this-parameter check passes
+   leniently on a type-param target; for-of39/iterableArrayPattern28 need
+   array-literal elaboration into an `Iterable<…> | null` target.
+10. TS2683 this-container rule (9 cases): rule fully oracled (wave-15);
+    still needs the enclosing-container walk; FP blast radius is the risk.
+11. TS2693 residue (7, binder/expr), TS2454 dedup, and the big TS2322/TS2345
+    census pools.
+12. Regex BODY validator (dedicated: quantifier braces, classes, group
+    modifiers; a wrong error is syntactic = whole-program suppression —
+    bucketed gate is the tripwire).
+13. nestedExcessPropertyChecking per-frame weak rule (risky; flow/062).
+14. resolution-mode import attributes (deep, 2 cases).
+15. Determinism defect with a concrete witness: social-app `--checkers=1` and
+    `--file-order=reverse` diverge; `Navigation.tsx:778:29` prints
+    `NativeStackNavigationProp<{…}>` in one partition and the expanded shape
+    in the other. Pattern-matches the open instantiation-budget partition bug.
+
+## Superseded queue (wave 16, kept for context)
 
 1. expr.zig one-arm items (mapped exactly): array-literal SPREAD swallows
    iteration failure instead of TS2488 (expr.zig:1176); destructuring-
