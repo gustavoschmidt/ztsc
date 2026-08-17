@@ -1763,8 +1763,8 @@ const Parser = struct {
                         if (isIdentLike(p.peekTag(1)) and !p.peekNewline(1)) {
                             return p.parseNamespaceDecl(ast.Flags.declare);
                         }
-                        if (p.peekTag(1) == .string_literal and !p.peekNewline(1)) {
-                            return p.parseAmbientModule();
+                        if (isModuleNameLiteral(p.peekTag(1)) and !p.peekNewline(1)) {
+                            return p.parseAmbientModule(true);
                         }
                         const start = p.curIdx();
                         _ = try p.bump();
@@ -1831,12 +1831,10 @@ const Parser = struct {
                 if (isIdentLike(t1) and !p.peekNewline(1)) {
                     return p.parseNamespaceDecl(0);
                 }
-                if (t1 == .string_literal and !p.peekNewline(1)) {
-                    // String-module name (`module "x" {}`) is augmentation:
-                    // still out of subset.
-                    const start = try p.bump();
-                    p.skipUnsupportedBlockish();
-                    return p.unsupportedFrom(start);
+                if (isModuleNameLiteral(t1) and !p.peekNewline(1)) {
+                    // `module "x" { }` with no `declare`: the same declaration
+                    // an ambient one makes, plus the TS1035 that says so.
+                    return p.parseAmbientModule(false);
                 }
                 return p.parseExpressionStatement();
             },
@@ -3890,9 +3888,36 @@ const Parser = struct {
     /// file: a project `global.d.ts` that opens with `declare module "*.scss";`
     /// and then augments an interface lost the augmentation to error recovery,
     /// and under `skipLibCheck` the parse error itself was invisible.
-    fn parseAmbientModule(p: *Parser) PE!Node {
+    /// `declared` is whether a `declare` modifier introduced this declaration.
+    /// TS1035: a QUOTED module name declares an EXTERNAL module, which only an
+    /// ambient declaration may do — `module "M" { }` on its own is an error,
+    /// while the same source in a `.d.ts` is silent because the whole file is
+    /// ambient from its first token.
+    /// Can this token start the NAME of a `module "…" { }`? A quoted string is
+    /// the only legal spelling, but a template is taken too so it can be
+    /// rejected with TS1443 instead of derailing the declaration behind it.
+    fn isModuleNameLiteral(t: TokTag) bool {
+        return switch (t) {
+            .string_literal, .no_substitution_template_literal, .template_head => true,
+            else => false,
+        };
+    }
+
+    fn parseAmbientModule(p: *Parser, declared: bool) PE!Node {
         const kw = try p.bump(); // `module`
-        const spec_tok = try p.bump(); // string literal
+        const spec_tok = p.curIdx();
+        if (p.curTag() == .no_substitution_template_literal or p.curTag() == .template_head) {
+            // TS1443: a module name is a `'`/`"` string, never a template. tsc
+            // parses the template anyway — substitutions and all — so the body
+            // behind it still parses; only the name is rejected.
+            _ = try p.parseTemplateExpr(false);
+            if (p.spec == 0) try p.errAtToken(.module_name_needs_quoted_string, spec_tok);
+        } else {
+            _ = try p.bump(); // string literal
+            if (!declared and !p.ambient and p.spec == 0) {
+                try p.errAtToken(.quoted_module_name_needs_ambient, spec_tok);
+            }
+        }
         if (p.curTag() != .l_brace) {
             _ = try p.eat(.semicolon);
             const empty = try p.scratchToSpan(p.scratchTop());

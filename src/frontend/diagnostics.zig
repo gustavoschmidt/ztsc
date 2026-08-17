@@ -270,6 +270,19 @@ pub const Code = enum(u16) {
     /// still use it. Reported on the NAME, once per segment of a dotted one
     /// (`module not.ok {}` answers twice). Grammar-class.
     module_keyword_for_namespace,
+    /// TS1035: `module "M" { }` with no `declare` and outside an ambient
+    /// context — a QUOTED module name declares an external module, which only
+    /// an ambient declaration may do. A `.d.ts` is ambient from its first token,
+    /// so the same source is silent there. Reported on the name; grammar-class.
+    quoted_module_name_needs_ambient,
+    /// TS1443: ``declare module `M` { }`` — a module name is a `'`/`"` string,
+    /// never a template. Reported on the template.
+    ///
+    /// SYNTACTIC, like TS1433 and unlike its TS1035 neighbour: tsc raises it
+    /// from the PARSER, so it silences every grammar diagnostic in the file
+    /// behind it. Measured — ``module "M" { }`` beside a templated one loses
+    /// both its TS1035 and the TS1155 of an uninitialized `const` inside it.
+    module_name_needs_quoted_string,
 
     // --- modifier order and repetition (tsc's `checkGrammarModifiers`) -------
     /// TS1030 `'{0}' modifier already seen.` — the same modifier twice on one
@@ -665,6 +678,7 @@ pub const Code = enum(u16) {
             .decorator_on_method_overload,
             .decorator_on_second_accessor,
             .module_keyword_for_namespace,
+            .quoted_module_name_needs_ambient,
             .label_not_allowed,
             .public_not_on_module_element,
             .private_not_on_module_element,
@@ -982,6 +996,8 @@ pub const Code = enum(u16) {
             .jsx_text_rbrace => "Unexpected token. Did you mean `{'}'}` or `&rbrace;`?",
             .jsx_text_gt => "Unexpected token. Did you mean `{'>'}` or `&gt;`?",
             .module_keyword_for_namespace => "A 'namespace' declaration should not be declared using the 'module' keyword. Please use the 'namespace' keyword instead.",
+            .quoted_module_name_needs_ambient => "Only ambient modules can use quoted names.",
+            .module_name_needs_quoted_string => "Module declaration names may only use ' or \" quoted strings.",
             .jsx_comma_operator => "JSX expressions may not use the comma operator. Did you mean to write an array?",
             .rest_element_property_name => "A rest element cannot have a property name.",
             .mod_seen_static => modSeenMessage("static"),
@@ -1231,6 +1247,8 @@ pub const Code = enum(u16) {
             .jsx_text_rbrace => 1381,
             .jsx_text_gt => 1382,
             .module_keyword_for_namespace => 1540,
+            .quoted_module_name_needs_ambient => 1035,
+            .module_name_needs_quoted_string => 1443,
             .jsx_comma_operator => 18007,
             .rest_element_property_name => 2566,
             .mod_seen_static,
