@@ -76,6 +76,7 @@ const default_exports = @import("default_exports.zig");
 const member_names = @import("member_names.zig");
 const decl_spaces = @import("decl_spaces.zig");
 const impl_expected = @import("impl_expected.zig");
+const index_signature = @import("index_signature.zig");
 const source = @import("source.zig");
 
 const Ast = ast.Ast;
@@ -2885,6 +2886,7 @@ const Binder = struct {
                 else => {},
             }
         }
+        try b.checkDuplicateIndexSignatures(b.tree.extraRange(data.members_start, data.members_end));
         b.restoreState(saved);
     }
 
@@ -3205,11 +3207,62 @@ const Binder = struct {
             ms = try b.newScope(.interface_members, node, is);
         }
 
-        for (b.tree.extraRange(data.members_start, data.members_end)) |member| {
+        const members = b.tree.extraRange(data.members_start, data.members_end);
+        for (members) |member| {
             if (member == null_node) continue;
             try b.bindTypeMember(member, ms);
         }
+        try b.checkDuplicateIndexSignatures(members);
         b.popScope(saved_scope);
+    }
+
+    /// TS2374 for the index signatures of ONE member list — a class body, an
+    /// `interface` block, or an object-type literal — that share a key domain
+    /// with a sibling (`index_signature.duplicateKey`).
+    ///
+    /// Only INSTANCE signatures: `static [k: string]` lives on the class value's
+    /// type, which tsc's `getIndexSymbol(classSymbol)` never reads, so two
+    /// static signatures are silently accepted (measured) and a static beside an
+    /// instance one is not a pair at all.
+    ///
+    /// One list at a time, so signatures pooled across a merged declaration
+    /// (`interface A {…} interface A {…}`, or a class beside its `interface`
+    /// half) go unreported — an under-report, and the only part of the rule that
+    /// would need symbol-level index-signature identity to answer.
+    fn checkDuplicateIndexSignatures(b: *Binder, members: []const Node) Error!void {
+        // Two parallel scratch lists rather than a struct: `duplicateKey` takes
+        // the keys as a slice, and every member list in real code has zero or
+        // one index signature, so the loop below usually appends nothing.
+        var keys: std.ArrayList([]const u8) = .empty;
+        defer keys.deinit(b.scratch);
+        var sites: std.ArrayList(Node) = .empty;
+        defer sites.deinit(b.scratch);
+        for (members) |member| {
+            if (member == null_node or b.nodeTag(member) != .index_signature) continue;
+            const md = b.tree.nodeData(member);
+            if (md.rhs & ast.Flags.static != 0) continue;
+            const key_type = b.tree.extraData(ast.IndexSig, md.lhs).key_type;
+            if (key_type == null_node or b.nodeTag(key_type) == .error_node) continue;
+            const span = b.tree.span(b.src, key_type);
+            try keys.append(b.scratch, b.src[span.start..span.end]);
+            try sites.append(b.scratch, member);
+        }
+        if (keys.items.len < 2) return;
+        for (sites.items, 0..) |member, i| {
+            if (!index_signature.duplicateKey(keys.items, i)) continue;
+            try b.diag(.duplicate_index_signature, b.memberStartToken(member));
+        }
+    }
+
+    /// The first token of a class or type member — its `main_token` walked back
+    /// over the modifier keywords the parser folded into the member's flag word,
+    /// which is where tsc's declaration node starts and so where it anchors.
+    /// `index_signature.isModifierKind` is the same predicate the parser's own
+    /// lookahead used to decide those tokens were modifiers of this member.
+    fn memberStartToken(b: *const Binder, member: Node) TokenIndex {
+        var tok = b.tree.nodeMainToken(member);
+        while (tok > 0 and index_signature.isModifierKind(b.tree.tokens.tag(tok - 1))) tok -= 1;
+        return tok;
     }
 
     /// A member of an interface or object-type literal.
@@ -4263,6 +4316,7 @@ const Binder = struct {
                 for (b.tree.nodeRange(node)) |member| {
                     if (member != null_node) try b.bindTypeMember(member, ms);
                 }
+                try b.checkDuplicateIndexSignatures(b.tree.nodeRange(node));
             },
             .number_literal,
             .string_literal,

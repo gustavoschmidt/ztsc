@@ -13,6 +13,12 @@
 //! chain `return`s on its first hit, so the order below is load-bearing: a
 //! two-parameter signature answers for its count and never mentions the `?` on
 //! the second one.
+//!
+//! `duplicateKey` answers the one legality question a signature cannot answer
+//! alone — whether a SIBLING already claimed its key domain (TS2374) — and is
+//! likewise pure, over the list of key spellings.
+
+const std = @import("std");
 
 const diagnostics = @import("diagnostics.zig");
 const scanner = @import("scanner.zig");
@@ -112,6 +118,26 @@ fn chainOf(s: Shape) ?Report {
     return null;
 }
 
+/// tsc's `checkTypeForDuplicateIndexSignatures` (TS2374), as the pure question
+/// about ONE member list: does `keys[i]`'s key domain also belong to another
+/// signature in the list? Every one of a duplicated set is reported, so this is
+/// asked per signature rather than returning "the extras".
+///
+/// `keys` is each index signature's key-type annotation as SOURCE TEXT, in
+/// declaration order. Two spellings that are the same text are the same type;
+/// two that are not may still be (`type S = string` beside `string`, or
+/// `string` inside a `string | number` tsc splits into its constituents), and
+/// those go unreported. That is the deliberate side to be wrong on: a text
+/// match cannot manufacture a duplicate that is not one, so the rule
+/// under-reports rather than inventing an error, and it stays a pure syntactic
+/// rule the binder can run without resolving a single type.
+pub fn duplicateKey(keys: []const []const u8, i: usize) bool {
+    for (keys, 0..) |k, j| {
+        if (j != i and std.mem.eql(u8, k, keys[i])) return true;
+    }
+    return false;
+}
+
 /// tsc's `isModifierKind`, the lookahead's "is this the start of a parameter
 /// modifier" test. Wider than the modifiers an index signature could sensibly
 /// carry, on purpose: the same predicate has to answer for
@@ -138,8 +164,6 @@ pub fn isModifierKind(tag: scanner.Tag) bool {
         else => false,
     };
 }
-
-const std = @import("std");
 
 /// A well-formed signature, as the baseline every test below perturbs.
 const ok: Shape = .{
@@ -233,6 +257,22 @@ test "each arm in tsc's order, and each on tsc's token" {
     s.value_type = false;
     try std.testing.expectEqual(Code.index_sig_type_annotation, check(s).chain.?.code);
     try std.testing.expectEqual(@as(u32, 10), check(s).chain.?.token); // the `[`
+}
+
+test "every signature of a duplicated key domain is reported, and only those" {
+    const t = std.testing;
+    const keys = [_][]const u8{ "string", "number", "string", "symbol", "string" };
+    try t.expect(duplicateKey(&keys, 0));
+    try t.expect(!duplicateKey(&keys, 1));
+    try t.expect(duplicateKey(&keys, 2));
+    try t.expect(!duplicateKey(&keys, 3));
+    try t.expect(duplicateKey(&keys, 4));
+    // A lone signature is never its own duplicate.
+    try t.expect(!duplicateKey(&.{"string"}, 0));
+    // A spelling difference is not resolved, so it goes unreported.
+    const aliased = [_][]const u8{ "string", "S" };
+    try t.expect(!duplicateKey(&aliased, 0));
+    try t.expect(!duplicateKey(&aliased, 1));
 }
 
 test "no value type, but a key type TS1268 would have caught first, stays silent" {

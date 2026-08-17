@@ -464,6 +464,16 @@ pub const Code = enum(u16) {
     index_sig_parameter_type_annotation,
     /// TS1021: `[k: string]` with no value type. Reported on the whole node.
     index_sig_type_annotation,
+    /// TS2374: two index signatures in one member list claim the same key
+    /// domain (`index_signature.duplicateKey`). Reported on EVERY signature of
+    /// the duplicated set, at the member's first token — its modifiers
+    /// included, which is where tsc's declaration node starts.
+    ///
+    /// tsc names the domain ("… for type 'string'"); a bind diagnostic is a
+    /// code plus a span with no payload to carry it, and the spelling is on the
+    /// line the diagnostic points at, so the invariant half is what is
+    /// reported — the policy `duplicate_identifier` already follows.
+    duplicate_index_signature,
     /// TS2452: `enum E { 1, 2 }` — a numeric literal as an enum member name.
     /// The grammar ACCEPTS it (it is a PropertyName), so this is a check on a
     /// parsed member, not a parse failure; rejecting it in the parser instead
@@ -687,6 +697,7 @@ pub const Code = enum(u16) {
             .index_sig_initializer,
             .index_sig_parameter_type_annotation,
             .index_sig_type_annotation,
+            .duplicate_index_signature,
             .enum_member_numeric_name,
             .enum_member_private_name,
             .computed_name_in_enum,
@@ -887,6 +898,7 @@ pub const Code = enum(u16) {
             .index_sig_initializer => "An index signature parameter cannot have an initializer.",
             .index_sig_parameter_type_annotation => "An index signature parameter must have a type annotation.",
             .index_sig_type_annotation => "An index signature must have a type annotation.",
+            .duplicate_index_signature => "Duplicate index signature.",
             .enum_member_numeric_name => "An enum member cannot have a numeric name.",
             .enum_member_private_name => "An enum member cannot be named with a private identifier.",
             .computed_name_in_enum => "Computed property names are not allowed in enums.",
@@ -1113,6 +1125,7 @@ pub const Code = enum(u16) {
             .index_sig_initializer => 1020,
             .index_sig_parameter_type_annotation => 1022,
             .index_sig_type_annotation => 1021,
+            .duplicate_index_signature => 2374,
             .enum_member_numeric_name => 2452,
             .enum_member_private_name => 18024,
             .computed_name_in_enum => 1164,
