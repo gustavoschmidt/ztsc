@@ -30,7 +30,8 @@ const accessibility = @import("accessibility.zig");
 const baseClassRef = @import("instantiate.zig").baseClassRef;
 const computed_key = @import("computed_key.zig");
 const conditions = @import("conditions.zig");
-const checkExprCached = @import("expr.zig").checkExprCached;
+const expr_zig = @import("expr.zig");
+const checkExprCached = expr_zig.checkExprCached;
 const classStaticType = @import("enums.zig").classStaticType;
 const decorators = @import("decorators.zig");
 const diagFmt = Checker.diagFmt;
@@ -441,7 +442,27 @@ fn checkForInOf(c: *Checker, node: Node) Error!void {
                 }
             }
         },
-        else => _ = try c.checkExprCached(e.left, types.no_type),
+        // A destructuring pattern head checks its own elements; anything else
+        // is a write, and tsc runs `checkReferenceExpression` on it.
+        .array_literal, .object_literal, .array_pattern, .object_pattern => {
+            _ = try c.checkExprCached(e.left, types.no_type);
+        },
+        else => {
+            const left_t = try c.checkExprCached(e.left, types.no_type);
+            // The head WRITES its target on every iteration, so the same
+            // refusals an assignment applies (TS2588/2628-32/2540/2542) apply.
+            _ = try expr_zig.checkWriteTargetRefused(c, e.left);
+            if (is_of) {
+                _ = try expr_zig.checkReferenceExpression(c, e.left, .for_of);
+            } else if (try c.isAssignable(types.string_type, left_t)) {
+                // tsc reaches the reference check for `for…in` only after the
+                // key type fits the target ("run check only if the former
+                // check succeeded to avoid cascading errors"). The key type is
+                // `getIndexTypeOrString(rightType)`, approximated by `string`,
+                // which is exactly what a `for…in` binding may hold.
+                _ = try expr_zig.checkReferenceExpression(c, e.left, .for_in);
+            }
+        },
     }
     try c.checkStatement(d.rhs);
 }
