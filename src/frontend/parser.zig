@@ -2729,7 +2729,8 @@ const Parser = struct {
                 const dots = try p.bump();
                 const target = try p.parseBindingName(.private_name_outside_class);
                 try p.pushScratch(try p.addNode(.{ .tag = .rest_element, .main_token = dots, .data = .{ .lhs = target, .rhs = 0 } }));
-                if (p.curTag() == .comma) try p.errAtCur(.rest_must_be_last);
+                // TS2462 is blamed on the bound NAME, not on the `...`.
+                if (p.curTag() == .comma) try p.errAtToken(.rest_must_be_last, p.nodes.items(.main_token)[target]);
             } else {
                 try p.pushScratch(try p.parseBindingElement());
             }
@@ -2777,7 +2778,8 @@ const Parser = struct {
                     target = bound;
                 }
                 try p.pushScratch(try p.addNode(.{ .tag = .rest_element, .main_token = dots, .data = .{ .lhs = target, .rhs = 0 } }));
-                if (p.curTag() == .comma) try p.errAtCur(.rest_must_be_last);
+                // TS2462 is blamed on the bound NAME, not on the `...`.
+                if (p.curTag() == .comma) try p.errAtToken(.rest_must_be_last, p.nodes.items(.main_token)[target]);
             } else if (isNameLike(p.curTag()) or p.curTag() == .string_literal or
                 p.curTag() == .numeric_literal or p.curTag() == .bigint_literal)
             {
@@ -3792,7 +3794,7 @@ const Parser = struct {
         const was_module_body = p.module_body;
         p.module_body = true;
         defer p.module_body = was_module_body;
-        return p.parseNamespaceName(kw, flags);
+        return p.parseNamespaceName(kw, flags, false);
     }
 
     /// One segment of a namespace name, plus everything to its right.
@@ -3808,8 +3810,16 @@ const Parser = struct {
     /// of the one before it. tsc gets there by a different route (the nested
     /// declaration is a member of a namespace whose only body is that
     /// declaration) and the observable answer is the same.
-    fn parseNamespaceName(p: *Parser, kw: u32, flags: u32) PE!Node {
-        const name_tok = try p.expectIdentLike();
+    fn parseNamespaceName(p: *Parser, kw: u32, flags: u32, nested: bool) PE!Node {
+        // A segment behind a `.` is an IdentifierName, so a reserved word is a
+        // legal name there and only there — tsc's `parseIdentifierName()` for
+        // the nested case against `parseIdentifier()` for the first, which is
+        // what makes `declare namespace chrome.debugger { }` parse while
+        // `declare namespace debugger { }` does not.
+        const name_tok = if (nested and isNameLike(p.curTag()) and p.curTag() != .private_identifier)
+            try p.bump()
+        else
+            try p.expectIdentLike();
         // TS1540: `module M { }` is the deprecated spelling of `namespace M { }`
         // — only `declare module "spec" { }` may still say `module`, and that
         // form never reaches here. tsc blames the NAME, so a dotted name
@@ -3823,7 +3833,7 @@ const Parser = struct {
             // The inner segments carry neither `declare` nor `export`: the
             // outermost one already answered for both, and repeating `declare`
             // would re-enter the ambient bookkeeping this body has entered once.
-            const inner = try p.parseNamespaceName(kw, flags & ~ast.Flags.declare);
+            const inner = try p.parseNamespaceName(kw, flags & ~ast.Flags.declare, true);
             try p.pushScratch(try p.addNode(.{
                 .tag = .export_decl,
                 .main_token = kw,

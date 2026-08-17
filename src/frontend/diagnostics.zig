@@ -116,6 +116,10 @@ pub const Code = enum(u16) {
     /// Multiple default clauses, default in wrong place, etc.
     multiple_default_clauses,
     /// Rest parameter/element not in last position.
+    /// TS2462: `var [...a, x] = …` / `var { ...r, a } = …` — a rest element is
+    /// the LAST element of a destructuring pattern or nothing. tsc blames the
+    /// bound NAME, not the `...` (measured against tsgo 7.0.2). Grammar-class,
+    /// so the rest of the file is still checked.
     rest_must_be_last,
     /// Line break not allowed here (e.g. after `throw`).
     line_break_not_allowed,
@@ -909,7 +913,7 @@ pub const Code = enum(u16) {
             .tagged_template_in_optional_chain => "Tagged template expressions are not permitted in an optional chain.",
             .newline_before_arrow => "Line terminator not permitted before arrow.",
             .multiple_default_clauses => "A 'default' clause cannot appear more than once in a 'switch' statement.",
-            .rest_must_be_last => "a rest element must be last",
+            .rest_must_be_last => "A rest element must be last in a destructuring pattern.",
             .line_break_not_allowed => "Line break not permitted here.",
             .argument_expected => "Argument expression expected.",
             .statement_not_allowed_in_ambient => "Statements are not allowed in ambient contexts.",
@@ -1248,6 +1252,7 @@ pub const Code = enum(u16) {
             .jsx_text_gt => 1382,
             .module_keyword_for_namespace => 1540,
             .quoted_module_name_needs_ambient => 1035,
+            .rest_must_be_last => 2462,
             .module_name_needs_quoted_string => 1443,
             .jsx_comma_operator => 18007,
             .rest_element_property_name => 2566,
