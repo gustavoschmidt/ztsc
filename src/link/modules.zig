@@ -1451,29 +1451,73 @@ const Linker = struct {
         return atoms.items[idx];
     }
 
-    /// Emit TS2305, or TS2724 when the module has a close export name, or
-    /// TS2459 when the module DECLARES the name at its top level and simply
-    /// did not export it (tsc's `reportNonExportedMember`, which outranks the
-    /// spelling suggestion — the name is spelled right, it is just private).
+    /// The name `mfile` exports `local_sym` UNDER, when that is not the
+    /// declaration's own name — tsc's `find(symbolsToArray(exports), s =>
+    /// getSymbolIfSameReference(s, localSymbol))`, which turns "declares it
+    /// locally" into "declares it locally, but exports it as …". Table order
+    /// is insertion order, so the first `export { bar as baz }` wins, as it
+    /// does there. The reserved `export=`/`default` keys are skipped: neither
+    /// is a name the author could have written in the import's braces.
+    fn exportNameOfLocal(l: *Linker, mfile: FileId, local_sym: u32) ?Atom {
+        const t = l.table(mfile) catch return null;
+        var it = t.iterator();
+        while (it.next()) |e| {
+            const a = e.key_ptr.*;
+            if (a == l.atom_default or a == l.atom_export_equals) continue;
+            const tgt = e.value_ptr.*;
+            if (tgt.kind == .binding and tgt.file == mfile and tgt.payload == local_sym) return a;
+        }
+        return null;
+    }
+
+    /// The "no such named export" family, in tsc's own order
+    /// (`getExternalModuleMember`'s error tail):
+    ///
+    ///   1. TS2724 when a close export NAME exists — a misspelling outranks
+    ///      everything, because the name the author meant is right there;
+    ///   2. TS2614 when the module has a DEFAULT export — "did you mean
+    ///      `import X from "m"`?", the mistake an ES-module author makes
+    ///      against a `export default` module, and tsc offers it whether or
+    ///      not the name also happens to be declared locally;
+    ///   3. TS2460/TS2459 when the module DECLARES the name at its top level
+    ///      (tsc's `reportNonExportedMember`) — TS2460 when some export of the
+    ///      module names that very declaration under a DIFFERENT name
+    ///      (`declare function bar(); export { bar as baz }`), TS2459 when it
+    ///      is not exported at all;
+    ///   4. TS2305 otherwise.
     fn diagNoExportedMember(l: *Linker, file: FileId, mfile_opt: ?FileId, module: Atom, name: Atom, span: Span) Error!void {
         if (mfile_opt) |mfile| {
-            const mb = l.files[mfile].bind;
-            if (mb.is_module) {
-                if (mb.lookupInScope(binder.file_scope, name)) |local_sym| {
-                    if (!mb.symbol_flags[local_sym].import_binding) {
-                        try l.diag(file, 2459, span, "Module '\"{s}\"' declares '{s}' locally, but it is not exported.", .{
-                            l.atomText(module), l.atomText(name),
-                        });
-                        return;
-                    }
-                }
-            }
             const sugg = try l.moduleExportSuggestion(mfile, name);
             if (sugg != 0) {
                 try l.diag(file, 2724, span, "'\"{s}\"' has no exported member named '{s}'. Did you mean '{s}'?", .{
                     l.atomText(module), l.atomText(name), l.atomText(sugg),
                 });
                 return;
+            }
+            if (l.table(mfile) catch null) |et| {
+                if (et.contains(l.atom_default)) {
+                    try l.diag(file, 2614, span, "Module '\"{s}\"' has no exported member '{s}'. Did you mean to use 'import {s} from \"{s}\"' instead?", .{
+                        l.atomText(module), l.atomText(name), l.atomText(name), l.atomText(module),
+                    });
+                    return;
+                }
+            }
+            const mb = l.files[mfile].bind;
+            if (mb.is_module) {
+                if (mb.lookupInScope(binder.file_scope, name)) |local_sym| {
+                    if (!mb.symbol_flags[local_sym].import_binding) {
+                        if (l.exportNameOfLocal(mfile, local_sym)) |as_name| {
+                            try l.diag(file, 2460, span, "Module '\"{s}\"' declares '{s}' locally, but it is exported as '{s}'.", .{
+                                l.atomText(module), l.atomText(name), l.atomText(as_name),
+                            });
+                            return;
+                        }
+                        try l.diag(file, 2459, span, "Module '\"{s}\"' declares '{s}' locally, but it is not exported.", .{
+                            l.atomText(module), l.atomText(name),
+                        });
+                        return;
+                    }
+                }
             }
         }
         try l.diag(file, 2305, span, "Module '\"{s}\"' has no exported member '{s}'.", .{
