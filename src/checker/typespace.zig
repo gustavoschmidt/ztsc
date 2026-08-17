@@ -147,20 +147,21 @@ pub fn typeFromTypeNameEx(c: *Checker, name_node: Node, args: []const TypeId, ou
                             return types.any_type;
                         }
                     },
-                    // A whole MODULE namespace object named as a type is the
-                    // same TS2709 `materializeTypeRef` reports for a
-                    // `namespace` block — `import WinJS = require("./m"); var
-                    // x: WinJS` and `import * as B from "./b"; const y: B`
-                    // both. tsc reaches it the same way too: the alias
-                    // resolves, its target carries `SymbolFlags.ValueModule`,
-                    // and `Type` does not include it.
-                    .namespace, .ambient_ns => {
-                        try c.diagFmt(2709, c.tokSpan(tok), "Cannot use namespace '{s}' as a type.", .{c.tokenText(tok)});
-                        return types.error_type;
-                    },
-                    // A property of an `export =` value (value space only) /
-                    // unresolved: any (documented).
-                    .default_expr, .export_equals_prop, .dual, .any => return types.any_type,
+                    // Namespace-as-type / a property of an `export =` value
+                    // (value space only) / unresolved: any (documented).
+                    //
+                    // A whole MODULE namespace object named as a type IS the
+                    // TS2709 `materializeTypeRef` reports for a `namespace`
+                    // block, and reporting it here fixes moduleInTypePosition1
+                    // and staticInstanceResolution5 — but it also fires where
+                    // the name has a second, TYPE meaning that ztsc's export
+                    // table drops on the floor: `export type Drink = 0 | 1;
+                    // export * as Drink from "./constants";` keeps only the
+                    // namespace, and `import * as B from "./b"` merged with a
+                    // local `interface B` reaches the import branch on the
+                    // binding's import half. Both are one export table entry
+                    // where tsc has a dual, so the diagnostic waits on that.
+                    .namespace, .default_expr, .ambient_ns, .export_equals_prop, .dual, .any => return types.any_type,
                 }
             }
             // TS2302: a class's type parameters do not reach its static
@@ -660,6 +661,55 @@ pub fn importTypeMember(c: *Checker, import_node: Node, name_tok: TokenIndex, ar
     return types.error_type;
 }
 
+/// Does this symbol's whole meaning consist of being a namespace? tsc's
+/// `SymbolFlags.Type` excludes `Namespace`, so such a symbol names no type —
+/// see `materializeTypeRef`'s TS2709 arm and the qualified-member test.
+fn pureNamespace(f: binder.SymbolFlags) bool {
+    if (!f.namespace_decl) return false;
+    return !(f.class or f.interface or f.type_alias or f.type_param or
+        f.enum_decl or f.import_binding);
+}
+
+/// The qualifier of a dotted type name reached no container. tsc splits that
+/// into two diagnostics at the LEFTMOST identifier of the chain, and both were
+/// silent `any` here:
+///
+///   * the name resolves to nothing at all, or to something with only a VALUE
+///     meaning (`var vv; let x: vv.T`) — TS2503 "Cannot find namespace";
+///   * it resolves to a TYPE that is not a container (a class, an interface, a
+///     type alias) — TS2702 "only refers to a type, but is being used as a
+///     namespace here".
+///
+/// Both oracle-verified against tsgo 7.0.2, together with the two cases that
+/// must stay silent here: a resolved container whose deeper segment failed
+/// (`.sym`, left to the TS2694 arms) and a namespace-augmentation name that
+/// only the augmented module's exports declare (`augmentModuleTypeSym`, the
+/// same fallback the bare-name path consults before it reports).
+///
+/// Returns whether it reported, so the caller can answer `error` instead of
+/// `any` exactly when tsc does.
+fn reportBadNsQualifier(c: *Checker, node: Node) Error!bool {
+    var n = node;
+    while (c.nodeTag(n) == .qualified_name or c.nodeTag(n) == .member_expr) {
+        n = c.tree.nodeData(n).lhs;
+    }
+    if (c.nodeTag(n) != .identifier) return false;
+    const tok = c.tree.nodeMainToken(n);
+    const a = try c.atomOfToken(tok);
+    const type_only_entity = switch (c.resolveNamespaceSpace(a, c.cur_scope)) {
+        .sym => return false,
+        .wrong_space => |sym| hasTypeMeaning(c.symFlags(sym)),
+        .none => false,
+    };
+    if ((try c.augmentModuleTypeSym(c.cur_scope, a)) != null) return false;
+    if (type_only_entity) {
+        try c.diagFmt(2702, c.tokSpan(tok), "'{s}' only refers to a type, but is being used as a namespace here.", .{c.tokenText(tok)});
+        return true;
+    }
+    try c.diagFmt(2503, c.tokSpan(tok), "Cannot find namespace '{s}'.", .{c.tokenText(tok)});
+    return true;
+}
+
 /// Resolve a qualified type name `A.B.T` (in type position) by walking
 /// namespace containers left-to-right, then building the final member's
 /// type. Missing/non-exported members report TS2694 like tsc.
@@ -683,12 +733,22 @@ pub fn typeFromQualifiedName(c: *Checker, node: Node, args: []const TypeId) Erro
             return types.error_type;
         }
     }
-    const container = (try c.resolveNsContainer(d.lhs)) orelse return types.any_type;
+    const container = (try c.resolveNsContainer(d.lhs)) orelse {
+        if (try reportBadNsQualifier(c, d.lhs)) return types.error_type;
+        return types.any_type;
+    };
     switch (container) {
         .ns => |ns_sym| {
             if (c.namespaceMemberSym(ns_sym, name)) |g| {
                 const mf = c.symFlags(g);
-                if (mf.exported and hasTypeMeaning(mf)) {
+                // A member that is ONLY a namespace is not a type — the same
+                // `SymbolFlags.Type` exclusion `materializeTypeRef` draws for a
+                // bare name. `namespace P { export namespace R { … } }` with
+                // `var x: P.R` is TS2694 here (oracle-verified: tsc's message
+                // for it really is "has no exported member 'R'", not TS2709);
+                // without the test `namedTypeFromSymbol` silently answered
+                // `any`.
+                if (mf.exported and hasTypeMeaning(mf) and !pureNamespace(mf)) {
                     return c.namedTypeFromSymbol(g, args, name_tok);
                 }
             }
@@ -758,17 +818,6 @@ pub fn enumSymFromImportTarget(c: *Checker, tgt: modules.Target) ?SymbolId {
 /// to `any`, so heritage `extends ns.Base` inherited zero members). Null for
 /// a non-namespace or unresolvable qualifier.
 pub fn resolveNsContainer(c: *Checker, node: Node) Error!?NsContainer {
-    return resolveNsContainerAt(c, node, 0);
-}
-
-/// `resolveNsContainer` with the alias-chain depth carried along. An
-/// entity-name alias resolves by resolving ANOTHER qualifier
-/// (`importEqualsEntityContainerAt`), and `import A = B; import B = A;` is a
-/// legal parse — alias_cycle.zig reports TS2303 for it, which means the corpus
-/// contains the shape — so the walk needs a bound. 16 is far past any real
-/// `import x = a.b.c` chain and costs one comparison per hop.
-fn resolveNsContainerAt(c: *Checker, node: Node, depth: u32) Error!?NsContainer {
-    if (depth > 16) return null;
     switch (c.nodeTag(node)) {
         .identifier => {
             const a = try c.atomOfToken(c.tree.nodeMainToken(node));
@@ -783,11 +832,26 @@ fn resolveNsContainerAt(c: *Checker, node: Node, depth: u32) Error!?NsContainer 
                         if (c.importTarget(sym)) |tgt| return c.containerFromImportTarget(tgt);
                         // No import RECORD means the ENTITY-NAME form,
                         // `import booz = foo.bar.baz` — nothing to link, so
-                        // the right-hand side is resolved in the alias's own
-                        // file and scope instead. Without it the qualifier
-                        // answered "not a container" and `booz.bar` silently
-                        // degraded to `any` rather than reporting TS2694.
-                        return importEqualsEntityContainerAt(c, sym, depth);
+                        // the right-hand side would have to be resolved in the
+                        // alias's own file and scope
+                        // (`importEqualsEntityContainer`, which jsx.zig
+                        // already does for `export import JSX = JSXInternal`).
+                        //
+                        // NOT done here, and the reason is measured: doing it
+                        // turns `declare namespace JSX { import React =
+                        // __React; interface IntrinsicAttributes extends
+                        // React.Attributes {} }` — the shape every bundled
+                        // `react.d.ts` fixture uses — from an empty interface
+                        // into a real one, and ztsc's JSX excess-property
+                        // check then rejects `<C {...{ "ignore-prop": 200 }}
+                        // />`. tsc accepts it: `isKnownProperty` treats a
+                        // HYPHENATED name as known when it is comparing JSX
+                        // attributes, and ztsc has that rule for a direct
+                        // attribute token only, not for a spread object
+                        // literal's string-literal key. Worth +3 exact
+                        // (aliasBug, innerAliases2,
+                        // tsxStatelessFunctionComponentsWithTypeArguments1)
+                        // once the hyphen rule reaches the spread path.
                     }
                     return null;
                 },
@@ -802,7 +866,7 @@ fn resolveNsContainerAt(c: *Checker, node: Node, depth: u32) Error!?NsContainer 
                 const m = (try c.resolveImportTypeModule(d.lhs, true)) orelse return null;
                 return c.nestNsContainer(.{ .module = m }, name);
             }
-            const outer = (try resolveNsContainerAt(c, d.lhs, depth)) orelse return null;
+            const outer = (try c.resolveNsContainer(d.lhs)) orelse return null;
             return c.nestNsContainer(outer, name);
         },
         else => return null,
@@ -845,12 +909,6 @@ pub fn containerFromImportTarget(c: *Checker, tgt0: modules.Target) ?NsContainer
 /// import JSX = JSXInternal }`), which left `JSX.Element` /
 /// `JSX.IntrinsicElements` resolving to nothing at all.
 pub fn importEqualsEntityContainer(c: *Checker, sym0: SymbolId) Error!?NsContainer {
-    return importEqualsEntityContainerAt(c, sym0, 0);
-}
-
-/// `importEqualsEntityContainer` with the alias-chain depth (see
-/// `resolveNsContainerAt`).
-fn importEqualsEntityContainerAt(c: *Checker, sym0: SymbolId, depth: u32) Error!?NsContainer {
     const sym = c.reprSym(sym0);
     if (!c.symFlags(sym).import_binding) return null;
     if (c.importTarget(sym) != null) return null; // module form: not ours
@@ -861,7 +919,7 @@ fn importEqualsEntityContainerAt(c: *Checker, sym0: SymbolId, depth: u32) Error!
         c.cur_scope = c.symScope(sym);
         const e = c.tree.extraData(ast.ImportEquals, c.tree.nodeData(decl).lhs);
         if (e.module_token != 0 or e.entity == null_node) return null;
-        return try resolveNsContainerAt(c, e.entity, depth + 1);
+        return try c.resolveNsContainer(e.entity);
     }
     return null;
 }

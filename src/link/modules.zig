@@ -1550,6 +1550,34 @@ const Linker = struct {
         l.aug_blocks = ablocks;
     }
 
+    /// TS2661, tsc's `checkExportSpecifier` tail: an `export { X }` with no
+    /// module specifier whose name resolves to a declaration of a GLOBAL
+    /// source file cannot export it — the specifier form re-exports a
+    /// module-local, and a global is not one.
+    ///
+    ///     // a.d.ts (a script — its top level IS the global scope)
+    ///     declare class X {}
+    ///     // b.ts
+    ///     export { X };   // TS2661
+    ///
+    /// `is_global` is the caller's verdict, because the two arms know it
+    /// differently: a name with no local symbol that the program's global
+    /// table answered is global by construction, while a resolved local is
+    /// global exactly when its own scope is the file scope of a SCRIPT (a
+    /// module's file scope is module-local — `export { x }` next to
+    /// `let x` is the ordinary form and must stay silent).
+    ///
+    /// Restricted to a genuine `export_specifier` node: a `.named` record is
+    /// also how `export var x` is recorded, and tsc's check is on the
+    /// specifier syntax alone. Reported at the specifier's own name token,
+    /// which is `propertyName || name` — `export { x, x as y }` answers twice.
+    fn reportGlobalExportSpecifier(l: *Linker, file: FileId, rec: binder.ExportRec, is_global: bool) Error!void {
+        if (!is_global or rec.module != 0) return;
+        const tree = l.files[file].tree;
+        if (tree.nodeTag(rec.node) != .export_specifier) return;
+        try l.diag(file, 2661, l.tokSpan(file, tree.nodeMainToken(rec.node)), "Cannot export '{s}'. Only local declarations can be exported from a module.", .{l.atomText(rec.local)});
+    }
+
     /// The flattened export table of `file` (built on demand, cycle-safe).
     fn table(l: *Linker, file: FileId) Error!*std.AutoArrayHashMapUnmanaged(Atom, Target) {
         if (l.state[file] != .unvisited) return &l.tables[file];
@@ -1562,6 +1590,7 @@ const Linker = struct {
             switch (rec.kind) {
                 .named => {
                     if (rec.sym != binder.no_symbol) {
+                        try l.reportGlobalExportSpecifier(file, rec, f.bind.symbol_scopes[rec.sym] == binder.file_scope and !f.bind.is_module);
                         const tgt = try l.finalizeLocal(file, rec.sym, rec.local, rec.type_only, 0);
                         try l.put(t, rec.exported, tgt);
                     } else if (rec.local != 0) {
@@ -1571,6 +1600,7 @@ const Linker = struct {
                         // on into the global table rather than reporting
                         // TS2304.
                         if (l.global_decls.get(rec.local)) |tgt| {
+                            try l.reportGlobalExportSpecifier(file, rec, true);
                             try l.put(t, rec.exported, tgt);
                         } else {
                             try l.diag(file, 2304, l.nodeSpan(file, rec.node), "Cannot find name '{s}'.", .{l.atomText(rec.local)});
