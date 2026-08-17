@@ -354,9 +354,25 @@ fn baseClassSymOf(c: *Checker, sym: SymbolId) Error!?SymbolId {
 /// `propertiesRelatedTo`) and must ask the identical question of the identical
 /// table — see the note there.
 pub fn instanceMember(c: *Checker, sym: SymbolId, name: Atom) ?SymbolId {
+    return ownMember(c, sym, name, false);
+}
+
+/// `name`'s member symbol in `sym`'s STATIC member table (`typeof C`'s own
+/// members), if it declares one — `instanceMember`'s other half.
+///
+/// `pub` for `nominal_members.zig`: the `private`/`protected` screen runs over
+/// the static side too (TS2417 on a `private static` that shadows a base
+/// static), and the two sides are separate tables, so which one a member came
+/// from is part of its identity.
+pub fn staticMember(c: *Checker, sym: SymbolId, name: Atom) ?SymbolId {
+    return ownMember(c, sym, name, true);
+}
+
+fn ownMember(c: *Checker, sym: SymbolId, name: Atom, statics: bool) ?SymbolId {
     const saved = c.enterSymFile(sym);
     defer c.restoreCtx(saved);
-    const ms = c.bind.membersScopeOf(c.localOf(sym)) orelse return null;
+    const local = c.localOf(sym);
+    const ms = (if (statics) c.bind.staticsScopeOf(local) else c.bind.membersScopeOf(local)) orelse return null;
     const lo = c.bind.scope_members_start[ms];
     const hi = c.bind.scope_members_start[ms + 1];
     for (lo..hi) |i| {
@@ -466,19 +482,8 @@ fn declaringClass(c: *Checker, recv: TypeId, name: Atom, site: Site) Error!?Decl
         if (dup) continue;
         seen[n] = sym;
         n += 1;
-        {
-            const saved = c.enterSymFile(sym);
-            defer c.restoreCtx(saved);
-            const local = c.localOf(sym);
-            const scope = if (statics) c.bind.staticsScopeOf(local) else c.bind.membersScopeOf(local);
-            if (scope) |ms| {
-                const lo = c.bind.scope_members_start[ms];
-                const hi = c.bind.scope_members_start[ms + 1];
-                for (lo..hi) |i| {
-                    if (c.bind.member_atoms[i] != name) continue;
-                    return .{ .cls = sym, .msym = c.toGlobal(c.bind.member_syms[i]), .statics = statics, .recv = recv_norm };
-                }
-            }
+        if (ownMember(c, sym, name, statics)) |msym| {
+            return .{ .cls = sym, .msym = msym, .statics = statics, .recv = recv_norm };
         }
         // Statics are not inherited through an interface, and an interface has
         // no static side at all, so the static search stays on the class chain.

@@ -1560,6 +1560,47 @@ pub fn hasUnresolvedBase(c: *Checker, sym: SymbolId) Error!bool {
     return false;
 }
 
+/// Bound on the breadth-first heritage walks that answer a question about the
+/// `extends`/`implements` GRAPH rather than about a member table — the same
+/// bound `accessibility.declaringClass` and `nominal_members.declaringMember`
+/// use, and for the same reason: a malformed program must not be able to make
+/// one of them unbounded.
+pub const max_heritage_nodes = 32;
+
+/// tsc's `hasBaseType(derived, base)` over the DECLARED heritage graph:
+/// equality included, so a class is its own base and a re-declaration inside a
+/// derived class is still a valid override of the base's `protected` member.
+///
+/// Breadth-first over `declaredBaseRefs` rather than the `extends` chain alone,
+/// because an interface may extend a class and several bases at once.
+pub fn derivesFrom(c: *Checker, derived: SymbolId, base: SymbolId) Error!bool {
+    var queue: [max_heritage_nodes]SymbolId = undefined;
+    var seen: [max_heritage_nodes]SymbolId = undefined;
+    var qn: usize = 1;
+    var head: usize = 0;
+    var n: usize = 0;
+    queue[0] = derived;
+    while (head < qn) {
+        const sym = queue[head];
+        head += 1;
+        if (sym == base) return true;
+        if (n == seen.len) return false;
+        var dup = false;
+        for (seen[0..n]) |s| if (s == sym) {
+            dup = true;
+        };
+        if (dup) continue;
+        seen[n] = sym;
+        n += 1;
+        for (try c.declaredBaseRefs(sym)) |b| {
+            if (c.ts.kind(b) != .ref or qn == queue.len) continue;
+            queue[qn] = c.ts.refSymbol(b);
+            qn += 1;
+        }
+    }
+    return false;
+}
+
 /// The base *class symbol* of `sym` (`class D extends B`), when the base
 /// resolves to a class declaration. Mirrors `baseClassRef`'s resolution but
 /// yields the symbol — used to inherit static members (`typeof D` includes
