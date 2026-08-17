@@ -1148,6 +1148,13 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!RelAnswer {
     var t = try c.ts.regularLiteral(t1);
     s = try c.ts.regular(s);
     t = try c.ts.regular(t);
+    // tsc's `getNormalizedType`, which runs `getSimplifiedType` over both
+    // operands before the relation looks at either: a conditional that is
+    // trivially its own check type (`T extends T ? T : never`) is the check
+    // type here, however deferred it stays everywhere else. Two kind reads on
+    // a pair that already failed the identity test — see `simplifyConditional`.
+    s = c.simplifyConditional(s);
+    t = c.simplifyConditional(t);
     if (s == t) return .yes;
     // The same simplification, one level down: a `this` NESTED inside a
     // deferred operator (`this extends {_zod:…} ? this["_zod"]["output"] :
@@ -2005,13 +2012,29 @@ fn condTrueSubstituted(c: *Checker, cond: TypeId) Error!TypeId {
     const chk = s.condCheck(cond);
     const tru = s.condTrue(cond);
     const chk_kind = s.kind(chk);
-    if (chk_kind != .type_param and chk_kind != .infer_var) return tru;
     const ext = s.condExtends(cond);
     if (ext == chk) return tru;
     switch (s.kind(ext)) {
         .any, .unknown => return tru,
         else => {},
     }
+    // The check type need not be a type VARIABLE. tsc runs every type node
+    // through `getTypeFromTypeNode` → `getConditionalFlowTypeOfType`, and
+    // `getImpliedConstraint` compares the branch's type against the CHECK
+    // NODE's type — so a true branch that IS the check type is substituted
+    // whatever kind that type is. `Extract<any[], T>` (`any[] extends T ?
+    // any[] : never`, `inlineConditionalHasSimilarAssignability`) is that
+    // shape with a concrete check: its true branch reads as `any[] & T`,
+    // which IS assignable to `T`, while the bare `any[]` is not.
+    //
+    // Answered here rather than in the type-variable path below because it
+    // needs no rewrite at all — the branch is the check type, so the
+    // substituted branch is the intersection itself.
+    if (tru == chk) {
+        const sub = try s.makeIntersection(c.scratch(), &.{ chk, ext });
+        return if (sub == chk) tru else sub;
+    }
+    if (chk_kind != .type_param and chk_kind != .infer_var) return tru;
     if (!try substitutableBranch(c, tru, 0)) return tru;
     const sub = try s.makeIntersection(c.scratch(), &.{ chk, ext });
     if (sub == chk) return tru;
@@ -2124,13 +2147,24 @@ fn substitutableBranch(c: *Checker, t: TypeId, depth: u32) Error!bool {
 /// Additive: every caller falls through to its previous rule on `false`.
 fn condBranchwiseRelated(c: *Checker, s: TypeId, t: TypeId) Error!bool {
     const st = &c.ts;
-    if (st.condExtends(s) != st.condExtends(t)) return false;
+    // The source's own `infer` binders are re-bound to the target's first, so
+    // that two conditionals written the same way but DECLARED separately still
+    // meet the identity test below — see `rebindCondInferVars`.
+    var s_ext = st.condExtends(s);
+    var s_tru = st.condTrue(s);
+    if (s_ext != st.condExtends(t)) {
+        if (try c.rebindCondInferVars(s, t)) |r| {
+            s_ext = r.extends;
+            s_tru = r.true_branch;
+        }
+    }
+    if (s_ext != st.condExtends(t)) return false;
     const s_chk = st.condCheck(s);
     const t_chk = st.condCheck(t);
     if (s_chk != t_chk) {
         if (!(try c.isAssignable(s_chk, t_chk)) and !(try c.isAssignable(t_chk, s_chk))) return false;
     }
-    const tru_ok = (try c.isAssignable(st.condTrue(s), st.condTrue(t))) or
+    const tru_ok = (try c.isAssignable(s_tru, st.condTrue(t))) or
         (try c.isAssignable(try condTrueOverExtends(c, s), st.condTrue(t)));
     return tru_ok and try c.isAssignable(st.condFalse(s), st.condFalse(t));
 }
@@ -3281,6 +3315,47 @@ pub fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
             }
         }
     }
+    // tsc `structuredTypeRelatedTo`, the SOURCE-mapped arm: "a source type
+    // `{ [P in Q]: X }` is related to a target type `T` if `keyof T` is
+    // related to `Q` and `X` is related to `T[P]`." Narrowed to the shape
+    // where `X` IS `T[P]` — the identity map written over an explicit key set
+    // rather than over `keyof T` — so the second half is free and the first
+    // (a `keyof` of the target) is only computed for a template that already
+    // names the target. `Pick<Params, keyof Params>` is the case: it is not
+    // homomorphic in ztsc's sense (its key set is a written `Q`, not
+    // `keyof Params`), so the identity arm below never saw it.
+    //
+    // The `keyof T <: Q` gate is what tsc's rule turns on and is not
+    // optional: `Pick<T, "a">` and `Pick<T, K>` produce FEWER keys than `T`
+    // requires, and tsgo rejects both.
+    if (sk == .mapped and !c.mappedAddsOptional(s) and c.ts.mappedAs(s) == 0) {
+        const val = c.ts.mappedValue(s);
+        if (c.ts.kind(val) == .index_access and
+            c.ts.indexAccessObj(val) == t and
+            c.ts.indexAccessIndex(val) == c.ts.mappedKeyParam(s) and
+            try c.isAssignable(try c.keyofType(t), try c.mappedKeySet(s))) return true;
+    }
+    // tsc's `getBaseConstraintOfType` for a still-generic HOMOMORPHIC map,
+    // asked of an ARRAY-ish target: `{ [P in keyof T]: X }` over a `T` bounded
+    // by an array or tuple type is an array for EVERY instantiation —
+    // `instantiateMappedType` maps an array source to an array and a tuple
+    // source element-wise — so the base constraint (the map applied to `T`'s
+    // own constraint) is what says whether the family fits.
+    //
+    // It is also what carries the READONLY-ness through:
+    // `mappedTypeUnionConstrainTupleTreatedAsArrayLike` is a map over
+    // `T extends [number] | [string]`, which is a legal `any[]`, beside one
+    // over `T extends [number] | readonly [string]`, which is only a
+    // `readonly any[]` — and tsgo reports exactly that one line.
+    //
+    // Restricted to an array-ish target and a bare type-parameter source, so
+    // an ordinary object-shaped map pays nothing: two kind reads on a pair
+    // that has already failed every rule above.
+    if (sk == .mapped and (tk == .array or tk == .tuple) and c.ts.mappedHomomorphic(s)) {
+        if (try homomorphicConstraintInstantiation(c, s)) |inst| {
+            if (try c.isAssignable(inst, t)) return true;
+        }
+    }
     // A homomorphic identity map with only modifier changes IS its source
     // (`Readonly<P>` → `P`). A map that adds `?` is not, and one that
     // rewrites the template is not.
@@ -3295,6 +3370,39 @@ pub fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
         }
     }
     return null;
+}
+
+/// A still-generic HOMOMORPHIC map applied to its source parameter's own
+/// CONSTRAINT — tsc's `getBaseConstraintOfType` for a mapped type. Null when
+/// the source is not a bare constrained parameter, or when the map does not
+/// materialize into something new.
+///
+/// A UNION constraint is distributed member-wise, because that is what
+/// `instantiateMappedType` does ("if T is a union type we distribute the
+/// mapped type over the union") and ztsc's `materializeMapped` does not: it
+/// would otherwise fold the whole union into one object and lose the very
+/// array-ness the caller is asking about.
+fn homomorphicConstraintInstantiation(c: *Checker, m: TypeId) Error!?TypeId {
+    const s = &c.ts;
+    const src = s.mappedSource(m);
+    if (s.kind(src) != .type_param) return null;
+    const sym = s.typeParamSymbol(src);
+    const cons = try c.typeParamConstraint(sym);
+    if (cons == types.no_type or cons == src) return null;
+    if (s.kind(cons) != .union_type) {
+        const map = [_]TpMap{.{ .sym = sym, .ty = cons }};
+        const inst = try c.instantiate(m, &map);
+        return if (inst == m) null else inst;
+    }
+    var parts: std.ArrayList(TypeId) = .empty;
+    defer parts.deinit(c.scratch());
+    for (try c.memberList(cons)) |member| {
+        const map = [_]TpMap{.{ .sym = sym, .ty = member }};
+        const inst = try c.instantiate(m, &map);
+        if (inst == m) return null;
+        try parts.append(c.scratch(), inst);
+    }
+    return try s.makeUnion(c.scratch(), parts.items);
 }
 
 /// The base-constraint reduction of a deferred indexed-access TARGET `T[K]`
