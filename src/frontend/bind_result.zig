@@ -16,6 +16,7 @@ const diagnostics = @import("diagnostics.zig");
 
 const Ast = ast.Ast;
 const Node = ast.Node;
+const TokenIndex = ast.TokenIndex;
 const Atom = intern.Atom;
 const Interner = intern.Interner;
 const Diagnostic = diagnostics.Diagnostic;
@@ -168,19 +169,13 @@ pub const mask_type = fbits(.{ .class = true }) | fbits(.{ .interface = true }) 
 pub const mask_member = fbits(.{ .property = true }) | fbits(.{ .method = true }) |
     fbits(.{ .getter = true }) | fbits(.{ .setter = true });
 
-/// Flag bits used on the TARGET side of an excludes check. A type-only import
-/// occupies the *type* space only, so `import type { T } …; let T;` merges
-/// without error while `type T = …` still clashes with it; a non-instantiated
+/// Flag bits used on the TARGET side of an excludes check. A non-instantiated
 /// namespace occupies no exclusion space at all (tsc's `NamespaceModule`), so
 /// it merges with anything — including a `var`/`let`/`const` of the same name.
-/// Neither bit is cleared on the symbol: only the excludes check ignores them,
+/// The bit is not cleared on the symbol: only the excludes check ignores it,
 /// so name resolution and the `N.member` container meaning are untouched.
 pub fn effectiveBits(f: SymbolFlags) u32 {
     var bits = f.bits();
-    if (f.import_binding and f.type_only) {
-        bits &= ~fbits(.{ .import_binding = true });
-        bits |= fbits(.{ .type_alias = true });
-    }
     if (f.ns_uninstantiated) bits &= ~fbits(.{ .namespace_decl = true });
     return bits;
 }
@@ -233,10 +228,6 @@ pub fn excludesOfFlags(f: SymbolFlags) u32 {
     }
     if (f.type_param) x |= mask_type & ~fbits(.{ .class = true });
     if (f.param) x |= mask_value & ~fbits(.{ .var_decl = true });
-    if (f.import_binding) x |= if (f.type_only)
-        mask_type | fbits(.{ .import_binding = true })
-    else
-        mask_value | mask_type;
     if (f.property) x |= mask_member;
     if (f.method) x |= mask_member & ~fbits(.{ .method = true });
     if (f.getter) x |= mask_member & ~fbits(.{ .setter = true });
@@ -244,6 +235,17 @@ pub fn excludesOfFlags(f: SymbolFlags) u32 {
     // Repeated `fn.prop = …` statements are all declarations of the same
     // property; they merge (the member type unions them), so `expando_member`
     // contributes nothing.
+    //
+    // tsc's `AliasExcludes = Alias`, last so it overrides the masks above: an
+    // import binding occupies no declaration space of its own, so it merges
+    // with every other meaning and only a second alias of the same name is a
+    // duplicate. (The `import_binding` bit rides in `mask_value`, which is why
+    // this has to strip it rather than simply not add it.) The conflict a
+    // merged alias CAN have — its TARGET's meanings against the ones its name
+    // declares locally — is TS2440, which needs the target resolved and is
+    // `checker/alias_conflict.zig`'s, not this table's.
+    x &= ~fbits(.{ .import_binding = true });
+    if (f.import_binding) x |= fbits(.{ .import_binding = true });
     return x;
 }
 
@@ -309,6 +311,23 @@ pub const FlowTag = enum(u8) {
     /// `reduceAntecedents` read the three parts; `flowAntecedents` answers
     /// with the one-element continuation so the generic walks stay generic.
     reduce_label,
+};
+
+/// An alias declaration whose NAME also declares a meaning of its own — the
+/// only shape TS2440 can be about. Collected by `collectAliasMerges`; the
+/// verdict (does the alias's TARGET carry one of these meanings?) is
+/// `checker/alias_conflict.zig`'s, which is where an alias can be resolved.
+pub const AliasMerge = struct {
+    /// The alias symbol.
+    sym: SymbolId,
+    /// Its alias declaration — an `import_decl`, `import_specifier` or
+    /// `import_equals`. The entity-name form's target is resolved from it.
+    decl: Node,
+    /// Token the diagnostic lands on (tsc's span for `decl`).
+    tok: TokenIndex,
+    /// The meanings the name declares BESIDE the alias, in the same member
+    /// table — never empty, or the record would not exist.
+    flags: SymbolFlags,
 };
 
 pub const ImportKind = enum(u8) { default, namespace, named, side_effect, equals };
@@ -464,6 +483,10 @@ pub const Bind = struct {
     /// `null_node` for the three property forms, which qualify outright.
     array_op_indexes: []const Node = &.{},
 
+    /// The file's alias declarations that merged with a local meaning — the
+    /// candidates for TS2440. Empty for almost every file.
+    alias_merges: []const AliasMerge = &.{},
+
     /// Remapped post-seal (atom ids).
     imports: []ImportRec,
     /// Remapped post-seal (atom ids).
@@ -523,10 +546,11 @@ pub const Bind = struct {
     /// strings.
     ///
     /// internal: read by the binder test that enforces the reminder.
-    /// (41 includes `enum_scope_syms`/`enum_scope_ids`, which hold symbol and
-    /// scope ids, and `array_op_nodes`/`array_op_indexes`, which hold node
-    /// ids — no atoms — so they need no rewrite.)
-    pub const remap_field_count = 41;
+    /// (42 includes `enum_scope_syms`/`enum_scope_ids`, which hold symbol and
+    /// scope ids, `array_op_nodes`/`array_op_indexes`, which hold node ids,
+    /// and `alias_merges`, which holds symbol/node/token ids and flag bits —
+    /// no atoms — so they need no rewrite.)
+    pub const remap_field_count = 42;
 
     /// Rewrite every atom this file stored through `map` (old atom -> new
     /// atom), restoring the atom-sorted order of the tables that have one.

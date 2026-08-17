@@ -109,6 +109,7 @@ pub const ImportRec = bind_result.ImportRec;
 pub const ExportRec = bind_result.ExportRec;
 pub const Ref = bind_result.Ref;
 pub const AmbientModule = bind_result.AmbientModule;
+pub const AliasMerge = bind_result.AliasMerge;
 pub const Bind = bind_result.Bind;
 
 const Error = error{OutOfMemory};
@@ -261,6 +262,7 @@ pub fn bind(
     try b.sym_reported.append(b.scratch, 0);
     try b.sym_block.append(b.scratch, 0);
     try b.sym_local_bits.append(b.scratch, 0);
+    try b.sym_exported_bits.append(b.scratch, 0);
     try b.decl_links.append(b.scratch, .{ .value = 0, .next = 0 });
     try b.decl_name_toks.append(b.scratch, 0);
     try b.decl_origins.append(b.scratch, .{ .block = 0, .exported = false, .ambient = false });
@@ -289,6 +291,7 @@ pub fn bind(
     try b.checkEnumFirstMembers();
     try b.checkNamespacePriorToMerge();
     try b.checkThisBeforeSuper();
+    try b.collectAliasMerges();
     return b.seal();
 }
 
@@ -408,6 +411,12 @@ const Binder = struct {
     /// for a container member, which an EXPORTED declaration fills with a
     /// placeholder of no meaning — see `priorFlags`. Scratch-only.
     sym_local_bits: std.ArrayList(u32) = .empty,
+    /// The other half: flag bits contributed by the `export`ed declarations of
+    /// a symbol — tsc's `exports` table entry for the name, which is SHARED by
+    /// every block of a merging container and so is never reset. Read by
+    /// `collectAliasMerges` for the meanings TS2440 compares against.
+    /// Scratch-only.
+    sym_exported_bits: std.ArrayList(u32) = .empty,
 
     // scopes under construction
     scope_parents: std.ArrayList(ScopeId) = .empty,
@@ -459,6 +468,8 @@ const Binder = struct {
     /// the `.length` / `.push` / `.unshift` property forms. See
     /// `Bind.array_op_nodes`.
     array_ops: std.ArrayList(Link) = .empty,
+    /// `Bind.alias_merges`, filled by the post-pass `collectAliasMerges`.
+    alias_merges: std.ArrayList(AliasMerge) = .empty,
     /// Short-circuit tests of the optional chains currently being bound
     /// (`bindOptionalChain`); a nested chain occupies a suffix of the stack.
     chain_sc: std.ArrayList(ChainTest) = .empty,
@@ -872,10 +883,11 @@ const Binder = struct {
     /// let x;`, `class x {} let x;` and `class x {} var x;` are all TS2300.
     fn dupCode(existing: SymbolFlags, kind: DeclKind) Code {
         if (existing.catch_param) return .catch_redeclare;
-        const e_import = existing.import_binding;
-        const n_import = kind.isImport();
-        if (e_import != n_import) return .import_conflict;
-        if (e_import and n_import) return .duplicate_identifier;
+        // Two import bindings of one name are an ordinary duplicate; an import
+        // beside a local declaration is no binder clash at all (the excludes
+        // table merges them, and TS2440 is the checker's — see
+        // `checker/alias_conflict.zig`).
+        if (existing.import_binding or kind.isImport()) return .duplicate_identifier;
         if (existing.enum_decl or kind == .enum_decl) return .enum_merge_conflict;
         if (existing.let_decl or existing.const_decl) return .block_scoped_redeclare;
         return .duplicate_identifier;
@@ -893,56 +905,6 @@ const Binder = struct {
     /// diagnostic collection deduplicate; carrying the count instead keeps
     /// the walk O(new declarations) and needs no dedup pass. The newcomer is
     /// appended by the caller straight after, hence the `+ 1`.
-    /// Report `code` at the symbol's IMPORT declaration. TS2440 needs it: the
-    /// message names the import declaration, which may be the one already in
-    /// the table (`let b = 1; import { b } from "./m";` points at line 2's
-    /// import, not at the `let`). Falls back to the first declaration when no
-    /// declaration is an import, which the caller's clash rules make
-    /// unreachable — it takes an import on one side to pick this code at all.
-    fn diagAtImportDecl(b: *Binder, sym: SymbolId, code: Code) Error!void {
-        var link = b.sym_decl_head.items[sym];
-        if (link == 0) return;
-        const first = link;
-        while (link != 0) : (link = b.decl_links.items[link].next) {
-            const l = b.decl_links.items[link];
-            if (importDeclStart(b, l.value) == null) continue;
-            return b.diag(code, b.importConflictTok(l.value, b.decl_name_toks.items[link]));
-        }
-        const l = b.decl_links.items[first];
-        try b.diag(code, b.dupDiagTok(l.value, b.decl_name_toks.items[first]));
-    }
-
-    /// The token TS2440 lands on for the alias declaration `decl`.
-    ///
-    /// tsc reports it from `checkAliasSymbol` as `error(node, …)` — at the whole
-    /// ALIAS DECLARATION, not at the local name it binds. For `import x = m.m`
-    /// that is the `import` keyword (or the `export` in front of `export import
-    /// q = M1.s`), and for a named import specifier it is the IMPORTED name,
-    /// where `x as x44` starts. Every other alias shape — a default or namespace
-    /// import — is spelled with the local name first, so the name token already
-    /// is the declaration's first token.
-    fn importConflictTok(b: *Binder, decl: Node, name_tok: TokenIndex) TokenIndex {
-        return importDeclStart(b, decl) orelse name_tok;
-    }
-
-    /// The first token of an alias declaration whose start differs from its
-    /// local name, or null for every other shape. Split out so
-    /// `diagAtImportDecl` can use it as the "is this declaration the import?"
-    /// test it already needs the answer for.
-    fn importDeclStart(b: *Binder, decl: Node) ?TokenIndex {
-        if (decl == null_node) return null;
-        switch (b.nodeTag(decl)) {
-            .import_equals => {
-                const main = b.tree.nodeMainToken(decl);
-                // `export import q = …`: tsc's node span starts at the modifier.
-                if (main > 0 and b.tree.tokens.tag(main - 1) == .keyword_export) return main - 1;
-                return main;
-            },
-            .import_specifier => return b.tree.nodeMainToken(decl),
-            else => return null,
-        }
-    }
-
     /// Do the declarations already in the table and the one now being bound
     /// belong to DIFFERENT blocks of a merging container? Two `interface I`
     /// blocks — and a `class C` + `interface C` pair — contribute to one
@@ -1033,7 +995,6 @@ const Binder = struct {
             }
         }
 
-        const n_import = kind.isImport();
         const gop = try b.members.getOrPut(b.scratch, memberKey(scope, atom));
         if (gop.found_existing) {
             const sym = gop.value_ptr.*;
@@ -1053,13 +1014,6 @@ const Binder = struct {
                     // catches that one in `checkTypeParameters`, comparing
                     // each against its predecessors, not in `declareSymbol`).
                     .catch_redeclare => try b.diag(code, name_tok),
-                    // TS2440 always lands on the IMPORT declaration, whichever
-                    // side of the clash it is: `import {a} …; let a = 1;` and
-                    // `let b = 1; import {b} …` both point at the import.
-                    .import_conflict => if (n_import)
-                        try b.diag(code, b.importConflictTok(decl_node, name_tok))
-                    else
-                        try b.diagAtImportDecl(sym, code),
                     else => if (kind == .type_param or existing.type_param)
                         try b.diag(code, name_tok)
                     else
@@ -1088,7 +1042,10 @@ const Binder = struct {
             }
             b.sym_flags.items[sym] = existing.merge(flags);
             b.sym_block.items[sym] = b.cur_block;
-            if (b.declaresLocalMeaning()) b.sym_local_bits.items[sym] |= flags.bits();
+            if (b.declaresLocalMeaning())
+                b.sym_local_bits.items[sym] |= flags.bits()
+            else
+                b.sym_exported_bits.items[sym] |= flags.bits();
             try b.appendDecl(sym, decl_node, name_tok);
             try b.noteExport(sym, atom, scope);
             return sym;
@@ -1103,7 +1060,9 @@ const Binder = struct {
         try b.sym_decl_count.append(b.scratch, 0);
         try b.sym_reported.append(b.scratch, 0);
         try b.sym_block.append(b.scratch, b.cur_block);
-        try b.sym_local_bits.append(b.scratch, if (b.declaresLocalMeaning()) flags.bits() else 0);
+        const local_meaning = b.declaresLocalMeaning();
+        try b.sym_local_bits.append(b.scratch, if (local_meaning) flags.bits() else 0);
+        try b.sym_exported_bits.append(b.scratch, if (local_meaning) 0 else flags.bits());
         gop.value_ptr.* = sym;
         try b.appendDecl(sym, decl_node, name_tok);
         try b.noteExport(sym, atom, scope);
@@ -1239,6 +1198,82 @@ const Binder = struct {
                 if (!b.saw_module_syntax) continue;
             } else if (b.scope_kinds.items[scope] != .namespace) continue;
             try b.checkMergedExportsOf(sym);
+        }
+    }
+
+    /// The binder's half of TS2440 ("Import declaration conflicts with local
+    /// declaration"): every alias whose NAME also declares a meaning of its
+    /// own, with those meanings and the token the message lands on. The
+    /// checker's half — resolving the alias's TARGET and intersecting the two
+    /// meaning sets — is `checker/alias_conflict.zig`; the split follows tsc,
+    /// whose `checkAliasSymbol` reads `symbol.flags` straight from the binder.
+    ///
+    /// Which declarations count is a question only the binder can answer,
+    /// because it is about tsc's two member tables. An `export`ed declaration
+    /// lands in the container's `exports`, a plain one in its `locals`, and
+    /// `checkAliasSymbol` looks at `symbol.exportSymbol ?? symbol` — so as soon
+    /// as ANY declaration of the name is exported, the exported set is the one
+    /// compared and the local ones drop out. `namespace Q { var z; export
+    /// import z = M; }` is silent in the oracle for exactly that reason, while
+    /// `namespace M1 { export var q = 5; } namespace M1 { export import q =
+    /// M1.s; }` — both in the shared `exports` table, across blocks — is the
+    /// error (`varNameConflictsWithImportInDifferentPartOfModule`).
+    ///
+    /// Nothing is recorded for the overwhelming majority of aliases, which
+    /// merge with nothing: `flags` is empty and the record is skipped.
+    fn collectAliasMerges(b: *Binder) Error!void {
+        for (1..b.sym_names.items.len) |i| {
+            const sym: SymbolId = @intCast(i);
+            if (!b.sym_flags.items[sym].import_binding) continue;
+            const exported = b.sym_exported_bits.items[sym];
+            const bits = if (exported != 0) exported else b.sym_local_bits.items[sym];
+            // The alias's own bits are not a meaning of the name.
+            const others: SymbolFlags = @bitCast(bits & ~fbits(.{ .import_binding = true }));
+            if (others.bits() == 0) continue;
+            var link = b.sym_decl_head.items[sym];
+            while (link != 0) : (link = b.decl_links.items[link].next) {
+                const l = b.decl_links.items[link];
+                if (!isAliasDecl(b, l.value)) continue;
+                try b.alias_merges.append(b.scratch, .{
+                    .sym = sym,
+                    .decl = l.value,
+                    .tok = aliasDeclTok(b, l.value, b.decl_name_toks.items[link]),
+                    .flags = others,
+                });
+                break;
+            }
+        }
+    }
+
+    fn isAliasDecl(b: *const Binder, decl: Node) bool {
+        if (decl == null_node) return false;
+        return switch (b.nodeTag(decl)) {
+            .import_decl, .import_specifier, .import_equals => true,
+            else => false,
+        };
+    }
+
+    /// The token TS2440 lands on for the alias declaration `decl`.
+    ///
+    /// tsc reports it from `checkAliasSymbol` as `error(node, …)` — at the
+    /// whole ALIAS DECLARATION, not at the local name it binds. For `import x =
+    /// m.m` that is the `import` keyword (or the `export` in front of `export
+    /// import q = M1.s`), and for a named import specifier it is the IMPORTED
+    /// name, where `x as x44` starts. The other two shapes — a default import
+    /// and `import * as ns` — report at the local name: the `ImportClause`
+    /// starts there, and a `NamespaceImport` is one of the node kinds
+    /// `getErrorSpanForNode` narrows to its own name (oracle-checked: `import *
+    /// as a from "./m"` reports at the `a`, not at the `*`).
+    fn aliasDeclTok(b: *const Binder, decl: Node, name_tok: TokenIndex) TokenIndex {
+        switch (b.nodeTag(decl)) {
+            .import_equals => {
+                const main = b.tree.nodeMainToken(decl);
+                // `export import q = …`: tsc's node span starts at the modifier.
+                if (main > 0 and b.tree.tokens.tag(main - 1) == .keyword_export) return main - 1;
+                return main;
+            },
+            .import_specifier => return b.tree.nodeMainToken(decl),
+            else => return name_tok,
         }
     }
 
@@ -5162,6 +5197,7 @@ const Binder = struct {
             .flow_map_ids = flow_map_ids,
             .array_op_nodes = array_op_nodes,
             .array_op_indexes = array_op_indexes,
+            .alias_merges = try arena.dupe(AliasMerge, b.alias_merges.items),
             .imports = &.{},
             .exports = &.{},
             .unresolved = &.{},
@@ -5819,20 +5855,24 @@ test "dup: duplicate parameters are TS2300 (strict mode)" {
     try expectBindCodes("function f([a, b]: any, { a: a2, c: a }: any) {}", dup2);
 }
 
-test "dup: import conflicts are TS2440, duplicate imports TS2300" {
-    // TS2440 names the IMPORT declaration and nothing else, in either
-    // order — the message *is* "Import declaration conflicts with local
-    // declaration of 'a'" (oracle-verified in both orders).
-    try expectBindCodes("import { a } from \"./m\"; let a = 1;", &.{.import_conflict});
-    try expectBindCodes("let a = 1; import { a } from \"./m\";", &.{.import_conflict});
+test "dup: an import merges with a local declaration, two imports are TS2300" {
+    // tsc's `AliasExcludes = Alias`: an import binding merges with every
+    // other meaning at bind time. Whether the pair is legal depends on the
+    // meanings of the import's TARGET, which only the checker can resolve —
+    // TS2440 is `checker/alias_conflict.zig`'s (in either order).
+    try expectBindCodes("import { a } from \"./m\"; let a = 1;", &.{});
+    try expectBindCodes("let a = 1; import { a } from \"./m\";", &.{});
+    try expectBindCodes("import type { T } from \"./m\"; let T = 1;", &.{});
+    try expectBindCodes("import type { T } from \"./m\"; type T = number;", &.{});
     // Two imports of one name are an ordinary duplicate, at both spellings.
     try expectBindCodes(
         "import { a } from \"./m\"; import { a } from \"./n\";",
         &.{ .duplicate_identifier, .duplicate_identifier },
     );
-    // Type-only imports live in type space only.
-    try expectBindCodes("import type { T } from \"./m\"; let T = 1;", &.{});
-    try expectBindCodes("import type { T } from \"./m\"; type T = number;", &.{.import_conflict});
+    try expectBindCodes(
+        "import type { T } from \"./m\"; import { T } from \"./n\";",
+        &.{ .duplicate_identifier, .duplicate_identifier },
+    );
 }
 
 test "dup: a name repeated across MERGING blocks is not a duplicate" {

@@ -72,6 +72,7 @@ pub const BumpArena = @import("checker/bump.zig").BumpArena;
 pub const prof_zig = @import("checker/prof.zig");
 const memprof_zig = @import("checker/memprof.zig");
 const memo_zig = @import("checker/memo.zig");
+const alias_conflict_zig = @import("checker/alias_conflict.zig");
 
 const Ast = ast.Ast;
 const Node = ast.Node;
@@ -2738,6 +2739,12 @@ pub const Checker = struct {
                 _ = c.scratch_arena.reset(.{ .retain_with_limit = scratch_retain_limit });
                 if (c.mprof.on) memprof_zig.sample(c);
             }
+            // TS2440 asks about the meanings of an alias's TARGET, which is
+            // only knowable here; it is a walk of the file's symbol table
+            // rather than of its statements, so it runs once per file (the
+            // seal sorts every diagnostic back into position order).
+            c.cur_scope = binder.file_scope;
+            try alias_conflict_zig.checkFileAliases(c);
         }
         // Every class instance type is now complete, so the written type
         // arguments collected along the way can be judged against their
