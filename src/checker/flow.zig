@@ -2791,7 +2791,7 @@ fn narrowBySwitchOn(c: *Checker, t: TypeId, sw: Node, clause: Node, key: RefKey,
     // a CONDITION on the reference, not a value to compare it against, so no
     // discriminant test applies.
     if (c.nodeTag(disc) == .true_literal) {
-        return narrowBySwitchOnTrue(c, t, sw, clause, key, decl);
+        return narrowBySwitchOnTrue(c, t, sw, clause, is_default, key, decl);
     }
 
     var prop: Atom = 0;
@@ -2916,12 +2916,14 @@ fn narrowBySwitchOnTypeof(c: *Checker, t0: TypeId, sw: Node, clause: Node, is_de
 /// ztsc's binder gives each clause its own `switch_clause` flow node and joins
 /// fallthrough separately, so a clause range (tsc's `clauseStart`/`clauseEnd`,
 /// which exists to model a fallthrough group) is exactly one clause here.
-fn narrowBySwitchOnTrue(c: *Checker, t0: TypeId, sw: Node, clause: Node, key: RefKey, decl: TypeId) Error!TypeId {
+///
+/// `is_default` covers BOTH default edges: an explicit `default:` clause and
+/// the implicit no-match edge, which arrives with `clause == null_node`.
+fn narrowBySwitchOnTrue(c: *Checker, t0: TypeId, sw: Node, clause: Node, is_default: bool, key: RefKey, decl: TypeId) Error!TypeId {
     var t = t0;
     const r = c.tree.extraData(ast.SubRange, c.tree.nodeData(sw).rhs);
     const clauses = c.tree.extraRange(r.start, r.end);
     var past = false;
-    const is_default = c.nodeTag(clause) == .default_clause;
     for (clauses) |cl| {
         if (cl == clause) {
             past = true;

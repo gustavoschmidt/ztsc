@@ -298,7 +298,9 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         .prefix_unary => return checkPrefixUnary(c, node, ctx),
         .postfix_unary => {
             const ot = try c.checkExprCached(d.lhs, types.no_type);
-            try checkArithmeticOperand(c, try checkNonNullType(c, ot, d.lhs), d.lhs);
+            if (try checkArithmeticOperand(c, try checkNonNullType(c, ot, d.lhs), d.lhs)) {
+                _ = try checkReferenceExpression(c, d.lhs, .increment);
+            }
             return types.number_type;
         },
         .non_null => {
@@ -3339,6 +3341,95 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
     return .{ .ty = result, .chained = chained };
 }
 
+/// The write sites tsc runs `checkReferenceExpression` for. Each carries its
+/// own pair of diagnostics — "must be a variable or a property access" and
+/// "may not be an optional property access".
+pub const RefSite = enum {
+    assignment,
+    object_rest,
+    increment,
+    for_in,
+    for_of,
+
+    fn invalidCode(self: RefSite) u16 {
+        return switch (self) {
+            .assignment => 2364,
+            .object_rest => 2701,
+            .increment => 2357,
+            .for_in => 2406,
+            .for_of => 2487,
+        };
+    }
+
+    fn invalidText(self: RefSite) []const u8 {
+        return switch (self) {
+            .assignment => "The left-hand side of an assignment expression must be a variable or a property access.",
+            .object_rest => "The target of an object rest assignment must be a variable or a property access.",
+            .increment => "The operand of an increment or decrement operator must be a variable or a property access.",
+            .for_in => "The left-hand side of a 'for...in' statement must be a variable or a property access.",
+            .for_of => "The left-hand side of a 'for...of' statement must be a variable or a property access.",
+        };
+    }
+
+    fn optionalCode(self: RefSite) u16 {
+        return switch (self) {
+            .assignment => 2779,
+            .object_rest => 2778,
+            .increment => 2777,
+            .for_in => 2780,
+            .for_of => 2781,
+        };
+    }
+
+    fn optionalText(self: RefSite) []const u8 {
+        return switch (self) {
+            .assignment => "The left-hand side of an assignment expression may not be an optional property access.",
+            .object_rest => "The target of an object rest assignment may not be an optional property access.",
+            .increment => "The operand of an increment or decrement operator may not be an optional property access.",
+            .for_in => "The left-hand side of a 'for...in' statement may not be an optional property access.",
+            .for_of => "The left-hand side of a 'for...of' statement may not be an optional property access.",
+        };
+    }
+};
+
+/// tsc's `checkReferenceExpression`: a write target has to be *classified as a
+/// reference* — an identifier or a property/element access, once parentheses
+/// and assertions are skipped — and it may not be an optional chain, because a
+/// short-circuited chain has nowhere to write to.
+///
+/// Both diagnostics are reported on the expression AS WRITTEN (tsc's `error
+/// (expr, …)`), not on the skipped-through node, so `(1 + 2) = 3` points at the
+/// parenthesized expression.
+///
+/// The answer is load-bearing beyond the diagnostic: every caller runs its own
+/// assignability / element-type check only when this returns true, which is how
+/// tsc keeps an invalid target from also reporting a TS2322 cascade.
+pub fn checkReferenceExpression(c: *Checker, expr: Node, site: RefSite) Error!bool {
+    var node = expr;
+    // `skipOuterExpressions(Parentheses | Assertions)`: `(x) = 1`, `(<T>x) = 1`
+    // and `x! = 1` all name the reference `x`.
+    while (true) switch (c.nodeTag(node)) {
+        .paren_expr, .as_expr, .satisfies_expr, .non_null => node = c.tree.nodeData(node).lhs,
+        else => break,
+    };
+    switch (c.nodeTag(node)) {
+        .identifier, .member_expr, .index_expr, .optional_member_expr, .optional_index_expr => {},
+        // A target the parser could not build is already reported as a syntax
+        // error; tsc suppresses every semantic diagnostic in such a file, so
+        // saying "not a reference" about it would be a pure false positive.
+        .error_node, .unsupported => return false,
+        else => {
+            try c.diagFmt(site.invalidCode(), c.nodeSpan(expr), "{s}", .{site.invalidText()});
+            return false;
+        },
+    }
+    if (c.isOptionalChain(node)) {
+        try c.diagFmt(site.optionalCode(), c.nodeSpan(expr), "{s}", .{site.optionalText()});
+        return false;
+    }
+    return true;
+}
+
 /// tsc's `checkDeleteExpression` (plus `checkGrammarDeleteExpression`) on an
 /// already-checked operand:
 ///
@@ -3387,7 +3478,13 @@ fn checkDeleteOperand(c: *Checker, operand: Node) Error!void {
         _ = try readonlyIndexWriteAt(c, recv, expr, ed.rhs);
     }
     const name = (try deleteTargetName(c, expr, tag)) orelse return;
-    const recv0 = c.nodeType(ed.lhs) orelse return;
+    // A link INSIDE a `?.` spine publishes no node type — `chainObjType` is what
+    // types it, and it does not write the memo — so ask that instead of giving
+    // up. `delete o.b?.c.d?.e` needs it: the receiver `o.b?.c.d` is two links
+    // down a chain. Re-checking cannot double-report; `diagFmt` dedupes on
+    // (file, code, span).
+    const recv0 = c.nodeType(ed.lhs) orelse
+        if (c.isOptionalChain(ed.lhs)) (try chainObjType(c, ed.lhs)).ty else return;
     const recv = try c.resolveStructural(try c.nonNullableChain(recv0));
     // `allow_index = false`: a string INDEX SIGNATURE standing in for the name is
     // not a property symbol, and tsc's checks here are all keyed off
@@ -3522,7 +3619,11 @@ fn checkPrefixUnary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         },
         .plus_plus, .minus_minus => {
             const ot = try c.checkExprCached(d.lhs, types.no_type);
-            try checkArithmeticOperand(c, try checkNonNullType(c, ot, d.lhs), d.lhs);
+            // tsc runs the reference check only when the operand TYPED as a
+            // valid arithmetic operand, to avoid cascading off one operand.
+            if (try checkArithmeticOperand(c, try checkNonNullType(c, ot, d.lhs), d.lhs)) {
+                _ = try checkReferenceExpression(c, d.lhs, .increment);
+            }
             return types.number_type;
         },
         else => {
@@ -3626,9 +3727,12 @@ fn isArithmeticOperand(c: *Checker, t: TypeId) Error!bool {
     return (try isNumberish(c, t)) or (try isBigintish(c, t));
 }
 
-fn checkArithmeticOperand(c: *Checker, t: TypeId, node: Node) Error!void {
-    if (try isArithmeticOperand(c, t)) return;
+/// Answers whether the operand passed — tsc's `checkArithmeticOperandType`
+/// return value gates the reference check that follows it.
+fn checkArithmeticOperand(c: *Checker, t: TypeId, node: Node) Error!bool {
+    if (try isArithmeticOperand(c, t)) return true;
     try c.diagFmt(2356, c.nodeSpan(node), "An arithmetic operand must be of type 'any', 'number', 'bigint' or an enum type.", .{});
+    return false;
 }
 
 /// TS2359 gate: is `t` a valid `instanceof` right-hand side — i.e. `any`,
@@ -3875,6 +3979,11 @@ fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
         return src;
     }
     const target_t = try checkAssignmentTarget(c, d.lhs);
+    // tsc's `checkAssignmentOperator` runs `checkReferenceExpression` on the
+    // target and only checks assignability when it passes, so an illegal
+    // target (`f() = 1`, `a?.b = 1`) reports ONE diagnostic, not a TS2322 on
+    // top of it.
+    const is_ref = try checkReferenceExpression(c, d.lhs, .assignment);
     // Writing an evolving (`auto`-typed) variable is unchecked: its
     // `null`/`undefined` declared type is where the flow type starts, not
     // a constraint on what may be stored (tsc's autoType). The type itself
@@ -3886,13 +3995,13 @@ fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
     const rt = try c.checkExprCached(d.rhs, rhs_ctx);
     switch (op) {
         .eq => {
-            if (!unchecked and target_t != types.error_type and target_t != types.any_type) {
+            if (is_ref and !unchecked and target_t != types.error_type and target_t != types.any_type) {
                 _ = try c.checkAssignable(rt, target_t, d.rhs, c.nodeSpan(d.lhs));
             }
             return rt;
         },
         .amp_amp_eq, .pipe_pipe_eq, .question_question_eq => {
-            if (!unchecked and target_t != types.error_type and target_t != types.any_type) {
+            if (is_ref and !unchecked and target_t != types.error_type and target_t != types.any_type) {
                 _ = try c.checkAssignable(rt, target_t, d.rhs, c.nodeSpan(d.lhs));
             }
             return rt;
@@ -3933,7 +4042,7 @@ fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
             // A reported operand means tsc never reaches the write-back
             // (`if (leftOk && rightOk) checkAssignmentOperator(resultType)`),
             // so the operand diagnostic is never doubled by a TS2322.
-            if (res.ok and !unchecked and target_t != types.error_type and target_t != types.any_type) {
+            if (res.ok and is_ref and !unchecked and target_t != types.error_type and target_t != types.any_type) {
                 // No expression node: the source type is synthesized by the
                 // operator, so there is no literal to elaborate or excess-check.
                 _ = try c.checkAssignable(res.ty, try baseOfLiteralType(c, target_t), null_node, c.nodeSpan(d.lhs));
@@ -4602,7 +4711,7 @@ fn checkObjectDestructuringProperty(c: *Checker, prop: Node, src: TypeId) Error!
         .object_property => {
             const key = try destructuringKey(c, prop, d.lhs);
             const elem = try destructuringMemberType(c, src, key, destructuringHasDefault(c, d.rhs));
-            try checkDestructuringTarget(c, d.rhs, elem);
+            try checkDestructuringTarget(c, d.rhs, elem, .assignment);
         },
         // `{ a }` / `{ a = init }` — the name is both key and target; lhs is
         // the target identifier, rhs the default.
@@ -4610,7 +4719,7 @@ fn checkObjectDestructuringProperty(c: *Checker, prop: Node, src: TypeId) Error!
             if (d.rhs != null_node) _ = try c.checkExprCached(d.rhs, types.no_type);
             const key = try destructuringKey(c, prop, null_node);
             const elem = try destructuringMemberType(c, src, key, d.rhs != null_node);
-            try checkDestructuringTarget(c, d.lhs, elem);
+            try checkDestructuringTarget(c, d.lhs, elem, .assignment);
         },
         // Declaration-shaped pattern nodes (a `for (…of…)` head can carry
         // one): main_token is the key, lhs the target (0 when shorthand).
@@ -4618,16 +4727,17 @@ fn checkObjectDestructuringProperty(c: *Checker, prop: Node, src: TypeId) Error!
         // (`destructure.zig`), so no source lookup runs here.
         .binding_property => {
             if (d.rhs != null_node) _ = try c.checkExprCached(d.rhs, types.no_type);
-            if (d.lhs != null_node) try checkDestructuringTarget(c, d.lhs, types.no_type);
+            if (d.lhs != null_node) try checkDestructuringTarget(c, d.lhs, types.no_type, .assignment);
         },
         // `{[k]: target}` — the key IS evaluated; lhs is it, rhs the target.
         .binding_property_computed => {
             if (d.lhs != null_node) _ = try c.checkExprCached(d.lhs, types.no_type);
-            if (d.rhs != null_node) try checkDestructuringTarget(c, d.rhs, types.no_type);
+            if (d.rhs != null_node) try checkDestructuringTarget(c, d.rhs, types.no_type, .assignment);
         },
         // `{ ...rest } = src`: the rest object is `src` minus the names its
         // siblings take (tsc's `getRestType`), which is not computed here.
-        .spread_element, .rest_element => try checkDestructuringTarget(c, d.lhs, types.no_type),
+        // An object rest target has its OWN pair of reference diagnostics.
+        .spread_element, .rest_element => try checkDestructuringTarget(c, d.lhs, types.no_type, .object_rest),
         .omitted, .error_node, .unsupported => {},
         else => _ = try checkAssignmentTarget(c, prop),
     }
@@ -4640,8 +4750,8 @@ fn checkArrayDestructuringElement(c: *Checker, el: Node, src: TypeId, index: u32
         .omitted, .error_node, .unsupported => {},
         // `[a, ...rest] = src`: the rest is an array of the remaining
         // elements, not the element at `index`.
-        .spread_element, .rest_element => try checkDestructuringTarget(c, c.tree.nodeData(el).lhs, types.no_type),
-        else => try checkDestructuringTarget(c, el, try destructuringElementType(c, src, index)),
+        .spread_element, .rest_element => try checkDestructuringTarget(c, c.tree.nodeData(el).lhs, types.no_type, .assignment),
+        else => try checkDestructuringTarget(c, el, try destructuringElementType(c, src, index), .assignment),
     }
 }
 
@@ -4651,21 +4761,21 @@ fn checkArrayDestructuringElement(c: *Checker, el: Node, src: TypeId, index: u32
 /// expression walker checked the target identifier as a *read*, so writing a
 /// not-yet-assigned `let` through a destructuring assignment reported TS2454
 /// at the write site itself.
-fn checkDestructuringTarget(c: *Checker, el0: Node, src: TypeId) Error!void {
+fn checkDestructuringTarget(c: *Checker, el0: Node, src: TypeId, site: RefSite) Error!void {
     const el = skipParens(c, el0);
     if (el == null_node) return;
     const d = c.tree.nodeData(el);
     switch (c.nodeTag(el)) {
         .binding_default => {
             if (d.rhs != null_node) _ = try c.checkExprCached(d.rhs, types.no_type);
-            try checkDestructuringTarget(c, d.lhs, src);
+            try checkDestructuringTarget(c, d.lhs, src, site);
         },
         // `[a = init] = …`: the cover grammar parses the default as a plain
         // assignment expression.
         .assign => {
             if (c.tree.tokens.tag(c.tree.nodeMainToken(el)) == .eq) {
                 _ = try c.checkExprCached(d.rhs, types.no_type);
-                try checkDestructuringTarget(c, d.lhs, src);
+                try checkDestructuringTarget(c, d.lhs, src, site);
             } else {
                 _ = try c.checkExprCached(el, types.no_type);
             }
@@ -4674,7 +4784,13 @@ fn checkDestructuringTarget(c: *Checker, el0: Node, src: TypeId) Error!void {
             try checkDestructuringPattern(c, el, src);
         },
         .omitted, .error_node, .unsupported => {},
-        else => _ = try checkAssignmentTarget(c, el),
+        // tsc's `checkReferenceAssignment`: a leaf pattern element is a write,
+        // and the same reference rules apply to it as to `x = v` — reported at
+        // the element AS WRITTEN, parentheses included.
+        else => {
+            _ = try checkAssignmentTarget(c, el);
+            _ = try checkReferenceExpression(c, el0, site);
+        },
     }
 }
 
