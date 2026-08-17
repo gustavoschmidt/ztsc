@@ -3781,10 +3781,11 @@ const Parser = struct {
         return p.addNode(.{ .tag = .enum_member, .main_token = name_tok, .data = .{ .lhs = init, .rhs = 0 } });
     }
 
-    /// `namespace N { ... }` / `module N { ... }`. The `namespace`/`module`
-    /// keyword must not yet be consumed. Only identifier-named namespaces are
-    /// in subset; a string-module name (`module "x" {}`, augmentation) or a
-    /// dotted name (`namespace A.B {}`) falls back to unsupported.
+    /// `namespace N { ... }` / `module N { ... }`, dotted names included. The
+    /// `namespace`/`module` keyword must not yet be consumed. A string-module
+    /// name (`module "x" {}`) is `parseAmbientModule` and a missing one
+    /// (`module {}`) is `parseAnonymousNamespace`; both are dispatched before
+    /// this is reached.
     fn parseNamespaceDecl(p: *Parser, flags: u32) PE!Node {
         const kw = try p.bump(); // `namespace` / `module`
         // `declare namespace N { ... }` makes the whole body ambient; a plain
@@ -3918,26 +3919,6 @@ const Parser = struct {
         return p.addNode(.{ .tag = .namespace_decl, .main_token = kw, .data = .{ .lhs = extra, .rhs = 0 } });
     }
 
-    /// `declare module "spec" { ... }` (the `declare` already consumed).
-    /// Modeled as a `namespace_decl` flagged `ambient_module`; `name_token`
-    /// is the specifier string literal. The block's exports become an ambient
-    /// module the linker resolves imports of `"spec"` against, and merges into
-    /// a real module's exports when `"spec"` also resolves (augmentation).
-    ///
-    /// The *shorthand* form has no block at all — `declare module "*.scss";`
-    /// — and declares a module whose every export is `any`. That is exactly
-    /// what an empty body already means downstream (the linker's
-    /// `ambientOpaque`: an ambient module with no named exports degrades
-    /// imports to `any`), so the shorthand parses to the same node with an
-    /// empty body span. Demanding the `{` instead cost the whole rest of the
-    /// file: a project `global.d.ts` that opens with `declare module "*.scss";`
-    /// and then augments an interface lost the augmentation to error recovery,
-    /// and under `skipLibCheck` the parse error itself was invisible.
-    /// `declared` is whether a `declare` modifier introduced this declaration.
-    /// TS1035: a QUOTED module name declares an EXTERNAL module, which only an
-    /// ambient declaration may do — `module "M" { }` on its own is an error,
-    /// while the same source in a `.d.ts` is silent because the whole file is
-    /// ambient from its first token.
     /// Can this token start the NAME of a `module "…" { }`? A quoted string is
     /// the only legal spelling, but a template is taken too so it can be
     /// rejected with TS1443 instead of derailing the declaration behind it.
@@ -3948,6 +3929,27 @@ const Parser = struct {
         };
     }
 
+    /// `declare module "spec" { ... }` (the `declare` already consumed).
+    /// Modeled as a `namespace_decl` flagged `ambient_module`; `name_token`
+    /// is the specifier string literal. The block's exports become an ambient
+    /// module the linker resolves imports of `"spec"` against, and merges into
+    /// a real module's exports when `"spec"` also resolves (augmentation).
+    ///
+    /// `declared` is whether a `declare` modifier introduced this declaration.
+    /// TS1035: a QUOTED module name declares an EXTERNAL module, which only an
+    /// ambient declaration may do — `module "M" { }` on its own is an error,
+    /// while the same source in a `.d.ts` is silent because the whole file is
+    /// ambient from its first token.
+    ///
+    /// The *shorthand* form has no block at all — `declare module "*.scss";`
+    /// — and declares a module whose every export is `any`. That is exactly
+    /// what an empty body already means downstream (the linker's
+    /// `ambientOpaque`: an ambient module with no named exports degrades
+    /// imports to `any`), so the shorthand parses to the same node with an
+    /// empty body span. Demanding the `{` instead cost the whole rest of the
+    /// file: a project `global.d.ts` that opens with `declare module "*.scss";`
+    /// and then augments an interface lost the augmentation to error recovery,
+    /// and under `skipLibCheck` the parse error itself was invisible.
     fn parseAmbientModule(p: *Parser, declared: bool) PE!Node {
         const kw = try p.bump(); // `module`
         const spec_tok = p.curIdx();
