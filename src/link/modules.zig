@@ -996,6 +996,203 @@ fn reportMergedMemberDups(
     try eachSharedMember(scratch, sym_base, segs, &r, MemberDupReporter.visit);
 }
 
+// ---------------------------------------------------------------------------
+// TS2433: a namespace merged with a class or function in ANOTHER file
+// ---------------------------------------------------------------------------
+//
+// The merged value is the class/function object with the namespace's exports
+// added, so the namespace block has to RUN second. Within one file the binder
+// enforces that by position (TS2434, `checkNamespacePriorToMerge`); across
+// files no position could fix it, and tsc says so with its own message:
+//
+//     // a.ts             // b.ts
+//     class D { }         namespace D { export var y = "hi"; }   // TS2433
+//
+// tsc's `checkModuleDeclaration` runs the two arms off one lookup —
+// `getFirstNonAmbientClassOrFunctionDeclaration(symbol)`, then "different
+// file?" before "written earlier?" — over the MERGED symbol, which is why the
+// cross-file half belongs to the linker.
+//
+// The rule applies at every nesting depth, not just at the global name: it is
+// the namespace MEMBER tables that merge `namespace X.Y { export class Point }`
+// with `namespace X.Y { export namespace Point { … } }`. So the walk descends
+// through the shared exported members of every namespace that merges across
+// files, which is also what bounds its cost — a name whose blocks all live in
+// one file, or that is not a namespace at all, is dropped before any member
+// table is touched.
+
+/// Is this file entirely ambient? tsc's `NodeFlags.Ambient` covers a `.d.ts`
+/// wholesale, and an ambient namespace is never the runtime half of a merge.
+fn isDeclarationFile(pf: *const ProgFile) bool {
+    return std.mem.endsWith(u8, pf.path, ".d.ts");
+}
+
+/// `declare` on the declaration itself (tsc reads the same flag through
+/// `NodeFlags.Ambient`). Only the three tags the merge rule looks at.
+fn declHasDeclareFlag(tree: *const Ast, decl: ast.Node) bool {
+    const lhs = tree.nodeData(decl).lhs;
+    const flags: u32 = switch (tree.nodeTag(decl)) {
+        .function_decl => tree.extraData(ast.FnProto, lhs).flags,
+        .class_decl => tree.extraData(ast.ClassData, lhs).flags,
+        .namespace_decl => tree.extraData(ast.NamespaceData, lhs).flags,
+        else => return false,
+    };
+    return flags & ast.Flags.declare != 0;
+}
+
+/// tsc's `getFirstNonAmbientClassOrFunctionDeclaration`, reduced to the only
+/// thing the cross-file arm asks of it: which FILE it lives in. A function
+/// needs a BODY to be the merge's runtime half — an overload signature has
+/// nothing for the namespace to run after.
+fn firstClassOrFunctionFile(files: []const ProgFile, sym_base: []const u32, parts: []const u32) ?FileId {
+    for (parts) |p| {
+        const fid = fileOfGlobal(sym_base, files.len, p);
+        const pf = &files[fid];
+        if (isDeclarationFile(pf)) continue;
+        for (pf.bind.declsOf(p - sym_base[fid])) |decl| {
+            switch (pf.tree.nodeTag(decl)) {
+                .class_decl => {},
+                .function_decl => if (pf.tree.nodeData(decl).rhs == 0) continue,
+                else => continue,
+            }
+            if (declHasDeclareFlag(pf.tree, decl)) continue;
+            return fid;
+        }
+    }
+    return null;
+}
+
+/// One merged name's TS2433s: every instantiated, non-ambient namespace block
+/// of it that is NOT in the file the class/function came from.
+fn reportNamespaceSplitAt(
+    arena: Allocator,
+    scratch: Allocator,
+    diags: []std.ArrayList(LinkDiag),
+    files: []const ProgFile,
+    sym_base: []const u32,
+    parts: []const u32,
+) Error!void {
+    const home = firstClassOrFunctionFile(files, sym_base, parts) orelse return;
+    for (parts) |p| {
+        const fid = fileOfGlobal(sym_base, files.len, p);
+        if (fid == home) continue; // the binder's TS2434 owns the same-file arm
+        const pf = &files[fid];
+        if (isDeclarationFile(pf)) continue;
+        const f = globalSymFlags(files, sym_base, p);
+        if (!f.namespace_decl or f.ns_uninstantiated) continue;
+        const decls = pf.bind.declsOf(p - sym_base[fid]);
+        const blocks = try scratch.alloc(ast.Node, decls.len);
+        var n: usize = 0;
+        for (decls) |decl| {
+            if (pf.tree.nodeTag(decl) != .namespace_decl) continue;
+            if (declHasDeclareFlag(pf.tree, decl)) continue;
+            blocks[n] = decl;
+            n += 1;
+        }
+        if (n == 0) continue;
+        try global_dup.reportAll(arena, diags, &.{.{
+            .file = fid,
+            .tree = pf.tree,
+            .src = pf.src,
+            .decls = blocks[0..n],
+        }}, .namespace_split_across_files);
+    }
+}
+
+/// The EXPORTED members of `parts`' namespace bodies, as segments for
+/// `eachSharedMember`. Only exported names take part in the merge tsc performs
+/// — a namespace local lives in its own table and meets nothing — so the
+/// segments are filtered copies rather than slices of the binder's arrays.
+/// Atom order survives the filter, which is what the k-way merge needs.
+fn nsMemberSegs(
+    scratch: Allocator,
+    files: []const ProgFile,
+    sym_base: []const u32,
+    parts: []const u32,
+) Error![]MemberSeg {
+    const segs = try scratch.alloc(MemberSeg, parts.len);
+    var n: usize = 0;
+    for (parts) |p| {
+        const fid = fileOfGlobal(sym_base, files.len, p);
+        const b = files[fid].bind;
+        const scope = b.namespaceScopeOf(p - sym_base[fid]) orelse continue;
+        const lo = b.scope_members_start[scope];
+        const hi = b.scope_members_start[scope + 1];
+        if (hi == lo) continue;
+        const atoms = try scratch.alloc(Atom, hi - lo);
+        const syms = try scratch.alloc(u32, hi - lo);
+        var k: usize = 0;
+        for (lo..hi) |i| {
+            const msym = b.member_syms[i];
+            if (!b.symbol_flags[msym].exported) continue;
+            atoms[k] = b.member_atoms[i];
+            syms[k] = msym;
+            k += 1;
+        }
+        if (k == 0) continue;
+        segs[n] = .{ .file = fid, .atoms = atoms[0..k], .syms = syms[0..k] };
+        n += 1;
+    }
+    return segs[0..n];
+}
+
+/// Namespaces nest, so the walk does. The cap is a guard on ztsc's stack, not
+/// a fact about the language: past it the remaining depths stay SILENT, which
+/// is the safe direction.
+const max_ns_merge_depth: u8 = 16;
+
+/// The TS2433 walk over one merged name and everything its namespace blocks
+/// export. `parts` are the contributors in merge order.
+fn reportNamespaceSplit(
+    arena: Allocator,
+    scratch: Allocator,
+    diags: []std.ArrayList(LinkDiag),
+    files: []const ProgFile,
+    sym_base: []const u32,
+    parts: []const u32,
+    depth: u8,
+) Error!void {
+    if (parts.len < 2 or depth >= max_ns_merge_depth) return;
+    // Nothing here merges across files unless two contributors sit in
+    // different ones — the whole-program gate that keeps this off the hot path
+    // for the lib's big single-file namespaces.
+    var live_ns = false;
+    var multi_file = false;
+    const first_file = fileOfGlobal(sym_base, files.len, parts[0]);
+    for (parts) |p| {
+        if (fileOfGlobal(sym_base, files.len, p) != first_file) multi_file = true;
+        const f = globalSymFlags(files, sym_base, p);
+        if (f.namespace_decl and !f.ns_uninstantiated) live_ns = true;
+    }
+    if (!live_ns or !multi_file) return;
+
+    try reportNamespaceSplitAt(arena, scratch, diags, files, sym_base, parts);
+
+    const segs = try nsMemberSegs(scratch, files, sym_base, parts);
+    const w: NsSplitWalker = .{
+        .arena = arena,
+        .scratch = scratch,
+        .diags = diags,
+        .files = files,
+        .sym_base = sym_base,
+        .depth = depth,
+    };
+    try eachSharedMember(scratch, sym_base, segs, &w, NsSplitWalker.visit);
+}
+
+const NsSplitWalker = struct {
+    arena: Allocator,
+    scratch: Allocator,
+    diags: []std.ArrayList(LinkDiag),
+    files: []const ProgFile,
+    sym_base: []const u32,
+    depth: u8,
+
+    fn visit(w: *const NsSplitWalker, _: Atom, hits: []const u32) Error!void {
+        try reportNamespaceSplit(w.arena, w.scratch, w.diags, w.files, w.sym_base, hits, w.depth + 1);
+    }
+};
+
 /// TS2451 / TS2300 / TS2567 for a module export that an AUGMENTATION of that
 /// module redeclares:
 ///
@@ -1289,6 +1486,10 @@ fn mergeGlobals(
             // of every contributor's flags, so a duplicate name still resolves).
             if (dup_diags) |ds| {
                 try reportGlobalDup(arena, scratch, ds, files, sym_base, parts, us);
+                // …the same merge, judged by tsc's other cross-file rule: a
+                // namespace that merges with a class or function in a
+                // DIFFERENT file (TS2433), at every nesting depth.
+                try reportNamespaceSplit(arena, scratch, ds, files, sym_base, parts, 0);
                 // …and, when the name merged INTO a module, the member tables
                 // that merge with it.
                 if (umdMergeTarget(chain)) |uf| {
@@ -2620,8 +2821,18 @@ const Linker = struct {
         // `.ambient_ns` payloads (registry indices) while filling, and a
         // `declare module "node:x" { import x = require("x"); export = x; }`
         // block may be reached before the `"x"` block it names.
+        //
+        // A NESTED block seeds nothing. tsc's `isModuleAugmentationExternal`
+        // makes `declare module "Map" { module "Observable" { … } }` an
+        // *augmentation* of "Observable", and `mergeModuleAugmentation`
+        // resolves that name and gives up silently when nothing answers — it
+        // never brings a module into existence. So the nested block still
+        // CONTRIBUTES members (which is what moduleAugmentationInAmbientModule
+        // 1-4 need, alongside `mergeAmbientBlocks`), but a specifier only
+        // nested blocks name stays unknown, and an import of it is TS2307.
         for (l.files) |*f| {
             for (f.bind.ambient_modules) |am| {
+                if (f.bind.scope_parents[am.scope] != binder.file_scope) continue;
                 const gop = try l.ambient.getOrPut(l.scratch, am.spec);
                 if (!gop.found_existing) gop.value_ptr.* = .empty;
             }
@@ -2630,9 +2841,7 @@ const Linker = struct {
             const fid: FileId = @intCast(fi);
             const b = f.bind;
             for (b.ambient_modules) |am| {
-                const gop = try l.ambient.getOrPut(l.scratch, am.spec);
-                if (!gop.found_existing) gop.value_ptr.* = .empty;
-                const tbl = gop.value_ptr;
+                const tbl = l.ambient.getPtr(am.spec) orelse continue;
 
                 // Declaration exports (`export function/const/interface/…`):
                 // members with the `exported` flag. Default exports are handled

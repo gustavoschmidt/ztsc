@@ -24,6 +24,8 @@ const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
+const elaborate = @import("elaborate.zig");
+
 // =====================================================================
 // enums
 // =====================================================================
@@ -78,6 +80,16 @@ const EnumScope = struct {
     active: bool = false,
     own: SymbolId = 0,
     seen: []const checker_zig.EnumMemberEntry = &.{},
+    /// File TS2651 on every forward reference the walk meets. Off for the
+    /// memoized member walk — that one is re-entrant, and a diagnostic filed
+    /// from inside it would land once per entry into the memo. `checkEnum`
+    /// re-runs the same evaluator once per member with this on, which visits
+    /// exactly the subexpressions tsc's `evaluate` does.
+    report: bool = false,
+    /// The `enum_member` node whose initializer is being evaluated — tsc's
+    /// `location`. A reference that lands back on it is TS2565 rather than
+    /// TS2651 (`declaration === location` in `evaluateEnumMember`).
+    self: Node = null_node,
 
     /// `.none` when the name is not a member evaluated so far — the caller
     /// falls back to ordinary resolution; a member declared LATER in the same
@@ -209,8 +221,23 @@ fn evalConstBinary(c: *Checker, node: Node, out: *std.ArrayList(u8), es: EnumSco
         return if (l == .deep) .deep else .none;
     }
     const r = try evalConst(c, d.rhs, out, es, depth + 1);
-    // `"a" + "b"`: both halves are already in `out`, back to back.
-    if (l == .str and r == .str and op == .plus) return .str;
+    // tsc's `+` arm coerces with `"" + left + right` as soon as EITHER side is
+    // a string, so `"a" + 1` and `` `1` + 1 `` are string constants — not
+    // computed members. A `.num` operand contributed nothing to `out`, so the
+    // stringified number goes in at that operand's place: after the left
+    // half's bytes, or at `mark` when the number is the left operand.
+    if (op == .plus and (l == .str or r == .str)) {
+        if (l == .str and r == .str) return .str;
+        if (l == .str and r == .num) {
+            try appendNumber(c, out, r.num);
+            return .str;
+        }
+        if (l == .num and r == .str) {
+            var buf: [64]u8 = undefined;
+            try out.insertSlice(c.scratch(), mark, numberText(&buf, l.num));
+            return .str;
+        }
+    }
     if (l != .num or r != .num) {
         out.shrinkRetainingCapacity(mark);
         return if (r == .deep) .deep else .none;
@@ -234,13 +261,18 @@ fn evalConstBinary(c: *Checker, node: Node, out: *std.ArrayList(u8), es: EnumSco
     } };
 }
 
+/// JS `String(v)` for the values the evaluator can hold, rendered into
+/// caller-owned storage. Empty when the value does not fit the buffer.
+fn numberText(buf: []u8, v: f64) []const u8 {
+    return if (v == @floor(v) and @abs(v) < 1e15)
+        std.fmt.bufPrint(buf, "{d}", .{@as(i64, @intFromFloat(v))}) catch ""
+    else
+        std.fmt.bufPrint(buf, "{d}", .{v}) catch "";
+}
+
 fn appendNumber(c: *Checker, out: *std.ArrayList(u8), v: f64) Error!void {
     var buf: [64]u8 = undefined;
-    const s = if (v == @floor(v) and @abs(v) < 1e15)
-        std.fmt.bufPrint(&buf, "{d}", .{@as(i64, @intFromFloat(v))}) catch return
-    else
-        std.fmt.bufPrint(&buf, "{d}", .{v}) catch return;
-    try out.appendSlice(c.scratch(), s);
+    try out.appendSlice(c.scratch(), numberText(&buf, v));
 }
 
 /// The literal type an enum member walk produced, back in evaluator terms.
@@ -280,7 +312,7 @@ fn evalConstEntity(c: *Checker, node: Node, out: *std.ArrayList(u8), es: EnumSco
         .identifier => {
             const a = try c.atomOfToken(c.tree.nodeMainToken(node));
             if (es.lookup(a)) |v| return constOfType(c, v, out);
-            if (try forwardEnumMember(c, es, a)) |v| return v;
+            if (try forwardEnumMember(c, es, a, node)) |v| return v;
             const sym = switch (c.resolveSpace(a, c.cur_scope, true)) {
                 .sym => |s| s,
                 else => return .none,
@@ -292,7 +324,7 @@ fn evalConstEntity(c: *Checker, node: Node, out: *std.ArrayList(u8), es: EnumSco
         // through its namespace container.
         .member_expr => {
             const name = try c.memberAtom(d.rhs);
-            if (try evalEnumQualified(c, d.lhs, name, out, es)) |r| return r;
+            if (try evalEnumQualified(c, d.lhs, name, out, es, node)) |r| return r;
             const saved_scope = c.cur_scope;
             defer c.cur_scope = saved_scope;
             const outer = (try c.resolveNsContainer(d.lhs)) orelse return .none;
@@ -309,7 +341,7 @@ fn evalConstEntity(c: *Checker, node: Node, out: *std.ArrayList(u8), es: EnumSco
                 .template_literal => try c.templateAtom(itok),
                 else => return .none,
             };
-            return (try evalEnumQualified(c, d.lhs, name, out, es)) orelse .none;
+            return (try evalEnumQualified(c, d.lhs, name, out, es, node)) orelse .none;
         },
         else => return .none,
     }
@@ -319,19 +351,27 @@ fn evalConstEntity(c: *Checker, node: Node, out: *std.ArrayList(u8), es: EnumSco
 /// yet — `const enum E1 { X = Y, Y = 1 }`. tsc's `evaluateEnumMember` reports
 /// TS2651 for it and then returns **0**, not `undefined`, so the member does
 /// have a value: the following members keep auto-incrementing and a `const`
-/// enum gets no TS2474. (ztsc does not report the TS2651 itself yet; the walk
-/// is memoized and re-entrant, which is no place to emit a diagnostic.)
+/// enum gets no TS2474. `at` is the reference expression tsc anchors that
+/// diagnostic on — the bare identifier, or the whole `E.M` / `E["M"]` access.
 ///
 /// Read straight off the declaration, never through `enumMembersOf` — the
 /// enum's own walk is in progress, and re-entering it would recurse.
-fn forwardEnumMember(c: *Checker, es: EnumScope, name: Atom) Error!?Const {
+fn forwardEnumMember(c: *Checker, es: EnumScope, name: Atom, at: Node) Error!?Const {
     if (!es.active) return null;
     for (c.declsOf(es.own)) |decl| {
         if (c.nodeTag(decl) != .enum_decl) continue;
         const data = c.tree.extraData(ast.EnumData, c.tree.nodeData(decl).lhs);
         for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
             if (m == null_node or c.nodeTag(m) != .enum_member) continue;
-            if ((try c.memberAtom(c.tree.nodeMainToken(m))) == name) return Const{ .num = 0 };
+            if ((try c.memberAtom(c.tree.nodeMainToken(m))) != name) continue;
+            if (es.report) {
+                if (m == es.self) {
+                    try c.diagFmt(2565, c.nodeSpan(at), "Property '{s}' is used before being assigned.", .{c.atomText(name)});
+                } else {
+                    try c.diagFmt(2651, c.nodeSpan(at), "A member initializer in a enum declaration cannot reference members declared after it, including members defined in other enums.", .{});
+                }
+            }
+            return Const{ .num = 0 };
         }
     }
     return null;
@@ -339,7 +379,7 @@ fn forwardEnumMember(c: *Checker, es: EnumScope, name: Atom) Error!?Const {
 
 /// `E.M` where `E` names an enum. Null when the qualifier is not an enum, so
 /// the caller can try the namespace-container reading of the same syntax.
-fn evalEnumQualified(c: *Checker, qual: Node, name: Atom, out: *std.ArrayList(u8), es: EnumScope) Error!?Const {
+fn evalEnumQualified(c: *Checker, qual: Node, name: Atom, out: *std.ArrayList(u8), es: EnumScope, at: Node) Error!?Const {
     // ztsc's own cycle cap, not a fact about the code: `.deep`, so a chain
     // of enum references longer than this stays SILENT instead of earning a
     // false TS1061/TS2474.
@@ -353,7 +393,7 @@ fn evalEnumQualified(c: *Checker, qual: Node, name: Atom, out: *std.ArrayList(u8
     // far rather than re-entering the walk.
     if (es.active and esym == es.own) {
         if (es.lookup(name)) |v| return try constOfType(c, v, out);
-        return (try forwardEnumMember(c, es, name)) orelse Const.none;
+        return (try forwardEnumMember(c, es, name, at)) orelse Const.none;
     }
     const v = (try c.enumMemberValue(esym, name)) orelse return Const.none;
     return try constOfType(c, v, out);
@@ -980,7 +1020,24 @@ pub fn checkEnum(c: *Checker, node: Node) Error!void {
             }
             continue;
         }
-        _ = try c.checkExprCached(init_node, types.no_type);
+        const init_t = try c.checkExprCached(init_node, types.no_type);
+        // TS2651. The memoized member walk already RESOLVES forward references
+        // (`forwardEnumMember`), but it may be entered from anywhere and must
+        // stay silent, so the diagnostic comes from a second, throwaway run of
+        // the same evaluator over this one initializer — same traversal, same
+        // "members evaluated so far" scope, `report` on.
+        if (esym != binder.no_symbol and base + i <= members.len) {
+            var probe: std.ArrayList(u8) = .empty;
+            defer probe.deinit(c.scratch());
+            const es: EnumScope = .{
+                .active = true,
+                .own = esym,
+                .seen = members[0 .. base + i - 1],
+                .report = true,
+                .self = m,
+            };
+            _ = try evalConst(c, init_node, &probe, es, 0);
+        }
         if (value != types.no_type) {
             // A `const` enum inlines its members at every use, so a value
             // that is not a finite number has nothing to inline.
@@ -1001,6 +1058,16 @@ pub fn checkEnum(c: *Checker, node: Node) Error!void {
             try c.diagFmt(2474, c.nodeSpan(init_node), "const enum member initializers must be constant expressions.", .{});
         } else if (ambient) {
             try c.diagFmt(1066, c.nodeSpan(init_node), "In ambient enum declarations member initializer must be constant expression.", .{});
+        } else if (!try c.isAssignable(init_t, types.number_type)) {
+            // A computed member of a plain enum is legal, but its VALUE still
+            // has to be a number — tsc's last arm of `computeConstantValue`,
+            // `checkTypeAssignableTo(checkExpression(initializer),
+            // numberType, initializer, ...)` with its own head message. The
+            // derivation chain under it is the ordinary assignability one.
+            const chain = try elaborate.chainText(c, init_t, types.number_type);
+            try c.diagFmt(18033, c.nodeSpan(init_node), "Type '{s}' is not assignable to type '{s}' as required for computed enum member values.{s}", .{
+                try c.typeToString(init_t), try c.typeToString(types.number_type), chain,
+            });
         }
     }
 }
