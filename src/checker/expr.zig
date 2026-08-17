@@ -585,15 +585,19 @@ fn checkIdentifier(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
                 if ((f.let_decl or f.const_decl or f.class or f.enum_decl) and !f.function and !f.var_decl and !f.param) {
                     try checkTdz(c, sym, node, tok);
                 }
-                if ((f.let_decl or f.var_decl) and !f.param and !f.const_decl and
+                if ((f.let_decl or f.var_decl or f.const_decl) and !f.param and
                     // A computed member name is evaluated outside its
                     // container's flow, so nothing read there is "used before
                     // being assigned" (`Checker.in_computed_member_name`).
                     // (wave-10 A: one flagged guard.)
                     !c.in_computed_member_name)
                 {
-                    try checkUseBeforeAssigned(c, sym, node, tok, declared);
-                    try checkEvolvingVarRead(c, sym, node, tok);
+                    // A `const` reaches here only for the evolving-ARRAY half
+                    // of `checkEvolvingVarRead` — `const x = []` gets tsc's
+                    // auto array type just as a `let` does — and is never
+                    // "used before being assigned".
+                    if (!f.const_decl) try checkUseBeforeAssigned(c, sym, node, tok, declared);
+                    try checkEvolvingVarRead(c, sym, node, tok, declared);
                 }
             }
             // Flow narrowing. A binding destructured out of a discriminated
@@ -751,11 +755,29 @@ fn isAmbientDeclarator(c: *Checker, decl: Node) bool {
 ///
 /// Both diagnostics are reported: TS7034 on the DECLARATION's name (once, by
 /// `diagFmt`'s span dedupe, however many reads there are) and TS7005 on the read.
-/// Evolving ARRAYS (`let x = []` -> `any[]`) are out of ztsc's subset, so only
-/// the `'any'` half of the pair is spelled here.
-fn checkEvolvingVarRead(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex) Error!void {
-    if (!c.isEvolvingVar(sym)) return;
+///
+/// The evolving ARRAY half — `let x = []`, `const x = []`, and a `let x;` that
+/// an `x = []` reaches — is the other spelling tsc's `type === autoType ||
+/// type === autoArrayType` admits, and its test is the literal one: *is the
+/// flow type at this read still the auto array*, i.e. did no `x.push(v)` /
+/// `x[i] = v` / non-empty assignment ever reach it (`flow.evolvingArrayStillAuto`).
+/// That is a strictly different question from the closure-crossing rule below,
+/// which is what the plain auto type needs — a same-container read of a
+/// never-pushed array reports, while a same-container read of a `let x;` is
+/// TS2454's business — so the two are asked separately and the array half,
+/// being the more specific, is asked first.
+fn checkEvolvingVarRead(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex, declared: TypeId) Error!void {
+    // The cheap type test gates the (syntactic, several-indirection) one, and
+    // this runs for every `let`/`var`/`const` identifier read: ztsc types a
+    // bare `[]` as `any[]`, so nothing but an `any[]` can be an evolving array.
+    const array_var = c.ts.kind(declared) == .array and
+        c.ts.arrayElem(declared) == types.any_type and c.isEvolvingArrayVar(sym);
     const f = c.symFlags(sym);
+    // A `const` has only the array half to answer for; the plain auto type is
+    // `let`/`var` only (`signatures.isEvolvingVar`).
+    if (f.const_decl) {
+        if (!array_var) return;
+    } else if (!array_var and !c.isEvolvingVar(sym)) return;
     // tsc's `!(getCombinedModifierFlags(declaration) & Export) && !(declaration.flags & Ambient)`:
     // neither shape gets the auto type at all (an ambient `declare var x;` is
     // plain `any`, and reports its implicit `any` at the declaration instead).
@@ -773,6 +795,16 @@ fn checkEvolvingVarRead(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex)
         .keyword_of, .keyword_in => return,
         else => {},
     }
+    if (try c.evolvingArrayStillAuto(node, sym, declared)) {
+        const aname = c.tokenText(tok);
+        try c.diagFmt(7034, c.tokSpan(c.tree.nodeMainToken(decls[0])), "Variable '{s}' implicitly has type 'any[]' in some locations where its type cannot be determined.", .{aname});
+        try c.diagFmt(7005, c.tokSpan(tok), "Variable '{s}' implicitly has an 'any[]' type.", .{aname});
+        return;
+    }
+    // An evolving ARRAY has no second question to ask: the closure-crossing
+    // rule below is the plain auto type's, and tsc's array arm is the flow
+    // type test alone. (A `const` never reaches it either — see the top.)
+    if (array_var or f.const_decl) return;
     // tsc's `isParameterOrMutableLocalVariable(symbol) && isPastLastAssignment(…)`
     // arm of the flow-container walk that precedes the check: for a MUTABLE LOCAL
     // `let` the analysis is hoisted back out to the declaration's own container,

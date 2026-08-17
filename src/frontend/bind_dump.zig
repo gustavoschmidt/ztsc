@@ -38,6 +38,7 @@ pub fn dump(
     var n_loop: usize = 0;
     var n_switch: usize = 0;
     var n_call: usize = 0;
+    var n_arraymut: usize = 0;
     for (b.flow_tags) |t| switch (t) {
         .start => n_start += 1,
         .assign => n_assign += 1,
@@ -46,11 +47,12 @@ pub fn dump(
         .loop_label => n_loop += 1,
         .switch_clause, .switch_no_match => n_switch += 1,
         .call_stmt => n_call += 1,
+        .array_mutation => n_arraymut += 1,
         .none, .unreachable_ => {},
     };
     try w.print(
-        "flow: nodes={d} attach={d} (start={d} assign={d} cond={d} branch={d} loop={d} switch={d} call={d})\n",
-        .{ b.flowCount(), b.flow_map_nodes.len, n_start, n_assign, n_cond, n_branch, n_loop, n_switch, n_call },
+        "flow: nodes={d} attach={d} (start={d} assign={d} cond={d} branch={d} loop={d} switch={d} call={d} arraymut={d})\n",
+        .{ b.flowCount(), b.flow_map_nodes.len, n_start, n_assign, n_cond, n_branch, n_loop, n_switch, n_call, n_arraymut },
     );
 
     for (b.imports) |rec| {
