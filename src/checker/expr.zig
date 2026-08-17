@@ -1292,7 +1292,23 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
                 else => {
                     // Spread of a non-array iterable (`[...set]`, `[...map]`):
                     // its element type via the `[Symbol.iterator]` protocol.
-                    const elem = (try c.iterationElementType(st)) orelse types.any_type;
+                    // A spread operand that carries NO such protocol is tsc's
+                    // TS2488, reported at the operand (its
+                    // `checkIteratedTypeOrElementType` under
+                    // `IterationUse.Spread`) — swallowing the failure into
+                    // `any` under-reported `[...new SymbolIterator]` for a
+                    // class with only `next()` (`iteratorSpreadInArray8`) and
+                    // for one whose `[Symbol.iterator]()` returns a `this`
+                    // with no `next` (`iteratorSpreadInArray10`).
+                    const elem = (try c.iterationElementType(st)) orelse blk: {
+                        if (c.ts.kind(st) != .none) {
+                            const operand = c.tree.nodeData(el).lhs;
+                            try c.diagFmt(2488, c.nodeSpan(operand), "Type '{s}' must have a '[Symbol.iterator]()' method that returns an iterator.", .{
+                                try c.typeToString(st),
+                            });
+                        }
+                        break :blk types.any_type;
+                    };
                     try elem_types.append(c.scratch(), elem);
                     try raw_types.append(c.scratch(), elem);
                     try tuple_elems.append(c.scratch(), .{ .ty = try c.ts.makeArray(elem), .flags = types.elem_flag_rest });
@@ -5154,13 +5170,38 @@ fn checkDestructuringPattern(c: *Checker, node: Node, src: TypeId) Error!void {
             for (c.tree.nodeRange(node)) |el| try checkObjectDestructuringProperty(c, el, src);
         },
         else => {
+            const iterated = try arrayPatternIteratedType(c, node, src);
             var index: u32 = 0;
             for (c.tree.nodeRange(node)) |el| {
                 defer index += 1;
-                try checkArrayDestructuringElement(c, el, src, index);
+                try checkArrayDestructuringElement(c, el, src, iterated, index);
             }
         },
     }
+}
+
+/// The element type an ARRAY destructuring-assignment pattern reads its
+/// positions through when the source carries no numeric domain of its own —
+/// tsc's `checkArrayLiteralAssignment` computes it once for the whole pattern
+/// (`checkIteratedTypeOrElementType`) and falls back to it for every element
+/// that `isArrayLikeType` did not answer.
+///
+/// A source that is neither array-like nor iterable is TS2488 at the pattern,
+/// which is the ONLY diagnostic tsc reports for `[a, b] = { 0: "", 1: true }`
+/// (`iterableArrayPattern23`/`24`). `no_type` afterwards, so the element walk
+/// stays exactly as unconstrained as tsc's `errorType` makes it.
+fn arrayPatternIteratedType(c: *Checker, pat: Node, src: TypeId) Error!TypeId {
+    if (src == types.no_type) return types.no_type;
+    const r = try c.resolveStructural(src);
+    switch (c.ts.kind(r)) {
+        .any, .err, .none => return types.any_type,
+        else => {},
+    }
+    if (try c.iterationElementType(r)) |e| return e;
+    try c.diagFmt(2488, c.nodeSpan(pat), "Type '{s}' must have a '[Symbol.iterator]()' method that returns an iterator.", .{
+        try c.typeToString(src),
+    });
+    return types.no_type;
 }
 
 /// The property an object-destructuring element names, and the token tsc
@@ -5225,17 +5266,17 @@ fn destructuringHasDefault(c: *Checker, el0: Node) bool {
     };
 }
 
-/// The element a NUMERIC destructuring position names. `no_type` when the
-/// source carries no numeric domain that can be read here: tsc falls back to
-/// the source's ITERATED type in that case, and reports TS2461/TS2488 when
-/// there is none — neither of which is done here, so an unreadable source
-/// only under-reports.
-fn destructuringElementType(c: *Checker, src: TypeId, index: u32) Error!TypeId {
+/// The element a NUMERIC destructuring position names. `iterated` is what the
+/// whole pattern's `arrayPatternIteratedType` answered: tsc reaches a position
+/// by indexed access only where `isArrayLikeType(source)` holds and otherwise
+/// hands every element that one iterated type, so a source with no numeric
+/// domain (a `Set`, a `Generator`) still types its positions.
+fn destructuringElementType(c: *Checker, src: TypeId, iterated: TypeId, index: u32) Error!TypeId {
     if (src == types.no_type) return types.no_type;
     const r = try c.resolveStructural(src);
     const rk = c.ts.kind(r);
     if (rk == .any or rk == .err) return types.any_type;
-    return (try numericIndexHit(c, r, rk, @floatFromInt(index))) orelse types.no_type;
+    return (try numericIndexHit(c, r, rk, @floatFromInt(index))) orelse iterated;
 }
 
 /// One property of an object destructuring pattern. A property KEY is a
@@ -5283,14 +5324,14 @@ fn checkObjectDestructuringProperty(c: *Checker, prop: Node, src: TypeId) Error!
 }
 
 /// One element of an array destructuring pattern, at position `index`.
-fn checkArrayDestructuringElement(c: *Checker, el: Node, src: TypeId, index: u32) Error!void {
+fn checkArrayDestructuringElement(c: *Checker, el: Node, src: TypeId, iterated: TypeId, index: u32) Error!void {
     if (el == null_node) return;
     switch (c.nodeTag(el)) {
         .omitted, .error_node, .unsupported => {},
         // `[a, ...rest] = src`: the rest is an array of the remaining
         // elements, not the element at `index`.
         .spread_element, .rest_element => try checkDestructuringTarget(c, c.tree.nodeData(el).lhs, types.no_type, .assignment),
-        else => try checkDestructuringTarget(c, el, try destructuringElementType(c, src, index), .assignment),
+        else => try checkDestructuringTarget(c, el, try destructuringElementType(c, src, iterated, index), .assignment),
     }
 }
 
