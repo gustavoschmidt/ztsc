@@ -2012,13 +2012,29 @@ fn condTrueSubstituted(c: *Checker, cond: TypeId) Error!TypeId {
     const chk = s.condCheck(cond);
     const tru = s.condTrue(cond);
     const chk_kind = s.kind(chk);
-    if (chk_kind != .type_param and chk_kind != .infer_var) return tru;
     const ext = s.condExtends(cond);
     if (ext == chk) return tru;
     switch (s.kind(ext)) {
         .any, .unknown => return tru,
         else => {},
     }
+    // The check type need not be a type VARIABLE. tsc runs every type node
+    // through `getTypeFromTypeNode` → `getConditionalFlowTypeOfType`, and
+    // `getImpliedConstraint` compares the branch's type against the CHECK
+    // NODE's type — so a true branch that IS the check type is substituted
+    // whatever kind that type is. `Extract<any[], T>` (`any[] extends T ?
+    // any[] : never`, `inlineConditionalHasSimilarAssignability`) is that
+    // shape with a concrete check: its true branch reads as `any[] & T`,
+    // which IS assignable to `T`, while the bare `any[]` is not.
+    //
+    // Answered here rather than in the type-variable path below because it
+    // needs no rewrite at all — the branch is the check type, so the
+    // substituted branch is the intersection itself.
+    if (tru == chk) {
+        const sub = try s.makeIntersection(c.scratch(), &.{ chk, ext });
+        return if (sub == chk) tru else sub;
+    }
+    if (chk_kind != .type_param and chk_kind != .infer_var) return tru;
     if (!try substitutableBranch(c, tru, 0)) return tru;
     const sub = try s.makeIntersection(c.scratch(), &.{ chk, ext });
     if (sub == chk) return tru;
