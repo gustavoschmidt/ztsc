@@ -1416,6 +1416,52 @@ fn baseCtorClassSym(c: *Checker, expr: Node, targ_count: usize) Error!?SymbolId 
     return bsym;
 }
 
+/// TS2507, the tail of tsc's `getBaseConstructorTypeOfClass`:
+/// `!isConstructorType(baseConstructorType)` — the `extends` expression names
+/// a value with nothing to construct, so there is no base at all. Reported at
+/// the expression, and `diagFmt`'s (file, code, span) dedupe makes the many
+/// callers of `baseClassRef` file it exactly once.
+///
+/// Deliberately narrow, because this arm is also where every base ztsc could
+/// NOT model lands — a mixin factory, an entity alias, an unmodeled
+/// construct — and staying silent there is the documented policy
+/// (`hasUnresolvedBase`). So the verdict is taken from the base's TYPE and
+/// only for types that are positively wrong:
+///
+///   - a PRIMITIVE (`var C = 1; class D extends C`), where nothing about
+///     ztsc's modelling is in question;
+///   - an OBJECT with no construct signature, which is what an
+///     `import C = require("./m")` namespace object is
+///     (`importAsBaseClass`).
+///
+/// `any` / `unknown` / `error` / a type parameter / a union / an intersection
+/// / a callable-but-not-constructable object all stay silent: each is either
+/// tsc's own escape hatch or a shape ztsc may be approximating.
+fn reportNonConstructorBase(c: *Checker, expr: Node) Error!void {
+    const t = try c.checkExprCached(expr, types.no_type);
+    const r = try c.resolveStructural(t);
+    switch (c.ts.kind(r)) {
+        .string,
+        .number,
+        .boolean,
+        .bigint,
+        .symbol,
+        .void,
+        .bool_true,
+        .bool_false,
+        .string_literal,
+        .number_literal,
+        .number_literal_fresh,
+        .bigint_literal,
+        => {},
+        .object => if (c.ts.objectConstructSigCount(r) != 0 or c.ts.objectCallSigCount(r) != 0) return,
+        else => return,
+    }
+    try c.diagFmt(2507, c.nodeSpan(expr), "Type '{s}' is not a constructor function type.", .{
+        try c.typeToString(t),
+    });
+}
+
 /// How many type arguments a heritage clause writes.
 fn heritageArgCount(c: *Checker, hd: ast.Data) usize {
     if (hd.rhs == 0) return 0;
@@ -1449,7 +1495,9 @@ pub fn baseClassRef(c: *Checker, sym: SymbolId) Error!?TypeId {
             if (try c.classBaseEntitySym(hd.lhs)) |bs| {
                 if (c.symFlags(bs).class) break :blk bs;
             }
-            break :blk (try baseCtorClassSym(c, hd.lhs, heritageArgCount(c, hd))) orelse return null;
+            if (try baseCtorClassSym(c, hd.lhs, heritageArgCount(c, hd))) |bs| break :blk bs;
+            try reportNonConstructorBase(c, hd.lhs);
+            return null;
         };
         var targs: std.ArrayList(TypeId) = .empty;
         defer targs.deinit(c.scratch());
