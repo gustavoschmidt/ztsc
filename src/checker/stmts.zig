@@ -46,7 +46,8 @@ const iteration = @import("iteration.zig");
 const reachability = @import("reachability.zig");
 const reserved_names = @import("reserved_names.zig");
 const static_block = @import("static_block.zig");
-const typeOfSymbol = @import("signatures.zig").typeOfSymbol;
+const signatures = @import("signatures.zig");
+const typeOfSymbol = signatures.typeOfSymbol;
 const typespace = @import("typespace.zig");
 
 // =====================================================================
@@ -751,9 +752,34 @@ fn checkFunctionDecl(c: *Checker, node: Node) Error!void {
     // Builds the signature (reports 7006 etc. once).
     _ = try c.signatureOfProto(node, d.lhs, false, true);
     if (d.rhs != 0) {
+        try checkOverloadSet(c, node);
         const sig = try c.signatureOfProto(node, d.lhs, false, true);
         try c.checkFunctionBody(node, d.lhs, d.rhs, sig, types.no_type);
     }
+}
+
+/// TS2394 for the overload set `node` implements — see
+/// `signatures.checkOverloadImplementation`. Driven from the IMPLEMENTATION so
+/// it runs once per function symbol, in source order, whichever declaration a
+/// type demand happened to reach first.
+fn checkOverloadSet(c: *Checker, node: Node) Error!void {
+    const name_tok = c.tree.extraData(ast.FnProto, c.tree.nodeData(node).lhs).name_token;
+    if (name_tok == 0) return;
+    const a = try c.atomOfToken(name_tok);
+    const local = c.bind.lookupInScope(c.cur_scope, a) orelse return;
+    const sym = c.toGlobal(local);
+    // A merged symbol's parts come from other files, which declare their own
+    // overload sets; only this file's declarations are this check's business.
+    if (c.prog.isMergedId(sym)) return;
+    var overloads: std.ArrayList(Node) = .empty;
+    defer overloads.deinit(c.scratch());
+    for (c.declsOf(sym)) |decl| {
+        if (c.nodeTag(decl) != .function_decl) continue;
+        // A second implementation is TS2393's business, not this one's.
+        if (decl != node and c.tree.nodeData(decl).rhs != 0) return;
+        if (decl != node) try overloads.append(c.scratch(), decl);
+    }
+    try signatures.checkOverloadImplementation(c, overloads.items, node);
 }
 
 /// Walk every function body postponed by `defer_bodies`, in queue order.

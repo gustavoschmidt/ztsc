@@ -1980,6 +1980,70 @@ pub const patternDefaultsProp = destructure.patternDefaultsProp;
 pub const pinBindingSym = destructure.pinBindingSym;
 pub const pinPatternParamSyms = destructure.pinPatternParamSyms;
 
+/// TS2394 — tsc's `checkFunctionOrConstructorSymbol`, overload-vs-implementation
+/// half: every overload signature of an implemented function must be one the
+/// implementation can stand in for. `overloads` are the bodiless declarations in
+/// source order, `impl_node` the one that carries the body; the FIRST
+/// incompatible overload is reported and the rest are left alone, exactly as
+/// tsc's loop `break`s.
+///
+/// Reported from the implementation's own check so it runs once per function,
+/// wherever the demand-driven `functionSymbolType` happened to build the
+/// signatures first.
+pub fn checkOverloadImplementation(c: *Checker, overloads: []const Node, impl_node: Node) Error!void {
+    if (overloads.len == 0) return;
+    const impl = try c.signatureOfProto(impl_node, c.tree.nodeData(impl_node).lhs, false, false);
+    if (c.ts.kind(impl) != .function) return;
+    for (overloads) |ov| {
+        const sig = try c.signatureOfProto(ov, c.tree.nodeData(ov).lhs, false, false);
+        if (c.ts.kind(sig) != .function) continue;
+        if (try implementationCompatible(c, impl, sig)) continue;
+        const name_tok = c.tree.extraData(ast.FnProto, c.tree.nodeData(ov).lhs).name_token;
+        const span = if (name_tok != 0) c.tokSpan(name_tok) else c.nodeSpan(ov);
+        try c.diagFmt(2394, span, "This overload signature is not compatible with its implementation signature.", .{});
+        return;
+    }
+}
+
+/// tsc's `isImplementationCompatibleWithOverload`: the return types must relate
+/// in SOME direction (or the overload's be `void`, which accepts anything), and
+/// the parameter lists must relate with the returns ignored.
+///
+/// Both signatures are erased — tsc compares `getErasedSignature` of each — and
+/// "ignore the return types" is spelled by giving the target a `void` return,
+/// which is what the relation already treats as accepting anything.
+fn implementationCompatible(c: *Checker, impl0: TypeId, ovl0: TypeId) Error!bool {
+    // `getErasedSignature` on BOTH sides first, and before the RETURN test:
+    // each declaration owns its own `T`, so `function f<T>(x: T[]): A<T>` and
+    // its identically-written implementation return two UNRELATED type
+    // variables until both are erased to `any` — and `A<T>` carrying a private
+    // member leaves no structural way back (`overloadGenericFunctionWithRest-
+    // Args`, `functionOverloadsRecursiveGenericReturnType`).
+    const impl = try c.eraseParamsToAny(impl0);
+    const ovl = try c.eraseParamsToAny(ovl0);
+    const sret = c.ts.fnReturn(impl);
+    const tret = c.ts.fnReturn(ovl);
+    if (c.ts.kind(tret) != .void and
+        !try c.isAssignable(tret, sret) and !try c.isAssignable(sret, tret)) return false;
+    return c.signatureAssignableErased(impl, try voidReturnOf(c, ovl));
+}
+
+/// `sig` with its return type replaced by `void` — the relation's stand-in for
+/// tsc's `ignoreReturnTypes` flag (see `implementationCompatible`). A predicate
+/// is dropped with the return it belongs to.
+fn voidReturnOf(c: *Checker, sig: TypeId) Error!TypeId {
+    if (c.ts.fnReturn(sig) == types.void_type) return sig;
+    const n = c.ts.fnParamCount(sig);
+    var params: std.ArrayList(types.Param) = .empty;
+    defer params.deinit(c.scratch());
+    try params.ensureTotalCapacity(c.scratch(), n);
+    for (0..n) |i| params.appendAssumeCapacity(c.ts.fnParam(sig, @intCast(i)));
+    const tps = try c.scratch().dupe(u32, c.ts.fnTypeParams(sig));
+    defer c.scratch().free(tps);
+    const flags = c.ts.fnFlags(sig) & ~types.fn_flag_predicate;
+    return c.ts.makeFunction(params.items, types.void_type, tps, flags);
+}
+
 fn functionSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
     const saved = c.enterSymFile(sym);
     defer c.restoreCtx(saved);
