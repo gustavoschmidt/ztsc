@@ -19,6 +19,7 @@
 const std = @import("std");
 
 const ast = @import("../frontend/ast.zig");
+const bind_result = @import("../frontend/bind_result.zig");
 const binder = @import("../frontend/binder.zig");
 const diagnostics = @import("../frontend/diagnostics.zig");
 const global_dup = @import("../link/global_dup.zig");
@@ -221,6 +222,45 @@ fn firstValueDecl(c: *Checker, sym: SymbolId) ?Node {
 ///   * `file`/`decl` locate the value declaration for the "is this it?" test.
 const ValueDecl = struct { sym: SymbolId, own: SymbolId, file: modules.FileId, decl: Node };
 
+/// Does tsc's symbol for this contributor still mean "a variable", after the
+/// SPLIT its binder performs and ztsc's does not?
+///
+/// ztsc's binder reports an intra-file duplicate and then keeps every
+/// declaration on ONE symbol. tsc reports the same duplicate and moves the
+/// offending declaration onto a FRESH one (`declareSymbol`'s `symbol =
+/// createSymbol(SymbolFlags.None, name)`), so from there on the name means only
+/// what the declarations AHEAD of the clash meant. It is that trimmed symbol —
+/// not the pair — that `initializeTypeChecker` folds into the other files'
+/// globals, which is why
+///
+///     var console: any;                        // lib: declare var console: Console
+///     namespace console { export var x = 2 }
+///
+/// is TS2300 at the pair *and* TS2403 on the `var` (`module_augmentExistingVariable`):
+/// the namespace is what got split off, the `var` kept the symbol, and the
+/// global merge with lib's `var` then succeeds.
+///
+/// Reversing the two reverses the verdict, measured against the oracle: with
+/// the namespace first, the `var` is what gets split off, lib's declaration
+/// joins the TS2300s, and there is no TS2403 anywhere. So the question is only
+/// ever about the FIRST declaration.
+///
+/// A meaning the `var` legally MERGES with was never split off (an
+/// uninstantiated `namespace` is tsc's `NamespaceModuleExcludes = 0`), and then
+/// `valueDeclaration` really can be something other than a declarator — so that
+/// shape is declined rather than trimmed.
+fn varSurvivedTheSplit(c: *Checker, part: SymbolId, pf: binder.SymbolFlags) bool {
+    if (!pf.var_decl) return false;
+    if (bind_result.excludesOfFlags(pf) & bind_result.fbits(.{ .var_decl = true }) == 0) return false;
+    const file = c.symFile(part);
+    const decls = c.prog.files[file].bind.declsOf(part - c.prog.sym_base[file]);
+    if (decls.len == 0) return false;
+    return switch (c.prog.files[file].tree.nodeTag(decls[0])) {
+        .declarator, .declarator_init, .declarator_full => true,
+        else => false,
+    };
+}
+
 /// Locate the symbol's value declaration, following a cross-file GLOBAL merge.
 ///
 /// A merged id folds constituents tsc sometimes keeps apart: the merged
@@ -235,30 +275,37 @@ const ValueDecl = struct { sym: SymbolId, own: SymbolId, file: modules.FileId, d
 /// Declined outright when a constituent carries a value meaning that is not a
 /// variable (a function/class/enum/namespace of the same name), because then
 /// tsc's `valueDeclaration` is that other declaration and not a declarator at
-/// all.
+/// all — UNLESS the constituent's own binder already SPLIT that meaning off;
+/// see `varSurvivedTheSplit`.
 fn firstValueDeclOf(c: *Checker, sym: SymbolId) Error!?ValueDecl {
     if (!c.prog.isMergedId(sym)) {
         const decl = firstValueDecl(c, sym) orelse return null;
         return .{ .sym = sym, .own = sym, .file = c.cur_file, .decl = decl };
     }
     const parts = c.prog.mergedSym(sym).parts;
+    const flags = try c.scratch().alloc(binder.SymbolFlags, parts.len);
+    defer c.scratch().free(flags);
+    for (parts, 0..) |p, i| {
+        if (c.symScope(p) != binder.file_scope) return null;
+        const pf = c.symFlags(p);
+        if (pf.import_binding or pf.param or pf.catch_param) return null;
+        if (pf.function or pf.class or pf.enum_decl or pf.namespace_decl) {
+            if (!varSurvivedTheSplit(c, p, pf)) return null;
+            // What tsc's symbol still means once the clashing declarations have
+            // moved to a symbol of their own: a plain variable.
+            flags[i] = .{ .var_decl = true };
+        } else {
+            flags[i] = pf;
+        }
+    }
     // A merge tsc REJECTED is not a set of subsequent declarations of one
     // variable: `mergeSymbol` reports the duplicate (`declare const a: number`
     // beside `declare const a: string` is TS2451 at both) and never goes on to
     // compare the second declaration's type against the first's.
-    {
-        const flags = try c.scratch().alloc(binder.SymbolFlags, parts.len);
-        defer c.scratch().free(flags);
-        for (parts, 0..) |p, i| flags[i] = c.symFlags(p);
-        if (global_dup.mergeClash(flags) != null) return null;
-    }
+    if (global_dup.mergeClash(flags) != null) return null;
     var found: ?ValueDecl = null;
     var own: SymbolId = 0;
     for (parts) |p| {
-        if (c.symScope(p) != binder.file_scope) return null;
-        const pf = c.symFlags(p);
-        if (pf.function or pf.class or pf.enum_decl or pf.namespace_decl or
-            pf.import_binding or pf.param or pf.catch_param) return null;
         if (c.symFile(p) == c.cur_file) own = p;
         if (found != null) continue;
         const file = c.symFile(p);
