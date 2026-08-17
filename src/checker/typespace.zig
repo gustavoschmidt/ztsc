@@ -838,7 +838,16 @@ fn nonNsFlags(f: binder.SymbolFlags) binder.SymbolFlags {
 /// Where a dotted ENTITY NAME stopped resolving: the namespace container that
 /// could not answer, the qualifier node that named it (for the message, which
 /// quotes the whole dotted path) and the segment it could not answer.
-pub const NsBreak = struct { ns: SymbolId, qualifier: Node, name_tok: TokenIndex };
+pub const NsBreak = struct {
+    ns: SymbolId,
+    qualifier: Node,
+    name_tok: TokenIndex,
+    /// The container declares the name but does not EXPORT it — the certain
+    /// half of the failure. A name the container does not declare at all is the
+    /// half a ztsc resolution gap can also produce, so a caller that is not
+    /// tsc's own `resolveEntityName` site screens on this.
+    unexported: bool,
+};
 
 /// tsc's `resolveEntityName` reports at the FIRST segment its container cannot
 /// answer, not at the last one written: `D.inner.Class1` with `inner`
@@ -864,8 +873,14 @@ pub fn nsChainBreak(c: *Checker, node: Node) Error!?NsBreak {
         .ns => |s| s,
         .module => return null,
     };
-    if (c.containerMemberSym(outer, try c.memberAtom(d.rhs)) != null) return null;
-    return .{ .ns = ns, .qualifier = d.lhs, .name_tok = d.rhs };
+    const name = try c.memberAtom(d.rhs);
+    if (c.containerMemberSym(outer, name) != null) return null;
+    return .{
+        .ns = ns,
+        .qualifier = d.lhs,
+        .name_tok = d.rhs,
+        .unexported = c.namespaceMemberSym(ns, name) != null,
+    };
 }
 
 /// The TS2694 / TS2724 pair for one `nsChainBreak`, spelled as tsc spells it:
@@ -904,18 +919,26 @@ pub fn checkImportEqualsEntity(c: *Checker, entity: Node, exported: bool) Error!
     }
     if (c.nodeTag(root) != .identifier) return;
     const tok = c.tree.nodeMainToken(root);
+    // A literal or a reserved word where the entity should be is a PARSE
+    // error (`import n = 5`, `import q = null`), not a name to resolve.
+    if (c.tree.tokens.tag(tok) != .identifier) return;
+    // `globalThis` is in scope everywhere and has no declaration to find.
+    if (std.mem.eql(u8, c.tokenText(tok), "globalThis")) return;
     const a = try c.atomOfToken(tok);
-    // A root that names NOTHING, in any space, is the plain not-found pair —
-    // the one thing the generic recovery walk this replaces used to report.
+    // A root that names NOTHING, in any space. tsc's `resolveEntityName` here
+    // carries `SymbolFlags.Namespace`, so the message is "Cannot find
+    // namespace" (TS2503/TS2833) and not the TS2304 an expression-position
+    // identifier would earn — oracle-verified for both the dotted and the bare
+    // form of the right-hand side.
     const root_sym: SymbolId = switch (c.resolveNamespaceSpace(a, c.cur_scope)) {
         .sym => |s| s,
         else => {
             if (c.resolveSpace(a, c.cur_scope, true) != .none) return;
             if (c.resolveSpace(a, c.cur_scope, false) != .none) return;
-            if (c.suggestName(a, c.cur_scope, true)) |sugg| {
-                try c.diagFmt(2552, c.tokSpan(tok), "Cannot find name '{s}'. Did you mean '{s}'?", .{ c.tokenText(tok), c.atomText(sugg) });
+            if (c.suggestName(a, c.cur_scope, false)) |sugg| {
+                try c.diagFmt(2833, c.tokSpan(tok), "Cannot find namespace '{s}'. Did you mean '{s}'?", .{ c.tokenText(tok), c.atomText(sugg) });
             } else {
-                try c.reportNameNotFound(tok);
+                try c.diagFmt(2503, c.tokSpan(tok), "Cannot find namespace '{s}'.", .{c.tokenText(tok)});
             }
             return;
         },
@@ -930,7 +953,16 @@ pub fn checkImportEqualsEntity(c: *Checker, entity: Node, exported: bool) Error!
 fn reportBadNsQualifier(c: *Checker, node: Node, member_tok: TokenIndex) Error!bool {
     // A qualifier whose own chain broke earlier reports there, not at its
     // leftmost identifier: `D.inner.Class1` blames `inner`.
+    //
+    // Only the DECLARED-BUT-UNEXPORTED half is certain enough to report from a
+    // type name. A name the container does not declare at all can equally mean
+    // ztsc resolved the wrong container — sibling `namespace X.A.B.C` blocks
+    // share one members scope here where tsc keeps their locals apart, so
+    // `implements A.C.Z` next to a local `namespace A {}` finds the local one
+    // (`declFileWithInternalModuleNameConflictsInExtendsClause2`) — and the
+    // documented policy for a resolution gap is silence.
     if (try nsChainBreak(c, node)) |b| {
+        if (!b.unexported) return false;
         try reportNsChainBreak(c, b);
         return true;
     }

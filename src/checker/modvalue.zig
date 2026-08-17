@@ -11,12 +11,15 @@
 //! `prog.globals` table, on demand.
 
 const std = @import("std");
+const ast = @import("../frontend/ast.zig");
 const binder = @import("../frontend/binder.zig");
 const intern = @import("../intern.zig");
 const modules = @import("../link/modules.zig");
 const types = @import("../types.zig");
 
 const Atom = intern.Atom;
+const Node = ast.Node;
+const null_node = ast.null_node;
 const SymbolId = binder.SymbolId;
 const TypeId = types.TypeId;
 
@@ -75,34 +78,62 @@ fn uninstantiatedPart(c: *const Checker, sym: SymbolId) bool {
     if (!f.namespace_decl or !f.ns_uninstantiated) return false;
     if (f.var_decl or f.let_decl or f.const_decl or f.function or f.class or
         f.param or f.catch_param or f.enum_decl or f.enum_member or f.import_binding) return false;
-    return !exportsAnAlias(c, sym, 8);
+    const tree = c.prog.files[c.symFile(sym)].tree;
+    for (c.declsOf(sym)) |decl| {
+        if (tree.nodeTag(decl) != .namespace_decl) continue;
+        if (!nonInstantiatedBlock(tree, decl, 16)) return false;
+    }
+    return true;
 }
 
-/// The one instantiating shape `ns_uninstantiated` misses. tsc's
-/// `getModuleInstanceStateWorker` returns `NonInstantiated` for an import
-/// declaration only when it is NOT exported, so `namespace C { export import a
-/// = A }` does emit a runtime object — but the parser records that `export` as
-/// a FLAG on the import node instead of as an `export` wrapper, and the
-/// binder's syntactic walk only unwraps the wrapper.
+/// tsc's `getModuleInstanceState(node) === NonInstantiated`, which is what
+/// decides whether the binder gives a `namespace` symbol `NamespaceModule` (no
+/// value meaning, so TS2708 at a value use) or `ValueModule`.
 ///
-/// Asked of the symbol table rather than the syntax, and only of a namespace
-/// the flag has already called type-only, so the walk is paid on the handful of
-/// namespaces whose verdict it can change (`exportImportAlias`: `namespace C {
-/// export import a = A }`, read as `C.a.x`). `depth` bounds the nested-block
-/// recursion; a scope tree cannot cycle, so it is only belt and braces.
-fn exportsAnAlias(c: *const Checker, ns: SymbolId, depth: u8) bool {
-    if (depth == 0) return true; // "cannot tell" ⇒ stay silent
-    const nb = c.symBind(ns);
-    const scope = nb.namespaceScopeOf(c.localOf(ns)) orelse return false;
-    const file = c.symFile(ns);
-    for (nb.member_syms[nb.scope_members_start[scope]..nb.scope_members_start[scope + 1]]) |s| {
-        const f = nb.symbol_flags[s];
-        if (!f.exported) continue;
-        if (f.import_binding) return true;
-        if (f.namespace_decl and f.ns_uninstantiated and
-            exportsAnAlias(c, c.toGlobalIn(file, s), depth - 1)) return true;
+/// NOT `binder.instantiated`, which answers the neighbouring question "does
+/// this block EMIT a runtime object with `preserveConstEnums` off" for the
+/// declaration-merge rule. The two disagree on exactly the shapes this one has
+/// to get right:
+///
+///   * a `const enum` body is `ConstEnumOnly`, not `NonInstantiated`, so the
+///     namespace keeps its value meaning (`constEnums`: `A.B.C.E.V1` is silent
+///     while the binder calls every block of `A` type-only);
+///   * an `export`ed import alias is `Instantiated` outright — tsc returns
+///     `NonInstantiated` for an import only when it is NOT exported
+///     (`exportImportAlias`: `namespace C { export import a = A }` read as
+///     `C.a.x`). The binder's walk cannot see that `export`, which the parser
+///     records as a FLAG on the import node rather than as an `export` wrapper.
+///
+/// Reached only after `ns_uninstantiated` — true wherever tsc's
+/// `NonInstantiated` is — has already screened the name, so the walk is paid on
+/// the handful of namespaces whose verdict it can change.
+fn nonInstantiatedBlock(tree: *const ast.Ast, node: Node, depth: u8) bool {
+    if (depth == 0) return false; // "cannot tell" ⇒ keep the value meaning
+    const data = tree.extraData(ast.NamespaceData, tree.nodeData(node).lhs);
+    for (tree.extraRange(data.body_start, data.body_end)) |raw| {
+        if (raw == null_node) continue;
+        // `export interface I {}` is an InterfaceDeclaration for tsc; the
+        // modifier is not a node of its own there.
+        var stmt = raw;
+        while (tree.nodeTag(stmt) == .export_decl) {
+            stmt = tree.nodeData(stmt).lhs;
+            if (stmt == null_node) return false;
+        }
+        switch (tree.nodeTag(stmt)) {
+            .interface_decl, .type_alias => {},
+            .import_decl => {
+                const e = tree.extraData(ast.ImportData, tree.nodeData(stmt).lhs);
+                if (e.flags & ast.Flags.exported != 0) return false;
+            },
+            .import_equals => {
+                const e = tree.extraData(ast.ImportEquals, tree.nodeData(stmt).lhs);
+                if (e.flags & ast.Flags.exported != 0) return false;
+            },
+            .namespace_decl => if (!nonInstantiatedBlock(tree, stmt, depth - 1)) return false,
+            else => return false,
+        }
     }
-    return false;
+    return true;
 }
 
 /// Value type of an import binding, via the sealed link tables.

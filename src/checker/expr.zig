@@ -2873,6 +2873,15 @@ fn memberChainInner(c: *Checker, node: Node, ctx: TypeId) Error!ChainLink {
         try accessibility.checkSuperField(c, name, name_tok);
     }
     var pt = try propertyTypeOf(c, obj_t, name, name_tok, site);
+    // A `#name` is resolved lexically before it is looked up, so an access
+    // from outside the declaring class is TS18013 even though the member
+    // table answered (`accessibility.checkPrivateName`). Asked only once the
+    // lookup HAS answered: a `#name` no type carries keeps its TS2339.
+    if (c.tree.tokens.tag(name_tok) == .private_identifier and pt != types.error_type) {
+        if (try accessibility.checkPrivateName(c, obj_t, name, name_tok, site)) {
+            return .{ .ty = types.error_type, .chained = chained };
+        }
+    }
     // tsc's `getNarrowableTypeForReference`, the property-access arm: this
     // access is itself a reference, so a union-constrained type variable it
     // reads enters the flow walk as its constraint (see `narrowable.zig`).
@@ -4745,7 +4754,13 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
             if (c.nodeTag(d.lhs) == .super_expr) try accessibility.checkSuperField(c, name, d.rhs);
             const r = try c.resolveStructural(obj_t);
             if (try c.propOfType(r, name)) |p| {
-                if (p.nonPublic()) try accessibility.check(c, obj_t, name, d.rhs, .{ .dir = .write, .recv_node = d.lhs });
+                const wsite: accessibility.Site = .{ .dir = .write, .recv_node = d.lhs };
+                // A `#name` write from outside the declaring class is the same
+                // TS18013 the read is (`Base.#prop = 10` in a derived class).
+                if (c.tree.tokens.tag(d.rhs) == .private_identifier) {
+                    if (try accessibility.checkPrivateName(c, obj_t, name, d.rhs, wsite)) return types.error_type;
+                }
+                if (p.nonPublic()) try accessibility.check(c, obj_t, name, d.rhs, wsite);
                 // A readonly property may be assigned via `this.x` inside the
                 // constructor of the class that OWNS the declaration (tsc:
                 // `checkReferenceExpression`). An inherited readonly still
