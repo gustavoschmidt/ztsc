@@ -117,6 +117,46 @@ fn reportSuperInName(c: *Checker, node: Node, depth: u16) Error!void {
     while (it.next()) |child| try reportSuperInName(c, child, depth + 1);
 }
 
+/// TS2465: a `this` reference written inside a CLASS member's computed name.
+///
+/// tsc's `getThisContainer` treats a computed property name as a `this`
+/// container when — and only when — its grandparent is class-like, precisely so
+/// that `checkThisExpression` can report this. An object literal's computed name
+/// is NOT one: the walk steps over it to the literal's own parent, so
+/// `var o = { [this.x]: 1 }` at top level is the file's `this` and silent. That
+/// asymmetry is why the walk below is entered from the class-member side.
+///
+/// The stop list is the set of nodes that ARE `this` containers, so a `this`
+/// under one of them never reaches the name. An ARROW is deliberately absent:
+/// `getThisContainer(includeArrowFunctions: false)` skips arrows, so a `this`
+/// inside one in a class computed name still belongs to the name.
+///
+/// Nesting is transparent the other way too, which is the shape
+/// `computedPropertyNames23` tests: the inner name of
+/// `[ { [this.bar()]: 1 }[0] ]() {}` is an object literal's, so the `this`
+/// walks past it to the OUTER, class-owned name and reports once.
+fn reportThisInName(c: *Checker, node: Node, depth: u16) Error!void {
+    if (node == null_node or depth > max_name_depth) return;
+    switch (c.nodeTag(node)) {
+        .this_expr => return c.diagFmt(
+            2465,
+            c.nodeSpan(node),
+            "'this' cannot be referenced in a computed property name.",
+            .{},
+        ),
+        .function_expr,
+        .function_decl,
+        .class_decl,
+        .class_method,
+        .object_method,
+        .class_field,
+        => return,
+        else => {},
+    }
+    var it = c.tree.childIterator(node);
+    while (it.next()) |child| try reportThisInName(c, child, depth + 1);
+}
+
 /// Far above any hand-written key expression; the cap only ever under-reports.
 const max_name_depth: u16 = 200;
 
@@ -156,6 +196,10 @@ pub fn checkMemberNames(c: *Checker, members: []const Node, home: Home) Error!vo
         if (c.node_types.contains(c.nodeKey(c.tree.nodeData(key).lhs))) continue;
         // Only a non-ambient class FIELD's name is a use that can be too early.
         c.defer_computed_key_tdz = home != .class_body or c.nodeTag(m) != .class_field;
+        // TS2465 is asked from HERE rather than from `checkComputedName`
+        // because it is the owner, not the name, that decides it: only a
+        // class-like grandparent makes a computed name a `this` container.
+        if (home != .type_space) try reportThisInName(c, c.tree.nodeData(key).lhs, 0);
         _ = try checkComputedName(c, key);
     }
 }
