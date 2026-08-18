@@ -175,10 +175,19 @@ pub fn switchIsExhaustive(c: *Checker, node: Node) bool {
         ((c.enumMemberTypeUnion(c.ts.enumSymbol(disc_t1), 0) catch return false) orelse return false)
     else
         disc_t1;
-    if (c.ts.kind(disc_t) != .union_type) return false;
+    // tsc's `eachTypeContainedIn(mapType(type, getRegularTypeOfLiteralType),
+    // switchTypes)` runs over the discriminant's CONSTITUENTS, and `mapType`
+    // over a non-union is the type itself — so a singleton literal
+    // discriminant (`const k: "a" = "a"`, or a parameter already narrowed to
+    // one member) is exhaustive as soon as its one case is present. Requiring
+    // a union here left such a switch non-terminal, and the code after it
+    // reachable, which is what reported a phantom TS2454 on a variable the
+    // switch had definitely assigned.
+    const disc_parts = if (c.ts.kind(disc_t) == .union_type) c.ts.memberCount(disc_t) else 1;
     const r = c.tree.extraData(ast.SubRange, d.rhs);
-    for (0..c.ts.memberCount(disc_t)) |mi| {
-        const rm = c.ts.regularLiteral(c.ts.memberAt(disc_t, mi)) catch return false;
+    for (0..disc_parts) |mi| {
+        const part = if (c.ts.kind(disc_t) == .union_type) c.ts.memberAt(disc_t, mi) else disc_t;
+        const rm = c.ts.regularLiteral(part) catch return false;
         if (!c.ts.isLiteralLike(rm) and
             c.ts.kind(rm) != .null and c.ts.kind(rm) != .undefined) return false;
         var covered = false;

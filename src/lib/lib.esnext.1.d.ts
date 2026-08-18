@@ -2242,6 +2242,21 @@ interface Map<K, V> {
     readonly size: number;
 }
 
+// NOTE (ztsc): the `iterable` construct overloads that tsc declares further
+// down (in lib.es2015.iterable.d.ts) are relocated *above* the `entries`
+// overloads declared here. tsc's `reorderCandidates` groups a call's
+// candidate signatures by declaring interface DECLARATION and splices each
+// new group in at the FRONT, so a merged interface resolves its LAST
+// declaration's overloads FIRST — `new Map(42)` reports against
+// `readonly (readonly [unknown, unknown])[]`, the collection overload.
+// ztsc applies that regrouping to CALL signatures only, so for the
+// Map/Set/WeakMap/WeakSet construct signatures the order is spelled out
+// here instead. Same relocation as the `Promise.all`/`race` note below.
+interface MapConstructor {
+    new (): Map<any, any>;
+    new <K, V>(iterable?: Iterable<readonly [K, V]> | null): Map<K, V>;
+}
+
 interface MapConstructor {
     new (): Map<any, any>;
     new <K, V>(entries?: readonly (readonly [K, V])[] | null): Map<K, V>;
@@ -2275,6 +2290,11 @@ interface WeakMap<K extends WeakKey, V> {
      * @param key Must be an object or symbol.
      */
     set(key: K, value: V): this;
+}
+
+// NOTE (ztsc): relocated from lib.es2015.iterable.d.ts — see MapConstructor.
+interface WeakMapConstructor {
+    new <K extends WeakKey = WeakKey, V = any>(iterable?: Iterable<readonly [K, V]> | null): WeakMap<K, V>;
 }
 
 interface WeakMapConstructor {
@@ -2346,6 +2366,11 @@ interface WeakSet<T extends WeakKey> {
      * @returns a boolean indicating whether a value exists in the WeakSet or not.
      */
     has(value: T): boolean;
+}
+
+// NOTE (ztsc): relocated from lib.es2015.iterable.d.ts — see MapConstructor.
+interface WeakSetConstructor {
+    new <T extends WeakKey = WeakKey>(iterable: Iterable<T>): WeakSet<T>;
 }
 
 interface WeakSetConstructor {
@@ -2579,16 +2604,11 @@ interface ReadonlyMap<K, V> {
     values(): MapIterator<V>;
 }
 
-interface MapConstructor {
-    new (): Map<any, any>;
-    new <K, V>(iterable?: Iterable<readonly [K, V]> | null): Map<K, V>;
-}
+// NOTE (ztsc): the `MapConstructor` / `WeakMapConstructor` construct
+// overloads tsc declares here are relocated *above* lib.es2015.collection's
+// — see the note there.
 
 interface WeakMap<K extends WeakKey, V> {}
-
-interface WeakMapConstructor {
-    new <K extends WeakKey = WeakKey, V = any>(iterable?: Iterable<readonly [K, V]> | null): WeakMap<K, V>;
-}
 
 interface SetIterator<T> extends IteratorObject<T, BuiltinIteratorReturn, unknown> {
     [Symbol.iterator](): SetIterator<T>;
@@ -2634,15 +2654,22 @@ interface ReadonlySet<T> {
     values(): SetIterator<T>;
 }
 
+// NOTE (ztsc): the `WeakSetConstructor` construct overload tsc declares here
+// is relocated *above* lib.es2015.collection's — see the note there.
+//
+// `SetConstructor`'s is NOT: `new Set(["a", "b"])` under a contextual
+// `Set<"a" | "b">` infers `T` through `Iterable<T>` rather than through
+// `readonly T[]`, and ztsc widens the array literal's element to `string`
+// on that path (tsc's `getCovariantInference` does not, because `T` is at
+// top level in the return type). Reordering would trade a wrong
+// last-overload MESSAGE for a wrong TYPE, so it stays in tsc's file order
+// until the inference path is fixed. Oracle-verified on excalidraw's
+// `bindingProperties: Set<BindableProp | BindingProp> = new Set([…])`.
 interface SetConstructor {
     new <T>(iterable?: Iterable<T> | null): Set<T>;
 }
 
 interface WeakSet<T extends WeakKey> {}
-
-interface WeakSetConstructor {
-    new <T extends WeakKey = WeakKey>(iterable: Iterable<T>): WeakSet<T>;
-}
 
 interface Promise<T> {}
 

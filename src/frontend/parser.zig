@@ -7397,6 +7397,7 @@ const Parser = struct {
             .initializer = false,
             .parameter_type = false,
             .parameter_type_indexable = false,
+            .parameter_type_bad_key = false,
             .value_type = false,
         };
         // Only the FIRST parameter is described: every rule past the count
@@ -7419,12 +7420,31 @@ const Parser = struct {
             // resolved. One token exactly, so `string[]` and `string | number`
             // do not qualify.
             var indexable = false;
+            var bad_key = false;
             if (try p.eat(.colon) != null) {
                 const key_kw = p.curTag();
                 const before = p.curIdx();
                 ty = try p.parseType();
-                indexable = p.curIdx() == before + 1 and
-                    (key_kw == .keyword_string or key_kw == .keyword_number or key_kw == .keyword_symbol);
+                if (p.curIdx() == before + 1) {
+                    indexable = key_kw == .keyword_string or key_kw == .keyword_number or
+                        key_kw == .keyword_symbol;
+                    // …and the keywords `isValidIndexKeyType` provably rejects
+                    // (TS1268). `true`/`false` are left out: a literal type is
+                    // TS1337, which comes first and is not modelled.
+                    bad_key = switch (key_kw) {
+                        .keyword_any,
+                        .keyword_boolean,
+                        .keyword_void,
+                        .keyword_unknown,
+                        .keyword_never,
+                        .keyword_object,
+                        .keyword_bigint,
+                        .keyword_undefined,
+                        .keyword_null,
+                        => true,
+                        else => false,
+                    };
+                }
             }
             var initializer = false;
             if (try p.eat(.eq) != null) {
@@ -7439,6 +7459,7 @@ const Parser = struct {
                 shape.initializer = initializer;
                 shape.parameter_type = ty != null_node;
                 shape.parameter_type_indexable = indexable;
+                shape.parameter_type_bad_key = bad_key;
                 key_type = ty;
             }
             shape.parameters += 1;

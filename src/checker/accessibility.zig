@@ -164,11 +164,16 @@ pub fn check(c: *Checker, recv: TypeId, name: Atom, name_tok: TokenIndex, site: 
 /// concerned: it is resolved LEXICALLY first (`lookupSymbolForPrivateIdentifier
 /// Declaration` — the enclosing class chain, which a nested function inside the
 /// class body is still part of), and only a member the enclosing class declares
-/// can be read at all. So an access from outside that class splits three ways:
+/// can be read at all. So an access splits three ways:
 ///
-///   * the receiver's type HAS a `#name` member → TS18013, naming the class
-///     that declares it (`new A2().#method()`);
-///   * it does not → nothing here, and the ordinary missing-property TS2339
+///   * no enclosing class declares `#name` and the receiver's type HAS one →
+///     TS18013, naming the class that declares it (`new A2().#method()`);
+///   * an enclosing class declares `#name` AND the receiver's `#name` belongs
+///     to a class that textually ENCLOSES that one → TS18014, the shadowing
+///     case: the inner `#name` hides the outer one, so the outer member is
+///     unreachable by that spelling however the receiver is typed
+///     (`privateNamesInNestedClasses-1`);
+///   * neither → nothing here, and the ordinary missing-property TS2339
 ///     stands.
 ///
 /// A STATIC `#name` is where "has it" and "inherits it" part company: tsc puts
@@ -192,17 +197,63 @@ pub fn check(c: *Checker, recv: TypeId, name: Atom, name_tok: TokenIndex, site: 
 /// COST: one token-tag test at the call site, so a program with no `#name`
 /// access pays nothing.
 pub fn checkPrivateName(c: *Checker, recv: TypeId, name: Atom, name_tok: TokenIndex, site: Site) Error!bool {
-    // Declared by an enclosing class: the ordinary lookup is the answer.
-    // (A DIFFERENT class's `#name` on the receiver is tsc's TS18014 shadowing
-    // case, which ztsc leaves silent.)
-    if (names.resolvePrivateName(c, name, c.cur_scope) == .member) return false;
+    const lexical: ?SymbolId = switch (names.resolvePrivateName(c, name, c.cur_scope)) {
+        .member => |m| m,
+        else => null,
+    };
     const owner = try declaringClass(c, recv, name, site) orelse return false;
     if (owner.statics and
         (c.ts.kind(owner.recv) != .ref or c.ts.refSymbol(owner.recv) != owner.cls)) return false;
+    if (lexical) |lex| {
+        // An enclosing class declares the spelling, so the ordinary lookup is
+        // the answer — UNLESS the receiver's `#name` is a different member of
+        // a class that ENCLOSES the one that declared it. tsc names the type,
+        // not the class (`typeToString(leftType)`), and names it BEFORE the
+        // `this`/class-value hops `declaringClass` makes, so `A.#x` reads
+        // `typeof A`.
+        if (!shadowsEnclosingClass(c, lex, owner.cls)) return false;
+        try c.diagFmt(18014, c.tokSpan(name_tok), "The property '{s}' cannot be accessed on type '{s}' within this class because it is shadowed by another private identifier with the same spelling.", .{
+            c.atomText(name), try c.typeToString(recv),
+        });
+        return true;
+    }
     try c.diagFmt(18013, c.tokSpan(name_tok), "Property '{s}' is not accessible outside class '{s}' because it has a private identifier.", .{
         c.atomText(name), try declaringClassName(c, owner.cls),
     });
     return true;
+}
+
+/// tsc's `findAncestor(lexicalClass, n => typeClass === n)`, the test that
+/// separates TS18014 from TS18013: is the class that declares the RECEIVER's
+/// `#name` the same as, or an ancestor of, the class whose `#name` the
+/// spelling resolved to lexically?
+///
+/// "Same" answers false here rather than true: a receiver whose `#name` is the
+/// very member the spelling resolved to is not shadowed at all, and tsc never
+/// reaches `checkPrivateIdentifierPropertyAccess` for it
+/// (`getPrivateIdentifierPropertyOfType` finds the property and the access
+/// succeeds).
+///
+/// The ancestry is read off the SCOPE chain — a class's member table hangs off
+/// the class node (`binder.bindClass`), and scope parents are the lexical
+/// nesting — so no AST parent pointers are needed. A receiver class from
+/// another file can enclose nothing in this one and is refused outright.
+fn shadowsEnclosingClass(c: *Checker, lex_member: SymbolId, type_cls: SymbolId) bool {
+    if (c.symFile(type_cls) != c.cur_file) return false;
+    const decls = c.declsOf(type_cls);
+    if (decls.len == 0) return false;
+    const type_node = decls[0];
+    // `resolvePrivateName` answers with a LOCAL symbol of the current file, so
+    // it indexes the binder's tables directly.
+    var s: ScopeId = c.bind.symbol_scopes[lex_member];
+    // A member table hangs off its class NODE, so the walk's first owner is the
+    // lexical class itself — the same-class case, which is not shadowing.
+    if (c.bind.scope_owners[s] == type_node) return false;
+    while (s != binder.file_scope) {
+        s = c.bind.scope_parents[s];
+        if (c.bind.scope_owners[s] == type_node) return true;
+    }
+    return false;
 }
 
 /// TS2855 at a `super.x` access: a class FIELD the base class declares is not

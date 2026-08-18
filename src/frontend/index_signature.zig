@@ -53,6 +53,14 @@ pub const Shape = struct {
     /// (TS1021) stay silent rather than answer where tsc would have said TS1268:
     /// `[a: boolean]` and `[index: RegExp]` are TS1268 in tsgo, measured.
     parameter_type_indexable: bool,
+    /// The other side of the same question: whether the annotation is PROVABLY
+    /// an illegal index key type — a bare `boolean`/`any`/`void`/`unknown`/
+    /// `never`/`object`/`bigint`/`undefined`/`null` keyword, none of which
+    /// `isValidIndexKeyType` accepts and none of which needs resolving to
+    /// recognize. The two flags are not complements: an annotation this cannot
+    /// vouch for either way (`RegExp`, `string[]`, an alias) sets neither, and
+    /// stays the under-report it already was.
+    parameter_type_bad_key: bool,
     /// Whether a `: T` followed the `]`.
     value_type: bool,
 };
@@ -126,12 +134,17 @@ fn chainOf(s: Shape) ?Report {
     }
     // TS1337 ("cannot be a literal type or generic type") and TS1268 ("must be
     // 'string', 'number', 'symbol', or a template literal type") go HERE, ahead
-    // of the value-type check, and both need the parameter type RESOLVED. So the
-    // last arm only fires for a parameter type that provably passes them; every
-    // other spelling is an under-report rather than a wrong key. Getting this
-    // order wrong is what the s2 sweep caught: `[a: boolean]`, `[index: any]`
-    // and `[index: RegExp]` have no value type either, and tsgo answers TS1268
-    // for all three.
+    // of the value-type check, and both need the parameter type RESOLVED — so
+    // only the spellings that need no resolution are answered: a bare non-key
+    // KEYWORD is TS1268 (`[a: boolean]`, `[index: any]`), a bare
+    // `string`/`number`/`symbol` clears both and reaches the value-type arm,
+    // and everything in between (`RegExp`, `string[]`, an alias) stays an
+    // under-report rather than a wrong key. Getting this order wrong is what
+    // the s2 sweep caught: `[a: boolean]` and `[index: any]` have no value type
+    // either, and tsgo still answers TS1268 for both.
+    if (s.parameter_type_bad_key) {
+        return .{ .code = .index_sig_key_type, .token = s.name_token.? };
+    }
     if (!s.parameter_type_indexable) return null;
     if (!s.value_type) return .{ .code = .index_sig_type_annotation, .token = s.bracket_token };
     return null;
@@ -241,6 +254,7 @@ const ok: Shape = .{
     .initializer = false,
     .parameter_type = true,
     .parameter_type_indexable = true,
+    .parameter_type_bad_key = false,
     .value_type = true,
 };
 
@@ -380,8 +394,10 @@ test "every signature of a duplicated key domain is reported, and only those" {
     try t.expect(!duplicateKey(&aliased, 1));
 }
 
-test "no value type, but a key type TS1268 would have caught first, stays silent" {
-    // `interface I { [a: boolean] }` is TS1268 in tsgo, not TS1021.
+test "an unvouched-for key type answers nothing, in place of the TS1268 tsc resolves" {
+    // `interface I { [a: RegExp] }` is TS1268 in tsgo; ztsc cannot resolve
+    // `RegExp`, so it under-reports rather than answering TS1021 for the
+    // missing value type — the arm TS1268 sits in front of.
     var s = ok;
     s.value_type = false;
     s.parameter_type_indexable = false;
@@ -395,4 +411,24 @@ test "no value type, but a key type TS1268 would have caught first, stays silent
     s.parameter_type_indexable = false;
     s.question = 23;
     try std.testing.expectEqual(Code.index_sig_question_mark, check(s).chain.?.code);
+}
+
+test "a provably illegal key type is TS1268, on the name, ahead of TS1021" {
+    // `interface I { [a: boolean] }` — tsgo reports TS1268 and not the TS1021
+    // the missing value type would otherwise earn.
+    var s = ok;
+    s.value_type = false;
+    s.parameter_type_indexable = false;
+    s.parameter_type_bad_key = true;
+    const r = check(s).chain.?;
+    try std.testing.expectEqual(Code.index_sig_key_type, r.code);
+    try std.testing.expectEqual(@as(u32, 11), r.token); // the parameter NAME
+    // A value type changes nothing: the key is still wrong.
+    s = ok;
+    s.parameter_type_indexable = false;
+    s.parameter_type_bad_key = true;
+    try std.testing.expectEqual(Code.index_sig_key_type, check(s).chain.?.code);
+    // Everything ahead of it in the chain still outranks it.
+    s.initializer = true;
+    try std.testing.expectEqual(Code.index_sig_initializer, check(s).chain.?.code);
 }

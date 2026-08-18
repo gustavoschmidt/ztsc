@@ -149,6 +149,45 @@ pub fn flowTypeOfReference(c: *Checker, node: Node, sym: SymbolId, declared: Typ
     {
         return c.flowTypeOfKey(node, .{ .sym = sym }, try c.ts.makeEvolvingArray(types.never_type));
     }
+    // The plain `autoType`'s half of the same story. `checkIdentifier` hands
+    // `getFlowTypeOfReference` an `initialType` of `undefinedType` — NOT the
+    // declared type — whenever the declared type is the auto type (`var x;` /
+    // `let x;`, no annotation, no initializer bar `null`/`undefined`),
+    // because such a variable holds `undefined` until an assignment writes
+    // it. So `var a; foo(a)` passes `undefined`, and
+    // `constraintSatisfactionWithAny.ts`'s six TS2345s are that one
+    // substitution. The auto type is never "used before being assigned":
+    // tsc's TS2454 arm is the `else` of the auto-type arm.
+    //
+    // Only for a reference in the declaration's OWN control-flow container.
+    // tsc's `isOuterVariable` forces `assumeInitialized`, and an
+    // "initialized" auto variable starts from the auto type itself — which is
+    // why `function f() { var a; const g = () => a; }` reads `any` (and
+    // reports TS7005, see `expr.checkEvolvingVarRead`) rather than
+    // `undefined`. A same-container walk never reaches the closure-crossing
+    // arm of `flowTypeInner`'s `.start`, so testing the containers once here
+    // is the whole of the distinction.
+    //
+    // Restricted further, to a variable NOTHING in the file ever writes. That
+    // is the sub-case where "the flow answers `undefined`" needs no flow walk
+    // to be true, and it is deliberately narrower than tsc: a variable that IS
+    // written somewhere reads `undefined` only on the paths that miss the
+    // write, and ztsc's answer for those paths — the auto type itself — is an
+    // under-report rather than an invention. The narrower rule is what keeps
+    // the substitution out of the two shapes where the surrounding checker is
+    // not yet ready for a real type in place of `any`: an assignment TARGET
+    // (`for ([{ ...y }] of …)`, tsc's own `isSpreadDestructuringAssignment-
+    // Target` exemption), and a `{ …, k: v, ...maybeUndefined }` whose later
+    // spread makes `k` non-excess in tsc (`shouldCheckAsExcessProperty`) but
+    // not yet in ztsc.
+    if (declared == types.any_type and c.isEvolvingVar(sym) and
+        c.containerOf(c.bind.symbol_scopes[c.localOf(sym)]) == c.containerOf(c.cur_scope))
+    {
+        try c.ensureReassignScan();
+        if (!c.reassigned_syms.contains(sym) and !c.definitely_assigned_syms.contains(sym)) {
+            return c.flowTypeOfKey(node, .{ .sym = sym }, types.undefined_type);
+        }
+    }
     return c.flowTypeOfKey(node, .{ .sym = sym }, declared);
 }
 
