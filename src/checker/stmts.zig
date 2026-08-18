@@ -2082,8 +2082,6 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
     // A concrete class must implement inherited abstract members.
     if (class_sym != binder.no_symbol) try c.checkAbstractImplementation(class_sym, node);
 
-    const class_is_abstract = data.flags & ast.Flags.abstract != 0;
-
     // `strictPropertyInitialization` (implied by `strict`, and ztsc runs no
     // other mode) checks every instance property for a definite assignment.
     // tsc skips the whole check inside an AMBIENT class — a `declare class`, or
@@ -2128,9 +2126,6 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
             .class_field => {
                 const e = c.tree.extraData(ast.Field, md.lhs);
                 const is_static = e.flags & ast.Flags.static != 0;
-                if (e.flags & ast.Flags.abstract != 0 and !class_is_abstract) {
-                    try c.diagFmt(1244, c.tokSpan(c.tree.nodeMainToken(member)), "Abstract properties can only appear within an abstract class.", .{});
-                }
                 c.this_type = if (is_static and class_sym != binder.no_symbol)
                     try c.ts.makeClassValue(class_sym)
                 else
@@ -2187,10 +2182,12 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
                 const proto = c.tree.extraData(ast.FnProto, md.lhs);
                 const is_static = proto.flags & ast.Flags.static != 0;
                 const is_abstract = proto.flags & ast.Flags.abstract != 0;
-                if (is_abstract and !class_is_abstract) {
-                    try c.diagFmt(1244, c.tokSpan(c.tree.nodeMainToken(member)), "Abstract methods can only appear within an abstract class.", .{});
-                }
-                if (is_abstract and md.rhs != 0) {
+                // Where `abstract` may SIT is the parser's
+                // `modifier_order.zig` (TS1242/TS1244/TS1253, blamed on the
+                // modifier). What is left here is the rule about the member's
+                // BODY, which tsc words for a MethodDeclaration only: an
+                // `abstract constructor() {}` is the TS1242 alone.
+                if (is_abstract and md.rhs != 0 and !c.isCtorMember(member, proto.flags)) {
                     try c.diagFmt(1245, c.tokSpan(c.tree.nodeMainToken(member)), "Method '{s}' cannot have an implementation because it is marked abstract.", .{c.tokenText(c.tree.nodeMainToken(member))});
                 }
                 c.this_type = if (is_static and class_sym != binder.no_symbol)

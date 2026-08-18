@@ -3016,7 +3016,7 @@ const Parser = struct {
                 // is.
                 .property => |bit| blk: {
                     defer flags |= bit;
-                    break :blk modifier_order.check(flags, bit, false);
+                    break :blk modifier_order.check(flags, bit, .other, false);
                 },
                 .rejected => |c| c,
             };
@@ -3636,13 +3636,23 @@ const Parser = struct {
         }
 
         var flags: u32 = 0;
-        // The first modifier-order hit, HELD rather than reported: tsc walks one
-        // modifier list per member, decorators and keywords together, and
+        // The modifier run, COLLECTED rather than judged on the spot: tsc walks
+        // one modifier list per member, decorators and keywords together, and
         // `return`s on its first error — and a decorator sits ahead of every
         // keyword, so `@dec public private x` in a class expression is the
-        // decorator's TS1206 alone. `reportMemberGrammar` decides between them
-        // once the member's shape (and so the decorator's verdict) is known.
-        var mod_err: ?ModifierErr = null;
+        // decorator's TS1206 alone. Half of the walk (TS1242/TS1244/TS1253, and
+        // TS1089's trailing block) also needs the member's KIND, which is not
+        // known until the name and what follows it have been read. So the run is
+        // banked here and `memberModErr` judges it at each report site, once the
+        // shape — and so the decorator's verdict — is settled.
+        //
+        // Sixteen entries is enough by construction: `classMemberModifierBit`
+        // spells twelve distinct modifiers, so a longer run must repeat one and
+        // the walk returns at that repeat well inside the buffer. A run that
+        // somehow overflows anyway drops its tail, which can only turn a
+        // diagnostic into silence — never into a wrong one.
+        var mods: [16]modifier_order.Mod = undefined;
+        var n_mods: usize = 0;
         // `const` in a class-member modifier list is TS1248 and nothing else —
         // it carries no flag because it means nothing. tsc's parser accepts it
         // as a modifier so the member behind it still parses (`static const H =
@@ -3665,13 +3675,9 @@ const Parser = struct {
                 continue;
             }
             if ((bit == ast.Flags.get or bit == ast.Flags.set or bit == ast.Flags.async) and p.peekNewline(1)) break;
-            // Repeated or out-of-order modifiers: tsc's `checkGrammarModifiers`
-            // returns on its FIRST hit, so `public private static x` answers
-            // once, for `private`, and never mentions `static`.
-            if (mod_err == null) {
-                if (modifier_order.check(flags, bit, p.abstract_class)) |code| {
-                    mod_err = .{ .code = code, .token = p.curIdx() };
-                }
+            if (n_mods < mods.len) {
+                mods[n_mods] = .{ .bit = bit, .token = p.curIdx() };
+                n_mods += 1;
             }
             _ = try p.bump();
             flags |= bit;
@@ -3687,7 +3693,7 @@ const Parser = struct {
             .l_bracket => {
                 // Computed member name / index signature in class.
                 if (p.atIndexSignature()) {
-                    _ = try p.reportMemberGrammar(deco_at, .{ .kind = .other }, mod_err);
+                    _ = try p.reportMemberGrammar(deco_at, .{ .kind = .other }, p.memberModErr(mods[0..n_mods], .other, 0));
                     return p.parseIndexSignatureAsClassMember(flags);
                 }
                 const cn = try p.parseComputedMemberName();
@@ -3707,7 +3713,7 @@ const Parser = struct {
                 } else {
                     // A CLASS member name: tsc's `parseClassElement` answers
                     // TS1068 here, not the object-literal TS1136.
-                    _ = try p.reportMemberGrammar(deco_at, .{ .kind = .other }, mod_err);
+                    _ = try p.reportMemberGrammar(deco_at, .{ .kind = .other }, p.memberModErr(mods[0..n_mods], .other, 0));
                     try p.fail(.expected_class_member);
                     return p.errorNode();
                 }
@@ -3718,7 +3724,7 @@ const Parser = struct {
         // `const` is never the FIRST error of a list that already has one:
         // tsc stops at the earliest modifier it rejects, and a repeated or
         // out-of-order one ahead of the `const` gets there first.
-        if (saw_const and mod_err == null) mod_err = .{ .code = .const_class_member, .token = name_tok };
+        const const_at: TokenIndex = if (saw_const) name_tok else 0;
 
         // Optional method `m?(): T` / `m?<K>(): T` (ambient/overload members).
         if (p.curTag() == .question) {
@@ -3751,10 +3757,18 @@ const Parser = struct {
             const member = try p.addNode(.{ .tag = .class_method, .main_token = name_tok, .data = .{ .lhs = proto, .rhs = body } });
             try p.checkGeneratorStar(star, body != null_node);
             const is_accessor = flags & (ast.Flags.get | ast.Flags.set) != 0;
+            const is_ctor = !is_accessor and computed == null and
+                p.tokTagAt(name_tok) == .keyword_constructor;
+            const mod_member: modifier_order.Member = if (is_accessor)
+                .accessor
+            else if (is_ctor)
+                .constructor
+            else
+                .method;
             const grammar_err = try p.reportMemberGrammar(deco_at, .{
                 .kind = if (is_accessor)
                     .accessor
-                else if (computed == null and p.tokTagAt(name_tok) == .keyword_constructor)
+                else if (is_ctor)
                     .constructor
                 else
                     .method,
@@ -3763,7 +3777,7 @@ const Parser = struct {
                 .in_class_decl = p.in_class_decl,
                 .second_accessor_of_modified_pair = is_accessor and computed == null and
                     p.isSecondAccessorOfModifiedPair(members_top, name_tok, flags),
-            }, mod_err);
+            }, p.memberModErr(mods[0..n_mods], mod_member, const_at));
             if (computed) |cn| {
                 // An accessor is judged by neither `checkGrammarProperty` nor
                 // `checkGrammarMethod`; a method is, and what it earns turns on
@@ -3814,9 +3828,27 @@ const Parser = struct {
             .abstract = flags & ast.Flags.abstract != 0,
             .declare = flags & ast.Flags.declare != 0,
             .in_class_decl = p.in_class_decl,
-        }, mod_err);
+        }, p.memberModErr(mods[0..n_mods], .property, const_at));
         if (computed) |cn| try p.finishComputedName(cn, member, .class_body, .property, grammar_err);
         return member;
+    }
+
+    /// The one diagnostic a class member's KEYWORD modifier run earns, judged
+    /// against the member kind the run turned out to introduce. `const_at` is
+    /// the member's name token when the run carried a `const` (TS1248, blamed
+    /// on the name) and 0 otherwise — it is the last thing tsc's walk can
+    /// reach, so it only speaks when the walk itself found nothing.
+    fn memberModErr(
+        p: *Parser,
+        mods: []const modifier_order.Mod,
+        member: modifier_order.Member,
+        const_at: TokenIndex,
+    ) ?ModifierErr {
+        if (modifier_order.walk(mods, member, p.abstract_class)) |f| {
+            return .{ .code = f.code, .token = f.token };
+        }
+        if (const_at != 0) return .{ .code = .const_class_member, .token = const_at };
+        return null;
     }
 
     /// The one grammar diagnostic a class member's modifier list earns, if any.

@@ -640,8 +640,10 @@ const Binder = struct {
     fn memberAtom(b: *Binder, tok: TokenIndex) Error!Atom {
         const text = b.tokenText(tok);
         switch (b.tree.tokens.tag(tok)) {
-            // `.jsx_string` is a JSX attribute's quoted value.
-            .string_literal, .jsx_string => return b.atomOf(stripQuotes(text)),
+            // `.jsx_string` is a JSX attribute's quoted value; a
+            // no-substitution template is a string literal for naming purposes
+            // (tsc's `isStringLiteralLike`), so `` obj[`k`] `` keys under `k`.
+            .string_literal, .jsx_string, .no_substitution_template_literal => return b.atomOf(stripQuotes(text)),
             .numeric_literal => {
                 var buf: [numeric_lit.max_name]u8 = undefined;
                 // Stack buffer: `atomOf` copies into the interner, but the
@@ -4094,9 +4096,10 @@ const Binder = struct {
 
     /// The property-name TOKEN an expando assignment target names, or null when
     /// the target is not one of the two bindable shapes: `obj.name` (the name
-    /// token) and `obj["name"]` / `obj[42]` (the literal's token). A computed key
-    /// that is not a literal — `obj[k]`, `obj[Symbol()]` — has no syntactic name
-    /// and is not one.
+    /// token) and ``obj["name"]`` / ``obj[`name`]`` / `obj[42]` (the literal's
+    /// token). A computed key that is not a literal — `obj[k]`, `obj[Symbol()]`
+    /// — has no syntactic name and is not one. The template-literal arm is
+    /// tsc's `isStringLiteralLike`, which a no-substitution template satisfies.
     fn expandoTargetName(b: *Binder, target: Node) ?TokenIndex {
         const d = b.tree.nodeData(target);
         switch (b.nodeTag(target)) {
@@ -4104,7 +4107,7 @@ const Binder = struct {
             .index_expr => {
                 if (d.rhs == null_node) return null;
                 return switch (b.nodeTag(d.rhs)) {
-                    .string_literal, .number_literal => b.tree.nodeMainToken(d.rhs),
+                    .string_literal, .template_literal, .number_literal => b.tree.nodeMainToken(d.rhs),
                     else => null,
                 };
             },

@@ -92,8 +92,9 @@ pub fn atomOfToken(c: *Checker, tok: TokenIndex) Error!Atom {
 pub fn memberAtom(c: *Checker, tok: TokenIndex) Error!Atom {
     const text = c.tokenText(tok);
     switch (c.tree.tokens.tag(tok)) {
-        // `.jsx_string` is a JSX attribute's quoted value.
-        .string_literal, .jsx_string => return c.atom(stripQuotes(text)),
+        // `.jsx_string` is a JSX attribute's quoted value; a no-substitution
+        // template is a string literal for naming purposes (`isStringLiteralLike`).
+        .string_literal, .jsx_string, .no_substitution_template_literal => return c.atom(stripQuotes(text)),
         .numeric_literal => {
             var buf: [numeric_lit.max_name]u8 = undefined;
             return c.internText(numeric_lit.name(&buf, text));

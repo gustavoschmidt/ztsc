@@ -461,6 +461,23 @@ pub const Code = enum(u16) {
     /// `declare export const x` — the statement-level pair, reported by the
     /// `declare export` arm of `parseStatementUnchecked` on the `export`.
     mod_order_export_declare,
+    /// TS1089 `'{0}' modifier cannot appear on a constructor declaration.` —
+    /// tsc's `checkGrammarModifiers` closes with a constructor-only block that
+    /// runs AFTER the per-modifier walk and asks, in this order, whether the
+    /// run carried `static`, `override` or `async`; it blames the modifier
+    /// itself. One code per word, like the TS1030/TS1029 families above.
+    ctor_mod_static,
+    ctor_mod_override,
+    ctor_mod_async,
+    /// TS1244 `Abstract methods can only appear within an abstract class.` and
+    /// TS1253, its wording for a PROPERTY — the `abstract` arm of the same
+    /// walk, for a member of a class that is not `abstract` (a class EXPRESSION
+    /// never is). Blamed on the `abstract` modifier, not on the member's name,
+    /// and one per member kind because tsc picks the wording off
+    /// `node.kind === PropertyDeclaration`. An accessor counts as a method and
+    /// an `accessor` field as a property.
+    abstract_method_outside_abstract_class,
+    abstract_property_outside_abstract_class,
 
     /// TS1385/TS1386/TS1387/TS1388: `type U = string | () => void` — a function
     /// or constructor type written bare as a union or intersection CONSTITUENT,
@@ -1095,6 +1112,11 @@ pub const Code = enum(u16) {
             .mod_order_abstract_override,
             .mod_order_abstract_accessor,
             .mod_order_export_declare,
+            .ctor_mod_static,
+            .ctor_mod_override,
+            .ctor_mod_async,
+            .abstract_method_outside_abstract_class,
+            .abstract_property_outside_abstract_class,
             .ctor_may_not_be_accessor,
             // The regex family: tsc's `checkGrammarRegularExpressionLiteral`
             // reaches the scanner's `scanRegularExpressionWorker`, so these are
@@ -1363,6 +1385,11 @@ pub const Code = enum(u16) {
             .mod_order_override_async => modOrderMessage("override", "async"),
             .mod_order_abstract_override => modOrderMessage("abstract", "override"),
             .mod_order_abstract_accessor => modOrderMessage("abstract", "accessor"),
+            .ctor_mod_static => ctorModMessage("static"),
+            .ctor_mod_override => ctorModMessage("override"),
+            .ctor_mod_async => ctorModMessage("async"),
+            .abstract_method_outside_abstract_class => "Abstract methods can only appear within an abstract class.",
+            .abstract_property_outside_abstract_class => "Abstract properties can only appear within an abstract class.",
             .mod_order_export_declare => modOrderMessage("export", "declare"),
             .fn_type_in_union => "Function type notation must be parenthesized when used in a union type.",
             .ctor_type_in_union => "Constructor type notation must be parenthesized when used in a union type.",
@@ -1716,6 +1743,9 @@ pub const Code = enum(u16) {
             .mod_order_abstract_accessor,
             .mod_order_export_declare,
             => 1029,
+            .ctor_mod_static, .ctor_mod_override, .ctor_mod_async => 1089,
+            .abstract_method_outside_abstract_class => 1244,
+            .abstract_property_outside_abstract_class => 1253,
             .fn_type_in_union => 1385,
             .ctor_type_in_union => 1386,
             .fn_type_in_intersection => 1387,
@@ -1757,6 +1787,11 @@ fn modSeenMessage(comptime word: []const u8) []const u8 {
 
 fn modOrderMessage(comptime first: []const u8, comptime second: []const u8) []const u8 {
     return "'" ++ first ++ "' modifier must precede '" ++ second ++ "' modifier.";
+}
+
+/// TS1089's sentence, for the three words tsc's constructor block can name.
+fn ctorModMessage(comptime word: []const u8) []const u8 {
+    return "'" ++ word ++ "' modifier cannot appear on a constructor declaration.";
 }
 
 /// TS1044's four modifiers share one sentence, differing only in the word.
