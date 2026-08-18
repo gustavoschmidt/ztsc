@@ -646,6 +646,16 @@ pub const Code = enum(u16) {
     /// TS1022: `[k]: T` reached as an index signature — only via a shape tsc's
     /// lookahead claims for one, e.g. `[k,]`.
     index_sig_parameter_type_annotation,
+    /// TS1268: `[k: boolean]: T` — the parameter type must be `string`,
+    /// `number`, `symbol` or a template literal type
+    /// (`everyType(type, isValidIndexKeyType)`). tsc resolves the type to
+    /// decide; ztsc only answers for the spellings that need no resolution at
+    /// all — a bare non-key type KEYWORD — so anything else stays the
+    /// under-report it already was. Sits AHEAD of TS1021 in tsc's chain, which
+    /// is why `[a: boolean]` with no value type answers this and not that.
+    /// Reported on the parameter NAME (tsc's `grammarErrorOnNode(parameter.name,
+    /// …)`).
+    index_sig_key_type,
     /// TS1021: `[k: string]` with no value type. Reported on the whole node.
     index_sig_type_annotation,
     /// TS2374: two index signatures in one member list claim the same key
@@ -976,6 +986,7 @@ pub const Code = enum(u16) {
             .index_sig_question_mark,
             .index_sig_initializer,
             .index_sig_parameter_type_annotation,
+            .index_sig_key_type,
             .index_sig_type_annotation,
             .duplicate_index_signature,
             .enum_member_numeric_name,
@@ -1210,6 +1221,7 @@ pub const Code = enum(u16) {
             .index_sig_question_mark => "An index signature parameter cannot have a question mark.",
             .index_sig_initializer => "An index signature parameter cannot have an initializer.",
             .index_sig_parameter_type_annotation => "An index signature parameter must have a type annotation.",
+            .index_sig_key_type => "An index signature parameter type must be 'string', 'number', 'symbol', or a template literal type.",
             .index_sig_type_annotation => "An index signature must have a type annotation.",
             .duplicate_index_signature => "Duplicate index signature.",
             .enum_member_numeric_name => "An enum member cannot have a numeric name.",
@@ -1535,6 +1547,7 @@ pub const Code = enum(u16) {
             .index_sig_question_mark => 1019,
             .index_sig_initializer => 1020,
             .index_sig_parameter_type_annotation => 1022,
+            .index_sig_key_type => 1268,
             .index_sig_type_annotation => 1021,
             .duplicate_index_signature => 2374,
             .enum_member_numeric_name => 2452,
