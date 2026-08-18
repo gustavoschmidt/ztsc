@@ -180,6 +180,32 @@ pub fn forOfElementType(c: *Checker, rt: TypeId, right_node: Node, is_await: boo
     return types.any_type;
 }
 
+/// `iterationElementType` under tsc's `mapType` semantics: a UNION
+/// contributes the elements of the constituents that ARE iterable and
+/// silently drops the ones that are not, instead of failing outright.
+///
+/// tsc's `getContextualTypeForElementExpression` ends in
+/// `mapType(arrayContextualType, t => getIteratedTypeOrElementType(…))`, and
+/// `mapType` collects the defined results. That is the CONTEXTUAL reading and
+/// it is deliberately laxer than the `for..of` one: `for (x of xs)` demands
+/// every constituent be iterable (TS2488), but an array literal under
+/// `Iterable<T> | null | undefined` — the shape every optional
+/// `iterable?: Iterable<T> | null` lib constructor parameter has — still
+/// types its elements by `T`. Without it `new Set(["a", "b"])` in
+/// `Set<"a" | "b">` position left its elements uncontextualized, they widened
+/// to `string`, and `T` came out `string` (excalidraw's `bindingProperties`).
+pub fn contextualIterationElementType(c: *Checker, rt: TypeId) Error!?TypeId {
+    const r = try c.resolveStructural(rt);
+    if (c.ts.kind(r) != .union_type) return iterationElementType(c, r);
+    var parts: std.ArrayList(TypeId) = .empty;
+    defer parts.deinit(c.scratch());
+    for (try c.memberList(r)) |m| {
+        if (try iterationElementType(c, m)) |e| try parts.append(c.scratch(), e);
+    }
+    if (parts.items.len == 0) return null;
+    return try c.ts.makeUnion(c.scratch(), parts.items);
+}
+
 /// The type produced by iterating `rt` (the `x` in `for (x of rt)` and the
 /// element of `[...rt]`), or null when `rt` is not iterable. Handles
 /// arrays/tuples/strings directly, `Generator`/`Iterator`/`IterableIterator`

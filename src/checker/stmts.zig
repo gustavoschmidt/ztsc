@@ -665,6 +665,7 @@ pub const asyncIterationElementType = iteration.asyncIterationElementType;
 pub const callableReturn = iteration.callableReturn;
 pub const forOfElementType = iteration.forOfElementType;
 pub const iterationElementType = iteration.iterationElementType;
+pub const contextualIterationElementType = iteration.contextualIterationElementType;
 pub const iteratorNextValue = iteration.iteratorNextValue;
 
 fn checkSwitch(c: *Checker, node: Node) Error!void {

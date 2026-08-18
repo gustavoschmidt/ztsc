@@ -1858,7 +1858,14 @@ fn contextualArrayElemOrIterated(c: *Checker, rctx: TypeId) Error!TypeId {
     if (rctx == types.no_type) return types.no_type;
     const direct = try contextualArrayElemType(c, rctx);
     if (direct != types.no_type) return direct;
-    return (try c.iterationElementType(rctx)) orelse types.no_type;
+    // `contextualIterationElementType`, not `iterationElementType`: tsc's
+    // `mapType` here drops a non-iterable constituent instead of failing the
+    // whole union, so an array literal under `Iterable<T> | null | undefined`
+    // — every optional `iterable?: Iterable<T> | null` lib parameter — still
+    // types its elements by `T`. Only reachable when the DIRECT read above
+    // found nothing, so `readonly T[] | Map<K, V>` still answers `T` and
+    // never folds in the map's `[K, V]`.
+    return (try c.contextualIterationElementType(rctx)) orelse types.no_type;
 }
 
 /// The contextual type for the element at index `i` of an array literal in

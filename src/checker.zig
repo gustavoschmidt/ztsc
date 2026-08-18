@@ -4053,6 +4053,7 @@ pub const Checker = struct {
     pub const checkStatement = stmts_zig.checkStatement;
     pub const forOfElementType = stmts_zig.forOfElementType;
     pub const iterationElementType = stmts_zig.iterationElementType;
+    pub const contextualIterationElementType = stmts_zig.contextualIterationElementType;
     pub const asyncIterationElementType = stmts_zig.asyncIterationElementType;
     pub const callableReturn = stmts_zig.callableReturn;
     pub const iteratorNextValue = stmts_zig.iteratorNextValue;
