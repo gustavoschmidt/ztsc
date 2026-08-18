@@ -2050,9 +2050,10 @@ fn condTrueSubstituted(c: *Checker, cond: TypeId) Error!TypeId {
 /// walk gives the constraint up and the branch-union reading stands.
 const max_cond_constraint_steps: u32 = 16;
 
-/// tsc's `getConstraintOfDistributiveConditionalType`, asked for its BOOLEAN:
-/// does the conditional relate to `target` through the constraint you get by
-/// putting the check parameter's own constraint in its place?
+/// tsc's `getConstraintOfDistributiveConditionalType`: the constraint you get
+/// by putting the check parameter's own constraint in the check position,
+/// or `null` when the parameter's bound settles nothing the branch union did
+/// not already say.
 ///
 /// ```ts
 /// type IsArray<T> = T extends unknown[] ? true : false;
@@ -2079,18 +2080,19 @@ const max_cond_constraint_steps: u32 = 16;
 ///   * otherwise undecided — no distributive constraint at all, and the caller's
 ///     branch-union answer stands.
 ///
-/// Purely additive: it is only ever asked after the branch-union reading has
-/// already refused, and it only ever returns `true`.
-fn distributiveConstraintRelates(c: *Checker, cond: TypeId, target: TypeId) Error!bool {
+/// Purely additive wherever it is consumed: `null` means "the branch union is
+/// still the answer", and a type means the branch union with branches no
+/// instantiation can reach dropped — never a wider reading.
+pub fn distributiveConstraint(c: *Checker, cond: TypeId) Error!?TypeId {
     const s = &c.ts;
-    if (!s.condDistributive(cond)) return false;
+    if (!s.condDistributive(cond)) return null;
     const chk = s.condCheck(cond);
-    if (s.kind(chk) != .type_param) return false;
+    if (s.kind(chk) != .type_param) return null;
     const con = try c.typeParamConstraint(s.typeParamSymbol(chk));
-    if (con == types.no_type or con == chk or con == types.error_type) return false;
+    if (con == types.no_type or con == chk or con == types.error_type) return null;
     switch (s.kind(con)) {
         // An `unknown`/`any` bound settles nothing the branch union did not.
-        .unknown, .any => return false,
+        .unknown, .any => return null,
         else => {},
     }
     const map = [_]TpMap{.{ .sym = s.typeParamSymbol(chk), .ty = con }};
@@ -2098,26 +2100,24 @@ fn distributiveConstraintRelates(c: *Checker, cond: TypeId, target: TypeId) Erro
     var steps: u32 = 0;
     while (steps < max_cond_constraint_steps) : (steps += 1) {
         const ext = try c.instantiate(s.condExtends(cur), &map);
-        if (try c.isAssignable(con, ext)) {
-            return c.isAssignable(try c.instantiate(s.condTrue(cur), &map), target);
-        }
+        if (try c.isAssignable(con, ext)) return try c.instantiate(s.condTrue(cur), &map);
         if (try extendsReachableFrom(c, ext, con)) {
             // Undecided. What is left of the chain is a deferred conditional
             // again, and a deferred conditional's constraint is the union of
             // its branches — the caller's own reading, but over the branches
             // the levels ABOVE have already ruled out. With nothing ruled out
             // it is the caller's answer verbatim, so there is nothing to add.
-            if (steps == 0) return false;
-            return c.isAssignable(try remainingBranchUnion(c, cur, &map), target);
+            if (steps == 0) return null;
+            return try remainingBranchUnion(c, cur, &map);
         }
         const fls = s.condFalse(cur);
         if (s.kind(fls) == .conditional and s.condCheck(fls) == chk and s.condDistributive(fls)) {
             cur = fls;
             continue;
         }
-        return c.isAssignable(try c.instantiate(fls, &map), target);
+        return try c.instantiate(fls, &map);
     }
-    return false;
+    return null;
 }
 
 /// The branch union of a conditional whose check the constraint did not settle
@@ -2357,7 +2357,8 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         // and falls back to the branch union; the two are alternatives for a
         // single boolean, so running the cheap one first costs a clean program
         // nothing.
-        return distributiveConstraintRelates(c, s, t);
+        if (try distributiveConstraint(c, s)) |dc| return c.isAssignable(dc, t);
+        return false;
     }
     // A deferred `keyof T` source relates through its apparent
     // constraint `string | number | symbol`; handled before union-target
