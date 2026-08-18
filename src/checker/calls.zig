@@ -1213,20 +1213,43 @@ pub fn instantiateSigForCall(c: *Checker, sig: TypeId, explicit_targs: []const T
                 try c.diagFmt(2558, c.nodeSpan(node), "Expected {d}-{d} type arguments, but got {d}.", .{ min, tps.len, explicit_targs.len });
             }
         }
+        // tsc's `fillMissingTypeArguments`. A missing trailing argument takes
+        // its default, instantiated under the arguments resolved SO FAR — so
+        // `B = A` sees the supplied `A` and `C = B` sees the defaulted `B`.
+        //
+        // The mapper spans EVERY type parameter, not just the earlier ones,
+        // and the not-yet-filled slots are seeded with `errorType`:
+        //
+        // ```ts
+        // for (let i = numTypeArguments; i < numTypeParameters; i++) result[i] = errorType;
+        // for (let i = numTypeArguments; i < numTypeParameters; i++) {
+        //     const defaultType = getDefaultFromTypeParameter(typeParameters[i]);
+        //     result[i] = defaultType ? instantiateType(defaultType, createTypeMapper(typeParameters, result)) : baseDefaultType;
+        // }
+        // ```
+        //
+        // That seed is what DEGRADES a default that names a LATER parameter —
+        // the forward reference TS2744 reports on. `declare function f14<T, U =
+        // V, V = C>(a?: T, b?: U, c?: V)` called as `f14<A>(a, b)` gives `U`
+        // the `errorType`, which relates to everything, so tsc reports nothing;
+        // mapping only the earlier parameters left `V` standing in `U`'s
+        // default, resolved it to `C`, and made `b` a false TS2345 (nine keys
+        // in `genericDefaults`). Leaving the slot behind as the raw parameter
+        // is not a third option: an escaped type parameter is worse than either.
+        const pmap = try c.scratch().alloc(TpMap, tps.len);
         for (tps, 0..) |tp, i| {
-            if (i < explicit_targs.len) {
-                args_buf[i] = explicit_targs[i];
-            } else if (c.typeParamHasDefault(tp)) {
-                // A missing trailing arg takes its default, instantiated
-                // under the args resolved so far (so `B = A` sees the
-                // supplied `A`, `C = B` sees the defaulted `B`).
-                const def = try c.typeParamDefault(tp);
-                const pmap = try c.scratch().alloc(TpMap, i);
-                for (tps[0..i], 0..) |ptp, j| pmap[j] = .{ .sym = ptp, .ty = args_buf[j] };
-                args_buf[i] = try c.instantiate(def, pmap);
-            } else {
-                args_buf[i] = types.any_type;
-            }
+            args_buf[i] = if (i < explicit_targs.len) explicit_targs[i] else types.error_type;
+            pmap[i] = .{ .sym = tp, .ty = args_buf[i] };
+        }
+        for (tps, 0..) |tp, i| {
+            if (i < explicit_targs.len) continue;
+            args_buf[i] = if (c.typeParamHasDefault(tp))
+                try c.instantiate(try c.typeParamDefault(tp), pmap)
+            else
+                types.any_type;
+            // `createTypeMapper(typeParameters, result)` reads the array this
+            // loop is filling, so each resolved default is visible to the next.
+            pmap[i].ty = args_buf[i];
         }
     } else {
         // The receiver type feeds inference of a `this`-parameter type
