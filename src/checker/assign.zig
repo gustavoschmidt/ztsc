@@ -2093,15 +2093,45 @@ pub fn distributiveConstraint(c: *Checker, cond: TypeId) Error!?TypeId {
     switch (s.kind(con)) {
         // An `unknown`/`any` bound settles nothing the branch union did not.
         .unknown, .any => return null,
+        // tsc's `instantiateConditionalType`: a DISTRIBUTIVE conditional whose
+        // check parameter is replaced by a UNION is re-evaluated once per
+        // constituent and the results unioned (`mapTypeWithAlias`). Asking the
+        // walk about `number | string` whole settles nothing — no single branch
+        // of `T extends number ? 0 : T extends string ? "" : false` covers it —
+        // while per constituent it settles completely, which is why `ZeroOf<T>`
+        // under `T extends number | string` is `0 | ""` and `let z2: 0 | "" = y`
+        // is legal (`conditionalTypes1` f21, oracle-verified).
+        //
+        // All or nothing: one undecided constituent leaves the whole reading
+        // undecided, and the caller's branch union — which is what an undecided
+        // constituent would contribute anyway — stands for every constituent.
+        .union_type => {
+            const con_members = try c.memberList(con);
+            var parts: std.ArrayList(TypeId) = .empty;
+            defer parts.deinit(c.scratch());
+            for (con_members) |m| {
+                const r = (try constraintWalk(c, cond, chk, m)) orelse return null;
+                try parts.append(c.scratch(), r);
+            }
+            return try s.makeUnion(c.scratch(), parts.items);
+        },
         else => {},
     }
-    const map = [_]TpMap{.{ .sym = s.typeParamSymbol(chk), .ty = con }};
+    return constraintWalk(c, cond, chk, con);
+}
+
+/// One pass of `distributiveConstraint`'s three-way decision down the
+/// false-branch chain, with `sub` — the whole constraint, or one constituent of
+/// it — standing in for the check parameter `chk`. `null` = undecided.
+fn constraintWalk(c: *Checker, cond: TypeId, chk: TypeId, sub: TypeId) Error!?TypeId {
+    const s = &c.ts;
+    const map = [_]TpMap{.{ .sym = s.typeParamSymbol(chk), .ty = sub }};
     var cur = cond;
     var steps: u32 = 0;
     while (steps < max_cond_constraint_steps) : (steps += 1) {
         const ext = try c.instantiate(s.condExtends(cur), &map);
-        if (try c.isAssignable(con, ext)) return try c.instantiate(s.condTrue(cur), &map);
-        if (try extendsReachableFrom(c, ext, con)) {
+        if (try c.isAssignable(sub, ext)) return try c.instantiate(s.condTrue(cur), &map);
+        if (try extendsReachableFrom(c, ext, sub)) {
             // Undecided. What is left of the chain is a deferred conditional
             // again, and a deferred conditional's constraint is the union of
             // its branches — the caller's own reading, but over the branches
