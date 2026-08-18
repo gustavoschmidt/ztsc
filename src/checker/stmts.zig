@@ -821,7 +821,34 @@ fn checkDerivedCtorSuperCall(c: *Checker, extends: ast.Node, ctor: ast.Node, bod
     if (c.nodeTag(extends) != .heritage) return;
     if (c.nodeTag(c.tree.nodeData(extends).lhs) == .null_literal) return;
     if (try hasSuperCall(c, body)) return;
-    try c.diagFmt(2377, c.nodeSpan(ctor), "Constructors for derived classes must contain a 'super' call.", .{});
+    try c.diagFmt(2377, ctorDeclSpan(c, ctor), "Constructors for derived classes must contain a 'super' call.", .{});
+}
+
+/// The span of a constructor DECLARATION, modifiers included — tsc's
+/// `error(node, …)` on a `ConstructorDeclaration`, whose `pos` is the start of
+/// its modifier list. `nodeSpan` starts at the `constructor` token, so
+/// `private constructor() {}` would be blamed three words late. The AST records
+/// no modifier tokens, but the parser guarantees a member's modifiers are the
+/// contiguous run of modifier keywords immediately before it.
+fn ctorDeclSpan(c: *Checker, ctor: ast.Node) source.Span {
+    var span = c.nodeSpan(ctor);
+    var tok = c.tree.nodeMainToken(ctor);
+    while (tok > 0) : (tok -= 1) {
+        switch (c.tree.tokens.tag(tok - 1)) {
+            .keyword_public,
+            .keyword_private,
+            .keyword_protected,
+            .keyword_declare,
+            .keyword_abstract,
+            .keyword_override,
+            .keyword_readonly,
+            .keyword_static,
+            => {},
+            else => break,
+        }
+    }
+    span.start = c.tokSpan(tok).start;
+    return span;
 }
 
 /// tsc's `findFirstSuperCall`, as a predicate:
