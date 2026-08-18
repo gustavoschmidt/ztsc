@@ -725,9 +725,10 @@ pub const Code = enum(u16) {
     /// which for ztsc means one thing — `await` inside an await context (an
     /// `async` function's parameters and body, or a class static block). tsc's
     /// `createIdentifier` prefers this wording over TS1003 whenever the token is
-    /// a reserved word. Like the TS1212 family above, the message drops the word
-    /// tsc names; like them, it is a GRAMMAR diagnostic (measured — see
-    /// `class`), despite reading as parser code in tsc.
+    /// a reserved word. Like the TS1212 family above, the message names the word
+    /// — which is the token the diagnostic is reported on, so `renderMessage`
+    /// reads it back off the span; like them, it is a GRAMMAR diagnostic
+    /// (measured — see `class`), despite reading as parser code in tsc.
     reserved_word_here,
 
     // --- class static blocks (tsc's `checkGrammar*`, so all four are semantic)
@@ -1225,12 +1226,13 @@ pub const Code = enum(u16) {
             .private_name_as_param => "Private identifiers cannot be used as parameters.",
             .using_binding_pattern => "'using' declarations may not have binding patterns.",
             .await_using_binding_pattern => "'await using' declarations may not have binding patterns.",
-            // tsc names the word (`'yield' is a reserved word...`); a Diagnostic
-            // is a code plus a span, so the invariant sentence is reported.
-            .strict_reserved_word => "Identifier expected. This is a reserved word in strict mode.",
-            .strict_reserved_word_in_class => "Identifier expected. This is a reserved word in strict mode. Class definitions are automatically in strict mode.",
-            .strict_reserved_word_in_module => "Identifier expected. This is a reserved word in strict mode. Modules are automatically in strict mode.",
-            .reserved_word_here => "Identifier expected. This is a reserved word that cannot be used here.",
+            // tsc names the word (`'yield' is a reserved word...`), and the word
+            // is the very token the diagnostic is reported on — so these fill
+            // `{0}` from their own span (`renderMessage`), with no `arg` to set.
+            .strict_reserved_word => "Identifier expected. '{0}' is a reserved word in strict mode.",
+            .strict_reserved_word_in_class => "Identifier expected. '{0}' is a reserved word in strict mode. Class definitions are automatically in strict mode.",
+            .strict_reserved_word_in_module => "Identifier expected. '{0}' is a reserved word in strict mode. Modules are automatically in strict mode.",
+            .reserved_word_here => "Identifier expected. '{0}' is a reserved word that cannot be used here.",
             .await_in_static_block => "'await' expression cannot be used inside a class static block.",
             .for_await_in_static_block => "'for await' loops cannot be used inside a class static block.",
             .return_in_static_block => "A 'return' statement cannot be used inside a class static block.",
@@ -1770,7 +1772,8 @@ pub const Diagnostic = struct {
     code: Code,
     span: Span,
     /// Empty for every non-interpolating code, which is nearly all of them —
-    /// hence the default, so only the JSX unclosed-tag family names it.
+    /// and for the interpolating codes whose argument IS the reported span
+    /// (`renderMessage`), which is why the default carries so far.
     arg: Span = .{ .start = 0, .end = 0 },
 
     /// The raw template. Interpolating codes still hold their `{0}` here; use
@@ -1781,15 +1784,20 @@ pub const Diagnostic = struct {
 };
 
 /// `d`'s message with the template's `{0}` replaced by the text of `d.arg` in
-/// `src`. Non-interpolating codes — every code but the JSX unclosed-tag
-/// family — return their static template and never allocate, so this is the
-/// one call site that has to hold the source buffer, and it holds it only
-/// while the substitution runs.
+/// `src`. Non-interpolating codes — the great majority — return their static
+/// template and never allocate, so this is the one call site that has to hold
+/// the source buffer, and it holds it only while the substitution runs.
+///
+/// An interpolating code with no `arg` names the text it is REPORTED on: the
+/// reserved-word family (TS1212/1213/1214/1359) says `'yield' is a reserved
+/// word…` about the very token its span covers, so the span is the argument
+/// and no call site has to repeat it.
 pub fn renderMessage(arena: Allocator, d: Diagnostic, src: []const u8) Allocator.Error![]const u8 {
     const template = d.code.message();
     const hole = std.mem.indexOf(u8, template, arg_hole) orelse return template;
-    const start = @min(d.arg.start, src.len);
-    const end = @min(@max(d.arg.end, start), src.len);
+    const arg = if (d.arg.end > d.arg.start) d.arg else d.span;
+    const start = @min(arg.start, src.len);
+    const end = @min(@max(arg.end, start), src.len);
     const text = src[start..end];
     const out = try arena.alloc(u8, template.len - arg_hole.len + text.len);
     @memcpy(out[0..hole], template[0..hole]);
@@ -1841,6 +1849,17 @@ test "renderMessage fills {0} from the source, and only for the codes with one" 
     try std.testing.expectEqualStrings(
         "Expected corresponding JSX closing tag for 'div'.",
         try renderMessage(a, expected_close, src),
+    );
+
+    // …and the reserved-word family is the opposite case: it names the text it
+    // is reported on, so an empty `arg` falls back to the span.
+    const reserved: Diagnostic = .{
+        .code = .strict_reserved_word,
+        .span = .{ .start = 4, .end = 5 },
+    };
+    try std.testing.expectEqualStrings(
+        "Identifier expected. 'x' is a reserved word in strict mode.",
+        try renderMessage(a, reserved, src),
     );
 }
 
