@@ -2796,6 +2796,10 @@ pub const Checker = struct {
             // seal sorts every diagnostic back into position order).
             c.cur_scope = binder.file_scope;
             try alias_conflict_zig.checkFileAliases(c);
+            // TS2744 is a property of a type-parameter LIST's own syntax, so
+            // it must not depend on anything demanding the declaration's type
+            // (see `checkFileTypeParamDefaults`); same once-per-file shape.
+            try typenode_zig.checkFileTypeParamDefaults(c);
         }
         // Every class instance type is now complete, so the written type
         // arguments collected along the way can be judged against their

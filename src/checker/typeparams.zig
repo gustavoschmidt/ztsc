@@ -222,6 +222,152 @@ pub fn declTypeParams(c: *Checker, decl: Node, buf: *std.ArrayList(TypeParamInfo
     }
 }
 
+/// The type-parameter list a node WRITES, as an extra-data range, or null
+/// when it writes none. One switch over every syntactic holder of a
+/// `<…>` list: the shared `FnProto` (functions, methods, arrows, function
+/// and constructor types, call/construct/method signatures) plus the three
+/// declaration forms that carry their own extra struct.
+fn writtenTypeParamRange(c: *const Checker, node: Node) ?[]const Node {
+    const d = c.tree.nodeData(node);
+    const start, const end = switch (c.tree.nodeTag(node)) {
+        .arrow_fn,
+        .function_expr,
+        .function_decl,
+        .class_method,
+        .function_type,
+        .method_signature,
+        .call_signature,
+        .construct_signature,
+        .constructor_type,
+        => blk: {
+            const p = c.tree.extraData(ast.FnProto, d.lhs);
+            break :blk .{ p.tp_start, p.tp_end };
+        },
+        .class_decl => blk: {
+            const e = c.tree.extraData(ast.ClassData, d.lhs);
+            break :blk .{ e.tp_start, e.tp_end };
+        },
+        .interface_decl => blk: {
+            const e = c.tree.extraData(ast.InterfaceData, d.lhs);
+            break :blk .{ e.tp_start, e.tp_end };
+        },
+        .type_alias => blk: {
+            const e = c.tree.extraData(ast.TypeAlias, d.lhs);
+            break :blk .{ e.tp_start, e.tp_end };
+        },
+        else => return null,
+    };
+    if (start == end) return null;
+    return c.tree.extraRange(start, end);
+}
+
+/// TS2744, "Type parameter defaults can only reference previously declared
+/// type parameters" — tsc's `checkTypeParametersNotReferenced`, run for every
+/// type-parameter list the current file writes.
+///
+/// ```ts
+/// for (let i = 0; i < typeParameterDeclarations.length; i++) {
+///     const node = typeParameterDeclarations[i];
+///     if (node.default) checkTypeParametersNotReferenced(node.default, typeParameterDeclarations, i);
+/// }
+/// ```
+///
+/// The window is `[i, len)`, so a parameter's default may not name ITSELF
+/// either (`<T = T>`) — the self-reference and the forward reference are one
+/// rule, not two.
+///
+/// This is a walk of the file's NODES rather than of its statements because
+/// the rule is about a declaration's syntax and nothing else: it must fire on
+/// a declaration whose type is never demanded (`declare function f13<T = U, U
+/// = B>(…)` with no call to it), and firing it lazily off `typeParamDefault`
+/// instead would make the report a function of which checker partition
+/// happened to materialize the declaration. It runs once per owned file, after
+/// the statement walk — `seal` sorts the diagnostics back into position order.
+///
+/// It reports nothing at all for the overwhelming majority of files: the
+/// per-node cost until a `<…>` list turns up is one tag compare.
+pub fn checkFileTypeParamDefaults(c: *Checker) Error!void {
+    const n = c.tree.nodeCount();
+    var node: Node = 1;
+    while (node < n) : (node += 1) {
+        const tps = writtenTypeParamRange(c, node) orelse continue;
+        for (tps, 0..) |tp, i| {
+            if (tp == null_node or c.nodeTag(tp) != .type_param) continue;
+            const def = c.tree.nodeData(tp).rhs;
+            if (def == null_node) continue;
+            try reportForwardDefaultRefs(c, def, tps[i..]);
+        }
+    }
+}
+
+/// Report every reference inside `root` to one of the type parameters in
+/// `window` (the defaulted parameter itself and everything after it).
+///
+/// The match is by NAME, and the shadow guard is the price of that: a nested
+/// declaration that rebinds one of these names owns its whole subtree, so the
+/// walk skips it rather than blaming a reference that resolves somewhere else.
+/// Conservative in the safe direction — a skipped subtree can only cost a
+/// report, never invent one.
+fn reportForwardDefaultRefs(c: *Checker, root: Node, window: []const Node) Error!void {
+    const mark = c.scratch_arena.mark();
+    defer c.scratch_arena.restore(mark);
+    var stack: std.ArrayList(Node) = .empty;
+    try stack.append(c.scratch(), root);
+    while (stack.pop()) |cur| {
+        if (cur != root) if (writtenTypeParamRange(c, cur)) |inner| {
+            if (try shadowsAny(c, inner, window)) continue;
+        };
+        // Two shapes hold identifiers that are not type references, and tsc's
+        // `node.kind === SyntaxKind.TypeReference` test excludes both: the head
+        // of a qualified name is a NAMESPACE, and the operand of `typeof` is a
+        // VALUE (a `TypeQuery`, not a `TypeReference`). Neither subtree holds a
+        // type node below it either, so both stop the walk.
+        switch (c.nodeTag(cur)) {
+            .qualified_name, .typeof_type => continue,
+            else => {},
+        }
+        if (try namedTypeParamRef(c, cur, window) != null) {
+            try c.diagFmt(2744, c.nodeSpan(cur), "Type parameter defaults can only reference previously declared type parameters.", .{});
+        }
+        var it = c.tree.childIterator(cur);
+        while (it.next()) |child| try stack.append(c.scratch(), child);
+    }
+}
+
+/// Does `inner` (a nested declaration's own parameter list) rebind any name in
+/// `window`?
+fn shadowsAny(c: *Checker, inner: []const Node, window: []const Node) Error!bool {
+    for (inner) |itp| {
+        if (itp == null_node or c.nodeTag(itp) != .type_param) continue;
+        const ia = try c.atomOfToken(c.tree.nodeMainToken(itp));
+        for (window) |wtp| {
+            if (wtp == null_node or c.nodeTag(wtp) != .type_param) continue;
+            if (ia == try c.atomOfToken(c.tree.nodeMainToken(wtp))) return true;
+        }
+    }
+    return false;
+}
+
+/// The index in `window` this node names, if it is a bare (unqualified) type
+/// reference to one of those parameters. A written type-argument list makes
+/// the reference a `.type_ref` whose `lhs` is the name; without one the
+/// reference IS the identifier. A qualified name (`N.T`) never resolves to a
+/// type parameter, so only the plain-identifier head counts.
+fn namedTypeParamRef(c: *Checker, node: Node, window: []const Node) Error!?usize {
+    const name: Node = switch (c.nodeTag(node)) {
+        .identifier => node,
+        .type_ref => c.tree.nodeData(node).lhs,
+        else => return null,
+    };
+    if (name == null_node or c.nodeTag(name) != .identifier) return null;
+    const a = try c.atomOfToken(c.tree.nodeMainToken(name));
+    for (window, 0..) |wtp, i| {
+        if (wtp == null_node or c.nodeTag(wtp) != .type_param) continue;
+        if (a == try c.atomOfToken(c.tree.nodeMainToken(wtp))) return i;
+    }
+    return null;
+}
+
 /// Type-parameter symbols of a single declaration node (class/interface/
 /// alias), in positional order, resolved in the current file context.
 /// Reopened interface blocks each bind a *distinct* type-param symbol for
