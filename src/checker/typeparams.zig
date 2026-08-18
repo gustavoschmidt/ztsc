@@ -188,38 +188,31 @@ pub fn canonicalizeClassTypeParams(c: *Checker, sym: SymbolId, buf: *std.ArrayLi
 /// resolved in the current file context. Non-generic (or non-declaring)
 /// nodes append nothing.
 pub fn declTypeParams(c: *Checker, decl: Node, buf: *std.ArrayList(TypeParamInfo)) Error!void {
-    const d = c.tree.nodeData(decl);
-    var tp_start: u32 = 0;
-    var tp_end: u32 = 0;
-    switch (c.nodeTag(decl)) {
-        .class_decl => {
-            const data = c.tree.extraData(ast.ClassData, d.lhs);
-            tp_start = data.tp_start;
-            tp_end = data.tp_end;
-        },
-        .interface_decl => {
-            const data = c.tree.extraData(ast.InterfaceData, d.lhs);
-            tp_start = data.tp_start;
-            tp_end = data.tp_end;
-        },
-        .type_alias => {
-            const data = c.tree.extraData(ast.TypeAlias, d.lhs);
-            tp_start = data.tp_start;
-            tp_end = data.tp_end;
-        },
-        else => return,
-    }
-    // Non-generic declaration: bail before `scopeOf`, which is the
-    // expensive half and is pure overhead for the common case.
-    if (tp_start == tp_end) return;
+    if (!isGenericDeclForm(c, decl)) return;
+    // `writtenTypeParamRange` answers null for a non-generic declaration, which
+    // bails before `scopeOf` — the expensive half, and pure overhead for the
+    // common case.
+    const tps = writtenTypeParamRange(c, decl) orelse return;
     const decl_scope = (try c.scopeOf(decl)) orelse return;
-    for (c.tree.extraRange(tp_start, tp_end)) |tp| {
+    for (tps) |tp| {
         if (tp == null_node or c.nodeTag(tp) != .type_param) continue;
         const a = try c.atomOfToken(c.tree.nodeMainToken(tp));
         const tp_sym = c.bind.lookupInScope(decl_scope, a) orelse continue;
         const td = c.tree.nodeData(tp);
         try buf.append(c.scratch(), .{ .sym = c.toGlobal(tp_sym), .constraint = td.lhs, .default = td.rhs });
     }
+}
+
+/// The declaration forms whose type parameters belong to a generic SYMBOL —
+/// the ones `typeParamsOf` and `buildInstMap` pair with a written argument
+/// list. A function's or signature's own parameters are read off its
+/// signature instead, so they are not these two readers' business even though
+/// `writtenTypeParamRange` can see them.
+fn isGenericDeclForm(c: *const Checker, decl: Node) bool {
+    return switch (c.tree.nodeTag(decl)) {
+        .class_decl, .interface_decl, .type_alias => true,
+        else => false,
+    };
 }
 
 /// The type-parameter list a node WRITES, as an extra-data range, or null
@@ -379,29 +372,10 @@ fn namedTypeParamRef(c: *Checker, node: Node, window: []const Node) Error!?usize
 /// the same positional name, so an instantiation must map all of them (see
 /// `buildInstMap`).
 pub fn typeParamSymsOfDecl(c: *Checker, decl: Node, buf: *std.ArrayList(SymbolId)) Error!void {
-    const d = c.tree.nodeData(decl);
-    var tp_start: u32 = 0;
-    var tp_end: u32 = 0;
-    switch (c.nodeTag(decl)) {
-        .class_decl => {
-            const data = c.tree.extraData(ast.ClassData, d.lhs);
-            tp_start = data.tp_start;
-            tp_end = data.tp_end;
-        },
-        .interface_decl => {
-            const data = c.tree.extraData(ast.InterfaceData, d.lhs);
-            tp_start = data.tp_start;
-            tp_end = data.tp_end;
-        },
-        .type_alias => {
-            const data = c.tree.extraData(ast.TypeAlias, d.lhs);
-            tp_start = data.tp_start;
-            tp_end = data.tp_end;
-        },
-        else => return,
-    }
+    if (!isGenericDeclForm(c, decl)) return;
+    const tps = writtenTypeParamRange(c, decl) orelse return;
     const decl_scope = (try c.scopeOf(decl)) orelse return;
-    for (c.tree.extraRange(tp_start, tp_end)) |tp| {
+    for (tps) |tp| {
         if (tp == null_node or c.nodeTag(tp) != .type_param) continue;
         const a = try c.atomOfToken(c.tree.nodeMainToken(tp));
         const tp_sym = c.bind.lookupInScope(decl_scope, a) orelse continue;
