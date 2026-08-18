@@ -4455,6 +4455,27 @@ fn deleteTargetName(c: *Checker, expr: Node, tag: ast.Tag) Error!?Atom {
     return try c.memberAtom(c.tree.nodeMainToken(ed.rhs));
 }
 
+/// tsc's `checkPrefixUnaryExpression` opens with a switch on the operand's
+/// SYNTAX, not on its type: a numeric literal written directly under `+` or `-`
+/// folds to a FRESH literal type of the signed value, and everything else falls
+/// through to plain `number`.
+///
+/// Syntactic is the entire point of the rule, and the reason it cannot be
+/// phrased over the operand's type: `let a: 1 = +1` is legal, while `+(1)`,
+/// `-(-1)` and `-n` (with `n: 1`) are all `number` and all report. Reading the
+/// type instead made the last two silent.
+///
+/// `-0` normalizes to `0`. tsc interns literal types through a JS `Map`, whose
+/// SameValueZero keys do not tell the two apart; ztsc's f64 key does, so
+/// `let l: 0 = -0` reported "Type '0' is not assignable to type '0'".
+fn signedNumberLiteral(c: *Checker, operand: Node, negate: bool) Error!?TypeId {
+    if (c.nodeTag(operand) != .number_literal) return null;
+    var v = c.numberTokenValue(c.tree.nodeMainToken(operand));
+    if (negate) v = -v;
+    if (v == 0) v = 0;
+    return try c.ts.makeNumberLiteral(v, true);
+}
+
 fn checkPrefixUnary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     const d = c.tree.nodeData(node);
     const op = c.tree.tokens.tag(c.tree.nodeMainToken(node));
@@ -4531,10 +4552,7 @@ fn checkPrefixUnary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             const ot = try c.checkExprCached(d.lhs, types.no_type);
             _ = try checkNonNullType(c, ot, d.lhs);
             _ = try reportSymbolOperand(c, node, d.lhs, d.lhs, ot, ot);
-            const rl = try c.ts.regularLiteral(ot);
-            if (c.ts.kind(rl) == .number_literal) {
-                return c.ts.makeNumberLiteral(-c.ts.numberValue(rl), c.ts.isFreshLiteral(ot));
-            }
+            if (try signedNumberLiteral(c, d.lhs, true)) |lit| return lit;
             // `bigint` only when the operand actually CARRIES a bigint
             // constituent: tsc's getUnaryResultType tests
             // `maybeTypeOfKind(t, BigIntLike)`, not assignability, so the
@@ -4550,6 +4568,11 @@ fn checkPrefixUnary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             const ot = try c.checkExprCached(d.lhs, types.no_type);
             _ = try checkNonNullType(c, ot, d.lhs);
             _ = try reportSymbolOperand(c, node, d.lhs, d.lhs, ot, ot);
+            // `~` coerces unconditionally; unary `+` folds a literal operand
+            // exactly as `-` does.
+            if (op == .plus) {
+                if (try signedNumberLiteral(c, d.lhs, false)) |lit| return lit;
+            }
             return types.number_type;
         },
         .plus_plus, .minus_minus => {
