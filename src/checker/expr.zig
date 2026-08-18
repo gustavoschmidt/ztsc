@@ -279,7 +279,12 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         .true_literal => return c.ts.makeBooleanLiteral(true, true),
         .false_literal => return c.ts.makeBooleanLiteral(false, true),
         .null_literal => return types.null_type,
-        .regex_literal => return types.any_type, // RegExp needs lib (documented)
+        // tsc's `checkExpression` for a regular-expression literal is
+        // `globalRegExpType`. `any` erased every method the lib declares on
+        // it: `/x/.exec(s)` came back `any`, so a match's groups were `any`,
+        // and nothing about a regex was ever wrong — `re.foo`, `re * 2`,
+        // `re` where a string is wanted all passed.
+        .regex_literal => return globalInterfaceType(c, "RegExp"),
         .this_expr => {
             const frame = thisFrame(c);
             // tsc's `checkThisExpression` switches on the container FIRST: a
@@ -1344,14 +1349,20 @@ fn checkTaggedTemplate(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     return calls_zig.resolveSignatureCall(c, node, sigs.items, &.{}, args.items, types.no_type, ctx);
 }
 
-/// The global `TemplateStringsArray` — the type tsc gives the synthesized
-/// first argument of every tagged-template call. `any` when the lib has no
-/// such interface (`--noLib`), which keeps position 0 silent rather than
-/// rejecting every tag in the program.
-fn templateStringsArrayType(c: *Checker) Error!TypeId {
-    const sym = c.prog.globals.lookup(try c.atom("TemplateStringsArray")) orelse return types.any_type;
+/// A lib-declared global INTERFACE, by name and with no type arguments — the
+/// `globalXType` family tsc materializes once per program. `any` when the lib
+/// declares no such interface (`--noLib`), which keeps whatever asked for it
+/// silent rather than rejecting every use in the program.
+fn globalInterfaceType(c: *Checker, comptime name: []const u8) Error!TypeId {
+    const sym = c.prog.globals.lookup(try c.atom(name)) orelse return types.any_type;
     if (!c.symFlags(sym).interface) return types.any_type;
     return c.ts.makeRef(sym, &.{});
+}
+
+/// The global `TemplateStringsArray` — the type tsc gives the synthesized
+/// first argument of every tagged-template call.
+fn templateStringsArrayType(c: *Checker) Error!TypeId {
+    return globalInterfaceType(c, "TemplateStringsArray");
 }
 
 fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
