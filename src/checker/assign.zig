@@ -117,6 +117,42 @@ pub fn isComparable(c: *Checker, a: TypeId, b: TypeId) Error!bool {
     return (try c.isAssignable(a, b)) or (try c.isAssignable(b, a));
 }
 
+/// The domain of tsc's `isSimpleTypeRelatedTo` — the primitives, literals and
+/// enums it decides on flags alone. It matters because the comparable relation
+/// retries a failed pair REVERSED through that function and nothing else
+/// (`isRelatedTo`: `relation === comparableRelation && … isSimpleTypeRelatedTo(
+/// target, source, relation) || isSimpleTypeRelatedTo(source, target, …)`), so
+/// `number` is comparable to `1` while `{}` is NOT comparable to `{ z }`.
+fn simpleRelationKind(k: types.Kind) bool {
+    return switch (k) {
+        .any,
+        .unknown,
+        .never,
+        .void,
+        .undefined,
+        .null,
+        .string,
+        .number,
+        .boolean,
+        .bigint,
+        .symbol,
+        .object_keyword,
+        .bool_true,
+        .bool_false,
+        .string_literal,
+        .number_literal,
+        .number_literal_fresh,
+        .bigint_literal,
+        .enum_type,
+        // tsc's `StringLike` covers these two as well (`TemplateLiteral` and
+        // `StringMapping`), instantiable though they are.
+        .template_literal_type,
+        .string_mapping,
+        => true,
+        else => false,
+    };
+}
+
 /// The relational operators' legality test (`<`, `>`, `<=`, `>=`), which tsc
 /// spells `isTypeComparableTo(l, r) || isTypeComparableTo(r, l)`. Mutual
 /// assignability answers that for every concrete pair; the one place the
@@ -220,6 +256,28 @@ pub fn castComparable(c: *Checker, a: TypeId, b: TypeId) Error!bool {
 /// non-overlapping cast (`T extends {a} as {b}`), and a union rejects only
 /// when NO constituent overlaps (`{q} as (number | boolean)`).
 pub fn castComparableRec(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!bool {
+    return castComparableDir(c, a0, b0, depth, .either);
+}
+
+/// Which way a comparable question is asked.
+///
+/// tsc's comparable relation is a RELATION — one-way, like assignability. The
+/// SYMMETRY belongs to the cast site alone: `checkAssertionWorker` asks
+/// `isTypeComparableTo(expr, target) || isTypeComparableTo(target, expr)`, and
+/// each of those two calls then runs one-way all the way down. Asking a nested
+/// PROPERTY both ways accepts casts tsc rejects — `{ x: T1, y: any }` to
+/// `{ x: T2 }` is TS2352 in tsgo (`T1` lacks `T2`'s members, and the reverse
+/// whole-object direction fails on the absent `y`), but the symmetric property
+/// reading found `T2` assignable to `T1` and took that as overlap
+/// (`objectTypesIdentityWithPrivates3`).
+pub const CompareDir = enum {
+    /// The cast site's own question: either direction may carry it.
+    either,
+    /// Inside one direction of that question: `a` is the relation SOURCE.
+    source_first,
+};
+
+fn castComparableDir(c: *Checker, a0: TypeId, b0: TypeId, depth: u32, dir: CompareDir) Error!bool {
     if (depth > 8) return true; // under-report over false-reject, per policy
     const a = try c.resolveStructural(a0);
     const b = try c.resolveStructural(b0);
@@ -247,7 +305,8 @@ pub fn castComparableRec(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!
     if ((c.ts.kind(a) == .type_param and !deferredCastPeer(c.ts.kind(b))) or
         (c.ts.kind(b) == .type_param and !deferredCastPeer(c.ts.kind(a))))
     {
-        return (try comparableOneWay(c, a0, b0, depth)) or (try comparableOneWay(c, b0, a0, depth));
+        if (try comparableOneWay(c, a0, b0, depth)) return true;
+        return dir == .either and try comparableOneWay(c, b0, a0, depth);
     }
     // A deferred `keyof T` compares through the key domain. tsc relates an
     // `Index` operand via `keyofConstraintType` — `string | number |
@@ -256,8 +315,8 @@ pub fn castComparableRec(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!
     // the `Object.keys(o).forEach((k) => o[k as keyof T])` idiom reported
     // TS2352: `string` is not assignable *into* `keyof T`, and the
     // whole key union is not assignable to `string`.
-    if (c.ts.kind(a) == .keyof_op) return c.castComparableRec(try c.propertyKeyType(), b0, depth + 1);
-    if (c.ts.kind(b) == .keyof_op) return c.castComparableRec(a0, try c.propertyKeyType(), depth + 1);
+    if (c.ts.kind(a) == .keyof_op) return castComparableDir(c, try c.propertyKeyType(), b0, depth + 1, dir);
+    if (c.ts.kind(b) == .keyof_op) return castComparableDir(c, a0, try c.propertyKeyType(), depth + 1, dir);
     // A DEFERRED indexed access (`T[K]`) overlaps everything, like an
     // unconstrained type parameter. tsc only rejects a cast through one when
     // `getBaseConstraintOfType` fully reduces it — which needs the object
@@ -296,29 +355,40 @@ pub fn castComparableRec(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!
     // Without it, the standard idiom of casting the computed result to the
     // declared conditional return type is a spurious TS2352.
     if (c.ts.kind(a) == .conditional) {
-        return (try c.castComparableRec(c.ts.condTrue(a), b0, depth + 1)) or
-            (try c.castComparableRec(c.ts.condFalse(a), b0, depth + 1));
+        return (try castComparableDir(c, c.ts.condTrue(a), b0, depth + 1, dir)) or
+            (try castComparableDir(c, c.ts.condFalse(a), b0, depth + 1, dir));
     }
     if (c.ts.kind(b) == .conditional) {
-        return (try c.castComparableRec(a0, c.ts.condTrue(b), depth + 1)) or
-            (try c.castComparableRec(a0, c.ts.condFalse(b), depth + 1));
+        return (try castComparableDir(c, a0, c.ts.condTrue(b), depth + 1, dir)) or
+            (try castComparableDir(c, a0, c.ts.condFalse(b), depth + 1, dir));
     }
     // Existential union distribution on either side.
     if (c.ts.kind(a) == .union_type) {
         for (try c.memberList(a)) |m| {
-            if (try c.castComparableRec(m, b0, depth + 1)) return true;
+            if (try castComparableDir(c, m, b0, depth + 1, dir)) return true;
         }
         return false;
     }
     if (c.ts.kind(b) == .union_type) {
         for (try c.memberList(b)) |m| {
-            if (try c.castComparableRec(a0, m, depth + 1)) return true;
+            if (try castComparableDir(c, a0, m, depth + 1, dir)) return true;
         }
         return false;
     }
-    if (try c.isComparable(a0, b0)) return true;
+    if (try c.isAssignable(a0, b0)) return true;
+    // The reverse probe. At the cast site it is the OTHER half of
+    // `checkAssertionWorker`'s two calls; one level down it is tsc's
+    // `isRelatedTo`, which under the comparable relation retries the pair
+    // reversed through `isSimpleTypeRelatedTo` ALONE — primitives, literals and
+    // enums, never an object shape. `{ a: number }` stays castable to
+    // `{ a: 1 }`; `{ x: {} }` stops being castable to `{ x: { z } }` just
+    // because `{ z }` fits `{}`.
+    if (dir == .either or (simpleRelationKind(c.ts.kind(a)) and simpleRelationKind(c.ts.kind(b)))) {
+        if (try c.isAssignable(b0, a0)) return true;
+    }
     if (try c.stringEnumCastOverlap(a, b)) return true;
-    return (try c.lenientOverlap(a0, b0, depth)) or (try c.lenientOverlap(b0, a0, depth));
+    if (try c.lenientOverlap(a0, b0, depth)) return true;
+    return dir == .either and try c.lenientOverlap(b0, a0, depth);
 }
 
 /// The two string-enum shapes tsc's assertion check accepts and mutual
@@ -519,7 +589,12 @@ pub fn lenientOverlap(c: *Checker, s0: TypeId, t0: TypeId, depth: u32) Error!boo
             if (sp.optional()) st = try c.makeUnion2(st, types.undefined_type);
             var tt = tp.ty;
             if (tp.optional()) tt = try c.makeUnion2(tt, types.undefined_type);
-            if (!try c.lenientComparable(st, tt, depth + 1)) return false;
+            // ONE-WAY, in this walk's own direction: `s` is the relation
+            // source here, so its property is the source property. See
+            // `CompareDir` — the other whole-object direction is a separate
+            // `lenientOverlap(t, s)` call at the cast site, not a second
+            // reading of each property.
+            if (!try castComparableDir(c, st, tt, depth + 1, .source_first)) return false;
         }
         // A callable/constructable target is decided on its signatures too,
         // not on its (often empty) property table: `{ new (p: A): X }` and
@@ -2106,10 +2181,10 @@ pub fn distributiveConstraint(c: *Checker, cond: TypeId) Error!?TypeId {
         // undecided, and the caller's branch union — which is what an undecided
         // constituent would contribute anyway — stands for every constituent.
         .union_type => {
-            const con_members = try c.memberList(con);
+            const parts_in = try c.memberList(con);
             var parts: std.ArrayList(TypeId) = .empty;
             defer parts.deinit(c.scratch());
-            for (con_members) |m| {
+            for (parts_in) |m| {
                 const r = (try constraintWalk(c, cond, chk, m)) orelse return null;
                 try parts.append(c.scratch(), r);
             }
