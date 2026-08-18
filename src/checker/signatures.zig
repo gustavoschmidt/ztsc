@@ -1641,14 +1641,42 @@ pub fn appendOverloadCandidates(c: *Checker, out: *std.ArrayList(TypeId), ov: Ty
 /// type literal, a class instance, an inherited-only signature list — keeps
 /// the stored order.
 pub fn appendObjectCallCandidates(c: *Checker, out: *std.ArrayList(TypeId), obj: TypeId) Error!void {
-    const n = c.ts.objectCallSigCount(obj);
-    const appendAll = struct {
-        fn f(ck: *Checker, dst: *std.ArrayList(TypeId), o: TypeId, cnt: u32) Error!void {
-            for (0..cnt) |i| try dst.append(ck.scratch(), ck.ts.objectCallSig(o, @intCast(i)));
+    return appendObjectSigCandidates(c, out, obj, .call);
+}
+
+/// The same reordering for CONSTRUCT signatures. `MapConstructor` is the
+/// canonical case: lib.es2015.collection declares
+/// `new <K, V>(entries?: readonly (readonly [K, V])[] | null)` and
+/// lib.es2015.iterable reopens the interface with
+/// `new <K, V>(iterable?: Iterable<readonly [K, V]> | null)`, so `new Map(42)`
+/// tries the ITERABLE overload first and reports its failure against the
+/// `entries` one — the last candidate in resolution order.
+pub fn appendObjectConstructCandidates(c: *Checker, out: *std.ArrayList(TypeId), obj: TypeId) Error!void {
+    return appendObjectSigCandidates(c, out, obj, .construct);
+}
+
+const SigKind = enum { call, construct };
+
+fn appendObjectSigCandidates(c: *Checker, out: *std.ArrayList(TypeId), obj: TypeId, kind: SigKind) Error!void {
+    const n = switch (kind) {
+        .call => c.ts.objectCallSigCount(obj),
+        .construct => c.ts.objectConstructSigCount(obj),
+    };
+    const sigAt = struct {
+        fn f(ck: *Checker, o: TypeId, i: u32, k: SigKind) TypeId {
+            return switch (k) {
+                .call => ck.ts.objectCallSig(o, i),
+                .construct => ck.ts.objectConstructSig(o, i),
+            };
         }
     }.f;
-    if (n < 2) return appendAll(c, out, obj, n);
-    const span = callSigGroupsOf(c, obj) orelse return appendAll(c, out, obj, n);
+    const appendAll = struct {
+        fn f(ck: *Checker, dst: *std.ArrayList(TypeId), o: TypeId, cnt: u32, k: SigKind) Error!void {
+            for (0..cnt) |i| try dst.append(ck.scratch(), sigAt(ck, o, @intCast(i), k));
+        }
+    }.f;
+    if (n < 2) return appendAll(c, out, obj, n, kind);
+    const span = sigGroupsOf(c, obj, kind) orelse return appendAll(c, out, obj, n, kind);
     // `bounds` is `groups + 1` ascending offsets: group `i` is
     // `[bounds[i], bounds[i + 1])` and `bounds[len - 1]` is the end of the
     // declarations' own (non-inherited) prefix. The boundaries index the
@@ -1658,28 +1686,33 @@ pub fn appendObjectCallCandidates(c: *Checker, out: *std.ArrayList(TypeId), obj:
     // than drop or duplicate a signature.
     const bounds = c.overload_group_pool.items[span.start..][0..span.len];
     if (bounds.len < 3 or bounds[0] != 0 or bounds[bounds.len - 1] > n) {
-        return appendAll(c, out, obj, n);
+        return appendAll(c, out, obj, n, kind);
     }
     var i = bounds.len - 1;
     while (i > 0) {
         i -= 1;
-        for (bounds[i]..bounds[i + 1]) |k| try out.append(c.scratch(), c.ts.objectCallSig(obj, @intCast(k)));
+        for (bounds[i]..bounds[i + 1]) |k| try out.append(c.scratch(), sigAt(c, obj, @intCast(k), kind));
     }
     // Anything past the prefix is INHERITED. tsc restarts its grouping at the
     // end of the result list whenever the declaring symbol changes, so those
     // stay after the reversed groups, in order.
-    for (bounds[bounds.len - 1]..n) |k| try out.append(c.scratch(), c.ts.objectCallSig(obj, @intCast(k)));
+    for (bounds[bounds.len - 1]..n) |k| try out.append(c.scratch(), sigAt(c, obj, @intCast(k), kind));
 }
 
-/// The declaration-group boundaries recorded for `obj`'s call signatures:
-/// `obj` itself when it IS the generic table, else the table its `origin` ref
-/// names (`interfaceGeneric`'s memo, read without materializing anything).
-fn callSigGroupsOf(c: *Checker, obj: TypeId) ?checker_zig.BaseSpan {
-    if (c.overload_groups.get(obj)) |s| return s;
+/// The declaration-group boundaries recorded for `obj`'s call (or construct)
+/// signatures: `obj` itself when it IS the generic table, else the table its
+/// `origin` ref names (`interfaceGeneric`'s memo, read without materializing
+/// anything).
+fn sigGroupsOf(c: *Checker, obj: TypeId, kind: SigKind) ?checker_zig.BaseSpan {
+    const map = switch (kind) {
+        .call => &c.overload_groups,
+        .construct => &c.construct_groups,
+    };
+    if (map.get(obj)) |s| return s;
     const orig = c.origin.get(obj) orelse return null;
     if (c.ts.kind(orig) != .ref) return null;
     const generic = c.iface_generic.get(c.ts.refSymbol(orig)) orelse return null;
-    return c.overload_groups.get(generic);
+    return map.get(generic);
 }
 
 /// The last call signature (a `.function` TypeId) reachable from any

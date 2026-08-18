@@ -613,9 +613,12 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
             // `declare var Array: ArrayConstructor` then `new Array()`.
             // The signature's own return type is the instance type, so no
             // `instance_ret` override is needed (unlike a class value).
-            for (0..c.ts.objectConstructSigCount(r)) |i| {
-                try sigs.append(c.scratch(), c.ts.objectConstructSig(r, @intCast(i)));
-            }
+            //
+            // In `reorderCandidates` order: a `…Constructor` interface that
+            // several lib files reopen resolves its LAST declaration group
+            // first (`MapConstructor` + lib.es2015.iterable's `iterable`
+            // overload) — see `appendObjectConstructCandidates`.
+            try c.appendObjectConstructCandidates(&sigs, r);
         } else if (rk == .union_type) {
             // `new (typeof A | typeof B)()`. tsc resolves a union callee's
             // signatures with `getUnionSignatures` over the constituents'
