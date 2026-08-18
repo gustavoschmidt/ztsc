@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-17, post wave 17)
+## Standings (2026-08-17, post wave 18 — 80% crossed)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **6858 / 8628 (79.5%)** |
-| excess keys (false positives) | 3541 | 2027 |
-| missing keys (under-reports) | 8617 | 4026 |
+| exact-match cases | 4902 / 7815 (62.7%) | **6963 / 8628 (80.7%)** |
+| excess keys (false positives) | 3541 | 2005 |
+| missing keys (under-reports) | 8617 | 3820 |
 | bucketed (ztsc parse error, incomparable) | 825 | 13 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Seventeen waves landed (3–17), every one with ZERO match→non-match regressions in
+Eighteen waves landed (3–18), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -190,7 +190,78 @@ IMPORTANT clarification from D: the recurring "social-app loads 4778 files /
 0 link errors" symptom is the WRONG CONFIG — agents must use tsconfig.json,
 not tsconfig.check.json; the checkout was fine.
 
-## Ranked next queue (wave 18) — distilled from wave-17 agent reports
+Wave 18 (+105 cases, the largest wave; 80% crossed; social-app baseline
+refreshed for a tsgo-proven namespace-print change in bskyogcard, keys
+unchanged): A removed untrustworthyOverride outright, split
+private/protected Prop bits (prop_flag_protected refines non_public),
+tightened TS2320 identity. B landed the three alias-order sites (shared
+modvalue.aliasValueVerdict), root-caused TS2454 twice (for-of var head typed
+any — a real typing bug; has_init vs tsc's flow rule), TS2394, importType
+TS2741. C landed tsc's effective-argument-list spread expansion (the whole
+iteratorSpreadInCall family) + TS2556 + union-callee raw min arity; closed
+the TS2769-anchor target (tsgo uses the LAST candidate's anchor — ztsc
+already matches). D fixed cross-file TS2403 (firstValueDeclOf trimming),
+the phantom-modifier parse of type members (+30 alone), TS6053/TS2308/TS2309,
+TS1212 positions.
+
+## Ranked next queue (wave 19) — distilled from wave-18 agent reports
+
+1. Tagged templates never check substitution arguments (~21 keys):
+   expr.zig:1237 checkTaggedTemplate already builds the argument list —
+   checkCallArguments is one call away.
+2. TS2744 type-parameter-default forward references (~20 keys in
+   genericDefaults.ts: 11 missing TS2744 + 9 excess TS2345 because ztsc
+   resolves the forward default instead of degrading to error). Declaration
+   check + props.zig typeParamDefault.
+3. Lib overload order: ztsc's src/lib has es2015.collection's MapConstructor
+   BEFORE es2015.iterable's, so the last overload is the Iterable one; tsgo's
+   merged order puts Iterable first / array last (proved via `new Map(42)`
+   last-overload error text). Reorder iterable Map/Set/WeakMap/WeakSet
+   overloads ahead of collection ones — fixes for-of39/iterableArrayPattern28;
+   elaborateLiteralError needs no change.
+4. Conditional-type substituted reading (A's oracle-corrected diagnosis):
+   tsc erases to the branch union WITH definitely-false branches dropped
+   under the check param's constraint. ztsc has the walk as
+   assign.distributiveConstraintRelates/remainingBranchUnion but only as a
+   bool — re-expose type-returning, consume from expr.deferredDefaultConstraint.
+5. lenientOverlap's nested property comparability is symmetric; tsc relates
+   one-way under comparable (objectTypesIdentityWithPrivates3). One line in
+   assign.zig; the symmetry was deliberate — measure.
+6. Overload-probe memo poisoning (root cause found): rollbackArgDiags
+   withdraws diagnostics but probe-created node_types entries survive, so the
+   winner cache-hits and never re-files (dottedSymbolResolution1,
+   thisInFunctionCall). Fix = invalidate node_types over the argument range
+   on rollback, or adopt tsc's checkDeferredNodes deferral for function-expr
+   bodies. Needs a measured attempt — the winner re-walks every callback body.
+7. complexRecursiveCollections: two concat<C> signatures whose distinct
+   type-param symbols fail to unify (assign/signatures) — 4 excess TS2430
+   elaborations of `C | T` vs `C | T`.
+8. Array-literal element contextual typing against a LEADING-variadic tuple
+   reads position-from-start (expr → tupleElemTypeAt); the call path already
+   reads from the end (tuple_relate.contextualElemType) — 4 keys,
+   contextualTypeTupleEnd.
+9. keyof array/tuple approximated as `number` (keyof.zig:180) — 9 keys in
+   variadicTuples1; big blast radius (mapped types over arrays), measure.
+10. No-return function with contextual return type CONTAINING undefined
+    infers `undefined`, not void (TS 5.1) — 5 keys.
+11. `var a;` evolving-any should read `undefined` before any assignment —
+    6 keys (flow.zig). switchIsExhaustive misses singleton discriminants
+    (reachability.zig; false TS2454).
+12. RegExp typing: expr.zig:274 types every regex literal `any`; hook up the
+    lib RegExp interface (validate-and-justify cycle — changes both apps'
+    types); then RegExp arithmetic TS2362/63 + RegExp.foo TS2339.
+13. Grammar residue: TS2394 for constructor overloads; TS1024 readonly on
+    type-member method (3 keys); TS1212-family word naming via Diagnostic.arg.
+14. prim→prim under-report bucket (121 keys / 57 cases) — RE-CHECK after
+    items 1-2 land; C's triage says it is mostly those structural gaps.
+15. regexp.zig extensions (Unicode property tables, v-mode set operators,
+    backrefs, octal) — low yield, well-mapped.
+16. nestedExcessPropertyChecking per-frame weak rule (risky; flow/062);
+    resolution-mode import attributes (deep); determinism defect
+    (social-app --checkers=1 vs --file-order=reverse, Navigation.tsx:778:29,
+    instantiation-budget partition bug).
+
+## Superseded queue (wave 18, kept for context)
 
 1. heritage.zig `untrustworthyOverride` — the single biggest mapped blocker:
    it declines EVERY TS2430 when the interface redeclares any base member with
