@@ -55,6 +55,12 @@ pub fn checkComputedName(c: *Checker, name_node: Node) Error!TypeId {
     if (name_node == null_node or c.nodeTag(name_node) != .computed_name) return types.no_type;
     const expr = c.tree.nodeData(name_node).lhs;
     if (superInNameIsError(c)) try reportSuperInName(c, expr, 0);
+    // A super CALL in the name is this file's TS2466, never the call site's
+    // TS2337 — tsc's `checkSuperExpression` tests the computed name first.
+    // (wave-20 A: `Checker.in_computed_key`.)
+    const saved_key = c.in_computed_key;
+    c.in_computed_key = true;
+    defer c.in_computed_key = saved_key;
     const kt = try c.checkExprCached(expr, types.no_type);
     try report(c, name_node, kt);
     return kt;

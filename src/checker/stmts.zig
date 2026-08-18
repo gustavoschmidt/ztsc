@@ -1034,13 +1034,16 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
     // …and the super-call container: this body is the container for every
     // `super(…)` written directly in it, whatever the enclosing one was.
     const saved_in_ctor = c.in_ctor_body;
+    const saved_in_key = c.in_computed_key;
     c.in_ctor_body = c.nodeTag(node) == .class_method and c.isCtorMember(node, proto.flags);
+    c.in_computed_key = false;
     defer {
         c.cur_scope = saved_scope;
         c.fn_ctx = saved_ctx;
         c.this_type = saved_this;
         c.field_init_depth = saved_field_init;
         c.in_ctor_body = saved_in_ctor;
+        c.in_computed_key = saved_in_key;
     }
     if (try c.scopeOf(node)) |s| c.cur_scope = s;
     // An explicit `this` parameter types `this` inside the body.

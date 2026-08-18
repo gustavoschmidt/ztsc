@@ -418,10 +418,14 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
         // true)`, so arrows count) is a constructor. A `super()` in a field
         // initializer, in a static field, in an arrow or function expression
         // inside the constructor, or in an object-literal accessor there is
-        // this error and nothing else. The arguments are still resolved
-        // against the base constructor below, which is where any further
-        // diagnostic about them comes from.
-        if (!c.in_ctor_body) {
+        // this error — except inside a computed property NAME, where
+        // `getSuperContainer` steps over the owning member entirely and TS2466
+        // is the answer instead (`computedPropertyNames30`; see
+        // `Checker.in_computed_key`).
+        //
+        // The arguments are still resolved against the base constructor below,
+        // which is where any further diagnostic about them comes from.
+        if (!c.in_ctor_body and !c.in_computed_key) {
             try c.diagFmt(2337, c.nodeSpan(shape.callee), "Super calls are not permitted outside constructors or in nested functions inside constructors.", .{});
         }
         if (try superCtorSigs(c, &super_sigs)) {
@@ -1262,20 +1266,8 @@ pub fn resolveSignatureCall(
 /// depends on the contextual signature.
 const contextual_implicit_any = [_]u16{ 7006, 7019, 7031 };
 
-/// `instantiateSigForCall` for the candidate the call is TYPED with once
-/// resolution has failed. tsc's `pickLongestCandidateSignature` instantiates
-/// such a candidate for its return type alone and never re-reports against it.
-/// ztsc's pick is `sigs[0]`, which may be an overload the written type-argument
-/// list does not fit — and TS2558 for THAT is a complaint about the signature
-/// ztsc happened to pick, not about the call: `_.map<number, string, Date>(c2,
-/// rf1)` over a two-overload `Combinators` reported "Expected 2 type arguments,
-/// but got 3" against the first overload, which `hasCorrectTypeArgumentArity`
-/// had already dropped from the candidate list (`genericCombinators2`).
-///
-/// Only that code is withdrawn. A type-argument-arity error the call really
-/// does have is reported from the candidate list — the lone-candidate arm of
-/// `resolveSignatureCall`, or `instantiateSigForCall` on the report signature —
-/// before this ever runs.
+/// "Expected N type arguments, but got M" — the one code
+/// `instantiateFallbackSig` withdraws.
 const targ_arity_code = [_]u16{2558};
 
 /// The type-parameter list's accepted arity RANGE when `written` is outside it,
@@ -1292,6 +1284,20 @@ fn targArityMismatch(tps: []const TypeParamInfo, written: usize) ?struct { min: 
     return .{ .min = min, .max = tps.len };
 }
 
+/// `instantiateSigForCall` for the candidate the call is TYPED with once
+/// resolution has failed. tsc's `pickLongestCandidateSignature` instantiates
+/// such a candidate for its return type alone and never re-reports against it.
+/// ztsc's pick is `sigs[0]`, which may be an overload the written type-argument
+/// list does not fit — and TS2558 for THAT is a complaint about the signature
+/// ztsc happened to pick, not about the call: `_.map<number, string, Date>(c2,
+/// rf1)` over a two-overload `Combinators` reported "Expected 2 type arguments,
+/// but got 3" against the first overload, which `hasCorrectTypeArgumentArity`
+/// had already dropped from the candidate list (`genericCombinators2`).
+///
+/// Only that code is withdrawn. A type-argument-arity error the call really
+/// does have is reported from the candidate list — the lone-candidate arm of
+/// `resolveSignatureCall`, or `instantiateSigForCall` on the report signature —
+/// before this ever runs.
 fn instantiateFallbackSig(
     c: *Checker,
     sig: TypeId,

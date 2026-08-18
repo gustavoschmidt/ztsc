@@ -1875,6 +1875,15 @@ pub const Checker = struct {
     /// entry for every function body — and cleared for a class body's members,
     /// whose initializers are containers of their own.
     in_ctor_body: bool = false,
+    /// Is the expression currently being walked a computed property NAME's?
+    /// `getSuperContainer` steps OVER a `ComputedPropertyName`, so a `super`
+    /// written there never reaches a legal container — and tsc's
+    /// `checkSuperExpression` tests for the computed name FIRST, reporting
+    /// TS2466 in place of the TS2337 the same call would get anywhere else.
+    /// The call site has no parent pointers to ask, so the name walk marks it.
+    /// Cleared by `checkFunctionBody`, since a function written inside the name
+    /// IS a container (`{ [(() => super())()]: 1 }` is TS2337 again).
+    in_computed_key: bool = false,
     /// The property-access node a COMPOUND assignment is currently writing, as
     /// a `nodeKey` (0 = none). tsc runs one member-accessibility check per access node,
     /// against the setter when the node is an assignment target

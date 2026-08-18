@@ -832,8 +832,13 @@ fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) Erro
     // memoizes, so judging it under the enclosing constructor's container
     // silently lost the TS2337.
     const saved_in_ctor = c.in_ctor_body;
-    defer c.in_ctor_body = saved_in_ctor;
+    const saved_in_key = c.in_computed_key;
+    defer {
+        c.in_ctor_body = saved_in_ctor;
+        c.in_computed_key = saved_in_key;
+    }
     c.in_ctor_body = c.nodeTag(fn_node) == .class_method and c.isCtorMember(fn_node, proto.flags);
+    c.in_computed_key = false;
     // …and *this* function's receiver, for exactly the same reason.
     // `checkFunctionBody` installs the explicit `this` parameter's type
     // before walking the body; this probe walks the same expressions and
