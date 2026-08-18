@@ -51,10 +51,14 @@ pub const Home = enum { class_body, ambient_class_body, type_space };
 ///
 /// Safe to call on a non-`.computed_name` node, which is what lets a member
 /// walk hand over whatever it has for a name.
-pub fn checkComputedName(c: *Checker, name_node: Node) Error!TypeId {
+/// `on_class` says the name belongs to a CLASS member — the one home in which
+/// a `this` reference inside it is TS2465 (see `IllegalRefs`). An object
+/// literal's name passes `false`, and so does an interface's or type literal's.
+pub fn checkComputedName(c: *Checker, name_node: Node, on_class: bool) Error!TypeId {
     if (name_node == null_node or c.nodeTag(name_node) != .computed_name) return types.no_type;
     const expr = c.tree.nodeData(name_node).lhs;
-    if (superInNameIsError(c)) try reportSuperInName(c, expr, 0);
+    const want: IllegalRefs = .{ .super = superInNameIsError(c), .this = on_class };
+    if (want.super or want.this) try reportIllegalRefs(c, expr, want, 0);
     const kt = try c.checkExprCached(expr, types.no_type);
     try report(c, name_node, kt);
     return kt;
@@ -90,19 +94,56 @@ fn superInNameIsError(c: *Checker) bool {
     }
 }
 
-/// Walk the name expression for a `super`, stopping at a nested
-/// `function`/class boundary: such a node IS a super container, and
-/// `getSuperContainer` returns it before the computed name is ever reached.
-fn reportSuperInName(c: *Checker, node: Node, depth: u16) Error!void {
+/// Which of the two keyword references a walk of the name expression should
+/// refuse. They share one traversal because they share the boundary exactly:
+/// both `getSuperContainer` and `getThisContainer` stop at the same set of
+/// nodes on the way out, and step over the same ones.
+const IllegalRefs = struct {
+    /// TS2466 — see `superInNameIsError` for when this is on.
+    super: bool,
+    /// TS2465: `this` cannot be referenced in a computed property name.
+    ///
+    /// tsc's `getThisContainer(node, includeArrowFunctions: true,
+    /// includeClassComputedPropertyName: true)` makes a ComputedPropertyName a
+    /// `this` container in its own right — but ONLY when its grandparent is
+    /// class-like. `checkThisExpression` then reports on that container instead
+    /// of switching on the ordinary ones.
+    ///
+    /// So it is the class-ness of the home that decides, not the name: an
+    /// interface's or a type literal's computed name steps over (its `this` is
+    /// `typeof globalThis`, and the shape reports TS7017 instead), while an
+    /// AMBIENT class body reports exactly like a concrete one.
+    this: bool,
+};
+
+/// Walk the name expression for an illegal `super`/`this`, stopping at a nested
+/// `function`/class boundary: such a node IS the reference's container, and the
+/// `getSuperContainer` / `getThisContainer` walk returns it before the computed
+/// name is ever reached.
+///
+/// An ARROW is deliberately absent from the boundary set — it has no `this` or
+/// `super` of its own, so `class C { [(() => this.bar())()]() {} }` reports —
+/// and so is the OBJECT LITERAL, which lets the walk reach a `this` nested in
+/// an inner object literal's own computed name
+/// (`[{ [this.bar()]: 1 }[0]]() {}`, `computedPropertyNames23`). A nested CLASS
+/// is a boundary for the opposite reason: its members' names get their own
+/// `checkMemberNames` pass, so descending would report them twice.
+fn reportIllegalRefs(c: *Checker, node: Node, want: IllegalRefs, depth: u16) Error!void {
     if (node == null_node or depth > max_name_depth) return;
     switch (c.nodeTag(node)) {
-        .super_expr => return c.diagFmt(
+        .super_expr => if (want.super) return c.diagFmt(
             2466,
             c.nodeSpan(node),
             "'super' cannot be referenced in a computed property name.",
             .{},
         ),
-        // A `super` written inside one of these has IT as its container, so
+        .this_expr => if (want.this) return c.diagFmt(
+            2465,
+            c.nodeSpan(node),
+            "'this' cannot be referenced in a computed property name.",
+            .{},
+        ),
+        // A reference written inside one of these has IT as its container, so
         // the computed name never enters the answer.
         .function_expr,
         .function_decl,
@@ -114,7 +155,7 @@ fn reportSuperInName(c: *Checker, node: Node, depth: u16) Error!void {
         else => {},
     }
     var it = c.tree.childIterator(node);
-    while (it.next()) |child| try reportSuperInName(c, child, depth + 1);
+    while (it.next()) |child| try reportIllegalRefs(c, child, want, depth + 1);
 }
 
 /// Far above any hand-written key expression; the cap only ever under-reports.
@@ -156,7 +197,7 @@ pub fn checkMemberNames(c: *Checker, members: []const Node, home: Home) Error!vo
         if (c.node_types.contains(c.nodeKey(c.tree.nodeData(key).lhs))) continue;
         // Only a non-ambient class FIELD's name is a use that can be too early.
         c.defer_computed_key_tdz = home != .class_body or c.nodeTag(m) != .class_field;
-        _ = try checkComputedName(c, key);
+        _ = try checkComputedName(c, key, home != .type_space);
     }
 }
 
