@@ -1035,6 +1035,26 @@ pub fn inferTypeArgs(
                         // so the probe's walk records no contravariant
                         // candidate and clears no top-level flag (see
                         // `InferCtx.Rev`).
+                        //
+                        // Giving the probe its OWN `contra`/`contra_sup` and
+                        // running tsc's `getInferredType` choice
+                        // (`preferContravariant`) over the pair is faithful and
+                        // is MEASURABLY worse: react-query's
+                        // `useInfiniteQuery({queryFn: ({pageParam}:
+                        // {pageParam?: string}) => …, initialPageParam:
+                        // undefined, getNextPageParam: lastPage => …})` pins
+                        // `TPageParam` at the covariant `undefined` — which is
+                        // a subtype of the annotated `string | undefined`, so
+                        // tsc's own rule picks it — and `getNextPageParam`'s
+                        // `string | undefined` return then fits no overload
+                        // (4 diagnostics on social-app). What supplies
+                        // `string | undefined` today is exactly this fold of
+                        // the contravariant candidate into the covariant
+                        // accumulator. Making the split hold here needs the
+                        // half tsc has and ztsc does not: pass two re-deriving
+                        // its own candidates rather than reading the probe's
+                        // published answer, so the callback's RETURN can still
+                        // contribute after the parameter has been fixed.
                         const probe_rev = try c.scratch().alloc(bool, tp_syms.len);
                         for (probe_rev) |*x| x.* = false;
                         const outer_rev = c.infer_ctx.rev;
@@ -1514,12 +1534,7 @@ pub fn inferTypeArgs(
     // reported TS2322 on the FIRST argument. `contra_sup` is the union of the
     // candidates, standing in for the `some` (see `InferCtx.contra_sup`).
     for (candidates, 0..) |*cd, i| {
-        const ct = contra[i];
-        if (ct == types.no_type) continue;
-        if (cd.* != types.no_type and c.ts.kind(cd.*) != .never and
-            (try c.covSubtypeOf(cd.*, ct) or
-                (contra_sup[i] != types.no_type and try c.covSubtypeOf(cd.*, contra_sup[i])))) continue;
-        cd.* = ct;
+        cd.* = try preferContravariant(c, cd.*, contra[i], contra_sup[i]);
     }
     // A provisional map over the raw candidates, so an inter-dependent
     // constraint (`K extends keyof T`) is checked with the *other*
@@ -2069,6 +2084,28 @@ pub fn covStripNullable(c: *Checker, t: TypeId) Error!TypeId {
     }.keep);
 }
 
+/// One type parameter's answer, given its covariant candidate `cov` and the
+/// contravariant pair (`con`, the common-subtype fold; `con_sup`, the union
+/// standing in for the candidate LIST — see `InferCtx.contra_sup`).
+///
+/// tsc's `getInferredType`:
+///
+/// ```ts
+/// inferredType = inferredCovariantType && !(inferredCovariantType.flags & TypeFlags.Never) &&
+///     some(inference.contraCandidates, t => isTypeSubtypeOf(inferredCovariantType, t)) ?
+///     inferredCovariantType : getContravariantInference(inference);
+/// ```
+///
+/// Shared by the outer resolution and the two-round object-literal probe,
+/// which runs the same choice over its own scratch candidate arrays.
+fn preferContravariant(c: *Checker, cov: TypeId, con: TypeId, con_sup: TypeId) Error!TypeId {
+    if (con == types.no_type) return cov;
+    if (cov == types.no_type or c.ts.kind(cov) == .never) return con;
+    if (try c.covSubtypeOf(cov, con)) return cov;
+    if (con_sup != types.no_type and try c.covSubtypeOf(cov, con_sup)) return cov;
+    return con;
+}
+
 /// `isTypeSubtypeOf` as far as the supertype fold needs it: assignability
 /// plus the one place the subtype relation is strictly stronger and the
 /// difference is observable here — a source that omits an OPTIONAL property
@@ -2079,10 +2116,25 @@ pub fn covSubtypeOf(c: *Checker, a: TypeId, b: TypeId) Error!bool {
     if (!try c.isAssignable(a, b)) return false;
     const rb = try c.resolveStructural(b);
     if (c.ts.kind(rb) != .object) return true;
-    for (0..c.ts.objectPropCount(rb)) |i| {
-        const p = c.ts.objectProp(rb, @intCast(i));
-        if (p.flags & types.prop_flag_optional == 0) continue;
-        if (try c.propOfType(a, p.name) == null) return false;
+    const ra = try c.resolveStructural(a);
+    // …EXCEPT when the source was written as an object literal (or is a
+    // tuple). tsc gates the whole optional-property demand on
+    // `requireOptionalProperties = (relation === subtypeRelation ||
+    // relation === strictSubtypeRelation) && !isObjectLiteralType(source) &&
+    // !isEmptyArrayLiteralType(source) && !isTupleType(source)`, and a
+    // covariant inference candidate is an object literal exactly as often as
+    // not: `route({ pre: (a: { query?: unknown; body?: unknown }) => {},
+    // schema: { query: "" } })` contributes the covariant `{ query: string }`
+    // and the contravariant `{ query?: unknown; body?: unknown }`, and
+    // demanding `body` of the literal rejected the covariant answer, so
+    // `TSchema["query"]` came out `unknown` (`coAndContraVariantInferences7`).
+    const require_optional = !c.ts.objectIsLiteralOrigin(ra) and c.ts.kind(ra) != .tuple;
+    if (require_optional) {
+        for (0..c.ts.objectPropCount(rb)) |i| {
+            const p = c.ts.objectProp(rb, @intCast(i));
+            if (p.flags & types.prop_flag_optional == 0) continue;
+            if (try c.propOfType(a, p.name) == null) return false;
+        }
     }
     // An INDEX SIGNATURE on the target must be present on the source. This
     // is the assignable/subtype gap that decides `reduce`: assignability
@@ -2099,7 +2151,6 @@ pub fn covSubtypeOf(c: *Checker, a: TypeId, b: TypeId) Error!bool {
     // `arr.reduce((acc: Record<string, true>, e) => …, {})` inferred `{}`
     // for the accumulator; every later read of the result was then an
     // implicit-any element access (TS7053).
-    const ra = try c.resolveStructural(a);
     inline for (.{ types.Store.objectStringIndex, types.Store.objectNumberIndex }) |idx| {
         if (idx(&c.ts, rb) != 0) {
             if (c.ts.kind(ra) != .object) return false;
