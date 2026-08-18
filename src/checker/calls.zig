@@ -1689,8 +1689,18 @@ fn combineTwoUnionSignatures(c: *Checker, left: TypeId, right0: TypeId) Error!?T
     }
     const lc = try unionSigPositions(c, left);
     const rc = try unionSigPositions(c, right);
-    const lreq = try c.requiredParams(left);
-    const rreq = try c.requiredParams(right);
+    // tsc's `combineSignaturesOfUnionMembers` takes `Math.max(left
+    // .minArgumentCount, right.minArgumentCount)` — the signatures' RAW
+    // minimums, counted off the declared parameter list, not
+    // `getMinArgumentCount`'s tuple-rest expansion. A signature whose only
+    // parameter is a rest declares NO required argument however the tuple
+    // typing it is shaped, so `((...a: [string]) => void) | ((...a: []) =>
+    // void)` combines to a signature callable with none. Reading the expanded
+    // minimum made the combined position REQUIRED and `fn(...args)` over
+    // `signatureCombiningRestParameters1`'s mapped bag came out TS2556
+    // instead of tsc's TS2345 about the `never` the positions intersect to.
+    const lreq = rawMinArgs(c, left);
+    const rreq = rawMinArgs(c, right);
     const n = @max(lc, rc);
     // tsc's `combineUnionParameters` rest bookkeeping: the combined signature
     // keeps a rest at its LAST position when either side has an effective one
@@ -1733,6 +1743,18 @@ fn combineTwoUnionSignatures(c: *Checker, left: TypeId, right0: TypeId) Error!?T
     }
     const ret = try s.makeUnion(c.scratch(), &.{ s.fnReturn(left), s.fnReturn(right) });
     return try s.makeFunction(params.items, ret, ltp, 0);
+}
+
+/// A signature's RAW `minArgumentCount`: the declared parameters before the
+/// first optional or rest one. tsc records this on the signature at creation;
+/// `getMinArgumentCount` is the expanded reading built on top of it.
+fn rawMinArgs(c: *const Checker, sig: TypeId) u32 {
+    const count = c.ts.fnParamCount(sig);
+    for (0..count) |i| {
+        const p = c.ts.fnParam(sig, @intCast(i));
+        if (p.optional() or p.rest()) return @intCast(i);
+    }
+    return count;
 }
 
 /// tsc's `getParameterCount`: how many POSITIONS a signature declares. A
