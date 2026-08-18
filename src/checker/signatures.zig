@@ -795,6 +795,18 @@ fn mayReturnNever(c: *Checker, fn_node: Node) bool {
     };
 }
 
+/// Does a contextual return type name `undefined` outright? tsc's
+/// `(unwrapReturnType(contextualReturnType, functionFlags) || undefinedType)
+/// .flags & TypeFlags.Undefined`, over a union's constituents — `void` is a
+/// different flag and deliberately does not count.
+fn ctxReturnAdmitsUndefined(c: *Checker, ret_ctx: TypeId) Error!bool {
+    return c.unionAnyMember(try c.resolveStructural(ret_ctx), struct {
+        fn f(ch: *Checker, m: TypeId) bool {
+            return ch.ts.kind(m) == .undefined;
+        }
+    }.f);
+}
+
 fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) Error!TypeId {
     if (body == 0) return types.any_type;
     // Establish *this* function's async/generator context while checking
@@ -940,6 +952,30 @@ fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) Erro
         // fast path stopped hiding the pair.
         if (c.stmtListTerminal(c.tree.nodeRange(body)) and mayReturnNever(c, fn_node)) {
             return types.never_type;
+        }
+        // TS 5.1's `getReturnTypeFromBody`, the `types.length === 0` arm:
+        //
+        // ```ts
+        // const contextualReturnType = getContextualReturnType(func, /*contextFlags*/ undefined);
+        // const returnType = contextualReturnType && (unwrapReturnType(contextualReturnType, functionFlags) || undefinedType).flags & TypeFlags.Undefined
+        //     ? undefinedType : voidType;
+        // ```
+        //
+        // A function that falls off its end produces `undefined` at runtime;
+        // `void` is the reading that says "the value is not meant to be
+        // used", and it is only the right one when the context does not ask
+        // for `undefined`. `const f: () => undefined = () => {}` and
+        // `f(() => {})` against `f(a: () => undefined)` are both correct
+        // TypeScript, and inferring `void` made each a TS2322/TS2345.
+        //
+        // The async caller has already awaited `ret_ctx` (tsc's
+        // `unwrapReturnType`), so this reads the same unwrapped type in both
+        // cases, and the `undefined` it answers is re-wrapped in a `Promise`
+        // there. `void` in the context is deliberately NOT undefined here:
+        // tsc tests `TypeFlags.Undefined` alone, which `() => void` — the
+        // overwhelmingly common contextual signature — does not carry.
+        if (ret_ctx != types.no_type and try ctxReturnAdmitsUndefined(c, ret_ctx)) {
+            return types.undefined_type;
         }
         return types.void_type;
     }

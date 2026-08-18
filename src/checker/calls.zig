@@ -851,7 +851,13 @@ fn checkThisArg(c: *Checker, node: Node, sig: TypeId) Error!void {
     if (!c.owned_mask[c.cur_file]) return;
     const this_ty = c.ts.fnThisType(sig);
     if (this_ty == 0) return;
-    const callee = c.callShape(node).callee;
+    // Parentheses and type-only assertions do not change a call's receiver:
+    // `(o.test!)()` is `o.test()`, and tsc's `getThisArgumentOfCall` reads the
+    // callee through `skipOuterExpressions` before asking for an access
+    // expression. Read without the skip, every such form had no receiver at
+    // all, so `this` came out `void` and the call was a false TS2684
+    // (`thisTypeSyntacticContext`'s `o.test!()`, `o.test!!!()`, `(o.test!)()`).
+    const callee = expr_zig.skipOuterExprs(c, c.callShape(node).callee);
     var recv: TypeId = types.void_type;
     switch (c.nodeTag(callee)) {
         .member_expr, .optional_member_expr, .index_expr, .optional_index_expr => {
@@ -883,7 +889,7 @@ fn checkThisArg(c: *Checker, node: Node, sig: TypeId) Error!void {
 fn thisArgMismatchSpan(c: *Checker, node: Node, sig: TypeId) Error!?Span {
     const this_ty = c.ts.fnThisType(sig);
     if (this_ty == 0 or this_ty == types.void_type or this_ty == types.any_type) return null;
-    const callee = c.callShape(node).callee;
+    const callee = expr_zig.skipOuterExprs(c, c.callShape(node).callee);
     const recv_node = switch (c.nodeTag(callee)) {
         .member_expr, .optional_member_expr, .index_expr, .optional_index_expr => c.tree.nodeData(callee).lhs,
         else => return null,
@@ -942,7 +948,12 @@ const ArityTally = struct {
 /// Pick a signature (first match for overloads, like tsc), infer type
 /// arguments, check arguments, and return the (instantiated) return
 /// type; `instance_ret` overrides the return for `new`.
-fn resolveSignatureCall(
+/// Resolve one call against a candidate signature list: overload selection,
+/// type-argument inference, the argument check and every diagnostic those
+/// raise. Shared with `expr.zig`'s tagged template, whose argument list is the
+/// synthesized strings array followed by the substitutions — tsc resolves the
+/// two through the same `resolveCall`.
+pub fn resolveSignatureCall(
     c: *Checker,
     node: Node,
     sigs: []const TypeId,
@@ -2135,8 +2146,14 @@ pub fn argumentsMatch(c: *Checker, sig: TypeId, arg_nodes: []const Node) Error!b
         // with `pt`, was accepted. tsc has no allowlist here at all:
         // `checkApplicableSignature` runs `checkExpressionWithContextualType`
         // on every argument.
+        // A PARENTHESIZED argument forwards the contextual type to what it
+        // wraps (`checkExpr`'s `.paren_expr` arm), so it belongs on this list
+        // for whatever reason its content does — and a parenthesized CALLBACK
+        // needs it most: probed context-free, every un-annotated parameter of
+        // it is a published TS7006 that the accepted candidate's re-check
+        // cannot withdraw (`f((x => x), 10)`, `parenthesizedContexualTyping3`).
         const ctx_typed = switch (tag) {
-            .arrow_fn, .function_expr, .array_literal, .object_literal, .template_expr, .cond_expr, .call_expr, .call_expr_targs, .optional_call, .new_expr, .new_expr_bare, .new_expr_targs => true,
+            .arrow_fn, .function_expr, .array_literal, .object_literal, .template_expr, .cond_expr, .paren_expr, .call_expr, .call_expr_targs, .optional_call, .new_expr, .new_expr_bare, .new_expr_targs => true,
             else => false,
         };
         // A function argument is probed on TRIAL. Its parameters take their
@@ -2151,7 +2168,12 @@ pub fn argumentsMatch(c: *Checker, sig: TypeId, arg_nodes: []const Node) Error!b
         // candidate's arguments are checked — published and diagnosed — by
         // `checkCallArguments` right after this returns true, so the memo
         // still ends up holding exactly the accepted candidate's answer.
-        const fn_arg = tag == .arrow_fn or tag == .function_expr;
+        // Parentheses included: the trial and the no-publish window are about
+        // the FUNCTION being walked, which `(x => x)` still is.
+        const fn_arg = switch (c.nodeTag(expr_zig.skipParens(c, an))) {
+            .arrow_fn, .function_expr => true,
+            else => false,
+        };
         if (fn_arg) c.no_publish_depth += 1;
         const at = blk: {
             errdefer if (fn_arg) {

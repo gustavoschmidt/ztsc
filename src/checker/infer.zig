@@ -765,7 +765,18 @@ pub fn inferTypeArgs(
         if (an == null_node) continue;
         defer ai += 1;
         const tag = c.nodeTag(an);
-        if (tag == .arrow_fn or tag == .function_expr) continue;
+        // Phase 2 owns every FUNCTION argument, parentheses and all: tsc's
+        // `isContextSensitive` opens with
+        // `case SyntaxKind.ParenthesizedExpression: return
+        // isContextSensitive(node.expression)`, so `f((x => x), 10)` is as
+        // context sensitive as `f(x => x, 10)` and takes its parameter types
+        // from the same pass. Read without the skip, a parenthesized callback
+        // fell through to this phase's context-free `checkExprCached(an,
+        // no_type)` — walked with no contextual signature at all, so every
+        // parameter of it was TS7006, and Phase 2 then skipped it too.
+        // (`isContextSensitive`'s parenthesis arm is already what the
+        // object-literal property walk above goes through `skipParens` for.)
+        if (isFunctionArg(c, an)) continue;
         // A SPREAD stands for the positions its type expands to. tsc runs
         // `getEffectiveCallArguments` once, before `inferTypeArguments`, so
         // inference sees the expansion too; unifying the spread's own
@@ -1357,7 +1368,13 @@ pub fn inferTypeArgs(
     for (arg_nodes) |an| {
         if (an == null_node) continue;
         defer ai += 1;
-        const tag = c.nodeTag(an);
+        // Parentheses included, exactly as Phase 1's skip excludes them. The
+        // node handed to `checkExprCached` below stays the WRITTEN argument —
+        // `checkExpr`'s parenthesis arm forwards the contextual type through —
+        // so the parenthesized expression keeps its own memo entry; only the
+        // questions about the function itself look inside.
+        const fn_node = skipParens(c, an);
+        const tag = c.nodeTag(fn_node);
         if (tag != .arrow_fn and tag != .function_expr) continue;
         const pt0 = try c.paramTypeAtInferred(sig, ai, partial) orelse continue;
         const rp0 = try c.resolveStructural(pt0);
@@ -1403,8 +1420,8 @@ pub fn inferTypeArgs(
         //
         // An ANNOTATED function argument is not context sensitive — its type
         // is the same whatever it is handed — so it stays an inference source.
-        if (try c.contextualCallSig(pt_partial, an) == types.no_type and
-            c.fnExprIsContextSensitive(an)) continue;
+        if (try c.contextualCallSig(pt_partial, fn_node) == types.no_type and
+            c.fnExprIsContextSensitive(fn_node)) continue;
         const at = try c.checkExprCached(an, pt_partial);
         try c.unify(pt0, at, tp_syms, candidates, 0);
         // The contravariant echo, widened. A context-sensitive callback's
@@ -1424,7 +1441,7 @@ pub fn inferTypeArgs(
         // is a non-context-sensitive argument — an annotated callback carries
         // real contravariant evidence, which is why tsc rejects
         // `f7(() => sv.get(), sink)` for `sink: (p: string | null) => void`.
-        const ctx_sensitive = c.fnExprIsContextSensitive(an);
+        const ctx_sensitive = c.fnExprIsContextSensitive(fn_node);
         for (contra, 0..) |*cc, i| {
             if (cc.* == before_contra[i]) continue;
             if (cc.* == fed[i] or (ctx_sensitive and fed[i] != types.any_type))
@@ -1891,13 +1908,21 @@ fn inferFromClassCtorParams(
 /// seed's constraint clamp.
 fn anyFunctionArg(c: *const Checker, arg_nodes: []const Node) bool {
     for (arg_nodes) |an| {
-        if (an == null_node) continue;
-        switch (c.nodeTag(an)) {
-            .arrow_fn, .function_expr => return true,
-            else => {},
-        }
+        if (an != null_node and isFunctionArg(c, an)) return true;
     }
     return false;
+}
+
+/// Is `an` an argument Phase 2 owns — an arrow or function expression, through
+/// however many parentheses were written around it? tsc's `isContextSensitive`
+/// looks through them (`case SyntaxKind.ParenthesizedExpression`), so both
+/// phases must agree on which arguments are functions or a parenthesized
+/// callback falls between them.
+fn isFunctionArg(c: *const Checker, an: Node) bool {
+    return switch (c.nodeTag(skipParens(c, an))) {
+        .arrow_fn, .function_expr => true,
+        else => false,
+    };
 }
 /// The constraint clamp, applied to a Phase-2 SEED rather than to the final
 /// answer (see the call site). `sofar` is the partial map built for the

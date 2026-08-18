@@ -2409,19 +2409,22 @@ pub const Checker = struct {
     /// assertion: object/array literals produce readonly, non-widened,
     /// literal-typed members (recursively). Cleared at function bodies.
     const_ctx: bool = false,
-    /// The template-expression node of the tagged template currently being
-    /// resolved. tsc's constant folding of a template expression tests
-    /// `node.parent.kind !== SyntaxKind.TaggedTemplateExpression`; ztsc has no
-    /// parent links, so `checkTaggedTemplate` marks its own template here.
+    /// The template node of the tagged template currently being resolved. It
+    /// is the call's synthesized strings-array ARGUMENT (tsc's
+    /// `getEffectiveCallArguments`), so while it is marked here it types as
+    /// `TemplateStringsArray` and leaves its substitutions — the call's other
+    /// arguments — to the argument walk. It is also what tsc's constant
+    /// folding of a template expression tests (`node.parent.kind !==
+    /// SyntaxKind.TaggedTemplateExpression`); ztsc has no parent links, so
+    /// `checkTaggedTemplate` marks its own template here.
     tagged_tpl: Node = null_node,
-    /// The signature `tagged_tpl`'s tag resolved to, or `no_type` before it is
-    /// picked. A tagged template's substitutions are the tag call's ARGUMENTS
-    /// (tsc's `getEffectiveCallArguments`: a synthetic first argument standing
-    /// for the strings array, then one per span), so each is contextually typed
-    /// by the tag's parameter at its position. The template node is what walks
-    /// them, and it is reached through `checkExprCached` rather than called
-    /// directly, so the signature travels here.
-    tagged_tpl_sig: TypeId = types.no_type,
+    /// The array-literal ELEMENT currently being checked. tsc's
+    /// `resolveTaggedTemplateExpression` asks `isArrayLiteralExpression(node
+    /// .parent)` before reporting a non-callable tag, because there the far
+    /// likelier reading is a missing comma between two template literals
+    /// (TS2796, not TS2349); ztsc has no parent links, so `checkArrayLiteral`
+    /// marks the element here.
+    array_elem: Node = null_node,
     /// Type-parameter symbols of every `inferTypeArgs` call currently on the
     /// stack (innermost last). A symbol in here but *not* in the current call's
     /// `tp_syms` is an OUTER call's still-in-flight inference variable — tsc

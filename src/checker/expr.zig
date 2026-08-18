@@ -25,6 +25,7 @@ const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
 const accessibility = @import("accessibility.zig");
+const calls_zig = @import("calls.zig");
 const comma = @import("comma.zig");
 const computed_key = @import("computed_key.zig");
 const conditions = @import("conditions.zig");
@@ -267,11 +268,23 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         .number_literal => return c.ts.makeNumberLiteral(c.numberTokenValue(main_tok), true),
         .string_literal => return c.ts.makeStringLiteral(try c.memberAtom(main_tok), true),
         .bigint_literal => return c.ts.makeBigIntLiteral(try c.atomOfToken(main_tok), true),
-        .template_literal => return c.ts.makeStringLiteral(try c.templateAtom(main_tok), true),
+        // A tag's own template is the call's synthesized strings-array
+        // argument, and answers with that argument's type (see
+        // `checkTaggedTemplate`); everywhere else a no-substitution template
+        // is its own string literal.
+        .template_literal => return if (node == c.tagged_tpl)
+            templateStringsArrayType(c)
+        else
+            c.ts.makeStringLiteral(try c.templateAtom(main_tok), true),
         .true_literal => return c.ts.makeBooleanLiteral(true, true),
         .false_literal => return c.ts.makeBooleanLiteral(false, true),
         .null_literal => return types.null_type,
-        .regex_literal => return types.any_type, // RegExp needs lib (documented)
+        // tsc's `checkExpression` for a regular-expression literal is
+        // `globalRegExpType`. `any` erased every method the lib declares on
+        // it: `/x/.exec(s)` came back `any`, so a match's groups were `any`,
+        // and nothing about a regex was ever wrong — `re.foo`, `re * 2`,
+        // `re` where a string is wanted all passed.
+        .regex_literal => return globalInterfaceType(c, "RegExp"),
         .this_expr => {
             const frame = thisFrame(c);
             // tsc's `checkThisExpression` switches on the container FIRST: a
@@ -348,25 +361,16 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // `` `setUint${BITS[bytes]}` as const `` widened to `string`,
             // which cannot index a `DataView` — a TS7053 false positive on
             // the standard "compute the accessor name" idiom.
-            // A tagged template's substitutions are the tag call's ARGUMENTS,
-            // so each takes its contextual type from the tag's parameter at
-            // its position — position 0 being the strings array, which tsc
-            // fills with a synthetic expression. Every real template tag
-            // collects them through a REST parameter, so that lookup is
-            // `paramTypeAt`'s rest arm. Without a contextual type at all,
-            // every `styled.div`…${(props) => props.$size}`` interpolation
-            // left its parameter implicit `any` — 341 of outline's excess
-            // keys were that one TS7006.
-            const tpl_sig = if (node == c.tagged_tpl) c.tagged_tpl_sig else types.no_type;
-            var sub_i: u32 = 1;
+            // A TAG's template is the call's synthesized strings-array
+            // argument (tsc's `getEffectiveCallArguments`), and answers with
+            // that argument's type. Its substitutions are the call's OTHER
+            // arguments — `checkTaggedTemplate` hands them to the argument
+            // walk, which is what contextually types them — so they are
+            // deliberately not walked from here: doing both would check each
+            // one twice, once under a contextual type this arm cannot know.
+            if (node == c.tagged_tpl) return templateStringsArrayType(c);
             for (c.tree.nodeRange(node)) |sub| {
-                if (sub == null_node) continue;
-                defer sub_i += 1;
-                const sub_ctx: TypeId = if (tpl_sig == types.no_type)
-                    types.no_type
-                else
-                    (try c.paramTypeAt(tpl_sig, sub_i)) orelse types.no_type;
-                _ = try c.checkExprCached(sub, sub_ctx);
+                if (sub != null_node) _ = try c.checkExprCached(sub, types.no_type);
             }
             // tsc folds a template expression that is a compile-time CONSTANT
             // to a fresh string literal *before* either of those two tests
@@ -375,9 +379,7 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // (evaluated !== undefined) return
             // getFreshTypeOfLiteralType(getStringLiteralType(evaluated))`).
             // See `evalConstToString`.
-            if (node != c.tagged_tpl) {
-                if (try c.constTemplateAtom(node)) |a| return c.ts.makeStringLiteral(a, true);
-            }
+            if (try c.constTemplateAtom(node)) |a| return c.ts.makeStringLiteral(a, true);
             if (c.const_ctx or c.isConstTypeVar(ctx) or try c.ctxWantsTemplate(ctx)) return c.templateExprType(node);
             return types.string_type;
         },
@@ -1291,14 +1293,22 @@ fn neverInitializedLocal(c: *Checker, sym: SymbolId) Error!bool {
 /// a tag: kysely's ``sql<Row>`…` `` came back `any`, so the `rows` of its
 /// result were `any[]` and every callback over them reported TS7006.
 ///
-/// Deliberately TYPE-ONLY, not a full call check: the return type is
-/// computed (with type-argument inference from the substitutions, and with
-/// explicit type arguments already applied by the `instantiation_expr` the
-/// parser builds for ``tag<T>`…` ``), but no argument diagnostic is reported
-/// and a tag with no call signature stays `any`. Reporting would need the
-/// synthesized `TemplateStringsArray` argument to relate exactly as tsc
-/// builds it, and getting that subtly wrong is a false positive on every
-/// tagged template in a program; answering with the return type is pure gain.
+/// A tag with no call signature stays `any` and reports nothing; otherwise the
+/// whole call goes through `resolveSignatureCall`, the ordinary call's
+/// pipeline — overload selection, type-argument inference, arity,
+/// per-argument assignability. tsc runs the two through the same
+/// `resolveCall`, and the parts that only the shared pipeline has are exactly
+/// what a hand-rolled "first signature whose arity fits" got wrong:
+/// ``foo2`${1}` `` against `foo2(strs: string[], …)` / `foo2(strs:
+/// TemplateStringsArray, …)` must pick the SECOND overload, because a
+/// `TemplateStringsArray` is not a `string[]`.
+///
+/// The synthesized strings-array argument is the TEMPLATE NODE itself, whose
+/// type is the global `TemplateStringsArray` for exactly as long as it is a
+/// tag's template — see the `.template_expr` / `.template_literal` arms of
+/// `checkExpr`, which also stop walking the substitutions there, since the
+/// substitutions are arguments of this call and the argument walk is what
+/// contextually types them.
 fn checkTaggedTemplate(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     const d = c.tree.nodeData(node);
     const tag_ty = try c.checkExprCached(d.lhs, types.no_type);
@@ -1307,14 +1317,26 @@ fn checkTaggedTemplate(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     // SyntaxKind.TaggedTemplateExpression`); ztsc has no parent links, so the
     // tagged template marks its own template node for the duration.
     const prev_tagged = c.tagged_tpl;
-    const prev_tpl_sig = c.tagged_tpl_sig;
     c.tagged_tpl = d.rhs;
-    c.tagged_tpl_sig = types.no_type;
-    defer {
-        c.tagged_tpl = prev_tagged;
-        c.tagged_tpl_sig = prev_tpl_sig;
+    defer c.tagged_tpl = prev_tagged;
+    // Argument nodes: the template stands in for the strings array, then one
+    // per substitution.
+    var args: std.ArrayList(Node) = .empty;
+    defer args.deinit(c.scratch());
+    try args.append(c.scratch(), d.rhs);
+    if (c.nodeTag(d.rhs) == .template_expr) {
+        for (c.tree.nodeRange(d.rhs)) |sub| {
+            if (sub != null_node) try args.append(c.scratch(), sub);
+        }
     }
-    const r = try c.resolveStructural(tag_ty);
+    // The tag's APPARENT type carries the signatures: a tag whose type is a
+    // type parameter is called through its base constraint, exactly as an
+    // ordinary call's callee is (`checkCallExprInner`'s `.type_param` arm).
+    var r = try c.resolveStructural(tag_ty);
+    if (c.ts.kind(r) == .type_param) {
+        const bc = try c.transitiveBaseConstraint(r);
+        if (bc != r) r = try c.resolveStructural(bc);
+    }
     var sigs: std.ArrayList(TypeId) = .empty;
     defer sigs.deinit(c.scratch());
     switch (c.ts.kind(r)) {
@@ -1328,50 +1350,98 @@ fn checkTaggedTemplate(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     if (sigs.items.len == 0) {
         // Nothing to draw a contextual type from, but the substitutions are
         // still expressions and still have to be checked.
-        _ = try c.checkExprCached(d.rhs, types.no_type);
+        for (args.items[1..]) |sub| _ = try c.checkExprCached(sub, types.no_type);
+        if (try tagNotCallable(c, tag_ty, r)) {
+            // ```ts
+            // if (isArrayLiteralExpression(node.parent)) {
+            //     const diagnostic = createDiagnosticForNode(node.tag,
+            //         Diagnostics.It_is_likely_that_you_are_missing_a_comma_to_separate_these_two_template_literals_…);
+            // ```
+            //
+            // Two template literals written on consecutive lines of an array
+            // literal parse as ONE tagged template, and "you are missing a
+            // comma" is the diagnosis that helps; "not callable" is a true
+            // statement about a program nobody wrote on purpose.
+            if (node == c.array_elem) {
+                try c.diagFmt(2796, c.nodeSpan(d.lhs), "It is likely that you are missing a comma to separate these two template literals. They form a tagged template expression which cannot be invoked.", .{});
+            } else {
+                try c.diagFmt(2349, c.nodeSpan(d.lhs), "This expression is not callable.", .{});
+            }
+            return types.error_type;
+        }
         return types.any_type;
     }
-    // Argument nodes: the template stands in for the strings array (its own
-    // parameter is `TemplateStringsArray`, which carries no type parameter in
-    // any real tag, so what it contributes to inference is nothing), then one
-    // per substitution.
-    var args: std.ArrayList(Node) = .empty;
-    defer args.deinit(c.scratch());
-    try args.append(c.scratch(), d.rhs);
-    if (c.nodeTag(d.rhs) == .template_expr) {
-        for (c.tree.nodeRange(d.rhs)) |sub| {
-            if (sub != null_node) try args.append(c.scratch(), sub);
-        }
+    return calls_zig.resolveSignatureCall(c, node, sigs.items, &.{}, args.items, types.no_type, ctx);
+}
+
+/// Is a tag with NO call signature one tsc rejects outright (TS2349), or one
+/// it lets through as `any`?
+///
+/// tsc runs the same `resolveCall` for a tagged template as for a call, so the
+/// answer is `resolveUntypedCall`'s: `any`/`error`, and anything assignable to
+/// the global `Function` (`isUntypedFunctionCall`'s last disjunct — an
+/// interface body with no call signature of its own), are silent; everything
+/// else is "This expression is not callable".
+///
+/// Stated as a CLOSED SET of kinds rather than as its complement, because a
+/// kind this file has not thought about is one whose signatures may simply not
+/// have been gathered — and answering "not callable" there manufactures a
+/// false positive on working code. The set is the shapes whose members are
+/// fully materialized by `resolveStructural`: a class value (construct
+/// signatures only — ``CtorTag`x` `` is tsc's TS2349), an object/interface with
+/// no call signature, and every primitive and literal.
+fn tagNotCallable(c: *Checker, tag_ty: TypeId, r: TypeId) Error!bool {
+    switch (c.ts.kind(r)) {
+        .class_value,
+        .object,
+        .ref,
+        .string,
+        .string_literal,
+        .template_literal_type,
+        .string_mapping,
+        .number,
+        .number_literal,
+        .number_literal_fresh,
+        .bigint,
+        .bigint_literal,
+        .boolean,
+        .bool_true,
+        .bool_false,
+        .symbol,
+        .unique_symbol,
+        .enum_type,
+        .array,
+        .tuple,
+        => {},
+        else => return false,
     }
-    // Overloads: the first signature whose arity fits, mirroring
-    // `resolveSignatureCall`'s order without its argument check.
-    var chosen = sigs.items[0];
-    if (sigs.items.len > 1) {
-        for (sigs.items) |sig| {
-            const n = args.items.len;
-            if (n >= try c.requiredParams(sig) and n <= try c.paramTotal(sig)) {
-                chosen = sig;
-                break;
-            }
-        }
-    }
-    // Inference walks the substitutions too, so it gets the uninstantiated
-    // signature's parameters — the best contextual type available before the
-    // type arguments exist (a tag written `styled.div<Props>` arrives here
-    // already instantiated, through the `instantiation_expr` its type args
-    // built, so for that shape the two are the same signature). When they are
-    // not, whatever that provisional pass said about the substitutions is
-    // withdrawn and re-derived below under the resolved parameters.
-    c.tagged_tpl_sig = chosen;
-    const tpl_span = c.nodeSpan(d.rhs);
-    const saved = c.diags.items.len;
-    const inst = try c.instantiateSigForCall(chosen, &.{}, args.items, node, ctx);
-    if (inst != chosen) {
-        c.rollbackDiags(saved, .{ .file = c.cur_file, .lo = tpl_span.start, .hi = tpl_span.end });
-    }
-    c.tagged_tpl_sig = inst;
-    _ = try c.checkExprCached(d.rhs, types.no_type);
-    return c.ts.fnReturn(inst);
+    // `isUntypedFunctionCall` opens its last disjunct with
+    // `!numCallSignatures && !numConstructSignatures`: a value that CAN be
+    // constructed but not called is rejected however assignable to `Function`
+    // it is — every class value is (`taggedTemplateWithConstructableTag01`,
+    // and the construct-signature-only interface of `…02`).
+    if (c.ts.kind(r) == .class_value) return true;
+    if (c.ts.kind(r) == .object and c.ts.objectConstructSigCount(r) != 0) return true;
+    // `isUntypedFunctionCall`'s `isTypeAssignableTo(funcType, globalFunctionType)`.
+    const sym = c.prog.globals.lookup(c.atom_Function) orelse return true;
+    if (!c.symFlags(sym).interface) return true;
+    return !try c.isAssignable(tag_ty, try c.ts.makeRef(sym, &.{}));
+}
+
+/// A lib-declared global INTERFACE, by name and with no type arguments — the
+/// `globalXType` family tsc materializes once per program. `any` when the lib
+/// declares no such interface (`--noLib`), which keeps whatever asked for it
+/// silent rather than rejecting every use in the program.
+fn globalInterfaceType(c: *Checker, comptime name: []const u8) Error!TypeId {
+    const sym = c.prog.globals.lookup(try c.atom(name)) orelse return types.any_type;
+    if (!c.symFlags(sym).interface) return types.any_type;
+    return c.ts.makeRef(sym, &.{});
+}
+
+/// The global `TemplateStringsArray` — the type tsc gives the synthesized
+/// first argument of every tagged-template call.
+fn templateStringsArrayType(c: *Checker) Error!TypeId {
+    return globalInterfaceType(c, "TemplateStringsArray");
 }
 
 fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
@@ -1427,7 +1497,7 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     // the element type of each array-like constituent (so array-literal
     // elements are contextually typed — literals stay literal instead of
     // widening).
-    var ctx_elem: TypeId = if (!ctx_tuple) try contextualArrayElemType(c, rctx) else types.no_type;
+    var ctx_elem: TypeId = if (!ctx_tuple) try contextualArrayElemOrIterated(c, rctx) else types.no_type;
     // tsc's `getContextualTypeForElementExpression` ends in
     // `getIteratedTypeOrElementType(IterationUse.Element, t, …)`, so an
     // ITERABLE contextual type types the elements even when it is not
@@ -1461,6 +1531,21 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     defer raw_types.deinit(c.scratch());
     var tuple_elems: std.ArrayList(types.TupleElem) = .empty;
     defer tuple_elems.deinit(c.scratch());
+    // How many positions the literal occupies — the length a tuple context
+    // with trailing fixed elements needs to place each one (see
+    // `contextualElemTypeAt`). A SPREAD stands for an unknown number of them,
+    // so from one on no position is knowable and there is no length to give;
+    // tsc gives up the same way (`getContextualTypeForElementExpression`
+    // threads the spread indices through and answers `undefined` past them).
+    const lit_len: ?u32 = blk: {
+        var n: u32 = 0;
+        for (c.tree.nodeRange(node)) |el| {
+            if (el == null_node) continue;
+            if (c.nodeTag(el) == .spread_element) break :blk null;
+            n += 1;
+        }
+        break :blk n;
+    };
     var i: u32 = 0;
     for (c.tree.nodeRange(node)) |el| {
         if (el == null_node) continue;
@@ -1527,12 +1612,16 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // [number, number]]` is the case: reading only the first tuple
             // gives the inner literal a contextual `number`, so it widens to
             // `number[]` and matches neither branch.
-            ectx = if (c.ts.kind(rctx) == .union_type)
-                try contextualElemTypeAt(c, rctx, i)
-            else
-                try c.tupleElemTypeAt(ctx_tuple_ty, i) orelse types.no_type;
+            ectx = try contextualElemTypeAt(c, if (c.ts.kind(rctx) == .union_type) rctx else ctx_tuple_ty, i, lit_len);
         }
+        // An element of an array literal is the one place a NON-CALLABLE tag
+        // gets a different diagnostic (`checkTaggedTemplate`'s TS2796); ztsc
+        // has no parent links, so the element marks itself for the duration,
+        // exactly as a tagged template marks its own template node.
+        const prev_elem = c.array_elem;
+        c.array_elem = el;
         const raw = try c.checkExprCached(el, ectx);
+        c.array_elem = prev_elem;
         var et = raw;
         if (!try keepLiteral(c, et, ectx)) et = try c.widenLiteral(et);
         // tsc's `checkExpressionForMutableLocation` ends
@@ -1746,6 +1835,32 @@ fn contextualArrayElemType(c: *Checker, rctx: TypeId) Error!TypeId {
     }
 }
 
+/// `contextualArrayElemType` with tsc's LAST RESORT behind it:
+///
+/// ```ts
+/// getTypeOfPropertyOfContextualType(arrayContextualType, "" + index) ||
+///     mapType(arrayContextualType, t => getIteratedTypeOrElementType(IterationUse.Element, t, …))
+/// ```
+///
+/// An `Iterable<T>` carries no numeric index at all — only
+/// `[Symbol.iterator]()` — so `var xs: Iterable<(x: string) => number> = [s =>
+/// s.length]` left its element with no contextual type and reported TS7006
+/// inside it (`iterableContextualTyping1`).
+///
+/// The `||` is where the ORDER matters, and it is why this is not an arm of
+/// `contextualArrayElemType`'s `.object` case: the two alternatives are tried
+/// over the WHOLE contextual type, not per union constituent. `readonly T[] |
+/// Map<K, V>` answers `T` from the first alternative and never reaches the
+/// second — folding the `Map`'s `[K, V]` into the element context instead made
+/// excalidraw's `[...boundElements, [id, el]]` shapes `(T | [K, V])[]`, three
+/// false TS2345s.
+fn contextualArrayElemOrIterated(c: *Checker, rctx: TypeId) Error!TypeId {
+    if (rctx == types.no_type) return types.no_type;
+    const direct = try contextualArrayElemType(c, rctx);
+    if (direct != types.no_type) return direct;
+    return (try c.iterationElementType(rctx)) orelse types.no_type;
+}
+
 /// The contextual type for the element at index `i` of an array literal in
 /// TUPLE context, given a (structurally resolved) contextual type — tsc's
 /// `getTypeOfPropertyOfContextualType(ctx, "" + i)`, which `mapType`s over a
@@ -1753,15 +1868,34 @@ fn contextualArrayElemType(c: *Checker, rctx: TypeId) Error!TypeId {
 /// rest element past the fixed part), an array constituent its element type,
 /// and anything else nothing. Returns `no_type` when no constituent holds an
 /// element there.
-fn contextualElemTypeAt(c: *Checker, rctx: TypeId, i: u32) Error!TypeId {
+///
+/// `length` is how many elements the literal has, or `null` when a spread
+/// makes that unknowable. A tuple whose FIXED elements sit after a variable
+/// one (`[...((a: number) => void)[], (a: string) => void]`) decides a
+/// position by counting back from the END, which is a question only the
+/// length can answer — `tuple_relate.contextualElemType`, the same reading
+/// the CALL-argument path already uses for a non-array rest parameter. Read
+/// from the start instead, `const a1: Funcs = [x => str(x)]` typed its lone
+/// element by the leading `(a: number) => void` and reported inside its body.
+/// Every other tuple shape keeps the positional read.
+fn contextualElemTypeAt(c: *Checker, rctx: TypeId, i: u32, length: ?u32) Error!TypeId {
     switch (c.ts.kind(rctx)) {
-        .tuple => return try c.tupleElemTypeAt(rctx, i) orelse types.no_type,
+        .tuple => {
+            if (length) |n| {
+                if (tuple_relate.fixedLength(c, rctx) < c.ts.tupleLen(rctx) and
+                    tuple_relate.endFixedCount(c, rctx) > 0)
+                {
+                    return (try tuple_relate.contextualElemType(c, rctx, i, n)) orelse types.no_type;
+                }
+            }
+            return try c.tupleElemTypeAt(rctx, i) orelse types.no_type;
+        },
         .array => return c.ts.arrayElem(rctx),
         .union_type => {
             var elems: std.ArrayList(TypeId) = .empty;
             defer elems.deinit(c.scratch());
             for (try c.memberList(rctx)) |m| {
-                const e = try contextualElemTypeAt(c, try c.resolveStructural(m), i);
+                const e = try contextualElemTypeAt(c, try c.resolveStructural(m), i, length);
                 if (e != types.no_type) try elems.append(c.scratch(), e);
             }
             if (elems.items.len == 0) return types.no_type;
@@ -3801,6 +3935,15 @@ fn numericIndexHit(c: *Checker, r: TypeId, rk: types.Kind, v: f64) Error!?TypeId
             const ni = c.ts.objectNumberIndex(rt);
             return if (ni != 0) ni else null;
         },
+        // A STRING carries a numeric domain through its apparent type: the
+        // lib's `interface String { readonly [index: number]: string }`. tsc
+        // reaches it the same way it reaches any other — `getPropertyName-
+        // FromIndex` turns the numeric name into a number index and
+        // `findApplicableIndexInfo` picks that signature off the apparent
+        // type. Without the arm, `s["0"]` was a TS7053 false positive while
+        // `s[0]` (which goes through `numberIndexType`) was silent
+        // (`templateStringInIndexExpression`).
+        .string, .string_literal, .template_literal_type, .string_mapping => return types.string_type,
         else => return null,
     }
 }
@@ -5225,6 +5368,23 @@ pub fn reportIndexImplicitAny(c: *Checker, node: Node, recv: Node, idx_t: TypeId
 pub fn skipParens(c: *const Checker, node: Node) Node {
     var n = node;
     while (n != null_node and c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+    return n;
+}
+
+/// tsc's `skipOuterExpressions` at its default `OuterExpressionKinds.All`:
+/// parentheses AND the assertions that change only the TYPE of what they wrap.
+/// The syntactic question underneath — "what expression is really here" — is
+/// unchanged by any of them, which is why `getThisArgumentOfCall` reads the
+/// callee through this and not through `skipParens`: `o.test!()` and
+/// `(o.test!)()` have the receiver `o` exactly as `o.test()` does.
+pub fn skipOuterExprs(c: *const Checker, node: Node) Node {
+    var n = node;
+    while (n != null_node) {
+        switch (c.nodeTag(n)) {
+            .paren_expr, .non_null, .as_expr, .satisfies_expr => n = c.tree.nodeData(n).lhs,
+            else => return n,
+        }
+    }
     return n;
 }
 
