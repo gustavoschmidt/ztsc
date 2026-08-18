@@ -47,6 +47,40 @@ const hasTypeMeaning = @import("names.zig").hasTypeMeaning;
 const NsContainer = @import("typespace.zig").NsContainer;
 const tpIndex = @import("calls.zig").tpIndex;
 
+/// TS2875, for the automatic JSX runtime (`jsx: "react-jsx"` /
+/// `"react-jsxdev"`): the `<jsxImportSource>/jsx-runtime` module that every JSX
+/// tag in the program compiles into has to EXIST, and the program's resolver
+/// could not find it.
+///
+/// tsc asks the question lazily, off the first JSX tag it checks in a file, and
+/// caches the answer on the file (`getNodeLinks(file).jsxImplicitImportContainer
+/// = false`) — so a file with fifty tags answers once, at its outermost-and-
+/// first one. `jsx_runtime_reported` is that cache; without it a React app with
+/// a broken `@types/react` install would report per tag rather than per file.
+///
+/// Silent when the automatic runtime is off (`jsx_runtime_module == null`,
+/// which covers `jsx: "preserve"` and the classic `react` factory) and, of
+/// course, when the module resolved.
+fn reportMissingJsxRuntime(c: *Checker, node: Node) Error!void {
+    const spec = c.prog.jsx_runtime_module orelse return;
+    if (c.prog.jsx_runtime_file != modules.no_file) return;
+    if (c.jsx_runtime_reported[c.cur_file]) return;
+    // The module needs a FILE to supply `JSX` from, which is what
+    // `jsx_runtime_file` records — but tsc's question here is only whether the
+    // specifier RESOLVES, and a global `declare module "react/jsx-runtime"`
+    // (how the suite's react16.d.ts ships it, and how DefinitelyTyped shims
+    // one) resolves it without a file of its own. Wildcards count too, exactly
+    // as they do for an ordinary import.
+    if (c.ambientIndex(try c.internText(spec)) != null) return;
+    c.jsx_runtime_reported[c.cur_file] = true;
+    try c.diagFmt(
+        2875,
+        c.nodeSpan(node),
+        "This JSX tag requires the module path '{s}' to exist, but none could be found. Make sure you have types for the appropriate package installed.",
+        .{spec},
+    );
+}
+
 pub fn checkJsxElement(c: *Checker, node: Node) Error!TypeId {
     // A JSX element's *type* is unconditionally `JSX.Element` (see the
     // return below): it does not depend on the tag's props, the attribute
@@ -64,6 +98,7 @@ pub fn checkJsxElement(c: *Checker, node: Node) Error!TypeId {
     // running anyway. Output is byte-identical for any `--checkers=N`
     // because the value produced here is `JSX.Element` either way.
     if (!c.owned_mask[c.cur_file]) return (try c.jsxNamespaceType(c.atom_Element)) orelse types.any_type;
+    try reportMissingJsxRuntime(c, node);
     const e = c.tree.extraData(ast.JsxElementData, c.tree.nodeData(node).lhs);
     var props: TypeId = types.no_type; // no_type = unknown target (skip attr typing)
     var is_component = false;

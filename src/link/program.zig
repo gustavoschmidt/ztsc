@@ -135,6 +135,13 @@ pub const Program = struct {
     /// off this module's exports there; the checker falls back to it when no
     /// global `JSX` namespace exists. See `tsconfig.Config.jsx_runtime_module`.
     jsx_runtime_file: FileId = no_file,
+    /// The SPECIFIER `jsx_runtime_file` was looked up under
+    /// (`"react/jsx-runtime"`, `"preact/jsx-runtime"`, …), or null when the
+    /// automatic runtime is off. Kept beside the FileId because the checker
+    /// needs the text even — especially — when the lookup FAILED: a JSX tag in
+    /// a program whose runtime module does not resolve is TS2875, and the
+    /// diagnostic names the path it could not find.
+    jsx_runtime_module: ?[]const u8 = null,
     /// The ROOT identifier of tsconfig `jsxFactory` (`MyLib` for
     /// `MyLib.createElement`), or null. tsc's `getJsxNamespaceAt` reads the
     /// `JSX` namespace out of that container (`MyLib.JSX.IntrinsicElements`)
