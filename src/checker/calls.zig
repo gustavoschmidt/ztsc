@@ -11,6 +11,7 @@ const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
 const source = @import("../frontend/source.zig");
 const paths = @import("../link/paths.zig");
+const modules = @import("../link/modules.zig");
 
 const Node = ast.Node;
 const null_node = ast.null_node;
@@ -1048,7 +1049,7 @@ fn resolveSignatureCall(
             // when NO candidate ever reaches argument checking. A truncated
             // instantiation has no arity to contribute (see `checkCallArguments`).
             if (c.ts.kind(inst) == .function) arity.note(req, tot, eff_n);
-            c.rollbackArgDiags(saved_infer, infer_file, arg_nodes);
+            rollbackArgProbe(c, saved_infer, infer_file, arg_nodes);
             c.inst_count = saved_inst_count;
             c.newBudgetWindow();
             c.inst_limit_tripped = saved_inst_trip;
@@ -1058,7 +1059,7 @@ fn resolveSignatureCall(
             try checkCallArguments(c, node, inst, arg_nodes, true);
             return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst);
         }
-        c.rollbackArgDiags(saved_infer, infer_file, arg_nodes);
+        rollbackArgProbe(c, saved_infer, infer_file, arg_nodes);
         c.inst_count = saved_inst_count;
         c.newBudgetWindow();
         c.inst_limit_tripped = saved_inst_trip;
@@ -1921,6 +1922,67 @@ pub const mintReverseElemVar = infer_zig.mintReverseElemVar;
 pub const substElemAccess = infer_zig.substElemAccess;
 pub const bindAnyToTypeParams = infer_zig.bindAnyToTypeParams;
 
+/// Withdraw a rejected candidate's diagnostics AND the `node_types` entries
+/// its probe published under the arguments.
+///
+/// `rollbackArgDiags` alone is not enough, and the gap is a silent one.
+/// `diagFmt`'s suppression key is withdrawn with the diagnostic, so the
+/// winning candidate is *allowed* to re-file — but only if it actually
+/// re-walks the expression, and `node_types` is exactly what stops it. The
+/// probe walks an argument under this candidate's contextual type and
+/// publishes every subexpression's answer; the inner reads are published
+/// under the CONTEXT-FREE key (`no_type`), which is the key the next
+/// candidate's walk asks with, so the re-walk cache-hits and the withdrawn
+/// diagnostic is never re-filed. The expression is checked twice and
+/// reported zero times, which is indistinguishable from never being checked.
+///
+/// Two shapes in the suite:
+///   * `two(y.find(" "))` over `two(c: string)` / `two(c: JQuery)` — the
+///     string candidate types `y.find(" ")`, files TS2454 on `y`, is
+///     rejected, and the JQuery candidate reads `y`'s type back out of the
+///     memo (dottedSymbolResolution1).
+///   * `this.data.find(function (d) { … this … })` — `find`'s generic
+///     type-predicate overload runs INFERENCE over the callback (which
+///     publishes; only `argumentsMatch` withholds a function argument via
+///     `no_publish_depth`), files TS2683, and is rejected; the plain
+///     overload re-walks the body and hits the memo (thisInFunctionCall).
+///
+/// Gated on the candidate having filed anything at all, which is the same
+/// test `rollbackArgDiags` early-returns on: with no diagnostic to lose there
+/// is nothing for a stale entry to swallow, so the overwhelmingly common
+/// rejection pays one comparison. When it does fire the cost is one AST walk
+/// over the arguments — bounded by the subtree the probe just type-checked.
+///
+/// The entries are removed rather than withheld (`no_publish_depth` over the
+/// whole probe) because withholding makes EVERY candidate re-walk every
+/// argument from scratch, including the winner, whose answers `node_types`
+/// then has to be re-taught by `checkCallArguments`. Removal charges only the
+/// candidates that actually poisoned something.
+fn rollbackArgProbe(c: *Checker, saved: usize, file: modules.FileId, arg_nodes: []const Node) void {
+    const filed = c.diags.items.len != saved;
+    c.rollbackArgDiags(saved, file, arg_nodes);
+    if (!filed) return;
+    const tree = c.prog.files[file].tree;
+    for (arg_nodes) |an| {
+        if (an != null_node) forgetNodeTypes(c, tree, file, an);
+    }
+}
+
+/// Drop `node`'s subtree from `node_types`. Iterative (an explicit worklist in
+/// scratch) rather than recursive: an argument is arbitrary user syntax and
+/// this runs under whatever stack the call chain has left.
+fn forgetNodeTypes(c: *Checker, tree: *const ast.Ast, file: modules.FileId, node: Node) void {
+    const mark = c.scratch_arena.mark();
+    defer c.scratch_arena.restore(mark);
+    var stack: std.ArrayList(Node) = .empty;
+    stack.append(c.scratch(), node) catch return;
+    while (stack.pop()) |n| {
+        _ = c.node_types.remove((@as(u64, file) << 32) | n);
+        var it = tree.childIterator(n);
+        while (it.next()) |child| stack.append(c.scratch(), child) catch return;
+    }
+}
+
 /// Would every argument check against `sig`? (Silent, for overload
 /// selection.)
 pub fn argumentsMatch(c: *Checker, sig: TypeId, arg_nodes: []const Node) Error!bool {
@@ -1951,7 +2013,7 @@ pub fn argumentsMatch(c: *Checker, sig: TypeId, arg_nodes: []const Node) Error!b
         defer ai += 1;
         if (c.nodeTag(an) == .spread_element) return true; // don't reject on spreads
         const pt = try c.paramTypeAt(sig, ai) orelse {
-            c.rollbackArgDiags(saved_diags, spec_file, arg_nodes);
+            rollbackArgProbe(c, saved_diags, spec_file, arg_nodes);
             return false;
         };
         const tag = c.nodeTag(an);
@@ -2016,7 +2078,7 @@ pub fn argumentsMatch(c: *Checker, sig: TypeId, arg_nodes: []const Node) Error!b
         };
         if (fn_arg) c.no_publish_depth -= 1;
         if (!try c.isAssignable(at, pt)) {
-            c.rollbackArgDiags(saved_diags, spec_file, arg_nodes);
+            rollbackArgProbe(c, saved_diags, spec_file, arg_nodes);
             return false;
         }
         // Freshness is not part of `isAssignable` here (see
@@ -2026,7 +2088,7 @@ pub fn argumentsMatch(c: *Checker, sig: TypeId, arg_nodes: []const Node) Error!b
         // `checkCallArguments`, which is exactly the error tsc avoids by
         // moving on to the next overload.
         if (try c.freshLiteralRejects(an, at, pt)) {
-            c.rollbackArgDiags(saved_diags, spec_file, arg_nodes);
+            rollbackArgProbe(c, saved_diags, spec_file, arg_nodes);
             return false;
         }
     }
