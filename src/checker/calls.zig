@@ -594,7 +594,10 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
                     // arguments blames the surplus ARGUMENTS, not the callee
                     // (`getArgumentArityError`'s `args.slice(maxCount)` node
                     // array) — see `reportArityError`.
-                    try reportArityError(c, node, shape.arg_nodes, nargs, 0, 0, false);
+                    var eff: std.ArrayList(EffArg) = .empty;
+                    defer eff.deinit(c.scratch());
+                    _ = try effectiveArgs(c, shape.arg_nodes, &eff);
+                    try reportArityError(c, node, eff.items, eff.items.len, 0, 0, false);
                 }
                 return .{ .ty = instance_ret, .chained = chained };
             }
@@ -948,7 +951,6 @@ fn resolveSignatureCall(
     ret_ctx: TypeId,
 ) Error!TypeId {
     if (sigs.len == 0) return types.any_type;
-    const nargs = countArgs(arg_nodes);
     if (sigs.len == 1) {
         // An explicit list on a call is one of the four sites tsc gates on the
         // type parameters' constraints (TS2344 — see
@@ -965,6 +967,17 @@ fn resolveSignatureCall(
         return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst);
     }
     // Overloads: first signature whose arity fits and whose args check.
+    //
+    // ARITY is counted over the EFFECTIVE argument list, tsc's
+    // `getEffectiveCallArguments` — a spread of a tuple spends one position
+    // per element. Counting the written arguments instead made a spread ONE
+    // position, so `pli(...[reads, writes, writes] as const)` matched the
+    // one-parameter overload and never reached the three-position one
+    // (`callWithSpread4`).
+    var eff: std.ArrayList(EffArg) = .empty;
+    defer eff.deinit(c.scratch());
+    const spread_at = try effectiveArgs(c, arg_nodes, &eff);
+    const eff_n = eff.items.len;
     //
     // tsc's `resolveCall` keeps two rejection piles: `candidatesForArgumentError`
     // (arity fit, arguments did not) and `candidatesForArgumentArityError`. Only
@@ -1023,11 +1036,18 @@ fn resolveSignatureCall(
         const inst = try c.instantiateSigForCall(sig, explicit_targs, arg_nodes, node, ret_ctx);
         const req = try c.requiredParams(inst);
         const tot = try c.paramTotal(inst);
-        if (nargs < req or nargs > tot) {
+        // `hasCorrectArity` over the effective list: a list that still holds
+        // an UNBOUNDED entry asks only whether that entry's position is one
+        // the signature can reach, since its length is not known statically.
+        const fits = if (spread_at) |si|
+            si >= req and (tot == std.math.maxInt(u32) or si < tot)
+        else
+            eff_n >= req and eff_n <= tot;
+        if (!fits) {
             // Fold this candidate into the set-wide arity picture tsc reports
             // when NO candidate ever reaches argument checking. A truncated
             // instantiation has no arity to contribute (see `checkCallArguments`).
-            if (c.ts.kind(inst) == .function) arity.note(req, tot, nargs);
+            if (c.ts.kind(inst) == .function) arity.note(req, tot, eff_n);
             c.rollbackArgDiags(saved_infer, infer_file, arg_nodes);
             c.inst_count = saved_inst_count;
             c.newBudgetWindow();
@@ -1051,16 +1071,25 @@ fn resolveSignatureCall(
     // `getArgumentArityError` over the whole set — with no TS2769 at all. Twelve
     // of the suite's TS2769/TS2554 divergences are exactly this pile mix-up.
     //
-    // A call carrying a SPREAD argument is left alone: its argument count is not
-    // known statically, so tsc answers with TS2556 about the spread instead, and
-    // guessing a count here could only invent an arity claim.
-    if (arg_err_count == 0 and arity.seen and !hasSpreadArg(c, arg_nodes)) {
-        if (nargs > arity.min and nargs < arity.max and !arity.rest) {
+    // A call whose effective list still holds an UNBOUNDED spread has no
+    // argument count to talk about, so `getArgumentArityError` answers about
+    // the SPREAD instead and never reaches its counting arms:
+    //
+    // ```ts
+    // const spreadIndex = getSpreadArgumentIndex(args);
+    // if (spreadIndex > -1) {
+    //     return createDiagnosticForNode(args[spreadIndex], Diagnostics.A_spread_argument_must_either_have_a_tuple_type_or_be_passed_to_a_rest_parameter);
+    // }
+    // ```
+    if (arg_err_count == 0 and arity.seen) {
+        if (spread_at) |si| {
+            try c.diagFmt(2556, argErrorSpan(c, eff.items[si].node), "A spread argument must either have a tuple type or be passed to a rest parameter.", .{});
+        } else if (eff_n > arity.min and eff_n < arity.max and !arity.rest) {
             try c.diagFmt(2575, calleeErrorSpan(c, node), "No overload expects {d} arguments, but overloads do exist that expect either {d} or {d} arguments.", .{
-                nargs, arity.below orelse arity.min, arity.above orelse arity.max,
+                eff_n, arity.below orelse arity.min, arity.above orelse arity.max,
             });
         } else {
-            try reportArityError(c, node, arg_nodes, nargs, arity.min, arity.max, arity.rest);
+            try reportArityError(c, node, eff.items, eff_n, arity.min, arity.max, arity.rest);
         }
         // Type the arguments (no report) and carry on with the first candidate,
         // exactly as the TS2769 path below does.
@@ -1660,8 +1689,18 @@ fn combineTwoUnionSignatures(c: *Checker, left: TypeId, right0: TypeId) Error!?T
     }
     const lc = try unionSigPositions(c, left);
     const rc = try unionSigPositions(c, right);
-    const lreq = try c.requiredParams(left);
-    const rreq = try c.requiredParams(right);
+    // tsc's `combineSignaturesOfUnionMembers` takes `Math.max(left
+    // .minArgumentCount, right.minArgumentCount)` — the signatures' RAW
+    // minimums, counted off the declared parameter list, not
+    // `getMinArgumentCount`'s tuple-rest expansion. A signature whose only
+    // parameter is a rest declares NO required argument however the tuple
+    // typing it is shaped, so `((...a: [string]) => void) | ((...a: []) =>
+    // void)` combines to a signature callable with none. Reading the expanded
+    // minimum made the combined position REQUIRED and `fn(...args)` over
+    // `signatureCombiningRestParameters1`'s mapped bag came out TS2556
+    // instead of tsc's TS2345 about the `never` the positions intersect to.
+    const lreq = rawMinArgs(c, left);
+    const rreq = rawMinArgs(c, right);
     const n = @max(lc, rc);
     // tsc's `combineUnionParameters` rest bookkeeping: the combined signature
     // keeps a rest at its LAST position when either side has an effective one
@@ -1704,6 +1743,18 @@ fn combineTwoUnionSignatures(c: *Checker, left: TypeId, right0: TypeId) Error!?T
     }
     const ret = try s.makeUnion(c.scratch(), &.{ s.fnReturn(left), s.fnReturn(right) });
     return try s.makeFunction(params.items, ret, ltp, 0);
+}
+
+/// A signature's RAW `minArgumentCount`: the declared parameters before the
+/// first optional or rest one. tsc records this on the signature at creation;
+/// `getMinArgumentCount` is the expanded reading built on top of it.
+fn rawMinArgs(c: *const Checker, sig: TypeId) u32 {
+    const count = c.ts.fnParamCount(sig);
+    for (0..count) |i| {
+        const p = c.ts.fnParam(sig, @intCast(i));
+        if (p.optional() or p.rest()) return @intCast(i);
+    }
+    return count;
 }
 
 /// tsc's `getParameterCount`: how many POSITIONS a signature declares. A
@@ -1986,6 +2037,111 @@ fn checkCallArguments(c: *Checker, node: Node, sig: TypeId, arg_nodes: []const N
     return checkCallArgumentsAnchored(c, node, sig, arg_nodes, report, null);
 }
 
+/// One entry of tsc's *effective* argument list — the list a spread has
+/// already been expanded into.
+///
+/// `ty` is `no_type` for an argument written at the call site, which is typed
+/// against its parameter the ordinary way. Anything else is one of tsc's
+/// `SyntheticExpression`s: the type is already known (it came out of the
+/// spread's tuple) and `node` is only the spread element it is blamed on.
+pub const EffArg = struct {
+    node: Node,
+    ty: TypeId = types.no_type,
+};
+
+/// tsc's `getEffectiveCallArguments`, spread half.
+///
+/// ```ts
+/// if (spreadType && isTupleType(spreadType)) {
+///     forEach(getElementTypes(spreadType), (t, i) => {
+///         const flags = spreadType.target.elementFlags[i];
+///         effectiveArgs.push(createSyntheticExpression(arg, t, !!(flags & ElementFlags.Variable), ...));
+///     });
+/// } else {
+///     effectiveArgs.push(arg);
+/// }
+/// ```
+///
+/// A spread of a TUPLE contributes one entry per element; a spread of
+/// anything else (an array, an iterable, a bare type parameter) stays a
+/// single entry typed by what iterating it yields, which is what tsc's
+/// `checkSpreadExpression` answers for the `SpreadElement` it leaves in
+/// place. `[a?: T]` contributes `T | undefined`, tsc's optionality on a tuple
+/// element (`h4(...t)` against `(a: string, b: number)` is
+/// "'string | undefined' is not assignable to 'number'").
+///
+/// Returns the index of the first entry standing for an UNBOUNDED tail —
+/// tsc's `getSpreadArgumentIndex` over the effective list — since from there
+/// on the list's length is not known statically.
+fn effectiveArgs(c: *Checker, arg_nodes: []const Node, out: *std.ArrayList(EffArg)) Error!?u32 {
+    var spread_at: ?u32 = null;
+    for (arg_nodes) |an| {
+        if (an == null_node) continue;
+        if (c.nodeTag(an) != .spread_element) {
+            try out.append(c.scratch(), .{ .node = an });
+            continue;
+        }
+        const at = try expandSpread(c, an, out);
+        if (spread_at == null) spread_at = at;
+    }
+    return spread_at;
+}
+
+/// One spread argument's contribution to the effective list. Returns the index
+/// (in `out`) of the first entry it appended that stands for an UNBOUNDED tail
+/// — tsc's `SyntheticExpression.isSpread`, which is what
+/// `getSpreadArgumentIndex` looks for.
+pub fn expandSpread(c: *Checker, an: Node, out: *std.ArrayList(EffArg)) Error!?u32 {
+    // Types the spread element itself, exactly as the pre-expansion walk did:
+    // `checkExpr`'s `.spread_element` arm answers with the spread OPERAND's
+    // type, so this both fills the node's memo and gives the type to expand.
+    var st = try c.resolveStructural(try c.checkExprCached(an, types.no_type));
+    // tsc's `isSpreadIntoCallOrNew`: an ARRAY LITERAL spread into a call is
+    // re-read as a TUPLE (`checkArrayLiteral`'s `inTupleContext`), so
+    // `f(1, 2, 3, 4, ...[5, 6])` spends exactly two more positions rather than
+    // an unbounded tail. ztsc's `checkArrayLiteral` has no call context to see
+    // that from, so rebuild the tuple here out of the literal's own elements.
+    // A literal that itself holds a spread or an elision has no fixed shape and
+    // keeps the array reading.
+    if (c.ts.kind(st) != .tuple) tupleize: {
+        const lit = expr_zig.skipParens(c, c.tree.nodeData(an).lhs);
+        if (lit == null_node or c.nodeTag(lit) != .array_literal) break :tupleize;
+        var elems: std.ArrayList(types.TupleElem) = .empty;
+        defer elems.deinit(c.scratch());
+        for (c.tree.nodeRange(lit)) |el| {
+            if (el == null_node or c.nodeTag(el) == .omitted or
+                c.nodeTag(el) == .spread_element) break :tupleize;
+            const et = c.nodeType(el) orelse break :tupleize;
+            try elems.append(c.scratch(), .{ .ty = try c.widenLiteral(et) });
+        }
+        st = try c.ts.makeTuple(elems.items);
+    }
+    if (c.ts.kind(st) == .tuple) {
+        var unbounded: ?u32 = null;
+        for (0..c.ts.tupleLen(st)) |i| {
+            const e = c.ts.tupleElem(st, @intCast(i));
+            var ty = e.ty;
+            if (e.rest()) {
+                ty = try c.elemOfArrayish(e.ty);
+                if (unbounded == null) unbounded = @intCast(out.items.len);
+            } else if (e.optional()) {
+                ty = try c.makeUnion2(e.ty, types.undefined_type);
+            }
+            try out.append(c.scratch(), .{ .node = an, .ty = ty });
+        }
+        return unbounded;
+    }
+    const at: u32 = @intCast(out.items.len);
+    const elem = (try c.iterationElementType(st)) orelse {
+        // Not iterable (already its own diagnostic elsewhere): one opaque
+        // entry, so the positions after it still line up.
+        try out.append(c.scratch(), .{ .node = an, .ty = types.error_type });
+        return at;
+    };
+    try out.append(c.scratch(), .{ .node = an, .ty = elem });
+    return at;
+}
+
 /// `checkCallArguments`, reporting back WHERE it blamed the arguments.
 ///
 /// `anchor_out`, when given, receives the span of the first diagnostic this
@@ -2030,9 +2186,55 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
     // each callback argument's contextual type with one that types its
     // parameters `any`.
     const arity_known = c.ts.kind(sig) == .function;
-    if (report and !has_spread and arity_known) {
-        if (nargs < required or nargs > total) {
-            try reportArityError(c, node, arg_nodes, nargs, required, total, total == std.math.maxInt(u32));
+    // tsc's `getEffectiveCallArguments`: a spread of a TUPLE stands for its
+    // elements, one argument each, so every argument after it lands on the
+    // position it really occupies. Without the expansion a spread was ONE
+    // opaque argument and everything it carried went unrelated
+    // (`callWithSpread2`, `callWithSpread3`).
+    var eff: std.ArrayList(EffArg) = .empty;
+    defer eff.deinit(c.scratch());
+    const spread_at = try effectiveArgs(c, arg_nodes, &eff);
+    // tsc's `hasCorrectArity` for a list that still holds an UNBOUNDED spread:
+    // the position it starts at must be one the signature can reach, and the
+    // tail it stands for must land in a rest parameter.
+    //
+    // ```ts
+    // if (spreadArgIndex >= 0) {
+    //     return spreadArgIndex >= getMinArgumentCount(signature) &&
+    //         (hasEffectiveRestParameter(signature) || spreadArgIndex < getParameterCount(signature));
+    // }
+    // ```
+    //
+    // When it does not fit, tsc's whole answer about the call is TS2556 on
+    // that spread — no argument is related at all, so the expanded entries
+    // stay silent rather than inventing a rejection out of a list whose
+    // length is not known statically.
+    const spread_fits = if (spread_at) |si|
+        si >= required and (total == std.math.maxInt(u32) or si < total)
+    else
+        true;
+    if (report and arity_known) {
+        if (spread_at) |si| {
+            // An IIFE is exempt: tsc's `isOptionalParameter` makes every
+            // un-annotated parameter of one optional from the effective
+            // argument count on, so its declared arity is never what the
+            // spread failed to satisfy — `(function (a, b, c) {})(...t)` with
+            // `t: [number, ...number[]]` is silent where the same call on a
+            // NAMED `(a: number, b: number, c: number)` is TS2556.
+            if (!spread_fits and iifeCallee(c, c.callShape(node).callee) == null_node) {
+                try c.diagFmt(2556, argErrorSpan(c, eff.items[si].node), "A spread argument must either have a tuple type or be passed to a rest parameter.", .{});
+            }
+        } else {
+            // No unbounded entry left, so the argument COUNT is known — even
+            // when the call was written with a spread, because every one of
+            // them expanded to a fixed list. tsc counts the EFFECTIVE
+            // arguments, an optional tuple element included: `f(...t)` with
+            // `t: [string, string?]` against `(a: string)` is
+            // "Expected 1 arguments, but got 2".
+            const n = eff.items.len;
+            if (n < required or n > total) {
+                try reportArityError(c, node, eff.items, n, required, total, total == std.math.maxInt(u32));
+            }
         }
     }
     // tsc reports at most ONE argument error per call. `checkApplicableSignature`
@@ -2064,15 +2266,15 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
     var packed_first: Node = null_node;
     var reported_arg = false;
     var ai: u32 = 0;
-    for (arg_nodes) |an| {
-        if (an == null_node) continue;
+    for (eff.items) |ea| {
+        const an = ea.node;
+        // An entry the spread expansion typed itself: there is no expression
+        // to check against a contextual type, and none of the elaborations
+        // below (each keyed on the argument's own syntax) applies to it.
+        const synthetic = ea.ty != types.no_type;
         defer ai += 1;
-        if (c.nodeTag(an) == .spread_element) {
-            _ = try c.checkExprCached(an, types.no_type);
-            continue;
-        }
         var pt = try c.paramTypeAt(sig, ai) orelse {
-            _ = try c.checkExprCached(an, types.no_type);
+            if (!synthetic) _ = try c.checkExprCached(an, types.no_type);
             continue;
         };
         // Inside the whole-list window, `paramTypeAt` has no answer: the target
@@ -2088,16 +2290,18 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
                 if (try tuple_relate.contextualElemType(c, w.ty, ai - w.from, @intCast(nargs -| w.from))) |ct| pt = ct;
             }
         }
-        const at = try c.checkExprCached(an, pt);
+        const at = if (synthetic) ea.ty else try c.checkExprCached(an, pt);
         if (ai >= whole_from) {
             if (packed_first == null_node) packed_first = an;
             try packed_elems.append(c.scratch(), .{ .ty = at });
             continue;
         }
-        if (report and !try c.isAssignable(at, pt)) {
+        if (report and (spread_fits or !synthetic) and !try c.isAssignable(at, pt)) {
             if (reported_arg) continue;
             const before = c.diags.items.len;
-            if (!try c.elaborateCallbackError(an, at, pt) and
+            if (synthetic) {
+                try c.reportNotAssignable(2345, at, pt, argErrorSpan(c, an));
+            } else if (!try c.elaborateCallbackError(an, at, pt) and
                 !try c.elaborateLiteralError(an, at, pt) and
                 // A fresh object-literal argument with an unknown property is
                 // tsc's TS2353/TS2561 on that property, not a TS2345 on the
@@ -2117,7 +2321,7 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
             }
             noteArgBlame(c, anchor_out, before, c.nodeSpan(an), argErrorSpan(c, an));
             reported_arg = true;
-        } else if (report and !reported_arg) {
+        } else if (report and !synthetic and !reported_arg) {
             // The excess-property check is part of the same walk tsc stops
             // at the first failure, so a later argument's excess property
             // is not reported either.
@@ -2250,7 +2454,7 @@ fn iifeMinArgs(c: *Checker, node: Node, nargs: usize) u32 {
 fn reportArityError(
     c: *Checker,
     node: Node,
-    arg_nodes: []const Node,
+    eff: []const EffArg,
     nargs: usize,
     min: u32,
     max: u32,
@@ -2261,7 +2465,7 @@ fn reportArityError(
         return;
     }
     const span = if (nargs > max)
-        extraArgsSpan(c, arg_nodes, max) orelse calleeErrorSpan(c, node)
+        extraArgsSpan(c, eff, max) orelse calleeErrorSpan(c, node)
     else
         calleeErrorSpan(c, node);
     if (min != max) {
@@ -2297,12 +2501,12 @@ fn hasSpreadArg(c: *Checker, arg_nodes: []const Node) bool {
 /// `args[max].pos` through the last argument's end — tsc's span for a call
 /// with too many arguments. Null when there is no argument at that position
 /// (nothing to blame, so the caller falls back to the callee).
-fn extraArgsSpan(c: *Checker, arg_nodes: []const Node, from: u32) ?Span {
+fn extraArgsSpan(c: *Checker, eff: []const EffArg, from: u32) ?Span {
     var i: u32 = 0;
     var start: ?u32 = null;
     var end: u32 = 0;
-    for (arg_nodes) |an| {
-        if (an == null_node) continue;
+    for (eff) |ea| {
+        const an = ea.node;
         defer i += 1;
         if (i < from) continue;
         const sp = c.nodeSpan(an);

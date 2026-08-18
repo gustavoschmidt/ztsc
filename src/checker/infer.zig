@@ -26,6 +26,7 @@ const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
 const TpMap = @import("enums.zig").TpMap;
+const calls = @import("calls.zig");
 const isUnitLikeKind = @import("assign.zig").isUnitLikeKind;
 const skipParens = @import("expr.zig").skipParens;
 const tuple_relate = @import("tuple_relate.zig");
@@ -765,6 +766,25 @@ pub fn inferTypeArgs(
         defer ai += 1;
         const tag = c.nodeTag(an);
         if (tag == .arrow_fn or tag == .function_expr) continue;
+        // A SPREAD stands for the positions its type expands to. tsc runs
+        // `getEffectiveCallArguments` once, before `inferTypeArguments`, so
+        // inference sees the expansion too; unifying the spread's own
+        // CONTAINER type against the position's parameter inferred the
+        // container where tsc infers an element — `foo<T>(...s: T[])` called
+        // `foo(...new SymbolIterator)` gave `T = SymbolIterator` instead of
+        // `T = symbol`, and every argument after a tuple spread was paired
+        // with the wrong parameter.
+        if (tag == .spread_element) {
+            var eff: std.ArrayList(calls.EffArg) = .empty;
+            defer eff.deinit(c.scratch());
+            _ = try calls.expandSpread(c, an, &eff);
+            for (eff.items, 0..) |ea, j| {
+                const ept = try c.paramTypeAt(sig, ai + @as(u32, @intCast(j))) orelse break;
+                try c.unify(ept, ea.ty, tp_syms, candidates, 0);
+            }
+            ai = (ai + @as(u32, @intCast(eff.items.len))) -| 1;
+            continue;
+        }
         const pt = try c.paramTypeAt(sig, ai) orelse continue;
         // Contextually type an array literal by the parameter so a
         // tuple-constrained target (`T extends readonly unknown[] | []`)
