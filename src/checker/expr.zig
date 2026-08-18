@@ -1497,7 +1497,7 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     // the element type of each array-like constituent (so array-literal
     // elements are contextually typed — literals stay literal instead of
     // widening).
-    var ctx_elem: TypeId = if (!ctx_tuple) try contextualArrayElemType(c, rctx) else types.no_type;
+    var ctx_elem: TypeId = if (!ctx_tuple) try contextualArrayElemOrIterated(c, rctx) else types.no_type;
     // tsc's `getContextualTypeForElementExpression` ends in
     // `getIteratedTypeOrElementType(IterationUse.Element, t, …)`, so an
     // ITERABLE contextual type types the elements even when it is not
@@ -1833,6 +1833,32 @@ fn contextualArrayElemType(c: *Checker, rctx: TypeId) Error!TypeId {
         },
         else => return types.no_type,
     }
+}
+
+/// `contextualArrayElemType` with tsc's LAST RESORT behind it:
+///
+/// ```ts
+/// getTypeOfPropertyOfContextualType(arrayContextualType, "" + index) ||
+///     mapType(arrayContextualType, t => getIteratedTypeOrElementType(IterationUse.Element, t, …))
+/// ```
+///
+/// An `Iterable<T>` carries no numeric index at all — only
+/// `[Symbol.iterator]()` — so `var xs: Iterable<(x: string) => number> = [s =>
+/// s.length]` left its element with no contextual type and reported TS7006
+/// inside it (`iterableContextualTyping1`).
+///
+/// The `||` is where the ORDER matters, and it is why this is not an arm of
+/// `contextualArrayElemType`'s `.object` case: the two alternatives are tried
+/// over the WHOLE contextual type, not per union constituent. `readonly T[] |
+/// Map<K, V>` answers `T` from the first alternative and never reaches the
+/// second — folding the `Map`'s `[K, V]` into the element context instead made
+/// excalidraw's `[...boundElements, [id, el]]` shapes `(T | [K, V])[]`, three
+/// false TS2345s.
+fn contextualArrayElemOrIterated(c: *Checker, rctx: TypeId) Error!TypeId {
+    if (rctx == types.no_type) return types.no_type;
+    const direct = try contextualArrayElemType(c, rctx);
+    if (direct != types.no_type) return direct;
+    return (try c.iterationElementType(rctx)) orelse types.no_type;
 }
 
 /// The contextual type for the element at index `i` of an array literal in
