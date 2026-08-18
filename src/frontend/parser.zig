@@ -4241,15 +4241,22 @@ const Parser = struct {
     /// declaration is a member of a namespace whose only body is that
     /// declaration) and the observable answer is the same.
     fn parseNamespaceName(p: *Parser, kw: u32, flags: u32, nested: bool) PE!Node {
-        // A segment behind a `.` is an IdentifierName, so a reserved word is a
-        // legal name there and only there — tsc's `parseIdentifierName()` for
-        // the nested case against `parseIdentifier()` for the first, which is
-        // what makes `declare namespace chrome.debugger { }` parse while
-        // `declare namespace debugger { }` does not.
-        const name_tok = if (nested and isNameLike(p.curTag()) and p.curTag() != .private_identifier)
-            try p.bump()
-        else
-            try p.expectIdentLike();
+        // A segment behind a `.` is an IdentifierName, so a reserved word PARSES
+        // there and only there — tsc's `parseIdentifierName()` for the nested
+        // case against `parseIdentifier()` for the first, which is what makes
+        // `declare namespace chrome.debugger { }` parse while `declare namespace
+        // debugger { }` does not.
+        //
+        // Parsing is not the whole verdict: tsc's BINDER runs
+        // `checkStrictModeIdentifier` over the name either way, and a
+        // ModuleDeclaration's name is not one of the IdentifierName positions
+        // that check exempts. So a FUTURE-reserved word is TS1212 on a nested
+        // segment exactly as on the first (`namespace private.public.foo`,
+        // measured) while `debugger`, a plain reserved word, stays legal.
+        const name_tok = if (nested and isNameLike(p.curTag()) and p.curTag() != .private_identifier) blk: {
+            try p.checkStrictReserved();
+            break :blk try p.bump();
+        } else try p.expectIdentLike();
         // TS1540: `module M { }` is the deprecated spelling of `namespace M { }`
         // — only `declare module "spec" { }` may still say `module`, and that
         // form never reaches here. tsc blames the NAME, so a dotted name
@@ -6908,6 +6915,14 @@ const Parser = struct {
             },
             else => {
                 if (isIdentLike(p.curTag())) {
+                    // The HEAD of a type reference is an identifier REFERENCE —
+                    // tsc's `parseIdentifier`, and its binder's
+                    // `checkStrictModeIdentifier` does not exempt it the way it
+                    // exempts an IdentifierName. So `var v: yield` is TS1212
+                    // wherever it stands, generator body or not, and `var u:
+                    // public` with it (measured). The `.B.C` tail is an
+                    // IdentifierName and stays exempt.
+                    try p.checkStrictReserved();
                     const name = try p.parseEntityName();
                     if (p.atLt()) {
                         const lt_tok = p.curIdx();
