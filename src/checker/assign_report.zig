@@ -1381,6 +1381,49 @@ fn nestedTargetPropType(c: *Checker, rt: TypeId, src_t: TypeId, key: Atom) Error
     return c.targetPropType(try c.resolveStructural(b), key);
 }
 
+/// tsc's `shouldCheckAsExcessProperty`: only a property whose symbol was
+/// DECLARED by this very object literal is excess-checked
+/// (`prop.valueDeclaration.parent === container.valueDeclaration`). A property
+/// written before a spread that supplies the same name does not survive
+/// `getSpreadType` — the result carries the SOURCE's symbol, declared
+/// elsewhere — so tsc never measures it against the target:
+///
+///     f({ x: 1, extra: 5, ...req })   // silent (TS2783 only)
+///     f({ x: 1, ...req, extra: 5 })   // TS2353: the spread is EARLIER
+///
+/// An OPTIONAL property on the spread source counts too, even though it leaves
+/// the earlier value reachable and so files no TS2783: `getSpreadType`
+/// synthesizes a fresh union symbol for that pair, and a synthesized symbol has
+/// no `valueDeclaration` at all — which fails the same guard.
+///
+/// An INDEX SIGNATURE on the source does not count (`allow_index = false`):
+/// index infos are spread separately and produce no property symbol to
+/// overwrite with, so `{ a: 1, ...someRecord }` still reports `a`. Nor does a
+/// source that names something else, and nor — because `propOfTypeEx` requires
+/// a UNION source to carry the name in every constituent — does
+/// `{ extra: number } | { zz: number }`.
+///
+/// A bare TYPE PARAMETER source resolves through its constraint here, unlike in
+/// `checkSpreadPropOverrides`, where reading the constraint would have been a
+/// false positive. The polarities are opposite: there the constraint would
+/// invent an overwrite, here it suppresses a check tsc also suppresses.
+fn overriddenByLaterSpread(c: *Checker, members: []const Node, after: usize, key: Atom) Error!bool {
+    for (members[after + 1 ..]) |el| {
+        if (el == null_node or c.nodeTag(el) != .spread_element) continue;
+        const raw = c.nodeType(c.tree.nodeData(el).lhs) orelse continue;
+        const st = try c.resolveStructural(raw);
+        switch (c.ts.kind(st)) {
+            // Spreading one of these yields no members to overwrite with —
+            // and an `any` source makes the whole literal `any`, which the
+            // freshness gate above has already turned the scan away from.
+            .any, .err, .unknown, .never => continue,
+            else => {},
+        }
+        if ((try c.propOfTypeEx(st, key, false)) != null) return true;
+    }
+    return false;
+}
+
 pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: TypeId, report: bool) Error!bool {
     var node = expr_node;
     // Unwrap parens and a JSX expression container (`prop={{ … }}`): the
@@ -1463,7 +1506,8 @@ pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: T
         .intersection => if (!try c.intersectionExcessCheckable(rt)) return false,
         else => return false,
     }
-    for (c.tree.nodeRange(node)) |prop| {
+    const members = c.tree.nodeRange(node);
+    for (members, 0..) |prop, i| {
         if (prop == null_node) continue;
         const tag = c.nodeTag(prop);
         if (tag != .object_property and tag != .object_shorthand and tag != .object_method) continue;
@@ -1480,6 +1524,11 @@ pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: T
             if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) continue;
         }
         const key = try c.memberAtom(key_tok);
+        // A property a LATER spread also supplies is not this literal's to
+        // answer for — see `overriddenByLaterSpread`. Skipped whole: the
+        // nested-literal recursion below elaborates a value the spread throws
+        // away, so it has nothing to say either.
+        if (try overriddenByLaterSpread(c, members, i, key)) continue;
         const known = try c.targetKnowsProp(rt, key);
         if (!known) {
             if (report) {
