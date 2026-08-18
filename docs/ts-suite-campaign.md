@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-17, post wave 18 — 80% crossed)
+## Standings (2026-08-18, post wave 19)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **6963 / 8628 (80.7%)** |
-| excess keys (false positives) | 3541 | 2005 |
-| missing keys (under-reports) | 8617 | 3820 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7004 / 8627 (81.2%)** |
+| excess keys (false positives) | 3541 | 1966 |
+| missing keys (under-reports) | 8617 | 3697 |
 | bucketed (ztsc parse error, incomparable) | 825 | 13 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Eighteen waves landed (3–18), every one with ZERO match→non-match regressions in
+Nineteen waves landed (3–19), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -204,7 +204,83 @@ already matches). D fixed cross-file TS2403 (firstValueDeclOf trimming),
 the phantom-modifier parse of type members (+30 alone), TS6053/TS2308/TS2309,
 TS1212 positions.
 
-## Ranked next queue (wave 19) — distilled from wave-18 agent reports
+Wave 19 (+41 cases; both app baselines refreshed for the +27-line lib stats
+footer, diagnostics unchanged): A rerouted tagged templates through
+resolveSignatureCall (IncompatibleTypedTags exact), leading-variadic tuple
+context, TS 5.1 undefined-return rule, RegExp typing (byte-empty app diffs,
+as predicted), radix literals. B landed the distributive-constraint
+substituted reading (type-returning distributiveConstraint), one-way nested
+comparability, indexed-access-pair inference; keyof-of-array implemented,
+measured, REVERTED — forcing resolveStructural(Array) inside keyofType
+poisons the expansions memo (39 excalidraw files); prerequisite recorded.
+C fixed the overload-probe memo poisoning (withdraw node_types entries
+covering withdrawn diagnostics; deterministic counters show +16/+3 re-checks
+per whole app) and TS2744 both halves. D landed the Map/WeakMap/WeakSet
+iterable-overload lib reorder (SetConstructor deliberately excluded — infer
+widens through Iterable<T>), var-undefined reads, singleton-exhaustive
+switch, TS1268, TS18014, reserved-word message interpolation.
+
+## Ranked next queue (wave 20) — distilled from wave-19 agent reports
+
+1. Construct-signature reorderCandidates: tsc splices each merged interface's
+   declaration group at the FRONT (last declaration resolves first); ztsc
+   implements this for CALL signatures only (signatures.appendObjectCallCandidates
+   + classes.recordCallSigGroups). Extending to construct signatures deletes
+   the wave-19 lib hack and fixes every merged constructor at once (also the
+   genericMethodOverspecialization getElementById shape).
+2. Iterable<T> covariant inference: tsc's getCovariantInference does not
+   widen an array literal's element when T is top-level in the return type;
+   ztsc does — this is what blocks the SetConstructor reorder (excalidraw
+   bindingProperties witness) and broke wave-12's inference attempt. infer.zig.
+3. keyof-of-array prerequisite: materialize the Array interface's generic
+   member table at checker init (nothing mid-expansion), THEN land B's
+   reconstructible keyof arm ('length'/'slice' ∈ keyof T[]; fixed indices for
+   tuples). 9+ keys.
+4. Excess-property check ignores later-spread overrides (tsc's
+   shouldCheckAsExcessProperty): live excalidraw FP repro —
+   `make({x:1, type:"text", ...plain})` false TS2353 today. assign_report.zig.
+5. for-of head destructuring pattern checked as an EXPRESSION
+   (stmts.checkForInOf calls checkExprCached(e.left) instead of the
+   destructuring path the `=` case uses) — phantom TS2698 on nestedObjectRest.
+6. resolveSignatureCall's arg_err_count==1 path re-walks arguments with
+   no_type and PUBLISHES implicit-any TS7006 tsc never emits
+   (taggedTemplateContextualTyping2:18:14; same loop on the TS2769 and arity
+   paths). calls.zig.
+7. Rollback-vs-memo, the nested half: diagnostics inside re-walked argument
+   subtrees are memo hits and lost permanently (4 keys
+   taggedTemplateContextualTyping1; dottedSymbolResolution1's TS2454).
+   End-state design is tsc's checkDeferredNodes (defer function-expression
+   body checks) — mapped to expr.zig checkExprCached publish site +
+   stmts.zig checkFunctionBody + signatures.zig; needs the expr/stmts owner.
+8. Binder expando: only string-literal keys recognized —
+   `Foo[`+"`b`"+`] = fn` template keys cost 4 cases.
+9. Parser cluster: `function F(public A)` should name the parameter `public`
+   (4 span-only cases); TS1089 on constructors (3, + 2 false TS1244/45 for
+   `abstract constructor`); TS1134 (6, parseDelimitedList recovery); TS2875
+   jsxImportSource (5, jsx+link, FP-risk); TS1024 (3).
+10. TS2394 for constructors — exact site documented: stmts.zig checkClass's
+    .class_method arm (line ~2186), sibling scan via isCtorMember, then the
+    already-pub signatures.checkOverloadImplementation anchored on the
+    constructor token.
+11. inferTypeArgs two-round publish fragility (documented in calls.zig enum
+    doc comment): widening the probe withdrawal to all arguments breaks
+    social-app's useInfiniteQuery TPageParam — the rounds read each other's
+    published answers. Robust fix belongs with inference.
+12. One-key census: 552 cases sit one key from exact. B19's relation list:
+    assignmentCompatability10, coAndContraVariantInferences7,
+    contravariantOnlyInferenceFromAnnotatedFunction, extractInferenceImprovement,
+    mappedTypeOverlappingStringEnumKeys, keyofInferenceIntersectsResults,
+    discriminatedUnionInference, unionTypeWithIndexAndTuple,
+    contextualTypeWithTuple, noInfer.ts:80. Plus
+    prefixedNumberLiteralAssignToNumberLiteralType (`let x: 1 = +1`, expr).
+13. TS2437 (typespace), TS2465 (expr), complexRecursiveCollections (needs its
+    independent TS2344 under-key too).
+14. nestedExcessPropertyChecking per-frame weak rule (risky; flow/062);
+    resolution-mode import attributes (deep); determinism defect (social-app
+    --checkers=1 vs --file-order=reverse, Navigation.tsx:778:29,
+    instantiation-budget partition bug).
+
+## Superseded queue (wave 19, kept for context)
 
 1. Tagged templates never check substitution arguments (~21 keys):
    expr.zig:1237 checkTaggedTemplate already builds the argument list —
