@@ -425,7 +425,14 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
         //
         // The arguments are still resolved against the base constructor below,
         // which is where any further diagnostic about them comes from.
-        if (!c.in_ctor_body and !c.in_computed_key) {
+        //
+        // A WRITTEN type-argument list takes the call out of this check
+        // entirely: `super<T>(0)` is TS2754 ("'super' may not use type
+        // arguments") and nothing else, tsgo-verified on
+        // `parserSuperExpression2`. ztsc does not implement TS2754, so the
+        // choice here is between silence and a different code at a different
+        // span — and silence is the one that is not wrong.
+        if (!c.in_ctor_body and !c.in_computed_key and shape.targ_nodes.len == 0) {
             try c.diagFmt(2337, c.nodeSpan(shape.callee), "Super calls are not permitted outside constructors or in nested functions inside constructors.", .{});
         }
         if (try superCtorSigs(c, &super_sigs)) {
