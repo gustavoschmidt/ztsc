@@ -284,12 +284,17 @@ fn writtenTypeParamRange(c: *const Checker, node: Node) ?[]const Node {
 /// happened to materialize the declaration. It runs once per owned file, after
 /// the statement walk — `seal` sorts the diagnostics back into position order.
 ///
-/// It reports nothing at all for the overwhelming majority of files: the
-/// per-node cost until a `<…>` list turns up is one tag compare.
+/// The candidate list is the binder's SCOPE OWNERS, not the file's nodes.
+/// Every syntactic holder of a `<…>` list — function, method, arrow, class,
+/// interface, alias, and the call/construct/method signature forms — opens a
+/// scope for the parameters to be resolved in, so `scope_owners` is a superset
+/// of the declarations this check is about and is two orders of magnitude
+/// shorter than `nodeCount`. (A node owning several scopes appears several
+/// times; `diagFmt` dedupes on `(file, code, span-start)`, so a repeat is
+/// free.)
 pub fn checkFileTypeParamDefaults(c: *Checker) Error!void {
-    const n = c.tree.nodeCount();
-    var node: Node = 1;
-    while (node < n) : (node += 1) {
+    for (c.prog.files[c.cur_file].bind.scope_owners, 0..) |node, s| {
+        if (s == 0 or node == null_node) continue;
         const tps = writtenTypeParamRange(c, node) orelse continue;
         for (tps, 0..) |tp, i| {
             if (tp == null_node or c.nodeTag(tp) != .type_param) continue;
