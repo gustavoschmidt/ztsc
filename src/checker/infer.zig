@@ -2483,6 +2483,22 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
     // `readonly Bound[] | null` too, which is what lets the array literal
     // written for it be formed as an array of `{ type: "arrow" }` instead
     // of widening its discriminant to `string`.
+    // tsc's `inferFromTypes` indexed-access pair: `O[K]` against `O2[K2]`
+    // infers object against object and index against index, and does it
+    // BEFORE either side is read through a constraint. It has to sit ahead of
+    // the apparent-source rule below, which replaces `NMap[T2]` with its base
+    // constraint `"A" | "B"` and leaves the pattern's `T` nothing structural
+    // to bind — so `<T extends 1|2|3>(x: `${T}`) => NMap[T]` did not relate to
+    // `<T2 extends 1|2>(x: `${T2}`) => NMap[T2]`: `instantiateSigInContextOf`
+    // came back with no candidate for `T`, `T` was clamped to its own
+    // constraint, and the instantiated return no longer matched
+    // (`templateLiteralTypes7` g3). The parameter positions cannot answer for
+    // it either — a template-literal pattern binds nothing at all.
+    if (s.kind(param) == .index_access and s.kind(arg) == .index_access) {
+        try c.unify(s.indexAccessObj(param), s.indexAccessObj(arg), tp_syms, candidates, depth + 1);
+        try c.unify(s.indexAccessIndex(param), s.indexAccessIndex(arg), tp_syms, candidates, depth + 1);
+        return;
+    }
     const arg_instantiable = switch (s.kind(arg)) {
         .type_param, .index_access, .conditional => true,
         else => false,

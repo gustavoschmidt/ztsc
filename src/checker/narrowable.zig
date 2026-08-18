@@ -34,6 +34,7 @@ const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
+const assign = @import("assign.zig");
 const isInstantiableKind = @import("expr.zig").isInstantiableKind;
 
 /// The reference the *enclosing* expression has put in a constraint position,
@@ -190,8 +191,20 @@ pub fn substituteConstraints(c: *Checker, t: TypeId) Error!TypeId {
 /// `unknown` under that reading (nothing to substitute) and a `… | undefined`
 /// union under the evaluating one, which invented a TS18048 on every read of it
 /// (`narrowing/084`).
+///
+/// tsc's `computeBaseConstraint` for a conditional asks
+/// `getConstraintOfDistributiveConditionalType` FIRST and only falls back to the
+/// branch union. The distributive reading is the branch union with the branches
+/// the check parameter's own bound rules out dropped, so
+/// `ZeroOf<T>` (`T extends null ? null : … : never`) under `T extends {}` is
+/// `"" | 0 | false` and not `"" | 0 | false | null | undefined` — the wider
+/// reading manufactured a TS2322 on every `let t: "" | 0 | false = x`
+/// (`distributiveConditionalTypeConstraints`, `conditionalTypes1` f21).
 fn constraintOrSelf(c: *Checker, t: TypeId) Error!TypeId {
     if (!isInstantiableKind(c.ts.kind(t))) return t;
+    if (c.ts.kind(t) == .conditional) {
+        if (try assign.distributiveConstraint(c, t)) |dc| return c.resolveStructural(dc);
+    }
     // tsc's `computeBaseConstraint` answers `keyofConstraintType` — `string |
     // number | symbol` — for an INDEX type, not `keyof <constraint>`: the keys
     // of an unknown object are only known to be property keys. It is what makes
