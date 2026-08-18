@@ -1329,7 +1329,14 @@ fn checkTaggedTemplate(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             if (sub != null_node) try args.append(c.scratch(), sub);
         }
     }
-    const r = try c.resolveStructural(tag_ty);
+    // The tag's APPARENT type carries the signatures: a tag whose type is a
+    // type parameter is called through its base constraint, exactly as an
+    // ordinary call's callee is (`checkCallExprInner`'s `.type_param` arm).
+    var r = try c.resolveStructural(tag_ty);
+    if (c.ts.kind(r) == .type_param) {
+        const bc = try c.transitiveBaseConstraint(r);
+        if (bc != r) r = try c.resolveStructural(bc);
+    }
     var sigs: std.ArrayList(TypeId) = .empty;
     defer sigs.deinit(c.scratch());
     switch (c.ts.kind(r)) {
@@ -1344,9 +1351,81 @@ fn checkTaggedTemplate(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         // Nothing to draw a contextual type from, but the substitutions are
         // still expressions and still have to be checked.
         for (args.items[1..]) |sub| _ = try c.checkExprCached(sub, types.no_type);
+        if (try tagNotCallable(c, tag_ty, r)) {
+            // ```ts
+            // if (isArrayLiteralExpression(node.parent)) {
+            //     const diagnostic = createDiagnosticForNode(node.tag,
+            //         Diagnostics.It_is_likely_that_you_are_missing_a_comma_to_separate_these_two_template_literals_…);
+            // ```
+            //
+            // Two template literals written on consecutive lines of an array
+            // literal parse as ONE tagged template, and "you are missing a
+            // comma" is the diagnosis that helps; "not callable" is a true
+            // statement about a program nobody wrote on purpose.
+            if (node == c.array_elem) {
+                try c.diagFmt(2796, c.nodeSpan(d.lhs), "It is likely that you are missing a comma to separate these two template literals. They form a tagged template expression which cannot be invoked.", .{});
+            } else {
+                try c.diagFmt(2349, c.nodeSpan(d.lhs), "This expression is not callable.", .{});
+            }
+            return types.error_type;
+        }
         return types.any_type;
     }
     return calls_zig.resolveSignatureCall(c, node, sigs.items, &.{}, args.items, types.no_type, ctx);
+}
+
+/// Is a tag with NO call signature one tsc rejects outright (TS2349), or one
+/// it lets through as `any`?
+///
+/// tsc runs the same `resolveCall` for a tagged template as for a call, so the
+/// answer is `resolveUntypedCall`'s: `any`/`error`, and anything assignable to
+/// the global `Function` (`isUntypedFunctionCall`'s last disjunct — an
+/// interface body with no call signature of its own), are silent; everything
+/// else is "This expression is not callable".
+///
+/// Stated as a CLOSED SET of kinds rather than as its complement, because a
+/// kind this file has not thought about is one whose signatures may simply not
+/// have been gathered — and answering "not callable" there manufactures a
+/// false positive on working code. The set is the shapes whose members are
+/// fully materialized by `resolveStructural`: a class value (construct
+/// signatures only — ``CtorTag`x` `` is tsc's TS2349), an object/interface with
+/// no call signature, and every primitive and literal.
+fn tagNotCallable(c: *Checker, tag_ty: TypeId, r: TypeId) Error!bool {
+    switch (c.ts.kind(r)) {
+        .class_value,
+        .object,
+        .ref,
+        .string,
+        .string_literal,
+        .template_literal_type,
+        .string_mapping,
+        .number,
+        .number_literal,
+        .number_literal_fresh,
+        .bigint,
+        .bigint_literal,
+        .boolean,
+        .bool_true,
+        .bool_false,
+        .symbol,
+        .unique_symbol,
+        .enum_type,
+        .array,
+        .tuple,
+        => {},
+        else => return false,
+    }
+    // `isUntypedFunctionCall` opens its last disjunct with
+    // `!numCallSignatures && !numConstructSignatures`: a value that CAN be
+    // constructed but not called is rejected however assignable to `Function`
+    // it is — every class value is (`taggedTemplateWithConstructableTag01`,
+    // and the construct-signature-only interface of `…02`).
+    if (c.ts.kind(r) == .class_value) return true;
+    if (c.ts.kind(r) == .object and c.ts.objectConstructSigCount(r) != 0) return true;
+    // `isUntypedFunctionCall`'s `isTypeAssignableTo(funcType, globalFunctionType)`.
+    const sym = c.prog.globals.lookup(c.atom_Function) orelse return true;
+    if (!c.symFlags(sym).interface) return true;
+    return !try c.isAssignable(tag_ty, try c.ts.makeRef(sym, &.{}));
 }
 
 /// A lib-declared global INTERFACE, by name and with no type arguments — the
@@ -1535,7 +1614,14 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // `number[]` and matches neither branch.
             ectx = try contextualElemTypeAt(c, if (c.ts.kind(rctx) == .union_type) rctx else ctx_tuple_ty, i, lit_len);
         }
+        // An element of an array literal is the one place a NON-CALLABLE tag
+        // gets a different diagnostic (`checkTaggedTemplate`'s TS2796); ztsc
+        // has no parent links, so the element marks itself for the duration,
+        // exactly as a tagged template marks its own template node.
+        const prev_elem = c.array_elem;
+        c.array_elem = el;
         const raw = try c.checkExprCached(el, ectx);
+        c.array_elem = prev_elem;
         var et = raw;
         if (!try keepLiteral(c, et, ectx)) et = try c.widenLiteral(et);
         // tsc's `checkExpressionForMutableLocation` ends
@@ -3823,6 +3909,15 @@ fn numericIndexHit(c: *Checker, r: TypeId, rk: types.Kind, v: f64) Error!?TypeId
             const ni = c.ts.objectNumberIndex(rt);
             return if (ni != 0) ni else null;
         },
+        // A STRING carries a numeric domain through its apparent type: the
+        // lib's `interface String { readonly [index: number]: string }`. tsc
+        // reaches it the same way it reaches any other — `getPropertyName-
+        // FromIndex` turns the numeric name into a number index and
+        // `findApplicableIndexInfo` picks that signature off the apparent
+        // type. Without the arm, `s["0"]` was a TS7053 false positive while
+        // `s[0]` (which goes through `numberIndexType`) was silent
+        // (`templateStringInIndexExpression`).
+        .string, .string_literal, .template_literal_type, .string_mapping => return types.string_type,
         else => return null,
     }
 }

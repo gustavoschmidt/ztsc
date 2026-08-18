@@ -2418,6 +2418,13 @@ pub const Checker = struct {
     /// SyntaxKind.TaggedTemplateExpression`); ztsc has no parent links, so
     /// `checkTaggedTemplate` marks its own template here.
     tagged_tpl: Node = null_node,
+    /// The array-literal ELEMENT currently being checked. tsc's
+    /// `resolveTaggedTemplateExpression` asks `isArrayLiteralExpression(node
+    /// .parent)` before reporting a non-callable tag, because there the far
+    /// likelier reading is a missing comma between two template literals
+    /// (TS2796, not TS2349); ztsc has no parent links, so `checkArrayLiteral`
+    /// marks the element here.
+    array_elem: Node = null_node,
     /// Type-parameter symbols of every `inferTypeArgs` call currently on the
     /// stack (innermost last). A symbol in here but *not* in the current call's
     /// `tp_syms` is an OUTER call's still-in-flight inference variable — tsc
