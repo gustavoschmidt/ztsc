@@ -974,11 +974,44 @@ pub fn checkImportEqualsEntity(c: *Checker, entity: Node, exported: bool) Error!
             return;
         },
     };
+    try reportHiddenModule(c, tok, a, root_sym);
     const b = (try nsChainBreak(c, entity)) orelse return;
     if (exported and modvalue.valuelessNamespace(c, root_sym)) {
         try c.diagFmt(2708, c.tokSpan(tok), "Cannot use namespace '{s}' as a value.", .{c.tokenText(tok)});
     }
     try reportNsChainBreak(c, b);
+}
+
+/// TS2437: `import Y = A` where a local declaration hides the module `A`.
+///
+/// The right-hand side resolves in NAMESPACE space, which walks straight past a
+/// local `var A` to find the outer `namespace A`. What the alias EMITS, though,
+/// is a plain `var Y = A;` — and that `A` resolves in VALUE space, to the local
+/// declaration. The alias would bind the wrong thing, so tsc refuses it.
+///
+/// Both halves of that reasoning are load-bearing, and each one is a silence:
+///
+///   * a module with no value of its own emits nothing that could be wrong, so
+///     an UNINSTANTIATED namespace is silent however it is shadowed — while the
+///     same namespace merged with a class reports
+///     (`internalImportUnInstantiatedModuleMergedWithClassNotReferencingInstance`
+///     against the `TypeOnly` shape, both oracle-measured);
+///   * a shadow that resolves in value space to the module ITSELF hides
+///     nothing, which is why a local `namespace`, `enum` or import alias of the
+///     same name is silent where a `var`, `let`, `function` or `class` reports.
+///
+/// Only the FIRST identifier of a dotted right-hand side is emitted as a bare
+/// name, so only it is checked: `import F = Q.R` beside a local `var R` is
+/// fine. Position does not matter either — a `var` written AFTER the alias
+/// hides it just the same.
+fn reportHiddenModule(c: *Checker, tok: TokenIndex, a: Atom, root_sym: SymbolId) Error!void {
+    if (modvalue.valuelessNamespace(c, root_sym)) return;
+    const in_value = switch (c.resolveSpace(a, c.cur_scope, true)) {
+        .sym => |s| s,
+        else => return,
+    };
+    if (in_value == root_sym) return;
+    try c.diagFmt(2437, c.tokSpan(tok), "Module '{s}' is hidden by a local declaration with the same name.", .{c.tokenText(tok)});
 }
 
 fn reportBadNsQualifier(c: *Checker, node: Node, member_tok: TokenIndex) Error!bool {
