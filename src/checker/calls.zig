@@ -564,6 +564,28 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
                 // on the class's own type-parameter constraints — the same
                 // written-list question as `G<Bad>` in a type position.
                 try c.queueTypeArgConstraints(node, cls, targs.items);
+                // …but the ARITY question is answered differently here than in
+                // a type position. tsc resolves `new C<A, B>(…)` through
+                // `getInstantiatedConstructorsForTypeArguments` →
+                // `checkTypeArguments`, whose complaint is TS2558 at the
+                // type-argument LIST ("Expected 1 type arguments, but got 2"),
+                // where the same written list under `var c: C<A, B>` is
+                // TS2314/TS2315/TS2707 at the NAME. `fixTypeArgs` answers the
+                // type-position question, so the count is checked here first
+                // (`tooManyTypeParameters1`,
+                // `constructorInvocationWithTooFewTypeArgs`).
+                if (targArityMismatch(tps.items, targs.items.len)) |exp| {
+                    const span = typeArgsSpan(c, shape.targ_nodes, node);
+                    if (exp.min == exp.max) {
+                        try c.diagFmt(2558, span, "Expected {d} type arguments, but got {d}.", .{ exp.max, targs.items.len });
+                    } else {
+                        try c.diagFmt(2558, span, "Expected {d}-{d} type arguments, but got {d}.", .{ exp.min, exp.max, targs.items.len });
+                    }
+                    for (shape.arg_nodes) |an| {
+                        if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+                    }
+                    return .{ .ty = types.error_type, .chained = chained };
+                }
                 const fixed = try c.fixTypeArgs(cls, targs.items, c.tree.nodeMainToken(node)) orelse return .{ .ty = types.error_type, .chained = chained };
                 @memcpy(inst_args, fixed);
             } else if (tps.items.len > 0) {
@@ -987,6 +1009,24 @@ pub fn resolveSignatureCall(
         if (explicit_targs.len > 0 and writesTypeArgs(c, node)) {
             try c.queueSigTypeArgConstraints(node, sigs[0], explicit_targs);
         }
+        // A candidate that declares NO type parameters cannot accept a written
+        // list at all: tsc's `hasCorrectTypeArgumentArity` rejects it before an
+        // argument is looked at, and `reportCallResolutionErrors` then reports
+        // out of `candidateForTypeArgumentError` alone. So `f<number>(1)` on
+        // `f: (v: T) => U` is "Expected 0 type arguments, but got 1" at the
+        // list, and NOT an argument error on top
+        // (`typeArgumentsOnFunctionsWithNoTypeParameters`,
+        // `genericWithOpenTypeParameters1`). The arguments are still typed for
+        // downstream consumers, silently — tsc's
+        // `pickLongestCandidateSignature` returns the candidate without ever
+        // running `checkApplicableSignature`.
+        if (explicit_targs.len > 0 and c.ts.kind(sigs[0]) == .function and
+            c.ts.fnTypeParams(sigs[0]).len == 0)
+        {
+            try c.diagFmt(2558, typeArgsSpan(c, c.callShape(node).targ_nodes, node), "Expected 0 type arguments, but got {d}.", .{explicit_targs.len});
+            try checkCallArguments(c, node, sigs[0], arg_nodes, false);
+            return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(sigs[0]);
+        }
         const inst = try c.instantiateSigForCall(sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
         if (instance_ret == types.no_type) try checkThisArg(c, node, inst);
         try checkCallArguments(c, node, inst, arg_nodes, true);
@@ -1119,7 +1159,7 @@ pub fn resolveSignatureCall(
         }
         // Type the arguments (no report) and carry on with the first candidate,
         // exactly as the TS2769 path below does.
-        const inst_one = try c.instantiateSigForCall(sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
+        const inst_one = try instantiateFallbackSig(c, sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
         try typeArgsAfterFailure(c, inst_one, arg_nodes);
         return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst_one);
     }
@@ -1155,7 +1195,7 @@ pub fn resolveSignatureCall(
     try checkCallArgumentsAnchored(c, node, inst_last, arg_nodes, true, &arg_anchor);
     if (arg_err_count == 1) {
         // Keep the candidate's own diagnostics; tsc files no TS2769 here.
-        const inst_one = try c.instantiateSigForCall(sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
+        const inst_one = try instantiateFallbackSig(c, sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
         try typeArgsAfterFailure(c, inst_last, arg_nodes);
         return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst_one);
     }
@@ -1211,7 +1251,7 @@ pub fn resolveSignatureCall(
     c.rollbackDiags(saved, .{ .file = c.cur_file, .lo = call_span.start, .hi = call_span.end });
     try c.diagFmt(2769, anchor, "No overload matches this call.", .{});
     // Continue with the first signature for downstream typing.
-    const inst = try c.instantiateSigForCall(sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
+    const inst = try instantiateFallbackSig(c, sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
     try typeArgsAfterFailure(c, inst_last, arg_nodes);
     return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst);
 }
@@ -1221,6 +1261,50 @@ pub fn resolveSignatureCall(
 /// destructured parameter's leaves (TS7031). Nothing else in the 70xx range
 /// depends on the contextual signature.
 const contextual_implicit_any = [_]u16{ 7006, 7019, 7031 };
+
+/// `instantiateSigForCall` for the candidate the call is TYPED with once
+/// resolution has failed. tsc's `pickLongestCandidateSignature` instantiates
+/// such a candidate for its return type alone and never re-reports against it.
+/// ztsc's pick is `sigs[0]`, which may be an overload the written type-argument
+/// list does not fit — and TS2558 for THAT is a complaint about the signature
+/// ztsc happened to pick, not about the call: `_.map<number, string, Date>(c2,
+/// rf1)` over a two-overload `Combinators` reported "Expected 2 type arguments,
+/// but got 3" against the first overload, which `hasCorrectTypeArgumentArity`
+/// had already dropped from the candidate list (`genericCombinators2`).
+///
+/// Only that code is withdrawn. A type-argument-arity error the call really
+/// does have is reported from the candidate list — the lone-candidate arm of
+/// `resolveSignatureCall`, or `instantiateSigForCall` on the report signature —
+/// before this ever runs.
+const targ_arity_code = [_]u16{2558};
+
+/// The type-parameter list's accepted arity RANGE when `written` is outside it,
+/// else null. `min` counts the parameters with no default, tsc's
+/// `getMinTypeArgumentCount`; `max` is the whole list. A non-generic target
+/// answers `0..0`, which is a real answer here — `new NonGeneric<T>()` is
+/// "Expected 0 type arguments, but got 1".
+fn targArityMismatch(tps: []const TypeParamInfo, written: usize) ?struct { min: usize, max: usize } {
+    var min: usize = 0;
+    for (tps) |tp| {
+        if (tp.default == 0) min += 1;
+    }
+    if (written >= min and written <= tps.len) return null;
+    return .{ .min = min, .max = tps.len };
+}
+
+fn instantiateFallbackSig(
+    c: *Checker,
+    sig: TypeId,
+    explicit_targs: []const TypeId,
+    arg_nodes: []const Node,
+    node: Node,
+    ret_ctx: TypeId,
+) Error!TypeId {
+    const saved = c.diags.items.len;
+    const inst = try c.instantiateSigForCall(sig, explicit_targs, arg_nodes, node, ret_ctx);
+    c.rollbackDiags(saved, .{ .file = c.cur_file, .lo = 0, .hi = 0, .codes = &targ_arity_code });
+    return inst;
+}
 
 /// Type every argument for downstream consumers once overload resolution has
 /// FAILED. There is no signature left to offer as a contextual type, so the
