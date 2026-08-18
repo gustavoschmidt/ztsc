@@ -222,9 +222,7 @@ pub fn buildProgram(
         var type_ref_misses: std.ArrayList(TypeRefMiss) = .empty;
         for (try resolve.scanReferences(scratch, bytes)) |ref| {
             const rfid = try disco.discoverReference(path, ref);
-            if (rfid == no_file and ref.kind == .types) {
-                try type_ref_misses.append(arena, typeRefMiss(ref));
-            }
+            if (rfid == no_file) try type_ref_misses.append(arena, typeRefMiss(ref));
         }
 
         // Resolve this file's specifiers; discover new files.
@@ -2574,6 +2572,17 @@ const Linker = struct {
         // (`export * from "fs"`) cannot: the registry those names live in is
         // built after every file table (`buildAmbient`), so it is empty at this
         // point. That half runs as a deferred pass — `starMergeFilesFromAmbient`.
+        //
+        // TS2308 rides along: tsc builds the star merge in a table of its own
+        // (`nestedSymbols`) precisely so it can tell a name two stars disagree
+        // about from one the module also declares itself. `own_exports` is that
+        // distinction here — the table is insertion-ordered, so everything pass
+        // 1 put in it sits below that mark.
+        const own_exports = t.count();
+        var star_first: std.AutoArrayHashMapUnmanaged(Atom, StarSource) = .empty;
+        defer star_first.deinit(l.scratch);
+        var star_dups: std.ArrayList(StarDup) = .empty;
+        defer star_dups.deinit(l.scratch);
         for (f.bind.exports) |rec| {
             if (rec.kind != .reexport_all) continue;
             const mfile = f.specs.get(rec.module) orelse continue;
@@ -2581,12 +2590,19 @@ const Linker = struct {
             const mt = try l.table(mfile);
             for (mt.keys(), mt.values()) |name, tgt| {
                 if (name == l.atom_default or name == l.atom_export_equals) continue;
+                const gop = try star_first.getOrPut(l.scratch, name);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = .{ .node = rec.node, .target = tgt };
+                } else if (!sameStarTarget(gop.value_ptr.target, tgt)) {
+                    try star_dups.append(l.scratch, .{ .name = name, .node = rec.node });
+                }
                 if (t.contains(name)) continue;
                 var final = tgt;
                 final.type_only = final.type_only or rec.type_only;
                 try t.put(l.scratch, name, final);
             }
         }
+        try l.reportStarCollisions(file, t, own_exports, &star_first, star_dups.items);
 
         // Pass 3: a `declare module "spec" { … }` augmentation's declarations
         // are exports of the module `spec` resolves to. tsc merges the
@@ -2639,18 +2655,55 @@ const Linker = struct {
     /// file-wide scan.
     fn reportExportAssignMixing(l: *Linker, file: FileId, node: ast.Node, scope: u32) Error!void {
         const b = l.files[file].bind;
+        // tsc runs this from `checkExternalModuleExports`, which it calls for an
+        // external module's SourceFile and for an ambient module declaration —
+        // never for a plain block. `moduleElementsInWrongContext` writes the
+        // whole module-element zoo, `export = M` included, inside `{ … }`: the
+        // file is not an external module, so tsc's walk never reaches it and
+        // ztsc's file-wide scan invented a TS2309 on top of the TS1231 family
+        // that shape really earns.
+        const ambient_scope = for (b.ambient_modules) |am| {
+            if (am.scope == scope) break true;
+        } else false;
+        if (!ambient_scope and !(scope == binder.file_scope and b.is_module)) return;
+        var has_company = false;
         for (b.exports) |other| {
             if (other.scope != scope) continue;
-            const is_value = switch (other.kind) {
-                .default => true,
-                .named => other.module == 0 and other.sym != binder.no_symbol and
-                    b.symbol_flags[other.sym].hasValue(),
-                else => false,
-            };
-            if (!is_value) continue;
-            try l.diag(file, 2309, l.nodeSpan(file, node), "An export assignment cannot be used in a module with other exported elements.", .{});
-            return;
+            switch (other.kind) {
+                .default => has_company = true,
+                .named => has_company = has_company or (other.module == 0 and
+                    other.sym != binder.no_symbol and b.symbol_flags[other.sym].hasValue()),
+                else => {},
+            }
         }
+        // A declaration carrying the `export` MODIFIER files no export record at
+        // all — the binder marks the symbol instead — so an ambient block's
+        // members have to be read directly: `export namespace a { … }` beside
+        // `export = c` is `incompatibleExports1`. Only for a block, whose member
+        // list is exactly its exports; a file scope holds every local as well.
+        if (!has_company and ambient_scope) {
+            const lo = b.scope_members_start[scope];
+            const hi = b.scope_members_start[scope + 1];
+            for (lo..hi) |i| {
+                const f = b.symbol_flags[b.member_syms[i]];
+                if (!f.exported) continue;
+                // An `export import a = x.c` counts only when the alias TARGET
+                // has a value meaning: tsc resolves it and judges that, and
+                // `importDeclWithExportModifierAndExportAssignmentInAmbientContext`
+                // — an alias to an interface, beside `export = x` — is silent
+                // while the same shape over a value namespace is TS2309
+                // (measured both ways). The link phase resolves no alias here,
+                // so one is skipped outright: an under-report on the value half
+                // and no false report on the type half. `effectiveBits` covers
+                // the other type-only shape, a non-instantiated namespace.
+                if (bind_result.effectiveBits(f) & bind_result.mask_value &
+                    ~bind_result.fbits(.{ .import_binding = true }) == 0) continue;
+                has_company = true;
+                break;
+            }
+        }
+        if (!has_company) return;
+        try l.diag(file, 2309, l.nodeSpan(file, node), "An export assignment cannot be used in a module with other exported elements.", .{});
     }
 
     /// The `export = X` entity of a known module (on-disk file first, then an
@@ -3649,8 +3702,98 @@ const Linker = struct {
     /// whole-file `.d.ts` suppression already delivers.
     fn reportUnresolvedTypeRefs(l: *Linker, file: FileId) Error!void {
         for (l.files[file].type_ref_misses) |miss| {
-            try l.diag(file, 2688, miss.span, "Cannot find type definition file for '{s}'.", .{miss.name});
+            switch (miss.kind) {
+                .types => try l.diag(file, 2688, miss.span, "Cannot find type definition file for '{s}'.", .{miss.name}),
+                // TS6053 names the specifier as WRITTEN, not the path resolution
+                // tried: `///<reference path='typescript.ts' />` in a directory
+                // without one reports `File 'typescript.ts' not found.`
+                // (`parserRealSource3`, measured).
+                .path => {
+                    // ztsc's path resolution is POSIX-only: it neither
+                    // normalizes `\` nor recognizes a Windows drive prefix,
+                    // while tsc does both (`normalizeSlashes`,
+                    // `isRootedDiskPath`). A directive spelled that way
+                    // resolves for the oracle and not here, so reporting would
+                    // blame the PROGRAM for ztsc's own gap —
+                    // `tripleSlashReferenceAbsoluteWindowsPath` is the corpus
+                    // case. An under-report until the resolver learns both.
+                    if (windowsSpelledPath(miss.name)) continue;
+                    try l.diag(file, 6053, miss.span, "File '{s}' not found.", .{miss.name});
+                },
+            }
         }
+    }
+
+    /// Which `export *` first contributed a name, and what it contributed —
+    /// tsc's `ExportCollisionTracker.specifierText` plus the symbol the
+    /// comparison is against.
+    const StarSource = struct { node: ast.Node, target: Target };
+
+    /// One `export *` that re-exported a name an EARLIER one already gave a
+    /// different meaning. tsc reports at the later declaration and names the
+    /// earlier one's specifier.
+    const StarDup = struct { name: Atom, node: ast.Node };
+
+    /// tsc's `resolveSymbol(targetSymbol) === resolveSymbol(sourceSymbol)`: two
+    /// stars that reach the SAME declaration are not a collision, however many
+    /// paths lead there (a diamond of re-exports is legal and common). ztsc's
+    /// `Target` is already the resolved end of that walk, so identity is a field
+    /// comparison — `type_only` excluded, because it records how the name
+    /// travelled and not what it names.
+    fn sameStarTarget(a: Target, b: Target) bool {
+        return a.kind == b.kind and a.file == b.file and a.payload == b.payload and a.name == b.name;
+    }
+
+    /// TS2308, tsc's `getExportsOfModuleWorker` collision pass: `export * from
+    /// "a"` and `export * from "b"` both exporting `x`, where the two `x`es are
+    /// different declarations, makes neither win — tsc reports at every star
+    /// past the first and names the first one's specifier.
+    ///
+    /// Two suppressions, both tsc's: a name the module also exports ITSELF wins
+    /// outright and says nothing (`symbols.has(id)`), and `default` / `export=`
+    /// never travel through a star to begin with.
+    ///
+    /// The specifier is quoted as WRITTEN — tsc's `getTextOfNode` hands the
+    /// message the source text, quotes included, so `export * from "./t1"`
+    /// reports `Module "./t1" has already…` and a single-quoted one keeps its
+    /// own quotes.
+    ///
+    /// Scope: stars whose source is a RESOLVED FILE, which is what this pass
+    /// merges. One served by an ambient `declare module "spec"` block settles in
+    /// `starMergeFilesFromAmbient`, past every file table, and goes unjudged.
+    fn reportStarCollisions(
+        l: *Linker,
+        file: FileId,
+        t: *const std.AutoArrayHashMapUnmanaged(Atom, Target),
+        own_exports: usize,
+        star_first: *const std.AutoArrayHashMapUnmanaged(Atom, StarSource),
+        dups: []const StarDup,
+    ) Error!void {
+        if (dups.len == 0) return;
+        const f = &l.files[file];
+        for (dups) |d| {
+            if (t.getIndex(d.name)) |i| {
+                if (i < own_exports) continue;
+            }
+            const first = star_first.get(d.name) orelse continue;
+            const spec_tok = f.tree.nodeData(first.node).rhs;
+            if (spec_tok == 0) continue;
+            try l.diag(
+                file,
+                2308,
+                l.nodeSpan(file, d.node),
+                "Module {s} has already exported a member named '{s}'. Consider explicitly re-exporting to resolve the ambiguity.",
+                .{ f.tree.tokenSlice(f.src, spec_tok), l.atomText(d.name) },
+            );
+        }
+    }
+
+    /// Is this reference path spelled the way Windows spells one — with `\`
+    /// separators, or behind a drive prefix? Both are ordinary path characters
+    /// to ztsc's POSIX-only resolver and structure to tsc's.
+    fn windowsSpelledPath(spec: []const u8) bool {
+        if (std.mem.indexOfScalar(u8, spec, '\\') != null) return true;
+        return spec.len >= 2 and spec[1] == ':' and std.ascii.isAlphabetic(spec[0]);
     }
 
     /// TS1202 / TS1203: `import x = require(...)` / `export = ...` are emit
