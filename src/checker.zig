@@ -1863,6 +1863,18 @@ pub const Checker = struct {
     /// assigned via `this.x` inside the constructor of the class that OWNS the
     /// declaration (tsc allows exactly this; an inherited readonly still errors).
     ctor_class_sym: SymbolId = binder.no_symbol,
+    /// Is the function body currently being walked a CONSTRUCTOR's own body?
+    /// tsc's `getSuperContainer(node, /*stopOnFunctions*/ true)` for a `super(…)`
+    /// call: the container is the nearest function-like node, arrows included,
+    /// and a super call is only permitted when that container is a constructor
+    /// (`Super_calls_are_not_permitted_outside_constructors_or_in_nested_
+    /// functions_inside_constructors`). Distinct from `ctor_class_sym`, which
+    /// stays set through a nested function so that a `super(…)` written there
+    /// still resolves against the base constructor rather than degrading to an
+    /// untyped call. Saved and restored by `checkFunctionBody` — the single
+    /// entry for every function body — and cleared for a class body's members,
+    /// whose initializers are containers of their own.
+    in_ctor_body: bool = false,
     /// The property-access node a COMPOUND assignment is currently writing, as
     /// a `nodeKey` (0 = none). tsc runs one member-accessibility check per access node,
     /// against the setter when the node is an assignment target

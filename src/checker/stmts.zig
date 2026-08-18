@@ -1031,11 +1031,16 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
     // return y }` still reports TS2454 on `y` (see `field_init_depth`).
     const saved_field_init = c.field_init_depth;
     c.field_init_depth = 0;
+    // …and the super-call container: this body is the container for every
+    // `super(…)` written directly in it, whatever the enclosing one was.
+    const saved_in_ctor = c.in_ctor_body;
+    c.in_ctor_body = c.nodeTag(node) == .class_method and c.isCtorMember(node, proto.flags);
     defer {
         c.cur_scope = saved_scope;
         c.fn_ctx = saved_ctx;
         c.this_type = saved_this;
         c.field_init_depth = saved_field_init;
+        c.in_ctor_body = saved_in_ctor;
     }
     if (try c.scopeOf(node)) |s| c.cur_scope = s;
     // An explicit `this` parameter types `this` inside the body.
@@ -2239,6 +2244,12 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
     // The same pairing, for the other question the two halves answer together:
     // whose annotation supplies the property's type (TS7032/TS7033).
     try implicit_any.reportAccessorImplicitAny(c, members);
+    // Each member is its own super-call container: a field initializer of a
+    // class written INSIDE a constructor must not inherit that constructor's
+    // (`checkFunctionBody` re-establishes it for the constructor itself).
+    const saved_in_ctor = c.in_ctor_body;
+    c.in_ctor_body = false;
+    defer c.in_ctor_body = saved_in_ctor;
     for (members, 0..) |member, mi| {
         if (member == null_node) continue;
         const md = c.tree.nodeData(member);

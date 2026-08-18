@@ -413,6 +413,17 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
     var super_sigs: std.ArrayList(TypeId) = .empty;
     defer super_sigs.deinit(c.scratch());
     if (!is_new and c.nodeTag(shape.callee) == .super_expr) {
+        // TS2337 — tsc's `checkSuperExpression`: a super CALL is permitted only
+        // when its container (`getSuperContainer(node, /*stopOnFunctions*/
+        // true)`, so arrows count) is a constructor. A `super()` in a field
+        // initializer, in a static field, in an arrow or function expression
+        // inside the constructor, or in an object-literal accessor there is
+        // this error and nothing else. The arguments are still resolved
+        // against the base constructor below, which is where any further
+        // diagnostic about them comes from.
+        if (!c.in_ctor_body) {
+            try c.diagFmt(2337, c.nodeSpan(shape.callee), "Super calls are not permitted outside constructors or in nested functions inside constructors.", .{});
+        }
         if (try superCtorSigs(c, &super_sigs)) {
             r = if (super_sigs.items.len == 1)
                 super_sigs.items[0]

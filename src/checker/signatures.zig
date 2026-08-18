@@ -826,6 +826,14 @@ fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) Erro
         .is_generator = proto.flags & ast.Flags.generator != 0,
         .yield_type = 0,
     };
+    // …and *this* function's super-call container, for the same reason again:
+    // a `super(…)` in a CONCISE-bodied arrow inside a constructor
+    // (`var r2 = () => super()`) is reached by this probe first, and the answer
+    // memoizes, so judging it under the enclosing constructor's container
+    // silently lost the TS2337.
+    const saved_in_ctor = c.in_ctor_body;
+    defer c.in_ctor_body = saved_in_ctor;
+    c.in_ctor_body = c.nodeTag(fn_node) == .class_method and c.isCtorMember(fn_node, proto.flags);
     // …and *this* function's receiver, for exactly the same reason.
     // `checkFunctionBody` installs the explicit `this` parameter's type
     // before walking the body; this probe walks the same expressions and
