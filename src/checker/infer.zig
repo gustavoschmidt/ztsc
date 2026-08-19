@@ -2810,6 +2810,34 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                     }
                 }
             }
+            // NOT a discriminant filter — measured, wave 21.
+            //
+            // `discriminatedUnionInference`'s `foo<T>(item: Item<T>)` with
+            // `Item<T> = {kind:'a',data:T} | {kind:'b',data:T[]}` fed
+            // `{kind:'b',data:[1,2]}` answers `T = number` in tsc and
+            // `T = number[]` here, because both constituents contribute and
+            // the leftmost wins the supertype fold. The obvious repair — pick
+            // the constituent the argument's DISCRIMINANT selects and infer
+            // only into it — is WRONG, and the oracle says so directly. With
+            // `src: {kind:'b', p:string, q:number}` and tsgo 7.0.2:
+            //
+            //   {kind:'a',p:T} | {kind:'b',q:T}                  -> number
+            //   {kind:'b',q:T} | {kind:'a',p:T}                  -> number
+            //   {kind:'a',p:T,q:number} | {kind:'b',p:string,q:T} -> string
+            //   {p:T} | {q:T}                                    -> string
+            //   {p:T,q:number} | {p:string,q:T}                  -> string
+            //
+            // Rows 1-2 look like a discriminant filter (order-independent,
+            // the matching constituent wins). Row 3 has the SAME discriminant
+            // and the SAME candidate pair (`string` then `number`) and takes
+            // the LEFTMOST — so a filter keyed on the discriminant would move
+            // it the wrong way. Rows 4-5 are the no-discriminant controls and
+            // confirm the plain leftmost fold. Whatever tsc does here is keyed
+            // on something else (rows 1-2 differ from row 3 only in that each
+            // target constituent is a strict SUBSET of the argument's property
+            // set), and wiring `discriminatedConstituent` into this arm would
+            // regress row 3's shape. Left unimplemented on purpose.
+            //
             // Unify against the single type-param member if the rest
             // doesn't already accept the arg (common: T | undefined).
             var tp_member: TypeId = types.no_type;
