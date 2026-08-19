@@ -360,6 +360,18 @@ fn untypedFunctionCall(c: *Checker, callee_t: TypeId, apparent: TypeId, ak: type
     return c.isAssignable(callee_t, try c.ts.makeRef(sym, &.{}));
 }
 
+/// Is the callee a NAME whose declared type is `never`, as opposed to a name
+/// the flow narrowed to `never`? See the `.never` arm of the call dispatch,
+/// which is the only caller.
+fn declaredNeverCallee(c: *Checker, callee: Node) Error!bool {
+    if (callee == null_node or c.nodeTag(callee) != .identifier) return false;
+    const sym = switch (c.resolveSpace(try c.atomOfToken(c.tree.nodeMainToken(callee)), c.cur_scope, true)) {
+        .sym => |s| s,
+        else => return false,
+    };
+    return c.ts.kind(try c.resolveStructural(try c.typeOfSymbol(sym))) == .never;
+}
+
 /// Call/new as an optional-chain link (see `memberChainInner`). Answers the
 /// return type WITHOUT the chain's short-circuit `undefined`, plus `chained`
 /// when this `?.()` — or an earlier link in the callee spine — short-circuits
@@ -733,9 +745,25 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
             },
             .function => try sigs.append(c.scratch(), r),
             .overloads => try c.appendOverloadCandidates(&sigs, r),
-            // Calling `never` is silently `never` (tsc; typically the
-            // non-nullable remainder of a null-narrowed reference).
+            // A `never` callee is a TS2349 to tsc — `never` has no call
+            // signatures — but here it is USUALLY ztsc's flow answer for a
+            // reference in UNREACHABLE code: `return assertNever(x)` after an
+            // exhaustive switch narrows the callee `assertNever` itself to
+            // `never`, and the oracle reports nothing on any of the eight
+            // suite cases written that way. So the diagnostic is gated on the
+            // callee's own DECLARED type being `never` (`let x: never; x()`,
+            // `declare const n: never; n()`), which is the case the flow
+            // cannot have invented. A narrowed-to-never callee in REACHABLE
+            // code (a `typeof x === "number"` branch on a `string`) is the
+            // under-report that gate costs.
             .never => {
+                if (try declaredNeverCallee(c, shape.callee)) {
+                    try c.diagFmt(2349, c.nodeSpan(shape.callee), "This expression is not callable.", .{});
+                    for (shape.arg_nodes) |an| {
+                        if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+                    }
+                    return .{ .ty = types.error_type, .chained = chained };
+                }
                 for (shape.arg_nodes) |an| {
                     if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
                 }

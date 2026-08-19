@@ -88,12 +88,22 @@ pub fn typesIdentical(c: *Checker, a: TypeId, b: TypeId) Error!bool {
     // "identical" rather than reading the heuristic as a difference.
     if (allOptional(c, ea) and allOptional(c, eb)) return true;
     // An object with NOTHING in it — no property, no index signature, no
-    // call or construct signature — is ztsc failing to materialize a shape
-    // rather than a program that wrote `{}`. A `declare class Point` merged
-    // with a `declare namespace Point` comes back empty here, and comparing
-    // that against the `{ x: number; y: number }` it should have been is a
-    // report about ztsc, not about the two declarations.
-    if (isEmptyObject(c, ea) or isEmptyObject(c, eb)) return true;
+    // call or construct signature — is USUALLY ztsc failing to materialize a
+    // shape rather than a program that wrote `{}`. A `declare class Point`
+    // merged with a `declare namespace Point` comes back empty here, and
+    // comparing that against the `{ x: number; y: number }` it should have
+    // been is a report about ztsc, not about the two declarations.
+    //
+    // Restricted to a pair of OBJECTS, because that is the shape a failed
+    // materialization takes: the two declarations named types that both
+    // resolve to member tables and one of them came back short. When the
+    // other side is a UNION, a function, or a primitive, an empty object is
+    // not evidence of a gap — `class C {}` genuinely HAS no members, and
+    // `var x: C; var x: C | D;` is the TS2403 tsc reports
+    // (`unionTypeEquivalence`). Whether the object is empty because ztsc gave
+    // up says nothing about a union on the other side either way.
+    if ((isEmptyObject(c, ea) or isEmptyObject(c, eb)) and
+        c.ts.kind(ea) == .object and c.ts.kind(eb) == .object) return true;
     // The relation is handed the UNRESOLVED pair: it resolves references
     // itself, and it has a rule that only applies to two materializations of
     // the same generic reference (an `any` type argument is ztsc's inference
