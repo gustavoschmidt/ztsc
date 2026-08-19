@@ -19,8 +19,11 @@
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
 const binder = @import("../frontend/binder.zig");
+const intern = @import("../intern.zig");
+const numeric_lit = @import("../numeric_lit.zig");
 const types = @import("../types.zig");
 
+const Atom = intern.Atom;
 const Node = ast.Node;
 const null_node = ast.null_node;
 const TypeId = types.TypeId;
@@ -218,6 +221,82 @@ pub fn report(c: *Checker, name_node: Node, kt: TypeId) Error!void {
         .{},
     );
 }
+
+/// The static member name a computed key `[expr]` declares — tsc's
+/// `isLateBindableName` followed by `getLateBoundNameFromType`. A computed name
+/// is late-BINDABLE when its type is a string literal, a numeric literal or a
+/// unique symbol; every other key (a `string`-typed one, a template type, an
+/// `any`) is dynamic and declares no member at all.
+///
+/// Two of ztsc's spellings sit alongside the type test, because ztsc names the
+/// member syntactically where tsc names it from a resolved symbol:
+///
+///   * `[Symbol.iterator]` is recognized from the SYNTAX (`wellKnownKeyOfExpr`)
+///     and keyed `__@iterator`, the way the binder's `memberKey` and the
+///     element access in `indexChainInner` both key it. That it is asked BEFORE
+///     the general `unique symbol` spelling is load-bearing: in the real lib
+///     `Symbol.iterator` IS a `unique symbol`, so keyed by its nominal
+///     `__@u<id>` instead, `{ [Symbol.iterator]: 0 }` declared a member no
+///     reader of `o[Symbol.iterator]` could find (`symbolProperty18`);
+///   * a QUALIFIED enum-member key (`[Breed.X]`) has a value the checker leaves
+///     unknown for a computed member, so it is keyed by the same text-derived
+///     `__@k$<obj>.<member>` placeholder the binder gives the declaration side.
+///
+/// `key_type` is the key expression's already-checked type, passed in rather
+/// than recomputed: a caller reading it out of the node-type memo then never
+/// re-enters the expression walk, and so never re-reports TS2464 on the key.
+pub fn lateBoundName(c: *Checker, key_expr: Node, key_type: TypeId) Error!?Atom {
+    if (c.wellKnownKeyOfExpr(key_expr)) |wk| return try c.atom(wk);
+    // The syntactic recognizer above needs no type, and is the only arm that
+    // can answer for a key the checker never typed: a METHOD's computed name is
+    // not an expression tsc checks (`symbolProperty1`), so a caller reading the
+    // node-type memo has nothing for it. Everything below is a question about
+    // the type, and has none to ask.
+    if (key_type == types.no_type or key_type == types.error_type) return null;
+    if (try c.uniqueSymAtom(key_type)) |a| return a;
+    const rk = try c.resolveStructural(key_type);
+    switch (c.ts.kind(rk)) {
+        .string_literal => return c.ts.dataA(rk),
+        .number_literal, .number_literal_fresh => {
+            var buf: [numeric_lit.max_name]u8 = undefined;
+            var w = std.Io.Writer.fixed(&buf);
+            numeric_lit.write(&w, c.ts.numberValue(rk)) catch return null;
+            // Stack buffer: intern a copy, never keep the slice.
+            return try c.internText(w.buffered());
+        },
+        .enum_type => {
+            if (c.nodeTag(key_expr) != .member_expr) return null;
+            const member_tok = c.tree.nodeData(key_expr).rhs;
+            return try c.computedSymKey(
+                member_tok,
+                ast.Flags.computed_sym | ast.Flags.computed_sym_qual,
+                c.cur_scope,
+            );
+        },
+        else => return null,
+    }
+}
+
+/// A computed name AS WRITTEN, brackets included — tsc's `symbolToString` of a
+/// late-bound property, which is `getTextOfNode` on the declaration's name
+/// (`'[Symbol.toPrimitive]'`, `'["zzz"]'`, `'[E.A]'`), never the synthetic atom
+/// the member is keyed by.
+///
+/// The node's own span ends at the key EXPRESSION, so the closing bracket is
+/// scanned for. Bounded: a name node the parser recovered from may have no `]`
+/// at all, and the un-terminated text is a better answer than a runaway slice.
+pub fn nameText(c: *const Checker, name_node: Node) []const u8 {
+    const sp = c.nodeSpan(name_node);
+    const limit = @min(c.src.len, sp.end + max_bracket_scan);
+    var end = sp.end;
+    while (end < limit and c.src[end] != ']') end += 1;
+    if (end < limit) end += 1 else return c.src[sp.start..sp.end];
+    return c.src[sp.start..end];
+}
+
+/// How far past a computed name's key expression its `]` is looked for. Only
+/// trivia can sit in between, and a comment is the only trivia with any length.
+const max_bracket_scan = 4096;
 
 /// Can a value of type `kt` name a property?
 pub fn admissible(c: *Checker, kt: TypeId) Error!bool {

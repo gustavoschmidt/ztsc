@@ -2694,23 +2694,6 @@ fn distributableSpreads(c: *Checker, node: Node, out: *std.ArrayList(DistSpread)
     }
 }
 
-/// The NOMINAL member atom an object literal's computed key `[expr]` declares,
-/// or null when the key names no static property (tsc's `isLateBindableName`
-/// answering false).
-///
-/// The two spellings are asked in the same order every other side of the
-/// checker asks them: a WELL-KNOWN symbol is keyed syntactically as
-/// `__@iterator` (the binder's `memberKey` and the element access in
-/// `indexChainInner` both do it that way), and only then does a general
-/// `unique symbol` key take its nominal `__@u<id>`. Order is load-bearing
-/// because in the real lib `Symbol.iterator` IS a `unique symbol`: keyed by
-/// the nominal id, `{ [Symbol.iterator]: 0 }` declared a member that no reader
-/// of `o[Symbol.iterator]` could ever find (`symbolProperty18`).
-fn symbolKeyAtom(c: *Checker, key_expr: Node, key_type: TypeId) Error!?Atom {
-    if (c.wellKnownKeyOfExpr(key_expr)) |wk| return try c.atom(wk);
-    return c.uniqueSymAtom(key_type);
-}
-
 fn checkObjectLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     const t = try objectLiteralWhole(c, node, ctx);
     // Duplicate keys — tsc's `checkGrammarObjectLiteralExpression`. Run AFTER
@@ -3091,49 +3074,36 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                     const kt = try c.checkExprCached(key_expr, types.no_type);
                     // TS2464. (wave-8 D: one flagged call into `computed_key.zig`.)
                     try computed_key.report(c, pd.lhs, kt);
-                    // A `unique symbol` key names a real, nominally-keyed
-                    // property (`{ [k]: v }`); any other computed key stays
-                    // dynamic (no static member).
-                    if (try symbolKeyAtom(c, key_expr, kt)) |key| {
-                        const pctx = try c.ctxPropType(rctx, ctx, key);
-                        var vt = try c.checkExprCached(pd.rhs, pctx);
-                        if (c.const_ctx) {
-                            vt = try c.ts.regularLiteral(vt);
-                        } else if (!try keepLiteral(c, vt, pctx)) vt = try c.widenPropValue(vt);
-                        try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
-                        continue;
-                    }
-                    // A qualified enum-member computed key (`{ [Breed.X]: v
-                    // }`): the key is the member's *value*, which a computed
-                    // member leaves unknown, so — exactly like the
-                    // type-literal/interface member — key it by the
-                    // text-derived `__@k$<obj>.<member>` placeholder. This
-                    // makes the literal match a `{ [Breed.X]: … }` target
-                    // (whose members the binder keys the same way) instead of
-                    // dropping the property and collapsing to `{}`.
-                    if (c.ts.kind(try c.resolveStructural(kt)) == .enum_type and
-                        c.nodeTag(key_expr) == .member_expr)
-                    {
-                        const member_tok = c.tree.nodeData(key_expr).rhs;
-                        const key = try c.computedSymKey(member_tok, ast.Flags.computed_sym | ast.Flags.computed_sym_qual, c.cur_scope);
-                        const pctx = try c.ctxPropType(rctx, ctx, key);
-                        var vt = try c.checkExprCached(pd.rhs, pctx);
-                        if (c.const_ctx) {
-                            vt = try c.ts.regularLiteral(vt);
-                        } else if (!try keepLiteral(c, vt, pctx)) vt = try c.widenPropValue(vt);
-                        try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
-                        continue;
-                    }
-                    // Non-symbol computed key (`{ [expr]: v }`): a `string`-
-                    // or `number`-widening key contributes an index
-                    // signature; a literal key names a real property. The
-                    // value is contextually typed by the target's matching
-                    // property/index (so `value: STATUS` under a `Record<…>`
-                    // context keeps its literal instead of widening).
                     const rk = try c.resolveStructural(kt);
                     const key_kind = c.ts.kind(rk);
+                    // A NUMERIC key contributes a number INDEX SIGNATURE in
+                    // ztsc's model, never a named member, so it is held back
+                    // from the late-bound question below (which does name it —
+                    // tsc late-binds `[0]` to the member `"0"`, and the excess
+                    // -property scan asks `computed_key.lateBoundName` for
+                    // exactly that name). Everything else late-bindable — a
+                    // well-known symbol, a `unique symbol` const, a string
+                    // literal, a qualified enum member — names a real property.
+                    const named: ?Atom = switch (key_kind) {
+                        .number, .number_literal, .number_literal_fresh => null,
+                        else => try computed_key.lateBoundName(c, key_expr, kt),
+                    };
+                    if (named) |key| {
+                        const pctx = try c.ctxPropType(rctx, ctx, key);
+                        var vt = try c.checkExprCached(pd.rhs, pctx);
+                        if (c.const_ctx) {
+                            vt = try c.ts.regularLiteral(vt);
+                        } else if (!try keepLiteral(c, vt, pctx)) vt = try c.widenPropValue(vt);
+                        try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
+                        continue;
+                    }
+                    // A DYNAMIC computed key (`{ [expr]: v }`): a `string`- or
+                    // `number`-widening key contributes an index signature and
+                    // anything else contributes nothing. The value is still
+                    // contextually typed by the target's matching index (so
+                    // `value: STATUS` under a `Record<…>` context keeps its
+                    // literal instead of widening).
                     const pctx: TypeId = if (rctx == types.no_type) types.no_type else switch (key_kind) {
-                        .string_literal => try c.ctxPropType(rctx, ctx, c.ts.dataA(rk)),
                         .string, .template_literal_type, .string_mapping => try ctxIndexType(c, rctx, false),
                         .number, .number_literal, .number_literal_fresh => try ctxIndexType(c, rctx, true),
                         else => types.no_type,
@@ -3143,9 +3113,6 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                         vt = try c.ts.regularLiteral(vt);
                     } else if (!try keepLiteral(c, vt, pctx)) vt = try c.widenPropValue(vt);
                     switch (key_kind) {
-                        .string_literal => {
-                            try upsertProp(c.scratch(), &props, &prop_index, .{ .name = c.ts.dataA(rk), .ty = vt });
-                        },
                         .string, .template_literal_type, .string_mapping => try str_index_vals.append(c.scratch(), vt),
                         .number, .number_literal, .number_literal_fresh => try num_index_vals.append(c.scratch(), vt),
                         else => {}, // symbol/unknown/other: no static member

@@ -43,6 +43,7 @@ const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
 const assign = @import("assign.zig");
+const computed_key = @import("computed_key.zig");
 const elaborate = @import("elaborate.zig");
 const tuple_zig = @import("tuple_relate.zig");
 
@@ -1535,18 +1536,49 @@ pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: T
         const tag = c.nodeTag(prop);
         if (tag != .object_property and tag != .object_shorthand and tag != .object_method) continue;
         const key_tok = c.tree.nodeMainToken(prop);
-        // A COMPUTED name has no name to be excess: tsc's
-        // `shouldCheckAsExcessProperty` only ever sees resolved symbols, and a
-        // late-bound one (`[Symbol.toStringTag](n) { … }`) is excluded by
-        // `isLateBoundName`. A method carries its computed name exactly where a
-        // property does (`nodeData(prop).lhs`), and skipping it only for the
-        // property form made the method's key the `[` token — reported as an
+        // A COMPUTED name is excess-checked under the name tsc LATE-BINDS it to
+        // — `getPropertiesOfType(source)` hands `hasExcessProperties` the
+        // late-bound symbol like any other, so `{ [Symbol.toPrimitive]: 0 }`
+        // against a target without that member is TS2353. Three things about it
+        // differ from an ordinary key, and all three are oracle-measured:
+        //
+        //   * the name is the LATE-BOUND one (`__@toPrimitive`, `"zzz"`, `"0"`,
+        //     the `__@k$E.A` enum placeholder), which is what the target is
+        //     asked about — `computed_key.lateBoundName`, the same answer the
+        //     object-literal walk keys the member by;
+        //   * a key that late-binds to NOTHING (a `string`-typed `[s]`) names no
+        //     member and is skipped, exactly as tsc's `isLateBindableName`
+        //     declines it;
+        //   * the report anchors on the whole `[…]` and NAMES it as written —
+        //     tsc's `symbolToString` of a late-bound symbol is its declaration's
+        //     name text, so `'[Symbol.toPrimitive]'` and not `'__@toPrimitive'`.
+        //
+        // A method carries its computed name exactly where a property does
+        // (`nodeData(prop).lhs`); reading the `[` token instead once reported an
         // excess property named "[" (`symbolProperty20`).
-        if (tag == .object_property or tag == .object_method) {
-            const pd = c.tree.nodeData(prop);
-            if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) continue;
+        //
+        // The key TYPE comes from the node-type memo the object-literal walk
+        // published, never from a fresh check: being the first to read a key
+        // would report TS2464 on it a second time. An object METHOD's computed
+        // key the walk never typed has no memo, and answers from the syntactic
+        // `Symbol.<name>` recognizer alone — which is the one shape that needs
+        // no type, and covers `{ [Symbol.toPrimitive]() {} }`.
+        const pd = c.tree.nodeData(prop);
+        const computed = (tag == .object_property or tag == .object_method) and
+            pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name;
+        var key_span = c.tokSpan(key_tok);
+        var key: Atom = undefined;
+        var key_text: []const u8 = undefined;
+        if (computed) {
+            const key_expr = c.tree.nodeData(pd.lhs).lhs;
+            const kt = c.nodeType(key_expr) orelse types.no_type;
+            key = (try computed_key.lateBoundName(c, key_expr, kt)) orelse continue;
+            key_span = c.nodeSpan(pd.lhs);
+            key_text = computed_key.nameText(c, pd.lhs);
+        } else {
+            key = try c.memberAtom(key_tok);
+            key_text = c.atomText(key);
         }
-        const key = try c.memberAtom(key_tok);
         // A property a LATER spread also supplies is not this literal's to
         // answer for — see `overriddenByLaterSpread`. Skipped whole: the
         // nested-literal recursion below elaborates a value the spread throws
@@ -1561,12 +1593,12 @@ pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: T
                 // different codes for the same finding, so the choice has to be
                 // made here rather than in a follow-up pass.
                 if (try excessPropSuggestion(c, rt, key)) |sugg| {
-                    try c.diagFmt(2561, c.tokSpan(key_tok), "Object literal may only specify known properties, but '{s}' does not exist in type '{s}'. Did you mean to write '{s}'?", .{
-                        c.atomText(key), try c.typeToString(target), c.atomText(sugg),
+                    try c.diagFmt(2561, key_span, "Object literal may only specify known properties, but '{s}' does not exist in type '{s}'. Did you mean to write '{s}'?", .{
+                        key_text, try c.typeToString(target), c.atomText(sugg),
                     });
                 } else {
-                    try c.diagFmt(2353, c.tokSpan(key_tok), "Object literal may only specify known properties, and '{s}' does not exist in type '{s}'.", .{
-                        c.atomText(key), try c.typeToString(target),
+                    try c.diagFmt(2353, key_span, "Object literal may only specify known properties, and '{s}' does not exist in type '{s}'.", .{
+                        key_text, try c.typeToString(target),
                     });
                 }
             }
@@ -1575,7 +1607,6 @@ pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: T
         // Recurse into nested fresh literals (and into a nested ARRAY literal,
         // whose elements the scan then walks).
         if (tag == .object_property) {
-            const pd = c.tree.nodeData(prop);
             const rhs_tag = c.nodeTag(pd.rhs);
             if (rhs_tag == .object_literal or rhs_tag == .array_literal) {
                 if (c.nodeType(pd.rhs)) |nested_t| {
