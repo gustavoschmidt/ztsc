@@ -3097,7 +3097,7 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                         var vt = try c.checkExprCached(pd.rhs, pctx);
                         if (c.const_ctx) {
                             vt = try c.ts.regularLiteral(vt);
-                        } else if (!try keepLiteral(c, vt, pctx)) vt = try c.widenPropValue(vt);
+                        } else if (!try propCtxKeepsLiteral(c, rctx, ctx, key, vt)) vt = try c.widenPropValue(vt);
                         try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
                         continue;
                     }
@@ -3128,16 +3128,15 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                 var vt = try c.checkExprCached(pd.rhs, pctx);
                 if (c.const_ctx) {
                     vt = try c.ts.regularLiteral(vt);
-                } else if (!try keepLiteral(c, vt, pctx)) vt = try c.widenPropValue(vt);
+                } else if (!try propCtxKeepsLiteral(c, rctx, ctx, key, vt)) vt = try c.widenPropValue(vt);
                 try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
             },
             .object_shorthand => {
                 const key = try c.memberAtom(c.tree.nodeMainToken(prop));
                 var vt = try c.checkExprCached(pd.lhs, types.no_type);
-                const pctx = try c.ctxPropType(rctx, ctx, key);
                 if (c.const_ctx) {
                     vt = try c.ts.regularLiteral(vt);
-                } else if (!try keepLiteral(c, vt, pctx)) vt = try c.widenPropValue(vt);
+                } else if (!try propCtxKeepsLiteral(c, rctx, ctx, key, vt)) vt = try c.widenPropValue(vt);
                 if (pd.rhs != 0) _ = try c.checkExprCached(pd.rhs, types.no_type);
                 try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
             },
@@ -3421,6 +3420,32 @@ fn ctxIndexType(c: *Checker, rctx: TypeId, want_number: bool) Error!TypeId {
 
 /// Contextual type for property `key` of an object literal typed by
 /// `ctx` (unions: union of the property across constituents).
+/// `keepLiteral` for an object-literal PROPERTY whose contextual type comes
+/// from `ctxPropType`, asked of the UN-REDUCED union tsc would have built —
+/// the object-literal twin of `elemCtxKeepsLiteral`, and the same mechanic for
+/// the same reason: `getTypeOfPropertyOfContextualType` maps over the union
+/// with `UnionReduction.None`, so the `AnyOrUnknown` collapse never runs and
+/// `isLiteralOfContextualType` still finds a literal constituent beside an
+/// `any` one.
+///
+/// `f(p: { a: "x" } | I)` where `I` has `[k: string]: any` is the live shape:
+/// property `a` contributes `"x"` from one constituent and `any` from the
+/// other's index signature, reduced to `any`, so `f({ a: "x" })` widened to
+/// `{ a: string }` and matched neither arm — a false TS2345 (and a false
+/// TS2322 for the same literal nested in an array).
+///
+/// Only the union arm can differ: for every other kind this is exactly
+/// `keepLiteral(cand, ctxPropType(…))`, which is what it calls.
+fn propCtxKeepsLiteral(c: *Checker, rctx: TypeId, ctx: TypeId, key: Atom, cand: TypeId) Error!bool {
+    if (c.ts.kind(rctx) == .union_type) {
+        for (try c.memberList(rctx)) |m| {
+            if (try propCtxKeepsLiteral(c, try c.resolveStructural(m), ctx, key, cand)) return true;
+        }
+        return false;
+    }
+    return keepLiteral(c, cand, try ctxPropType(c, rctx, ctx, key));
+}
+
 pub fn ctxPropType(c: *Checker, rctx: TypeId, ctx: TypeId, key: Atom) Error!TypeId {
     if (ctx == types.no_type) return types.no_type;
     switch (c.ts.kind(rctx)) {
