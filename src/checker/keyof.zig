@@ -56,76 +56,72 @@ fn keyofObjectTable(c: *Checker, r: TypeId) Error!TypeId {
 /// `atoms.uniqueSymAtom`, `binder.memberKey`).
 pub const synthetic_prefix = "__@";
 
-/// The KEY TYPE of a member whose name is a SYMBOL rather than a string —
-/// tsc's `getLiteralTypeFromProperty`, which answers a late-bound property's
-/// `links.nameType` (the `unique symbol` its computed key evaluated to)
-/// instead of a string literal over the property's internal name. Null for
-/// every ordinary member, and for the synthetic atoms that are *not* symbol
-/// names (`__@ctor`, `__@class`, the `__@k$…` computed-key placeholder).
+/// What `keyof` makes of a member NAME, as one memoized answer: `no_type` for
+/// an ordinary name, whose key is its string literal, and otherwise the SYMBOL
+/// the member is named by.
 ///
-/// ztsc keys a symbol-named member by one of two synthetic atoms, and both
-/// decode back to the symbol they stand for:
+/// tsc's `getLiteralTypeFromProperty` answers a
+/// LATE-BOUND property with its `links.nameType` — the `unique symbol` its
+/// computed key evaluated to — rather than a string literal over the
+/// property's internal name. ztsc keys such a member by the synthetic atom
+/// the parser and binder share, and `__@u<id>` decodes back to the symbol
+/// arithmetically: `Checker.uniqueSymType` IS `makeUniqueSymbol(<global node
+/// id of the annotation>)` and `uniqueSymAtom` prints that id, so the key
+/// type is the very type `typeof k` has. That identity is what makes
+/// `keyof I` accept `s` and reject a DIFFERENT `unique symbol`.
 ///
-///   * `__@u<id>` — `[k]` where `k: unique symbol`. `Checker.uniqueSymType`
-///     IS `makeUniqueSymbol(<global node id of the annotation>)`, and
-///     `uniqueSymAtom` prints that id, so parsing it back is exact: the key
-///     type is the very same interned type `typeof k` has.
-///   * `__@<name>` — a well-known `Symbol.<name>`, keyed syntactically
-///     because the lib's own declaration is what gives it its identity. Its
-///     type is `SymbolConstructor`'s `<name>` member, read off the lib.
-///
-/// Answering a string literal here is what made `Extract<keyof I, string>`
+/// Answering a string literal instead is what made `Extract<keyof I, string>`
 /// keep `"__@u90369"`, `keyof I` print an atom nobody wrote, `const k: keyof
-/// I = s` a spurious TS2322 and `Pick<I, typeof s>` an empty object: the key
-/// domain of a symbol-named member is `symbol`, and every string filter —
-/// `Extract`, a template-literal placeholder, an index-signature domain
+/// I = s` a spurious TS2322, `Pick<I, typeof s>` an empty object and
+/// `{ [P in keyof I]: 1 }` drop the member: the key domain of a symbol-named
+/// member is `symbol`, and every string filter — `Extract`, a
+/// template-literal placeholder, an index-signature domain
 /// (`index_constraints.applicableSlots` already agrees) — has to see that.
 ///
-/// Only reached from `keyofObjectTableUncached`, which is memoized per object
-/// type (`Checker.keyof_obj_cache`), so the lib lookup below runs once per
-/// table rather than once per query.
-pub fn symbolNamedKeyType(c: *Checker, name: types.Atom) Error!?TypeId {
+/// The memo is not an optimization, it is what makes the rule affordable:
+/// answering needs the member's NAME, and reading a name is not free —
+/// `Interner.lookup` takes the interner's shard mutex — while this runs for
+/// every property of every table `keyof` expands. Asking it directly cost
+/// drizzle 10% of its wall clock against a 2% bar; keyed by atom (the answer
+/// is a pure function of the name and never changes) it costs one
+/// integer-map hit.
+///
+/// WELL-KNOWN symbols are deliberately NOT symbol-named here, and that too is
+/// measured. `__@iterator` and `__@unscopables` sit on `Array`, `String`,
+/// `Map`, `Set` and every iterable in the lib, so honouring them puts a
+/// `unique symbol` constituent into the `keyof` of nearly every type a
+/// program touches — which was the other half of that same 10%. A `unique
+/// symbol` CONST member is rare in real code and costs nothing, and it is the
+/// half the suite asks for (`keyRemappingKeyofResult`,
+/// `contextuallyTypedSymbolNamedProperties`, `extractInferenceImprovement`
+/// all key on `const s = Symbol()`). The consequence kept: `Extract<keyof
+/// number[], string>` still wrongly keeps `"__@iterator"`. Closing it wants
+/// the fact carried on the TABLE — a flag set once where the table is
+/// interned — not re-derived per property, which is a types.zig change and
+/// its own measurement.
+pub fn memberKeyKind(c: *Checker, name: types.Atom) Error!TypeId {
+    if (c.sym_key_cache.get(name)) |t| return t;
+    const answer = try computeMemberKeyKind(c, name);
+    try c.sym_key_cache.put(c.cm(), name, answer);
+    return answer;
+}
+
+fn computeMemberKeyKind(c: *Checker, name: types.Atom) Error!TypeId {
     const txt = c.atomText(name);
-    if (!std.mem.startsWith(u8, txt, synthetic_prefix)) return null;
+    if (!std.mem.startsWith(u8, txt, synthetic_prefix)) return types.no_type;
     const rest = txt[synthetic_prefix.len..];
-    if (rest.len > 1 and rest[0] == 'u') {
-        if (std.fmt.parseInt(u32, rest[1..], 10)) |id| {
-            return try c.ts.makeUniqueSymbol(id);
-        } else |_| {}
-    }
-    // A whitelist, not "anything else": `__@ctor` and `__@class` are member
-    // slots ztsc invents for a constructor and a class expression, and
-    // `__@k$…` is the placeholder a computed key wears until it is
-    // nominalized. None of them names a symbol, and all three must keep
-    // whatever key behaviour they already had.
-    if (!isWellKnownSymbolName(rest)) return null;
-    return try wellKnownSymbolType(c, rest);
-}
-
-/// The reverse of `ast.wellKnownSymbolKey`: is `name` the bare property name
-/// of a well-known `Symbol.<name>`? Asked of the forward mapping rather than
-/// of a second copy of its list, which would drift the first time a symbol is
-/// added.
-fn isWellKnownSymbolName(name: []const u8) bool {
-    return ast.wellKnownSymbolKey(name) != null;
-}
-
-/// `typeof Symbol.<name>` — the `unique symbol` the lib declares for a
-/// well-known symbol. `symbol` when no lib declares one (`--noLib`, or a
-/// `--lib` older than the one that introduced it): the key is still a symbol,
-/// ztsc just cannot say *which*, and answering the synthetic atom's string
-/// literal instead would put a name nobody wrote back into `keyof`.
-fn wellKnownSymbolType(c: *Checker, name: []const u8) Error!TypeId {
-    const obj = (try symbolConstructorTable(c)) orelse return types.symbol_type;
-    const p = (try c.propOfType(obj, try c.internText(name))) orelse return types.symbol_type;
-    return switch (c.ts.kind(try c.ts.regular(p.ty))) {
-        .unique_symbol, .symbol => p.ty,
-        else => types.symbol_type,
-    };
+    // `__@u<id>` and nothing else. `__@ctor` and `__@class` are member slots
+    // ztsc invents for a constructor and a class expression, `__@k$…` is the
+    // placeholder a computed key wears until it is nominalized, and the
+    // well-known `__@<name>` keys are excluded on purpose (see above) — all
+    // of them must keep whatever key behaviour they already had.
+    if (rest.len < 2 or rest[0] != 'u') return types.no_type;
+    const id = std.fmt.parseInt(u32, rest[1..], 10) catch return types.no_type;
+    return try c.ts.makeUniqueSymbol(id);
 }
 
 /// The member atom a SYMBOL-typed key denotes — the inverse of
-/// `symbolNamedKeyType`, and what lets `I[typeof s]` and every mapped type
+/// `memberKeyKind`, and what lets `I[typeof s]` and every mapped type
 /// over a key set containing one find the member again.
 ///
 /// Well-known symbols are tried FIRST, and the order is the design, not a
@@ -134,6 +130,11 @@ fn wellKnownSymbolType(c: *Checker, name: []const u8) Error!TypeId {
 /// a key no table has, since the declaration side is keyed syntactically
 /// (`__@iterator`). `expr.zig`'s element-access path orders the same two
 /// probes the same way for the same reason.
+///
+/// `keyof` no longer PRODUCES a well-known symbol key (see
+/// `memberKeyKind` for the measurement that scoped it out), so that
+/// first probe now serves only a key written by hand —
+/// `T[typeof Symbol.iterator]` — and never runs on a key set walk.
 pub fn symbolKeyAtom(c: *Checker, idx: TypeId) Error!?types.Atom {
     if (c.ts.kind(try c.ts.regular(idx)) != .unique_symbol) return null;
     if (try wellKnownAtomOfType(c, idx)) |a| return a;
@@ -181,6 +182,9 @@ fn keyofObjectTableUncached(c: *Checker, r: TypeId) Error!TypeId {
         // `constructor(private db: …)` parameter property would otherwise be a
         // required key of every mock).
         if (p.nonPublic()) continue;
+        // The SYMBOL this member is named by, if any — one memoized probe
+        // per property; see `memberKeyKind`.
+        const kind = try memberKeyKind(c, p.name);
         // A member declared with a computed ENUM-MEMBER key is NAMED by that
         // enum member even though the table keys it by the string value —
         // tsc's `symbol.links.nameType`. Without it `keyof M` came back as a
@@ -190,11 +194,8 @@ fn keyofObjectTableUncached(c: *Checker, r: TypeId) Error!TypeId {
             try parts.append(c.scratch(), nt);
             continue;
         }
-        // A SYMBOL-named member is named by the symbol, not by the synthetic
-        // atom the table keys it under — the same `nameType` rule, for the
-        // other late-bound name kind. See `symbolNamedKeyType`.
-        if (try symbolNamedKeyType(c, p.name)) |kt| {
-            try parts.append(c.scratch(), kt);
+        if (kind != types.no_type) {
+            try parts.append(c.scratch(), kind);
             continue;
         }
         try parts.append(c.scratch(), try c.ts.makeStringLiteral(p.name, false));

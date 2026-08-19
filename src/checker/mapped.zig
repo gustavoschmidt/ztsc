@@ -646,7 +646,7 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
             // with a `[s]: …` member). The property is stored under the
             // synthetic atom that names the symbol, exactly as the source
             // table stores it — `symbolKeyAtom` is the inverse of the
-            // `keyof` side's `symbolNamedKeyType`, so the round trip is
+            // `keyof` side's `memberKeyKind`, so the round trip is
             // lossless and no `key_name_types` entry is needed: `keyof` of
             // the RESULT decodes the atom back to the same symbol.
             //
@@ -912,7 +912,7 @@ pub fn collectMappedKeys(c: *Checker, constraint0: TypeId, out: *std.ArrayList(T
                     // filter — `keyof T & symbol`, the counterpart of the
                     // `keyof T & string` idiom this arm exists for. Reachable
                     // only since `keyof` started answering a symbol-named
-                    // member with the symbol itself (`symbolNamedKeyType`).
+                    // member with the symbol itself (`memberKeyKind`).
                     .unique_symbol => want_symbol and !want_string and !want_number,
                     else => false,
                 };
