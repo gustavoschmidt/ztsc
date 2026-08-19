@@ -4126,15 +4126,18 @@ const Binder = struct {
     /// one name merge into a single property whose declarations are all the
     /// assignments.
     ///
-    /// Still open: `decl[k] = 0` for a `const k` of literal type. tsc late-binds
-    /// that one too, but the NAME is the const's type, which no binder can see;
-    /// it needs the computed-key placeholder route (`computedSymPlaceholder`) and
-    /// a rekey on the checker side.
+    ///   - `decl[k] = 0` for a `const k` of literal type (or a `const k` that is
+    ///     a `unique symbol`) is late-bound too, but the NAME is the const's
+    ///     TYPE, which no binder can see. The member is declared under the
+    ///     computed-key placeholder `__@k$k` and the checker rekeys it once the
+    ///     const's type is in hand (`signatures.expandoProps` →
+    ///     `nominalizeComputedKey`), dropping it when the key turns out not to
+    ///     be late-bindable at all (`let k = "Y"`).
     fn bindExpandoAssignment(b: *Binder, node: Node) Error!void {
         if (b.nodeTag(node) != .assign) return;
         if (b.tree.tokens.tag(b.tree.nodeMainToken(node)) != .eq) return;
         const d = b.tree.nodeData(node);
-        const name_tok = expandoTargetName(b, d.lhs) orelse return;
+        const key = expandoTargetName(b, d.lhs) orelse return;
         const td = b.tree.nodeData(d.lhs);
         if (b.nodeTag(td.lhs) != .identifier) return;
 
@@ -4147,25 +4150,36 @@ const Binder = struct {
             xs = try b.newScope(.expando, node, b.cur_scope);
             try b.expando_scopes.put(b.scratch, sym, xs);
         }
-        const atom = try b.memberAtom(name_tok);
-        _ = try b.declare(xs, atom, .expando_member, node, name_tok, .{});
+        const atom = if (key.computed)
+            try b.computedSymPlaceholder(b.tokenText(key.tok))
+        else
+            try b.memberAtom(key.tok);
+        _ = try b.declare(xs, atom, .expando_member, node, key.tok, .{});
         b.sym_flags.items[sym].expando = true;
     }
 
-    /// The property-name TOKEN an expando assignment target names, or null when
-    /// the target is not one of the two bindable shapes: `obj.name` (the name
-    /// token) and ``obj["name"]`` / ``obj[`name`]`` / `obj[42]` (the literal's
-    /// token). A computed key that is not a literal — `obj[k]`, `obj[Symbol()]`
-    /// — has no syntactic name and is not one. The template-literal arm is
-    /// tsc's `isStringLiteralLike`, which a no-substitution template satisfies.
-    fn expandoTargetName(b: *Binder, target: Node) ?TokenIndex {
+    /// The property-name token of an expando assignment target, plus whether it
+    /// still needs the checker's late-bound rekey.
+    const ExpandoKey = struct { tok: TokenIndex, computed: bool = false };
+
+    /// The property name an expando assignment target names, or null when the
+    /// target is not one of the bindable shapes: `obj.name` (the name token),
+    /// ``obj["name"]`` / ``obj[`name`]`` / `obj[42]` (the literal's token), and
+    /// `obj[k]` for a plain identifier key — the last of which names nothing
+    /// syntactically and is reported `computed` so the caller keys it by a
+    /// placeholder. A key that is neither a literal nor a bare identifier
+    /// (`obj[Symbol()]`, `obj[a.b]`) is not bindable at all. The
+    /// template-literal arm is tsc's `isStringLiteralLike`, which a
+    /// no-substitution template satisfies.
+    fn expandoTargetName(b: *Binder, target: Node) ?ExpandoKey {
         const d = b.tree.nodeData(target);
         switch (b.nodeTag(target)) {
-            .member_expr => return if (d.rhs == 0) null else d.rhs,
+            .member_expr => return if (d.rhs == 0) null else .{ .tok = d.rhs },
             .index_expr => {
                 if (d.rhs == null_node) return null;
                 return switch (b.nodeTag(d.rhs)) {
-                    .string_literal, .template_literal, .number_literal => b.tree.nodeMainToken(d.rhs),
+                    .string_literal, .template_literal, .number_literal => .{ .tok = b.tree.nodeMainToken(d.rhs) },
+                    .identifier => .{ .tok = b.tree.nodeMainToken(d.rhs), .computed = true },
                     else => null,
                 };
             },

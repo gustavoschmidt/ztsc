@@ -441,7 +441,15 @@ fn checkDeclarator(c: *Checker, decl: Node, is_const: bool, ambient: bool) Error
                 return;
             }
             if (e.init != 0) {
-                const it = try c.checkExprCached(e.init, ann);
+                const it0 = try c.checkExprCached(e.init, ann);
+                // tsc binds `f.x = 1` onto the FUNCTION EXPRESSION's symbol,
+                // so the initializer of `const f: T = () => {}` already
+                // carries the expando members when it is checked against `T`
+                // — which is the whole point of
+                // `expandoFunctionExpressionsWithDynamicNames2`, where the
+                // annotation demands a member only the assignments supply.
+                // The variable itself keeps `T` (see `varHasTypeAnnotation`).
+                const it = try expandoInitializerType(c, d.lhs, e.init, it0);
                 if (ann != types.no_type and ann != types.error_type) {
                     // An INLINE deferred conditional annotation does not get
                     // the both-branches leniency here (see
@@ -464,6 +472,24 @@ fn checkDeclarator(c: *Checker, decl: Node, is_const: bool, ambient: bool) Error
     // After the arms above so the initializer is typed under its own
     // contextual type first — `checkDeclPattern` reads the cache.
     try c.checkDeclPattern(decl, types.no_type);
+}
+
+/// `it`, the type of a variable's function-expression initializer, with the
+/// expando members `name`'s symbol collected folded in. A pass-through for
+/// everything else — a non-identifier binding, a non-callable initializer,
+/// or a symbol with no `f.x = …` assignments at all.
+fn expandoInitializerType(c: *Checker, name: Node, init: Node, it: TypeId) Error!TypeId {
+    switch (c.nodeTag(init)) {
+        .arrow_fn, .function_expr => {},
+        else => return it,
+    }
+    if (c.nodeTag(name) != .identifier) return it;
+    const a = try c.atomOfToken(c.tree.nodeMainToken(name));
+    const sym = switch (c.resolveSpace(a, c.cur_scope, true)) {
+        .sym => |s| s,
+        else => return it,
+    };
+    return signatures.withExpandoProps(c, sym, it);
 }
 
 /// Force typeOfSymbol for every name bound by a pattern so inference

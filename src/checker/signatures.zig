@@ -25,6 +25,7 @@ const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
+const atoms = @import("atoms.zig");
 const RefKey = @import("flow.zig").RefKey;
 const baseTypeVariableOfClass = @import("classes.zig").baseTypeVariableOfClass;
 const expr_zig = @import("expr.zig");
@@ -1498,9 +1499,29 @@ fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
         }
         return types.any_type;
     }
-    if (f.var_decl or f.let_decl or f.const_decl)
-        return withExpandoProps(c, sym, try variableSymbolType(c, sym));
+    if (f.var_decl or f.let_decl or f.const_decl) {
+        const t = try variableSymbolType(c, sym);
+        // tsc declares `f.x = 1`'s member on the FUNCTION EXPRESSION the
+        // variable is initialized with, not on the variable — so an
+        // ANNOTATED `const f: T = () => {}` keeps exactly `T` and `f.x`
+        // stays the TS2339 tsc reports. (The initializer still carries the
+        // members where it is checked against the annotation; see
+        // `stmts.expandoInitializerType`.) Only an unannotated variable,
+        // whose type IS the initializer's, folds them in here.
+        if (varHasTypeAnnotation(c, sym)) return t;
+        return withExpandoProps(c, sym, t);
+    }
     return types.any_type;
+}
+
+/// Does any declarator of `sym` carry an explicit type annotation?
+fn varHasTypeAnnotation(c: *Checker, sym: SymbolId) bool {
+    for (c.declsOf(sym)) |decl| {
+        if (c.nodeTag(decl) != .declarator_full) continue;
+        const e = c.tree.extraData(ast.DeclaratorFull, c.tree.nodeData(decl).rhs);
+        if (e.type_ann != 0) return true;
+    }
+    return false;
 }
 
 /// The value (`typeof C`) side of a class symbol. Normally just the
@@ -1531,33 +1552,103 @@ fn callableClassValue(c: *Checker, sym: SymbolId, f: binder.SymbolFlags) Error!T
     return c.ts.makeIntersection(c.scratch(), &.{ try functionSymbolType(c, sym), cls });
 }
 
-/// Fold a function value's *expando* properties into its type: the
-/// callable base intersected with an object of the `fn.prop = value`
-/// declarations the binder collected (TS 3.1 properties-on-functions).
-/// A pass-through for the overwhelming majority of symbols, which have
-/// none. tsc models this as one anonymous type carrying both the call
-/// signatures and the members; the intersection is the same shape ztsc
-/// already uses for a function merged with a namespace.
-fn withExpandoProps(c: *Checker, sym: SymbolId, base: TypeId) Error!TypeId {
-    if (!c.symFlags(sym).expando) return base;
+/// Fold a function value's *expando* properties into its type (TS 3.1
+/// properties-on-functions). A pass-through for the overwhelming majority
+/// of symbols, which have none.
+///
+/// tsc models the result as ONE anonymous type carrying both the call
+/// signatures and the members, and that shape is load-bearing rather than
+/// cosmetic: an intersection `{ prop: string } & (() => void)` has no call
+/// signature of its own as far as `sourceSatisfiesSigs` is concerned, so
+/// `function inner() {}; inner.prop = "x"` was not assignable to
+/// `{ (): void; prop: string }` — the exact shape every expando case in the
+/// suite returns. It also prints the way tsc prints it
+/// (`{ (): void; prop: string; }`, not `{ prop: string; } & (() => void)`).
+pub fn withExpandoProps(c: *Checker, sym: SymbolId, base: TypeId) Error!TypeId {
+    const props = (try expandoProps(c, sym)) orelse return base;
+    return foldPropsIntoCallable(c, base, props);
+}
+
+/// The expando properties the binder collected for `sym`, or null when it
+/// has none. Scratch-allocated, so the caller must consume them before the
+/// next reset.
+pub fn expandoProps(c: *Checker, sym: SymbolId) Error!?[]const types.Prop {
+    if (!c.symFlags(sym).expando) return null;
     const saved = c.enterSymFile(sym);
     defer c.restoreCtx(saved);
-    const xs = c.bind.expandoScopeOf(c.localOf(sym)) orelse return base;
+    const xs = c.bind.expandoScopeOf(c.localOf(sym)) orelse return null;
+    // The key of a `f[k] = v` assignment is bound as a computed-key
+    // placeholder (`__@k$k`); the const it names is only resolvable here,
+    // where the declaring scope is in hand — the same rekey a computed
+    // class/interface member takes (`nominalizeComputedKey`).
+    const kscope = c.symScope(sym);
     var props: std.ArrayList(types.Prop) = .empty;
     defer props.deinit(c.scratch());
     const lo = c.bind.scope_members_start[xs];
     const hi = c.bind.scope_members_start[xs + 1];
     for (lo..hi) |i| {
+        const name = try c.nominalizeComputedKey(c.bind.member_atoms[i], kscope);
+        // The key did not resolve to a literal or a `unique symbol`
+        // (`f[k] = 1` with `let k = "Y"`): tsc's `isLateBindableName` fails,
+        // so NO member is declared and the read stays a TS7053. Keeping the
+        // placeholder would invent a property named `__@k$k`.
+        if (std.mem.startsWith(u8, c.atomText(name), atoms.computed_sym_prefix)) continue;
         const msym = c.toGlobal(c.bind.member_syms[i]);
         try props.append(c.scratch(), .{
-            .name = c.bind.member_atoms[i],
+            .name = name,
             .ty = try c.typeOfSymbol(msym),
             .flags = 0,
         });
     }
-    if (props.items.len == 0) return base;
-    const obj = try c.ts.makeObject(props.items, 0, 0, 0);
-    return c.ts.makeIntersection(c.scratch(), &.{ base, obj });
+    if (props.items.len == 0) return null;
+    const out: []const types.Prop = try props.toOwnedSlice(c.scratch());
+    return out;
+}
+
+/// `base` with `props` folded in as members of a single anonymous type,
+/// keeping whatever call/construct signatures `base` offers. Falls back to
+/// an intersection for a base that is not a plain callable — a type
+/// variable, a union, an already-merged namespace value — where there is no
+/// one member table to extend.
+fn foldPropsIntoCallable(c: *Checker, base: TypeId, props: []const types.Prop) Error!TypeId {
+    switch (c.ts.kind(base)) {
+        .function => return c.ts.makeObjectSigs(props, 0, 0, 0, &.{base}, &.{}),
+        .overloads => return c.ts.makeObjectSigs(props, 0, 0, 0, try c.memberList(base), &.{}),
+        .object => {
+            var all: std.ArrayList(types.Prop) = .empty;
+            defer all.deinit(c.scratch());
+            for (0..c.ts.objectPropCount(base)) |i| {
+                try all.append(c.scratch(), c.ts.objectProp(base, @intCast(i)));
+            }
+            for (props) |p| {
+                for (all.items) |*e| {
+                    if (e.name == p.name) break;
+                } else try all.append(c.scratch(), p);
+            }
+            var calls: std.ArrayList(TypeId) = .empty;
+            defer calls.deinit(c.scratch());
+            for (0..c.ts.objectCallSigCount(base)) |i| {
+                try calls.append(c.scratch(), c.ts.objectCallSig(base, @intCast(i)));
+            }
+            var ctors: std.ArrayList(TypeId) = .empty;
+            defer ctors.deinit(c.scratch());
+            for (0..c.ts.objectConstructSigCount(base)) |i| {
+                try ctors.append(c.scratch(), c.ts.objectConstructSig(base, @intCast(i)));
+            }
+            return c.ts.makeObjectSigs(
+                all.items,
+                c.ts.objectStringIndex(base),
+                c.ts.objectNumberIndex(base),
+                0,
+                calls.items,
+                ctors.items,
+            );
+        },
+        else => {
+            const obj = try c.ts.makeObject(props, 0, 0, 0);
+            return c.ts.makeIntersection(c.scratch(), &.{ base, obj });
+        },
+    }
 }
 
 /// Type of one expando property: the widened type of the assigned
@@ -1578,11 +1669,49 @@ fn expandoMemberType(c: *Checker, sym: SymbolId) Error!TypeId {
         // that the walk the body's `this` sees — so the "has a receiver" mark
         // has to be recorded here too, or the `this` is a false TS2683.
         try expr_zig.markAssignedMethodFn(c, c.tree.nodeData(decl).lhs, rhs);
-        const t = try c.widenLiteral(try c.checkExprCached(rhs, types.no_type));
+        const ctx = try annotatedTargetPropType(c, c.tree.nodeData(decl).lhs, sym);
+        const raw = try c.checkExprCached(rhs, ctx);
+        // tsc's `checkExpressionForMutableLocation`: a fresh literal the
+        // contextual type ADMITS keeps its literal type and only sheds its
+        // freshness; everything else widens.
+        const t = if (ctx != types.no_type and try c.contextAdmitsLiteral(ctx, raw))
+            try c.ts.regularLiteral(raw)
+        else
+            try c.widenLiteral(raw);
         try parts.append(c.scratch(), t);
     }
     if (parts.items.len == 0) return types.any_type;
     return c.ts.makeUnion(c.scratch(), parts.items);
+}
+
+/// The contextual type an expando assignment's right-hand side is checked
+/// under: the property the TARGET's own type annotation declares for it, or
+/// `no_type`.
+///
+/// tsc contextually types the right-hand side of `a.b = e` by the type of
+/// `a.b`, and for an ANNOTATED target that type is fixed independently of the
+/// assignments — so `const C: StatelessComponent<P> = …; C.defaultProps = {
+/// color: "red" }` keeps `"red"` a literal instead of widening it to `string`
+/// (`expandoFunctionContextualTypes`), and `const foo: Foo = …;
+/// foo[mySymbol] = true` keeps `true` instead of `boolean`.
+///
+/// Restricted to an annotated target on purpose: an UNANNOTATED one gets its
+/// type FROM these assignments, so asking for it here would be the cycle.
+fn annotatedTargetPropType(c: *Checker, target: Node, member: SymbolId) Error!TypeId {
+    switch (c.nodeTag(target)) {
+        .member_expr, .index_expr => {},
+        else => return types.no_type,
+    }
+    const obj = c.tree.nodeData(target).lhs;
+    if (obj == null_node or c.nodeTag(obj) != .identifier) return types.no_type;
+    const sym = switch (c.resolveSpace(try c.atomOfToken(c.tree.nodeMainToken(obj)), c.cur_scope, true)) {
+        .sym => |s| s,
+        else => return types.no_type,
+    };
+    if (!varHasTypeAnnotation(c, sym)) return types.no_type;
+    const name = try c.nominalizeComputedKey(c.symNameAtom(member), c.cur_scope);
+    const p = (try c.propOfType(try c.typeOfSymbol(sym), name)) orelse return types.no_type;
+    return p.ty;
 }
 
 /// Fold every callable constituent of a merged global function symbol into
