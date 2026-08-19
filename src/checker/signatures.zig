@@ -78,6 +78,10 @@ pub fn signatureOfProtoCtx(
     // A SET accessor's parameter takes its type from the paired GET
     // accessor's return type, not from anything at the setter itself.
     const setter_ctx = try setterParamTypeFromGetter(c, node, proto);
+    // …and when there is no getter to take it from, an object literal's lone
+    // setter earns tsc's TS7032 (the class form is reported off the member
+    // list, in `implicit_any.reportAccessorImplicitAny`).
+    if (report_implicit) try reportLoneObjectLiteralSetter(c, node, proto);
 
     // Type parameters (global symbol ids in the signature type).
     var tps: std.ArrayList(u32) = .empty;
@@ -608,8 +612,17 @@ fn paramInitCanBeUndefined(c: *Checker, pn: Node) Error!bool {
 /// guard (`get x() { return this.x; }` must terminate).
 fn setterParamTypeFromGetter(c: *Checker, node: Node, proto: ast.FnProto) Error!TypeId {
     if (proto.flags & ast.Flags.set == 0) return types.no_type;
-    if (c.nodeTag(node) != .class_method) return types.no_type;
-    const getter = pairedGetter(c, node, proto) orelse return types.no_type;
+    // Both accessor spellings tsc pairs: a class member, and an object
+    // literal's `set x(v) {}` shorthand — which the parser models as an
+    // `object_method` holding a `function_expr`, so `node` is the
+    // FUNCTION EXPRESSION and the pairing has to start from the literal.
+    // The two carry their FnProto in `nodeData(…).lhs` alike, so everything
+    // below is shared.
+    const getter = switch (c.nodeTag(node)) {
+        .class_method => pairedGetter(c, node, proto) orelse return types.no_type,
+        .function_expr => (try pairedObjectLiteralGetter(c, node)) orelse return types.no_type,
+        else => return types.no_type,
+    };
     const gproto = c.tree.extraData(ast.FnProto, c.tree.nodeData(getter).lhs);
     if (gproto.return_type != 0) return c.typeFromTypeNode(gproto.return_type);
     const gsig = try c.signatureOfProto(getter, c.tree.nodeData(getter).lhs, true, false);
@@ -640,6 +653,94 @@ fn pairedGetter(c: *Checker, setter: Node, proto: ast.FnProto) ?Node {
         return m;
     }
     return null;
+}
+
+/// The GET accessor written alongside this SET accessor in the same OBJECT
+/// LITERAL, or null — the literal counterpart of `pairedGetter`.
+///
+/// The AST carries no parent links, so the enclosing literal is found by
+/// scanning forward for the `object_literal` that owns an `object_method`
+/// whose value IS this function expression. Exactly one node in the file can
+/// hold it (a node has one parent), so the match is unambiguous, and the scan
+/// only ever runs for an UNANNOTATED first parameter of a set accessor —
+/// `paramInfo` ignores `setter_ctx` when an annotation is present, and
+/// accessor shorthands are rare enough that the walk never showed on the
+/// benchmark.
+fn pairedObjectLiteralGetter(c: *Checker, setter_fn: Node) Error!?Node {
+    const pair = (try objectLiteralAccessorPair(c, setter_fn)) orelse return null;
+    return if (pair.getter == null_node) null else pair.getter;
+}
+
+/// The object-literal member node holding `setter_fn`, plus the GET accessor
+/// written for the same key in that literal (`null_node` when there is none).
+const ObjLitAccessorPair = struct { member: Node, getter: Node };
+
+fn objectLiteralAccessorPair(c: *Checker, setter_fn: Node) Error!?ObjLitAccessorPair {
+    const total: Node = @intCast(c.tree.nodeCount());
+    var lit: Node = setter_fn + 1;
+    while (lit < total) : (lit += 1) {
+        if (c.nodeTag(lit) != .object_literal) continue;
+        const members = c.tree.nodeRange(lit);
+        var setter_member: Node = null_node;
+        for (members) |m| {
+            if (m == null_node or c.nodeTag(m) != .object_method) continue;
+            if (c.tree.nodeData(m).rhs == setter_fn) {
+                setter_member = m;
+                break;
+            }
+        }
+        if (setter_member == null_node) continue;
+        const name = (try objLitMemberKey(c, setter_member)) orelse return null;
+        for (members) |m| {
+            if (m == null_node or m == setter_member or c.nodeTag(m) != .object_method) continue;
+            const f = c.tree.nodeData(m).rhs;
+            if (f == null_node or c.nodeTag(f) != .function_expr) continue;
+            const mp = c.tree.extraData(ast.FnProto, c.tree.nodeData(f).lhs);
+            if (mp.flags & ast.Flags.get == 0) continue;
+            if (((try objLitMemberKey(c, m)) orelse continue) != name) continue;
+            return .{ .member = setter_member, .getter = f };
+        }
+        return .{ .member = setter_member, .getter = null_node };
+    }
+    return null;
+}
+
+/// The member atom an object-literal member declares, or null when it
+/// declares no static one.
+///
+/// The two forms the literal's own member walk keys a nominal member under: a
+/// plain/string/numeric name, and a SYNTACTIC `[Symbol.wellKnown]`
+/// (`{ get [Symbol.isConcatSpreadable]() {…},
+///     set [Symbol.isConcatSpreadable](x) {…} }`). Any other computed key
+/// stays dynamic there and so pairs with nothing here — asking for its TYPE
+/// is exactly what tsc declines to do at a method's key.
+fn objLitMemberKey(c: *Checker, member: Node) Error!?Atom {
+    const k = c.tree.nodeData(member).lhs;
+    if (k != null_node and c.nodeTag(k) == .computed_name) {
+        const wk = c.wellKnownKeyOfExpr(c.tree.nodeData(k).lhs) orelse return null;
+        return try c.atom(wk);
+    }
+    return try c.memberAtom(c.tree.nodeMainToken(member));
+}
+
+/// TS7032 for an object literal's LONE `set x(v) {}`: nothing can supply the
+/// property's type, so tsc names the setter at the literal's KEY token. The
+/// class-body form of the same rule lives in
+/// `implicit_any.reportAccessorImplicitAny`, which walks a member list; an
+/// object literal has no equivalent walk, and the setter's own signature
+/// build is the one place that already knows the pairing.
+fn reportLoneObjectLiteralSetter(c: *Checker, node: Node, proto: ast.FnProto) Error!void {
+    if (proto.flags & ast.Flags.set == 0) return;
+    if (c.nodeTag(node) != .function_expr) return;
+    if (implicit_any.paramIsAnnotated(c, proto)) return;
+    const pair = (try objectLiteralAccessorPair(c, node)) orelse return;
+    if (pair.getter != null_node) return;
+    // Reported at the KEY, so only a key that IS a name can carry it: a
+    // `[Symbol.x]`-keyed lone setter has no token to name and tsc's own
+    // message ("Property '…'") has nothing to fill in.
+    const kn = c.tree.nodeData(pair.member).lhs;
+    if (kn != null_node and c.nodeTag(kn) == .computed_name) return;
+    try implicit_any.reportSetAccessorImplicitAny(c, c.tree.nodeMainToken(pair.member));
 }
 
 fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_implicit: bool, setter_ctx: TypeId) Error!types.Param {

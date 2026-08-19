@@ -2311,15 +2311,6 @@ interface Set<T> {
     readonly size: number;
 }
 
-// NOTE (ztsc): the `iterable` construct overload that tsc declares further
-// down (in lib.es2015.iterable.d.ts) is relocated *above* the `values` one
-// declared here, so that the group reversal in
-// `appendObjectConstructCandidates` puts `values` first — see the note at the
-// relocation site for why this one interface inverts tsc's order.
-interface SetConstructor {
-    new <T>(iterable?: Iterable<T> | null): Set<T>;
-}
-
 interface SetConstructor {
     new <T = any>(values?: readonly T[] | null): Set<T>;
     readonly prototype: Set<any>;
@@ -2643,27 +2634,9 @@ interface ReadonlySet<T> {
     values(): SetIterator<T>;
 }
 
-// NOTE (ztsc): the `SetConstructor` construct overload tsc declares here is
-// relocated *above* lib.es2015.collection's, so that
-// `appendObjectConstructCandidates` — which visits declaration groups
-// back-to-front — tries the `readonly T[]` overload FIRST. Its Map/WeakMap/
-// WeakSet siblings keep tsc's file order and get tsc's resolution order from
-// that reversal; this one is inverted on purpose, and is the only construct
-// overload in this file that is.
-//
-// `new Set(["a", "b"])` under a contextual `Set<"a" | "b">` infers `T`
-// through `Iterable<T>` rather than through `readonly T[]`, and ztsc widens
-// the array literal's element to `string` on that path — reduced:
-//
-//     declare function fIter<T>(x: Iterable<T> | null): Box<T>;
-//     const a: Box<"a" | "b"> = fIter(["a", "b"]);  // ztsc: Box<string>
-//
-// tsc does not widen, because the inference to `T` was not made at a TOP-LEVEL
-// occurrence (`getCovariantInference`'s `inference.topLevel`). Until that is
-// fixed, tsc's order would trade a wrong last-overload MESSAGE for a wrong
-// TYPE. Oracle-verified on excalidraw's `bindingProperties:
-// Set<BindableProp | BindingProp> = new Set([…])` and social-app's
-// `ReportDialog/const.ts`.
+interface SetConstructor {
+    new <T>(iterable?: Iterable<T> | null): Set<T>;
+}
 
 interface WeakSet<T extends WeakKey> {}
 

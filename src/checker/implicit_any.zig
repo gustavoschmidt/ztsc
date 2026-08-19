@@ -311,8 +311,16 @@ fn accessorPartner(c: *Checker, members: []const Node, m: Node, name: Atom, flag
     return null;
 }
 
+/// TS7032 at an accessor NAME token, for callers outside this file that do
+/// their own pairing — an OBJECT LITERAL's accessors, which have no member
+/// list to walk (`signatures.reportLoneObjectLiteralSetter`).
+pub fn reportSetAccessorImplicitAny(c: *Checker, name_tok: TokenIndex) Error!void {
+    if (!c.prog.no_implicit_any) return;
+    _ = try reportAccessorAny(c, 7032, name_tok, 0, "set accessor lacks a parameter type annotation");
+}
+
 /// Does this accessor's first parameter carry a type annotation?
-fn paramIsAnnotated(c: *Checker, proto: ast.FnProto) bool {
+pub fn paramIsAnnotated(c: *Checker, proto: ast.FnProto) bool {
     for (c.tree.extraRange(proto.params_start, proto.params_end)) |p| {
         if (p == null_node) continue;
         return switch (c.nodeTag(p)) {
