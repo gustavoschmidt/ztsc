@@ -449,7 +449,10 @@ fn checkDeclarator(c: *Checker, decl: Node, is_const: bool, ambient: bool) Error
                 // `expandoFunctionExpressionsWithDynamicNames2`, where the
                 // annotation demands a member only the assignments supply.
                 // The variable itself keeps `T` (see `varHasTypeAnnotation`).
-                const it = try expandoInitializerType(c, d.lhs, e.init, it0);
+                const it = if (ann == types.no_type)
+                    it0 // no annotation: the VARIABLE's own type folds them in
+                else
+                    try expandoInitializerType(c, d.lhs, e.init, it0);
                 if (ann != types.no_type and ann != types.error_type) {
                     // An INLINE deferred conditional annotation does not get
                     // the both-branches leniency here (see

@@ -1508,7 +1508,7 @@ fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
         // members where it is checked against the annotation; see
         // `stmts.expandoInitializerType`.) Only an unannotated variable,
         // whose type IS the initializer's, folds them in here.
-        if (varHasTypeAnnotation(c, sym)) return t;
+        if (!f.expando or varHasTypeAnnotation(c, sym)) return t;
         return withExpandoProps(c, sym, t);
     }
     return types.any_type;
