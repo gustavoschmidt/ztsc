@@ -45,6 +45,37 @@
 //! `class D extends A {}` still relates to `A`, while a re-declaration in `D`
 //! is its own symbol and does not.
 //!
+//! NOT YET COVERED: ECMAScript `#private` NAMES. Oracled against tsgo 7.0.2 in
+//! wave 22; every shape below is a diagnostic ztsc does not produce.
+//!
+//!     class A { #x = 1; a = 1 }
+//!     class B { #x = 1; a = 1 }
+//!     a = b;   // TS2322 + "Property '#x' in type 'B' refers to a different
+//!              //           member that cannot be accessed from within type 'A'."
+//!
+//! The same for `#m(){}` and `get #g(){}`, in BOTH directions, and
+//! order-independently. Everything adjacent already matches: `class D extends
+//! C {}` still relates to `C` (one shared declaration), `{a:number}` vs a
+//! class with `#x` is TS2741 both ways, and the soft-`private` sibling case is
+//! the TS2322 above with tsc's OTHER message. `keyof A` should also be `"a"`
+//! alone, where ztsc answers `"#x" | "a"`.
+//!
+//! What the relation needs, and why the name cannot supply it: ztsc keys a
+//! `#x` member by the atom `#x`, which is the SAME atom a quoted `{"#x": 1}`
+//! key produces — and that one IS a real key (`keyof {"#x": number}` is
+//! `"#x"`). Testing the name therefore breaks quoted keys, and it is not
+//! cheap either (see COST below). tsc has no such collision: a private
+//! identifier's escaped name is mangled per class.
+//!
+//! So the missing half is agent A's, in the binder/`classes.zig`, and either
+//! form works: `prop_flag_non_public` on the member (the three
+//! `propertiesRelatedTo` gates and `keyof`'s own screen then admit it at no
+//! cost, and `nonPublicPropMismatch` needs one arm returning tsc's
+//! private-name message), or a per-class atom (`#x@A`), in which case the two
+//! sides simply hold different names and this file needs an arm that reports
+//! "different member" rather than letting the missing-property rule answer
+//! TS2741.
+//!
 //! COST. Every caller screens on `prop_flag_non_public` first — already loaded
 //! on the `Prop`/table slot the relation walk read to get the member's name —
 //! so a program whose compared types have no non-public member anywhere pays
@@ -52,6 +83,12 @@
 //! that bit does anything here run, and then it is the binder's member tables
 //! and the already-memoized `declaredBaseRefs` heritage: no type is resolved
 //! and no member type is instantiated.
+//!
+//! That bit is also why the private-name rule above waits for it rather than
+//! reading names here: a name read is an interner lookup and
+//! `Interner.lookup` takes the interner's shard mutex, so screening the
+//! property walk on the NAME put a lock on the hot path — interleaved A/B on
+//! drizzle, 4.28s -> 4.63s median (+7-8%) against a 2% bar.
 
 const binder = @import("../frontend/binder.zig");
 const intern = @import("../intern.zig");
