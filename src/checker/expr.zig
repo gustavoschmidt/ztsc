@@ -1491,6 +1491,21 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             }
         }
     }
+    // tsc's `isTupleLikeType` has a third disjunct beyond "is a tuple" and
+    // "has a property named `0`": an ARRAY-LIKE whose `length` type is
+    // entirely number LITERALS is tuple-like. An INTERSECTION is where that
+    // shape hides — `type fixed1 = [...number[]] & { length: 2 }` (the #29311
+    // repro in `contextualTypeWithTuple`) is array-like from the tuple half
+    // and pins `length` to `2` from the object half, so tsc contextually types
+    // `[0, 0]` as `[number, number]`. ztsc read no tuple context, built
+    // `number[]`, and `number[]`'s `length` is `number` — a false TS2322. The
+    // pin also makes arity real: `[0, 0, 0]` is TS2322 `'3'` vs `'2'`
+    // (tsgo-verified), which the array reading could never report.
+    if (ctx_tuple_ty == types.no_type and rctx != types.no_type and
+        c.ts.kind(rctx) == .intersection and try tupleLikeByLength(c, rctx))
+    {
+        ctx_tuple_ty = rctx;
+    }
     const ctx_tuple = ctx_tuple_ty != types.no_type;
     // Contextual element type for a plain (non-tuple) array literal. A
     // direct array context yields its element; a union context contributes
@@ -1601,6 +1616,7 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             continue;
         }
         var ectx: TypeId = ctx_elem;
+        var ectx_src: TypeId = types.no_type;
         if (ctx_tuple) {
             // A UNION contextual type contributes what EVERY constituent
             // holds at this index, not just the one tuple that put the
@@ -1612,7 +1628,8 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // [number, number]]` is the case: reading only the first tuple
             // gives the inner literal a contextual `number`, so it widens to
             // `number[]` and matches neither branch.
-            ectx = try contextualElemTypeAt(c, if (c.ts.kind(rctx) == .union_type) rctx else ctx_tuple_ty, i, lit_len);
+            ectx_src = if (c.ts.kind(rctx) == .union_type) rctx else ctx_tuple_ty;
+            ectx = try contextualElemTypeAt(c, ectx_src, i, lit_len);
         }
         // An element of an array literal is the one place a NON-CALLABLE tag
         // gets a different diagnostic (`checkTaggedTemplate`'s TS2796); ztsc
@@ -1623,7 +1640,11 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         const raw = try c.checkExprCached(el, ectx);
         c.array_elem = prev_elem;
         var et = raw;
-        if (!try keepLiteral(c, et, ectx)) et = try c.widenLiteral(et);
+        const keeps = if (ectx_src != types.no_type)
+            try elemCtxKeepsLiteral(c, ectx_src, i, lit_len, et)
+        else
+            try keepLiteral(c, et, ectx);
+        if (!keeps) et = try c.widenLiteral(et);
         // tsc's `checkExpressionForMutableLocation` ends
         // `getWidenedLiteralLikeTypeForContextualType` with
         // `getRegularTypeOfLiteralType` on BOTH arms: an element whose literal
@@ -1915,8 +1936,94 @@ fn contextualElemTypeAt(c: *Checker, rctx: TypeId, i: u32, length: ?u32) Error!T
             const idx = c.ts.objectNumberIndex(rctx);
             return if (idx != 0) idx else types.no_type;
         },
+        // tsc reads the position off the WHOLE type
+        // (`getTypeOfPropertyOfContextualType(t, "" + i)`), so an intersection
+        // answers from whichever constituent declares it — the `[...number[]]`
+        // half of `[...number[]] & { length: 2 }`, never the `{ length: 2 }`
+        // half. Constituents that agree contribute an intersection, which is
+        // what a property of an intersection type is; the NO-REDUCE spelling
+        // because this is a contextual read, not a declared type.
+        .intersection => {
+            var parts: std.ArrayList(TypeId) = .empty;
+            defer parts.deinit(c.scratch());
+            for (try c.memberList(rctx)) |m| {
+                const e = try contextualElemTypeAt(c, try c.resolveStructural(m), i, length);
+                if (e != types.no_type) try parts.append(c.scratch(), e);
+            }
+            if (parts.items.len == 0) return types.no_type;
+            if (parts.items.len == 1) return parts.items[0];
+            return c.ts.makeIntersectionNoReduce(c.scratch(), parts.items);
+        },
         else => return types.no_type,
     }
+}
+
+/// tsc's `isTupleLikeType` third disjunct: `isArrayLikeType(type) &&
+/// getTypeOfPropertyOfType(type, "length")` exists and is entirely number
+/// LITERALS. Asked only of an INTERSECTION — the one form that can be
+/// array-like without being a `.tuple` while still pinning `length` to a
+/// literal. A bare `T[]` is array-like too, but its `length` is `number`, so
+/// the disjunct could never fire for it; restricting the question keeps the
+/// property lookup off the ordinary array-literal path entirely.
+fn tupleLikeByLength(c: *Checker, r: TypeId) Error!bool {
+    var array_like = false;
+    for (try c.memberList(r)) |m| {
+        switch (c.ts.kind(try c.resolveStructural(m))) {
+            .array, .tuple => array_like = true,
+            else => {},
+        }
+    }
+    if (!array_like) return false;
+    const len = (try c.propOfType(r, c.atom_length)) orelse return false;
+    return allNumberLiterals(c, try c.resolveStructural(len.ty));
+}
+
+/// tsc's `everyType(lengthType, t => !!(t.flags & TypeFlags.NumberLiteral))`.
+fn allNumberLiterals(c: *Checker, t: TypeId) Error!bool {
+    if (c.ts.kind(t) == .union_type) {
+        for (try c.memberList(t)) |m| {
+            if (!try allNumberLiterals(c, try c.resolveStructural(m))) return false;
+        }
+        return true;
+    }
+    return switch (c.ts.kind(t)) {
+        .number_literal, .number_literal_fresh => true,
+        else => false,
+    };
+}
+
+/// `keepLiteral` for an element position whose contextual type comes from
+/// `contextualElemTypeAt`, asked of the UN-REDUCED union tsc would have built.
+///
+/// tsc reads a contextual element type through
+/// `getTypeOfPropertyOfContextualType`, whose `mapType(…, /*noReductions*/
+/// true)` ends in `getUnionType(mapped, UnionReduction.None)`. The
+/// `AnyOrUnknown` early return that collapses `"a" | any` to `any` sits INSIDE
+/// `if (unionReduction !== UnionReduction.None)`, so the union tsc hands the
+/// element still HAS its literal constituents — and
+/// `isLiteralOfContextualType` recurses through a union (`some(types, …)`) and
+/// finds them.
+///
+/// `unionTypeWithIndexAndTuple` is the shape: `f(args: ["a"] | I)` where `I`
+/// has `[index: number]: any`. Position 0 contributes `"a"` from the tuple and
+/// `any` from the interface's numeric index; reduced, the element is typed by
+/// `any`, `"a"` widens to `string`, the literal becomes `string[]` and matches
+/// neither branch (a false TS2345).
+///
+/// ztsc's `makeUnion` always reduces and `internType` is private to the store,
+/// so there is no unreduced union to hand back as `ectx`. But the only thing
+/// the reduction destroys is this predicate's answer, and the predicate over a
+/// union is a `some` — so ask it per CONSTITUENT, which is exactly what the
+/// unreduced union would have answered. The contextual type flowing into the
+/// element expression stays the reduced one, as it already was.
+fn elemCtxKeepsLiteral(c: *Checker, rctx: TypeId, i: u32, length: ?u32, cand: TypeId) Error!bool {
+    if (c.ts.kind(rctx) == .union_type) {
+        for (try c.memberList(rctx)) |m| {
+            if (try elemCtxKeepsLiteral(c, try c.resolveStructural(m), i, length, cand)) return true;
+        }
+        return false;
+    }
+    return keepLiteral(c, cand, try contextualElemTypeAt(c, rctx, i, length));
 }
 
 /// True when a (structurally resolved) union contextual type has two or
