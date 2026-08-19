@@ -625,6 +625,16 @@ pub const Code = enum(u16) {
     /// the base prototype reached before the base constructor has run. tsc's
     /// `checkSuperExpression`, which exempts the `super` that IS the call.
     super_before_super_property,
+    /// TS2377: a derived class's constructor whose body contains no `super(…)`
+    /// call at all. tsc's `checkConstructorDeclaration` asks it with
+    /// `findFirstSuperCall`, a purely SYNTACTIC search of the body that stops
+    /// at every function-like node — so a `super()` written in a nested arrow,
+    /// function or class constructor does not count, while one in an `if`, a
+    /// loop or an initializer expression does. Only the IMPLEMENTATION is
+    /// asked (an overload signature has no body), and `extends null` is
+    /// exempt: there is no base constructor to call. Reported on the whole
+    /// constructor declaration, so the span starts at its first MODIFIER.
+    derived_ctor_needs_super_call,
 
     // --- ambient-context and modifier grammar (checked in the parser) ------
     /// TS1036: an executable statement in an ambient context (`declare
@@ -932,6 +942,7 @@ pub const Code = enum(u16) {
             .multiple_default_exports,
             .super_before_this,
             .super_before_super_property,
+            .derived_ctor_needs_super_call,
             .decorator_not_valid_here,
             .decorator_on_method_overload,
             .decorator_on_second_accessor,
@@ -1424,6 +1435,7 @@ pub const Code = enum(u16) {
             .multiple_default_exports => "A module cannot have multiple default exports.",
             .super_before_this => "'super' must be called before accessing 'this' in the constructor of a derived class.",
             .super_before_super_property => "'super' must be called before accessing a property of 'super' in the constructor of a derived class.",
+            .derived_ctor_needs_super_call => "Constructors for derived classes must contain a 'super' call.",
             .regex_expected_r_brace => "'}' expected.",
             .regex_expected_r_bracket => "']' expected.",
             .regex_expected_r_paren => "')' expected.",
@@ -1632,6 +1644,7 @@ pub const Code = enum(u16) {
             .multiple_default_exports => 2528,
             .super_before_this => 17009,
             .super_before_super_property => 17011,
+            .derived_ctor_needs_super_call => 2377,
             .decorator_not_valid_here => 1206,
             .decorator_on_method_overload => 1249,
             .decorator_on_second_accessor => 1207,

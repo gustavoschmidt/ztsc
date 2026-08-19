@@ -505,6 +505,14 @@ const Binder = struct {
     /// it. Measured: `constructor() { const f = () => this.a; super(); }` is
     /// clean, `constructor() { const o = { p: this }; super(); }` is not.
     in_derived_ctor: bool = false,
+    /// Has a `super(…)` call been bound in the function-like body currently
+    /// being walked? tsc's `findFirstSuperCall`, which searches a constructor's
+    /// body and stops at every function-like node — so, exactly like
+    /// `in_derived_ctor`, `bindFunctionLike` overwrites this on the way in and
+    /// `saveState` restores it on the way out, which is what makes a `super()`
+    /// in a nested arrow or function not count for the constructor around it
+    /// (TS2377).
+    saw_super_call: bool = false,
     /// The `this` expressions — and the `super`s that are not a call's callee,
     /// which earn the same rule under a different code — collected by that
     /// flag, each with the flow node in effect where it was written (tsc's
@@ -777,6 +785,7 @@ const Binder = struct {
         stack_len: usize,
         ctor_return: ?PendingId,
         in_derived_ctor: bool,
+        saw_super_call: bool,
     };
 
     fn saveState(b: *Binder) SavedState {
@@ -789,6 +798,7 @@ const Binder = struct {
             .stack_len = b.scope_stack.items.len,
             .ctor_return = b.ctor_return,
             .in_derived_ctor = b.in_derived_ctor,
+            .saw_super_call = b.saw_super_call,
         };
     }
 
@@ -801,6 +811,7 @@ const Binder = struct {
         b.scope_stack.items.len = s.stack_len;
         b.ctor_return = s.ctor_return;
         b.in_derived_ctor = s.in_derived_ctor;
+        b.saw_super_call = s.saw_super_call;
     }
 
     // --- symbols ------------------------------------------------------------
@@ -2744,6 +2755,7 @@ const Binder = struct {
         // arrow included, which is what `includeArrowFunctions` buys tsc — ends
         // the region `this`-before-`super` covers.
         b.in_derived_ctor = ctor == .derived_ctor;
+        b.saw_super_call = false;
 
         try b.bindTypeParams(proto.tp_start, proto.tp_end);
         const home: ParamHome = .{ .ctor = is_ctor, .body = body != 0 };
@@ -2772,6 +2784,14 @@ const Binder = struct {
                 try b.pendAdd(pid, b.cur_flow);
                 try b.flow_pairs.append(b.scratch, .{ .value = node, .next = try b.finishPending(pid) });
             }
+            // TS2377, tsc's `checkConstructorDeclaration`: a derived class's
+            // IMPLEMENTATION has to call the base constructor somewhere. The
+            // question is the one `saw_super_call` answers, and it is asked
+            // here — after the body, before `restoreState` puts the enclosing
+            // function's answer back.
+            if (ctor == .derived_ctor and !b.saw_super_call) {
+                try b.diag(.derived_ctor_needs_super_call, memberStartToken(b, b.tree.nodeMainToken(node)));
+            }
         }
         // A NAMED function expression can call itself: tsc's `resolveName`
         // stops at the `FunctionExpression` whose own name matches, so the
@@ -2795,6 +2815,38 @@ const Binder = struct {
             }
         }
         b.restoreState(saved);
+    }
+
+    /// The first token of the class member whose NAME is `name_tok` — its
+    /// leading modifier run, if it has one. tsc anchors a diagnostic taken on
+    /// the whole declaration there, so `private constructor() {}` reports at
+    /// `private`, not at `constructor`.
+    ///
+    /// Read back off the token stream, the same trick `constTypeParam` uses and
+    /// for the same reason: the parser consumes a member modifier without
+    /// storing where it was, and only a modifier keyword can occupy a slot
+    /// between the member's start and its name, so the walk cannot run past its
+    /// own member. (A DECORATOR can sit ahead of the run and is not covered —
+    /// an under-shot span on a shape no diagnostic here reaches.)
+    fn memberStartToken(b: *const Binder, name_tok: TokenIndex) TokenIndex {
+        var tok = name_tok;
+        while (tok > 0) {
+            switch (b.tree.tokens.tag(tok - 1)) {
+                .keyword_public,
+                .keyword_private,
+                .keyword_protected,
+                .keyword_static,
+                .keyword_readonly,
+                .keyword_abstract,
+                .keyword_override,
+                .keyword_declare,
+                .keyword_async,
+                .keyword_accessor,
+                => tok -= 1,
+                else => return tok,
+            }
+        }
+        return tok;
     }
 
     /// Does a `const` modifier precede the type parameter named by `name_tok`?
@@ -4521,7 +4573,16 @@ const Binder = struct {
                 const info = b.tree.extraData(ast.CallInfo, d.rhs);
                 for (b.tree.extraRange(info.targs_start, info.targs_end)) |t| try b.bindType(t);
                 for (b.tree.extraRange(info.args_start, info.args_end)) |a| try b.bindExpr(a);
-                if (b.nodeTag(node) != .new_expr_targs) try b.bindArrayMutationCall(node, d.lhs);
+                if (b.nodeTag(node) != .new_expr_targs) {
+                    // `super<T>()`: type arguments do not change what the call
+                    // IS — tsc's `isSuperCall` and `bindCallExpressionFlow` look
+                    // only at the callee — so it advances the flow and counts as
+                    // the constructor's super call exactly as a bare `super()`
+                    // does. Without this `superWithTypeArgument.ts` was a false
+                    // TS2377.
+                    try b.bindSuperCall(node, d.lhs);
+                    try b.bindArrayMutationCall(node, d.lhs);
+                }
             },
             .instantiation_expr => {
                 try b.bindExpr(d.lhs);
@@ -4611,15 +4672,7 @@ const Binder = struct {
                 if (b.nodeTag(d.lhs) == .import_expr) try b.bindDynamicImport(node);
                 var it = b.tree.childIterator(node);
                 while (it.next()) |child| try b.bindExpr(child);
-                // tsc's `bindCallExpressionFlow`: a `super(...)` call — in ANY
-                // position, not just a statement — advances the flow, so that
-                // `this` after it can be told apart from `this` before it. The
-                // arguments are bound first (as they are in tsc), which is why
-                // `super(this)` still reports.
-                if (b.nodeTag(d.lhs) == .super_expr) {
-                    b.cur_flow = try b.addFlow(.call_stmt, b.cur_flow, node);
-                    try b.super_call_flows.append(b.scratch, b.cur_flow);
-                }
+                try b.bindSuperCall(node, d.lhs);
                 try b.bindArrayMutationCall(node, d.lhs);
             },
 
@@ -4629,6 +4682,20 @@ const Binder = struct {
                 while (it.next()) |child| try b.bindExpr(child);
             },
         }
+    }
+
+    /// tsc's `bindCallExpressionFlow` for a `super(...)` call: it advances the
+    /// flow — in ANY position, not just as a statement — so that `this` after it
+    /// can be told apart from `this` before it (TS17009), and it is the call
+    /// TS2377 asks the constructor for. Called AFTER the arguments are bound,
+    /// as in tsc, which is why `super(this)` still reports.
+    ///
+    /// A no-op for every other callee, so both call shapes hand it theirs.
+    fn bindSuperCall(b: *Binder, node: Node, callee: Node) Error!void {
+        if (b.nodeTag(callee) != .super_expr) return;
+        b.cur_flow = try b.addFlow(.call_stmt, b.cur_flow, node);
+        try b.super_call_flows.append(b.scratch, b.cur_flow);
+        b.saw_super_call = true;
     }
 
     /// Is `node` a (non-optional) `obj.<name>` member access?
