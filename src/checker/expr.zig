@@ -48,6 +48,7 @@ const hasTypeMeaning = @import("names.zig").hasTypeMeaning;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
 const identity = @import("identity.zig");
 const indexableConstituent = @import("typenode.zig").indexableConstituent;
+const negatedBigIntLiteral = @import("typenode.zig").negatedBigIntLiteral;
 const init = Checker.init;
 const instantiate = @import("enums.zig").instantiate;
 const isNonPrimitiveKind = @import("assign.zig").isNonPrimitiveKind;
@@ -4634,6 +4635,15 @@ fn checkPrefixUnary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             _ = try checkNonNullType(c, ot, d.lhs);
             _ = try reportSymbolOperand(c, node, d.lhs, d.lhs, ot, ot);
             if (try signedNumberLiteral(c, d.lhs, true)) |lit| return lit;
+            // tsc's `checkPrefixUnaryExpression` folds a MINUS over a bigint
+            // literal into a fresh literal type of its own
+            // (`getFreshTypeOfLiteralType(getBigIntLiteralType({ negative:
+            // true, … }))`), exactly as it folds one over a numeric literal
+            // just above. Without it `let x: -1n = -1n` failed on its own
+            // spelling: `-1n` coerced to plain `bigint`.
+            if (c.nodeTag(d.lhs) == .bigint_literal) {
+                return negatedBigIntLiteral(c, c.tree.nodeMainToken(d.lhs), true);
+            }
             // `bigint` only when the operand actually CARRIES a bigint
             // constituent: tsc's getUnaryResultType tests
             // `maybeTypeOfKind(t, BigIntLike)`, not assignability, so the

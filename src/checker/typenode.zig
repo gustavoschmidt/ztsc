@@ -29,6 +29,7 @@ const Node = ast.Node;
 const null_node = ast.null_node;
 const Atom = intern.Atom;
 const SymbolId = binder.SymbolId;
+const TokenIndex = ast.TokenIndex;
 const TypeId = types.TypeId;
 
 const checker_zig = @import("../checker.zig");
@@ -205,12 +206,24 @@ fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
         .false_literal => return types.false_type,
         .null_literal => return types.null_type,
         .prefix_unary => {
-            // Negative numeric literal type `-1`.
-            if (c.tree.tokens.tag(c.tree.nodeMainToken(node)) == .minus and
-                d.lhs != 0 and c.nodeTag(d.lhs) == .number_literal)
-            {
-                const v = c.numberTokenValue(c.tree.nodeMainToken(d.lhs));
-                return c.ts.makeNumberLiteral(-v, false);
+            // Negative literal type `-1` / `-1n`. The parser wraps BOTH in a
+            // `.number_literal` node (its type-position `.minus` arm takes
+            // either token and leafs one tag), so the operand is told apart by
+            // its TOKEN, not by its node tag — read as a number, `-1n`'s `1n`
+            // parsed as `0` and the type came out `0`.
+            if (c.tree.tokens.tag(c.tree.nodeMainToken(node)) == .minus and d.lhs != 0) {
+                const lit = c.tree.nodeMainToken(d.lhs);
+                switch (c.tree.tokens.tag(lit)) {
+                    .numeric_literal => {
+                        var v = -c.numberTokenValue(lit);
+                        // `-0` is `0`: tsc's literal-type map is keyed by value
+                        // with SameValueZero, so the two are one type.
+                        if (v == 0) v = 0;
+                        return c.ts.makeNumberLiteral(v, false);
+                    },
+                    .bigint_literal => return negatedBigIntLiteral(c, lit, false),
+                    else => {},
+                }
             }
             return types.any_type;
         },
@@ -681,6 +694,44 @@ pub fn restTupleAtPosition(c: *Checker, sig: TypeId, pos: u32) Error!TypeId {
         });
     }
     return c.ts.makeTuple(elems.items);
+}
+
+/// The bigint LITERAL type `-<lit>` denotes, for the literal token `lit`.
+/// Shared by the two positions the negation is written in: a literal TYPE
+/// (`let f: -1n`, the `.prefix_unary` arm above) and an EXPRESSION (`-1n`,
+/// `checkPrefixUnary`'s `.minus` arm, which passes `fresh`).
+///
+/// tsc models a bigint literal as a `{ negative, base10Value }` pseudo-bigint
+/// and `pseudoBigIntToString` writes the sign in front; ztsc keys one by its
+/// source text, so the negated form is that text with a `-` glued on. The one
+/// value that does not take the sign is ZERO — tsc's own `negative &&
+/// base10Value !== "0"` guard — without which `-0n` and `0n` would be two
+/// types that print alike.
+pub fn negatedBigIntLiteral(c: *Checker, lit: TokenIndex, fresh: bool) Error!TypeId {
+    const text = c.tokenText(lit);
+    if (bigIntTokenIsZero(text)) return c.ts.makeBigIntLiteral(try c.atomOfToken(lit), fresh);
+    // Scratch, like every other synthetic member/type name built from token
+    // text (`computedSymKey`): the arena is reset per source element, and
+    // `internText` copies before the slice can go away.
+    const s = try std.fmt.allocPrint(c.scratch(), "-{s}", .{text});
+    return c.ts.makeBigIntLiteral(try c.internText(s), fresh);
+}
+
+/// Is a bigint literal token's text the value zero (`0n`, `0x0n`, `0b0_0n`)?
+fn bigIntTokenIsZero(text: []const u8) bool {
+    var digits = text;
+    if (std.mem.endsWith(u8, digits, "n")) digits = digits[0 .. digits.len - 1];
+    if (digits.len > 2 and digits[0] == '0') {
+        switch (digits[1]) {
+            'x', 'X', 'b', 'B', 'o', 'O' => digits = digits[2..],
+            else => {},
+        }
+    }
+    if (digits.len == 0) return false;
+    for (digits) |ch| {
+        if (ch != '0' and ch != '_') return false;
+    }
+    return true;
 }
 
 /// Copy union members to scratch: slices into the type store dangle
