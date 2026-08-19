@@ -62,8 +62,8 @@ const tpIndex = @import("calls.zig").tpIndex;
 /// which covers `jsx: "preserve"` and the classic `react` factory) and, of
 /// course, when the module resolved.
 fn reportMissingJsxRuntime(c: *Checker, node: Node) Error!void {
-    const spec = c.prog.jsx_runtime_module orelse return;
-    if (c.prog.jsx_runtime_file != modules.no_file) return;
+    const spec = c.prog.jsxRuntimeSpec(c.cur_file) orelse return;
+    if (c.prog.jsxRuntimeFile(c.cur_file) != modules.no_file) return;
     if (c.jsx_runtime_reported[c.cur_file]) return;
     // The module needs a FILE to supply `JSX` from, which is what
     // `jsx_runtime_file` records — but tsc's question here is only whether the
@@ -312,13 +312,26 @@ pub fn jsxNamespaceType(c: *Checker, member: Atom) Error!?TypeId {
 /// (e.g. `IntrinsicClassAttributes<T>`) are never instantiated bare.
 pub fn jsxNamespaceMember(c: *Checker, member: Atom) Error!?SymbolId {
     if (try jsxFactoryNamespaceMember(c, member)) |g| return g;
+    // tsc's `getJsxNamespaceAt` asks the implicit-import container FIRST and
+    // only falls back to `resolveName(JSX)` when there is none — so a program
+    // that has BOTH a global `JSX` namespace and an automatic runtime types its
+    // tags from the runtime's namespace. @emotion/react is the shape that
+    // depends on it: its `jsx-runtime` re-exports an `IntrinsicElements` that
+    // widens react's global one with `css`, and reading the global first made
+    // every `css={…}` attribute an excess property (TS2322).
+    //
+    // The per-member fallback (rather than tsc's all-or-nothing container) is
+    // deliberate: a runtime module that resolves but publishes only *part* of
+    // the namespace still gets the global's remaining members here, where tsc
+    // would type them as the error type.
+    if (try jsxRuntimeNamespaceMember(c, member)) |g| return g;
     switch (c.resolveSpace(c.atom_JSX, c.cur_scope, false)) {
         .sym => |s| if (try jsxNamespaceSym(c, s)) |ns| {
             if (nsTypeMember(c, ns, member)) |g| return g;
         },
         else => {},
     }
-    return try jsxRuntimeNamespaceMember(c, member);
+    return null;
 }
 
 /// The namespace a symbol that NAMES the JSX namespace denotes: itself when it
@@ -390,7 +403,7 @@ fn jsxFactoryNamespaceMember(c: *Checker, member: Atom) Error!?SymbolId {
 /// bogus tag). The driver puts that module in the program and hands its FileId
 /// over as `Program.jsx_runtime_file`.
 pub fn jsxRuntimeNamespaceMember(c: *Checker, member: Atom) Error!?SymbolId {
-    const f = c.prog.jsx_runtime_file;
+    const f = c.prog.jsxRuntimeFile(c.cur_file);
     if (f == modules.no_file or c.prog.links.len == 0) return null;
     const ns_tgt = c.prog.links[f].exportTarget(c.atom_JSX) orelse return null;
     const ns_sym0 = c.targetTypeSym(ns_tgt) orelse return null;
@@ -460,22 +473,20 @@ pub const JsxProps = struct {
 /// non-union, non-`never` type that is merely ASSIGNABLE to the global
 /// `Function`.
 ///
-/// Two shapes are excused here that tsc DOES report, both deliberate
-/// under-reports of ztsc's own making:
+/// One shape is excused here that tsc DOES report, a deliberate under-report of
+/// ztsc's own making: a TYPE PARAMETER, because tsc asks the question of the
+/// APPARENT type and ztsc's structural resolve does not walk a parameter's
+/// constraint, so `<T extends ComponentType>` would otherwise read as
+/// signature-less.
 ///
-///   * a TYPE PARAMETER, because tsc asks the question of the APPARENT type and
-///     ztsc's structural resolve does not walk a parameter's constraint, so
-///     `<T extends ComponentType>` would otherwise read as signature-less;
-///   * `undefined`/`void`, because an unannotated ambient `declare var Foo` —
-///     which tsc types `any`, and which is how half the suite's JSX fixtures
-///     declare their components — is typed `undefined` by ztsc today. Until
-///     that is fixed, `undefined` is the one kind whose provenance ztsc cannot
-///     trust, and reporting on it turned `tsxReactEmit3`/`tsxExternalModuleEmit2`
-///     into five false positives apiece.
+/// `undefined`/`void` used to be excused too, for a reason that has since been
+/// fixed: an unannotated ambient `declare var Foo` — how half the suite's JSX
+/// fixtures declare their components — was typed `undefined` rather than `any`,
+/// so reporting on `undefined` was five false positives apiece in
+/// `tsxReactEmit3`/`tsxExternalModuleEmit2`. See `SymbolFlags.ambient_var`.
 fn tagWithoutSignaturesIsError(c: *Checker, tag_ty: TypeId, resolved: TypeId) Error!bool {
     switch (c.ts.kind(resolved)) {
         .any, .err, .string, .string_literal, .type_param, .infer_var => return false,
-        .undefined, .void => return false,
         // tsc's `!(getReducedType(apparentFuncType).flags & TypeFlags.Never)`
         // guard puts `never` back INSIDE the error, so it falls through.
         .never => return true,

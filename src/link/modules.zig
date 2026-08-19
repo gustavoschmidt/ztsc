@@ -59,6 +59,7 @@ const source = @import("../frontend/source.zig");
 const libs = @import("../libs.zig");
 const alias_cycle = @import("alias_cycle.zig");
 const global_dup = @import("global_dup.zig");
+const jsx_pragma = @import("jsx_pragma.zig");
 const package_id = @import("package_id.zig");
 const paths = @import("paths.zig");
 const resolve = @import("resolve.zig");
@@ -216,6 +217,8 @@ pub fn buildProgram(
         {
             if (try disco.discoverModule(path, jsx_runtime_module.?)) |jf| jsx_runtime_fid = jf;
         }
+        // …and this file's own `/* @jsxImportSource X */` override, if any.
+        const jsx_pragma_rt = try disco.discoverJsxPragma(path, bytes);
 
         // Triple-slash `/// <reference>` directives pull extra files into the
         // program — not import bindings, just program inputs.
@@ -250,6 +253,8 @@ pub fn buildProgram(
                 .files = resolved_specs,
             },
             .type_ref_misses = try type_ref_misses.toOwnedSlice(arena),
+            .jsx_pragma_module = if (jsx_pragma_rt) |p| p.spec else null,
+            .jsx_pragma_file = if (jsx_pragma_rt) |p| p.file else no_file,
         });
         spec_atoms.deinit(scratch);
         spec_files.deinit(scratch);
@@ -4262,6 +4267,25 @@ pub const Discovery = struct {
         const resolved = try d.rcache.resolve(d.io, d.scratch, d.dir, importer, spec) orelse
             return null;
         return try d.fileFor(resolved);
+    }
+
+    /// The per-file automatic JSX runtime a `/* @jsxImportSource X */` pragma
+    /// selects, resolved. Null when `src` carries no pragma (the common case,
+    /// and the only cost then is the leading-comment scan) or when `importer`
+    /// is not a JSX file — a `.ts` file has no tags for the runtime to serve,
+    /// and tsc's implicit import container is only ever asked for from one.
+    ///
+    /// `file` is `no_file` when the module does not resolve; that is not a
+    /// failure to report here, it is what makes the file's first tag TS2875.
+    pub fn discoverJsxPragma(
+        d: *const Discovery,
+        importer: []const u8,
+        src: []const u8,
+    ) !?struct { spec: []const u8, file: FileId } {
+        if (!parser.isJsxPath(importer)) return null;
+        const base = jsx_pragma.scan(src) orelse return null;
+        const spec = try std.fmt.allocPrint(d.arena, "{s}/jsx-runtime", .{base});
+        return .{ .spec = spec, .file = (try d.discoverModule(importer, spec)) orelse no_file };
     }
 
     /// Auto-include `@types/node` on account of `bound`'s imports, like tsc's

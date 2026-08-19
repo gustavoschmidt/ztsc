@@ -205,10 +205,20 @@ fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8) Lo
     }
     // Automatic JSX runtime: the `JSX` namespace comes from the
     // `<jsxImportSource>/jsx-runtime` module rather than global scope.
-    if (acc.jsx) |j| {
-        if (std.mem.eql(u8, j, "react-jsx") or std.mem.eql(u8, j, "react-jsxdev")) {
+    //
+    // tsc's `getJSXImplicitImportBase` turns it on for `jsx: "react-jsx"` /
+    // `"react-jsxdev"` OR for an explicit `jsxImportSource`, whatever the `jsx`
+    // mode is — naming an import source is itself the opt-in, so a project on
+    // `jsx: "preserve"` with `jsxImportSource: "@emotion/react"` still reads its
+    // namespace (and still reports TS2875 when that module is missing).
+    {
+        const auto = if (acc.jsx) |j|
+            std.mem.eql(u8, j, "react-jsx") or std.mem.eql(u8, j, "react-jsxdev")
+        else
+            false;
+        if (auto or acc.jsx_import_source != null) {
             cfg.jsx_runtime_module = try std.fmt.allocPrint(arena, "{s}/jsx-runtime", .{acc.jsx_import_source orelse "react"});
-            try cx.note("'jsx: {s}': the `JSX` namespace is read from '{s}' (automatic runtime), falling back to a global `JSX` namespace", .{ j, cfg.jsx_runtime_module.? });
+            try cx.note("'jsx: {s}': the `JSX` namespace is read from '{s}' (automatic runtime), falling back to a global `JSX` namespace", .{ acc.jsx orelse "react", cfg.jsx_runtime_module.? });
         }
     }
     if (acc.jsx_factory) |f| {

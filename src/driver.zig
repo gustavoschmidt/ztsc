@@ -321,6 +321,12 @@ pub const FileTables = struct {
     /// Per-file `/// <reference types="X" />` directives that resolved to
     /// nothing; the linker replays them as TS2688.
     type_ref_misses: std.ArrayList([]const modules.TypeRefMiss) = .empty,
+    /// Per-file `/* @jsxImportSource X */` override: the expanded specifier
+    /// `X/jsx-runtime` and the FileId it resolved to (`no_file` if it did not).
+    /// Null/`no_file` for the overwhelming majority of files, which take the
+    /// program-wide runtime instead. See `ProgFile.jsx_pragma_module`.
+    jsx_pragma_modules: std.ArrayList(?[]const u8) = .empty,
+    jsx_pragma_files: std.ArrayList(FileId) = .empty,
 
     /// Give every table a slot for every discovered file (null/empty
     /// defaults). Called after each round of discovery, since resolving one
@@ -336,6 +342,8 @@ pub const FileTables = struct {
         while (t.spec_files.items.len < n) try t.spec_files.append(arena, &.{});
         while (t.edges.items.len < n) try t.edges.append(arena, &.{});
         while (t.type_ref_misses.items.len < n) try t.type_ref_misses.append(arena, &.{});
+        while (t.jsx_pragma_modules.items.len < n) try t.jsx_pragma_modules.append(arena, null);
+        while (t.jsx_pragma_files.items.len < n) try t.jsx_pragma_files.append(arena, modules.no_file);
     }
 
     /// Reorder every table so that entry `k` becomes the old entry
@@ -352,6 +360,8 @@ pub const FileTables = struct {
         try permuteInPlace([]Atom, arena, t.spec_atoms.items, order);
         try permuteInPlace([]FileId, arena, t.spec_files.items, order);
         try permuteInPlace([]const modules.TypeRefMiss, arena, t.type_ref_misses.items, order);
+        try permuteInPlace(?[]const u8, arena, t.jsx_pragma_modules.items, order);
+        try permuteInPlace(FileId, arena, t.jsx_pragma_files.items, order);
         t.edges.clearRetainingCapacity();
     }
 };
@@ -597,6 +607,17 @@ pub fn build(
                     try ref_files.append(arena, jf);
                 }
             }
+            // …and its per-file override: `/* @jsxImportSource preact */` swaps
+            // the runtime for THIS file only, so its module is a program input
+            // of its own. Scanned only for JSX files (nothing else can carry a
+            // tag) and only over the leading comment block.
+            if (tables.results.items[i]) |src| {
+                if (try disco.discoverJsxPragma(importer, src.bytes)) |p| {
+                    tables.jsx_pragma_modules.items[i] = p.spec;
+                    tables.jsx_pragma_files.items[i] = p.file;
+                    if (p.file != modules.no_file) try ref_files.append(arena, p.file);
+                }
+            }
             // Triple-slash `/// <reference>` directives pull extra files into
             // the program — program inputs, not import bindings. Their
             // resolved ids join the discovery edge list so the deterministic
@@ -793,6 +814,10 @@ fn renumber(
 
         try tables.permute(arena, order);
         if (jsx_fid) |f| jsx_fid = new_ids[f];
+        // The per-file `@jsxImportSource` resolutions are FileIds too.
+        for (tables.jsx_pragma_files.items) |*fid| {
+            if (fid.* != modules.no_file) fid.* = new_ids[fid.*];
+        }
         // Remap the resolved FileIds inside the spec maps.
         for (tables.spec_files.items) |spec_files| {
             for (spec_files) |*fid| {
@@ -892,6 +917,8 @@ fn linkProgram(
             .bind = bnd.?,
             .specs = .{ .atoms = tables.spec_atoms.items[i], .files = tables.spec_files.items[i] },
             .type_ref_misses = tables.type_ref_misses.items[i],
+            .jsx_pragma_module = tables.jsx_pragma_modules.items[i],
+            .jsx_pragma_file = tables.jsx_pragma_files.items[i],
         };
     }
     const lr = try modules.link(arena, gpa, io, interner, prog_files, link_opts);

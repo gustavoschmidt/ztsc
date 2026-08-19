@@ -150,6 +150,27 @@ pub const Program = struct {
     /// from there. See `tsconfig.Config.jsx_factory_ns`.
     jsx_factory_ns: ?[]const u8 = null,
 
+    /// The automatic-runtime specifier in force in `file`: its own
+    /// `@jsxImportSource` pragma when it has one, else the program-wide
+    /// setting. Null when the automatic runtime is off for it entirely.
+    pub fn jsxRuntimeSpec(p: *const Program, file: FileId) ?[]const u8 {
+        if (file < p.files.len) {
+            if (p.files[file].jsx_pragma_module) |m| return m;
+        }
+        return p.jsx_runtime_module;
+    }
+
+    /// The file `jsxRuntimeSpec(file)` resolved to, or `no_file`. Paired with
+    /// `jsxRuntimeSpec` so the two never disagree about WHICH specifier is
+    /// being talked about — a pragma file whose module is missing must not
+    /// borrow the program-wide one's resolution.
+    pub fn jsxRuntimeFile(p: *const Program, file: FileId) FileId {
+        if (file < p.files.len) {
+            if (p.files[file].jsx_pragma_module != null) return p.files[file].jsx_pragma_file;
+        }
+        return p.jsx_runtime_file;
+    }
+
     /// Count of real per-file symbols (merged ids start here).
     pub fn totalSymbols(p: *const Program) u32 {
         return p.sym_base[p.files.len];
@@ -208,6 +229,13 @@ pub const ProgFile = struct {
     /// the driver that discovered the file (only it runs resolution); replayed
     /// as TS2688 by `Linker.reportUnresolvedTypeRefs`.
     type_ref_misses: []const TypeRefMiss = &.{},
+    /// This file's own `/* @jsxImportSource X */` pragma, expanded to the
+    /// specifier `X/jsx-runtime`, and what it resolved to — null/`no_file` when
+    /// the file carries no pragma and the program-wide `jsx_runtime_module`
+    /// applies. Read through `Program.jsxRuntimeSpec`/`jsxRuntimeFile`, never
+    /// directly: one `.tsx` may pick preact while its neighbour picks react.
+    jsx_pragma_module: ?[]const u8 = null,
+    jsx_pragma_file: FileId = no_file,
 };
 
 /// A `/// <reference … />` in a program file that resolved to nothing. `span`
