@@ -20,6 +20,7 @@ const Error = checker_zig.Error;
 const max_instantiation_depth = checker_zig.max_instantiation_depth;
 
 const EnumMemberCollect = @import("enums.zig").EnumMemberCollect;
+const symbolKeyAtom = @import("keyof.zig").symbolKeyAtom;
 
 /// Dense, stable id for a mapped type's key parameter `K`, keyed by the
 /// mapped-type nodeKey. Mapped nodes are excluded from the type-node memo,
@@ -641,6 +642,31 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
                 try props.append(c.scratch(), .{ .name = name, .ty = pt, .flags = applyPropModifiers(base, flags) });
                 if (as_clause == 0) try name_types.append(c.scratch(), .{ .name = name, .ty = key_lit });
             },
+            // A SYMBOL-named key (`{ [P in keyof I]: … }` over an interface
+            // with a `[s]: …` member). The property is stored under the
+            // synthetic atom that names the symbol, exactly as the source
+            // table stores it — `symbolKeyAtom` is the inverse of the
+            // `keyof` side's `symbolNamedKeyType`, so the round trip is
+            // lossless and no `key_name_types` entry is needed: `keyof` of
+            // the RESULT decodes the atom back to the same symbol.
+            //
+            // Without this arm the key fell to the catch-all below and the
+            // member was dropped outright, so `Readonly<I>`, `Partial<I>`
+            // and every homomorphic map silently lost its symbol-named
+            // members the moment `keyof` stopped calling them strings.
+            .unique_symbol => {
+                const kname = (try symbolKeyAtom(c, key_lit)) orelse continue;
+                const name = if (as_clause == 0)
+                    kname
+                else
+                    (try c.remapKey(as_clause, key_id, key_lit)) orelse continue;
+                var base: u32 = 0;
+                if (mod_src != 0) {
+                    if (try c.propOfTypeEx(mod_src, kname, false)) |sp| base = sp.flags & mod_mask;
+                }
+                const pt = try stripMappedOptional(c, try c.substMappedKey(value, key_id, key_lit), base, flags);
+                try props.append(c.scratch(), .{ .name = name, .ty = pt, .flags = applyPropModifiers(base, flags) });
+            },
             .string_literal => {
                 const name = (try c.remapKey(as_clause, key_id, key_lit)) orelse continue;
                 var base: u32 = 0;
@@ -882,6 +908,12 @@ pub fn collectMappedKeys(c: *Checker, constraint0: TypeId, out: *std.ArrayList(T
                 const keep = switch (s.kind(try c.resolveStructural(cand))) {
                     .string_literal => !want_number and !want_symbol,
                     .number_literal, .number_literal_fresh => !want_string and !want_symbol,
+                    // A symbol-named key survives exactly the mirror-image
+                    // filter — `keyof T & symbol`, the counterpart of the
+                    // `keyof T & string` idiom this arm exists for. Reachable
+                    // only since `keyof` started answering a symbol-named
+                    // member with the symbol itself (`symbolNamedKeyType`).
+                    .unique_symbol => want_symbol and !want_string and !want_number,
                     else => false,
                 };
                 if (keep) try out.append(c.scratch(), cand);

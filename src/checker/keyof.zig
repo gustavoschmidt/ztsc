@@ -50,6 +50,124 @@ fn keyofObjectTable(c: *Checker, r: TypeId) Error!TypeId {
     return computed;
 }
 
+/// The synthetic-member-atom prefix the parser, the binder and the checker
+/// share for every key that is not a source identifier. It cannot begin a
+/// real identifier, so it never collides (`ast.wellKnownSymbolKey`,
+/// `atoms.uniqueSymAtom`, `binder.memberKey`).
+pub const synthetic_prefix = "__@";
+
+/// The KEY TYPE of a member whose name is a SYMBOL rather than a string —
+/// tsc's `getLiteralTypeFromProperty`, which answers a late-bound property's
+/// `links.nameType` (the `unique symbol` its computed key evaluated to)
+/// instead of a string literal over the property's internal name. Null for
+/// every ordinary member, and for the synthetic atoms that are *not* symbol
+/// names (`__@ctor`, `__@class`, the `__@k$…` computed-key placeholder).
+///
+/// ztsc keys a symbol-named member by one of two synthetic atoms, and both
+/// decode back to the symbol they stand for:
+///
+///   * `__@u<id>` — `[k]` where `k: unique symbol`. `Checker.uniqueSymType`
+///     IS `makeUniqueSymbol(<global node id of the annotation>)`, and
+///     `uniqueSymAtom` prints that id, so parsing it back is exact: the key
+///     type is the very same interned type `typeof k` has.
+///   * `__@<name>` — a well-known `Symbol.<name>`, keyed syntactically
+///     because the lib's own declaration is what gives it its identity. Its
+///     type is `SymbolConstructor`'s `<name>` member, read off the lib.
+///
+/// Answering a string literal here is what made `Extract<keyof I, string>`
+/// keep `"__@u90369"`, `keyof I` print an atom nobody wrote, `const k: keyof
+/// I = s` a spurious TS2322 and `Pick<I, typeof s>` an empty object: the key
+/// domain of a symbol-named member is `symbol`, and every string filter —
+/// `Extract`, a template-literal placeholder, an index-signature domain
+/// (`index_constraints.applicableSlots` already agrees) — has to see that.
+///
+/// Only reached from `keyofObjectTableUncached`, which is memoized per object
+/// type (`Checker.keyof_obj_cache`), so the lib lookup below runs once per
+/// table rather than once per query.
+pub fn symbolNamedKeyType(c: *Checker, name: types.Atom) Error!?TypeId {
+    const txt = c.atomText(name);
+    if (!std.mem.startsWith(u8, txt, synthetic_prefix)) return null;
+    const rest = txt[synthetic_prefix.len..];
+    if (rest.len > 1 and rest[0] == 'u') {
+        if (std.fmt.parseInt(u32, rest[1..], 10)) |id| {
+            return try c.ts.makeUniqueSymbol(id);
+        } else |_| {}
+    }
+    // A whitelist, not "anything else": `__@ctor` and `__@class` are member
+    // slots ztsc invents for a constructor and a class expression, and
+    // `__@k$…` is the placeholder a computed key wears until it is
+    // nominalized. None of them names a symbol, and all three must keep
+    // whatever key behaviour they already had.
+    if (!isWellKnownSymbolName(rest)) return null;
+    return try wellKnownSymbolType(c, rest);
+}
+
+/// The reverse of `ast.wellKnownSymbolKey`: is `name` the bare property name
+/// of a well-known `Symbol.<name>`? Asked of the forward mapping rather than
+/// of a second copy of its list, which would drift the first time a symbol is
+/// added.
+fn isWellKnownSymbolName(name: []const u8) bool {
+    return ast.wellKnownSymbolKey(name) != null;
+}
+
+/// `typeof Symbol.<name>` — the `unique symbol` the lib declares for a
+/// well-known symbol. `symbol` when no lib declares one (`--noLib`, or a
+/// `--lib` older than the one that introduced it): the key is still a symbol,
+/// ztsc just cannot say *which*, and answering the synthetic atom's string
+/// literal instead would put a name nobody wrote back into `keyof`.
+fn wellKnownSymbolType(c: *Checker, name: []const u8) Error!TypeId {
+    const obj = (try symbolConstructorTable(c)) orelse return types.symbol_type;
+    const p = (try c.propOfType(obj, try c.internText(name))) orelse return types.symbol_type;
+    return switch (c.ts.kind(try c.ts.regular(p.ty))) {
+        .unique_symbol, .symbol => p.ty,
+        else => types.symbol_type,
+    };
+}
+
+/// The member atom a SYMBOL-typed key denotes — the inverse of
+/// `symbolNamedKeyType`, and what lets `I[typeof s]` and every mapped type
+/// over a key set containing one find the member again.
+///
+/// Well-known symbols are tried FIRST, and the order is the design, not a
+/// preference: the lib types `Symbol.iterator` as a `unique symbol` of its
+/// own, so `uniqueSymAtom` would happily answer `__@u<lib node>` for it —
+/// a key no table has, since the declaration side is keyed syntactically
+/// (`__@iterator`). `expr.zig`'s element-access path orders the same two
+/// probes the same way for the same reason.
+pub fn symbolKeyAtom(c: *Checker, idx: TypeId) Error!?types.Atom {
+    if (c.ts.kind(try c.ts.regular(idx)) != .unique_symbol) return null;
+    if (try wellKnownAtomOfType(c, idx)) |a| return a;
+    return c.uniqueSymAtom(idx);
+}
+
+/// `SymbolConstructor` resolved to its member table, or null when no lib
+/// declares it.
+fn symbolConstructorTable(c: *Checker) Error!?TypeId {
+    const iface = c.prog.globals.lookup(try c.internText("SymbolConstructor")) orelse return null;
+    if (!c.symFlags(iface).interface) return null;
+    const obj = try c.resolveStructural(try c.ts.makeRef(iface, &.{}));
+    return if (c.ts.kind(obj) == .object) obj else null;
+}
+
+/// The `__@<name>` member key of the well-known symbol whose type is `t`.
+///
+/// Found by scanning `SymbolConstructor` for the member that HAS this type
+/// rather than by decoding `t`: a well-known symbol's identity is the lib
+/// declaration, and nothing about the interned `unique symbol` records which
+/// property it came from. The scan is over one already-resolved table (~25
+/// members) and only a symbol-typed key ever reaches it.
+fn wellKnownAtomOfType(c: *Checker, t: TypeId) Error!?types.Atom {
+    const obj = (try symbolConstructorTable(c)) orelse return null;
+    const reg = try c.ts.regular(t);
+    for (0..c.ts.objectPropCount(obj)) |i| {
+        const p = c.ts.objectProp(obj, @intCast(i));
+        if ((try c.ts.regular(p.ty)) != reg) continue;
+        const key = ast.wellKnownSymbolKey(c.atomText(p.name)) orelse continue;
+        return try c.internText(key);
+    }
+    return null;
+}
+
 fn keyofObjectTableUncached(c: *Checker, r: TypeId) Error!TypeId {
     var parts: std.ArrayList(TypeId) = .empty;
     defer parts.deinit(c.scratch());
@@ -70,6 +188,13 @@ fn keyofObjectTableUncached(c: *Checker, r: TypeId) Error!TypeId {
         // satisfied `T extends E` (immich `src/utils/sync.ts:34`).
         if (c.key_name_types.get((@as(u64, r) << 32) | p.name)) |nt| {
             try parts.append(c.scratch(), nt);
+            continue;
+        }
+        // A SYMBOL-named member is named by the symbol, not by the synthetic
+        // atom the table keys it under — the same `nameType` rule, for the
+        // other late-bound name kind. See `symbolNamedKeyType`.
+        if (try symbolNamedKeyType(c, p.name)) |kt| {
+            try parts.append(c.scratch(), kt);
             continue;
         }
         try parts.append(c.scratch(), try c.ts.makeStringLiteral(p.name, false));
@@ -514,6 +639,28 @@ fn indexedAccessTypeInner(c: *Checker, obj: TypeId, idx: TypeId) Error!TypeId {
                 try parts.append(c.scratch(), try c.indexedAccessType(obj, m));
             }
             return c.ts.makeUnion(c.scratch(), parts.items);
+        },
+        // A SYMBOL key — `I[typeof s]`, and every distribution of
+        // `I[keyof I]` over a table with a symbol-named member. The member is
+        // stored under the synthetic atom that names the symbol, so the
+        // lookup is the string-literal arm's with `symbolKeyAtom` in place of
+        // `literalAtom`; a `symbol`-domain index signature is the fallback,
+        // the way `objectStringIndex` is for a string key.
+        .unique_symbol => {
+            if (try symbolKeyAtom(c, idx)) |name| {
+                if (try c.propOfType(r, name)) |p| {
+                    return if (p.optional() and !c.homo_index_mode) c.makeUnion2(p.ty, types.undefined_type) else p.ty;
+                }
+            }
+            if (c.ts.kind(r) == .object and c.ts.objectStringIndex(r) != 0 and
+                c.ts.objectFlags(r) & types.obj_flag_symbol_index != 0)
+            {
+                return c.ts.objectStringIndex(r);
+            }
+            return switch (c.ts.kind(r)) {
+                .any, .err => types.any_type,
+                else => types.unknown_type,
+            };
         },
         .string_literal => {
             if (try c.propOfType(r, c.ts.literalAtom(idx))) |p| {
