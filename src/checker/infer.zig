@@ -610,6 +610,22 @@ pub const InferCtx = struct {
     /// — whether ANY ONE of them still accepts the covariant answer — which the
     /// folded common subtype alone cannot answer.
     contra_sup: []TypeId = &.{},
+    /// The `InferencePriority.LiteralKeyof` candidate set, one entry per type
+    /// parameter — the object types synthesized when a `keyof T` PATTERN met a
+    /// literal argument (`unify`'s `.keyof_op` arm). Kept apart from `contra`
+    /// for two reasons, both tsc's:
+    ///
+    ///   * `LiteralKeyof` is in `PriorityImpliesCombination`, so
+    ///     `getContravariantInference` folds this set with `getIntersectionType`
+    ///     rather than the common-subtype `reduceLeft` every other
+    ///     contravariant candidate takes — `bar('a', 'b')` on
+    ///     `<T>(x: keyof T, y: keyof T) => T` is `{ a: any } & { b: any }`;
+    ///   * it is a LOW priority, and tsc drops a whole candidate list the
+    ///     moment a higher-priority (numerically smaller) one arrives. Any
+    ///     ordinary candidate, covariant or contravariant, therefore wipes it —
+    ///     which is why `<T>(x: keyof T, y: T) => T` fed `('a', {a: 1, q: 2})`
+    ///     answers `{ a: number; q: number }` in either argument order.
+    keyof_contra: []TypeId = &.{},
     /// tsc's `InferenceInfo.topLevel`, one flag per type parameter: false once a
     /// candidate has been recorded from a position that is not at the top level
     /// of the parameter type it came from. Only a still-top-level parameter
@@ -697,6 +713,9 @@ pub fn inferTypeArgs(
     // Its per-candidate half (see `InferCtx.contra_sup`).
     const contra_sup = try c.scratch().alloc(TypeId, tp_syms.len);
     for (contra_sup) |*x| x.* = types.no_type;
+    // tsc's `InferencePriority.LiteralKeyof` set (see `InferCtx.keyof_contra`).
+    const keyof_contra = try c.scratch().alloc(TypeId, tp_syms.len);
+    for (keyof_contra) |*x| x.* = types.no_type;
     // tsc's `InferenceInfo.topLevel`, registered the same way.
     const top_flags = try c.scratch().alloc(bool, tp_syms.len);
     for (top_flags) |*x| x.* = true;
@@ -714,6 +733,7 @@ pub fn inferTypeArgs(
         .owner = candidates.ptr,
         .contra = contra,
         .contra_sup = contra_sup,
+        .keyof_contra = keyof_contra,
         .top_flags = top_flags,
         .implied_arity = arity,
         .rev = .{ .owner = candidates.ptr, .flags = rev_flags },
@@ -1534,6 +1554,17 @@ pub fn inferTypeArgs(
     // reported TS2322 on the FIRST argument. `contra_sup` is the union of the
     // candidates, standing in for the `some` (see `InferCtx.contra_sup`).
     for (candidates, 0..) |*cd, i| {
+        // The `LiteralKeyof` set is the lowest-priority evidence there is: it
+        // only ever says "the argument was a key of this parameter", so tsc
+        // discards it outright once any ordinary candidate exists (see
+        // `InferCtx.keyof_contra`). When it is all there is, it IS the
+        // contravariant answer — already folded by intersection.
+        if (cd.* == types.no_type and contra[i] == types.no_type and
+            keyof_contra[i] != types.no_type)
+        {
+            cd.* = keyof_contra[i];
+            continue;
+        }
         cd.* = try preferContravariant(c, cd.*, contra[i], contra_sup[i]);
     }
     // A provisional map over the raw candidates, so an inter-dependent
@@ -3786,8 +3817,105 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
             }
         },
         .mapped => try c.inferReverseMapped(param, arg, tp_syms, candidates, depth),
+        .keyof_op => try inferToKeyof(c, param, arg, tp_syms, candidates),
         else => {},
     }
+}
+
+/// tsc's `inferFromTypes` literal-keyof arm:
+///
+/// ```ts
+/// else if ((isLiteralType(source) || source.flags & TypeFlags.String) && target.flags & TypeFlags.Index) {
+///     const empty = createEmptyObjectTypeFromStringLiteral(source);
+///     inferWithPriority(empty, (target as IndexType).type, InferencePriority.LiteralKeyof);
+/// }
+/// ```
+///
+/// A `keyof T` PATTERN met by a literal argument says nothing about `T`'s
+/// shape except that the literal names one of its keys — so tsc SYNTHESIZES
+/// the smallest object that would have that key (`{ a: any }`) and offers it
+/// as evidence. Without it, `bar<T>(x: keyof T, y: keyof T): T` called as
+/// `bar('a', 'b')` recorded nothing at all, `T` fell back to `unknown`, and
+/// `keyof unknown` — `never` — rejected both arguments (TS2345 where tsc is
+/// clean; `keyofInferenceIntersectsResults`).
+///
+/// The candidates go to the `LiteralKeyof` set, not to `candidates`: see
+/// `InferCtx.keyof_contra` for the two rules (intersect, lowest priority)
+/// that set exists to carry.
+fn inferToKeyof(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, candidates: []TypeId) Error!void {
+    const s = &c.ts;
+    // Only a BARE inference variable under the `keyof`. `keyof T[K]` and
+    // friends have no key set to hand the synthesized object to, and tsc's
+    // recursion into `inferFromTypes` would find no inference position
+    // either.
+    const operand = s.keyofOperand(param);
+    if (s.kind(operand) != .type_param) return;
+    const i = tpIndex(tp_syms, s.typeParamSymbol(operand)) orelse return;
+    const slot = keyofContraSlot(c, candidates, i) orelse return;
+    const empty = try emptyObjectFromLiteralKeys(c, arg) orelse return;
+    slot.* = if (slot.* == types.no_type)
+        empty
+    else
+        try s.makeIntersection(c.scratch(), &.{ slot.*, empty });
+}
+
+/// The `LiteralKeyof` candidate slot for type parameter `i`, when
+/// `candidates` is the accumulator the in-flight call registered (the same
+/// ownership rule as `contraSlot`, minus its parameter-position test — tsc
+/// files this candidate from wherever the `keyof` pattern sits).
+fn keyofContraSlot(c: *Checker, candidates: []TypeId, i: usize) ?*TypeId {
+    const ctx = &c.infer_ctx;
+    if (ctx.owner != candidates.ptr) return null;
+    if (ctx.keyof_contra.len != candidates.len) return null;
+    return &ctx.keyof_contra[i];
+}
+
+/// tsc's `createEmptyObjectTypeFromStringLiteral`: an anonymous object with
+/// one `any` property per STRING-LITERAL constituent of `t`, plus a
+/// `[x: string]: {}` index when `t` is `string` itself. Returns null when `t`
+/// is not a literal type at all — a non-unit source says nothing about the
+/// key set and tsc's guard (`isLiteralType(source) || source.flags & String`)
+/// skips the arm entirely.
+///
+/// A unit source with no string literal in it still produces `{}` (tsc builds
+/// the table by filtering for `StringLiteral` after the guard passed), which
+/// is why `num<T>(x: keyof T)` fed `1` answers `T = {}` and then rejects the
+/// argument against `keyof {}` — `never`.
+fn emptyObjectFromLiteralKeys(c: *Checker, t0: TypeId) Error!?TypeId {
+    const s = &c.ts;
+    const t = try c.resolveStructural(t0);
+    if (s.kind(t) == .string) {
+        const empty = try s.makeObject(&.{}, types.no_type, types.no_type, 0);
+        return try s.makeObject(&.{}, empty, types.no_type, 0);
+    }
+    if (!isUnitLikeUnion(c, t)) return null;
+    var props: std.ArrayList(types.Prop) = .empty;
+    defer props.deinit(c.scratch());
+    switch (s.kind(t)) {
+        .string_literal => try props.append(c.scratch(), .{ .name = s.literalAtom(t), .ty = types.any_type }),
+        .union_type => for (try c.memberList(t)) |m| {
+            if (s.kind(m) != .string_literal) continue;
+            const name = s.literalAtom(m);
+            for (props.items) |p| {
+                if (p.name == name) break;
+            } else try props.append(c.scratch(), .{ .name = name, .ty = types.any_type });
+        },
+        else => {},
+    }
+    return try s.makeObject(props.items, types.no_type, types.no_type, 0);
+}
+
+/// tsc's `isLiteralType`: a unit type, or a union whose every constituent is
+/// one. (`boolean` counts in tsc because it IS the `true | false` union.)
+fn isUnitLikeUnion(c: *Checker, t: TypeId) bool {
+    const s = &c.ts;
+    if (s.kind(t) == .union_type) {
+        for (c.memberList(t) catch return false) |m| {
+            if (!isUnitLikeKind(s.kind(m))) return false;
+        }
+        return true;
+    }
+    return isUnitLikeKind(s.kind(t));
 }
 
 /// The one constituent of the union `uni` that the object parameter's own
