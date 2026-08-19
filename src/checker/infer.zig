@@ -2810,33 +2810,33 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                     }
                 }
             }
-            // NOT a discriminant filter — measured, wave 21.
+            // NOT a discriminant filter, and nothing this arm does at all —
+            // re-derived from the oracle in wave 22 and SOLVED. Kept here
+            // because this is where the question keeps getting asked.
             //
             // `discriminatedUnionInference`'s `foo<T>(item: Item<T>)` with
             // `Item<T> = {kind:'a',data:T} | {kind:'b',data:T[]}` fed
-            // `{kind:'b',data:[1,2]}` answers `T = number` in tsc and
-            // `T = number[]` here, because both constituents contribute and
-            // the leftmost wins the supertype fold. The obvious repair — pick
-            // the constituent the argument's DISCRIMINANT selects and infer
-            // only into it — is WRONG, and the oracle says so directly. With
-            // `src: {kind:'b', p:string, q:number}` and tsgo 7.0.2:
+            // `{kind:'b',data:[1,2]}` answers `T = number` in tsc. Every
+            // constituent still contributes; what changes is that some
+            // constituents are not an inference site at all. With
+            // `src: {kind:'b', p:string, q:number}`, tsgo 7.0.2 answers each
+            // constituent ALONE (the control the wave-21 matrix was missing):
             //
-            //   {kind:'a',p:T} | {kind:'b',q:T}                  -> number
-            //   {kind:'b',q:T} | {kind:'a',p:T}                  -> number
-            //   {kind:'a',p:T,q:number} | {kind:'b',p:string,q:T} -> string
-            //   {p:T} | {q:T}                                    -> string
-            //   {p:T,q:number} | {p:string,q:T}                  -> string
+            //   {kind:'a',p:T}                                   -> unknown
+            //   {kind:'a',p:T,q:number}                          -> string
+            //   {kind:'b',q:T}                                   -> number
+            //   {p:T}                                            -> string
+            //   {p:T,z:boolean}                                  -> unknown
             //
-            // Rows 1-2 look like a discriminant filter (order-independent,
-            // the matching constituent wins). Row 3 has the SAME discriminant
-            // and the SAME candidate pair (`string` then `number`) and takes
-            // the LEFTMOST — so a filter keyed on the discriminant would move
-            // it the wrong way. Rows 4-5 are the no-discriminant controls and
-            // confirm the plain leftmost fold. Whatever tsc does here is keyed
-            // on something else (rows 1-2 differ from row 3 only in that each
-            // target constituent is a strict SUBSET of the argument's property
-            // set), and wiring `discriminatedConstituent` into this arm would
-            // regress row 3's shape. Left unimplemented on purpose.
+            // Rows 1 and 5 infer NOTHING even standing alone, so no union
+            // rule was ever involved: it is `typesDefinitelyUnrelated`
+            // gating `inferFromObjectTypes` (see the `.object` arm). Row 1
+            // is unrelated because `kind` disagrees AND the target is
+            // missing `q`; row 2 differs only in covering `q`, which is why
+            // it infers despite the same discriminant mismatch. Feed those
+            // solo answers into the ordinary leftmost supertype fold and
+            // every union row of the wave-21 matrix falls out, in both
+            // orders — no filter, no reordering, no special case here.
             //
             // Unify against the single type-param member if the rest
             // doesn't already accept the arg (common: T | undefined).
@@ -3190,6 +3190,19 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                         }
                     }
                 }
+                // tsc gates the whole structural block —
+                // `inferFromProperties`, `inferFromSignatures`,
+                // `inferFromIndexTypes` — on `!typesDefinitelyUnrelated`. Two
+                // shapes that each require something the other lacks are not
+                // an inference site at all: the candidates such a pair yields
+                // are noise that then wins or loses the covariant fold by
+                // accident. It is also the whole of the discriminated-union
+                // story (see `typesDefinitelyUnrelated`) — `foo<T>(item:
+                // {kind:'a',data:T} | {kind:'b',data:T[]})` fed
+                // `{kind:'b',data:[1,2]}` stops collecting `T = number[]`
+                // from the constituent whose `kind` cannot match, which is
+                // what `discriminatedUnionInference` asks for.
+                if (try typesDefinitelyUnrelated(c, ra, param)) return;
                 for (0..s.objectPropCount(param)) |i| {
                     const pp = s.objectProp(param, @intCast(i));
                     if (s.objectPropByName(ra, pp.name)) |ap| {
@@ -3944,6 +3957,59 @@ fn isUnitLikeUnion(c: *Checker, t: TypeId) bool {
         return true;
     }
     return isUnitLikeKind(s.kind(t));
+}
+
+/// tsc's `getUnmatchedProperty(source, target, /*requireOptionalProperties*/
+/// false, match_discriminants)` reduced to a yes/no: does `target` declare a
+/// REQUIRED property that `source` either lacks outright or — only when
+/// `match_discriminants` — carries at a *different* unit value?
+///
+/// Optional properties on either side are skipped: an absent optional cannot
+/// prove two shapes apart. `any` on the source side always matches, since it
+/// is compatible with every discriminant value.
+fn hasUnmatchedProp(c: *Checker, source: TypeId, target: TypeId, match_discriminants: bool) Error!bool {
+    const s = &c.ts;
+    for (0..s.objectPropCount(target)) |i| {
+        const tp = s.objectProp(target, @intCast(i));
+        if (tp.optional()) continue;
+        const sp = s.objectPropByName(source, tp.name) orelse return true;
+        if (!match_discriminants) continue;
+        // Only a SINGLE unit literal is a discriminant. `'a' | 'c'`,
+        // `boolean` and `string` are not (tsc tests `TypeFlags.Unit`, which
+        // a union never carries), so a target property typed that way can
+        // never make the two shapes "definitely unrelated".
+        if (!isUnitLikeKind(s.kind(tp.ty))) continue;
+        if (s.kind(sp.ty) == .any) continue;
+        if ((try s.regularLiteral(sp.ty)) != (try s.regularLiteral(tp.ty))) return true;
+    }
+    return false;
+}
+
+/// tsc's `typesDefinitelyUnrelated`: two object types that EACH have a
+/// required property unmatched in the other cannot possibly be related, and
+/// `inferFromObjectTypes` skips property/signature/index inference between
+/// them entirely.
+///
+/// This is what stops a discriminated union's non-selected constituents from
+/// contributing candidates — but note that it is not a discriminant filter,
+/// and the difference is exactly what the union arm's oracle matrix records:
+/// with `src: {kind:'b', p:string, q:number}`,
+///
+///   `{kind:'a', p:T}`            is unrelated (`kind` differs AND `q` is
+///                                 missing from the target) — no candidate;
+///   `{kind:'a', p:T, q:number}`  is NOT unrelated (`kind` differs, but the
+///                                 target covers every source property) —
+///                                 it contributes `T = string` even though
+///                                 the argument can never satisfy it.
+///
+/// So the asymmetry that made rows 1-2 of that matrix look order-independent
+/// while row 3 took the leftmost is a *property coverage* test, not a
+/// discriminant one. Both directions are required; the discriminant
+/// comparison runs only in the source→target direction, matching tsc's
+/// argument order.
+fn typesDefinitelyUnrelated(c: *Checker, source: TypeId, target: TypeId) Error!bool {
+    return (try hasUnmatchedProp(c, source, target, true)) and
+        (try hasUnmatchedProp(c, target, source, false));
 }
 
 /// The one constituent of the union `uni` that the object parameter's own
