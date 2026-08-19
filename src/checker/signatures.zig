@@ -749,12 +749,16 @@ fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_implicit
             const tok = c.tree.nodeMainToken(name_node);
             // tsc's `reportImplicitAny` picks the diagnostic off the
             // declaration: a REST parameter gets its own, TS7019, because the
-            // type it falls to is `any[]` rather than `any` — and it is
-            // anchored at the parameter (the `...`), not at the name.
+            // type it falls to is `any[]` rather than `any`. BOTH are anchored
+            // at the whole parameter declaration, not at the name — which only
+            // shows when the parameter carries something before its name: the
+            // `...` of a rest, or a modifier. `function F(public A) {}` is a
+            // TS7006 at `public` (with `A` still the name in the message), and
+            // so is `new (public x)` in an interface (ParameterList4/5/6/13).
             if (flags & types.param_flag_rest != 0) {
                 try c.diagFmt(7019, c.nodeSpan(pn), "Rest parameter '{s}' implicitly has an 'any[]' type.", .{c.tokenText(tok)});
             } else {
-                try c.diagFmt(7006, c.tokSpan(tok), "Parameter '{s}' implicitly has an 'any' type.", .{c.tokenText(tok)});
+                try c.diagFmt(7006, c.nodeSpan(pn), "Parameter '{s}' implicitly has an 'any' type.", .{c.tokenText(tok)});
             }
         }
         // A DESTRUCTURED parameter has no name to report TS7006 against: tsc

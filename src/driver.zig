@@ -663,7 +663,7 @@ pub fn build(
     _ = resolve_scratch.reset(.retain_capacity);
 
     const link_timer = Timer.start(io);
-    const prog = try linkProgram(arena, gpa, io, interner, &tables, opts.link_opts, jsx_runtime_fid orelse modules.no_file);
+    const prog = try linkProgram(arena, gpa, io, interner, &tables, opts.link_opts, jsx_runtime_fid orelse modules.no_file, opts.jsx_runtime_module);
     timings.link_ns = link_timer.readNs();
 
     return .{
@@ -863,6 +863,7 @@ fn linkProgram(
     tables: *const FileTables,
     link_opts: modules.LinkOpts,
     jsx_runtime_file: FileId,
+    jsx_runtime_module: ?[]const u8,
 ) !*modules.Program {
     const n_files = tables.paths.items.len;
     const prog_files = try arena.alloc(modules.ProgFile, n_files);
@@ -912,6 +913,7 @@ fn linkProgram(
         .types_wildcard = link_opts.types_wildcard,
         .experimental_decorators = link_opts.experimental_decorators,
         .jsx_runtime_file = jsx_runtime_file,
+        .jsx_runtime_module = jsx_runtime_module,
         .jsx_factory_ns = link_opts.jsx_factory_ns,
     };
     return prog;

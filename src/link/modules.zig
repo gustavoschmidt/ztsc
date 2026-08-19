@@ -282,6 +282,7 @@ pub fn buildProgram(
             .types_wildcard = link_opts.types_wildcard,
             .experimental_decorators = link_opts.experimental_decorators,
             .jsx_runtime_file = jsx_runtime_fid,
+            .jsx_runtime_module = jsx_runtime_module,
             .jsx_factory_ns = link_opts.jsx_factory_ns,
         },
         .load_failures = try arena.dupe(BuildDiag, failures.items),

@@ -943,6 +943,13 @@ pub const Checker = struct {
     /// diagnostics survive `seal`).
     owned: []const FileId,
     owned_mask: []bool = &.{},
+    /// Per-file "the missing JSX runtime module has been reported here" latch —
+    /// tsc's `getNodeLinks(file).jsxImplicitImportContainer = false` memo, whose
+    /// only observable effect is that TS2875 is answered ONCE per file however
+    /// many JSX tags it holds. Mutable accumulator, indexed by FileId; only the
+    /// checker that OWNS a file ever reaches the report, so no two checkers race
+    /// on an entry. See `jsx.reportMissingJsxRuntime`.
+    jsx_runtime_reported: []bool = &.{},
     /// PROFILER ONLY (`--dup-profile`): the OWNED file whose top-level walk is
     /// live. Unlike `cur_file` it does not move under `enterSymFile`, so a
     /// declaration materialized from three files deep still attributes its
@@ -2697,6 +2704,8 @@ pub const Checker = struct {
         c.owned_mask = try arena_alloc.alloc(bool, prog.files.len);
         @memset(c.owned_mask, false);
         for (owned) |f| c.owned_mask[f] = true;
+        c.jsx_runtime_reported = try arena_alloc.alloc(bool, prog.files.len);
+        @memset(c.jsx_runtime_reported, false);
         // Global flow-id bases (see `flow_base`). Flow nodes are strictly
         // fewer than symbols program-wide, so the same u32 prefix sum that
         // `Program.sym_base` uses is equally safe here.
