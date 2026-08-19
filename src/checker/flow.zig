@@ -1913,9 +1913,26 @@ pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: R
         // `getReferenceCandidate` of the condition); a comma expression
         // condition is its right operand.
         .assign, .seq_expr => {
+            // tsc's `narrowTypeByBinaryExpression`, `=`/`||=`/`&&=`/`??=` arm:
+            //
+            //     narrowTypeByTruthiness(narrowType(type, expr.right, assumeTrue), expr.left, assumeTrue)
+            //
+            // The assigned VALUE is itself a condition, so
+            // `if (this.based = (target instanceof C))` narrows `target` as
+            // well as `this.based` — `controlFlowForCompoundAssignmentToThisMember`.
+            // A genuinely compound `+=` says nothing about either operand and
+            // takes tsc's `default` arm (which `referenceCandidate` mirrors by
+            // handing the assignment back unchanged).
+            var out = t;
+            if (c.nodeTag(cond) == .assign) {
+                const op = c.tree.tokens.tag(c.tree.nodeMainToken(cond));
+                if (op == .eq or logicalAssignOp(op)) {
+                    out = try c.narrowByCondition(t, d.rhs, sense, key, decl);
+                }
+            }
             const cand = c.referenceCandidate(cond);
-            if (cand != cond) return c.narrowByCondition(t, cand, sense, key, decl);
-            return t;
+            if (cand != cond) return c.narrowByCondition(out, cand, sense, key, decl);
+            return out;
         },
         .identifier => {
             if (try refMatches(c, cond, key)) {
