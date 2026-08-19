@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-19, post wave 20)
+## Standings (2026-08-19, post wave 21)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7049 / 8627 (81.7%)** |
-| excess keys (false positives) | 3541 | 1906 |
-| missing keys (under-reports) | 8617 | 3612 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7073 / 8627 (82.0%)** |
+| excess keys (false positives) | 3541 | 1873 |
+| missing keys (under-reports) | 8617 | 3597 |
 | bucketed (ztsc parse error, incomparable) | 825 | 13 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Twenty waves landed (3–20), every one with ZERO match→non-match regressions in
+Twenty-one waves landed (3–21), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -238,7 +238,65 @@ TS2875 (ambientIndex-gated), TS2377-super, TS2604. This wave rode through
 repeated transient API stalls + one machine sleep; all four agents resumed
 cleanly from their worktrees each time.
 
-## Ranked next queue (wave 21) — distilled from wave-20 agent reports
+Wave 21 (+24 cases, perfectly additive; both app baselines refreshed again for
+the lib-footer after the SetConstructor NOTE deletion): A landed the
+SetConstructor reorder, object-literal accessor pairing + TS7032, optional
+parameter properties, Function-in-union callability. B landed the
+keyof-inference intersection arm and template `infer N extends number`
+conversion — and REFUTED two wave-20 diagnoses by oracle (discriminated-union
+inference is property-subset-driven, not discriminant-driven — 5-row matrix
+committed in infer.zig; templateLiteralTypes4 was the infer-binder conversion,
+not constraint instantiation). C landed the no-reduction contextual union
+(element + property sides), the tuple-like-length disjunct, TS2438, late-bound
+excess names, negative bigints. D landed per-file @jsxImportSource pragma
+(new link/jsx_pragma.zig), ambient `declare var` as `any`
+(SymbolFlags.ambient_var — last spare u32 bit), TS2875 deferred-body anchor.
+OPERATIONAL WARNINGS for future waves: (1) agent D accidentally worked in the
+MAIN checkout, not its worktree — briefs must have agents verify
+`git rev-parse --show-toplevel` matches their worktree before editing;
+(2) the shared session scratchpad got cross-contaminated again (one agent's
+debug output appended to another's app capture) — use uniquely-named private
+capture dirs; (3) repeated machine sleeps / API stalls this wave — agents
+resume cleanly if they commit early and often.
+
+## Ranked next queue (wave 22) — distilled from wave-21 agent reports
+
+1. Late-bound expando, full seam (mapped by A+C): binder `expandoTargetName`
+   needs an `.identifier` arm emitting computedSymPlaceholder (its doc comment
+   already names the route); then signatures.withExpandoProps rekeys via
+   atoms.nominalizeComputedKey extended from unique-symbol to const STRING
+   values; expr owns the TS7053 at the index write. 3 cases / 6 keys
+   (expandoFunctionExpressionsWithDynamicNames{,2}, expandoFunctionSymbolProperty).
+   ONE agent should own binder+signatures+atoms for this.
+2. Symbol-named-member representation (types.zig/names.zig/print.zig):
+   `interface I { [s]: string }` models the member as the string literal
+   "__@u…", so Extract<keyof T, string> keeps it — the sole blocker left on
+   extractInferenceImprovement, and a correctness issue generally.
+3. D's expr leads: yield-in-non-generator must return `any` WITHOUT checking
+   the operand (expr.zig:552 — 5 YieldExpression*_es6 cases); `x ??= 1` types
+   as `1` instead of tsc's getTypeFacts rule (expr.zig:5126);
+   `<this />` blocked on a class-instance inference cycle returning error type
+   when a method lacks a return annotation (expr/classes).
+4. redeclare.zig's isEmptyObject escape hatch is why 7 TS2403 near-misses stay
+   (unionTypeEquivalence: `C` vs `C | D` where `class C {}` really is empty) —
+   narrow the heuristic, don't remove it.
+5. Per-class #private member identity in the relation (assign.zig):
+   privateNamesAndFields' TS2416 currently just converts to TS2415 because
+   both classes' #foo key one atom.
+6. discriminatedUnionInference REWRITTEN: pick the union constituent whose
+   property set is a SUBSET of the argument's (B's committed 5-row matrix);
+   leftmost otherwise.
+7. Two-round inference re-derivation (untaken three waves running).
+8. Census: one-key TS2339 excess pool (arrayEvery needs `every`'s `this is S[]`
+   predicate; for-of head narrowing; the 3-case moduleAugmentation
+   namespace-merged-into-value family); TS7006; TS2322/TS2345 pools.
+9. exhaustiveSwitchWithWideningLiteralTypes (flow/narrow);
+   superCallParameterContextualTyping3 (super.x member access).
+10. Plain-array contextual noReductions (C's measured-safe deliberate gap).
+11. TS5102 tsconfig-anchored diagnostics (infrastructure); per-frame weak rule;
+    resolution-mode attributes; determinism defect (Navigation.tsx:778:29).
+
+## Superseded queue (wave 21, kept for context)
 
 1. SetConstructor lib reorder — VERIFIED SAFE by wave-20 B (witness matrix
    byte-identical to tsgo, apps byte-empty, sweep perfectly neutral). Land it
