@@ -670,7 +670,7 @@ pub fn classInstanceGeneric(c: *Checker, sym0: SymbolId) Error!TypeId {
             const mf = c.symFlags(msym);
             if (isCtorName(c, name)) continue;
             var flags: u32 = 0;
-            if (mf.optional_member) flags |= types.prop_flag_optional;
+            if (mf.optional_member or memberIsOptionalParamProperty(c, msym)) flags |= types.prop_flag_optional;
             if (mf.readonly_member) flags |= types.prop_flag_readonly;
             // A get-only accessor is a read-only property (TS2540 on write).
             if (mf.getter and !mf.setter) flags |= types.prop_flag_readonly;
@@ -1063,7 +1063,7 @@ fn lazyRefPropRec(c: *Checker, ref: TypeId, name: Atom, depth: u32) Error!?types
             defer _ = c.lazy_member_active.remove(msym);
             const mf = c.symFlags(msym);
             var flags: u32 = 0;
-            if (mf.optional_member) flags |= types.prop_flag_optional;
+            if (mf.optional_member or memberIsOptionalParamProperty(c, msym)) flags |= types.prop_flag_optional;
             if (mf.readonly_member) flags |= types.prop_flag_readonly;
             if (mf.getter and !mf.setter) flags |= types.prop_flag_readonly;
             flags |= visibilityPropFlags(c, msym, mf.non_public);
@@ -2057,6 +2057,26 @@ fn classChainMemberTypeRec(c: *Checker, t: TypeId, name: Atom, depth: u32) Error
     const nb = try c.baseClassRef(sym) orelse return null;
     const base_ref = if (map.items.len == 0) nb else try c.instantiate(nb, map.items);
     return classChainMemberTypeRec(c, base_ref, name, depth + 1);
+}
+
+/// A parameter property written `constructor(public two?: U)` declares an
+/// OPTIONAL member, exactly as `two?: U` written in the body would — tsc's
+/// `getTypeOfVariableOrParameterOrProperty` reads the optionality off the
+/// declaration, and a `ParameterPropertyDeclaration` is one of the
+/// declarations it reads. The binder records `optional_member` only for the
+/// class-body spellings (`class_field` / `class_method`), so the parameter
+/// form is answered here off its `param_full` decl node.
+///
+/// An INITIALIZER does not make it optional: `constructor(public y = "h")`
+/// makes the PARAMETER omissible but the property is always assigned, and
+/// tsc keeps it required (`{} as {}` into that class is still a TS2741).
+fn memberIsOptionalParamProperty(c: *Checker, msym: SymbolId) bool {
+    for (c.declsOf(msym)) |decl| {
+        if (c.nodeTag(decl) != .param_full) continue;
+        const e = c.tree.extraData(ast.ParamFull, c.tree.nodeData(decl).rhs);
+        if (e.flags & ast.Flags.optional != 0) return true;
+    }
+    return false;
 }
 
 /// Whether a class member symbol's declaration is `abstract`.
