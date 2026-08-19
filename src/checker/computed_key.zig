@@ -59,6 +59,12 @@ pub fn checkComputedName(c: *Checker, name_node: Node, on_class: bool) Error!Typ
     const expr = c.tree.nodeData(name_node).lhs;
     const want: IllegalRefs = .{ .super = superInNameIsError(c), .this = on_class };
     if (want.super or want.this) try reportIllegalRefs(c, expr, want, 0);
+    // A super CALL in the name is this file's TS2466, never the call site's
+    // TS2337 — tsc's `checkSuperExpression` tests the computed name first.
+    // (wave-20 A: `Checker.in_computed_key`.)
+    const saved_key = c.in_computed_key;
+    c.in_computed_key = true;
+    defer c.in_computed_key = saved_key;
     const kt = try c.checkExprCached(expr, types.no_type);
     try report(c, name_node, kt);
     return kt;

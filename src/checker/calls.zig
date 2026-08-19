@@ -413,6 +413,28 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
     var super_sigs: std.ArrayList(TypeId) = .empty;
     defer super_sigs.deinit(c.scratch());
     if (!is_new and c.nodeTag(shape.callee) == .super_expr) {
+        // TS2337 — tsc's `checkSuperExpression`: a super CALL is permitted only
+        // when its container (`getSuperContainer(node, /*stopOnFunctions*/
+        // true)`, so arrows count) is a constructor. A `super()` in a field
+        // initializer, in a static field, in an arrow or function expression
+        // inside the constructor, or in an object-literal accessor there is
+        // this error — except inside a computed property NAME, where
+        // `getSuperContainer` steps over the owning member entirely and TS2466
+        // is the answer instead (`computedPropertyNames30`; see
+        // `Checker.in_computed_key`).
+        //
+        // The arguments are still resolved against the base constructor below,
+        // which is where any further diagnostic about them comes from.
+        //
+        // A WRITTEN type-argument list takes the call out of this check
+        // entirely: `super<T>(0)` is TS2754 ("'super' may not use type
+        // arguments") and nothing else, tsgo-verified on
+        // `parserSuperExpression2`. ztsc does not implement TS2754, so the
+        // choice here is between silence and a different code at a different
+        // span — and silence is the one that is not wrong.
+        if (!c.in_ctor_body and !c.in_computed_key and shape.targ_nodes.len == 0) {
+            try c.diagFmt(2337, c.nodeSpan(shape.callee), "Super calls are not permitted outside constructors or in nested functions inside constructors.", .{});
+        }
         if (try superCtorSigs(c, &super_sigs)) {
             r = if (super_sigs.items.len == 1)
                 super_sigs.items[0]
@@ -553,6 +575,28 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
                 // on the class's own type-parameter constraints — the same
                 // written-list question as `G<Bad>` in a type position.
                 try c.queueTypeArgConstraints(node, cls, targs.items);
+                // …but the ARITY question is answered differently here than in
+                // a type position. tsc resolves `new C<A, B>(…)` through
+                // `getInstantiatedConstructorsForTypeArguments` →
+                // `checkTypeArguments`, whose complaint is TS2558 at the
+                // type-argument LIST ("Expected 1 type arguments, but got 2"),
+                // where the same written list under `var c: C<A, B>` is
+                // TS2314/TS2315/TS2707 at the NAME. `fixTypeArgs` answers the
+                // type-position question, so the count is checked here first
+                // (`tooManyTypeParameters1`,
+                // `constructorInvocationWithTooFewTypeArgs`).
+                if (targArityMismatch(tps.items, targs.items.len)) |exp| {
+                    const span = typeArgsSpan(c, shape.targ_nodes, node);
+                    if (exp.min == exp.max) {
+                        try c.diagFmt(2558, span, "Expected {d} type arguments, but got {d}.", .{ exp.max, targs.items.len });
+                    } else {
+                        try c.diagFmt(2558, span, "Expected {d}-{d} type arguments, but got {d}.", .{ exp.min, exp.max, targs.items.len });
+                    }
+                    for (shape.arg_nodes) |an| {
+                        if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+                    }
+                    return .{ .ty = types.error_type, .chained = chained };
+                }
                 const fixed = try c.fixTypeArgs(cls, targs.items, c.tree.nodeMainToken(node)) orelse return .{ .ty = types.error_type, .chained = chained };
                 @memcpy(inst_args, fixed);
             } else if (tps.items.len > 0) {
@@ -613,9 +657,12 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
             // `declare var Array: ArrayConstructor` then `new Array()`.
             // The signature's own return type is the instance type, so no
             // `instance_ret` override is needed (unlike a class value).
-            for (0..c.ts.objectConstructSigCount(r)) |i| {
-                try sigs.append(c.scratch(), c.ts.objectConstructSig(r, @intCast(i)));
-            }
+            //
+            // In `reorderCandidates` order: a `…Constructor` interface that
+            // several lib files reopen resolves its LAST declaration group
+            // first (`MapConstructor` + lib.es2015.iterable's `iterable`
+            // overload) — see `appendObjectConstructCandidates`.
+            try c.appendObjectConstructCandidates(&sigs, r);
         } else if (rk == .union_type) {
             // `new (typeof A | typeof B)()`. tsc resolves a union callee's
             // signatures with `getUnionSignatures` over the constituents'
@@ -973,6 +1020,24 @@ pub fn resolveSignatureCall(
         if (explicit_targs.len > 0 and writesTypeArgs(c, node)) {
             try c.queueSigTypeArgConstraints(node, sigs[0], explicit_targs);
         }
+        // A candidate that declares NO type parameters cannot accept a written
+        // list at all: tsc's `hasCorrectTypeArgumentArity` rejects it before an
+        // argument is looked at, and `reportCallResolutionErrors` then reports
+        // out of `candidateForTypeArgumentError` alone. So `f<number>(1)` on
+        // `f: (v: T) => U` is "Expected 0 type arguments, but got 1" at the
+        // list, and NOT an argument error on top
+        // (`typeArgumentsOnFunctionsWithNoTypeParameters`,
+        // `genericWithOpenTypeParameters1`). The arguments are still typed for
+        // downstream consumers, silently — tsc's
+        // `pickLongestCandidateSignature` returns the candidate without ever
+        // running `checkApplicableSignature`.
+        if (explicit_targs.len > 0 and c.ts.kind(sigs[0]) == .function and
+            c.ts.fnTypeParams(sigs[0]).len == 0)
+        {
+            try c.diagFmt(2558, typeArgsSpan(c, c.callShape(node).targ_nodes, node), "Expected 0 type arguments, but got {d}.", .{explicit_targs.len});
+            try checkCallArguments(c, node, sigs[0], arg_nodes, false);
+            return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(sigs[0]);
+        }
         const inst = try c.instantiateSigForCall(sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
         if (instance_ret == types.no_type) try checkThisArg(c, node, inst);
         try checkCallArguments(c, node, inst, arg_nodes, true);
@@ -1105,10 +1170,8 @@ pub fn resolveSignatureCall(
         }
         // Type the arguments (no report) and carry on with the first candidate,
         // exactly as the TS2769 path below does.
-        const inst_one = try c.instantiateSigForCall(sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
-        for (arg_nodes) |an| {
-            if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
-        }
+        const inst_one = try instantiateFallbackSig(c, sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
+        try typeArgsAfterFailure(c, inst_one, arg_nodes);
         return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst_one);
     }
     // No candidate matched. tsc does not report at the callee: it re-checks
@@ -1143,10 +1206,8 @@ pub fn resolveSignatureCall(
     try checkCallArgumentsAnchored(c, node, inst_last, arg_nodes, true, &arg_anchor);
     if (arg_err_count == 1) {
         // Keep the candidate's own diagnostics; tsc files no TS2769 here.
-        const inst_one = try c.instantiateSigForCall(sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
-        for (arg_nodes) |an| {
-            if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
-        }
+        const inst_one = try instantiateFallbackSig(c, sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
+        try typeArgsAfterFailure(c, inst_last, arg_nodes);
         return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst_one);
     }
     // WHICH diagnostic marks the spot. tsc's `reportCallResolutionErrors`
@@ -1201,11 +1262,119 @@ pub fn resolveSignatureCall(
     c.rollbackDiags(saved, .{ .file = c.cur_file, .lo = call_span.start, .hi = call_span.end });
     try c.diagFmt(2769, anchor, "No overload matches this call.", .{});
     // Continue with the first signature for downstream typing.
-    const inst = try c.instantiateSigForCall(sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
-    for (arg_nodes) |an| {
-        if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
-    }
+    const inst = try instantiateFallbackSig(c, sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
+    try typeArgsAfterFailure(c, inst_last, arg_nodes);
     return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst);
+}
+
+/// The implicit-`any` family a CONTEXTUAL parameter type would have prevented:
+/// a parameter's own type (TS7006), a rest parameter's (TS7019), and a
+/// destructured parameter's leaves (TS7031). Nothing else in the 70xx range
+/// depends on the contextual signature.
+const contextual_implicit_any = [_]u16{ 7006, 7019, 7031 };
+
+/// "Expected N type arguments, but got M" — the one code
+/// `instantiateFallbackSig` withdraws.
+const targ_arity_code = [_]u16{2558};
+
+/// The type-parameter list's accepted arity RANGE when `written` is outside it,
+/// else null. `min` counts the parameters with no default, tsc's
+/// `getMinTypeArgumentCount`; `max` is the whole list. A non-generic target
+/// answers `0..0`, which is a real answer here — `new NonGeneric<T>()` is
+/// "Expected 0 type arguments, but got 1".
+fn targArityMismatch(tps: []const TypeParamInfo, written: usize) ?struct { min: usize, max: usize } {
+    var min: usize = 0;
+    for (tps) |tp| {
+        if (tp.default == 0) min += 1;
+    }
+    if (written >= min and written <= tps.len) return null;
+    return .{ .min = min, .max = tps.len };
+}
+
+/// `instantiateSigForCall` for the candidate the call is TYPED with once
+/// resolution has failed. tsc's `pickLongestCandidateSignature` instantiates
+/// such a candidate for its return type alone and never re-reports against it.
+/// ztsc's pick is `sigs[0]`, which may be an overload the written type-argument
+/// list does not fit — and TS2558 for THAT is a complaint about the signature
+/// ztsc happened to pick, not about the call: `_.map<number, string, Date>(c2,
+/// rf1)` over a two-overload `Combinators` reported "Expected 2 type arguments,
+/// but got 3" against the first overload, which `hasCorrectTypeArgumentArity`
+/// had already dropped from the candidate list (`genericCombinators2`).
+///
+/// Only that code is withdrawn. A type-argument-arity error the call really
+/// does have is reported from the candidate list — the lone-candidate arm of
+/// `resolveSignatureCall`, or `instantiateSigForCall` on the report signature —
+/// before this ever runs.
+fn instantiateFallbackSig(
+    c: *Checker,
+    sig: TypeId,
+    explicit_targs: []const TypeId,
+    arg_nodes: []const Node,
+    node: Node,
+    ret_ctx: TypeId,
+) Error!TypeId {
+    const saved = c.diags.items.len;
+    const inst = try c.instantiateSigForCall(sig, explicit_targs, arg_nodes, node, ret_ctx);
+    c.rollbackDiags(saved, .{ .file = c.cur_file, .lo = 0, .hi = 0, .codes = &targ_arity_code });
+    return inst;
+}
+
+/// Type every argument for downstream consumers once overload resolution has
+/// FAILED. There is no signature left to offer as a contextual type, so the
+/// walk is context-free — but tsc checks each argument exactly ONCE, against
+/// the candidate it reports out of, and its node-links cache makes every later
+/// visit a no-op. A function-expression argument that DID receive a contextual
+/// signature during resolution must therefore not acquire implicit-`any`
+/// parameters from this second, context-free walk:
+/// ``tempTag2 `${ x => { … } }${ undefined }${ "hello" }` `` reported TS7006 on
+/// `x` where tsc reports the TS2769 alone
+/// (`taggedTemplateContextualTyping2`).
+///
+/// `report_sig` is the signature the failure was reported against. An argument
+/// whose parameter there is CALLABLE is one contextual typing reached, so the
+/// family above is withdrawn over that argument's span. Everything else the
+/// walk says stands — this walk is also what republishes the diagnostics
+/// inside argument subtrees that the failure report withdrew.
+fn typeArgsAfterFailure(c: *Checker, report_sig: TypeId, arg_nodes: []const Node) Error!void {
+    const has_params = c.ts.kind(report_sig) == .function;
+    for (arg_nodes, 0..) |an, i| {
+        if (an == null_node) continue;
+        const contextual = has_params and try paramIsCallable(c, report_sig, @intCast(i));
+        const before = c.diags.items.len;
+        _ = try c.checkExprCached(an, types.no_type);
+        if (!contextual) continue;
+        const span = c.nodeSpan(an);
+        c.rollbackDiags(before, .{
+            .file = c.cur_file,
+            .lo = span.start,
+            .hi = span.end,
+            .codes = &contextual_implicit_any,
+        });
+    }
+}
+
+/// Does `sig`'s `i`-th effective parameter carry a call signature — i.e. would
+/// an argument written there have been contextually typed as a function?
+/// A union counts when any constituent does, which is how
+/// `f: FuncType | undefined` still types its argument's parameters.
+fn paramIsCallable(c: *Checker, sig: TypeId, i: u32) Error!bool {
+    const pt = try c.paramTypeAt(sig, i) orelse return false;
+    return typeIsCallable(c, pt);
+}
+
+fn typeIsCallable(c: *Checker, t: TypeId) Error!bool {
+    const r = try c.resolveStructural(t);
+    switch (c.ts.kind(r)) {
+        .function, .overloads => return true,
+        .object => return c.ts.objectCallSigCount(r) != 0,
+        .union_type, .intersection => {
+            for (try c.memberList(r)) |m| {
+                if (try typeIsCallable(c, m)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
 }
 
 /// Instantiate a (possibly generic) signature for a call: explicit
@@ -1218,10 +1387,16 @@ pub fn instantiateSigForCall(c: *Checker, sig: TypeId, explicit_targs: []const T
     if (explicit_targs.len > 0) {
         const min = c.sigMinTargs(tps);
         if (explicit_targs.len < min or explicit_targs.len > tps.len) {
+            // tsc's error node is the type-argument node ARRAY
+            // (`createDiagnosticForNodeArray(… node.typeArguments …)`), not the
+            // call: `[1,2,3].map<any,any>(…)` is blamed on `any,any`, not on the
+            // array literal the call chains off. Falls back to the whole node
+            // for a callee shape that carries no written list.
+            const span = typeArgsSpan(c, c.callShape(node).targ_nodes, node);
             if (min == tps.len) {
-                try c.diagFmt(2558, c.nodeSpan(node), "Expected {d} type arguments, but got {d}.", .{ tps.len, explicit_targs.len });
+                try c.diagFmt(2558, span, "Expected {d} type arguments, but got {d}.", .{ tps.len, explicit_targs.len });
             } else {
-                try c.diagFmt(2558, c.nodeSpan(node), "Expected {d}-{d} type arguments, but got {d}.", .{ min, tps.len, explicit_targs.len });
+                try c.diagFmt(2558, span, "Expected {d}-{d} type arguments, but got {d}.", .{ min, tps.len, explicit_targs.len });
             }
         }
         // tsc's `fillMissingTypeArguments`. A missing trailing argument takes

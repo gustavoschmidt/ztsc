@@ -837,39 +837,39 @@ pub const LazyStat = enum(u8) {
 };
 
 pub const map_containers = [_][]const u8{
-    "node_types",               "sig_cache",              "node_scopes",
-    "reassigned_syms",          "reassigned_in_loop",     "member_written_syms",
-    "member_written_in_loop",   "ns_types",               "ambient_ns_types",
-    "relation",                 "expansions",             "overload_groups",
-    "overload_group_pool",      "origin",                 "iface_generic",
-    "iface_stack",              "pending_class_decos",    "class_inst_generic",
-    "class_static_cache",       "class_static_owner",     "class_static_stack",
-    "class_ctor_cache",         "enum_value_cache",       "enum_info_cache",
-    "enum_relation_cache",      "alias_generic",          "alias_state",
-    "alias_recursive",          "flow_same",              "flow_narrow",
-    "ref_keys",                 "flow_loop_stack",        "flow_stack",
-    "flow_tmp",                 "flow_reduce",            "da_cache",
-    "ctp_cache",                "cmp_cache",              "ctt_cache",
-    "ci_cache",                 "infer_visited",          "subst_this_cache",
-    "mmp_cache",                "arrayish_elem_cache",    "tp_constraint_cache",
-    "erase_cache",              "erase_any_cache",        "inst_map_ids",
-    "fresh_tp_ids",             "this_tp_ids",            "fresh_tp_info",
-    "type_node_cache",          "atom_cache",             "infer_ids",
-    "infer_constraints",        "infer_scopes",           "mapped_key_ids",
-    "mapped_key_scopes",        "inst_diag_at",           "infer_active",
-    "lazy_member_active",       "this_bound_fns",         "chain_guards",
-    "never_isect",              "deep_path_list",         "deep_path_ids",
-    "flow_reach",               "member_type_stack",      "lazy_index_objs",
-    "pending_type_args",        "pending_type_args_pool", "pending_type_args_seen",
-    "tp_constrained_cache",     "nominal_bases",          "nominal_base_pool",
-    "keyof_mapped_active",      "ctp_syms_seen",          "weak_types",
-    "base_ref_active",          "lazy_member",            "trunc_lazy_member",
-    "lazy_map",                 "pattern_root_decls",     "pattern_root_ids",
-    "pattern_narrow_busy",      "key_name_types",         "enum_members",
-    "keyof_obj_cache",          "trunc_expansions",       "inst_map_bytes",
-    "tp_mentions",              "smk_cache",              "rel_maybe",
-    "spec_sym_types",           "spec_tainted",           "last_assign_pos",
-    "definitely_assigned_syms",
+    "node_types",             "sig_cache",                "node_scopes",
+    "reassigned_syms",        "reassigned_in_loop",       "member_written_syms",
+    "member_written_in_loop", "ns_types",                 "ambient_ns_types",
+    "relation",               "expansions",               "overload_groups",
+    "construct_groups",       "origin",                   "iface_generic",
+    "overload_group_pool",    "iface_stack",              "pending_class_decos",
+    "class_inst_generic",     "class_static_cache",       "class_static_owner",
+    "class_static_stack",     "class_ctor_cache",         "enum_value_cache",
+    "enum_info_cache",        "enum_relation_cache",      "alias_generic",
+    "alias_state",            "alias_recursive",          "flow_same",
+    "flow_narrow",            "ref_keys",                 "flow_loop_stack",
+    "flow_stack",             "flow_tmp",                 "flow_reduce",
+    "da_cache",               "ctp_cache",                "cmp_cache",
+    "ctt_cache",              "ci_cache",                 "infer_visited",
+    "subst_this_cache",       "mmp_cache",                "arrayish_elem_cache",
+    "tp_constraint_cache",    "erase_cache",              "erase_any_cache",
+    "inst_map_ids",           "fresh_tp_ids",             "this_tp_ids",
+    "fresh_tp_info",          "type_node_cache",          "atom_cache",
+    "infer_ids",              "infer_constraints",        "infer_scopes",
+    "mapped_key_ids",         "mapped_key_scopes",        "inst_diag_at",
+    "infer_active",           "lazy_member_active",       "this_bound_fns",
+    "chain_guards",           "never_isect",              "deep_path_list",
+    "deep_path_ids",          "flow_reach",               "member_type_stack",
+    "lazy_index_objs",        "pending_type_args",        "pending_type_args_pool",
+    "pending_type_args_seen", "tp_constrained_cache",     "nominal_bases",
+    "nominal_base_pool",      "keyof_mapped_active",      "ctp_syms_seen",
+    "weak_types",             "base_ref_active",          "lazy_member",
+    "trunc_lazy_member",      "lazy_map",                 "pattern_root_decls",
+    "pattern_root_ids",       "pattern_narrow_busy",      "key_name_types",
+    "enum_members",           "keyof_obj_cache",          "trunc_expansions",
+    "inst_map_bytes",         "tp_mentions",              "smk_cache",
+    "rel_maybe",              "spec_sym_types",           "spec_tainted",
+    "last_assign_pos",        "definitely_assigned_syms",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -1148,6 +1148,13 @@ pub const Checker = struct {
     /// `appendOverloadCandidates` / `appendObjectCallCandidates` apply the
     /// reversal at the call site and nowhere else.
     overload_groups: IntMap(TypeId, BaseSpan) = .empty,
+    /// The same thing for an interface's CONSTRUCT signatures, which group
+    /// and reorder by exactly the same rule (`MapConstructor`, reopened by
+    /// lib.es2015.iterable, is the canonical case) but live in their own
+    /// signature list, so they need their own boundaries.
+    /// `appendObjectConstructCandidates` reads it; the spans index the shared
+    /// `overload_group_pool`.
+    construct_groups: IntMap(TypeId, BaseSpan) = .empty,
     /// Ascending start indices into a merged overload set's member list, one
     /// per declaration group, indexed by `overload_groups`. `starts[0]` is
     /// always 0 and group `i` runs to `starts[i + 1]` (or the end).
@@ -1856,6 +1863,27 @@ pub const Checker = struct {
     /// assigned via `this.x` inside the constructor of the class that OWNS the
     /// declaration (tsc allows exactly this; an inherited readonly still errors).
     ctor_class_sym: SymbolId = binder.no_symbol,
+    /// Is the function body currently being walked a CONSTRUCTOR's own body?
+    /// tsc's `getSuperContainer(node, /*stopOnFunctions*/ true)` for a `super(…)`
+    /// call: the container is the nearest function-like node, arrows included,
+    /// and a super call is only permitted when that container is a constructor
+    /// (`Super_calls_are_not_permitted_outside_constructors_or_in_nested_
+    /// functions_inside_constructors`). Distinct from `ctor_class_sym`, which
+    /// stays set through a nested function so that a `super(…)` written there
+    /// still resolves against the base constructor rather than degrading to an
+    /// untyped call. Saved and restored by `checkFunctionBody` — the single
+    /// entry for every function body — and cleared for a class body's members,
+    /// whose initializers are containers of their own.
+    in_ctor_body: bool = false,
+    /// Is the expression currently being walked a computed property NAME's?
+    /// `getSuperContainer` steps OVER a `ComputedPropertyName`, so a `super`
+    /// written there never reaches a legal container — and tsc's
+    /// `checkSuperExpression` tests for the computed name FIRST, reporting
+    /// TS2466 in place of the TS2337 the same call would get anywhere else.
+    /// The call site has no parent pointers to ask, so the name walk marks it.
+    /// Cleared by `checkFunctionBody`, since a function written inside the name
+    /// IS a container (`{ [(() => super())()]: 1 }` is TS2337 again).
+    in_computed_key: bool = false,
     /// The property-access node a COMPOUND assignment is currently writing, as
     /// a `nodeKey` (0 = none). tsc runs one member-accessibility check per access node,
     /// against the setter when the node is an assignment target
@@ -3514,6 +3542,7 @@ pub const Checker = struct {
     pub const dropSpeculativeSymTypes = signatures_zig.dropSpeculativeSymTypes;
     pub const appendOverloadCandidates = signatures_zig.appendOverloadCandidates;
     pub const appendObjectCallCandidates = signatures_zig.appendObjectCallCandidates;
+    pub const appendObjectConstructCandidates = signatures_zig.appendObjectConstructCandidates;
     pub const lastCallSig = signatures_zig.lastCallSig;
     pub const targetValueType = signatures_zig.targetValueType;
     pub const dualValueType = signatures_zig.dualValueType;

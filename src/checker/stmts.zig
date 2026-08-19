@@ -782,6 +782,124 @@ fn checkOverloadSet(c: *Checker, node: Node) Error!void {
     try signatures.checkOverloadImplementation(c, overloads.items, node);
 }
 
+/// TS2394 for the constructor overload set `impl` implements — the class-member
+/// half of `checkOverloadSet`. The bodiless `constructor(…);` declarations are
+/// the sibling class members, in source order; a second one WITH a body is
+/// TS2392's business, not this one's.
+fn checkCtorOverloadSet(c: *Checker, members: []const ast.Node, impl: ast.Node) Error!void {
+    var overloads: std.ArrayList(ast.Node) = .empty;
+    defer overloads.deinit(c.scratch());
+    for (members) |m| {
+        if (m == null_node or m == impl or c.nodeTag(m) != .class_method) continue;
+        const d = c.tree.nodeData(m);
+        const proto = c.tree.extraData(ast.FnProto, d.lhs);
+        if (!c.isCtorMember(m, proto.flags)) continue;
+        if (d.rhs != 0) return;
+        try overloads.append(c.scratch(), m);
+    }
+    try signatures.checkOverloadImplementation(c, overloads.items, impl);
+}
+
+/// TS2377 — tsc's `checkConstructorDeclaration`, super-call half:
+///
+/// ```ts
+/// if (getClassExtendsHeritageElement(containingClassDecl)) {
+///     const classExtendsNull = classDeclarationExtendsNull(containingClassDecl);
+///     const superCall = findFirstSuperCall(node.body!);
+///     if (superCall) { … }
+///     else if (!classExtendsNull) {
+///         error(node, Diagnostics.Constructors_for_derived_classes_must_contain_a_super_call);
+///     }
+/// }
+/// ```
+///
+/// Only an IMPLEMENTATION is asked (tsc returns early on a missing body), so
+/// `body` is never 0 here, and `class C extends null` is exempt — it has no
+/// base constructor to call.
+fn checkDerivedCtorSuperCall(c: *Checker, extends: ast.Node, ctor: ast.Node, body: ast.Node) Error!void {
+    if (extends == null_node or body == null_node) return;
+    if (c.nodeTag(extends) != .heritage) return;
+    if (c.nodeTag(c.tree.nodeData(extends).lhs) == .null_literal) return;
+    if (try hasSuperCall(c, body)) return;
+    try c.diagFmt(2377, ctorDeclSpan(c, ctor), "Constructors for derived classes must contain a 'super' call.", .{});
+}
+
+/// The span of a constructor DECLARATION, modifiers included — tsc's
+/// `error(node, …)` on a `ConstructorDeclaration`, whose `pos` is the start of
+/// its modifier list. `nodeSpan` starts at the `constructor` token, so
+/// `private constructor() {}` would be blamed three words late. The AST records
+/// no modifier tokens, but the parser guarantees a member's modifiers are the
+/// contiguous run of modifier keywords immediately before it.
+fn ctorDeclSpan(c: *Checker, ctor: ast.Node) source.Span {
+    var span = c.nodeSpan(ctor);
+    var tok = c.tree.nodeMainToken(ctor);
+    while (tok > 0) : (tok -= 1) {
+        switch (c.tree.tokens.tag(tok - 1)) {
+            .keyword_public,
+            .keyword_private,
+            .keyword_protected,
+            .keyword_declare,
+            .keyword_abstract,
+            .keyword_override,
+            .keyword_readonly,
+            .keyword_static,
+            => {},
+            else => break,
+        }
+    }
+    span.start = c.tokSpan(tok).start;
+    return span;
+}
+
+/// tsc's `findFirstSuperCall`, as a predicate:
+///
+/// ```ts
+/// function findFirstSuperCall(node: Node): SuperCall | undefined {
+///     return isSuperCall(node) ? node :
+///         isFunctionLike(node) ? undefined :
+///         forEachChild(node, findFirstSuperCall);
+/// }
+/// ```
+///
+/// The walk stops at every FUNCTION-LIKE node — an arrow, a function
+/// expression, a nested class's own method — because a `super()` written
+/// inside one belongs to that function's `super` binding, not to this
+/// constructor. It is TS2337's business there, not this check's
+/// (`superCallInsideClassDeclaration`: `class B extends A { constructor()
+/// { class D extends C { constructor() { super(); } } } }` is still TS2377).
+///
+/// Iterative rather than recursive: a constructor body is arbitrary user
+/// syntax, and this walk has no depth limit of its own.
+fn hasSuperCall(c: *Checker, body: ast.Node) Error!bool {
+    // Cycle-free by construction (a tree), so the worklist is a plain stack;
+    // it lives on the scratch arena for the length of one constructor.
+    var stack: std.ArrayList(ast.Node) = .empty;
+    defer stack.deinit(c.scratch());
+    try stack.append(c.scratch(), body);
+    while (stack.pop()) |n| {
+        switch (c.nodeTag(n)) {
+            .call_expr, .call_expr_targs => {
+                if (c.nodeTag(c.tree.nodeData(n).lhs) == .super_expr) return true;
+            },
+            .arrow_fn,
+            .function_expr,
+            .function_decl,
+            .class_method,
+            .object_method,
+            .method_signature,
+            .call_signature,
+            .construct_signature,
+            .function_type,
+            .constructor_type,
+            => continue,
+            else => {},
+        }
+        var it = c.tree.childIterator(n);
+        while (it.next()) |ch| try stack.append(c.scratch(), ch);
+    }
+    return false;
+}
+
 /// Walk every function body postponed by `defer_bodies`, in queue order.
 /// Each entry restores the file and `this` it was queued under; draining a
 /// body may queue more (a nested class, another field), so the loop reads
@@ -913,11 +1031,19 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
     // return y }` still reports TS2454 on `y` (see `field_init_depth`).
     const saved_field_init = c.field_init_depth;
     c.field_init_depth = 0;
+    // …and the super-call container: this body is the container for every
+    // `super(…)` written directly in it, whatever the enclosing one was.
+    const saved_in_ctor = c.in_ctor_body;
+    const saved_in_key = c.in_computed_key;
+    c.in_ctor_body = c.nodeTag(node) == .class_method and c.isCtorMember(node, proto.flags);
+    c.in_computed_key = false;
     defer {
         c.cur_scope = saved_scope;
         c.fn_ctx = saved_ctx;
         c.this_type = saved_this;
         c.field_init_depth = saved_field_init;
+        c.in_ctor_body = saved_in_ctor;
+        c.in_computed_key = saved_in_key;
     }
     if (try c.scopeOf(node)) |s| c.cur_scope = s;
     // An explicit `this` parameter types `this` inside the body.
@@ -2121,6 +2247,12 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
     // The same pairing, for the other question the two halves answer together:
     // whose annotation supplies the property's type (TS7032/TS7033).
     try implicit_any.reportAccessorImplicitAny(c, members);
+    // Each member is its own super-call container: a field initializer of a
+    // class written INSIDE a constructor must not inherit that constructor's
+    // (`checkFunctionBody` re-establishes it for the constructor itself).
+    const saved_in_ctor = c.in_ctor_body;
+    c.in_ctor_body = false;
+    defer c.in_ctor_body = saved_in_ctor;
     for (members, 0..) |member, mi| {
         if (member == null_node) continue;
         const md = c.tree.nodeData(member);
@@ -2200,6 +2332,16 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
                 const sig = try c.signatureOfProto(member, md.lhs, true, true);
                 if (md.rhs != 0) {
                     const is_ctor = c.isCtorMember(member, proto.flags);
+                    // TS2394 for a CONSTRUCTOR overload set. Same rule and
+                    // same driver as `checkOverloadSet` for a function
+                    // declaration — run it from the IMPLEMENTATION so it
+                    // fires once — but the declarations are siblings in the
+                    // class body rather than a symbol's declaration list: a
+                    // constructor has no name to look up.
+                    if (is_ctor) {
+                        try checkCtorOverloadSet(c, members, member);
+                        try checkDerivedCtorSuperCall(c, data.extends, member, md.rhs);
+                    }
                     const saved_ctor = c.ctor_class_sym;
                     if (is_ctor) c.ctor_class_sym = class_sym;
                     defer c.ctor_class_sym = saved_ctor;

@@ -144,29 +144,35 @@ pub fn interfaceGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
         if (!c.symFlags(csym).interface) continue;
         result = try c.interfaceConstituentApplyBases(csym, result, owner);
     }
-    try recordCallSigGroups(c, parts, result);
+    try recordSigGroups(c, parts, result, .call_signature);
+    try recordSigGroups(c, parts, result, .construct_signature);
     try c.iface_generic.put(c.cm(), sym, result);
     return result;
 }
 
-/// Record where each `interface` DECLARATION's call signatures start in the
-/// generic table's call-signature list, for `appendObjectCallCandidates` —
-/// tsc's `reorderCandidates` groups a callable type's signatures by
+/// Record where each `interface` DECLARATION's call (or construct) signatures
+/// start in the generic table's corresponding signature list, for
+/// `appendObjectCallCandidates` / `appendObjectConstructCandidates` — tsc's
+/// `reorderCandidates` groups a callable type's signatures by
 /// `signature.declaration.parent`, and an interface reopened twice is two
 /// parents even though it is one symbol.
 ///
 /// `mergeBaseObject` appends the DERIVED object's signatures before the base's
 /// and `interfaceGeneric` folds the constituents' direct members before any
 /// `extends`, so the declarations' own signatures are a contiguous prefix of
-/// `result`'s call-signature list, in declaration order. The recorded value is
+/// `result`'s signature list, in declaration order. The recorded value is
 /// `groups + 1` ascending offsets — group `i` is `[bounds[i], bounds[i + 1])`
 /// and the last entry is the end of that prefix, so the inherited remainder is
 /// identifiable without re-deriving it. Nothing is recorded unless at least two
 /// declarations contribute a signature, which is what makes the order
 /// observable at all.
-fn recordCallSigGroups(c: *Checker, parts: []const SymbolId, result: TypeId) Error!void {
+///
+/// The two signature kinds are counted and stored separately because they are
+/// separate lists on the object: `MapConstructor` reopened by
+/// lib.es2015.iterable is two construct groups and zero call groups.
+fn recordSigGroups(c: *Checker, parts: []const SymbolId, result: TypeId, want: ast.Tag) Error!void {
     if (c.ts.kind(result) != .object) return;
-    const n = c.ts.objectCallSigCount(result);
+    const n = if (want == .call_signature) c.ts.objectCallSigCount(result) else c.ts.objectConstructSigCount(result);
     if (n < 2) return;
     var bounds: std.ArrayList(u32) = .empty;
     defer bounds.deinit(c.scratch());
@@ -180,7 +186,7 @@ fn recordCallSigGroups(c: *Checker, parts: []const SymbolId, result: TypeId) Err
             const data = c.tree.extraData(ast.InterfaceData, c.tree.nodeData(decl).lhs);
             var cnt: u32 = 0;
             for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
-                if (m != null_node and c.nodeTag(m) == .call_signature) cnt += 1;
+                if (m != null_node and c.nodeTag(m) == want) cnt += 1;
             }
             if (cnt == 0) continue;
             try bounds.append(c.scratch(), total);
@@ -191,7 +197,8 @@ fn recordCallSigGroups(c: *Checker, parts: []const SymbolId, result: TypeId) Err
     try bounds.append(c.scratch(), total);
     const at: u32 = @intCast(c.overload_group_pool.items.len);
     try c.overload_group_pool.appendSlice(c.cm(), bounds.items);
-    try c.overload_groups.put(c.cm(), result, .{ .start = at, .len = @intCast(bounds.items.len) });
+    const dst = if (want == .call_signature) &c.overload_groups else &c.construct_groups;
+    try dst.put(c.cm(), result, .{ .start = at, .len = @intCast(bounds.items.len) });
 }
 
 /// Set `this` to `sym`'s generic instance (polymorphic `this` return,
