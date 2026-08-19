@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-18, post wave 19)
+## Standings (2026-08-19, post wave 20)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7004 / 8627 (81.2%)** |
-| excess keys (false positives) | 3541 | 1966 |
-| missing keys (under-reports) | 8617 | 3697 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7049 / 8627 (81.7%)** |
+| excess keys (false positives) | 3541 | 1906 |
+| missing keys (under-reports) | 8617 | 3612 |
 | bucketed (ztsc parse error, incomparable) | 825 | 13 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Nineteen waves landed (3–19), every one with ZERO match→non-match regressions in
+Twenty waves landed (3–20), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -220,7 +220,66 @@ iterable-overload lib reorder (SetConstructor deliberately excluded — infer
 widens through Iterable<T>), var-undefined reads, singleton-exhaustive
 switch, TS1268, TS18014, reserved-word message interpolation.
 
-## Ranked next queue (wave 20) — distilled from wave-19 agent reports
+Wave 20 (+45 cases; both app baselines refreshed for a −206-byte lib-comment
+stats change, diagnostics unchanged; two merge conflicts resolved — a
+container-list union and C/D's duplicate TS2465, one implementation kept):
+A landed construct-signature reorderCandidates (lib hack removed;
+SetConstructor still held back pending inference), TS2394/TS2377/TS2337,
+type-arg arity anchors, arg_err TS7006 withdrawal. B landed keyof-of-array
+(Array tables materialized at checker init), the Iterable contextual fix
+(REAL cause was iteration's union arm, not covariant inference), and VERIFIED
+the SetConstructor reorder safe end-to-end (witness matrix + neutral sweep) —
+next wave can land it and delete the NOTE block at lib.esnext.1.d.ts:2656.
+C landed the later-spread excess-property rule (tsc shouldCheckAsExcessProperty;
+O(N²)→O(N) follow-up), TS2437, TS2465, prefix-unary literal folding (also
+fixed -0 interning). D landed template-literal expando keys, TS7006
+whole-declaration spans, the TS1089/TS1244/TS1253 modifier-walk rewrite,
+TS2875 (ambientIndex-gated), TS2377-super, TS2604. This wave rode through
+repeated transient API stalls + one machine sleep; all four agents resumed
+cleanly from their worktrees each time.
+
+## Ranked next queue (wave 21) — distilled from wave-20 agent reports
+
+1. SetConstructor lib reorder — VERIFIED SAFE by wave-20 B (witness matrix
+   byte-identical to tsgo, apps byte-empty, sweep perfectly neutral). Land it
+   and delete the NOTE block at src/lib/lib.esnext.1.d.ts:2656-2667.
+2. B's precise handoffs: unionTypeWithIndexAndTuple (contextual union must
+   use noReductions — makeUnion reduces `"a" | any` to `any`, tsc keeps it);
+   contextualTypeWithTuple (isTupleLikeType third disjunct: array-like whose
+   length is all number literals); assignmentCompatability10 (optional
+   parameter property produces a REQUIRED member); keyofInferenceIntersectsResults
+   (synthesize {key: any} from an Index target in unify, intersect candidates);
+   extractInferenceImprovement (unique-symbol member names modelled as string
+   literals; NakedTypeVariable pick); discriminatedUnionInference
+   (discriminantConstituent wiring for the union-PARAM arm);
+   templateLiteralTypes4 (method type-param constraint evaluated against the
+   declaring constraint instead of the instantiated tuple).
+3. Late-bound expando: `expr[s]`/`foo[symb]` assignments need a checker-side
+   rekey (expr.zig/signatures.zig; 3 cases from wave-20 D's split).
+4. Object-literal setter parameter from the paired getter:
+   setterParamTypeFromGetter bails on non-.class_method and pairedGetter only
+   walks class bodies — 4 one-key cases + the missing TS7032 (signatures.zig).
+5. Two-round inference re-derivation (the real fix for the probe-publish
+   coupling): pass two must RE-DERIVE instead of reading the probe's published
+   answers, so a callback's return contributes after its parameter fixes.
+   Measured wrong-way variants are documented in infer.zig; the faithful
+   contra-slot split fixes coAndContraVariantInferences7 but breaks
+   social-app's useInfiniteQuery until re-derivation exists.
+6. C's small residue: TS2438 (shadowedInternalModule — needs the alias to
+   carry a TYPE meaning); symbolProperty21 (well-known-symbol computed keys
+   in the excess scan); negative bigint literal types (typenode resolves
+   `-1n` to 0).
+7. D's residue: `<this />` JSX tag path; TS2875's deferred-body anchor (2
+   jsxNamespace cases); per-file @jsxImportSource pragma; `declare var Foo`
+   with no annotation types as `undefined` not `any` (costs TS2604 excuses,
+   7 FPs if reported naively); TS1134 (parseDelimitedList recovery); TS1024.
+8. Census pools: TS2322 under ~480/excess ~370, TS2339, TS7006 one-key
+   families. 552+ cases sit one key from exact.
+9. nestedExcessPropertyChecking per-frame weak rule (untaken twice);
+   resolution-mode import attributes; determinism defect (social-app
+   --checkers=1 vs --file-order=reverse, instantiation-budget partition bug).
+
+## Superseded queue (wave 20, kept for context)
 
 1. Construct-signature reorderCandidates: tsc splices each merged interface's
    declaration group at the FRONT (last declaration resolves first); ztsc
