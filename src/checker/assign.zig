@@ -3695,7 +3695,27 @@ pub fn indexKeyDeclared(c: *Checker, obj: TypeId, idx: TypeId) Error!bool {
 /// `computeBaseConstraint` returns an object/array type unchanged; it never
 /// descends into its type arguments.
 pub fn indexObjBaseConstraint(c: *Checker, t: TypeId) Error!TypeId {
-    if (c.ts.kind(t) != .type_param) return c.transitiveBaseConstraint(t);
+    // …and the same rule at the TOP, for a LIST object: `computeBaseConstraint`
+    // ends in `return t` for anything that is not itself instantiable, so a
+    // container is its own base constraint and its element types are left
+    // alone. `transitiveBaseConstraint` substitutes them, and both
+    // indexed-access rules then decline: the object of `NoInfer<T>`'s encoding
+    // (`[T][T extends any ? 0 : never]`, the shape `noInferWrapper` builds)
+    // came back `[unknown]`, so the access reduced to `unknown` and `return
+    // this._value` inside a `class C<T>` was a false TS2322 against `T`
+    // (`noInfer.ts:80`, `narrowingNoInfer1`). Left alone, the object is `[T]`,
+    // the index's own base constraint is `0`, and the access is exactly `T`.
+    //
+    // Tuples and arrays ONLY, not tsc's whole `return t` fallthrough: widening
+    // it to every non-instantiable kind takes the substitution away from an
+    // OBJECT object too, and zod's `flatten<addQuestionMarks<
+    // baseObjectOutputType<Shape>>>` then stops relating to the mapped shape
+    // it is asserted to (`declarationEmitMappedTypePreservesTypeParameter-
+    // Constraint`, a false TS2352). A list is the shape the deferred access
+    // needs and the one whose positional read is unambiguous.
+    const k = c.ts.kind(t);
+    if (k == .tuple or k == .array) return t;
+    if (k != .type_param) return c.transitiveBaseConstraint(t);
     var cur = t;
     var i: u32 = 0;
     while (i < 8 and c.ts.kind(cur) == .type_param) : (i += 1) {
