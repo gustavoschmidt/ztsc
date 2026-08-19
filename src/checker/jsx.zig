@@ -75,10 +75,50 @@ fn reportMissingJsxRuntime(c: *Checker, node: Node) Error!void {
     c.jsx_runtime_reported[c.cur_file] = true;
     try c.diagFmt(
         2875,
-        c.nodeSpan(node),
+        c.nodeSpan(jsxRuntimeAnchor(c, node)),
         "This JSX tag requires the module path '{s}' to exist, but none could be found. Make sure you have types for the appropriate package installed.",
         .{spec},
     );
+}
+
+/// Which tag "the first JSX tag tsc checks in this file" actually is.
+///
+/// tsc does not check a file's tags in source order: `checkSourceFile` walks
+/// the statements, and `checkFunctionExpressionOrObjectLiteralMethod` DEFERS a
+/// function expression's, an arrow's and an object-literal method's body to a
+/// final pass (`checkNodeDeferred` / `checkDeferredNodes`). A function or class
+/// *declaration*'s body is checked in place. So the report lands on the first
+/// tag outside every deferred body, and only a file whose tags are all inside
+/// one reports on the first of those — which is what `node`, the tag that
+/// triggered this, already is.
+///
+/// `const Title = (props) => <h1/>; const el = <Title/>;` is the shape that
+/// makes the difference visible: tsc blames `<Title/>`, not the `<h1/>` in the
+/// arrow it checks second.
+///
+/// Walked once per file and only from the report itself — i.e. only in a
+/// program whose runtime module is missing, which is the whole subject of
+/// TS2875 — so the traversal costs nothing in a program that resolves.
+fn jsxRuntimeAnchor(c: *Checker, node: Node) Node {
+    for (c.tree.nodeRange(0)) |stmt| {
+        if (firstEagerJsxTag(c, stmt)) |n| return n;
+    }
+    return node;
+}
+
+/// First `.jsx_element` in `node`'s subtree, not entering a body tsc defers.
+fn firstEagerJsxTag(c: *const Checker, node: Node) ?Node {
+    if (node == null_node) return null;
+    switch (c.nodeTag(node)) {
+        .jsx_element => return node,
+        .arrow_fn, .function_expr, .object_method => return null,
+        else => {},
+    }
+    var it = c.tree.childIterator(node);
+    while (it.next()) |child| {
+        if (firstEagerJsxTag(c, child)) |n| return n;
+    }
+    return null;
 }
 
 pub fn checkJsxElement(c: *Checker, node: Node) Error!TypeId {
