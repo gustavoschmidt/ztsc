@@ -30,6 +30,7 @@ const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
 const lazyIndexedProp = @import("instantiate.zig").lazyIndexedProp;
+const tuple_relate = @import("tuple_relate.zig");
 
 /// The key set of one object member table — the names it stores, plus the
 /// domains its index signatures open up. Reads nothing but names, flags and
@@ -100,6 +101,53 @@ fn keyofObjectTableUncached(c: *Checker, r: TypeId) Error!TypeId {
         try parts.append(c.scratch(), types.number_type);
     }
     return c.ts.makeUnion(c.scratch(), parts.items);
+}
+
+/// `keyof T[]` / `keyof readonly T[]` / `keyof [A, B]` — the lib list
+/// interface's member NAMES, its numeric index domain, and (for a tuple) the
+/// literal names of its FIXED positions.
+///
+/// tsc reaches this through `getIndexType(getApparentType(t))`: an array or
+/// tuple's apparent type is an `Array<T>` / `ReadonlyArray<T>` reference, so
+/// `keyof string[]` is `number | "length" | "push" | "slice" | …` and
+/// `keyof [A, B]` adds `"0" | "1"`. `readonly` picks `ReadonlyArray`, which
+/// is what keeps `"push"` OUT of `keyof readonly string[]`.
+///
+/// **Read off the GENERIC table, never built here.** `keyofObjectTable` reads
+/// names, visibility and index-signature presence only, all of which survive
+/// substitution, so the element type is irrelevant — and building the table
+/// from this walk is a measured disaster: materializing a generic member table
+/// runs a declaration walk that can re-enter the very reference being
+/// expanded, so WHEN it first runs is observable (see `lazyShapeOf`; hoisting
+/// the construction into `keyofType` took excalidraw's sweep from 17
+/// diagnostics to 279). `Checker.run` materializes both tables once, at its
+/// top, before any expansion is in flight; here we only read what it left.
+/// With no lib (or no table) the answer degrades to the old `number`
+/// approximation.
+fn arrayKeySet(c: *Checker, r: TypeId) Error!TypeId {
+    const s = &c.ts;
+    const readonly = switch (s.kind(r)) {
+        .array => s.arrayIsReadonly(r),
+        .tuple => s.tupleIsReadonly(r),
+        else => false,
+    };
+    const generic = (if (readonly) c.readonly_array_generic else c.array_generic) orelse
+        return types.number_type;
+    var parts: std.ArrayList(TypeId) = .empty;
+    defer parts.deinit(c.scratch());
+    try parts.append(c.scratch(), try keyofObjectTable(c, generic));
+    // A tuple's FIXED positions are real properties of it (tsc's
+    // `getPropertyOfType(tuple, "0")`), so their names are keys on top of the
+    // borrowed list members. The variable part is not: `[A, ...B[]]` has no
+    // `"1"` key, only the `number` domain the list interface already gave.
+    if (s.kind(r) == .tuple) {
+        var buf: [16]u8 = undefined;
+        for (0..tuple_relate.fixedLength(c, r)) |i| {
+            const name = try c.internText(std.fmt.bufPrint(&buf, "{d}", .{i}) catch continue);
+            try parts.append(c.scratch(), try s.makeStringLiteral(name, false));
+        }
+    }
+    return s.makeUnion(c.scratch(), parts.items);
 }
 
 /// The answer for an operand whose key set cannot be read right now: its
@@ -177,7 +225,7 @@ pub fn keyofType(c: *Checker, t: TypeId) Error!TypeId {
         // checked against the wrong target.
         .any, .never => return c.makeUnion2(types.string_type, c.makeUnion2(types.number_type, types.symbol_type) catch unreachable),
         .object => return keyofObjectTable(c, r),
-        .array, .tuple => return types.number_type, // approximation (no lib members)
+        .array, .tuple => return arrayKeySet(c, r),
         // `keyof typeof N` for a namespace or class value. `.class_value`
         // is a nominal shortcut carrying no properties of its own, so it
         // fell to the `else` arm and collapsed to `never` — and a namespace

@@ -2448,8 +2448,23 @@ pub const Checker = struct {
     atom_length: Atom = 0,
     typeof_atoms: [8]Atom = @splat(0),
     typeof_union: TypeId = 0,
+    /// The `Array<T>` / `ReadonlyArray<T>` GENERIC member tables, materialized
+    /// once at the top of `run` and never rebuilt. `keyof T[]` reads its member
+    /// NAMES off them (`keyof.arrayKeySet`), and names survive substitution —
+    /// so the element type never enters into it.
+    ///
+    /// Built there rather than on demand because materializing a generic member
+    /// table is not a pure function of the symbol: it runs a declaration walk
+    /// that can re-enter the reference being expanded, so WHEN it first runs is
+    /// observable (see `lazyShapeOf` — hoisting the construction into
+    /// `keyofType` took excalidraw's sweep from 17 diagnostics to 279). The top
+    /// of `run` is the one point with nothing in flight. Null when no lib
+    /// declares the interface, which is the lib-free path.
+    array_generic: ?TypeId = null,
+    readonly_array_generic: ?TypeId = null,
     // Names of the lib interfaces primitives/arrays bridge to.
     atom_Array: Atom = 0,
+    atom_ReadonlyArray: Atom = 0,
     atom_String: Atom = 0,
     atom_Number: Atom = 0,
     atom_Boolean: Atom = 0,
@@ -2747,7 +2762,18 @@ pub const Checker = struct {
         var tu: [8]TypeId = undefined;
         for (c.typeof_atoms, 0..) |a, i| tu[i] = try c.ts.makeStringLiteral(a, false);
         c.typeof_union = try c.ts.makeUnion(arena_alloc, &tu);
+        c.atom_ReadonlyArray = try c.atom("ReadonlyArray");
         return c;
+    }
+
+    /// The generic member table of a lib LIST interface, or null when the lib
+    /// does not declare it (or declares it as something other than an
+    /// interface whose table is an object).
+    fn listInterfaceGeneric(c: *Checker, name: Atom) Error!?TypeId {
+        const sym = c.prog.globals.lookup(name) orelse return null;
+        if (!c.symFlags(sym).interface) return null;
+        const g = try c.interfaceGeneric(sym);
+        return if (c.ts.kind(g) == .object) g else null;
     }
 
     pub fn deinit(c: *Checker) void {
@@ -2773,6 +2799,12 @@ pub const Checker = struct {
         prof_zig.declRunStart(c);
         defer prof_zig.declRunEnd(c);
         memprof_zig.runStart(c);
+        // The two list interfaces' generic member tables, materialized HERE and
+        // nowhere else — see `array_generic`. Nothing is in flight yet, so this
+        // is the one point at which building them perturbs no expansion; from
+        // anywhere else the walk lands inside somebody's `expandRef`.
+        c.array_generic = try listInterfaceGeneric(c, c.atom_Array);
+        c.readonly_array_generic = try listInterfaceGeneric(c, c.atom_ReadonlyArray);
         for (c.owned) |f| {
             c.setFile(f);
             c.owned_file = f;
