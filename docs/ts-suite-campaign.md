@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-19, post wave 21)
+## Standings (2026-08-19, post wave 22)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7073 / 8627 (82.0%)** |
-| excess keys (false positives) | 3541 | 1873 |
-| missing keys (under-reports) | 8617 | 3597 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7114 / 8627 (82.5%)** |
+| excess keys (false positives) | 3541 | 1808 |
+| missing keys (under-reports) | 8617 | 3565 |
 | bucketed (ztsc parse error, incomparable) | 825 | 13 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Twenty-one waves landed (3–21), every one with ZERO match→non-match regressions in
+Twenty-two waves landed (3–22), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -259,7 +259,81 @@ debug output appended to another's app capture) — use uniquely-named private
 capture dirs; (3) repeated machine sleeps / API stalls this wave — agents
 resume cleanly if they commit early and often.
 
-## Ranked next queue (wave 22) — distilled from wave-21 agent reports
+Wave 22 (+41 cases): A landed the full late-bound expando seam (four
+coordinated defects incl. tsc's declare-on-the-function-expression model),
+the TS2403 escape narrowing, a message-safe #private relation retry, and
+declared-`never` callees. B solved discriminated-union inference — the THIRD
+diagnosis correction (it's tsc's typesDefinitelyUnrelated gate on
+inferFromObjectTypes; ~60-probe oracle) — and landed symbol-named members for
+unique-symbol consts. C landed yield-in-non-generator, logical-assignment
+result types (tsc's read-type rule + RHS contextual typing), super.x receiver
+typing. D landed for-of head narrowing (silent iterationElementType),
+`this is` receiver predicates, the moduleAugmentation merge family, and JSX
+intrinsic-miss fixes.
+PERF LESSON (from B's self-caught +10% incident): `atomText`/`Interner.lookup`
+takes a shard mutex — NEVER put a name-text test in a per-property path; memo
+per atom and scope the question. Also: ad-hoc `--strict` triage against tsgo
+is invalid (it bails on lib.dom errors and manufactures phantom excess).
+
+## Ranked next queue (wave 23) — distilled from wave-22 agent reports
+
+1. readonly class-field initializer widening: memberTypeOf's .class_field arm
+   (signatures.zig:2416) calls widenLiteral unconditionally — `class A
+   { readonly kind = "A" }` infers `string`. The variable half exists
+   (widenInitializer's is_const). Fixes exhaustiveSwitchWithWideningLiteralTypes.
+2. `??` right-operand narrowing: binder.zig:4538's .binary arm builds
+   condition edges only for &&/|| — add .question_question, and the
+   conditions.zig consumption (nullishCoalescingOperator11: `s ?? f(s)` sees
+   s unnarrowed where tsc has `null | undefined`, then silent via never).
+3. #private per-class encoding (the unlock B proved): binder sets
+   prop_flag_non_public on #private members OR gives them per-class atoms —
+   nominal_members.zig documents what the relation then needs, full oracle
+   committed. Also: private STATICS are not inherited
+   (privateNamesConstructorChain-1/-2, statics.zig).
+4. Optional METHODS carry no `| undefined`: the binder only sets
+   optional_member for .class_field/.property_signature, never
+   .class_method/.method_signature (binder.zig:3209,3726) — a real type gap.
+5. modvalue.targetValueType's .binding arm hands typeOfSymbol a raw
+   (file, local) without prog.mergedOf — statics worked around it; other
+   consumers have the same hole.
+6. assignmentReduced needs tsc's weak-type refusal (maybeAssignable says
+   `{x?:"ok"}[]` ~ `{x?:"ok"}` where tsc refuses — assignmentTypeNarrowing).
+7. narrowByInstance's union arm needs tsc's directlyRelated (strict-subtype
+   BOTH ways before plain subtyping) — partialTypeNarrowedToByTypeGuard;
+   requires a strict-subtype relation ztsc lacks.
+8. TS2722 is entirely missing (possibly-undefined callee → ztsc says TS2349);
+   calls.zig; residual on logicalAssignment5/6/7.
+9. tsconfig-anchored diagnostics infrastructure + TS5102 for the removed
+   `baseUrl` (3 cases) and friends (tsconfig.zig/main.zig).
+10. print/message fidelity: symbol members render as raw atoms
+    (`__@u90369` vs tsgo's `[s]`); TS2300/TS2451 carry no identifier name;
+    TS2349/TS2351 lack the second line. Diagnostic-arg machinery exists.
+11. Extract<keyof number[], string> still keeps "__@iterator" — carry the
+    symbol-name fact on the interned table (one types.zig flag set once,
+    never re-derived per property).
+12. objectLiteralEnumPropertyNames:46 — a numeric-const computed key becomes
+    a NUMBER INDEX SIGNATURE instead of a late-bound property (expr/
+    computed_key; the string-const sibling works).
+13. Cluster of located one-keys: contextuallyTypedBindingInitializer:28
+    (stmts.materializePatternTypes passes no_type for destructuring-default
+    context); looseThisTypeInFunctions:29 (object-literal method `this` =
+    the literal's own type); es6DeclOrdering/missingPropertiesOfClassExpression
+    (this.x expando under-report); staticMismatchBecauseOfPrototype:11:5
+    (baseClassRef from a var of construct-signature type — instantiate.zig);
+    parameterReferenceInInitializer1 (false TS2304 in a later
+    param-property initializer); esModuleInteropImportNamespace.
+14. elaborate.zig needs a fifth Mismatch variant for tsc's private-name
+    message ("refers to a different member").
+15. Two-round inference re-derivation (fifth window; must land WITH the
+    contra-slot split; witnesses social-app useInfiniteQuery + excalidraw
+    bindingProperties).
+16. Census pools: TS2322 337 excess/487 under, TS2339 153/150, TS7006 111/17,
+    TS2345 102/72, TS7053 42/34, TS2349 37/10, TS2741 21/45, TS2344 1/47,
+    TS2536 0/21.
+17. Determinism defect (Navigation.tsx:778:29); resolution-mode attributes;
+    per-frame weak rule.
+
+## Superseded queue (wave 22, kept for context)
 
 1. Late-bound expando, full seam (mapped by A+C): binder `expandoTargetName`
    needs an `.identifier` arm emitting computedSymPlaceholder (its doc comment
