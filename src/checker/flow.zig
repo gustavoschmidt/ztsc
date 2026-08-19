@@ -180,7 +180,15 @@ pub fn flowTypeOfReference(c: *Checker, node: Node, sym: SymbolId, declared: Typ
     // Target` exemption), and a `{ …, k: v, ...maybeUndefined }` whose later
     // spread makes `k` non-excess in tsc (`shouldCheckAsExcessProperty`) but
     // not yet in ztsc.
-    if (declared == types.any_type and c.isEvolvingVar(sym) and
+    //
+    // And never for an AMBIENT variable. tsc's `getTypeForVariableLikeDeclaration`
+    // hands out the auto type only when `!(declaration.flags & NodeFlags.Ambient)`
+    // — a `declare var Foo;` (or any `var` in a `.d.ts`) is plain `any`, since
+    // nothing in the declaring file assigns to it and "holds `undefined` until
+    // written" is simply false of it. Without the test every reference to a
+    // `declare var` read `undefined`, which is how the suite's JSX fixtures
+    // declare their components.
+    if (declared == types.any_type and !c.symFlags(sym).ambient_var and c.isEvolvingVar(sym) and
         c.containerOf(c.bind.symbol_scopes[c.localOf(sym)]) == c.containerOf(c.cur_scope))
     {
         try c.ensureReassignScan();

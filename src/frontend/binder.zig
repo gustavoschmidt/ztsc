@@ -2597,13 +2597,13 @@ const Binder = struct {
             .declarator_full => {
                 const d = b.tree.nodeData(binding);
                 const e = b.tree.extraData(ast.DeclaratorFull, d.rhs);
-                try b.bindPattern(d.lhs, .catch_param, binding);
+                try b.bindPattern(d.lhs, .catch_param, binding, .{});
                 try b.bindType(e.type_ann);
             },
             .declarator => {
-                try b.bindPattern(b.tree.nodeData(binding).lhs, .catch_param, binding);
+                try b.bindPattern(b.tree.nodeData(binding).lhs, .catch_param, binding, .{});
             },
-            else => try b.bindPattern(binding, .catch_param, binding),
+            else => try b.bindPattern(binding, .catch_param, binding, .{}),
         }
     }
 
@@ -2626,27 +2626,33 @@ const Binder = struct {
     fn bindVarDecl(b: *Binder, node: Node) Error!void {
         const kind = b.declKindOfVar(node);
         const d = b.tree.nodeData(node);
+        // `b.ambient` covers the INHERITED half (a `.d.ts`, a `declare
+        // namespace` body); the statement's own `declare` modifier is a token
+        // in front of `var`/`let`/`const`, which is where the parser leaves it.
+        const mt = b.tree.nodeMainToken(node);
+        const ambient = b.ambient or (mt > 0 and b.tree.tokens.tag(mt - 1) == .keyword_declare);
+        const extra: SymbolFlags = .{ .ambient_var = ambient };
         if (b.nodeTag(node) == .var_decl_one) {
-            try b.bindDeclarator(d.lhs, kind);
+            try b.bindDeclarator(d.lhs, kind, extra);
         } else {
             for (b.tree.nodeRange(node)) |decl| {
-                if (decl != null_node) try b.bindDeclarator(decl, kind);
+                if (decl != null_node) try b.bindDeclarator(decl, kind, extra);
             }
         }
     }
 
-    fn bindDeclarator(b: *Binder, node: Node, kind: DeclKind) Error!void {
+    fn bindDeclarator(b: *Binder, node: Node, kind: DeclKind, extra: SymbolFlags) Error!void {
         const d = b.tree.nodeData(node);
         switch (b.nodeTag(node)) {
-            .declarator => try b.bindPattern(d.lhs, kind, node),
+            .declarator => try b.bindPattern(d.lhs, kind, node, extra),
             .declarator_init => {
-                try b.bindPattern(d.lhs, kind, node);
+                try b.bindPattern(d.lhs, kind, node, extra);
                 try b.bindNamedExpr(d.rhs, b.assignedNameToken(d.lhs));
                 b.cur_flow = try b.addFlow(.assign, b.cur_flow, node);
             },
             .declarator_full => {
                 const e = b.tree.extraData(ast.DeclaratorFull, d.rhs);
-                try b.bindPattern(d.lhs, kind, node);
+                try b.bindPattern(d.lhs, kind, node, extra);
                 try b.bindType(e.type_ann);
                 if (e.init != 0) {
                     try b.bindNamedExpr(e.init, b.assignedNameToken(d.lhs));
@@ -2659,32 +2665,32 @@ const Binder = struct {
 
     /// Declare all names bound by a pattern. `var` names go to the nearest
     /// function/file scope; everything else binds in the current scope.
-    fn bindPattern(b: *Binder, node: Node, kind: DeclKind, decl_node: Node) Error!void {
+    fn bindPattern(b: *Binder, node: Node, kind: DeclKind, decl_node: Node, extra: SymbolFlags) Error!void {
         if (node == null_node) return;
         const d = b.tree.nodeData(node);
         switch (b.nodeTag(node)) {
             .identifier => {
                 const tok = b.tree.nodeMainToken(node);
                 const target = if (kind == .var_decl) b.var_scope else b.cur_scope;
-                _ = try b.declare(target, try b.atomOfToken(tok), kind, decl_node, tok, .{});
+                _ = try b.declare(target, try b.atomOfToken(tok), kind, decl_node, tok, extra);
             },
             .array_pattern, .object_pattern => {
-                for (b.tree.nodeRange(node)) |el| try b.bindPattern(el, kind, decl_node);
+                for (b.tree.nodeRange(node)) |el| try b.bindPattern(el, kind, decl_node, extra);
             },
             .binding_default => {
-                try b.bindPattern(d.lhs, kind, decl_node);
+                try b.bindPattern(d.lhs, kind, decl_node, extra);
                 try b.bindExpr(d.rhs);
             },
-            .rest_element => try b.bindPattern(d.lhs, kind, decl_node),
+            .rest_element => try b.bindPattern(d.lhs, kind, decl_node, extra),
             .binding_property => {
                 if (d.lhs != 0) {
                     // `key: target` — the key is a property name, not a binding.
-                    try b.bindPattern(d.lhs, kind, decl_node);
+                    try b.bindPattern(d.lhs, kind, decl_node, extra);
                 } else {
                     // Shorthand `{ a }` (possibly with a default) binds the key.
                     const tok = b.tree.nodeMainToken(node);
                     const target = if (kind == .var_decl) b.var_scope else b.cur_scope;
-                    _ = try b.declare(target, try b.atomOfToken(tok), kind, decl_node, tok, .{});
+                    _ = try b.declare(target, try b.atomOfToken(tok), kind, decl_node, tok, extra);
                 }
                 if (d.rhs != 0) try b.bindExpr(d.rhs); // default initializer
             },
@@ -2692,7 +2698,7 @@ const Binder = struct {
                 // `[expr]: target` — the key is an ordinary expression read in
                 // the enclosing scope; only the target binds.
                 if (d.lhs != 0) try b.bindExpr(d.lhs);
-                if (d.rhs != 0) try b.bindPattern(d.rhs, kind, decl_node);
+                if (d.rhs != 0) try b.bindPattern(d.rhs, kind, decl_node, extra);
             },
             .omitted, .error_node, .unsupported => {},
             else => {}, // not a pattern (recovery); no bindings
@@ -2906,13 +2912,13 @@ const Binder = struct {
         const d = b.tree.nodeData(node);
         switch (b.nodeTag(node)) {
             .param => {
-                try b.bindPattern(d.lhs, .param, node);
+                try b.bindPattern(d.lhs, .param, node, .{});
                 try b.bindType(d.rhs);
                 if (!home.body) try b.reportPatternInitializers(d.lhs);
             },
             .param_full => {
                 const e = b.tree.extraData(ast.ParamFull, d.rhs);
-                try b.bindPattern(d.lhs, .param, node);
+                try b.bindPattern(d.lhs, .param, node, .{});
                 try b.bindType(e.type_ann);
                 try b.bindExpr(e.init);
                 // TS2369, tsc's `checkParameter`: a parameter property outside
@@ -2957,7 +2963,7 @@ const Binder = struct {
                 }
             },
             else => {
-                try b.bindPattern(node, .param, node);
+                try b.bindPattern(node, .param, node, .{});
                 if (!home.body) try b.reportPatternInitializers(node);
             },
         }

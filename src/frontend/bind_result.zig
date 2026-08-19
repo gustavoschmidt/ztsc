@@ -137,7 +137,17 @@ pub const SymbolFlags = packed struct(u32) {
     /// location — so a bare `A` inside a member initializer names the member
     /// and shadows an outer `A`. Two members of one name are TS2300.
     enum_member: bool = false,
-    _pad: u1 = 0,
+    /// A `var`/`let` declared in an AMBIENT context — `declare var x;`, or any
+    /// declaration in a `.d.ts` / `declare namespace` body. tsc's `autoType`
+    /// (the control-flow-tracked `any` that reads `undefined` until an
+    /// assignment writes it) is reserved for NON-ambient variables:
+    /// `getTypeForVariableLikeDeclaration` requires `!(declaration.flags &
+    /// NodeFlags.Ambient)` before it hands one out, and an ambient `declare var
+    /// Foo;` is plain `any`. Nothing assigns to an ambient variable in the file
+    /// that declares it, so without the bit every reference to one read
+    /// `undefined` — which is how half the suite's JSX fixtures declare their
+    /// components.
+    ambient_var: bool = false,
 
     pub fn bits(f: SymbolFlags) u32 {
         return @bitCast(f);
