@@ -1407,6 +1407,9 @@ fn nestedTargetPropType(c: *Checker, rt: TypeId, src_t: TypeId, key: Atom) Error
 /// `checkSpreadPropOverrides`, where reading the constraint would have been a
 /// false positive. The polarities are opposite: there the constraint would
 /// invent an overwrite, here it suppresses a check tsc also suppresses.
+///
+/// Only ever called for a property BEFORE `lastSpreadIndex` — see there for why
+/// the scan is not paid per property.
 fn overriddenByLaterSpread(c: *Checker, members: []const Node, after: usize, key: Atom) Error!bool {
     for (members[after + 1 ..]) |el| {
         if (el == null_node or c.nodeTag(el) != .spread_element) continue;
@@ -1422,6 +1425,25 @@ fn overriddenByLaterSpread(c: *Checker, members: []const Node, after: usize, key
         if ((try c.propOfTypeEx(st, key, false)) != null) return true;
     }
     return false;
+}
+
+/// One past the index of the LAST spread element, or 0 when the literal has
+/// none — so `i < lastSpreadIndex(members)` is exactly "some spread follows
+/// property `i`".
+///
+/// This single pass is what keeps `overriddenByLaterSpread` off the hot path.
+/// Asking it per property would scan the remaining members each time, which is
+/// quadratic in the literal's size — and the object literals that matter are
+/// the big ones (excalidraw's element constructors run to dozens of members),
+/// while the overwhelming majority carry no spread at all and answer 0 here.
+fn lastSpreadIndex(c: *const Checker, members: []const Node) usize {
+    var i = members.len;
+    while (i > 0) {
+        i -= 1;
+        const el = members[i];
+        if (el != null_node and c.nodeTag(el) == .spread_element) return i;
+    }
+    return 0;
 }
 
 pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: TypeId, report: bool) Error!bool {
@@ -1507,6 +1529,7 @@ pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: T
         else => return false,
     }
     const members = c.tree.nodeRange(node);
+    const last_spread = lastSpreadIndex(c, members);
     for (members, 0..) |prop, i| {
         if (prop == null_node) continue;
         const tag = c.nodeTag(prop);
@@ -1528,7 +1551,7 @@ pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: T
         // answer for — see `overriddenByLaterSpread`. Skipped whole: the
         // nested-literal recursion below elaborates a value the spread throws
         // away, so it has nothing to say either.
-        if (try overriddenByLaterSpread(c, members, i, key)) continue;
+        if (i < last_spread and try overriddenByLaterSpread(c, members, i, key)) continue;
         const known = try c.targetKnowsProp(rt, key);
         if (!known) {
             if (report) {
