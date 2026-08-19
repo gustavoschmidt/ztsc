@@ -141,6 +141,20 @@ pub fn checkJsxElement(c: *Checker, node: Node) Error!TypeId {
         const chosen = try c.jsxComponentProps(tag_ty, targs.items, node);
         props = chosen.props orelse types.no_type;
         overloads_exhausted = chosen.overloads_exhausted;
+        // TS2604, tsc's `resolveJsxOpeningLikeElement`: with no signature to
+        // resolve against there is no component here at all. Blamed on the TAG
+        // NAME, not on the element.
+        if (chosen.no_signatures) {
+            // tsc's `getTextOfNode(node.tagName)` — the tag as WRITTEN, which
+            // for a qualified tag (`<A.B/>`) is the whole dotted name.
+            const tag_span = c.nodeSpan(e.tag);
+            try c.diagFmt(
+                2604,
+                tag_span,
+                "JSX element type '{s}' does not have any construct or call signatures.",
+                .{c.src[tag_span.start..tag_span.end]},
+            );
+        }
     }
     // tsc's `discriminateContextualTypeByJSXAttributes`, the JSX half of the
     // step an object literal gets in `objectLiteralType`: a props type that is
@@ -399,17 +413,26 @@ pub fn jsxComponentProps(c: *Checker, tag_ty: TypeId, explicit_targs: []const Ty
     // lost its contextual signature (TS7006/TS7031 on its parameters).
     if (c.ts.kind(t) == .union_type) {
         var acc: TypeId = types.no_type;
+        // tsc resolves a union tag through `getUnionSignatures`, which needs
+        // EVERY constituent to contribute one — so a single non-callable
+        // member makes the whole union signature-less (`tsxUnionTypeComponent2`:
+        // `ComponentClass<any> | number`).
+        var any_missing = false;
         for (try c.memberList(t)) |m| {
-            const p = (try jsxComponentProps(c, m, explicit_targs, node)).props orelse continue;
+            const r = try jsxComponentProps(c, m, explicit_targs, node);
+            if (r.no_signatures) any_missing = true;
+            const p = r.props orelse continue;
             acc = if (acc == types.no_type) p else try c.makeUnion2(acc, p);
         }
-        return .{ .props = if (acc == types.no_type) null else acc };
+        return .{ .props = if (acc == types.no_type) null else acc, .no_signatures = any_missing };
     }
+    // A class always has a construct signature, whatever its props turn out to
+    // be, so a null here means "no discernible props", never "not a component".
     if (c.ts.kind(t) == .class_value) return .{ .props = try c.jsxClassComponentProps(t, explicit_targs, node) };
     var sigs: std.ArrayList(TypeId) = .empty;
     defer sigs.deinit(c.scratch());
     try collectJsxCallSigs(c, t, &sigs);
-    if (sigs.items.len == 0) return .{ .props = null };
+    if (sigs.items.len == 0) return .{ .props = null, .no_signatures = try tagWithoutSignaturesIsError(c, tag_ty, t) };
     if (sigs.items.len == 1) return .{ .props = try jsxPropsOfSig(c, sigs.items[0], explicit_targs, node) };
     return try chooseJsxSignature(c, sigs.items, explicit_targs, node);
 }
@@ -421,7 +444,47 @@ pub fn jsxComponentProps(c: *Checker, tag_ty: TypeId, explicit_targs: []const Ty
 pub const JsxProps = struct {
     props: ?TypeId,
     overloads_exhausted: bool = false,
+    /// tsc's `getUninstantiatedJsxSignaturesOfType` came back EMPTY and the tag
+    /// type is not one of the shapes that excuses that — i.e. this tag is a
+    /// TS2604. Distinct from `props == null`, which a perfectly good class
+    /// component with no discernible props also answers.
+    no_signatures: bool = false,
 };
+
+/// TS2604's precondition: a component tag whose type offers no call or
+/// construct signature is an error UNLESS tsc excuses it. The excuses are
+/// `getUninstantiatedJsxSignaturesOfType`'s string arms — a `string`-typed tag
+/// is given `anySignature`, and a string LITERAL is looked up as an intrinsic —
+/// and `isUntypedFunctionCall`'s: `any` (and an error type, which
+/// `resolveJsxOpeningLikeElement` returns on before asking at all), and a
+/// non-union, non-`never` type that is merely ASSIGNABLE to the global
+/// `Function`.
+///
+/// Two shapes are excused here that tsc DOES report, both deliberate
+/// under-reports of ztsc's own making:
+///
+///   * a TYPE PARAMETER, because tsc asks the question of the APPARENT type and
+///     ztsc's structural resolve does not walk a parameter's constraint, so
+///     `<T extends ComponentType>` would otherwise read as signature-less;
+///   * `undefined`/`void`, because an unannotated ambient `declare var Foo` —
+///     which tsc types `any`, and which is how half the suite's JSX fixtures
+///     declare their components — is typed `undefined` by ztsc today. Until
+///     that is fixed, `undefined` is the one kind whose provenance ztsc cannot
+///     trust, and reporting on it turned `tsxReactEmit3`/`tsxExternalModuleEmit2`
+///     into five false positives apiece.
+fn tagWithoutSignaturesIsError(c: *Checker, tag_ty: TypeId, resolved: TypeId) Error!bool {
+    switch (c.ts.kind(resolved)) {
+        .any, .err, .string, .string_literal, .type_param, .infer_var => return false,
+        .undefined, .void => return false,
+        // tsc's `!(getReducedType(apparentFuncType).flags & TypeFlags.Never)`
+        // guard puts `never` back INSIDE the error, so it falls through.
+        .never => return true,
+        else => {},
+    }
+    const sym = c.prog.globals.lookup(c.atom_Function) orelse return true;
+    if (!c.symFlags(sym).interface) return true;
+    return !(try c.isAssignable(tag_ty, try c.ts.makeRef(sym, &.{})));
+}
 
 /// The call signatures a component tag offers, in declaration order — the list
 /// tsc's `resolveJsxOpeningLikeElement` hands to `resolveCall`.
