@@ -15,6 +15,7 @@ const ast = @import("../frontend/ast.zig");
 const binder = @import("../frontend/binder.zig");
 const intern = @import("../intern.zig");
 const modules = @import("../link/modules.zig");
+const paths = @import("../link/paths.zig");
 const types = @import("../types.zig");
 
 const Atom = intern.Atom;
@@ -336,6 +337,21 @@ pub fn namespaceObjectType(c: *Checker, file: FileId) Error!TypeId {
                 return t;
             }
         }
+    }
+    // A file that is a SCRIPT has no module symbol to import FROM: tsc's
+    // `resolveExternalModuleName` finds no `sourceFile.symbol`, reports TS2306
+    // at the specifier (`link/modules.zig` does the same) and binds nothing, so
+    // every read through the alias is the ERROR type rather than a member of an
+    // empty object. Answering `{}` instead turned `import foo = require("./
+    // script"); foo.answer` into a TS2339 on top of the TS2306 tsgo reports
+    // alone (`importNonExternalModule`). A synthetic JSON/JS any-module is not a
+    // script — it carries `export =` and never sees a binder — and is excluded
+    // here exactly as it is at the report site.
+    if (c.prog.links.len != 0 and !c.prog.files[file].bind.is_module and
+        paths.anyModuleSourceFor(c.prog.files[file].path) == null)
+    {
+        try c.ns_types.put(c.cm(), file, types.error_type);
+        return types.error_type;
     }
     var props: std.ArrayList(types.Prop) = .empty;
     defer props.deinit(c.scratch());
