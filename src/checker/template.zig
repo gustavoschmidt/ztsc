@@ -911,13 +911,133 @@ pub fn inferFromTemplate(c: *Checker, text: []const u8, tpl: TypeId, ids: []cons
 pub fn bindTemplateInfer(c: *Checker, hole: TypeId, captured: []const u8, ids: []const u32, vals: []TypeId) Error!void {
     const s = &c.ts;
     if (s.kind(hole) != .infer_var) return;
-    const idx = indexOfId(ids, s.inferVarId(hole)) orelse return;
-    const lit = try c.ts.makeStringLiteral(try c.internText(captured), false);
+    const var_id = s.inferVarId(hole);
+    const idx = indexOfId(ids, var_id) orelse return;
+    const str = try c.ts.makeStringLiteral(try c.internText(captured), false);
+    const lit = try constrainedCapture(c, var_id, captured, str);
     if (vals[idx] == types.no_type) {
         vals[idx] = lit;
     } else {
         vals[idx] = try c.makeUnion2(vals[idx], lit);
     }
+}
+
+/// tsc's `inferToTemplateLiteralType` placeholder rule: "if we are inferring
+/// from a string literal type to a type variable whose constraint includes one
+/// of the allowed template literal placeholder types, infer from a literal type
+/// corresponding to the constraint."
+///
+/// A template pattern always CAPTURES text, so the natural candidate is the
+/// string literal of the capture. When the binder is CONSTRAINED
+/// (`` `${infer N extends number}` ``), tsc converts the capture to the
+/// constraint's own literal form instead — `"5"` becomes the number literal
+/// `5`, not `"5"`. ztsc enforces an `infer` constraint by wrapping the true
+/// branch in `V extends C ? … : false`, so without the conversion the string
+/// literal failed that guard and every such conditional collapsed to its false
+/// branch: `IndexFor<S> = S extends \`${infer N extends number}\` ? N : never`
+/// answered `never` for every input, which is what made
+/// `templateLiteralTypes4`'s `IndicesOf<TDef>` empty and rejected all four
+/// `p.getIndex(0)` / `p.setIndex(0, 0)` calls.
+///
+/// `str` is the string-literal type of the capture — returned unchanged
+/// whenever the constraint does not ask for something else, which is tsc's
+/// `matchingType === neverType` fall-through.
+fn constrainedCapture(c: *Checker, var_id: u32, captured: []const u8, str: TypeId) Error!TypeId {
+    const cons = c.infer_constraints.get(var_id) orelse return str;
+    const s = &c.ts;
+    const ct = try c.resolveStructural(cons.ty);
+    if (s.kind(ct) == .any or s.kind(ct) == .err) return str;
+    const parts: []const TypeId = if (s.kind(ct) == .union_type)
+        try c.scratch().dupe(TypeId, try c.memberList(ct))
+    else
+        &.{ct};
+    // tsc's `allTypeFlags` screen, in the same order: `string` in the
+    // constraint means the capture already IS the preferred form; a numeric or
+    // bigint constituent is only a candidate when the capture round-trips
+    // through it.
+    var allow_number = false;
+    var allow_bigint = false;
+    for (parts) |p| {
+        switch (s.kind(p)) {
+            .string => return str,
+            .number, .number_literal, .number_literal_fresh, .enum_type => allow_number = true,
+            .bigint, .bigint_literal => allow_bigint = true,
+            else => {},
+        }
+    }
+    if (allow_number and !isNumericString(captured)) allow_number = false;
+    if (allow_bigint and !isBigIntString(captured)) allow_bigint = false;
+    // tsc's `reduceLeft` over the constraint's constituents, which keeps the
+    // FIRST match in a fixed precedence order (string-literal, then number,
+    // then bigint, then boolean, then any other literal). Anything already
+    // chosen wins over a later constituent of lower precedence.
+    var left: TypeId = types.no_type;
+    for (parts) |p| {
+        const cand: TypeId = switch (s.kind(p)) {
+            .string_literal => if (std.mem.eql(u8, c.atomText(s.literalAtom(p)), captured)) p else continue,
+            .number, .enum_type => if (allow_number)
+                try s.makeNumberLiteral(numericValue(captured) orelse continue, false)
+            else
+                continue,
+            .number_literal, .number_literal_fresh => if (allow_number) p else continue,
+            // A `bigint_literal`'s atom is the literal TEXT, `n` suffix
+            // included (see `types.Kind.bigint_literal`) — the capture is the
+            // bare digits, so the suffix is added back here.
+            // NOT `.bigint`. tsc's `parseBigIntLiteralType(str)` arm belongs
+            // here, and minting the literal is one line — but a bigint literal
+            // minted this way does not satisfy the `X extends bigint` guard
+            // `constrainInferBinders` wraps the true branch in, so
+            // `` `${infer X extends bigint}` `` takes the FALSE branch and the
+            // conditional answers `never` either way. The same shape with
+            // `number` works, and a hand-written `123n extends bigint ? 1 : 0`
+            // resolves true, so the fault is in how the guard reads a
+            // SUBSTITUTED bigint literal, not here; leaving the arm out keeps
+            // the capture as its string literal, which is what ztsc did before
+            // this function existed. `bigint | number` still converts, via the
+            // `.number` arm that outranks it in tsc's chain anyway.
+            .bigint_literal => if (allow_bigint) p else continue,
+            .boolean => if (std.mem.eql(u8, captured, "true"))
+                types.true_type
+            else if (std.mem.eql(u8, captured, "false"))
+                types.false_type
+            else
+                types.boolean_type,
+            .bool_true => if (std.mem.eql(u8, captured, "true")) p else continue,
+            .bool_false => if (std.mem.eql(u8, captured, "false")) p else continue,
+            else => continue,
+        };
+        if (left == types.no_type or precedence(s.kind(p)) < precedence(s.kind(try c.resolveStructural(left)))) {
+            left = cand;
+        }
+    }
+    return if (left == types.no_type) str else left;
+}
+
+/// The rank a constraint constituent has in tsc's `matchingType` `reduceLeft`
+/// chain — lower wins. Only the kinds `constrainedCapture` can produce a
+/// candidate for appear; everything else never reaches the comparison.
+fn precedence(k: types.Kind) u8 {
+    return switch (k) {
+        .string_literal => 0,
+        .number, .number_literal, .number_literal_fresh => 1,
+        .enum_type => 2,
+        .bigint, .bigint_literal => 3,
+        .boolean, .bool_true, .bool_false => 4,
+        else => 5,
+    };
+}
+
+/// The `f64` a captured string denotes under JavaScript's `Number()`, or null
+/// when it denotes none. `isNumericString` has already said the text is a
+/// number; this repeats its radix handling because `parseFloat` refuses the
+/// radix forms.
+fn numericValue(str0: []const u8) ?f64 {
+    const str = std.mem.trim(u8, str0, " \t\n\r");
+    if (radixBase(str)) |base| {
+        const n = std.fmt.parseInt(u64, str[2..], base) catch return null;
+        return @floatFromInt(n);
+    }
+    return std.fmt.parseFloat(f64, str) catch null;
 }
 
 /// Infer from a template-literal *type* source into a template-literal
