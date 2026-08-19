@@ -991,6 +991,31 @@ pub fn narrowByInstance(c: *Checker, t: TypeId, instance: TypeId, sense: bool, c
                 // `undefined` declares no heritage, so it survives a false
                 // branch and never survives a true one.
                 try isDerivedFrom(c, m, want, 0)
+            else if (check_derived and !sense)
+                // tsc's assumeFalse arm for `instanceof` is
+                // `filterType(type, t => !isTypeDerivedFrom(t, candidate))` —
+                // the NOMINAL test and nothing else. A candidate that answers
+                // through none of its clauses (`derivedTestOf` → null) is one
+                // no source can be derived from, so the false branch removes
+                // NOTHING. The common shape is a UNION of constructors:
+                // `declare const ctors: typeof A | typeof B; if (!(u instanceof
+                // ctors))` leaves `u` exactly as it was, which is what the test
+                // named `doesNotNarrowUnionOfConstructorsWithInstanceof` is
+                // about — the structural fallback below instead filtered `A`
+                // and `B` out and left `never`. The NON-union arm at the bottom
+                // of this function already draws this line; only the union arm
+                // was still reaching for assignability.
+                //
+                // The true branch keeps the structural fallback: it is tsc's
+                // own `getNarrowedTypeWorker` tail (`isTypeSubtypeOf(candidate,
+                // type) ? candidate : …`), and the oracle does narrow
+                // `string | A | B` to `A | B` there.
+                //
+                // `readonlyDerivedFrom` below still applies, which is what
+                // keeps `x instanceof Array` filtering a `readonly T[]` out of
+                // its else branch — `Array` models as `.array` and has no
+                // nominal declaration either (`instanceofNarrowReadonlyArray`).
+                false
             else blk: {
                 var ok = try c.isAssignable(m, instance);
                 // tsc's `getNarrowedTypeWorker` filters with the SUBTYPE

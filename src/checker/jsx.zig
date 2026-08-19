@@ -147,25 +147,27 @@ pub fn checkJsxElement(c: *Checker, node: Node) Error!TypeId {
         // Fragment `<>…</>`: no attributes, no props.
     } else if (c.isIntrinsicJsxTag(e.tag)) {
         const tag_atom = try c.atomOfToken(c.tree.nodeMainToken(e.tag));
-        if (try c.jsxNamespaceType(c.atom_IntrinsicElements)) |ie| {
-            if (try c.propOfType(try c.resolveStructural(ie), tag_atom)) |p| {
-                props = p.ty;
-            } else {
-                try c.diagFmt(2339, c.nodeSpan(e.tag), "Property '{s}' does not exist on type 'JSX.IntrinsicElements'.", .{c.atomText(tag_atom)});
-            }
-        } else {
+        // Every arm below reports per TAG REFERENCE, not per element: tsc's
+        // `checkJsxElementDeferred` resolves the closing tag name
+        // independently of the opening one, so `<a></a>` reports twice.
+        // Fragments (`<>…</>`) resolve no tag and never report.
+        const open_lt = c.tree.nodeMainToken(node);
+        switch (try intrinsicPropsOf(c, tag_atom)) {
+            .props => |p| props = p,
+            .missing => {
+                try jsxIntrinsicMissing(c, open_lt, tag_atom);
+                if (e.close_lt != 0) try jsxIntrinsicMissing(c, e.close_lt, tag_atom);
+            },
             // tsc's `getIntrinsicTagSymbol`: with no `JSX.IntrinsicElements`
             // in scope the intrinsic tag's props type is the error type, and
             // under `noImplicitAny` that is reported as TS7026 — the JSX
             // counterpart of the implicit-'any' family. A `.tsx` file with no
             // JSX namespace at all (no React typings, `jsx: preserve`) is the
             // common shape; ztsc silently typed the props as "unknown target".
-            //
-            // The report is per TAG REFERENCE, not per element: tsc resolves
-            // the closing tag name independently, so `<a></a>` reports twice.
-            // Fragments (`<>…</>`) resolve no tag and never report.
-            try jsxIntrinsicImplicitAny(c, c.tree.nodeMainToken(node));
-            if (e.close_lt != 0) try jsxIntrinsicImplicitAny(c, e.close_lt);
+            .no_namespace => {
+                try jsxIntrinsicImplicitAny(c, open_lt);
+                if (e.close_lt != 0) try jsxIntrinsicImplicitAny(c, e.close_lt);
+            },
         }
     } else {
         is_component = true;
@@ -178,7 +180,34 @@ pub fn checkJsxElement(c: *Checker, node: Node) Error!TypeId {
         for (c.tree.extraRange(e.targs_start, e.targs_end)) |tn| {
             if (tn != null_node) try targs.append(c.scratch(), try c.typeFromTypeNode(tn));
         }
-        const chosen = try c.jsxComponentProps(tag_ty, targs.items, node);
+        // tsc's `getUninstantiatedJsxSignaturesOfType`, string-literal arm: a
+        // component-looking tag whose VALUE is a string literal still names an
+        // intrinsic element — `var CustomTag: "h1" = "h1"; <CustomTag/>` is
+        // looked up as `JSX.IntrinsicElements["h1"]`. A hit synthesizes a
+        // signature (so the props type is the intrinsic's); a miss is a TS2339
+        // naming the LITERAL, reported at the element, and leaves the signature
+        // list empty so the TS2604 below fires as well (`tsxDynamicTagName3`).
+        // `tagWithoutSignaturesIsError` already excused the literal from
+        // TS2604; without the lookup it reported nothing at all.
+        const lit_tag: ?Atom = blk: {
+            const rt = try c.resolveStructural(tag_ty);
+            break :blk if (c.ts.kind(rt) == .string_literal) c.ts.literalAtom(rt) else null;
+        };
+        const chosen: JsxProps = if (lit_tag) |name| switch (try intrinsicPropsOf(c, name)) {
+            .props => |p| .{ .props = p },
+            .missing => blk: {
+                try jsxIntrinsicMissing(c, c.tree.nodeMainToken(node), name);
+                break :blk .{ .props = null, .no_signatures = true };
+            },
+            // Silent, unlike the lowercase-tag arm above:
+            // `getIntrinsicAttributesTypeFromStringLiteralType` returns
+            // `anyType` outright when `JSX.IntrinsicElements` is the error type
+            // ("If we need to report an error, we already [have] done so
+            // here"), so `<this._tagName>` in a file with no JSX namespace at
+            // all earns nothing — not the TS7026 an intrinsic tag would
+            // (`tsxDynamicTagName9`).
+            .no_namespace => .{ .props = null },
+        } else try c.jsxComponentProps(tag_ty, targs.items, node);
         props = chosen.props orelse types.no_type;
         overloads_exhausted = chosen.overloads_exhausted;
         // TS2604, tsc's `resolveJsxOpeningLikeElement`: with no signature to
@@ -316,6 +345,35 @@ fn reportJsxOverloadFailure(c: *Checker, node: Node, e: ast.JsxElementData, prop
         .codes = &jsx_applicability_codes,
     });
     try c.diagFmt(2769, if (one_place) first else elem, "No overload matches this call.", .{});
+}
+
+/// What `JSX.IntrinsicElements[name]` answered. The three cases are tsc's
+/// `getIntrinsicTagSymbol` arms and they report differently: a hit types the
+/// props, a miss is TS2339, and no `JSX.IntrinsicElements` in scope at all is
+/// TS7026 (per TAG REFERENCE, not per element).
+const IntrinsicLookup = union(enum) {
+    props: TypeId,
+    missing,
+    no_namespace,
+};
+
+fn intrinsicPropsOf(c: *Checker, name: Atom) Error!IntrinsicLookup {
+    const ie = (try c.jsxNamespaceType(c.atom_IntrinsicElements)) orelse return .no_namespace;
+    const p = (try c.propOfType(try c.resolveStructural(ie), name)) orelse return .missing;
+    return .{ .props = p.ty };
+}
+
+/// TS2339 for an intrinsic tag `JSX.IntrinsicElements` does not declare.
+///
+/// Blamed on the ELEMENT (`lt` = its `<`), not on the tag name: tsc's
+/// `getIntrinsicTagSymbol` errors on the `JsxOpeningLikeElement`/
+/// `JsxClosingElement` it was handed, so `<span/>` reports at the `<` one
+/// column before the name — and a PAIRED element reports TWICE, because
+/// `checkJsxElementDeferred` resolves the closing tag name independently
+/// ("so that rename/go to definition/etc work"). ztsc reported once, at the
+/// name; both halves showed up as position mismatches across the tsx corpus.
+fn jsxIntrinsicMissing(c: *Checker, lt: TokenIndex, name: Atom) Error!void {
+    try c.diagFmt(2339, c.tokSpan(lt), "Property '{s}' does not exist on type 'JSX.IntrinsicElements'.", .{c.atomText(name)});
 }
 
 /// TS7026 at one intrinsic-tag reference (`lt` = the tag's `<`), raised when
@@ -512,6 +570,10 @@ pub const JsxProps = struct {
 /// `resolveJsxOpeningLikeElement` returns on before asking at all), and a
 /// non-union, non-`never` type that is merely ASSIGNABLE to the global
 /// `Function`.
+///
+/// The string-literal excuse is only reached through a UNION tag type now:
+/// `checkJsxElement` performs the intrinsic lookup itself for a bare literal
+/// tag, and a MISS there is a TS2604 after all.
 ///
 /// One shape is excused here that tsc DOES report, a deliberate under-report of
 /// ztsc's own making: a TYPE PARAMETER, because tsc asks the question of the

@@ -953,7 +953,7 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
                 const saved = c.cur_scope;
                 defer c.cur_scope = saved;
                 c.cur_scope = b.flowScope(flow);
-                if (try assignNarrows(c, target, key, declared)) |narrowed| {
+                if (try assignNarrows(c, flow, target, key, declared)) |narrowed| {
                     switch (narrowed) {
                         .ty => |t| return t,
                         .base_of_antecedent => base_of_ante = true,
@@ -1540,6 +1540,41 @@ fn forInSubjectMatches(c: *Checker, flow: FlowId, target: Node, key: RefKey) Err
     return refMatches(c, e.right, key);
 }
 
+/// What a `for..in` / `for..of` HEAD writes into its target on every
+/// iteration — tsc's `getAssignedType`, whose `ForInStatement` arm is
+/// `stringType` and whose `ForOfStatement` arm is
+/// `checkRightHandSideOfForOf`.
+///
+/// The DECLARATION form (`for (const x of xs)`) is answered by the
+/// `.var_decl*` arm of `assignNarrows`, which reads the element type off the
+/// freshly declared symbol. This is the ASSIGNMENT form — `for (x of xs)`
+/// writing an OUTER binding — which tsc narrows exactly like `x = <element>`
+/// and ztsc used to leave at the declared type, so `let x: string | number;
+/// x = true; for (x of numbers) x.toExponential()` still saw the `true`.
+///
+/// The element type is computed with the silent `iterationElementType` rather
+/// than `forOfElementType`: the loop statement itself already reported
+/// TS2488/TS2504 for a non-iterable subject, and a flow query must not report
+/// it a second time. A non-iterable subject simply narrows nothing.
+fn forHeadAssignedType(c: *Checker, flow: FlowId, target: Node) Error!?TypeId {
+    const b = c.bind;
+    const scope = b.flowScope(flow);
+    if (b.scope_kinds[scope] != .for_head) return null;
+    const owner = b.scope_owners[scope];
+    if (owner == null_node) return null;
+    const is_of = switch (c.nodeTag(owner)) {
+        .for_of_stmt => true,
+        .for_in_stmt => false,
+        else => return null,
+    };
+    const e = c.tree.extraData(ast.ForInOf, c.tree.nodeData(owner).lhs);
+    if (e.left != target) return null;
+    if (!is_of) return types.string_type;
+    const rt = c.nodeType(e.right) orelse try c.checkExprCached(e.right, types.no_type);
+    if (e.is_await != 0) return try c.asyncIterationElementType(rt);
+    return try c.iterationElementType(rt);
+}
+
 /// Does this type carry a `null`/`undefined` constituent to strip? tsc's
 /// `getNonNullableTypeIfNeeded` guard, kept syntactic so that a type whose
 /// nullish arm is hidden behind a constraint (a bare type parameter) is left
@@ -1583,7 +1618,7 @@ const AssignResult = union(enum) {
 /// If the assign-flow node writes the reference (or invalidates a
 /// property path by writing its root), what the reference is worth after the
 /// assignment; null when it is unrelated.
-fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) Error!?AssignResult {
+fn assignNarrows(c: *Checker, flow: FlowId, target: Node, key: RefKey, declared: TypeId) Error!?AssignResult {
     if (target == null_node) return null;
     const root_sym = key.sym;
     switch (c.nodeTag(target)) {
@@ -1786,9 +1821,16 @@ fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) Error
             }
             return null;
         },
+        // A bare identifier is only ever an assign-flow target as the head of
+        // a `for..in`/`for..of` writing an existing binding; the head assigns
+        // the key/element type on every iteration.
         .identifier => {
             if (!try c.identIsSym(target, root_sym)) return null;
-            return .{ .ty = declared };
+            if (key.len != 0) return .{ .ty = declared };
+            if (!assignmentRefines(c, declared)) return .{ .ty = declared };
+            const assigned = (try forHeadAssignedType(c, flow, target)) orelse
+                return .{ .ty = declared };
+            return .{ .ty = try assignmentReduced(c, declared, assigned) };
         },
         else => {
             if (try patternBindsSym(c, target, root_sym)) return .{ .ty = declared };
@@ -1871,9 +1913,26 @@ pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: R
         // `getReferenceCandidate` of the condition); a comma expression
         // condition is its right operand.
         .assign, .seq_expr => {
+            // tsc's `narrowTypeByBinaryExpression`, `=`/`||=`/`&&=`/`??=` arm:
+            //
+            //     narrowTypeByTruthiness(narrowType(type, expr.right, assumeTrue), expr.left, assumeTrue)
+            //
+            // The assigned VALUE is itself a condition, so
+            // `if (this.based = (target instanceof C))` narrows `target` as
+            // well as `this.based` — `controlFlowForCompoundAssignmentToThisMember`.
+            // A genuinely compound `+=` says nothing about either operand and
+            // takes tsc's `default` arm (which `referenceCandidate` mirrors by
+            // handing the assignment back unchanged).
+            var out = t;
+            if (c.nodeTag(cond) == .assign) {
+                const op = c.tree.tokens.tag(c.tree.nodeMainToken(cond));
+                if (op == .eq or logicalAssignOp(op)) {
+                    out = try c.narrowByCondition(t, d.rhs, sense, key, decl);
+                }
+            }
             const cand = c.referenceCandidate(cond);
-            if (cand != cond) return c.narrowByCondition(t, cand, sense, key, decl);
-            return t;
+            if (cand != cond) return c.narrowByCondition(out, cand, sense, key, decl);
+            return out;
         },
         .identifier => {
             if (try refMatches(c, cond, key)) {
@@ -2969,7 +3028,21 @@ fn guardCallOf(c: *Checker, call: Node) Error!?GuardCall {
     const sig_t = (try effectsSignature(c, call, shape, callee_t)) orelse return null;
     if (!c.ts.fnHasPredicate(sig_t)) return null; // `never` return, no predicate
     const pred = c.ts.fnPredicate(sig_t);
-    if (pred.param == types.Predicate.this_param) return null; // `this is T`: gap
+    // `this is T` names the call's RECEIVER rather than a parameter — tsc's
+    // `narrowTypeByTypePredicate` reads its subject off
+    // `getInvokedExpression(…).expression` for a `ThisIdentifier` predicate.
+    // `Array.every<S extends T>(pred): this is S[]` is the lib's own instance
+    // of it, so `if (xs.every(isString)) xs[0].slice(0)` needs the receiver
+    // narrowed; the rest of the machinery (`refMatches` on the guarded node)
+    // is positional and does not care that the node came from the callee.
+    if (pred.param == types.Predicate.this_param) {
+        const recv: Node = switch (c.nodeTag(callee)) {
+            .member_expr, .optional_member_expr, .index_expr, .optional_index_expr => c.tree.nodeData(callee).lhs,
+            else => return null,
+        };
+        if (recv == null_node) return null;
+        return .{ .pred = pred, .arg = recv };
+    }
     if (pred.param >= shape.arg_nodes.len) return null;
     const arg = shape.arg_nodes[pred.param];
     if (arg == null_node) return null;

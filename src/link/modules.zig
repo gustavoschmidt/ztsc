@@ -408,7 +408,7 @@ pub fn link(
     // every file's harvest slice and every `declare module` augmentation of a
     // resolved real module. Needs the sealed export tables (`out`).
     const sym_base = try computeSymBase(arena, files);
-    const gm = try mergeGlobals(arena, scratch, files, sym_base, out, l.atom_export_equals, umds, .{ .diags = l.diags, .io = l.io, .interner = l.interner });
+    const gm = try mergeGlobals(arena, scratch, files, sym_base, out, l.atom_export_equals, l.atom_default, umds, .{ .diags = l.diags, .io = l.io, .interner = l.interner });
     for (0..files.len) |i| out[i].diags = try arena.dupe(LinkDiag, l.diags[i].items);
 
     // Seal the ambient module export tables in registry order, so
@@ -561,7 +561,7 @@ pub fn singleWithLibProgram(
     // Unlinked single-file path: a script user file may still augment lib
     // globals; merge diagnostics (none for the clean case) have no link table
     // to land in here and are dropped.
-    const gm = try mergeGlobals(arena, arena, files, sym_base, &.{}, 0, &.{}, null);
+    const gm = try mergeGlobals(arena, arena, files, sym_base, &.{}, 0, 0, &.{}, null);
     return .{ .files = files, .sym_base = sym_base, .globals = gm.globals, .merged = gm.merged, .constit_keys = gm.constit_keys, .constit_vals = gm.constit_vals };
 }
 
@@ -1562,6 +1562,10 @@ fn mergeGlobals(
     sym_base: []const u32,
     links: []const FileLinks,
     export_equals_atom: Atom,
+    /// The interned name `"default"`, or 0 for a caller with no interner. An
+    /// augmenting block's `export default interface I` names the real module's
+    /// DEFAULT export, not one called `I` (`mergeAugmentations`).
+    default_atom: Atom,
     /// The program's `export as namespace X` declarations, sorted by name (see
     /// umd.zig). They join the global merge chain of the name they publish.
     umds: []const umd.Global,
@@ -1657,7 +1661,7 @@ fn mergeGlobals(
     // Cross-file module augmentation merge: fold a `declare module
     // "spec" { interface I { … } }` block (in a MODULE-context file) into the
     // interface `I` already exported by the real module `spec` resolves to.
-    try mergeAugmentations(&m, files, sym_base, links, export_equals_atom);
+    try mergeAugmentations(&m, files, sym_base, links, export_equals_atom, default_atom);
 
     // …and the same fold WITHIN one ambient specifier, whose blocks name no
     // real file for the pass above to key off.
@@ -1766,6 +1770,7 @@ fn mergeAugmentations(
     sym_base: []const u32,
     links: []const FileLinks,
     export_equals_atom: Atom,
+    default_atom: Atom,
 ) Error!void {
     if (links.len != files.len) return; // unlinked path: no export tables
 
@@ -1792,7 +1797,14 @@ fn mergeAugmentations(
                 // unification stays deferred — degrade, no crash.
                 const lf_flags = b.symbol_flags[local];
                 if (!lf_flags.interface and !lf_flags.namespace_decl) continue;
-                const name = b.member_atoms[i];
+                // `export default interface I { x }` in the block names the
+                // real module's DEFAULT export, not one spelled `I` — the
+                // local name is not exported at all. tsc merges the two
+                // default-export symbols (`moduleAugmentationOfAlias`).
+                const name = if (lf_flags.export_default and default_atom != 0)
+                    default_atom
+                else
+                    b.member_atoms[i];
                 const tgt = links[mfile].exportTarget(name) orelse
                     exportEqualsMemberTarget(files, links, mfile, export_equals_atom, name) orelse
                     continue;
