@@ -5233,6 +5233,20 @@ pub fn markAssignedMethodFn(c: *Checker, target: Node, value0: Node) Error!void 
     try markThisBound(c, value);
 }
 
+/// A compound assignment's left operand as tsc's `checkExpression(left)` sees
+/// it: the target READ, not the target WRITE. The two differ wherever a
+/// property has a wider setter than getter (`get x(): number` / `set x(v:
+/// number | undefined)`) and wherever the flow has narrowed the target (`if
+/// (this.z) this.z += dz`), and reading the write type there rejected code tsc
+/// accepts. Re-checking `target` as an expression cannot double-report:
+/// `diagFmt` dedupes on (file, code, span).
+fn readOfAssignTarget(c: *Checker, target: Node) Error!TypeId {
+    const saved_write_target = c.write_target_node;
+    c.write_target_node = c.nodeKey(target);
+    defer c.write_target_node = saved_write_target;
+    return c.checkExprCached(target, types.no_type);
+}
+
 fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
     const d = c.tree.nodeData(node);
     const op = c.tree.tokens.tag(c.tree.nodeMainToken(node));
@@ -5262,6 +5276,23 @@ fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
     const unchecked = assignTargetIsEvolving(c, d.lhs);
     var rhs_ctx: TypeId = if (op == .eq) target_t else types.no_type;
     if (target_t == types.error_type or unchecked) rhs_ctx = types.no_type;
+    // `&&=`, `||=`, `??=` are the LOGICAL assignments: unlike `+=` they do not
+    // synthesize a value from both operands, they answer one operand or the
+    // other, so tsc's `checkBinaryLikeExpressionWorker` computes their result
+    // from the very code `&&`/`||`/`??` use. That needs the left operand's
+    // READ type up front — before the right operand, which it also
+    // contextually types (`getContextualTypeForAssignmentDeclaration` answers
+    // `getTypeOfExpression(left)` for an ordinary target, which is why
+    // `f ??= (a => a)` infers `a: number` from `f`'s signature instead of
+    // reporting TS7006).
+    const logical_lt: TypeId = switch (op) {
+        .amp_amp_eq, .pipe_pipe_eq, .question_question_eq => if (target_t == types.error_type)
+            types.error_type
+        else
+            try readOfAssignTarget(c, d.lhs),
+        else => types.no_type,
+    };
+    if (logical_lt != types.no_type and logical_lt != types.error_type) rhs_ctx = logical_lt;
     // tsc's `getContextualThisParameterType`, last arm: in `obj.m = function
     // () {…}` (any assignment operator) the function has a receiver — `obj` —
     // so a `this` in its body is not TS2683. A contextual signature with a
@@ -5276,10 +5307,33 @@ fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
             return rt;
         },
         .amp_amp_eq, .pipe_pipe_eq, .question_question_eq => {
+            // tsc's `checkAssignmentOperator(rightType)`: the RIGHT operand is
+            // what gets stored, so it alone is related to the write type.
             if (is_ref and !unchecked and target_t != types.error_type and target_t != types.any_type) {
                 _ = try c.checkAssignable(rt, target_t, d.rhs, c.nodeSpan(d.lhs));
             }
-            return rt;
+            if (logical_lt == types.error_type) return rt;
+            // …but the expression's VALUE is the operator's, computed exactly
+            // as `&&`/`||`/`??` compute theirs. `results &&= xs` therefore
+            // still admits `undefined` (the left operand's falsy part
+            // survives — TS2532 on `(results &&= xs).push(…)`), while
+            // `x ??= 1` over `0 | 1 | 2 | 3` answers the whole union rather
+            // than the literal `1` that the right operand alone would give.
+            switch (op) {
+                .pipe_pipe_eq => {
+                    if (!try c.canBeFalsy(logical_lt, 0)) return logical_lt;
+                    return c.logicalUnion(try c.getTruthyPart(logical_lt), rt);
+                },
+                .amp_amp_eq => {
+                    const falsy = try c.getFalsyPart(logical_lt, false);
+                    if (try c.getTruthyPart(logical_lt) == types.never_type) return logical_lt;
+                    return c.logicalUnion(falsy, rt);
+                },
+                else => {
+                    if (!try c.canBeNullish(logical_lt, 0)) return logical_lt;
+                    return c.logicalUnion(try c.nonNullableNullish(logical_lt), rt);
+                },
+            }
         },
         // `+=`, `-=`, `*=`, … : the operation's RESULT is what gets stored,
         // so tsc runs the same assignability check `=` runs, with the
@@ -5293,22 +5347,10 @@ fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
         // `*=` alike), so `x1 *= {}` reports the same TS2362/TS2363 on its
         // operands that `x1 * {}` does, and `b |= b` the same TS2447.
         else => {
-            // The operand is the target READ, not the target WRITE: tsc
-            // classifies `checkExpression(left)` and only `checkAssignment
-            // Operator` consults the write type. The two differ wherever a
-            // property has a wider setter than getter (`get x(): number` /
-            // `set x(v: number | undefined)`) and wherever the flow has
-            // narrowed the target (`if (this.z) this.z += dz`), and reading
-            // the write type there rejected code tsc accepts. Re-checking
-            // `d.lhs` as an expression cannot double-report: `diagFmt`
-            // dedupes on (file, code, span).
-            const saved_write_target = c.write_target_node;
-            c.write_target_node = c.nodeKey(d.lhs);
             const read_t = if (target_t == types.error_type)
                 types.error_type
             else
-                try c.checkExprCached(d.lhs, types.no_type);
-            c.write_target_node = saved_write_target;
+                try readOfAssignTarget(c, d.lhs);
             const lt = try baseOfLiteralType(c, read_t);
             const res = if (op == .plus_eq)
                 try checkPlusOperands(c, node, lt, rt, d.lhs, d.rhs)
