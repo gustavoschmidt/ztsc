@@ -48,6 +48,7 @@ const hasTypeMeaning = @import("names.zig").hasTypeMeaning;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
 const identity = @import("identity.zig");
 const indexableConstituent = @import("typenode.zig").indexableConstituent;
+const negatedBigIntLiteral = @import("typenode.zig").negatedBigIntLiteral;
 const init = Checker.init;
 const instantiate = @import("enums.zig").instantiate;
 const isNonPrimitiveKind = @import("assign.zig").isNonPrimitiveKind;
@@ -1491,6 +1492,21 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             }
         }
     }
+    // tsc's `isTupleLikeType` has a third disjunct beyond "is a tuple" and
+    // "has a property named `0`": an ARRAY-LIKE whose `length` type is
+    // entirely number LITERALS is tuple-like. An INTERSECTION is where that
+    // shape hides — `type fixed1 = [...number[]] & { length: 2 }` (the #29311
+    // repro in `contextualTypeWithTuple`) is array-like from the tuple half
+    // and pins `length` to `2` from the object half, so tsc contextually types
+    // `[0, 0]` as `[number, number]`. ztsc read no tuple context, built
+    // `number[]`, and `number[]`'s `length` is `number` — a false TS2322. The
+    // pin also makes arity real: `[0, 0, 0]` is TS2322 `'3'` vs `'2'`
+    // (tsgo-verified), which the array reading could never report.
+    if (ctx_tuple_ty == types.no_type and rctx != types.no_type and
+        c.ts.kind(rctx) == .intersection and try tupleLikeByLength(c, rctx))
+    {
+        ctx_tuple_ty = rctx;
+    }
     const ctx_tuple = ctx_tuple_ty != types.no_type;
     // Contextual element type for a plain (non-tuple) array literal. A
     // direct array context yields its element; a union context contributes
@@ -1601,6 +1617,7 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             continue;
         }
         var ectx: TypeId = ctx_elem;
+        var ectx_src: TypeId = types.no_type;
         if (ctx_tuple) {
             // A UNION contextual type contributes what EVERY constituent
             // holds at this index, not just the one tuple that put the
@@ -1612,7 +1629,8 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // [number, number]]` is the case: reading only the first tuple
             // gives the inner literal a contextual `number`, so it widens to
             // `number[]` and matches neither branch.
-            ectx = try contextualElemTypeAt(c, if (c.ts.kind(rctx) == .union_type) rctx else ctx_tuple_ty, i, lit_len);
+            ectx_src = if (c.ts.kind(rctx) == .union_type) rctx else ctx_tuple_ty;
+            ectx = try contextualElemTypeAt(c, ectx_src, i, lit_len);
         }
         // An element of an array literal is the one place a NON-CALLABLE tag
         // gets a different diagnostic (`checkTaggedTemplate`'s TS2796); ztsc
@@ -1623,7 +1641,14 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         const raw = try c.checkExprCached(el, ectx);
         c.array_elem = prev_elem;
         var et = raw;
-        if (!try keepLiteral(c, et, ectx)) et = try c.widenLiteral(et);
+        // In TUPLE context the question goes to the un-reduced union — see
+        // `elemCtxKeepsLiteral`. `ectx` itself is the reduced one, and stays
+        // the type the element expression was checked against.
+        const keeps = if (ctx_tuple)
+            try elemCtxKeepsLiteral(c, ectx_src, i, lit_len, et)
+        else
+            try keepLiteral(c, et, ectx);
+        if (!keeps) et = try c.widenLiteral(et);
         // tsc's `checkExpressionForMutableLocation` ends
         // `getWidenedLiteralLikeTypeForContextualType` with
         // `getRegularTypeOfLiteralType` on BOTH arms: an element whose literal
@@ -1915,8 +1940,94 @@ fn contextualElemTypeAt(c: *Checker, rctx: TypeId, i: u32, length: ?u32) Error!T
             const idx = c.ts.objectNumberIndex(rctx);
             return if (idx != 0) idx else types.no_type;
         },
+        // tsc reads the position off the WHOLE type
+        // (`getTypeOfPropertyOfContextualType(t, "" + i)`), so an intersection
+        // answers from whichever constituent declares it — the `[...number[]]`
+        // half of `[...number[]] & { length: 2 }`, never the `{ length: 2 }`
+        // half. Constituents that agree contribute an intersection, which is
+        // what a property of an intersection type is; the NO-REDUCE spelling
+        // because this is a contextual read, not a declared type.
+        .intersection => {
+            var parts: std.ArrayList(TypeId) = .empty;
+            defer parts.deinit(c.scratch());
+            for (try c.memberList(rctx)) |m| {
+                const e = try contextualElemTypeAt(c, try c.resolveStructural(m), i, length);
+                if (e != types.no_type) try parts.append(c.scratch(), e);
+            }
+            if (parts.items.len == 0) return types.no_type;
+            if (parts.items.len == 1) return parts.items[0];
+            return c.ts.makeIntersectionNoReduce(c.scratch(), parts.items);
+        },
         else => return types.no_type,
     }
+}
+
+/// tsc's `isTupleLikeType` third disjunct: `isArrayLikeType(type) &&
+/// getTypeOfPropertyOfType(type, "length")` exists and is entirely number
+/// LITERALS. Asked only of an INTERSECTION — the one form that can be
+/// array-like without being a `.tuple` while still pinning `length` to a
+/// literal. A bare `T[]` is array-like too, but its `length` is `number`, so
+/// the disjunct could never fire for it; restricting the question keeps the
+/// property lookup off the ordinary array-literal path entirely.
+fn tupleLikeByLength(c: *Checker, r: TypeId) Error!bool {
+    var array_like = false;
+    for (try c.memberList(r)) |m| {
+        switch (c.ts.kind(try c.resolveStructural(m))) {
+            .array, .tuple => array_like = true,
+            else => {},
+        }
+    }
+    if (!array_like) return false;
+    const len = (try c.propOfType(r, c.atom_length)) orelse return false;
+    return allNumberLiterals(c, try c.resolveStructural(len.ty));
+}
+
+/// tsc's `everyType(lengthType, t => !!(t.flags & TypeFlags.NumberLiteral))`.
+fn allNumberLiterals(c: *Checker, t: TypeId) Error!bool {
+    if (c.ts.kind(t) == .union_type) {
+        for (try c.memberList(t)) |m| {
+            if (!try allNumberLiterals(c, try c.resolveStructural(m))) return false;
+        }
+        return true;
+    }
+    return switch (c.ts.kind(t)) {
+        .number_literal, .number_literal_fresh => true,
+        else => false,
+    };
+}
+
+/// `keepLiteral` for an element position whose contextual type comes from
+/// `contextualElemTypeAt`, asked of the UN-REDUCED union tsc would have built.
+///
+/// tsc reads a contextual element type through
+/// `getTypeOfPropertyOfContextualType`, whose `mapType(…, /*noReductions*/
+/// true)` ends in `getUnionType(mapped, UnionReduction.None)`. The
+/// `AnyOrUnknown` early return that collapses `"a" | any` to `any` sits INSIDE
+/// `if (unionReduction !== UnionReduction.None)`, so the union tsc hands the
+/// element still HAS its literal constituents — and
+/// `isLiteralOfContextualType` recurses through a union (`some(types, …)`) and
+/// finds them.
+///
+/// `unionTypeWithIndexAndTuple` is the shape: `f(args: ["a"] | I)` where `I`
+/// has `[index: number]: any`. Position 0 contributes `"a"` from the tuple and
+/// `any` from the interface's numeric index; reduced, the element is typed by
+/// `any`, `"a"` widens to `string`, the literal becomes `string[]` and matches
+/// neither branch (a false TS2345).
+///
+/// ztsc's `makeUnion` always reduces and `internType` is private to the store,
+/// so there is no unreduced union to hand back as `ectx`. But the only thing
+/// the reduction destroys is this predicate's answer, and the predicate over a
+/// union is a `some` — so ask it per CONSTITUENT, which is exactly what the
+/// unreduced union would have answered. The contextual type flowing into the
+/// element expression stays the reduced one, as it already was.
+fn elemCtxKeepsLiteral(c: *Checker, rctx: TypeId, i: u32, length: ?u32, cand: TypeId) Error!bool {
+    if (c.ts.kind(rctx) == .union_type) {
+        for (try c.memberList(rctx)) |m| {
+            if (try elemCtxKeepsLiteral(c, try c.resolveStructural(m), i, length, cand)) return true;
+        }
+        return false;
+    }
+    return keepLiteral(c, cand, try contextualElemTypeAt(c, rctx, i, length));
 }
 
 /// True when a (structurally resolved) union contextual type has two or
@@ -2587,23 +2698,6 @@ fn distributableSpreads(c: *Checker, node: Node, out: *std.ArrayList(DistSpread)
     }
 }
 
-/// The NOMINAL member atom an object literal's computed key `[expr]` declares,
-/// or null when the key names no static property (tsc's `isLateBindableName`
-/// answering false).
-///
-/// The two spellings are asked in the same order every other side of the
-/// checker asks them: a WELL-KNOWN symbol is keyed syntactically as
-/// `__@iterator` (the binder's `memberKey` and the element access in
-/// `indexChainInner` both do it that way), and only then does a general
-/// `unique symbol` key take its nominal `__@u<id>`. Order is load-bearing
-/// because in the real lib `Symbol.iterator` IS a `unique symbol`: keyed by
-/// the nominal id, `{ [Symbol.iterator]: 0 }` declared a member that no reader
-/// of `o[Symbol.iterator]` could ever find (`symbolProperty18`).
-fn symbolKeyAtom(c: *Checker, key_expr: Node, key_type: TypeId) Error!?Atom {
-    if (c.wellKnownKeyOfExpr(key_expr)) |wk| return try c.atom(wk);
-    return c.uniqueSymAtom(key_type);
-}
-
 fn checkObjectLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     const t = try objectLiteralWhole(c, node, ctx);
     // Duplicate keys — tsc's `checkGrammarObjectLiteralExpression`. Run AFTER
@@ -2984,49 +3078,36 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                     const kt = try c.checkExprCached(key_expr, types.no_type);
                     // TS2464. (wave-8 D: one flagged call into `computed_key.zig`.)
                     try computed_key.report(c, pd.lhs, kt);
-                    // A `unique symbol` key names a real, nominally-keyed
-                    // property (`{ [k]: v }`); any other computed key stays
-                    // dynamic (no static member).
-                    if (try symbolKeyAtom(c, key_expr, kt)) |key| {
-                        const pctx = try c.ctxPropType(rctx, ctx, key);
-                        var vt = try c.checkExprCached(pd.rhs, pctx);
-                        if (c.const_ctx) {
-                            vt = try c.ts.regularLiteral(vt);
-                        } else if (!try keepLiteral(c, vt, pctx)) vt = try c.widenPropValue(vt);
-                        try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
-                        continue;
-                    }
-                    // A qualified enum-member computed key (`{ [Breed.X]: v
-                    // }`): the key is the member's *value*, which a computed
-                    // member leaves unknown, so — exactly like the
-                    // type-literal/interface member — key it by the
-                    // text-derived `__@k$<obj>.<member>` placeholder. This
-                    // makes the literal match a `{ [Breed.X]: … }` target
-                    // (whose members the binder keys the same way) instead of
-                    // dropping the property and collapsing to `{}`.
-                    if (c.ts.kind(try c.resolveStructural(kt)) == .enum_type and
-                        c.nodeTag(key_expr) == .member_expr)
-                    {
-                        const member_tok = c.tree.nodeData(key_expr).rhs;
-                        const key = try c.computedSymKey(member_tok, ast.Flags.computed_sym | ast.Flags.computed_sym_qual, c.cur_scope);
-                        const pctx = try c.ctxPropType(rctx, ctx, key);
-                        var vt = try c.checkExprCached(pd.rhs, pctx);
-                        if (c.const_ctx) {
-                            vt = try c.ts.regularLiteral(vt);
-                        } else if (!try keepLiteral(c, vt, pctx)) vt = try c.widenPropValue(vt);
-                        try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
-                        continue;
-                    }
-                    // Non-symbol computed key (`{ [expr]: v }`): a `string`-
-                    // or `number`-widening key contributes an index
-                    // signature; a literal key names a real property. The
-                    // value is contextually typed by the target's matching
-                    // property/index (so `value: STATUS` under a `Record<…>`
-                    // context keeps its literal instead of widening).
                     const rk = try c.resolveStructural(kt);
                     const key_kind = c.ts.kind(rk);
+                    // A NUMERIC key contributes a number INDEX SIGNATURE in
+                    // ztsc's model, never a named member, so it is held back
+                    // from the late-bound question below (which does name it —
+                    // tsc late-binds `[0]` to the member `"0"`, and the excess
+                    // -property scan asks `computed_key.lateBoundName` for
+                    // exactly that name). Everything else late-bindable — a
+                    // well-known symbol, a `unique symbol` const, a string
+                    // literal, a qualified enum member — names a real property.
+                    const named: ?Atom = switch (key_kind) {
+                        .number, .number_literal, .number_literal_fresh => null,
+                        else => try computed_key.lateBoundName(c, key_expr, kt),
+                    };
+                    if (named) |key| {
+                        const pctx = try c.ctxPropType(rctx, ctx, key);
+                        var vt = try c.checkExprCached(pd.rhs, pctx);
+                        if (c.const_ctx) {
+                            vt = try c.ts.regularLiteral(vt);
+                        } else if (!try propCtxKeepsLiteral(c, rctx, ctx, key, vt)) vt = try c.widenPropValue(vt);
+                        try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
+                        continue;
+                    }
+                    // A DYNAMIC computed key (`{ [expr]: v }`): a `string`- or
+                    // `number`-widening key contributes an index signature and
+                    // anything else contributes nothing. The value is still
+                    // contextually typed by the target's matching index (so
+                    // `value: STATUS` under a `Record<…>` context keeps its
+                    // literal instead of widening).
                     const pctx: TypeId = if (rctx == types.no_type) types.no_type else switch (key_kind) {
-                        .string_literal => try c.ctxPropType(rctx, ctx, c.ts.dataA(rk)),
                         .string, .template_literal_type, .string_mapping => try ctxIndexType(c, rctx, false),
                         .number, .number_literal, .number_literal_fresh => try ctxIndexType(c, rctx, true),
                         else => types.no_type,
@@ -3036,9 +3117,6 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                         vt = try c.ts.regularLiteral(vt);
                     } else if (!try keepLiteral(c, vt, pctx)) vt = try c.widenPropValue(vt);
                     switch (key_kind) {
-                        .string_literal => {
-                            try upsertProp(c.scratch(), &props, &prop_index, .{ .name = c.ts.dataA(rk), .ty = vt });
-                        },
                         .string, .template_literal_type, .string_mapping => try str_index_vals.append(c.scratch(), vt),
                         .number, .number_literal, .number_literal_fresh => try num_index_vals.append(c.scratch(), vt),
                         else => {}, // symbol/unknown/other: no static member
@@ -3050,16 +3128,15 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                 var vt = try c.checkExprCached(pd.rhs, pctx);
                 if (c.const_ctx) {
                     vt = try c.ts.regularLiteral(vt);
-                } else if (!try keepLiteral(c, vt, pctx)) vt = try c.widenPropValue(vt);
+                } else if (!try propCtxKeepsLiteral(c, rctx, ctx, key, vt)) vt = try c.widenPropValue(vt);
                 try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
             },
             .object_shorthand => {
                 const key = try c.memberAtom(c.tree.nodeMainToken(prop));
                 var vt = try c.checkExprCached(pd.lhs, types.no_type);
-                const pctx = try c.ctxPropType(rctx, ctx, key);
                 if (c.const_ctx) {
                     vt = try c.ts.regularLiteral(vt);
-                } else if (!try keepLiteral(c, vt, pctx)) vt = try c.widenPropValue(vt);
+                } else if (!try propCtxKeepsLiteral(c, rctx, ctx, key, vt)) vt = try c.widenPropValue(vt);
                 if (pd.rhs != 0) _ = try c.checkExprCached(pd.rhs, types.no_type);
                 try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
             },
@@ -3343,6 +3420,32 @@ fn ctxIndexType(c: *Checker, rctx: TypeId, want_number: bool) Error!TypeId {
 
 /// Contextual type for property `key` of an object literal typed by
 /// `ctx` (unions: union of the property across constituents).
+/// `keepLiteral` for an object-literal PROPERTY whose contextual type comes
+/// from `ctxPropType`, asked of the UN-REDUCED union tsc would have built —
+/// the object-literal twin of `elemCtxKeepsLiteral`, and the same mechanic for
+/// the same reason: `getTypeOfPropertyOfContextualType` maps over the union
+/// with `UnionReduction.None`, so the `AnyOrUnknown` collapse never runs and
+/// `isLiteralOfContextualType` still finds a literal constituent beside an
+/// `any` one.
+///
+/// `f(p: { a: "x" } | I)` where `I` has `[k: string]: any` is the live shape:
+/// property `a` contributes `"x"` from one constituent and `any` from the
+/// other's index signature, reduced to `any`, so `f({ a: "x" })` widened to
+/// `{ a: string }` and matched neither arm — a false TS2345 (and a false
+/// TS2322 for the same literal nested in an array).
+///
+/// Only the union arm can differ: for every other kind this is exactly
+/// `keepLiteral(cand, ctxPropType(…))`, which is what it calls.
+fn propCtxKeepsLiteral(c: *Checker, rctx: TypeId, ctx: TypeId, key: Atom, cand: TypeId) Error!bool {
+    if (c.ts.kind(rctx) == .union_type) {
+        for (try c.memberList(rctx)) |m| {
+            if (try propCtxKeepsLiteral(c, try c.resolveStructural(m), ctx, key, cand)) return true;
+        }
+        return false;
+    }
+    return keepLiteral(c, cand, try ctxPropType(c, rctx, ctx, key));
+}
+
 pub fn ctxPropType(c: *Checker, rctx: TypeId, ctx: TypeId, key: Atom) Error!TypeId {
     if (ctx == types.no_type) return types.no_type;
     switch (c.ts.kind(rctx)) {
@@ -4560,6 +4663,15 @@ fn checkPrefixUnary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             _ = try checkNonNullType(c, ot, d.lhs);
             _ = try reportSymbolOperand(c, node, d.lhs, d.lhs, ot, ot);
             if (try signedNumberLiteral(c, d.lhs, true)) |lit| return lit;
+            // tsc's `checkPrefixUnaryExpression` folds a MINUS over a bigint
+            // literal into a fresh literal type of its own
+            // (`getFreshTypeOfLiteralType(getBigIntLiteralType({ negative:
+            // true, … }))`), exactly as it folds one over a numeric literal
+            // just above. Without it `let x: -1n = -1n` failed on its own
+            // spelling: `-1n` coerced to plain `bigint`.
+            if (c.nodeTag(d.lhs) == .bigint_literal) {
+                return negatedBigIntLiteral(c, c.tree.nodeMainToken(d.lhs), true);
+            }
             // `bigint` only when the operand actually CARRIES a bigint
             // constituent: tsc's getUnaryResultType tests
             // `maybeTypeOfKind(t, BigIntLike)`, not assignability, so the

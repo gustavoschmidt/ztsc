@@ -95,6 +95,21 @@ pub fn checkFileAliases(c: *Checker) Error!void {
 /// is a handful of hops at most; the bound is what makes a CYCLE terminate.
 const max_hops = 8;
 
+/// Does `import X = <entity>` name a target with TYPE meaning?
+///
+/// tsc's `checkImportEqualsDeclaration` guards a second rule on exactly this
+/// question — `if (target.flags & SymbolFlags.Type) checkTypeNameIsReserved(
+/// node.name, Import_name_cannot_be_0)`, the TS2438 `reserved_names.zig`
+/// reports — and it is the same `resolveAlias` walk TS2440 already runs here,
+/// so it is asked of this module rather than duplicated. Only reachable for an
+/// alias whose NAME is a predefined type name, which is why the walk's cost
+/// never lands on ordinary code.
+pub fn entityTargetHasTypeMeaning(c: *Checker, entity: Node) Error!bool {
+    const target = (try entitySym(c, entity)) orelse return false;
+    const m = (try symMeanings(c, target, max_hops)) orelse return false;
+    return m.type_space;
+}
+
 /// The meanings of `resolveAlias(sym)`, or null when the target does not
 /// resolve — tsc's `target !== unknownSymbol` guard, which is why an import of
 /// a name the module does not export (`import d, { x } from "./m"`) earns
