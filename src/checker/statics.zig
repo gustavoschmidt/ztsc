@@ -229,7 +229,20 @@ fn selfExtendingClass(c: *Checker, sym: SymbolId) Error!bool {
 
 /// Static side of a class (statics as object props; construct handled
 /// separately by `new` resolution).
-pub fn classStaticType(c: *Checker, sym: SymbolId) Error!TypeId {
+pub fn classStaticType(c: *Checker, sym0: SymbolId) Error!TypeId {
+    // Normalize to the cross-file MERGED symbol, exactly as the instance side
+    // does (`classInstanceGeneric`): in tsc there is only ever one symbol
+    // after merging, so `typeof X` must carry every contributor's statics
+    // whichever id the caller happened to hold. A named import reaches this
+    // through `targetValueType`'s raw `(file, local)` target, so
+    // `declare module "./observable" { namespace Observable { let v } }`
+    // against `export declare class Observable` + `export namespace
+    // Observable` was visible through `import * as O` (which routes the id
+    // through `mergedOf` itself) and invisible through `import { Observable }`
+    // — the whole `moduleAugmentation{ExtendFileModule2,ExtendAmbientModule2,
+    // DeclarationEmit2}` family. Normalizing BEFORE the cache probe keeps one
+    // entry per entity rather than one per spelling.
+    const sym = c.prog.mergedOf(sym0) orelse sym0;
     // Only complete objects are ever memoized, so a hit is never cut.
     if (c.class_static_cache.get(sym)) |t| {
         c.class_static_cut = false;
