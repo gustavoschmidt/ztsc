@@ -1403,6 +1403,9 @@ fn checkInstanceSideExtends(c: *Checker, class_sym: SymbolId, members: []const N
     if (try c.hasUnresolvedBase(class_sym)) return true;
     // Windowed and bounded — see `relatesToBase`.
     if (try relatesToBase(c, this_t, base_ref)) return true;
+    if (try privateShadowNeutralized(c, this_t, base_ref)) |neutral| {
+        if (try relatesToBase(c, neutral, base_ref)) return true;
+    }
 
     const issued = try issueMemberSpecificError(c, members, this_t, base_ref);
     if (!issued and name_token != 0) {
@@ -1413,6 +1416,67 @@ fn checkInstanceSideExtends(c: *Checker, class_sym: SymbolId, members: []const N
         });
     }
     return false;
+}
+
+/// `derived` with every `#name` property it SHADOWS from the base restored to
+/// the base's own, or null when it shadows none.
+///
+/// tsc names each `#foo` declaration `__#<id>@foo`, so a derived class's
+/// `#foo` is a DIFFERENT property from its base's and the base's stays on the
+/// derived instance type untouched — which is why
+///
+///     class A { #foo: number }
+///     class B extends A { #foo: string }
+///
+/// is not an error at all (`privateNamesAndFields`). ztsc keys both under the
+/// atom `#foo`, so the derived declaration overwrites the inherited entry and
+/// the pair reads as an incompatible override.
+///
+/// Giving private names per-class atoms is the faithful fix, but the atom is
+/// what every diagnostic prints as the member's name, so the synthetic key
+/// would leak into TS2339/TS2416/`keyof` messages. Undoing the shadowing for
+/// the one question that asks it keeps the identity where it is needed and
+/// the spelling where the user reads it. Only reached once the plain relation
+/// has already failed, so it costs nothing on a class that extends cleanly.
+fn privateShadowNeutralized(c: *Checker, derived: TypeId, base: TypeId) Error!?TypeId {
+    const d = try c.resolveStructural(derived);
+    if (c.ts.kind(d) != .object) return null;
+    const b = try c.resolveStructural(base);
+    var props: std.ArrayList(types.Prop) = .empty;
+    defer props.deinit(c.scratch());
+    var shadowed = false;
+    for (0..c.ts.objectPropCount(d)) |i| {
+        var p = c.ts.objectProp(d, @intCast(i));
+        const text = c.atomText(p.name);
+        if (text.len != 0 and text[0] == '#') {
+            if (try c.propOfTypeEx(b, p.name, false)) |bp| {
+                if (bp.ty != p.ty) {
+                    p = bp;
+                    shadowed = true;
+                }
+            }
+        }
+        try props.append(c.scratch(), p);
+    }
+    if (!shadowed) return null;
+    var calls: std.ArrayList(TypeId) = .empty;
+    defer calls.deinit(c.scratch());
+    for (0..c.ts.objectCallSigCount(d)) |i| {
+        try calls.append(c.scratch(), c.ts.objectCallSig(d, @intCast(i)));
+    }
+    var ctors: std.ArrayList(TypeId) = .empty;
+    defer ctors.deinit(c.scratch());
+    for (0..c.ts.objectConstructSigCount(d)) |i| {
+        try ctors.append(c.scratch(), c.ts.objectConstructSig(d, @intCast(i)));
+    }
+    return try c.ts.makeObjectSigs(
+        props.items,
+        c.ts.objectStringIndex(d),
+        c.ts.objectNumberIndex(d),
+        c.ts.objectFlags(d),
+        calls.items,
+        ctors.items,
+    );
 }
 
 /// Does an `implements` clause name a CLASS? tsc's `checkClassLikeDeclaration`
