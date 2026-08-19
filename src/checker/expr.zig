@@ -555,6 +555,15 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // (`Generator<T>`). Delegation `yield* x` (rhs=1) is unchecked
             // (iterable-protocol; a gap). `yield`'s own value type is `any`
             // (the caller-supplied `.next(v)` value — TNext, out of subset).
+            // …but only inside a generator. tsc's `checkYieldExpression`
+            // bails to `any` the moment `getContainingFunction` yields
+            // nothing or a non-generator, BEFORE it ever looks at the
+            // operand — so `class C { foo() { yield foo } }` is TS1163 and
+            // nothing else, where checking the operand would add a TS2304
+            // tsgo never reports. The question is syntactic, so it takes the
+            // scope walk rather than the dynamic `fn_ctx` (see
+            // `enclosingFnIsGenerator`).
+            if (!enclosingFnIsGenerator(c)) return types.any_type;
             const yt: TypeId = if (c.fn_ctx) |fc| fc.yield_type else 0;
             const in_async = if (c.fn_ctx) |fc| fc.is_async else false;
             const delegate = d.rhs != 0;
@@ -592,6 +601,37 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             return types.any_type;
         },
     }
+}
+
+/// Is the function lexically enclosing the node now being checked a
+/// generator? False at the top level of the file (no enclosing function) —
+/// the sibling of `Checker.enclosingFnIsAsync`, and syntactic for the same
+/// reason: `yield`'s legality is a property of the parser's `YieldContext`,
+/// while `fn_ctx` describes whichever frame happens to be in flight when a
+/// contextual type re-checks the expression.
+///
+/// An arrow is not transparent: `function* g() { const f = () => yield 1 }`
+/// has the ARROW as its containing function, which is exactly why the
+/// `yield` there is not a yield at all.
+fn enclosingFnIsGenerator(c: *const Checker) bool {
+    var cur = c.cur_scope;
+    while (cur != binder.file_scope) {
+        if (c.bind.scope_kinds[cur] == .function) {
+            const owner = c.bind.scope_owners[cur];
+            if (owner == ast.null_node) return false;
+            const flags = switch (c.tree.nodeTag(owner)) {
+                .arrow_fn, .function_expr, .function_decl, .class_method, .function_type => c.tree.extraData(ast.FnProto, c.tree.nodeData(owner).lhs).flags,
+                // A class `static { … }` block — the one `.function` scope
+                // owned by a `.block` (see `bindClass`). It is function-like
+                // to tsc's `getContainingFunction` and never a generator.
+                .block => return false,
+                else => return false,
+            };
+            return flags & ast.Flags.generator != 0;
+        }
+        cur = c.bind.scope_parents[cur];
+    }
+    return false;
 }
 
 // =====================================================================
