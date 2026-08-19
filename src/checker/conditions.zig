@@ -576,8 +576,18 @@ fn testedRef(c: *Checker, loc: Node, name_tok: ast.TokenIndex) Error!TestedRef {
                 out.len += 1;
                 n = skipParens(c, c.tree.nodeData(n).lhs);
             },
-            .identifier, .this_expr => {
-                out.buf[out.len] = if (c.nodeTag(n) == .this_expr) "this" else c.tokenText(c.tree.nodeMainToken(n));
+            // `super` roots a path exactly as `this` does — tsc compares the
+            // property SYMBOL, and `super.m` and `super.m()` name the same one,
+            // so `super.m && super.m()` is excused like every other pair.
+            // Without the arm the walk falls through to the bare-name fallback
+            // below, whose one-component path `chainUsesRef` cannot match
+            // against a member access (`controlFlowSuperPropertyAccess`).
+            .identifier, .this_expr, .super_expr => {
+                out.buf[out.len] = switch (c.nodeTag(n)) {
+                    .this_expr => "this",
+                    .super_expr => "super",
+                    else => c.tokenText(c.tree.nodeMainToken(n)),
+                };
                 out.len += 1;
                 std.mem.reverse([]const u8, out.buf[0..out.len]);
                 return out;

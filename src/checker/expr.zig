@@ -3627,6 +3627,36 @@ fn enterConstraintPos(c: *Checker, ref: Node, index_expr: Node) narrowable.Const
 /// non-`?.` continuation whose object is *declared* nullish still reports
 /// TS2532/18047-9 via `checkNonNullType` (the marker distinguishes the
 /// chain's own undefined from an inherently-nullable intermediate).
+/// The type of a `super` RECEIVER — the object half of `super.x` — or null
+/// when `recv` is not `super` (or the enclosing receiver is not a class
+/// instance, in which case the old `any` stands).
+///
+/// tsc's `checkSuperExpression` answers `getTypeWithThisArgument(baseClass
+/// Type, classType.thisType)` here: the base class's INSTANCE type, which is
+/// what makes `super.foo({ method(p) {…} })` contextually type `p` from the
+/// base's parameter (`superCallParameterContextualTyping3`) instead of
+/// leaving it an implicit any.
+///
+/// A super CALL is deliberately NOT this, which is why the `.super_expr` arm
+/// of `checkExpr` still answers `any`: tsc's `resolveCallExpression` never
+/// types `super` as a value in call position at all, resolving instead against
+/// the base's CONSTRUCT signatures (`calls.superCtorSigs`). Typing the keyword
+/// itself would hand `super(…)` a non-callable object type on every shape that
+/// path declines.
+///
+/// Null for a STATIC member too: `super` there is the base's static side,
+/// which ztsc does not model — `c.this_type` is a `.class_value`, not a `.ref`.
+fn superReceiverType(c: *Checker, recv: Node) Error!?TypeId {
+    if (c.nodeTag(recv) != .super_expr) return null;
+    const t = c.this_type;
+    if (t == 0) return null;
+    // Inside a method the receiver is the POLYMORPHIC `this` (see
+    // `signatureOfProtoCtx`); the class it stands for is what has the base.
+    const inst = if (c.ts.kind(t) == .this_type) c.ts.thisTypeInstance(t) else t;
+    if (c.ts.kind(inst) != .ref) return null;
+    return c.baseClassRef(c.ts.refSymbol(inst));
+}
+
 fn memberChainInner(c: *Checker, node: Node, ctx: TypeId) Error!ChainLink {
     const d = c.tree.nodeData(node);
     const own_optional = c.nodeTag(node) == .optional_member_expr;
@@ -3641,6 +3671,7 @@ fn memberChainInner(c: *Checker, node: Node, ctx: TypeId) Error!ChainLink {
             if (link.chained) chained = true;
             break :obj link.ty;
         }
+        if (try superReceiverType(c, d.lhs)) |st| break :obj st;
         break :obj try c.checkExprCached(d.lhs, types.no_type);
     };
     const name_tok: TokenIndex = d.rhs;
@@ -3657,17 +3688,18 @@ fn memberChainInner(c: *Checker, node: Node, ctx: TypeId) Error!ChainLink {
     // `checkAssignmentTarget` has already judged it as a WRITE; tsc runs one
     // accessibility check per access node, so the re-read must not run a
     // second one in the opposite direction (`accessibility.Dir`).
-    const site: accessibility.Site = .{
+    var site: accessibility.Site = .{
         .dir = if (c.write_target_node != 0 and c.nodeKey(node) == c.write_target_node) .none else .read,
         .recv_node = d.lhs,
     };
     // `super.x` on a base-class FIELD is TS2855, and it is a question about the
-    // DECLARATION rather than about the receiver's type — which is what makes it
-    // reachable at all: `super` types as `any` here, so no property lookup runs.
-    // `.none` is the compound-assignment re-read, whose write half already ran
-    // this (see `checkAssignmentTarget`).
+    // DECLARATION rather than about the receiver's type. `.none` is the
+    // compound-assignment re-read, whose write half already ran this (see
+    // `checkAssignmentTarget`). Reporting it is tsc's early return out of
+    // `checkPropertyAccessibility`, so the `private`/`protected` rules are
+    // skipped for this access — which `.none` is exactly the spelling of.
     if (c.nodeTag(d.lhs) == .super_expr and site.dir != .none) {
-        try accessibility.checkSuperField(c, name, name_tok);
+        if (try accessibility.checkSuperField(c, name, name_tok)) site.dir = .none;
     }
     var pt = try propertyTypeOf(c, obj_t, name, name_tok, site);
     // A `#name` is resolved lexically before it is looked up, so an access
@@ -5807,13 +5839,18 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
         },
         .member_expr => {
             const d = c.tree.nodeData(node);
-            var obj_t = try c.checkExprCached(d.lhs, types.no_type);
+            var obj_t = (try superReceiverType(c, d.lhs)) orelse
+                try c.checkExprCached(d.lhs, types.no_type);
             obj_t = try checkNonNullType(c, obj_t, d.lhs);
             const name = try c.memberAtom(d.rhs);
             // `super.field = v` is TS2855 like the read is — tsc's
-            // `checkPropertyAccessibility` runs on both directions. See the
-            // read site in `memberChainInner`.
-            if (c.nodeTag(d.lhs) == .super_expr) try accessibility.checkSuperField(c, name, d.rhs);
+            // `checkPropertyAccessibility` runs on both directions, and its
+            // early return means the `private`/`protected` rules are skipped
+            // once it fires. See the read site in `memberChainInner`.
+            var super_field = false;
+            if (c.nodeTag(d.lhs) == .super_expr) {
+                super_field = try accessibility.checkSuperField(c, name, d.rhs);
+            }
             const r = try c.resolveStructural(obj_t);
             // A dotted write that resolves through a string INDEX SIGNATURE
             // rather than a declared member (`i.a = 1` on
@@ -5821,7 +5858,10 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
             // it does not suppress the assignability check.
             var via_index = false;
             if (try c.propOfTypeViaIndex(r, name, &via_index)) |p| {
-                const wsite: accessibility.Site = .{ .dir = .write, .recv_node = d.lhs };
+                const wsite: accessibility.Site = .{
+                    .dir = if (super_field) .none else .write,
+                    .recv_node = d.lhs,
+                };
                 // A `#name` write from outside the declaring class is the same
                 // TS18013 the read is (`Base.#prop = 10` in a derived class).
                 if (c.tree.tokens.tag(d.rhs) == .private_identifier) {

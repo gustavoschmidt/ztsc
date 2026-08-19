@@ -92,17 +92,28 @@ pub const Site = struct {
 
     /// tsc's `left.kind === SyntaxKind.ThisKeyword / SuperKeyword`.
     fn viaThis(site: Site, c: *Checker) bool {
+        return switch (site.recvTag(c)) {
+            .this_expr, .super_expr => true,
+            else => false,
+        };
+    }
+
+    /// tsc's `isSuper` — the `super` KEYWORD alone, which `this` does not share:
+    /// every protected member of a supertype is accessible through it, whatever
+    /// instance the access is otherwise reached on.
+    fn viaSuper(site: Site, c: *Checker) bool {
+        return site.recvTag(c) == .super_expr;
+    }
+
+    fn recvTag(site: Site, c: *Checker) ast.Tag {
         var n = site.recv_node;
-        if (n == ast.null_node) return false;
+        if (n == ast.null_node) return .error_node;
         while (c.nodeTag(n) == .paren_expr) {
             const inner = c.tree.nodeData(n).lhs;
             if (inner == ast.null_node) break;
             n = inner;
         }
-        return switch (c.nodeTag(n)) {
-            .this_expr, .super_expr => true,
-            else => false,
-        };
+        return c.nodeTag(n);
     }
 };
 
@@ -126,6 +137,14 @@ pub fn check(c: *Checker, recv: TypeId, name: Atom, name_tok: TokenIndex, site: 
         });
         return;
     }
+    // Property is known to be PROTECTED at this point, and tsc's next line is
+    // "all protected properties of a supertype are accessible in a super
+    // access" — an unconditional `if (isSuper) return true`, ahead of both the
+    // enclosing-class and the reached-through-an-instance rules. `super.m` in
+    // `class C extends B` reaches `B`'s protected `m` on a receiver typed `B`,
+    // which is not an instance of `C`, so the instance rule alone would make
+    // every such access a TS2446 (`controlFlowSuperPropertyAccess`).
+    if (site.viaSuper(c)) return;
     const enclosing = try enclosingDerived(c, found.cls) orelse {
         // tsc's "allow accessibility if the context is a function with a `this`
         // parameter" arm, which no lexical class covers: `function f(this: Foo) {
@@ -278,22 +297,25 @@ fn shadowsEnclosingClass(c: *Checker, lex_member: SymbolId, type_cls: SymbolId) 
 ///
 /// Reached from the `super`-receiver member-access sites only, so a program
 /// without `super.x` pays nothing.
-pub fn checkSuperField(c: *Checker, name: Atom, name_tok: TokenIndex) Error!void {
+/// Answers whether it REPORTED, which is tsc's early return: the caller must
+/// then skip the `private`/`protected` rules for this access.
+pub fn checkSuperField(c: *Checker, name: Atom, name_tok: TokenIndex) Error!bool {
     // The innermost enclosing class is the one whose base `super` names.
     var it = EnclosingClasses.init(c);
-    const cls = it.next(c) orelse return;
-    var sym = (try baseClassSymOf(c, cls)) orelse return;
+    const cls = it.next(c) orelse return false;
+    var sym = (try baseClassSymOf(c, cls)) orelse return false;
     var hops: u32 = 0;
     while (hops < 32) : (hops += 1) {
         // The FIRST base that declares the name is the one whose declarations
         // decide, exactly as the property lookup that found it would resolve.
         if (instanceMember(c, sym, name)) |msym| {
-            if (!allClassFields(c, msym)) return;
+            if (!allClassFields(c, msym)) return false;
             try c.diagFmt(2855, c.tokSpan(name_tok), "Class field '{s}' defined by the parent class is not accessible in the child class via super.", .{c.atomText(name)});
-            return;
+            return true;
         }
-        sym = (try baseClassSymOf(c, sym)) orelse return;
+        sym = (try baseClassSymOf(c, sym)) orelse return false;
     }
+    return false;
 }
 
 /// tsc's `isConflictingPrivateProperty` half of `getReducedType`: an
