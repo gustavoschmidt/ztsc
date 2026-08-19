@@ -1641,7 +1641,10 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         const raw = try c.checkExprCached(el, ectx);
         c.array_elem = prev_elem;
         var et = raw;
-        const keeps = if (ectx_src != types.no_type)
+        // In TUPLE context the question goes to the un-reduced union — see
+        // `elemCtxKeepsLiteral`. `ectx` itself is the reduced one, and stays
+        // the type the element expression was checked against.
+        const keeps = if (ctx_tuple)
             try elemCtxKeepsLiteral(c, ectx_src, i, lit_len, et)
         else
             try keepLiteral(c, et, ectx);
