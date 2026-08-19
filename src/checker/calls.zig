@@ -777,6 +777,28 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
                 defer starts.deinit(c.scratch());
                 for (try c.memberList(r)) |m| {
                     const before: u32 = @intCast(sigs.items.len);
+                    // The global `Function` is callable HERE too, even though
+                    // `isUntypedFunctionCall`'s last disjunct above excludes a
+                    // union outright (`!(funcType.flags & TypeFlags.Union)`).
+                    // tsc puts it in `resolveUnionTypeMembers` instead:
+                    //
+                    //     getUnionSignatures(map(type.types, t =>
+                    //         t === globalFunctionType ? [unknownSignature]
+                    //                                  : getSignaturesOfType(t, Call)))
+                    //
+                    // so a `Function` constituent contributes a wildcard rather
+                    // than the empty list that would make the union
+                    // non-callable. `Function | (() => object)` is the case
+                    // (`unionOfFunctionAndSignatureIsCallable`): the interface
+                    // body has no call signature, so the structural arm below
+                    // reported TS2349 where tsc calls it and yields the
+                    // error/`any` a wildcard signature resolves to. Tested on
+                    // the DECLARED constituent, which is tsc's own reference
+                    // identity check.
+                    if (c.ts.kind(m) == .ref and c.globalSymNamed(c.ts.refSymbol(m), "Function")) {
+                        saw_any = true;
+                        continue;
+                    }
                     const rm = try c.resolveStructural(m);
                     switch (c.ts.kind(rm)) {
                         .any, .err => saw_any = true,
@@ -1063,12 +1085,19 @@ pub fn resolveSignatureCall(
     var arg_err_count: usize = 0;
     var last_arg_err: TypeId = types.no_type;
     var arity: ArityTally = .{};
+    // …and a written TYPE-ARGUMENT list has a pile of its own, which
+    // `reportCallResolutionErrors` reports out of only when both the others
+    // are empty (`signaturesWithCorrectTypeArgumentArity.length === 0`).
+    var targ_arity_ok: usize = 0;
     for (sigs) |sig| {
         // With explicit type arguments, only a signature with the matching
         // type-parameter count is a candidate (tsc). Skips e.g. the
         // non-generic `new (): Map<any, any>` when `new Map<K, V>()` names
         // two type args, so the generic overload is chosen instead.
-        if (explicit_targs.len > 0 and !c.sigTargArityOk(sig, explicit_targs.len)) continue;
+        if (explicit_targs.len > 0) {
+            if (!c.sigTargArityOk(sig, explicit_targs.len)) continue;
+            targ_arity_ok += 1;
+        }
         // A candidate's TYPE-ARGUMENT INFERENCE is as speculative as the
         // argument check that follows it. Inference contextually types every
         // function argument by this candidate's parameter (`partialParamCtx`
@@ -1158,6 +1187,29 @@ pub fn resolveSignatureCall(
     //     return createDiagnosticForNode(args[spreadIndex], Diagnostics.A_spread_argument_must_either_have_a_tuple_type_or_be_passed_to_a_rest_parameter);
     // }
     // ```
+    // …but a written TYPE-ARGUMENT list that fits NO overload is answered
+    // before the argument count is ever discussed. tsc's
+    // `reportCallResolutionErrors` reaches its last `else` with both rejection
+    // piles empty and asks the type-argument question first:
+    //
+    // ```
+    // const signaturesWithCorrectTypeArgumentArity =
+    //     filter(signatures, s => hasCorrectTypeArgumentArity(s, typeArguments));
+    // if (signaturesWithCorrectTypeArgumentArity.length === 0) {
+    //     diagnostics.add(getTypeArgumentArityError(node, signatures, typeArguments, headMessage));
+    // }
+    // ```
+    //
+    // `new Map<string>()` is the case (`newMap`): every `MapConstructor`
+    // overload takes 0 or 2 type parameters, so nothing reaches argument
+    // checking and ztsc fell through to a TS2769 about arguments that were
+    // never the problem.
+    if (arg_err_count == 0 and explicit_targs.len > 0 and targ_arity_ok == 0) {
+        try reportTargArityError(c, node, sigs, explicit_targs.len);
+        const inst_one = try instantiateFallbackSig(c, sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
+        try typeArgsAfterFailure(c, inst_one, arg_nodes);
+        return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst_one);
+    }
     if (arg_err_count == 0 and arity.seen) {
         if (spread_at) |si| {
             try c.diagFmt(2556, argErrorSpan(c, eff.items[si].node), "A spread argument must either have a tuple type or be passed to a rest parameter.", .{});
@@ -1276,6 +1328,37 @@ const contextual_implicit_any = [_]u16{ 7006, 7019, 7031 };
 /// "Expected N type arguments, but got M" — the one code
 /// `instantiateFallbackSig` withdraws.
 const targ_arity_code = [_]u16{2558};
+
+/// tsc's `getTypeArgumentArityError`, for an overload set no written
+/// type-argument list fits. It straddles the SET rather than any one
+/// candidate: the two counts are the largest arity still BELOW the written
+/// one and the smallest still ABOVE it, and only when both exist is there a
+/// pair to name (TS2743). With just one side there is a single number to
+/// expect, and the message degrades to the ordinary TS2558.
+///
+/// Reported at the type-argument LIST, tsc's
+/// `createDiagnosticForNodeArray(… node.typeArguments …)`.
+fn reportTargArityError(c: *Checker, node: Node, sigs: []const TypeId, written: usize) Error!void {
+    var below: ?usize = null;
+    var above: ?usize = null;
+    for (sigs) |sig| {
+        if (c.ts.kind(sig) != .function) continue;
+        const tps = c.ts.fnTypeParams(sig);
+        const min = c.sigMinTargs(tps);
+        if (min > written) {
+            if (above == null or min < above.?) above = min;
+        } else if (tps.len < written) {
+            if (below == null or tps.len > below.?) below = tps.len;
+        }
+    }
+    const span = typeArgsSpan(c, c.callShape(node).targ_nodes, node);
+    if (below != null and above != null) {
+        try c.diagFmt(2743, span, "No overload expects {d} type arguments, but overloads do exist that expect either {d} or {d} type arguments.", .{ written, below.?, above.? });
+        return;
+    }
+    const expected = below orelse above orelse return;
+    try c.diagFmt(2558, span, "Expected {d} type arguments, but got {d}.", .{ expected, written });
+}
 
 /// The type-parameter list's accepted arity RANGE when `written` is outside it,
 /// else null. `min` counts the parameters with no default, tsc's
