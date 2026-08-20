@@ -3114,17 +3114,12 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                     }
                 }
             }
-            // NOT a discriminant filter, and nothing this arm does at all —
-            // re-derived from the oracle in wave 22 and SOLVED. Kept here
-            // because this is where the question keeps getting asked.
+            // PART of this arm is `typesDefinitelyUnrelated`, and part of it
+            // is a discriminant filter after all. Waves 21, 22 and 28 each
+            // re-derived a piece; the whole answer, from the oracle:
             //
-            // `discriminatedUnionInference`'s `foo<T>(item: Item<T>)` with
-            // `Item<T> = {kind:'a',data:T} | {kind:'b',data:T[]}` fed
-            // `{kind:'b',data:[1,2]}` answers `T = number` in tsc. Every
-            // constituent still contributes; what changes is that some
-            // constituents are not an inference site at all. With
-            // `src: {kind:'b', p:string, q:number}`, tsgo 7.0.2 answers each
-            // constituent ALONE (the control the wave-21 matrix was missing):
+            // With `src: {kind:'b', p:string, q:number}`, tsgo 7.0.2 answers
+            // each constituent ALONE (the control wave 21 was missing):
             //
             //   {kind:'a',p:T}                                   -> unknown
             //   {kind:'a',p:T,q:number}                          -> string
@@ -3132,15 +3127,22 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
             //   {p:T}                                            -> string
             //   {p:T,z:boolean}                                  -> unknown
             //
-            // Rows 1 and 5 infer NOTHING even standing alone, so no union
-            // rule was ever involved: it is `typesDefinitelyUnrelated`
-            // gating `inferFromObjectTypes` (see the `.object` arm). Row 1
-            // is unrelated because `kind` disagrees AND the target is
-            // missing `q`; row 2 differs only in covering `q`, which is why
-            // it infers despite the same discriminant mismatch. Feed those
-            // solo answers into the ordinary leftmost supertype fold and
-            // every union row of the wave-21 matrix falls out, in both
-            // orders — no filter, no reordering, no special case here.
+            // Rows 1 and 5 infer NOTHING even standing alone, so those two
+            // rows are not a union rule: they are `typesDefinitelyUnrelated`
+            // gating `inferFromObjectTypes` (see the `.object` arm). Row 1 is
+            // unrelated because `kind` disagrees AND the target is missing
+            // `q`; row 2 differs only in covering `q`, which is why it infers
+            // despite the same discriminant mismatch. ztsc reproduces all five
+            // exactly, so that half is faithful and needs nothing here.
+            //
+            // What wave 22 then concluded — that feeding those solo answers
+            // into the leftmost supertype fold reproduces every union row, so
+            // there is no filter at all — is FALSE, and the control that
+            // settles it is below: `Item<T> = {kind:'a',data:T} |
+            // {kind:'b',data:T[]}` fed `{kind:'b',data:[1,2]}` answers
+            // `number` for the union while its 'a' constituent answers
+            // `number[]` ALONE and 'a' is leftmost. A discriminant filter runs
+            // over the union, and it is the block immediately below.
             //
             // Unify against the single type-param member if the rest
             // doesn't already accept the arg (common: T | undefined).
@@ -3195,6 +3197,50 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 if (rem.items.len == 0 or rem.items.len == ams.len) break :blk arg;
                 break :blk try s.makeUnion(c.scratch(), rem.items);
             };
+            // A DISCRIMINATED union PARAMETER fed a single object argument
+            // infers from the constituent the argument's own discriminant
+            // selects, and from that one ALONE. The union-ARGUMENT arm below
+            // already applies this rule (`discriminatedConstituent`, tsc's
+            // `getMatchingUnionConstituentForType`); the union-PARAMETER side
+            // did not, and `inferToMultipleTypes`' per-constituent fold then
+            // took the leftmost candidate.
+            //
+            // `discriminatedUnionInference` (the #28862 repro) is the case:
+            // `Item<T> = {kind:'a',data:T} | {kind:'b',data:T[]}` fed
+            // `{kind:'b',data:[1,2]}` answered `T = number[]` where tsgo 7.0.2
+            // answers `number`, so the argument was a false TS2345 against the
+            // 'a' constituent.
+            //
+            // A wave-22 note here concluded the opposite — that no union rule
+            // is involved and `typesDefinitelyUnrelated` explains everything.
+            // The SOLO controls it was missing settle it (tsgo 7.0.2, each
+            // constituent standing alone, no contextual return type on the
+            // call so the seed cannot fix `T`):
+            //
+            //   {kind:'a',data:T}      <- {kind:'b',data:[1,2]}   -> number[]
+            //   {kind:'a',p:T,q:number}<- {kind:'b',p:'str',q:1}  -> string
+            //   {kind:'a',p:T}         <- {kind:'b',p:'str',q:1}  -> unknown
+            //   Item<T> (the UNION)    <- {kind:'b',data:[1,2]}   -> number
+            //
+            // ztsc reproduces the first three exactly, so its
+            // `typesDefinitelyUnrelated` is faithful — and the fourth row is
+            // NOT the fold of the first two. The non-matching constituent does
+            // infer on its own and is dropped by the union.
+            //
+            // Only for a bare object argument with no naked type-param member
+            // in the union (`T | {kind:'a'}` still owes its variable the whole
+            // source), and only when exactly one constituent agrees on every
+            // unit-literal property of the argument — `discriminatedConstituent`
+            // answers null otherwise, which leaves the walk below untouched.
+            if (n_tp == 0 and s.kind(arg) != .union_type) {
+                const arg_obj = try c.resolveStructural(arg);
+                if (s.kind(arg_obj) == .object and s.objectPropCount(arg_obj) != 0) {
+                    if (try c.discriminatedConstituent(arg_obj, param, .unit_on_both)) |m| {
+                        try c.unify(m, arg, tp_syms, candidates, depth + 1);
+                        return;
+                    }
+                }
+            }
             // tsc's `inferToMultipleTypes` runs each non-variable target
             // constituent against each SOURCE constituent on its own, and
             // records which sources produced an inference (`matched[i]`). The
@@ -3720,7 +3766,7 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 // no discriminant then contributes each of its literal
                 // property types as a candidate, which collapses to the
                 // widened primitive.
-                if (try c.discriminatedConstituent(param, ra)) |m| {
+                if (try c.discriminatedConstituent(param, ra, .unit_on_source)) |m| {
                     try c.unify(param, m, tp_syms, candidates, depth + 1);
                     return;
                 }
@@ -4523,7 +4569,11 @@ fn typesDefinitelyUnrelated(c: *Checker, source: TypeId, target: TypeId) Error!b
 /// with no discriminant would otherwise contribute each of its literal
 /// property types as a candidate, and the merged candidate widens to the
 /// primitive.
-pub fn discriminatedConstituent(c: *Checker, param: TypeId, uni: TypeId) Error!?TypeId {
+///
+/// `mode` says which of `param`'s properties count as discriminants — see
+/// `DiscMode`; the two call sites drive the choice from opposite sides of the
+/// pair and need different answers.
+pub fn discriminatedConstituent(c: *Checker, param: TypeId, uni: TypeId, mode: DiscMode) Error!?TypeId {
     const s = &c.ts;
     var have_disc = false;
     var found: TypeId = types.no_type;
@@ -4536,11 +4586,16 @@ pub fn discriminatedConstituent(c: *Checker, param: TypeId, uni: TypeId) Error!?
         for (0..s.objectPropCount(param)) |i| {
             const pp = s.objectProp(param, @intCast(i));
             if (!isUnitLikeKind(s.kind(pp.ty))) continue;
-            saw_disc = true;
             const ap = s.objectPropByName(rm, pp.name) orelse {
-                agrees = false;
-                break;
+                if (mode == .unit_on_source) {
+                    saw_disc = true;
+                    agrees = false;
+                    break;
+                }
+                continue;
             };
+            if (mode == .unit_on_both and !isUnitLikeKind(s.kind(ap.ty))) continue;
+            saw_disc = true;
             if (!try c.isAssignable(pp.ty, ap.ty)) {
                 agrees = false;
                 break;
@@ -4555,6 +4610,23 @@ pub fn discriminatedConstituent(c: *Checker, param: TypeId, uni: TypeId) Error!?
     if (!have_disc or n_found != 1) return null;
     return found;
 }
+
+/// Which properties count as a DISCRIMINANT for `discriminatedConstituent`.
+pub const DiscMode = enum {
+    /// A unit-literal property of the driving object, whatever the
+    /// constituent's own property is. The union-ARGUMENT arm's contract: the
+    /// driver is the PARAMETER, whose literal-typed properties are written by
+    /// the declaration and so are discriminants by construction.
+    unit_on_source,
+    /// A property that is a unit literal on BOTH sides. The union-PARAMETER
+    /// arm's contract: there the driver is the ARGUMENT, and an object literal
+    /// is full of incidental fresh literals that discriminate nothing.
+    /// React's `setState({ b: 1, c: true })` against `Pick<SS, K> | SS | null`
+    /// is the case — `b` and `c` are unit in the argument and `number` /
+    /// `boolean` in `SS`, and reading them as discriminants selected `SS` and
+    /// starved `Pick<SS, K>` of the key set (conformance `inference/046`).
+    unit_on_both,
+};
 
 /// Do an intersection PARAMETER constituent and an argument constituent
 /// describe the same part of the value? Only same-kind pairs qualify, so
