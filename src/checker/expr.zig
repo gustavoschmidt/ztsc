@@ -4012,7 +4012,7 @@ fn memberChainInner(c: *Checker, node: Node, ctx: TypeId) Error!ChainLink {
         if (c.nodeTag(d.lhs) != .super_expr and try reportUnknownOperand(c, obj_t, d.lhs)) {
             return .{ .ty = types.error_type, .chained = chained };
         }
-        obj_t = try checkNonNullType(c, obj_t, d.lhs);
+        obj_t = try checkNullishOperand(c, obj_t, d.lhs);
     }
     // A compound assignment's target is re-read as an expression after
     // `checkAssignmentTarget` has already judged it as a WRITE; tsc runs one
@@ -4072,18 +4072,31 @@ fn memberChainInner(c: *Checker, node: Node, ctx: TypeId) Error!ChainLink {
 /// `[null][0] * 1` carry the very same `null` type and still get TS2531,
 /// because neither node is the keyword itself.
 ///
-/// tsc rejects an `unknown` operand here too, ahead of the nullish test
-/// (TS18046 for an entity name, TS2571 otherwise). ztsc does not: over the
-/// TypeScript test suite that arm traded 20 missing keys for 14 spurious
-/// ones, because it turns every place ztsc infers `unknown` and tsc infers
-/// a real type into a NEW diagnostic. It belongs with the inference gaps,
-/// not here.
+/// An `unknown` operand is rejected here too, AHEAD of the nullish test —
+/// TS18046 for an entity name, TS2571 otherwise (`reportUnknownOperand`) —
+/// and the position continues on the error type, which every arithmetic and
+/// relational classification accepts. So `u >= 0`, `u + 1`, `u * 2`, `-u`,
+/// `+u`, `~u`, `u++`, `u in o` and `n in u` are each ONE TS18046 on the
+/// operand rather than a TS2362/TS2365 on the operator (oracle-verified).
 ///
 /// `void` is deliberately NOT nullish here: tsc masks the operand's falsy
 /// flags with `TypeFlags.Nullable`, which is `Undefined | Null` only, so
 /// `v.toString()` on a `void` receiver reports the missing property rather
 /// than "possibly 'undefined'".
 fn checkNonNullType(c: *Checker, t: TypeId, obj_node: Node) Error!TypeId {
+    if (try reportUnknownOperand(c, t, obj_node)) return types.error_type;
+    return checkNullishOperand(c, t, obj_node);
+}
+
+/// The nullish half of `checkNonNullType` alone, for the two receiver
+/// positions that have ALREADY run the `unknown` probe and taken their own
+/// early return out of it — a property access and an element access, each of
+/// which has a lookup to skip rather than an error type to carry on with.
+/// Splitting it keeps `reportUnknownOperand`'s `resolveStructural` off the
+/// hottest path in the checker: every non-optional property access reaches
+/// here, and probing twice for a type just proven not to be `unknown` is
+/// pure waste.
+fn checkNullishOperand(c: *Checker, t: TypeId, obj_node: Node) Error!TypeId {
     const has_null = c.containsNull(t);
     const has_undef = c.hasUndefinedMember(t);
     if (!has_null and !has_undef) return t;
@@ -4157,14 +4170,12 @@ fn nonNullRemainder(c: *Checker, t: TypeId) Error!TypeId {
 /// enough to print (TS18046 "'x' is of type 'unknown'.") and says "Object"
 /// otherwise (TS2571). `false` — nothing reported — for every other type.
 ///
-/// `checkNonNullType` deliberately does NOT call it: over the TypeScript test
-/// suite the general gate traded 20 missing keys for 14 spurious ones, because
-/// it turns every position where ztsc infers `unknown` and tsc infers a real
-/// type into a diagnostic that did not exist (see the note there). What is
-/// safe is a position that ALREADY has a verdict for `unknown` — a call's
-/// callee, which was reporting the generic TS2349 — where this only changes
-/// the code, text, and span of a diagnostic that was going to be reported
-/// either way.
+/// `checkNonNullType` calls it first thing, which covers every non-nullable
+/// position at once. The positions that must ask BEFORE reaching there —
+/// a property-access receiver, an element-access receiver, a call's callee —
+/// do so themselves, because each has its own early return to take (the
+/// member lookup, the index walk, the signature resolution must all be
+/// skipped) and none of them reaches `checkNonNullType` afterwards.
 pub fn reportUnknownOperand(c: *Checker, t: TypeId, node: Node) Error!bool {
     if (c.ts.kind(try c.resolveStructural(t)) != .unknown) return false;
     // `this` is not an `isEntityNameExpression`, so it takes the object form
@@ -4565,7 +4576,7 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
         if (try reportUnknownOperand(c, obj_t, d.lhs)) {
             return .{ .ty = types.error_type, .chained = chained };
         }
-        obj_t = try checkNonNullType(c, obj_t, d.lhs);
+        obj_t = try checkNullishOperand(c, obj_t, d.lhs);
     }
     const r = try c.resolveStructural(obj_t);
     const rk = c.ts.kind(r);

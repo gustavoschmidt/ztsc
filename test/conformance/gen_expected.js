@@ -89,6 +89,14 @@ function walk(dir) {
 // `--pretty false` line shape: file(line,col): error TScode: message
 const DIAG_RE = /^(.+)\((\d+),(\d+)\): error TS(\d+):/;
 
+// The same shape with no file anchor — a GLOBAL error. tsgo prints these at
+// column 0 for everything that stops it doing the work: TS5023 unknown
+// compiler option, TS6053 file not found, TS18003 no inputs, TS5112 a
+// tsconfig it refuses to load. They carry no position, so `DIAG_RE` skips
+// them and the run comes back as an EMPTY diagnostic list — indistinguishable
+// from a genuinely clean case. See `runOracle` for why that must not pass.
+const GLOBAL_DIAG_RE = /^error TS(\d+): (.*)$/;
+
 // A directory case may carry a tsconfig.json whose `compilerOptions.lib`
 // overrides the default `esnext,dom` — this is how the lib_dom cases toggle
 // DOM on/off. Returns the OPTIONS with `--lib` replaced (everything else, incl.
@@ -184,19 +192,44 @@ function optionsForDir(dir) {
 }
 
 // All file-anchored diagnostics from one tsgo run, absolute file paths.
-// Global (file-less) errors don't match the regex and are skipped, exactly
-// as the old programmatic harness skipped diagnostics without file/start.
+//
+// A run that made NO VERDICT must not come back as an empty list. An empty
+// list means "clean", and `emit` answers clean by DELETING the snapshot —
+// so a case whose oracle invocation failed would silently retire its own
+// expectations, in a log 1320 lines long, and `--check` would go on passing
+// because it compares the same empty content against the file it just lost.
+// Under `--check` alone the same failure reports a MISMATCH claiming tsgo is
+// clean, which reads as "the snapshot is stale" and invites regenerating it.
+//
+// Every way the oracle can fail arrives that way, because none of them
+// produces a positioned diagnostic: a mistyped option in ONE directory case's
+// tsconfig (`optionsForDir` forwards it, so the failure is that case's alone),
+// a moved entry file, a crash. So the global errors are read too, and any of
+// them — like any abnormal termination — is a harness failure, not a verdict.
+// A healthy run over the whole suite emits none.
 function runOracle(entryAbs, opts) {
   const r = spawnSync(tsgo, [...(opts || OPTIONS), entryAbs], {
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
   });
   if (r.error) throw r.error;
+  if (r.signal) throw new Error(`tsgo killed by ${r.signal}: ${entryAbs}`);
   const diags = [];
+  const globals = [];
   for (const line of ((r.stdout || "") + (r.stderr || "")).split("\n")) {
     const m = DIAG_RE.exec(line);
-    if (!m) continue;
-    diags.push({ file: path.resolve(m[1]), line: +m[2], col: +m[3], code: +m[4] });
+    if (m) {
+      diags.push({ file: path.resolve(m[1]), line: +m[2], col: +m[3], code: +m[4] });
+      continue;
+    }
+    const g = GLOBAL_DIAG_RE.exec(line);
+    if (g) globals.push(`TS${g[1]}: ${g[2]}`);
+  }
+  if (globals.length) {
+    throw new Error(
+      `tsgo made no verdict for ${entryAbs} — it reported a global error instead:\n  ` +
+        globals.join("\n  "),
+    );
   }
   return diags;
 }

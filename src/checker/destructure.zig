@@ -28,6 +28,7 @@ const RefKey = @import("flow.zig").RefKey;
 const containsAtom = @import("expr.zig").containsAtom;
 const markSpeculativePin = @import("signatures.zig").markSpeculativePin;
 const max_deep_ref_depth = @import("flow.zig").max_deep_ref_depth;
+const subst = @import("subst.zig");
 
 /// Pin every symbol bound by a destructured parameter's pattern to the type
 /// the parameter (contextual or annotated) gives it. The counterpart of the
@@ -412,6 +413,77 @@ pub fn optionalizePatternDefaults(c: *Checker, t: TypeId, pat: Node) Error!TypeI
     return c.ts.makeObject(props.items, c.ts.objectStringIndex(t), c.ts.objectNumberIndex(t), c.ts.objectFlags(t));
 }
 
+/// Whether a pattern element's DEFAULT is RELATED to the type of the position
+/// it stands in for, or merely typed by it.
+///
+/// Only a declaration whose type is WRITTEN relates it. When the type is
+/// inferred from an initializer instead, `getBindingElementTypeFromParentType`
+/// unions the default's own type into the element's — `let { a: v = 1 } = src`
+/// binds `string | number` where `let { a: v = 1 }: A = src` binds `string`
+/// (oracle-verified) — and the relation is then vacuous by construction: the
+/// source of the check is the very type the target just absorbed. So the two
+/// spellings differ by one TS2322, and skipping is exactly equivalent to
+/// building the union and relating against it.
+pub const DefaultCheck = enum { relate, contextual_only };
+
+/// A binding element's DEFAULT: checked under the contextual type of the
+/// position it stands in for, then related to that position's declared type.
+/// `el` is a `.binding_property` or a `.binding_default`, `pt` the type the
+/// element's position destructures (`no_type` when nothing declares it — an
+/// unannotated parameter, a `for` head — which is tsc's "no parent type" and
+/// reports nothing).
+///
+/// tsc's `checkVariableLikeDeclaration` tail:
+/// `checkTypeAssignableToAndOptionallyElaborate(checkExpressionCached(init),
+/// type, node, node.initializer)` — the error node is the ELEMENT, whose
+/// span `getErrorSpanForNode` narrows to its NAME, and the initializer is the
+/// elaboration root, so a mismatch inside an object/array literal or an arrow
+/// body is blamed there instead. `function h({ prop = "baz" }: StringUnion)`
+/// reports on `prop`, while `({ prop = [101, 1234] }: Tuples)` reports twice
+/// inside the array literal.
+///
+/// `undefined` comes off the target exactly where tsc takes it off
+/// (`getBindingElementTypeFromParentType`): a default is what supplies the
+/// missing value, so `{ a = 1 }: { a?: string }` is TS2322 against `string` —
+/// unless the default is ITSELF possibly-undefined, in which case the
+/// position keeps it and `{ a = undefined }` is clean.
+///
+/// The same stripped type is what CONTEXTUALLY types the default: tsc's
+/// `getContextualTypeForBindingElement` ends in `getTypeOfPropertyOfType`,
+/// which answers the property's declared type — an optional property's
+/// `undefined` is folded in by the destructuring walk, not by that lookup.
+/// A class expression's static members are contextually typed through it
+/// (`staticFieldWithInterfaceContext`'s `{ c: c4 = class { static x = { a:
+/// "a" } } }: { c?: I }`), and a `I | undefined` context hid that.
+pub fn checkPatternDefault(c: *Checker, el: Node, pt: TypeId, mode: DefaultCheck) Error!void {
+    const d = c.tree.nodeData(el);
+    const declared = if (pt == types.no_type or pt == types.error_type)
+        pt
+    else
+        try c.removeUndefined(pt);
+    const it = try c.checkExprCached(d.rhs, defaultContextualType(c, d.lhs, declared));
+    if (mode == .contextual_only or pt == types.no_type or pt == types.error_type) return;
+    const target = if (c.containsUndefinedish(it)) pt else declared;
+    // The element's NAME — for a shorthand `{ a = 1 }` the key token itself,
+    // which is where tsc's `BindingElement` error span lands either way.
+    const span = if (d.lhs != 0) c.nodeSpan(d.lhs) else c.tokSpan(c.tree.nodeMainToken(el));
+    _ = try c.checkAssignable(it, target, d.rhs, span);
+}
+
+/// The contextual type of a binding element's DEFAULT: the type its position
+/// destructures — except when the element's own name is itself a PATTERN,
+/// which tsc's `getContextualTypeForBindingElement` refuses outright
+/// (`isBindingPattern(name)` returns `undefined` before the property lookup).
+/// The ASSIGNABILITY target above is unaffected: `{ a: { z } = 1 }` is still
+/// checked against `{ z: string }`, it just does not type `1` from it.
+pub fn defaultContextualType(c: *Checker, name: Node, pt: TypeId) TypeId {
+    if (name == null_node) return pt;
+    return switch (c.nodeTag(name)) {
+        .object_pattern, .array_pattern => types.no_type,
+        else => pt,
+    };
+}
+
 /// Does the object binding pattern `pat` destructure `name` with a default?
 pub fn patternDefaultsProp(c: *Checker, pat: Node, name: Atom) Error!bool {
     const el = (try patternMemberElem(c, pat, .binding, name)) orelse return false;
@@ -489,13 +561,17 @@ pub fn checkPatternProps(c: *Checker, pat: Node, whole: TypeId) Error!void {
     if (pat == null_node or whole == types.no_type) return;
     switch (c.nodeTag(pat)) {
         .binding_default => try checkPatternProps(c, c.tree.nodeData(pat).lhs, whole),
-        // A TYPE PARAMETER is left alone by the PROPERTY walk. tsc narrows one
-        // by its constraint's constituents (`value.kind === "a"` makes `T` read
-        // as `T & { a: string }`), ztsc does not — `narrowingDestructuring`'s
-        // five pre-existing TS2339s on `value.a` are that gap — so anything
-        // this walk concluded about `T` would be about the missing narrowing
-        // rather than about the pattern.
-        .object_pattern => if (c.ts.kind(whole) != .type_param)
+        // Anything still GENERIC is left alone by the PROPERTY walk. A bare
+        // type parameter, because tsc narrows one by its constraint's
+        // constituents (`value.kind === "a"` makes `T` read as `T & { a:
+        // string }`) and ztsc does not — `narrowingDestructuring`'s five
+        // pre-existing TS2339s on `value.a` are that gap. And any type that
+        // merely CARRIES one, because tsc's `getIndexedAccessType` defers on
+        // it rather than answering: `correlatedUnions`' `{ letter, caller }:
+        // LetterCaller<K>` destructures `{ [P in K]: … }[K]`, which has no
+        // resolved member table to be missing a property from.
+        .object_pattern => if (c.ts.kind(whole) != .type_param and
+            !try subst.containsTypeParam(c, whole))
             try checkObjectPatternProps(c, pat, whole),
         // The ITERABILITY walk has no such excuse: narrowing `T` to
         // `T & { kind: "a" }` cannot add a `[Symbol.iterator]` the constraint
@@ -568,14 +644,19 @@ fn checkObjectPatternProps(c: *Checker, pat: Node, whole: TypeId) Error!void {
         if (p.nonPublic()) {
             try accessibility.check(c, whole, key, key_tok, .{ .dir = .read });
         }
-        // A nested pattern destructures the property's own type — with nullish
-        // stripped first, because a possibly-undefined intermediate is tsc's
-        // TS2532 (the access's own diagnostic), not a missing property, and
-        // `never` has no member to be missing.
+        // A nested pattern destructures exactly what the element BINDS
+        // (`patternPropType`, then the default's `undefined` strip), and a
+        // nullish remainder is NOT taken off: tsc types the element through
+        // `getIndexedAccessType`, which has no property to find on `undefined`
+        // or `null`, so `const { a: { b } } = o` on `{ a?: { b: string } }` is
+        // TS2339 naming `{ b: string; } | undefined` — not the TS2532 a dotted
+        // `o.a.b` would get. A DEFAULT is what makes it clean, and it does so
+        // by supplying the missing value, which is the same strip
+        // `defaultedElemType` performs. `never` has no member to be missing.
         const sub = c.tree.nodeData(el).lhs;
         if (sub == 0) continue;
-        var pt = p.ty;
-        if (c.containsNullish(pt)) pt = try c.nonNullable(pt);
+        var pt = if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
+        if (c.tree.nodeData(el).rhs != 0) pt = try defaultedElemType(c, c.tree.nodeData(el).rhs, pt);
         if (c.ts.kind(pt) == .never) continue;
         try checkPatternProps(c, sub, pt);
     }
