@@ -4551,8 +4551,11 @@ const Binder = struct {
             },
             .binary => {
                 switch (b.tree.tokens.tag(b.tree.nodeMainToken(node))) {
-                    .amp_amp, .pipe_pipe => {
+                    .amp_amp, .pipe_pipe, .question_question => {
                         // Value position: bind as condition, then join.
+                        // tsc's `bindBinaryExpressionFlow` treats all three
+                        // short-circuiting operators alike here
+                        // (`isLogicalOrCoalescingBinaryOperator`).
                         const cond = try b.bindCondition(node);
                         const pid = try b.newPending();
                         try b.pendAdd(pid, cond.t);
@@ -4768,9 +4771,59 @@ const Binder = struct {
         try b.attachFlow(node);
     }
 
+    /// tsc's `isLogicalExpression`: a `&&` / `||` / `??`, seen through
+    /// parentheses AND `!`. Those build their own condition edges, so the
+    /// enclosing `bindCondition` must not add a leaf pair on top.
+    fn isLogicalExpr(b: *const Binder, node: Node) bool {
+        var n = node;
+        while (n != null_node) {
+            const d = b.tree.nodeData(n);
+            switch (b.nodeTag(n)) {
+                .paren_expr => n = d.lhs,
+                .prefix_unary => {
+                    if (b.tree.tokens.tag(b.tree.nodeMainToken(n)) != .bang) return false;
+                    n = d.lhs;
+                },
+                .binary => return switch (b.tree.tokens.tag(b.tree.nodeMainToken(n))) {
+                    .amp_amp, .pipe_pipe, .question_question => true,
+                    else => false,
+                },
+                else => return false,
+            }
+        }
+        return false;
+    }
+
+    /// The LEFT operand of `??`, bound as a condition.
+    ///
+    /// tsc decides "this test is about NULLISHNESS, not truthiness" in
+    /// `narrowType`, by looking UP from the flow node's expression:
+    /// `isBinaryExpression(expr.parent) && parent.operatorToken === ?? &&
+    /// parent.left === expr`. ztsc's AST carries no parent links, so the two
+    /// leaf edges record the `??` node itself instead and the checker reads
+    /// the operand back off it — the marker is unambiguous because the `??`
+    /// node never appears on a flow edge any other way (as a whole condition
+    /// it contributes only its operands' joins).
+    ///
+    /// A left operand that builds its OWN edges — a nested `&&`/`||`/`??`
+    /// (through parens and `!`, exactly tsc's `isLogicalExpression`) or an
+    /// optional chain — is delegated unchanged: in tsc those inner operands'
+    /// parent is not the `??` either, so they narrow by truthiness.
+    fn bindNullishTest(b: *Binder, lhs: Node, qq: Node) Error!CondFlows {
+        if (b.isLogicalExpr(lhs) or (lhs != null_node and b.isOptionalChain(lhs))) {
+            return b.bindCondition(lhs);
+        }
+        try b.bindExpr(lhs);
+        return .{
+            .t = try b.addFlow(.cond_true, b.cur_flow, qq),
+            .f = try b.addFlow(.cond_false, b.cur_flow, qq),
+        };
+    }
+
     /// Bind a condition expression, producing the flows for its true and
-    /// false outcomes. Decomposes `&&`, `||`, `!`, and parens so the checker can
-    /// narrow each operand (truthiness/typeof/equality/discriminant).
+    /// false outcomes. Decomposes `&&`, `||`, `??`, `!`, and parens so the
+    /// checker can narrow each operand
+    /// (truthiness/nullishness/typeof/equality/discriminant).
     fn bindCondition(b: *Binder, node: Node) Error!CondFlows {
         if (node == null_node) {
             return .{ .t = b.cur_flow, .f = unreachable_flow };
@@ -4796,6 +4849,21 @@ const Binder = struct {
                 },
                 .pipe_pipe => {
                     const lhs = try b.bindCondition(d.lhs);
+                    b.cur_flow = lhs.f;
+                    const rhs = try b.bindCondition(d.rhs);
+                    const pid = try b.newPending();
+                    try b.pendAdd(pid, lhs.t);
+                    try b.pendAdd(pid, rhs.t);
+                    return .{ .t = try b.finishPending(pid), .f = rhs.f };
+                },
+                // tsc's `bindLogicalLikeExpression` routes `??` through the
+                // very same `else` arm as `||`: the right operand is reached
+                // from the left's FALSE outcome, and both operands' true
+                // outcomes join. What differs is only what "false" MEANS for
+                // the left operand — nullish, not falsy — and that is
+                // `bindNullishTest`'s job.
+                .question_question => {
+                    const lhs = try b.bindNullishTest(d.lhs, node);
                     b.cur_flow = lhs.f;
                     const rhs = try b.bindCondition(d.rhs);
                     const pid = try b.newPending();
