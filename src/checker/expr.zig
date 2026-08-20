@@ -918,33 +918,51 @@ fn checkIdentifier(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // the constraint is what decides the outcome anyway (see
             // `narrowable.zig`), so a guard has constituents to filter.
             const declared = try c.narrowableRefType(node, try c.typeOfSymbol(sym), ctx);
-            // TDZ (TS2448) and definite assignment (TS2454). Both are
-            // `void` — they contribute nothing to this identifier's type,
-            // which is `flowTypeOfReference(declared)` below either way —
-            // so the owned-file guard (see `checkJsxElement`) applies: in a
-            // file this checker does not own, `seal` drops whatever they
-            // report, and the only state they touch is `da_cache`, a pure
-            // (flow, sym) memo that every reader re-derives on miss.
+            // TDZ (TS2448) is `void` — it contributes nothing to this
+            // identifier's type — so the owned-file guard (see
+            // `checkJsxElement`) applies: in a file this checker does not own,
+            // `seal` drops whatever it reports, and the only state it touches
+            // is `da_cache`, a pure (flow, sym) memo that every reader
+            // re-derives on miss.
             if (c.owned_mask[c.cur_file]) {
                 if ((f.let_decl or f.const_decl or f.class or f.enum_decl) and !f.function and !f.var_decl and !f.param) {
                     try checkTdz(c, sym, node, tok);
                 }
-                if ((f.let_decl or f.var_decl or f.const_decl) and !f.param and
-                    // A computed member name is evaluated outside its
-                    // container's flow, so nothing read there is "used before
-                    // being assigned" (`Checker.in_computed_member_name`).
-                    // (wave-10 A: one flagged guard.)
-                    !c.in_computed_member_name)
-                {
-                    // A `const` is asked too: its initializer is what makes it
-                    // definitely assigned, and a read in its TEMPORAL DEAD ZONE
-                    // has not run that initializer yet — tsc reports TS2448 and
-                    // TS2454 together there (`exportBinding`'s `export default
-                    // x` ahead of `const x = 'x'`).
-                    try checkUseBeforeAssigned(c, sym, node, tok, declared);
+            }
+            // Definite assignment (TS2454) is NOT `void`: tsc returns the
+            // DECLARED type for a reference it convicts, "to reduce follow-on
+            // errors", so the narrowing that would otherwise apply is dropped
+            // and the follow-on assignability errors survive. That makes the
+            // VERDICT part of the answer, and an answer may not depend on
+            // which checker owns the file — so the verdict is computed
+            // unconditionally here and only the REPORT stays owned. Every
+            // checker pays the definite-assignment walk; it is memoized per
+            // (flow, sym) and only reached by a `let`/`var`/`const` read whose
+            // declared type excludes undefined.
+            var unassigned = false;
+            if ((f.let_decl or f.var_decl or f.const_decl) and !f.param and
+                // A computed member name is evaluated outside its
+                // container's flow, so nothing read there is "used before
+                // being assigned" (`Checker.in_computed_member_name`).
+                // (wave-10 A: one flagged guard.)
+                !c.in_computed_member_name)
+            {
+                // A `const` is asked too: its initializer is what makes it
+                // definitely assigned, and a read in its TEMPORAL DEAD ZONE
+                // has not run that initializer yet — tsc reports TS2448 and
+                // TS2454 together there (`exportBinding`'s `export default
+                // x` ahead of `const x = 'x'`).
+                unassigned = try useBeforeAssignedVerdict(c, sym, node, declared);
+                if (c.owned_mask[c.cur_file]) {
+                    if (unassigned) {
+                        try c.diagFmt(2454, c.tokSpan(tok), "Variable '{s}' is used before being assigned.", .{c.tokenText(tok)});
+                    }
                     try checkEvolvingVarRead(c, sym, node, tok, declared);
                 }
             }
+            // "Return the declared type to reduce follow-on errors"
+            // (`checkIdentifier`, right after the TS2454 `error()`).
+            if (unassigned) return declared;
             // Flow narrowing. A binding destructured out of a discriminated
             // union has no flow of its own that a guard on a SIBLING binding
             // touches, so its parent union is narrowed as a pseudo-reference
@@ -1198,10 +1216,16 @@ fn checkEvolvingVarRead(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex,
     try c.diagFmt(7005, c.tokSpan(tok), "Variable '{s}' implicitly has an 'any' type.", .{name});
 }
 
-fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex, declared: TypeId) Error!void {
+/// tsc's `assumeInitialized` chain, inverted: is this reference one tsc reports
+/// TS2454 on? A VERDICT rather than a check, because tsc's answer is not only
+/// the diagnostic — a convicted reference also takes the DECLARED type instead
+/// of the narrowed one, so every checker has to reach the same conclusion
+/// whether or not it owns the file (see the call site in `checkIdentifier`).
+fn useBeforeAssignedVerdict(c: *Checker, sym: SymbolId, node: Node, declared: TypeId) Error!bool {
     // Only for declarations without initializer whose type excludes
     // undefined/any, used in the same function container.
-    if (c.symFile(sym) != c.cur_file) return; // cross-file: assigned
+    if (c.symFile(sym) != c.cur_file) return false; // cross-file: assigned
+    const tok = c.tree.nodeMainToken(node);
     const decls = c.declsOf(sym);
     var has_init = false;
     var has_definite = false;
@@ -1225,7 +1249,7 @@ fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: TokenInde
     // any flow analysis and regardless of where the use sits, so a use even
     // ahead of the declaration is exempt too.
     if (valueDeclarator(c, decls)) |vd| {
-        if (isAmbientDeclarator(c, vd)) return;
+        if (isAmbientDeclarator(c, vd)) return false;
     }
     // tsc's `isOuterVariable`, class-field half: `getControlFlowContainer`
     // stops at a PropertyDeclaration, so a field initializer is its own flow
@@ -1237,7 +1261,7 @@ fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: TokenInde
     // and takes the region back: `x = <U>(a: U) => { var y: T; return y }`
     // still reports (`typeParametersAvailableInNestedScope`).
     if (c.field_init_depth > 0 and
-        c.bind.scope_kinds[flowContainerOf(c, c.cur_scope)] != .function) return;
+        c.bind.scope_kinds[flowContainerOf(c, c.cur_scope)] != .function) return false;
     // tsc's `isOuterVariable`, namespace half. `getControlFlowContainer` stops
     // at a MODULE BLOCK, and two blocks of one `namespace N` are two blocks
     // with two flow graphs — while the binder folds their members into a
@@ -1264,7 +1288,7 @@ fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: TokenInde
                 break;
             }
         }
-        if (!in_block) return;
+        if (!in_block) return false;
     }
     // A use *before* the declaration (TDZ position) is also
     // definitely-unassigned even when the declarator has an
@@ -1282,7 +1306,7 @@ fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: TokenInde
         if (c.nodeTag(c.tree.nodeData(decls[0]).lhs) != .identifier) {
             const span = c.nodeSpan(decls[0]);
             const at = c.tree.tokens.start(tok);
-            if (at >= span.start and at < span.end) return;
+            if (at >= span.start and at < span.end) return false;
         }
     }
     // An INITIALIZER is not an exemption: tsc's `assumeInitialized` never asks
@@ -1295,14 +1319,14 @@ fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: TokenInde
     // `const x = 1; … x` that is one memoized walk back to the declarator's own
     // assign node. The `!` (definite assignment) modifier IS tsc's exemption
     // (`declaration.exclamationToken`), and stays one.
-    if (has_definite and !before_decl) return;
+    if (has_definite and !before_decl) return false;
     const dk = c.ts.kind(declared);
-    if (dk == .any or dk == .err or dk == .unknown or dk == .void or dk == .none) return;
-    if (c.containsUndefinedish(declared)) return;
+    if (dk == .any or dk == .err or dk == .unknown or dk == .void or dk == .none) return false;
+    if (c.containsUndefinedish(declared)) return false;
     // `for (x of xs)` / `for ({ a: x } of xs)`: the head's target is a WRITE.
     // After the type guards above, which are array reads — this one walks the
     // scope chain (and, on a name hit, one node span).
-    if (try inForHeadWriteTarget(c, node, sym)) return;
+    if (try inForHeadWriteTarget(c, node, sym)) return false;
     // tsc's `isOuterVariable`: a reference whose control-flow container is not
     // the declaration's is assumed initialized — the enclosing function's flow
     // says nothing about when the closure runs. TS 5.0 carved one hole in
@@ -1319,11 +1343,11 @@ fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: TokenInde
     // container. `export function f(g = () => foo) { let foo = "in"; }` is the
     // shape that needs the difference.
     if (flowContainerOf(c, c.cur_scope) != flowContainerOf(c, c.symScope(sym))) {
-        if (has_init or has_definite) return;
-        if (!try neverInitializedLocal(c, sym)) return;
+        if (has_init or has_definite) return false;
+        if (!try neverInitializedLocal(c, sym)) return false;
     }
-    const flow = c.bind.flowAt(node) orelse return;
-    if (try c.definitelyAssigned(flow, sym)) return;
+    const flow = c.bind.flowAt(node) orelse return false;
+    if (try c.definitelyAssigned(flow, sym)) return false;
     // The assignment walk alone is not tsc's answer. tsc runs the ordinary
     // narrowing walk over `declared | undefined` (`getOptionalType` is the
     // initial type whenever `assumeInitialized` is false) and reports only
@@ -1335,8 +1359,7 @@ fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: TokenInde
     // report — every clean reference still costs one boolean walk.
     const optional = try c.makeUnion2(declared, types.undefined_type);
     const narrowed = try unassignedVarType(c, node, sym, optional);
-    if (!c.containsUndefinedish(narrowed)) return;
-    try c.diagFmt(2454, c.tokSpan(tok), "Variable '{s}' is used before being assigned.", .{c.tokenText(tok)});
+    return c.containsUndefinedish(narrowed);
 }
 
 /// tsc's `isMutableLocalVariableDeclaration && !isSymbolAssignedDefinitely`:

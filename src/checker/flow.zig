@@ -1455,10 +1455,8 @@ pub fn thisPropUnassigned(c: *Checker, flow: FlowId, name: Atom, declared: TypeI
 /// `undefined` still enters only at the top of the flow, which is what makes
 /// "the answer still admits `undefined`" mean "some path left it unwritten".
 ///
-/// KNOWN GAP, diagnosed in wave-24 A and NOT landed (the fix is one line in
-/// `expr.zig`, which that wave did not own). A reference this walk convicts is
-/// one tsc reports TS2454 on — and tsc then returns the DECLARED type for it,
-/// not the narrowed one:
+/// A reference this walk convicts is one tsc reports TS2454 on — and tsc then
+/// returns the DECLARED type for it, not the narrowed one:
 ///
 /// ```ts
 /// // checkIdentifier, after the TS2454 error():
@@ -1468,20 +1466,12 @@ pub fn thisPropUnassigned(c: *Checker, flow: FlowId, name: Atom, declared: TypeI
 /// if (typeof sb === "string") {} else { b = sb; }  // tsc: TS2322 *and* TS2454
 /// ```
 ///
-/// ztsc narrows `sb` to `boolean` in the `else` and answers TS2454 alone, so
-/// the assignment's TS2322 goes missing. That single divergence is most of the
-/// `typeGuards*` under-pool — `typeGuardOfFormTypeOf{String,Number,Boolean}`,
-/// `…IsOrderIndependent`, `typeGuardsIn{Module,Global,ExternalModule}` and
-/// `typeGuardOfForm{InstanceOf,NotExpr}` all report a missing TS2322 on exactly
-/// the lines where a `var` with no assignment is read under a guard.
-///
-/// The catch, and the reason it is not a one-liner after all: `expr.zig` runs
-/// `checkUseBeforeAssigned` only under `owned_mask`, deliberately, because a
-/// diagnostic contributes nothing to a node's TYPE. Tying the type to the
-/// verdict breaks that invariant — the answer would depend on which checker got
-/// the file, which the determinism tests forbid — so the VERDICT (not the
-/// report) has to move out of the ownership guard first, and pay for the
-/// definite-assignment walk in every checker.
+/// That is why `expr.zig` runs `useBeforeAssignedVerdict` OUTSIDE its
+/// `owned_mask` guard while keeping the report inside it (wave-25 A): the
+/// verdict is part of the identifier's type, and a type may not depend on which
+/// checker got the file. Every checker pays this walk; it is memoized per
+/// (flow, sym) and only a `let`/`var`/`const` read whose declared type excludes
+/// undefined reaches it.
 pub fn unassignedVarType(c: *Checker, node: Node, sym: SymbolId, optional: TypeId) Error!TypeId {
     return c.flowTypeOfKey(node, .{ .sym = sym, .opt_init = true }, optional);
 }
