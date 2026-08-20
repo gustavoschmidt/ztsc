@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-20, post wave 27)
+## Standings (2026-08-20, post wave 28)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7269 / 8632 (84.2%)** |
-| excess keys (false positives) | 3541 | 1675 |
-| missing keys (under-reports) | 8617 | 3222 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7321 / 8632 (84.8%)** |
+| excess keys (false positives) | 3541 | 1642 |
+| missing keys (under-reports) | 8617 | 3103 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Twenty-seven waves landed (3–27), every one with ZERO match→non-match regressions in
+Twenty-eight waves landed (3–28), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -371,7 +371,65 @@ parser sub-cluster; order-dependent social-app keys 3→1.
 PROTOCOL ADDITION: bench/parity_sweep.sh is now a standing combined gate — it
 had been silently failing (2 single-key package FPs at head, see wave-28 #1).
 
-## Ranked next queue (wave 28) — distilled from wave-27 agent reports
+Wave 28 (+52; PACKAGE PARITY TABLE FULLY 0/0 for the first time): A killed
+both package FPs — @types/node TS2430 via tsc's getTypeWithThisArgument as a
+free retry (eager binding measured zod +14% wall — rejected), drizzle TS2416
+via three HKT-encoding fixes — plus boolean-domain intersection reduction and
+same-value enum mapped keys. B CLOSED FeedPage.tsx:101 (the degenerate Omit
+self-pair spinning to depth limit; the two recorded non-fixes could never
+work — the outer-vs-inner aliasInstance origin tag is a separate latent bug,
+still open) and landed higher-order mechanism (a)
+(instantiateTypeWithSingleGenericCallSignature; genericContextualTypes1
+10→2 keys); StarterPackDialog.tsx:245 characterized as CHECKER-PARTITION
+dependent with a deterministic --checkers=1 repro. C landed the yield/for-of/
+destructuring cluster (+35 — including discovering destructuring assignments
+were never TS2322-checked), in-on-primitives, TS2673/74 verdict withdrawal.
+D landed TS2786 with the JSX.ElementType gate (both apps on it — no perf
+hit), the placeholder bug, and both halves of for(var of X) composed.
+
+## Ranked next queue (wave 29) — distilled from wave-28 agent reports
+
+1. DETERMINISM ENDGAME (unblocked by FeedPage): (a) replace alias_recursive's
+   asymmetric marking with always-materialize (moves the social-app baseline —
+   Navigation.tsx:778's message converges; tsgo-prove); (b) fix
+   aliasInstance's outer-vs-inner origin tag (B's latent-bug find — ztsc tags
+   the OUTER alias where tsc keeps the inner); (c) StarterPackDialog.tsx:245
+   via the deterministic repro `--checkers=1 --workers=1` (partition-dependent
+   TS2769 on platform({web,native}) mapped-type overloads);
+   (d) FeedSourceCard.tsx:197 TS2353. GOAL: social-app byte-identical across
+   --checkers=1/2/4/8 AND all file orders.
+2. Relation one-FP pool: 96 cases exactly one false positive from exact, 49
+   relation-shaped (contravariantOnlyInferenceFromAnnotatedFunction,
+   divergentAccessors1, numericEnumMappedType, objectFromEntries,
+   arrayLiterals3, castingTuple, subtypeReductionUnionConstraints,
+   deeplyNestedConstraints, …).
+3. Destructuring RHS pattern-context (C's single root cause):
+   destructure.patternContextualType extended to .array_literal lets
+   DestructSrc.exact drop — ~6 cases (ES5For-of30, restElementWith
+   AssignmentPattern1, privateNameFieldDestructuredBinding,
+   sourceMapValidationDestructuring*, unionsOfTupleTypes1).
+4. Inference residue: genericContextualTypes1's last 2 keys; the pipe
+   rest-tuple family (fnParam(i).ty raw vs rest element read);
+   genericTypeArgumentInference1 (empty-array candidate demoted to
+   empty_seed, invisible to later contextual instantiation).
+5. yield* delegation inference (generatorTypeCheck20/21/25 —
+   signatures.zig yields.delegated abandons inference).
+6. `this` typed `any` in class methods/function expressions (the last
+   jsxComponentTypeErrors key + tsxDynamicTagName7 — expr/flow).
+7. Class+interface declaration-merge folding into DERIVED instances
+   (@types/react Component is that merge; unblocks removing D's
+   derivedClassInstance guard — 18-case FP risk documented in jsx.zig).
+8. Substitution types (a conditional's true branch keeps `number & T`-style
+   constraint info): the blocker C found for conditional callees
+   (types/conditions.zig; net-zero measured without it).
+9. narrowingIntersection (flow); complicatedIndexesOfIntersections
+   AreInferencable (reverse-mapped through Pick); for-of53/54 + for-of15
+   (binder/iteration); TS1434 residue (48 keys).
+10. LibraryManagedAttributes (deferred WITH a detection guard in jsx.zig
+    that silences the too-strict path — full modelling needs its own cycle).
+11. Census pools; resolution-mode attributes; per-frame weak rule.
+
+## Superseded queue (wave 28, kept for context)
 
 1. PRIORITY package FPs (parity ratchet, both single-key): (a) @types/node
    stream.d.ts:1025 TS2430 DuplexOptions-extends-WritableOptions —
