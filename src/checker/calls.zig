@@ -450,6 +450,18 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
     // `getNonNullableType` answers `errorType` when nothing is left, and
     // `resolveCallExpression` returns `resolveErrorCall(node)` for it. Without
     // this every `a()` on `(() => void) | undefined` was a TS2349.
+    // …and `checkNonNullTypeWithReporter`'s own head runs ahead of that, for
+    // `new` as much as for a call: an `unknown` callee is TS18046 naming it
+    // (TS2571 when it has no name to print), not the generic "not
+    // callable"/"not constructable" the resolve below would reach. Both are
+    // reported today, so this only re-codes a diagnostic that already exists
+    // — see `reportUnknownOperand` for why the general gate stays out.
+    if (c.nodeTag(shape.callee) != .super_expr and try expr_zig.reportUnknownOperand(c, callee_t, shape.callee)) {
+        for (shape.arg_nodes) |an| {
+            if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+        }
+        return .{ .ty = types.error_type, .chained = chained };
+    }
     if (!is_new and !shape.optional and c.nodeTag(shape.callee) != .super_expr) {
         if (nullishCallee(c, callee_t)) |code| {
             try c.diagFmt(code.number(), c.nodeSpan(shape.callee), "Cannot invoke an object which is possibly {s}.", .{code.text()});
