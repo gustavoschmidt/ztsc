@@ -3823,6 +3823,7 @@ pub const Checker = struct {
     pub const remapKey = generics_zig.remapKey;
     pub const numberLiteralAtom = generics_zig.numberLiteralAtom;
     pub const reduceIndexedAccess = generics_zig.reduceIndexedAccess;
+    pub const simplifyMappedIndexAccess = generics_zig.simplifyMappedIndexAccess;
     pub const isGenericObjectForIndex = generics_zig.isGenericObjectForIndex;
     pub const containsMappedParam = generics_zig.containsMappedParam;
     pub const containsMappedParamInner = generics_zig.containsMappedParamInner;

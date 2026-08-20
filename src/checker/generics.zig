@@ -2403,6 +2403,7 @@ pub const objectFromPropsFlags = mapped_zig.objectFromPropsFlags;
 pub const remapKey = mapped_zig.remapKey;
 pub const numberLiteralAtom = mapped_zig.numberLiteralAtom;
 pub const reduceIndexedAccess = mapped_zig.reduceIndexedAccess;
+pub const simplifyMappedIndexAccess = mapped_zig.simplifyMappedIndexAccess;
 pub const isGenericObjectForIndex = mapped_zig.isGenericObjectForIndex;
 pub const containsMappedParam = mapped_zig.containsMappedParam;
 pub const containsMappedParamInner = mapped_zig.containsMappedParamInner;

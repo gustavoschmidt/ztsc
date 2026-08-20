@@ -1079,6 +1079,38 @@ pub fn reduceIndexedAccess(c: *Checker, obj: TypeId, idx: TypeId) Error!TypeId {
     return c.indexedAccessType(obj, idx);
 }
 
+/// tsc's `getSimplifiedIndexedAccessType`, the generic-MAPPED-object arm:
+/// "If the object type is a mapped type `{ [P in K]: E }`, where `K` is
+/// generic, instantiate `E` using a mapper that substitutes the index type
+/// for `P`."
+///
+/// Null for anything else — a non-mapped object, or a map that REMAPS its
+/// keys (`as N<P>`), where the substitution is not the value at `idx`.
+///
+/// The map's OPTIONALITY is deliberately not folded in. tsc bakes `|
+/// undefined` into `getTemplateTypeFromMappedType` and therefore carries it
+/// on both sides of every template comparison; ztsc keeps `mappedValue` the
+/// written template and judges `?` separately (`mappedAddsOptional`), so
+/// adding it here would make one side of that comparison carry an
+/// `undefined` the other never has.
+///
+/// This is what relates `Readonly<Partial<T>>` to `Partial<T>`: the source's
+/// template is `Partial<T>[P]`, which is the target's `T[P]` only once the
+/// inner map is substituted through. Neither side's base-constraint route
+/// can answer it — `T` is a free parameter, so both accesses stay deferred.
+pub fn simplifyMappedIndexAccess(c: *Checker, acc: TypeId) Error!?TypeId {
+    const s = &c.ts;
+    if (s.kind(acc) != .index_access) return null;
+    const obj = s.indexAccessObj(acc);
+    if (s.kind(obj) != .mapped or s.mappedAs(obj) != 0) return null;
+    const val = try c.substMappedKey(
+        s.mappedValue(obj),
+        s.mappedParamId(s.mappedKeyParam(obj)),
+        s.indexAccessIndex(acc),
+    );
+    return if (val == acc) null else val;
+}
+
 /// Shallow analogue of tsc's `isGenericObjectType` for the object side of an
 /// indexed access: is `t` (or a union/intersection constituent of it) an
 /// *instantiable* type whose indexed property genuinely depends on later
