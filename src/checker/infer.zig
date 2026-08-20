@@ -2269,7 +2269,22 @@ pub fn combineCovariant(c: *Checker, prev: TypeId, cand: TypeId) Error!TypeId {
     // arbitrary arrival order decide (`argsOrArgArray<T>((T | T[])[])` fed
     // `(ObservableInput<T> | ObservableInput<T>[])[]` collects both a bare
     // `T`, via `ArrayLike<T>`'s iteration element, and the real union).
-    if (s.kind(prev) == .type_param or s.kind(cand) == .type_param) return c.makeUnion2(prev, cand);
+    //
+    // "Weakest evidence" is a statement about a bare variable STANDING BESIDE
+    // a structural candidate, so it only applies when exactly one side is one.
+    // Two bare variables are peers — neither is the weaker reading of the
+    // other — and tsc folds them with the ordinary `getCommonSupertype`
+    // (`reduceLeft((s, t) => isTypeSubtypeOf(s, t) ? t : s)`), which keeps the
+    // LEFTMOST of two unrelated parameters. That pair is the signature
+    // relation's normal case, where the "concrete" types are the target's own
+    // free parameters: `<T>(x: {foo: T}, y: {foo: T; bar: T}) => number`
+    // against `<T, U>(x: {foo: T}, y: {foo: U; bar: U}) => number` collects
+    // `T` and `U` for the source's single parameter. Unioning them made the
+    // instantiated source `{foo: T|U; bar: T|U}`, which absorbs both of the
+    // target's parameters and relates; tsc keeps `T`, so `y` fails
+    // contravariantly and the pair is a TS2322
+    // (`assignmentCompatWith{Call,Construct}Signatures5`/`6`).
+    if ((s.kind(prev) == .type_param) != (s.kind(cand) == .type_param)) return c.makeUnion2(prev, cand);
     if (c.covLiteralShape(prev) and c.covLiteralShape(cand)) return c.makeUnion2(prev, cand);
     // The literal candidates' union is folded in LAST, so a literal never
     // sits on the left of the pair. Only a FRESH OBJECT triggers the
