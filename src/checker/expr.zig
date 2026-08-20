@@ -4541,6 +4541,115 @@ fn checkIndexExpr(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Type
     return link.ty;
 }
 
+/// tsc's `isGenericIndexType` — the `IsGenericIndexType` bit of
+/// `getGenericObjectFlags` — asked of the INDEX of an element access: an
+/// instantiable non-primitive (a type variable, a deferred access, a
+/// conditional), a `keyof`, a template-literal pattern or a string mapping.
+///
+/// A generic MAPPED type is deliberately absent: it carries the *object*-side
+/// bit only, and the object side of an element-access expression does not
+/// defer (see `indexChainInner`). A union or intersection is generic when any
+/// constituent is, which is what `getGenericObjectFlags` ORs over — and what
+/// keeps a BRANDED key (`string & { _brand }`, both constituents concrete)
+/// on the eager path it has always taken.
+fn indexTypeIsGeneric(c: *Checker, t: TypeId) Error!bool {
+    const s = &c.ts;
+    return switch (s.kind(t)) {
+        .type_param,
+        .infer_var,
+        .mapped_param,
+        .index_access,
+        .conditional,
+        .keyof_op,
+        .template_literal_type,
+        .string_mapping,
+        => true,
+        .union_type, .intersection => blk: {
+            for (0..s.memberCount(t)) |i| {
+                if (try indexTypeIsGeneric(c, s.memberAt(t, i))) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+/// tsc's `checkIndexedAccessIndexType` for the access an element-access
+/// EXPRESSION just deferred: "is every constituent of the index assignable to
+/// `keyof` the object" — or, failing that, applicable to a number index
+/// signature the object has. Answers whether it reported TS2536, in which case
+/// the caller substitutes `error_type` exactly as tsc does.
+///
+/// `keyof.checkIndexedAccessIndexType` is the same tsc function reached from a
+/// type NODE, where ztsc deliberately restricts itself to a decidable
+/// literal-key shape (see there). The two do not overlap: the object side of an
+/// element-access expression never defers, so an access that gets here always
+/// has a GENERIC index — the case that check declines to look at — and one
+/// that gets there never does.
+///
+/// tsc's `AccessFlags.Writing` arm of the same function — TS2542 through a
+/// `Readonly<T>` — is `readonlyIndexWriteAt`'s here instead: a mapped receiver
+/// is one of the shapes `indexChainInner` declines to defer, so the write has
+/// no deferred access to hang the check on.
+fn checkDeferredIndexType(c: *Checker, acc: TypeId, node: Node) Error!bool {
+    const s = &c.ts;
+    const obj = s.indexAccessObj(acc);
+    const idx = s.indexAccessIndex(acc);
+    const keys = try c.keyofType(obj);
+    // tsc's `getIndexInfoOfType(objectType, numberType)`, asked of the
+    // apparent type: a numeric key reaches a number index signature even
+    // when `keyof` does not spell it out.
+    const apparent = try c.resolveStructural(try c.indexObjBaseConstraint(obj));
+    const has_number_index = switch (s.kind(apparent)) {
+        .array, .tuple => true,
+        .object => s.objectNumberIndex(apparent) != 0,
+        else => false,
+    };
+    var one = [_]TypeId{idx};
+    const parts: []const TypeId = if (s.kind(idx) == .union_type) try c.memberList(idx) else one[0..];
+    for (parts) |p| {
+        if (try c.isAssignable(p, keys)) continue;
+        if (has_number_index and try c.typeIsNumberLike(try c.resolveStructural(p))) continue;
+        try c.diagFmt(2536, c.nodeSpan(node), "Type '{s}' cannot be used to index type '{s}'.", .{
+            try c.typeToString(idx), try c.typeToString(obj),
+        });
+        return true;
+    }
+    return false;
+}
+
+/// Is `obj` an element-access receiver ztsc is willing to DEFER over?
+///
+/// tsc defers on a generic INDEX whatever the object is
+/// (`getIndexedAccessTypeOrUndefined`); this is narrower on purpose, and each
+/// exclusion names a place where ztsc's *relation* cannot read a deferred
+/// access back, so deferring would turn silence into a false positive:
+///
+///   * a NON-generic object. `assign.zig`'s indexed-access source rule takes
+///     both sides' base constraints at once, which for a concrete receiver is
+///     the receiver with its type ARGUMENTS substituted — excalidraw's
+///     `{ [key: string]: E; [key: number]: E }[E["id"]]` came back keyed by
+///     `Entity`, not by `E`, and stopped being an `E`
+///     (`keyofAndIndexedAccess2` f50/f51's callers). tsc constrains ONE side
+///     at a time and keeps the other; ztsc does not, so the eager answer —
+///     which is what a concrete receiver has always given — stays.
+///   * a MAPPED object, or a type parameter CONSTRAINED by a generic mapped
+///     type. `Partial<T>[K]` and `Record<keyof T, number>[K]` are exactly the
+///     accesses whose meaning lives in `getSimplifiedIndexedAccessType`, and
+///     the relation reaches that simplification only when the map is the
+///     access's own object — never through a constraint. A generic mapped
+///     receiver still gets its write-side TS2542 (`readonlyIndexWriteAt`),
+///     which needs the receiver, not the deferred type.
+///
+/// Both are UNDER-deferrals: the access falls back to the eager answer it gave
+/// before deferral existed, so nothing that reports today stops reporting.
+fn indexDeferrableObject(c: *Checker, obj: TypeId) Error!bool {
+    if (!try c.isGenericObjectForIndex(obj)) return false;
+    if (c.ts.kind(try c.resolveStructural(obj)) == .mapped) return false;
+    const bc = try c.indexObjBaseConstraint(obj);
+    return bc == obj or c.ts.kind(try c.resolveStructural(bc)) != .mapped;
+}
+
 /// Element access as an optional-chain link (see `memberChainInner`).
 fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!ChainLink {
     const d = c.tree.nodeData(node);
@@ -4630,6 +4739,29 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
         return .{ .ty = result, .chained = chained };
     }
     const ik = c.ts.kind(try c.ts.regularLiteral(idx_t));
+    // tsc's `getIndexedAccessTypeOrUndefined`, element-access-EXPRESSION arm:
+    // a GENERIC index — a type variable, `keyof T`, another deferred access,
+    // a conditional — makes the access DEFERRED, `Obj[Idx]`, instead of being
+    // resolved against a member table that does not exist yet. `x[k]` under
+    // `<T, K extends keyof T>` is `T[K]`, and `let n: number = x[k]` is the
+    // TS2322 tsc reports; classifying `k` by `typeIsStringLike` instead
+    // (the `else` arm below) answered `any` and said nothing at all.
+    //
+    // The index side is tsc's whole test; the object side is `indexDeferrable-
+    // Object`'s narrower one, which names the receivers whose deferred access
+    // ztsc's relation cannot read back. A concrete key never defers either
+    // way, so `x["a"]` under `T extends { a: string }` is still `string`.
+    //
+    // `reduceIndexedAccess` is the shared builder, so a key that reduces
+    // anyway (a concrete template pattern, a `never` key set) takes the
+    // ordinary arms below unchanged — only an access that actually stayed
+    // deferred is adopted here.
+    const deferred: ?TypeId = def: {
+        if (!try indexTypeIsGeneric(c, idx_t)) break :def null;
+        if (!try indexDeferrableObject(c, obj_t)) break :def null;
+        const acc = try c.reduceIndexedAccess(obj_t, idx_t);
+        break :def if (c.ts.kind(acc) == .index_access) acc else null;
+    };
     // tsc's `getIndexedAccessType` distributes over a UNION index type:
     // `o[k]` with `k: "a" | "b"` is `o["a"] | o["b"]`. Without this arm a
     // union key matched none of the kinds below and fell through to the
@@ -4644,7 +4776,7 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
     // certain shapes reach here (see `UnionIndexMiss`); the fallback type
     // below is unchanged either way, so whatever the access already reported
     // downstream still reports.
-    const distributed: ?TypeId = switch (try c.unionIndexElemType(r, idx_t)) {
+    const distributed: ?TypeId = if (deferred != null) null else switch (try c.unionIndexElemType(r, idx_t)) {
         .resolved => |ut| ut,
         .miss => |m| blk: {
             switch (m) {
@@ -4657,7 +4789,11 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
             break :blk null;
         },
     };
-    if (distributed) |ut| {
+    if (deferred) |acc| {
+        // tsc's `checkIndexedAccessIndexType`, which `checkElementAccess-
+        // Expression` runs on the access it just built.
+        result = if (try checkDeferredIndexType(c, acc, node)) types.error_type else acc;
+    } else if (distributed) |ut| {
         result = ut;
     } else switch (ik) {
         .string_literal => {
@@ -5300,6 +5436,16 @@ fn hasPrimitiveFacet(c: *Checker, t: TypeId, comptime f: fn (*Checker, TypeId) b
             const con = try c.typeParamConstraint(c.ts.typeParamSymbol(t));
             if (con == types.no_type or con == t) return false;
             return hasPrimitiveFacet(c, con, f, depth + 1);
+        },
+        // …and a deferred indexed access through its apparent type, the same
+        // step one kind over. `this.testy[key] += 1` inside `class Test<T
+        // extends Record<string, number>>` is `T[keyof T] += 1`, whose
+        // apparent type is `number`: tsc types the operands fine and reports
+        // only the write-back (TS2322). Without the arm the access matched
+        // nothing and the operand itself was a phantom TS2365.
+        .index_access => {
+            const bc = (try props_zig.indexAccessApparent(c, t)) orelse return false;
+            return hasPrimitiveFacet(c, bc, f, depth + 1);
         },
         else => return false,
     }
@@ -6189,6 +6335,24 @@ fn readonlyIndexWriteAt(c: *Checker, obj: TypeId, node: Node, idx_node: Node) Er
             },
         }
     }
+    // tsc's `checkIndexedAccessIndexType`, `AccessFlags.Writing` arm: a write
+    // through a generic MAPPED receiver that ADDS `readonly` is TS2542 —
+    // `y[k] = x[k]` on a `Readonly<T>`. Gated on a GENERIC index because that
+    // is the only way tsc reaches the check: it runs on a deferred access, and
+    // only a generic index defers an element access. A concrete key on the same
+    // receiver resolves to a named member and is TS2540 instead.
+    //
+    // The map's own `readonly` is asked, not `indexWriteVerdict` — a deferred
+    // map has no index signatures yet, which is why the verdict below answers
+    // `.none` for it.
+    if (c.ts.kind(obj) == .mapped and c.ts.mappedFlags(obj) & types.mapped_flag_readonly_add != 0 and
+        try indexTypeIsGeneric(c, idx_t))
+    {
+        try c.diagFmt(2542, c.nodeSpan(node), "Index signature in type '{s}' only permits reading.", .{
+            try c.typeToString(obj),
+        });
+        return false;
+    }
     // A key that NAMES a declared member writes that member, whose own
     // `readonly` is the member-access path's TS2540 — the index signature is
     // never consulted (tsc's `getPropertyNameFromIndex` runs first).
@@ -6901,61 +7065,51 @@ fn arityFiltered(c: *Checker, sig: TypeId, required: ?u32) TypeId {
 /// `no_type` and the expression keeps its context-free check.
 fn combineCallSignatures(c: *Checker, sigs: []const TypeId) Error!TypeId {
     const s = &c.ts;
-    // Per signature: how many LEADING fixed parameters it declares, and the
-    // element type of its trailing rest parameter (`no_type` when it has
-    // none). tsc's `combineIntersectionParameters` reads a position through
-    // `tryGetTypeAtPosition`, which answers a rest parameter's element type
-    // for every position it covers — the reason `(...data: any[]) => void`
-    // combines with `(message?: any, …rest) => void` instead of aborting.
-    const fixed = try c.scratch().alloc(usize, sigs.len);
-    defer c.scratch().free(fixed);
-    const rest_elem = try c.scratch().alloc(TypeId, sigs.len);
-    defer c.scratch().free(rest_elem);
-    var max_fixed: usize = 0;
+    // Per signature: how many POSITIONS it declares, and whether its trailing
+    // rest is open-ended. Both are the shared `getParameterCount` /
+    // `hasEffectiveRestParameter` pair, so a rest typed by a FIXED TUPLE
+    // spreads into its own elements instead of aborting the combination —
+    // `(a: number, ...args: []) => void` declares exactly one position, which
+    // is what lets it combine with `(b: string) => void` and
+    // `(c: boolean) => void` (`signatureCombiningRestParameters1`).
+    const positions = try c.scratch().alloc(u32, sigs.len);
+    defer c.scratch().free(positions);
+    const open_rest = try c.scratch().alloc(bool, sigs.len);
+    defer c.scratch().free(open_rest);
+    var max_pos: u32 = 0;
     var any_rest = false;
     for (sigs, 0..) |sig, si| {
         if (s.fnTypeParams(sig).len != 0 or s.fnThisType(sig) != 0) return types.no_type;
-        fixed[si] = s.fnParamCount(sig);
-        rest_elem[si] = types.no_type;
-        for (0..s.fnParamCount(sig)) |i| {
-            const p = s.fnParam(sig, @intCast(i));
-            if (!p.rest()) continue;
-            // Only a trailing rest with an array-shaped type is understood;
-            // a tuple rest would need positional expansion.
-            const rt = try c.resolveStructural(p.ty);
-            if (i + 1 != s.fnParamCount(sig) or s.kind(rt) != .array) return types.no_type;
-            fixed[si] = i;
-            rest_elem[si] = s.arrayElem(rt);
-            any_rest = true;
-        }
-        max_fixed = @max(max_fixed, fixed[si]);
+        // A rest typed by a UNION OF TUPLES has no single positional
+        // expansion at all (`sigRestUnion`), so there is nothing to combine.
+        if (try c.sigRestUnion(sig) != null) return types.no_type;
+        positions[si] = try c.effParamCount(sig);
+        const n = s.fnParamCount(sig);
+        open_rest[si] = n > 0 and s.fnParam(sig, n - 1).rest() and (try c.sigRestTuple(sig)) == null;
+        if (open_rest[si]) any_rest = true;
+        max_pos = @max(max_pos, positions[si]);
     }
     var params: std.ArrayList(types.Param) = .empty;
     defer params.deinit(c.scratch());
     var parts: std.ArrayList(TypeId) = .empty;
     defer parts.deinit(c.scratch());
-    for (0..max_fixed) |i| {
+    for (0..max_pos) |i| {
+        const pos: u32 = @intCast(i);
         parts.clearRetainingCapacity();
         var name: Atom = 0;
         var opt = false;
         for (sigs, 0..) |sig, si| {
-            if (i >= fixed[si]) {
-                if (rest_elem[si] != types.no_type) {
-                    // Covered by the rest parameter, and a rest position is
-                    // always optional.
-                    opt = true;
-                    try parts.append(c.scratch(), rest_elem[si]);
-                    continue;
-                }
-                // A signature that does not declare this position leaves it
-                // optional, matching tsc's `combineSignatures` arity rule.
-                opt = true;
-                continue;
+            // tsc's `tryGetTypeAtPosition` answers a rest parameter's element
+            // type for every position it covers — the reason
+            // `(...data: any[]) => void` combines with
+            // `(message?: any, …rest) => void`. A position past a signature's
+            // list, and a rest position, are both optional.
+            if (pos >= try c.requiredParams(sig)) opt = true;
+            const pt = (try c.paramTypeAt(sig, pos)) orelse continue;
+            if (pos < positions[si] and pos < s.fnParamCount(sig) and name == 0) {
+                name = s.fnParam(sig, pos).name;
             }
-            const p = s.fnParam(sig, @intCast(i));
-            if (name == 0) name = p.name;
-            if (p.optional()) opt = true;
-            try parts.append(c.scratch(), p.ty);
+            try parts.append(c.scratch(), pt);
         }
         if (parts.items.len == 0) return types.no_type;
         try params.append(c.scratch(), .{
@@ -6967,8 +7121,8 @@ fn combineCallSignatures(c: *Checker, sigs: []const TypeId) Error!TypeId {
     if (any_rest) {
         parts.clearRetainingCapacity();
         for (sigs, 0..) |sig, si| {
-            _ = sig;
-            if (rest_elem[si] != types.no_type) try parts.append(c.scratch(), rest_elem[si]);
+            if (!open_rest[si]) continue;
+            try parts.append(c.scratch(), try c.elemOfArrayish(s.fnParam(sig, s.fnParamCount(sig) - 1).ty));
         }
         try params.append(c.scratch(), .{
             .name = 0,

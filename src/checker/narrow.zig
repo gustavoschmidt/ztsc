@@ -293,6 +293,24 @@ pub fn narrowByTypeof(c: *Checker, t0: TypeId, str: Atom, sense: bool) Error!Typ
         if (a == str) which = i;
     }
     if (which == typeof_names.len) return narrowByTypeofHostObject(c, t0, sense);
+    // A union that flow-merging built with an INSTANTIABLE constituent —
+    // `(T[K] & string) | T[K]`, which is what two sequential `if (typeof …)`
+    // statements leave behind — takes the per-constituent rule below,
+    // constituent by constituent. `narrowByTypeofResolved`'s own union arm is
+    // a pure filter: it asks `typeofMatches` of each member, and a deferred
+    // access matches no concrete kind, so every member was dropped and the
+    // branch came back `never` (a phantom TS2339 on the guarded read). Gated
+    // on an instantiable member being present, so an ordinary union keeps the
+    // single, cheaper pass it has always taken.
+    if (c.ts.kind(t0) == .union_type and try unionHasInstantiable(c, t0)) {
+        var parts: std.ArrayList(TypeId) = .empty;
+        defer parts.deinit(c.scratch());
+        for (try c.memberList(t0)) |m| {
+            const nm = try narrowByTypeof(c, m, str, sense);
+            if (nm != types.never_type) try parts.append(c.scratch(), nm);
+        }
+        return c.ts.makeUnion(c.scratch(), parts.items);
+    }
     // A type parameter narrows through its CONSTRAINT (`typeofMatches` only
     // inspects concrete kinds, so filtering `T` itself would collapse
     // `typeof x === 'object'` to `never`) — but the answer must stay a
@@ -304,16 +322,95 @@ pub fn narrowByTypeof(c: *Checker, t0: TypeId, str: Atom, sense: bool) Error!Typ
     // `m.set(typeof e === "string" ? e : e.id, e)` is read at the merge of
     // the two branches, and a bare filtered constraint made it
     // `string | { id: string }` — not assignable to `T` (TS2345).
-    if (c.ts.kind(t0) == .type_param) {
-        const con = try c.baseConstraintOf(t0);
-        if (con != t0) {
+    //
+    // A deferred indexed access or conditional is the SAME situation: tsc's
+    // `getNarrowedType` fallback is written for every `TypeFlags.Instantiable`,
+    // not for type parameters alone. `const item = obj[k]` under
+    // `<T, K extends keyof T>` is `T[K]`, and `if (typeof item == 'function')`
+    // must leave `T[K] & Function` — filtering the access itself matches no
+    // concrete kind and collapsed the branch to `never`, so `item.call(obj)`
+    // was a phantom TS2339 (`typeGuardOfFormTypeOfFunction` f100). Their
+    // constraint takes the TRANSITIVE step, since `T[K]`'s first hop is
+    // typically another deferred access.
+    if (c.ts.kind(t0) == .type_param or c.ts.kind(t0) == .index_access or c.ts.kind(t0) == .conditional) {
+        const deferred = c.ts.kind(t0) != .type_param;
+        const con = if (deferred)
+            try c.transitiveBaseConstraint(t0)
+        else
+            try c.baseConstraintOf(t0);
+        // `never` is not a usable constraint, it is the absence of one:
+        // `T[K]`'s base constraint for an unconstrained `T` collapses through
+        // `unknown[keyof unknown]` to `never` (the same collapse
+        // `indexObjBaseConstraint` names), and filtering it would report the
+        // whole branch unreachable.
+        if (con != t0 and con != types.no_type and c.ts.kind(con) != .never) {
             const narrowed = try c.narrowByTypeofResolved(con, which, sense);
             if (narrowed == con) return t0; // nothing filtered
             if (c.ts.kind(narrowed) == .never) return types.never_type;
             return c.ts.makeIntersection(c.scratch(), &.{ t0, narrowed });
         }
+        // No usable constraint. tsc's `getNarrowedType` reads a missing base
+        // constraint as `unknown` — which every typeof candidate is related to
+        // — and still answers `getIntersectionType([t, candidate])`. That is
+        // what leaves `T[K] & Function` for `if (typeof item === 'function')`
+        // under `<T, K extends keyof T>`, so `item.call(obj)` reads the
+        // apparent `Function` member instead of reporting TS2339.
+        //
+        // Positive branch only: `typeof x !== 'string'` subtracts a
+        // constituent, and a deferred access has none to subtract. A bare type
+        // PARAMETER is left alone exactly as before — an unconstrained `T`
+        // narrowed to `T & string` would stop being passable where `T` is
+        // wanted, the regression the constraint route above was written for.
+        if (deferred and sense) {
+            if (try typeofCandidate(c, which)) |cand| {
+                return c.ts.makeIntersection(c.scratch(), &.{ t0, cand });
+            }
+        }
     }
     return c.narrowByTypeofResolved(t0, which, sense);
+}
+
+/// Does this union carry a constituent whose narrowing needs the instantiable
+/// rule — a deferred access or conditional, bare or under an intersection
+/// (`T[K] & string`, the shape the previous branch's narrowing itself left)?
+fn unionHasInstantiable(c: *Checker, t: TypeId) Error!bool {
+    for (0..c.ts.memberCount(t)) |i| {
+        const m = c.ts.memberAt(t, @intCast(i));
+        switch (c.ts.kind(m)) {
+            .index_access, .conditional => return true,
+            .intersection => {
+                for (0..c.ts.memberCount(m)) |j| {
+                    switch (c.ts.kind(c.ts.memberAt(m, @intCast(j)))) {
+                        .index_access, .conditional => return true,
+                        else => {},
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// The type `typeof x === "<name>"` ASSERTS — tsc's `typeofTypesByName`, plus
+/// the `"function"` entry `narrowTypeByTypeof` supplies at the use site
+/// (`globalFunctionType`). Read off `narrowByTypeofResolved`'s own `unknown`
+/// answer so the two cannot drift; only `"function"`, which has no single type
+/// in ztsc's subset, is named here.
+///
+/// `"object"` is deliberately absent, exactly as it is from tsc's table: it
+/// asserts `nonPrimitive | null`, which is not one type to intersect with, and
+/// tsc falls back to a facts filter that leaves an instantiable alone. Null
+/// here says the same — leave the narrowed type as it is.
+fn typeofCandidate(c: *Checker, which: usize) Error!?TypeId {
+    if (which == 6) return null;
+    if (which == 7) {
+        const sym = c.prog.globals.lookup(c.atom_Function) orelse return null;
+        if (!c.symFlags(sym).interface) return null;
+        return try c.ts.makeRef(sym, &.{});
+    }
+    const cand = try c.narrowByTypeofResolved(types.unknown_type, which, true);
+    return if (cand == types.unknown_type or c.ts.kind(cand) == .never) null else cand;
 }
 
 /// `typeof x === "Object"` — a string literal that is not one of the eight

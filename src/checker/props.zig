@@ -426,6 +426,16 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, o: PropLookup) Error!?types
             if (u == t) return null;
             return propOfTypeIdx(c, u, name, o);
         },
+        // A still-deferred indexed access `T[K]` has the apparent members of
+        // its BASE CONSTRAINT (`indexAccessApparent`). Member access only
+        // (`allow_index`), like the `.mapped` arm above: the structural
+        // relation reaches a deferred access through its own rules in
+        // `assign.zig` and must not also see invented members.
+        .index_access => {
+            if (!allow_index) return null;
+            const bc = (try indexAccessApparent(c, t)) orelse return null;
+            return propOfTypeIdx(c, try c.resolveStructural(bc), name, o);
+        },
         .ref => return propOfTypeIdx(c, try c.resolveStructural(t), name, o),
         .class_value => return classValueProp(c, s.classSymbol(t), name, o),
         .enum_type => {
@@ -440,6 +450,79 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, o: PropLookup) Error!?types
         .function, .overloads => return if (o.skip_augment) null else functionInterfaceProp(c, .callable, name),
         else => return null,
     }
+}
+
+/// The APPARENT type of a still-deferred indexed access `T[K]`: tsc's
+/// `getApparentType` is `getBaseConstraintOfType` for every
+/// `TypeFlags.Instantiable`, and `computeBaseConstraint`'s IndexedAccess arm
+/// is "index the object's base constraint by the index's base constraint".
+/// Under `<T extends { [x: string]: Item }, K extends keyof T>` the access
+/// `T[K]` has apparent type `Item` — which is what lets `obj[key].name` read
+/// a real member, and what makes `obj[key] += 1` an arithmetic operand.
+///
+/// Null when there is no better answer than the access itself: an
+/// UNCONSTRAINED `T` is its own base constraint, so the access stays generic
+/// and tsc's `getApparentType` falls back to `unknownType` — which has no
+/// members and is not a number either.
+///
+/// Both sides take the TRANSITIVE constraint (tsc's `getBaseConstraint`
+/// recurses), unlike the relation's `indexAccessTargetConstraint`, which
+/// stops the index after one step on purpose: there, collapsing `K extends
+/// keyof T` through `keyof unknown` to `never` would make an unresolvable
+/// access accept every source. Here the answer only ever ADDS apparent
+/// structure to a type that had none, so an over-eager constraint cannot
+/// silence a diagnostic — and stopping early would leave every `T[K]`
+/// memberless, which is the whole point.
+pub fn indexAccessApparent(c: *Checker, t: TypeId) Error!?TypeId {
+    const s = &c.ts;
+    const idx = s.indexAccessIndex(t);
+    // An INTERSECTION object DISTRIBUTES. tsc reads `(A & B)[K]` through
+    // `getReducedApparentType`, whose members are every constituent's, so a
+    // constituent that reduces supplies members even while its sibling stays
+    // deferred: `SpyObj<T> = T & { [k in keyof T]: Spy }` indexed by `keyof T`
+    // has `Spy`'s members, from the mapped half alone — the bare `T` half
+    // cannot answer and does not have to. Taking the whole intersection's base
+    // constraint instead substituted `T := unknown` through it and collapsed
+    // the map's key domain to `never`, so the access had no members at all.
+    const obj0 = try c.resolveStructural(s.indexAccessObj(t));
+    if (s.kind(obj0) == .intersection) {
+        var parts: std.ArrayList(TypeId) = .empty;
+        defer parts.deinit(c.scratch());
+        for (try c.memberList(obj0)) |m| {
+            var acc = try c.reduceIndexedAccess(m, idx);
+            // A generic MAP constituent defers, and its answer is its template
+            // with the key substituted (`getSimplifiedIndexedAccessType`) —
+            // the `{ [k in keyof T]: Spy }` half is exactly this shape.
+            if (s.kind(acc) == .index_access) {
+                acc = (try c.simplifyMappedIndexAccess(acc)) orelse acc;
+            }
+            // Still deferred (or circular): that constituent has nothing to
+            // contribute, and the others still might.
+            if (s.kind(acc) == .index_access or acc == t) continue;
+            try parts.append(c.scratch(), acc);
+        }
+        if (parts.items.len != 0) return try s.makeIntersection(c.scratch(), parts.items);
+    }
+    const obj_bc = try c.indexObjBaseConstraint(s.indexAccessObj(t));
+    // tsc's `getSimplifiedIndexedAccessType`, which `getSimplifiedTypeOr-
+    // Constraint` asks for BEFORE the constraint route: an access whose object
+    // is a generic MAP is that map's template with the key substituted, no key
+    // set needed. `<T extends Record<keyof T, number>>` constrains `T[K]` to
+    // `Record<keyof T, number>[K]`, whose template is `number`; the constraint
+    // route below cannot answer it, because that map's key domain is still
+    // generic and `isGenericObjectForIndex` (rightly) stops there. Built only
+    // when the constraint IS such a map, so nothing else pays the intern.
+    const obj_r = try c.resolveStructural(obj_bc);
+    if (s.kind(obj_r) == .mapped and s.mappedAs(obj_r) == 0) {
+        const lifted = try s.makeIndexAccess(obj_r, idx);
+        if (try c.simplifyMappedIndexAccess(lifted)) |sim| {
+            if (sim != t) return sim;
+        }
+    }
+    const idx_bc = try c.transitiveBaseConstraint(idx);
+    if (try c.isGenericObjectForIndex(obj_bc) or try c.containsFreeTypeParam(idx_bc, &.{})) return null;
+    const bc = try c.reduceIndexedAccess(obj_bc, idx_bc);
+    return if (bc == t) null else bc;
 }
 
 /// Does this deferred mapped type's KEY DOMAIN stay generic — i.e. would

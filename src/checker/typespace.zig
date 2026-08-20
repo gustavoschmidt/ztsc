@@ -1093,7 +1093,10 @@ pub fn typeFromQualifiedName(c: *Checker, node: Node, args: []const TypeId) Erro
         // An enum merged with a namespace still has namespace members;
         // only a pure enum can conclude "no such member" here.
         if (!c.symFlags(esym).namespace_decl) {
-            try c.diagFmt(2694, c.tokSpan(name_tok), "Namespace '{s}' has no exported member '{s}'.", .{ c.symbolName(esym), c.atomText(name) });
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(c.scratch());
+            try entityNameText(c, d.lhs, &buf);
+            try c.diagFmt(2694, c.tokSpan(name_tok), "Namespace '{s}' has no exported member '{s}'.", .{ buf.items, c.atomText(name) });
             return types.error_type;
         }
     }
@@ -1123,12 +1126,21 @@ pub fn typeFromQualifiedName(c: *Checker, node: Node, args: []const TypeId) Erro
                     }
                 }
             }
+            // Both messages name the QUALIFIER as written, not the container's
+            // own single name: tsc renders the symbol with
+            // `SymbolFormatFlags.None`, whose qualified-name walk spells every
+            // enclosing namespace — `M.N`, not `N` (and `M.Deep.Deeper` for a
+            // chain). The dotted text of `d.lhs` is exactly that walk, and it
+            // is already what the TS2749 arm above prints.
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(c.scratch());
+            try entityNameText(c, d.lhs, &buf);
             const sugg = try namespaceMemberSuggestion(c, ns_sym, name);
             if (sugg != 0) {
-                try c.diagFmt(2724, c.tokSpan(name_tok), "'{s}' has no exported member named '{s}'. Did you mean '{s}'?", .{ c.symbolName(ns_sym), c.atomText(name), c.atomText(sugg) });
+                try c.diagFmt(2724, c.tokSpan(name_tok), "'{s}' has no exported member named '{s}'. Did you mean '{s}'?", .{ buf.items, c.atomText(name), c.atomText(sugg) });
                 return types.error_type;
             }
-            try c.diagFmt(2694, c.tokSpan(name_tok), "Namespace '{s}' has no exported member '{s}'.", .{ c.symbolName(ns_sym), c.atomText(name) });
+            try c.diagFmt(2694, c.tokSpan(name_tok), "Namespace '{s}' has no exported member '{s}'.", .{ buf.items, c.atomText(name) });
             return types.error_type;
         },
         .module => |m| {
