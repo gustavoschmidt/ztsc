@@ -277,7 +277,17 @@ pub fn dualHasValue(c: *Checker, tgt: modules.Target) Error!bool {
 pub fn targetValueType(c: *Checker, tgt: modules.Target) Error!TypeId {
     switch (tgt.kind) {
         .any => return types.any_type,
-        .binding => return c.typeOfSymbol(c.toGlobalIn(tgt.file, tgt.payload)),
+        // A link target names the DECLARATION the export table recorded, but a
+        // cross-file `declare module` augmentation may since have merged that
+        // declaration with others. tsc has one symbol per entity after merging,
+        // so the value type must be the MERGED one whichever spelling reached
+        // here: `import { Observable }` (a raw `(file, local)` target) and
+        // `import * as O` (which routes through `mergedOf` in
+        // `namespaceObjectType`) have to agree.
+        .binding => {
+            const g = c.toGlobalIn(tgt.file, tgt.payload);
+            return c.typeOfSymbol(c.prog.mergedOf(g) orelse g);
+        },
         .namespace => return c.namespaceObjectType(tgt.file),
         .ambient_ns => return c.ambientNamespaceType(tgt.payload),
         // `import { X } from "m"` where `m` is `export = <value>` and `X`

@@ -3120,16 +3120,18 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                     try computed_key.report(c, pd.lhs, kt);
                     const rk = try c.resolveStructural(kt);
                     const key_kind = c.ts.kind(rk);
-                    // A NUMERIC key contributes a number INDEX SIGNATURE in
-                    // ztsc's model, never a named member, so it is held back
-                    // from the late-bound question below (which does name it —
-                    // tsc late-binds `[0]` to the member `"0"`, and the excess
-                    // -property scan asks `computed_key.lateBoundName` for
-                    // exactly that name). Everything else late-bindable — a
-                    // well-known symbol, a `unique symbol` const, a string
-                    // literal, a qualified enum member — names a real property.
+                    // A key of the WIDE `number` type is dynamic — it names no
+                    // one member, so it contributes a number index signature.
+                    // A numeric LITERAL key is late-bound exactly like a string
+                    // literal one: tsc names `[0]` the member `"0"`, so
+                    // `{ [an]: 5 }` with `const an = 0` satisfies
+                    // `{ 0: number }` instead of being a bare index signature
+                    // that is missing it (`objectLiteralEnumPropertyNames`).
+                    // Everything else late-bindable — a well-known symbol, a
+                    // `unique symbol` const, a string literal, a qualified enum
+                    // member — names a real property too.
                     const named: ?Atom = switch (key_kind) {
-                        .number, .number_literal, .number_literal_fresh => null,
+                        .number => null,
                         else => try computed_key.lateBoundName(c, key_expr, kt),
                     };
                     if (named) |key| {
