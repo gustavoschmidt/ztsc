@@ -786,6 +786,18 @@ const Parser = struct {
         try p.addDiag(code, .{ .code = code, .span = .{ .start = at, .end = at } });
     }
 
+    /// Report zero-width at the END of an ALREADY CONSUMED token — the
+    /// `errAtCurEnd` of a token the parser has walked past. tsc's
+    /// `grammarErrorAtPos(node, node.pos, …)` lands there whenever the node
+    /// whose `pos` is being blamed is EMPTY and begins after that token: an
+    /// empty `VariableDeclarationList` starts where the `var` ended, which is
+    /// column 4 of `var ;` and column 9 of `for (var in X)`.
+    fn errAtTokenEnd(p: *Parser, code: Code, tok: u32) Error!void {
+        const start = p.tok_starts.items[tok] & scanner.Tokens.start_mask;
+        const at = scanner.tokenEnd(p.src, p.tok_tags.items[tok], start);
+        try p.addDiag(code, .{ .code = code, .span = .{ .start = at, .end = at } });
+    }
+
     fn errAtToken(p: *Parser, code: Code, tok: u32) Error!void {
         const start = p.tok_starts.items[tok] & scanner.Tokens.start_mask;
         const end = scanner.tokenEnd(p.src, p.tok_tags.items[tok], start);
@@ -2393,6 +2405,19 @@ const Parser = struct {
                 .using_binding_pattern
         else
             null;
+        // tsc's `parseDelimitedList` asks `isListElement` before the FIRST
+        // element too, so a list whose head is already a TERMINATOR parses zero
+        // declarators — and `checkGrammarVariableDeclarationList` answers for
+        // the empty list (TS1123) instead of the parser answering "Variable
+        // declaration expected" at whatever follows. `const` at end of file,
+        // `var ;` and a `for (var in X)` head are all this shape; the last one
+        // is why the code is GRAMMAR-class, since tsgo reports the RHS's TS2304
+        // beside it.
+        if (!p.atStartOfDeclarator() and p.varDeclaratorListDone()) {
+            if (p.spec > 0) return error.Backtrack;
+            try p.errAtTokenEnd(.empty_var_decl_list, kw);
+            return p.addNode(.{ .tag = .var_decl, .main_token = kw, .data = .{ .lhs = 0, .rhs = 0 } });
+        }
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
         while (true) {
@@ -2552,18 +2577,19 @@ const Parser = struct {
     /// head with two INITIALIZED declarations answers for the count alone.
     ///
     /// Positions are tsc's, measured: the count is blamed on the SECOND
-    /// declarator's first token (`grammarErrorOnFirstToken(declarations[1])`)
-    /// and the initializer on the declarator's NAME.
-    ///
-    /// The type-annotation arm below these two (TS2483/TS2404) is left out: it
-    /// needs no more than these do, but no corpus case is one key away from it
-    /// and ztsc already answers those heads with a checker diagnostic tsc's
-    /// `return` suppresses, so adding it would leave the excess in place.
+    /// declarator's first token (`grammarErrorOnFirstToken(declarations[1])`),
+    /// and the initializer and the TYPE ANNOTATION on the declarator's NAME
+    /// (`grammarErrorOnNode(firstDeclaration.name/firstDeclaration)`, whose
+    /// first token is the same one).
     fn checkForInOfHead(p: *Parser, init: Node, is_of: bool) Error!void {
         if (p.spec != 0 or init == null_node) return;
         switch (p.nodeTagAt(init)) {
             .var_decl => {
                 const data = p.nodeDataAt(init);
+                // An EMPTY list already answered TS1123 (`parseVarDecl`), and
+                // tsc's `checkGrammarVariableDeclarationList` `return`s true
+                // there, so the count arm never runs.
+                if (data.rhs - data.lhs < 2) return;
                 const second = p.extra.items[data.lhs + 1];
                 const code: Code = if (is_of) .for_of_one_declaration else .for_in_one_declaration;
                 try p.errAtToken(code, p.nodeMainTokenAt(second));
@@ -2575,7 +2601,19 @@ const Parser = struct {
                     .declarator_full => p.extraFieldAt(ast.DeclaratorFull, "init", p.nodeDataAt(decl).rhs) != null_node,
                     else => false,
                 };
-                if (!has_init) return;
+                if (!has_init) {
+                    // Last arm of tsc's chain: the head's one declaration may
+                    // not carry a TYPE ANNOTATION either. `grammarErrorOnNode`
+                    // blames the whole declaration, whose first token is the
+                    // name — the same anchor the initializer arm uses.
+                    const ann = switch (p.nodeTagAt(decl)) {
+                        .declarator_full => p.extraFieldAt(ast.DeclaratorFull, "type_ann", p.nodeDataAt(decl).rhs),
+                        else => null_node,
+                    };
+                    if (ann == null_node) return;
+                    const tcode: Code = if (is_of) .for_of_type_annotation else .for_in_type_annotation;
+                    return p.errAtToken(tcode, p.nodeMainTokenAt(decl));
+                }
                 const code: Code = if (is_of) .for_of_declaration_initializer else .for_in_declaration_initializer;
                 try p.errAtToken(code, p.nodeMainTokenAt(decl));
             },
@@ -3296,8 +3334,27 @@ const Parser = struct {
                 try p.pushScratch(try p.addNode(.{ .tag = .rest_element, .main_token = dots, .data = .{ .lhs = target, .rhs = 0 } }));
                 // TS2462 is blamed on the bound NAME, not on the `...`.
                 if (p.curTag() == .comma) try p.errAtToken(.rest_must_be_last, p.nodes.items(.main_token)[target]);
-            } else {
+            } else if (p.atStartOfDeclarator()) {
                 try p.pushScratch(try p.parseBindingElement());
+            } else {
+                // tsc's `parsingContextErrors(ArrayBindingElements)`: a token
+                // that starts no element is TS1181 here, not the TS1134 that
+                // `parseIdentifierOrPattern` would give — the array pattern has
+                // its own wording, exactly as the object one has TS1180's.
+                //
+                // …and `abortParsingListOrMoveToNextToken`'s two-way recovery.
+                // A token some ENCLOSING list would take ends this one and is
+                // left where it is (`isInSomeParsingContext`, approximated by
+                // the statement list, which is the enclosing context that
+                // matters here): `let[0] = 100` leaves `0` to become the
+                // expression statement tsc parses. Anything else — an operator
+                // no list starts with — is SKIPPED and the pattern keeps
+                // reading, so `var [...x = a]` stays one diagnostic instead of
+                // handing `= a]` to the enclosing declarator.
+                try p.fail(.expected_binding_pattern_element);
+                if (p.atStartOfStatement()) break;
+                _ = try p.bump();
+                continue;
             }
             if (try p.eat(.comma) == null and p.curTag() != .r_bracket) {
                 try p.fail(.expected_comma);

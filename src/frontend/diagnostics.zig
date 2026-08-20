@@ -95,7 +95,17 @@ pub const Code = enum(u16) {
     /// TS1180: the same in an object BINDING pattern (`var { + } = o`) — tsc
     /// words and numbers that one separately.
     expected_binding_pattern_property,
+    /// TS1181: the same in an ARRAY binding pattern (`var [ 0 ] = a`) — tsc's
+    /// `parsingContextErrors(ArrayBindingElements)`, a third wording beside
+    /// TS1180's and TS1134's.
+    expected_binding_pattern_element,
     expected_binding,
+    /// TS1123: a `var`/`let`/`const` whose declarator list parsed ZERO
+    /// declarators (`const` at end of file, `var ;`, a `for (var in x)` head).
+    /// tsc's `checkGrammarVariableDeclarationList`, so this is a GRAMMAR
+    /// diagnostic — `for (var in X)` reports it beside the RHS's TS2304, which
+    /// a syntactic answer would suppress.
+    empty_var_decl_list,
     expected_string_literal,
     expected_from,
     /// TS1005 for the `as` of a namespace import (`import * as ns from "m"`)
@@ -348,6 +358,12 @@ pub const Code = enum(u16) {
     /// `return`s, so a head that is wrong about the count never reaches these.
     for_of_declaration_initializer,
     for_in_declaration_initializer,
+    /// TS2483/TS2404: the one declaration a `for…of` / `for…in` head may have
+    /// carries a TYPE ANNOTATION. Last arm of tsc's chain, so a head that is
+    /// wrong about the count or has an initializer never reaches these; blamed
+    /// on the whole declaration, whose first token is the name.
+    for_of_type_annotation,
+    for_in_type_annotation,
     /// TS17008: an opening tag whose element ran to end of file, or whose
     /// closing tag turned out to belong to an ENCLOSING element
     /// (`<div><span></div>` blames the `span`). tsc reports it on the OPENING
@@ -985,10 +1001,13 @@ pub const Code = enum(u16) {
             .declare_in_ambient_context,
             .generator_in_ambient_context,
             .overload_signature_generator,
+            .empty_var_decl_list,
             .for_of_one_declaration,
             .for_in_one_declaration,
             .for_of_declaration_initializer,
             .for_in_declaration_initializer,
+            .for_of_type_annotation,
+            .for_in_type_annotation,
             .module_keyword_for_namespace,
             .quoted_module_name_needs_ambient,
             .const_class_member,
@@ -1255,7 +1274,9 @@ pub const Code = enum(u16) {
             .expected_class_member => "Unexpected token. A constructor, method, accessor, or property was expected.",
             .expected_property_name => "Property assignment expected.",
             .expected_binding_pattern_property => "Property destructuring pattern expected.",
+            .expected_binding_pattern_element => "Array element destructuring pattern expected.",
             .expected_binding => "Variable declaration expected.",
+            .empty_var_decl_list => "Variable declaration list cannot be empty.",
             .expected_string_literal => "String literal expected.",
             .expected_from => "'from' expected.",
             .expected_as => "'as' expected.",
@@ -1382,6 +1403,8 @@ pub const Code = enum(u16) {
             .for_in_one_declaration => "Only a single variable declaration is allowed in a 'for...in' statement.",
             .for_of_declaration_initializer => "The variable declaration of a 'for...of' statement cannot have an initializer.",
             .for_in_declaration_initializer => "The variable declaration of a 'for...in' statement cannot have an initializer.",
+            .for_of_type_annotation => "The left-hand side of a 'for...of' statement cannot use a type annotation.",
+            .for_in_type_annotation => "The left-hand side of a 'for...in' statement cannot use a type annotation.",
             .jsx_element_unclosed => "JSX element '{0}' has no corresponding closing tag.",
             .jsx_expected_closing_tag => "Expected corresponding JSX closing tag for '{0}'.",
             .jsx_fragment_unclosed => "JSX fragment has no corresponding closing tag.",
@@ -1592,7 +1615,9 @@ pub const Code = enum(u16) {
             .expected_class_member => 1068,
             .expected_property_name => 1136,
             .expected_binding_pattern_property => 1180,
+            .expected_binding_pattern_element => 1181,
             .expected_binding => 1134,
+            .empty_var_decl_list => 1123,
             .expected_declaration => 1146,
             .expected_case_or_default => 1130,
             .expected_catch_or_finally => 1472,
@@ -1753,6 +1778,8 @@ pub const Code = enum(u16) {
             .for_in_one_declaration => 1091,
             .for_of_declaration_initializer => 1190,
             .for_in_declaration_initializer => 1189,
+            .for_of_type_annotation => 2483,
+            .for_in_type_annotation => 2404,
             .jsx_element_unclosed => 17008,
             .jsx_expected_closing_tag => 17002,
             .jsx_fragment_unclosed => 17014,
