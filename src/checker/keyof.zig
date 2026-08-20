@@ -95,10 +95,22 @@ pub const synthetic_prefix = "__@";
 /// half the suite asks for (`keyRemappingKeyofResult`,
 /// `contextuallyTypedSymbolNamedProperties`, `extractInferenceImprovement`
 /// all key on `const s = Symbol()`). The consequence kept: `Extract<keyof
-/// number[], string>` still wrongly keeps `"__@iterator"`. Closing it wants
-/// the fact carried on the TABLE — a flag set once where the table is
-/// interned — not re-derived per property, which is a types.zig change and
-/// its own measurement.
+/// number[], string>` still wrongly keeps `"__@iterator"`.
+///
+/// Carrying the fact on the TABLE instead — an object flag set once where the
+/// table is interned — was tried and does NOT close it. The per-property
+/// derivation is not what costs: it is already one integer-map hit, and a
+/// table flag can only skip tables that have no synthetic member at all, which
+/// `Array`/`String`/`Map`/`Set` are precisely not. Measured (drizzle, 9
+/// interleaved A/B samples of 15 batched invocations): answering the
+/// well-known keys with `SymbolConstructor`'s own `unique symbol` — memoized
+/// per atom, so 13 scans for the whole program — is +11.2% median wall and
+/// +8.8% min, with every paired sample worse, against a 2% bar. The cost is
+/// downstream and intrinsic: the extra `unique symbol` constituent widens the
+/// `keyof` of nearly every lib type and every relation over one pays for it.
+/// The suite pays nothing back — the same run was 7116 exact either way, zero
+/// cases moved. Reopen only with a plan that makes the WIDER key set cheap,
+/// not with another way to compute it.
 pub fn memberKeyKind(c: *Checker, name: types.Atom) Error!TypeId {
     if (c.sym_key_cache.get(name)) |t| return t;
     const answer = try computeMemberKeyKind(c, name);
