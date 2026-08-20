@@ -1221,6 +1221,63 @@ pub fn weakTypeMismatch(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
     return true;
 }
 
+/// Second reading of a pair whose `this` markers the home-instance rewrite
+/// (`this_apparent`) could not relate: bind each side's markers to that side's
+/// own RECEIVER instead — tsc's `getTypeWithThisArgument(type, type)`.
+///
+/// A class or interface INSTANCE binds `this` to itself, including in the
+/// members it INHERITED: tsc resolves a type reference's members with the
+/// reference as `thisArgument` (`resolveTypeReferenceMembers` pads the type
+/// argument list with the reference), so `class D extends RB` reads `RB`'s
+/// `destroy(): this` as `destroy(): D` and not as `destroy(): RB`. Reading it
+/// as `RB` is a FALSE POSITIVE generator: `class Duplex extends ReadableBase`
+/// inherits `destroy(): this`, so relating `Duplex` to `Writable` compared
+/// `ReadableBase` against `WritableBase` — two unrelated halves of a stream —
+/// and @types/node's `interface DuplexOptions extends WritableOptions` was a
+/// phantom TS2430 on the `construct?(this: Duplex, …)` member that hangs off
+/// that pair.
+///
+/// A RETRY, not the first reading, and that is a perf decision with a
+/// diagnostic consequence, both worth stating:
+///
+///   * Cost. The rewrite is per RECEIVER, so a base's member types are
+///     re-substituted once per subclass instead of once for the whole family.
+///     Done eagerly it cost zod +53% types created (52.7 K → 80.6 K) and +70%
+///     instantiations for a wall-clock +14%; done here it is paid only by pairs
+///     that have already failed, which no clean program has many of.
+///   * Direction. This can only turn a NO into a YES, so it removes false
+///     positives and never adds one. The symmetric FALSE NEGATIVE — a TARGET
+///     `class W extends WB { extra() }` asks for `destroy(): W` where the
+///     home-instance reading only asked for `destroy(): WB`, so a source
+///     returning a bare `WB` is accepted — is NOT fixed by a retry, and stays
+///     the under-report it already was.
+///
+/// `prior` is the home-instance reading's answer, returned unchanged when the
+/// retry does not apply or does not settle the pair.
+fn receiverBoundRetry(c: *Checker, s: TypeId, t: TypeId, prior: RelAnswer) Error!RelAnswer {
+    const s_recv = try thisReceiverOf(c, s);
+    const t_recv = try thisReceiverOf(c, t);
+    if (s_recv == this_apparent and t_recv == this_apparent) return prior;
+    const sb = try c.substThis(s, s_recv);
+    const tb = try c.substThis(t, t_recv);
+    if (sb == s and tb == t) return prior;
+    const answer = try relate(c, sb, tb, true);
+    return if (answer.related()) answer else prior;
+}
+
+/// The receiver a `this` marker inside `ty`'s members denotes, or
+/// `this_apparent` when `ty` is not a receiver at all: an anonymous object
+/// shape, a deferred operator and a bare marker have no reference their
+/// members could have been resolved against. A reference whose ARGUMENTS still
+/// mention `this` (`Wrapper<this>`) is not a receiver either — its members'
+/// markers belong to the enclosing declaration, not to the instantiation.
+fn thisReceiverOf(c: *Checker, ty: TypeId) Error!TypeId {
+    const k = c.ts.kind(ty);
+    if (k != .object) return this_apparent;
+    const ref = refFacetOf(c, ty, k) orelse return this_apparent;
+    return if (try c.containsThisType(ref)) this_apparent else ref;
+}
+
 /// One relation frame. `memoize` is false for the single caller that
 /// DELEGATES its own frame's question unchanged — the `.ref` arm of
 /// `isAssignableInner`, which resolves a lazy reference to the very
@@ -1293,7 +1350,11 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!RelAnswer {
         const ta = try c.substThis(t, this_apparent);
         // Delegated wholesale, answer and all: the rewritten pair IS this
         // frame's question, so its provisional-ness is this frame's too.
-        if (sa != s or ta != t) return relate(c, sa, ta, true);
+        if (sa != s or ta != t) {
+            const answer = try relate(c, sa, ta, true);
+            if (answer.related()) return answer;
+            return receiverBoundRetry(c, s, t, answer);
+        }
     }
     const sk = c.ts.kind(s);
     const tk = c.ts.kind(t);
@@ -2655,7 +2716,32 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         if (try c.simplifyMappedIndexAccess(s)) |sim| {
             if (try c.isAssignable(sim, t)) return true;
         }
-        const obj_bc = try c.indexObjBaseConstraint(c.ts.indexAccessObj(s));
+        // An access whose OBJECT is a conditional distributes over the two
+        // branches — tsc's `getSimplifiedIndexedAccessType` rewrites
+        // `(T extends U ? X : Y)[K]` as `T extends U ? X[K] : Y[K]` — and a
+        // conditional source relates when BOTH its branches do (the rule the
+        // `.conditional` arm above applies directly). The true branch is read
+        // under the extends assumption, exactly as that arm reads it.
+        //
+        // `Assume<T, U> = T extends U ? T : U` indexed by a property name is
+        // the shape: drizzle's `PreparedQueryKind<…, true>["execute"]` asserts
+        // an HKT application down to `MySqlPreparedQuery<TConfig>` and then
+        // reads its `execute` off it, and without the distribution the whole
+        // access could only go through its base constraint — which substitutes
+        // the free parameters nested inside it and loses `TConfig` entirely.
+        //
+        // Both rewrites must land somewhere new: a branch that reduces back to
+        // this very access would re-ask this frame's own question and read its
+        // in-progress mark as a yes.
+        if (c.ts.kind(c.ts.indexAccessObj(s)) == .conditional) {
+            const cond = c.ts.indexAccessObj(s);
+            const idx = c.ts.indexAccessIndex(s);
+            const tru = try c.reduceIndexedAccess(try condTrueSubstituted(c, cond), idx);
+            const fls = try c.reduceIndexedAccess(c.ts.condFalse(cond), idx);
+            if (tru != s and fls != s and
+                try c.isAssignable(tru, t) and try c.isAssignable(fls, t)) return true;
+        }
+        const obj_bc = try relationIndexObjConstraint(c, c.ts.indexAccessObj(s));
         // Same two guards as the target rule: neither side may still be
         // generic after taking base constraints.
         const idx_bc = try c.baseConstraintOf(c.ts.indexAccessIndex(s));
@@ -3820,7 +3906,7 @@ fn homomorphicConstraintInstantiation(c: *Checker, m: TypeId) Error!?TypeId {
 /// => unknown` through `DriverValueMapper<T["data"], T["driverParam"]>`
 /// where the constraint's `data`/`driverParam` are declared `unknown`.
 pub fn indexAccessTargetConstraint(c: *Checker, t: TypeId) Error!?TypeId {
-    const obj_bc = try c.indexObjBaseConstraint(c.ts.indexAccessObj(t));
+    const obj_bc = try relationIndexObjConstraint(c, c.ts.indexAccessObj(t));
     // The INDEX takes a single constraint step, not a fixpoint: for
     // `K extends keyof T` that step lands on the deferred `keyof T`, which
     // is still generic and (correctly) blocks the rule. Iterating would
@@ -3898,6 +3984,107 @@ pub fn indexObjBaseConstraint(c: *Checker, t: TypeId) Error!TypeId {
         cur = next;
     }
     return cur;
+}
+
+/// The object side of a deferred indexed access, for the RELATION's two rules
+/// (`indexAccessTargetConstraint` and the `.index_access` source arm) — which
+/// is `indexObjBaseConstraint` plus tsc's constituent-wise reading of an
+/// INTERSECTION.
+///
+/// Falling through to `transitiveBaseConstraint` there substituted the
+/// constituents' members instead, so the object half of `(Y & { a: T })` came
+/// back `{ a: unknown }` and the access reduced to `unknown` — which both rules
+/// read as "no constraint" and decline on. That is a family of false positives,
+/// all of it the HKT encoding: `(THKT & { readonly config: TConfig })["type"]`
+/// is how drizzle's `PreparedQueryKind` applies a type-level function, and the
+/// `execute:` member built from it did not relate to the `execute()` its base
+/// class declares (`mysql-core/query-builders/insert.d.ts`, a phantom TS2416).
+/// The constituent-wise reading keeps `{ a: T }` intact, so the access is `T` —
+/// exactly what tsc computes.
+///
+/// The RELATION only, not `indexObjBaseConstraint` itself: its other callers
+/// ask a different question — what apparent members does `T[K]` have, and is
+/// this receiver one to defer over (`indexDeferrableObject`) — and the answer
+/// they want for `T & { [k in keyof T]: Spy }` is the whole substituted shape,
+/// not the mapped constituent alone (`spyComparisonChecking`, where dropping
+/// the unconstrained `T` half left a bare mapped type and stopped the access
+/// deferring at all).
+fn relationIndexObjConstraint(c: *Checker, t: TypeId) Error!TypeId {
+    if (c.ts.kind(t) == .intersection)
+        return (try intersectionBaseConstraint(c, t, 0)) orelse t;
+    return indexObjBaseConstraint(c, t);
+}
+
+/// The base constraint of an INTERSECTION object, tsc's `computeBaseConstraint`
+/// for a `UnionOrIntersection`:
+///
+/// ```ts
+/// for (const type of types) {
+///     const baseType = getBaseConstraint(type);
+///     if (baseType) { if (baseType !== type) different = true; baseTypes.push(baseType); }
+///     else { different = true; }
+/// }
+/// if (!different) return t;
+/// return … getIntersectionType(baseTypes) …
+/// ```
+///
+/// `null` is tsc's `undefined` — every constituent was dropped, so the
+/// intersection has no constraint at all and the caller's rule declines.
+/// A constituent keeps its own shape: only a type PARAMETER moves (to its
+/// constraint chain's end), and an unconstrained one disappears, which is what
+/// makes `Y & { a: T }` read as `{ a: T }` rather than as `{ a: unknown }`.
+fn intersectionBaseConstraint(c: *Checker, t: TypeId, depth: u32) Error!?TypeId {
+    if (depth > max_intersection_constraint_depth) return t;
+    var parts: std.ArrayList(TypeId) = .empty;
+    defer parts.deinit(c.scratch());
+    var different = false;
+    // Indexed rather than held as a slice: the recursive calls below intern
+    // types, and the member list aliases store memory.
+    for (0..c.ts.memberCount(t)) |i| {
+        const m = c.ts.memberAt(t, i);
+        if (try intersectionMemberBaseConstraint(c, m, depth)) |bc| {
+            if (bc != m) different = true;
+            try parts.append(c.scratch(), bc);
+        } else different = true;
+    }
+    if (!different) return t;
+    if (parts.items.len == 0) return null;
+    return try c.ts.makeIntersection(c.scratch(), parts.items);
+}
+
+/// How deep the constituent walk follows nested intersections and indexed
+/// accesses. Each step is a strictly smaller type in practice; the cap is
+/// there so a pathological constraint cycle cannot spin.
+const max_intersection_constraint_depth: u32 = 8;
+
+/// One constituent's contribution to `intersectionBaseConstraint`. `null` when
+/// the constituent has no base constraint of its own — tsc's `undefined`, the
+/// answer `computeBaseConstraint` gives an unconstrained type parameter.
+fn intersectionMemberBaseConstraint(c: *Checker, m: TypeId, depth: u32) Error!?TypeId {
+    return switch (c.ts.kind(m)) {
+        .type_param => blk: {
+            if (try c.typeParamConstraint(c.ts.typeParamSymbol(m)) == types.no_type) break :blk null;
+            break :blk try indexObjBaseConstraint(c, m);
+        },
+        .this_type => c.ts.thisTypeInstance(m),
+        .intersection => try intersectionBaseConstraint(c, m, depth + 1),
+        // An indexed access is instantiable too, and `computeBaseConstraint`
+        // reduces it the same way the relation's own rules do: constrain both
+        // operands, then index. This is the constituent the HKT encoding
+        // actually produces — `Assume<(THKT & { config: C })["type"], PQ<C>>`
+        // reads its true branch as `X & PQ<C>` with `X` that access — so
+        // without this arm the intersection stays generic and the rule declines.
+        .index_access => blk: {
+            const obj_bc = try relationIndexObjConstraint(c, c.ts.indexAccessObj(m));
+            const idx_bc = try c.baseConstraintOf(c.ts.indexAccessIndex(m));
+            if (try c.isGenericObjectForIndex(obj_bc)) break :blk m;
+            if (try c.containsFreeTypeParam(idx_bc, &.{})) break :blk m;
+            const bc = try c.reduceIndexedAccess(obj_bc, idx_bc);
+            break :blk if (c.ts.kind(bc) == .unknown) m else bc;
+        },
+        // Not instantiable: `computeBaseConstraint` ends in `return t`.
+        else => m,
+    };
 }
 
 /// tsc's `getBaseConstraintOfType`: follow constraints all the way down.

@@ -510,8 +510,24 @@ pub fn planConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, distributiv
         // (`… => any`) return harmlessly. Resolve it rather than deferring —
         // this is what lets Awaited unwrap a real Promise's `then` callback
         // without erasing the method's own `TResult` params.
-        if (!ext_generic and s.kind(chk) == .function and s.kind(try c.resolveStructural(extends_ty)) == .function) {
-            return planConcreteConditional(c, chk, extends_ty);
+        //
+        // "Harmlessly" is a property of the PATTERN, not of the check, and it
+        // has to be tested (`functionCheckDecidable`): a pattern position that
+        // is not `any` / `unknown` / a bare `infer` reads the free param, and
+        // the answer then depends on what that param becomes.
+        // `(() => X) extends (() => true)` is the case in point — it is TRUE
+        // for `X = true` and false otherwise — and resolving it while `X` was
+        // free baked the false branch in for good. That is the `Equal<X, Y>`
+        // identity probe, which every HKT encoding switches on: drizzle's
+        // `PreparedQueryKind<…, TAssume>` opens with `Equal<TAssume, true>
+        // extends true ?`, so an `insert(…).execute` resolved through the
+        // WRONG arm of it and did not relate to the `execute()` its base class
+        // declares (a phantom TS2416).
+        if (!ext_generic and s.kind(chk) == .function) {
+            const ext_fn = try c.resolveStructural(extends_ty);
+            if (s.kind(ext_fn) == .function and try functionCheckDecidable(c, chk, ext_fn)) {
+                return planConcreteConditional(c, chk, extends_ty);
+            }
         }
         // An array/tuple check against an array pattern whose element is a
         // bare `infer` — the lib's `FlatArray`, `Arr extends
@@ -832,6 +848,58 @@ fn constrainInferBinders(c: *Checker, extends_ty: TypeId, true_ty: TypeId, false
         out = try c.ts.makeConditional(try c.ts.makeInferVar(id, cons.name, true), cons.ty, out, false_ty, false);
     }
     return out;
+}
+
+/// Is a FUNCTION check's match against a FUNCTION pattern settled by its
+/// shape alone — i.e. can no substitution of the free type parameters still
+/// inside it change the answer?
+///
+/// It can only be settled where the pattern ABSORBS what those parameters
+/// reach. `(value: infer V, ...args: infer _) => any` — Awaited's callback
+/// pattern — absorbs every position, so a `then` method's own `T`/`TResult1`
+/// cannot decide anything and the conditional is resolvable while they are
+/// still free. `() => true` absorbs nothing, so `(() => X) extends (() => true)`
+/// is decided by `X` and must stay deferred.
+///
+/// Position-wise, so a check whose free parameters sit only in the return is
+/// still settled by a pattern with concrete parameter types. Deliberately
+/// coarse on the parameter side — one free parameter anywhere in the check's
+/// parameter list asks the whole pattern list to absorb — because a
+/// position-by-position reading has to model rest elements and arity
+/// differences to be sound, and the shapes that need this rule (a callback
+/// pattern) absorb every position anyway.
+fn functionCheckDecidable(c: *Checker, chk: TypeId, ext: TypeId) Error!bool {
+    const s = &c.ts;
+    // The check's OWN type parameters are bound inside it and cannot be
+    // substituted from outside, so they are not what makes it undecidable.
+    const own = s.fnTypeParams(chk);
+    var params_free = false;
+    for (0..s.fnParamCount(chk)) |i| {
+        if (try c.containsFreeTypeParam(s.fnParam(chk, @intCast(i)).ty, own)) {
+            params_free = true;
+            break;
+        }
+    }
+    if (params_free) {
+        for (0..s.fnParamCount(ext)) |i| {
+            if (!absorbingPatternType(c, s.fnParam(ext, @intCast(i)).ty)) return false;
+        }
+    }
+    if (try c.containsFreeTypeParam(s.fnReturn(chk), own)) {
+        if (!absorbingPatternType(c, s.fnReturn(ext))) return false;
+    }
+    return true;
+}
+
+/// A pattern position that matches anything at all: `any`, `unknown`, or an
+/// UNCONSTRAINED `infer` binder. A constrained binder (`infer V extends C`)
+/// judges what it captures, so it absorbs nothing.
+fn absorbingPatternType(c: *Checker, t: TypeId) bool {
+    return switch (c.ts.kind(t)) {
+        .any, .unknown => true,
+        .infer_var => !c.infer_constraints.contains(c.ts.inferVarId(t)),
+        else => false,
+    };
 }
 
 /// Decidability rule for a check against an array pattern whose element is
