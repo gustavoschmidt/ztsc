@@ -5304,7 +5304,7 @@ pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode
         const shared = if (erase == .any) try c.eraseParamsToAnyOf(se, t) else try c.eraseParamsOf(se, t);
         if (shared != se) {
             se = shared;
-        } else if (erase == .constraints and try c.containsTypeParam(se)) {
+        } else if (erase == .constraints) {
             // A NON-generic source that does not mention the target's type
             // parameters at all (the erasure above changed nothing) is tsc's
             // one un-erased case: `compareSignaturesRelated` instantiates a
@@ -5318,20 +5318,29 @@ pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode
             // `subtypingWithGeneric{Call,Construct}SignaturesWithOptional
             // Parameters` and `callSignatureAssignabilityInInheritance6`.
             //
-            // Restricted to a source that mentions some OUTER type parameter,
-            // which is the shape of every case above (`a: () => T` for the
-            // interface's own `T`). A fully CONCRETE source keeps the lenient
-            // erasure, deliberately: tsc reaches those pairs with a source
-            // whose generic-ness came from higher-order inference
-            // (`const f: <A>(x: A) => A[] = wrap(list)`, where tsc infers
-            // `wrap(list): <A>(x: A) => A[]` and then instantiates that
-            // generic SOURCE in the target's context), and ztsc's inference
-            // hands back an already-instantiated signature there — so the
-            // free-parameter comparison would report on code tsc accepts
-            // (`genericContextualTypes1`, `genericFunctionInference1`, and the
-            // `comparisonOperator…OnInstantiatedCallSignature` pair, where both
-            // directions failing turns into TS2365/TS2367). Under-reporting on
-            // the concrete side is the safe half of the same gap.
+            // This used to be restricted to a source mentioning some OUTER
+            // type parameter, because a fully CONCRETE source is the shape tsc
+            // reaches with a source whose generic-ness came from higher-order
+            // inference (`const f: <A>(x: A) => A[] = wrap(list)`, where tsc
+            // infers `wrap(list): <A>(x: A) => A[]` and instantiates that
+            // generic SOURCE in the target's context) while ztsc's inference
+            // hands back an already-instantiated signature — so the
+            // free-parameter comparison reported on code tsc accepts.
+            //
+            // Re-measured in wave 25, after the wave 20-24 inference work: the
+            // three named blockers no longer bite. The
+            // `comparisonOperator{WithNoRelationshipObjects,WithSubtypeObject}
+            // OnInstantiatedCallSignature` pair — where both directions
+            // failing would turn into a false TS2365/TS2367 — still matches
+            // the oracle exactly (195/195 and 194/194), and
+            // `genericContextualTypes1` / `genericFunctionInference1` are
+            // unchanged (both already diverge for unrelated reasons). Dropping
+            // the restriction is what makes the whole "concrete source against
+            // a generic target" direction report:
+            // `assignmentCompatWith{Call,Construct}Signatures3` and `…4` and
+            // `genericSpecializations1` all became exact, with zero
+            // baseline-exact regressions across the suite and both apps
+            // byte-identical.
             te = t;
         }
     }
