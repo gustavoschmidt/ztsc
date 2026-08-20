@@ -63,6 +63,7 @@ const resolveStructural = @import("instantiate.zig").resolveStructural;
 const scratch = Checker.scratch;
 const sig_zig = @import("signatures.zig");
 const signatureOfProtoCtx = sig_zig.signatureOfProtoCtx;
+const sliceTuple = @import("typenode.zig").sliceTuple;
 const templateExprType = @import("generics.zig").templateExprType;
 const tuple_relate = @import("tuple_relate.zig");
 const tupleElemTypeAt = @import("assign.zig").tupleElemTypeAt;
@@ -6555,11 +6556,30 @@ fn checkArrayDestructuringElement(c: *Checker, el: Node, src: TypeId, iterated: 
     if (el == null_node) return;
     switch (c.nodeTag(el)) {
         .omitted, .error_node, .unsupported => {},
-        // `[a, ...rest] = src`: the rest is an array of the remaining
-        // elements, not the element at `index`.
-        .spread_element, .rest_element => try checkDestructuringTarget(c, c.tree.nodeData(el).lhs, types.no_type, .assignment),
+        // `[a, ...rest] = src`: the rest is the remaining elements, not the
+        // element at `index`.
+        .spread_element, .rest_element => try checkDestructuringTarget(c, c.tree.nodeData(el).lhs, try arrayRestSourceType(c, src, iterated, index), .assignment),
         else => try checkDestructuringTarget(c, el, try destructuringElementType(c, src, iterated, index), .assignment),
     }
+}
+
+/// The type an array-pattern REST position reads, tsc's
+/// `checkArrayLiteralDestructuringElementAssignment`:
+/// `everyType(sourceType, isTupleType) ? sliceTupleType(t, elementIndex) :
+/// createArrayType(elementType)`. A tuple source keeps its remaining
+/// positions — which is what tells `[...{ 0: a, b }] = tuple` that
+/// `[string, number]` has no `b` — and anything else is an array of the
+/// iterated element type.
+///
+/// `no_type` where the source is unknown, which is what every rest position
+/// used to read: a nested pattern under one then resolves nothing, exactly
+/// as it did before.
+fn arrayRestSourceType(c: *Checker, src: TypeId, iterated: TypeId, index: u32) Error!TypeId {
+    if (src == types.no_type) return types.no_type;
+    const r = try c.resolveStructural(src);
+    if (c.ts.kind(r) == .tuple) return sliceTuple(c, r, index, 0);
+    if (iterated == types.no_type) return types.no_type;
+    return c.ts.makeArray(iterated);
 }
 
 /// The assignment target of one pattern element, peeled through its default
