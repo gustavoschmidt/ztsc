@@ -2547,6 +2547,21 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
                 if (try c.isAssignable(s, bc)) return true;
             }
         }
+        // A UNION target is decided member-by-member before the source is
+        // widened, for exactly the same reason: tsc's
+        // `unionOrIntersectionRelatedTo` runs ahead of the source-Index arm
+        // in `structuredTypeRelatedTo`, so `keyof T` meets a union that
+        // CONTAINS `keyof T` by identity. Widened first, the answer is
+        // `string | number | symbol` against a union of key literals plus
+        // that very `keyof T` — no. `keyof (A & B)` distributes to
+        // `keyof A | keyof B`, so this is every relation between two
+        // intersections that share a generic constituent
+        // (`homomorphicMappedTypeIntersectionAssignability`).
+        if (tk == .union_type) {
+            for (try c.memberList(t)) |m| {
+                if (try c.isAssignable(s, m)) return true;
+            }
+        }
         return c.isAssignable(try c.propertyKeyType(), t);
     }
     // Enum *source* against a non-enum target. Handled before union-target
@@ -2632,6 +2647,14 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
     // a source whose constraint resolves to nothing better than itself, or
     // does not relate, falls through unchanged.
     if (sk == .index_access) {
+        // tsc's `getSimplifiedIndexedAccessType` runs BEFORE the constraint
+        // route (`getSimplifiedTypeOrConstraint` asks for it first): an
+        // access whose object is a generic MAP is the map's template with
+        // the key substituted, no constraint needed. `Readonly<Partial<T>>`'s
+        // `Partial<T>[P]` is `T[P]`, which is what makes it a `Partial<T>`.
+        if (try c.simplifyMappedIndexAccess(s)) |sim| {
+            if (try c.isAssignable(sim, t)) return true;
+        }
         const obj_bc = try c.indexObjBaseConstraint(c.ts.indexAccessObj(s));
         // Same two guards as the target rule: neither side may still be
         // generic after taking base constraints.
@@ -2774,7 +2797,26 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         if (sk == .index_access and
             try c.isAssignable(c.ts.indexAccessObj(s), c.ts.indexAccessObj(t)) and
             try c.isAssignable(c.ts.indexAccessIndex(s), c.ts.indexAccessIndex(t))) return true;
+        // The mirror of the source rule above: a TARGET access over a
+        // generic map is the map's substituted template.
+        if (try c.simplifyMappedIndexAccess(t)) |sim| return c.isAssignable(s, sim);
         if (try c.indexAccessTargetConstraint(t)) |bc| return c.isAssignable(s, bc);
+        // An INTERSECTION source still gets tsc's "some constituent is
+        // immediately related to the target" test
+        // (`unionOrIntersectionRelatedTo`, which runs ahead of every
+        // target-flag branch). ztsc hoisted this arm above the
+        // intersection-source arm for branded scalars, and its unconditional
+        // `return false` then took that test away from every intersection
+        // whose target is a deferred access: `NonNullable<T[P]>` — the lib's
+        // `T[P] & {}` — stopped relating to `T[P]` itself (`mappedTypes6`
+        // `Denullified<T>` → `Required<T>`/`T`/`Partial<T>`). Last, not
+        // first, so the constraint route above keeps deciding the pairs it
+        // already decided.
+        if (sk == .intersection) {
+            for (try c.memberList(s)) |m| {
+                if (try c.isAssignable(m, t)) return true;
+            }
+        }
         return false;
     }
     // Deferred (still generic) mapped types. Self-contained: every shape it
@@ -2986,6 +3028,17 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         return false;
     }
     if (tk == .type_param) return false;
+    // A still-deferred `T[K]` SOURCE never reaches the structural comparison.
+    // tsc's `structuredTypeRelatedToWorker` puts the type-variable arm and
+    // the structural arm in one `else if` chain, so an indexed access relates
+    // through its constraint or not at all — everything above this line is
+    // that constraint route. Falling through instead handed the target a
+    // source with NO members, which every members-of-the-target walk accepts
+    // vacuously: `T[K]` satisfied `{}` (and therefore `NonNullable<T[K]>`,
+    // the lib's `T[K] & {}`) and every all-optional object, for an
+    // unconstrained `T` whose values may well be `null`
+    // (`mappedTypes6` f2 `w = x`).
+    if (sk == .index_access) return false;
 
     switch (tk) {
         .boolean => return sk == .bool_true or sk == .bool_false,
@@ -3564,6 +3617,28 @@ pub fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
             for (constituents) |q| {
                 if (try c.isAssignable(q, skeys)) try applicable.append(c.scratch(), q);
             }
+            // …and the same intersection taken from the SOURCE side, for a
+            // target key set that is still DEFERRED. tsc writes this test as
+            // `intersectTypes(targetKeys, sourceKeys)` not being `never`, and
+            // an intersection with a deferred `keyof T` is never `never` — so
+            // `{ [K in keyof T]?: number }` (`T extends { x: number }`)
+            // accepts `{ x: 1 }`, indexing the source by `keyof T & "x"`.
+            // Asking "is `q` a key of the source" cannot see that: the
+            // deferred `keyof T` widens to `string | number | symbol` and
+            // matches nothing. Asking the mirror question — "is this SOURCE
+            // key one the map produces" — reaches the constraint route on
+            // `keyof T` and answers `"x"`, which is the key set to index by
+            // (`mappedTypeRelationships` f90).
+            if (applicable.items.len == 0) {
+                const sk_res = try c.resolveStructural(skeys);
+                const s_parts: []const TypeId = if (c.ts.kind(sk_res) == .union_type)
+                    try c.memberList(sk_res)
+                else
+                    &.{skeys};
+                for (s_parts) |q| {
+                    if (try c.isAssignable(q, tkeys)) try applicable.append(c.scratch(), q);
+                }
+            }
             if (applicable.items.len == 0) return null;
             const filtered = try c.ts.makeUnion(c.scratch(), applicable.items);
             const access = try c.reduceIndexedAccess(s, filtered);
@@ -3573,8 +3648,26 @@ pub fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
         // when `keyof S` is related to `C` and `S[P]` is related to `X`.
         // Guarded, as tsc guards it, on the target not adding `?` — that
         // direction (`S` → `Partial<S>`) is a different rule.
+        //
+        // …and on the target not REMOVING `?`. tsc's `!(modifiers &
+        // MappedTypeModifiers.ExcludeOptional)` wraps this whole family of
+        // source-to-mapped-target rules, not just the identity fast path
+        // above: a `-?` map REQUIRES every key its source may have declared
+        // optional, so `Required<T>` is not something a bare `T` (or an
+        // `{}`) satisfies. Without the gate the general rule below saw a
+        // matching key set and a template of `T[P]` and said yes — the
+        // `Required<T>`/`Denullified<T>` half of `mappedTypes6`.
+        if (c.ts.mappedFlags(t) & types.mapped_flag_optional_remove != 0) return null;
         if (c.mappedAddsOptional(t) or c.ts.mappedAs(t) != 0) return null;
-        if (!try c.isAssignable(try c.keyofType(s), try c.mappedKeySet(t))) return null;
+        // tsc relates the TARGET's key set to the SOURCE's, not the other way
+        // round (`isRelatedTo(targetKeys, sourceKeys)`), and the direction is
+        // the whole rule: every key the map PRODUCES has to be one the source
+        // supplies. Asked backwards, a source with the wrong keys passed
+        // whenever its own keys happened to fit — `Readonly<Thing>` met
+        // `Readonly<T>` for a `T extends Thing`, because `"a" | "b"` reaches
+        // `keyof T` through `T`'s constraint while `keyof T` reaches nothing
+        // (`mappedTypeRelationships` f41).
+        if (!try c.isAssignable(try c.mappedKeySet(t), try c.keyofType(s))) return null;
         const access = try c.reduceIndexedAccess(s, c.ts.mappedKeyParam(t));
         return if (try c.isAssignable(access, c.ts.mappedValue(t))) true else null;
     }
@@ -3612,12 +3705,29 @@ pub fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
     // The `keyof T <: Q` gate is what tsc's rule turns on and is not
     // optional: `Pick<T, "a">` and `Pick<T, K>` produce FEWER keys than `T`
     // requires, and tsgo rejects both.
+    // A template that WRAPS `T[P]` in an intersection is the same rule with
+    // the second half no longer free: `Denullified<T> = { [P in keyof T]-?:
+    // NonNullable<T[P]> }` has the template `T[P] & {}` (the lib spells
+    // `NonNullable<X>` as `X & {}`), which relates to `T[P]` through its own
+    // constituent. The syntactic screen still costs one kind read on a
+    // template that does not name the target at all.
     if (sk == .mapped and !c.mappedAddsOptional(s) and c.ts.mappedAs(s) == 0) {
         const val = c.ts.mappedValue(s);
-        if (c.ts.kind(val) == .index_access and
-            c.ts.indexAccessObj(val) == t and
-            c.ts.indexAccessIndex(val) == c.ts.mappedKeyParam(s) and
-            try c.isAssignable(try c.keyofType(t), try c.mappedKeySet(s))) return true;
+        const exact = isTargetKeyAccess(c, val, t, c.ts.mappedKeyParam(s));
+        var names_target = exact;
+        if (!names_target and c.ts.kind(val) == .intersection) {
+            for (try c.memberList(val)) |m| {
+                if (isTargetKeyAccess(c, m, t, c.ts.mappedKeyParam(s))) {
+                    names_target = true;
+                    break;
+                }
+            }
+        }
+        if (names_target and try c.isAssignable(try c.keyofType(t), try c.mappedKeySet(s))) {
+            if (exact) return true;
+            const acc = try c.reduceIndexedAccess(t, c.ts.mappedKeyParam(s));
+            if (try c.isAssignable(val, acc)) return true;
+        }
     }
     // tsc's `getBaseConstraintOfType` for a still-generic HOMOMORPHIC map,
     // asked of an ARRAY-ish target: `{ [P in keyof T]: X }` over a `T` bounded
@@ -3654,6 +3764,14 @@ pub fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
         }
     }
     return null;
+}
+
+/// Is `v` exactly the access `obj[key]` — the mapped template that reads its
+/// relation target at the map's own key parameter?
+fn isTargetKeyAccess(c: *Checker, v: TypeId, obj: TypeId, key: TypeId) bool {
+    return c.ts.kind(v) == .index_access and
+        c.ts.indexAccessObj(v) == obj and
+        c.ts.indexAccessIndex(v) == key;
 }
 
 /// A still-generic HOMOMORPHIC map applied to its source parameter's own
@@ -3764,6 +3882,17 @@ pub fn indexObjBaseConstraint(c: *Checker, t: TypeId) Error!TypeId {
     var cur = t;
     var i: u32 = 0;
     while (i < 8 and c.ts.kind(cur) == .type_param) : (i += 1) {
+        // An UNCONSTRAINED parameter is its own base constraint. tsc's
+        // `computeBaseConstraint` returns `undefined` for it, and both
+        // callers then keep the parameter and see a generic object, which
+        // stops the rule. `baseConstraintOf` instead substitutes it with
+        // `unknown` — and `unknown[never]` (the index side of `T[keyof T]`
+        // collapses the same way) reduces to `never`, a source assignable
+        // to absolutely everything. That is what made `T[keyof T]` and
+        // `U[keyof T]` interchangeable, and `T[keyof T]` assignable to any
+        // annotation at all (`mappedTypeRelationships` f3–f13,
+        // `keyofAndIndexedAccess2`).
+        if (try c.typeParamConstraint(c.ts.typeParamSymbol(cur)) == types.no_type) break;
         const next = try c.baseConstraintOf(cur);
         if (next == cur) break;
         cur = next;
@@ -5344,6 +5473,43 @@ pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode
             te = t;
         }
     }
+    // The same rule for a GENERIC source: tsc instantiates it in the target's
+    // context and leaves the target's own parameters standing, so what the
+    // source has to satisfy is `<T2>(x: { a: T2 }) => T2[]` with `T2` free,
+    // not that signature erased to `any`. Erased, `<T extends Base>(x: {a: T})
+    // => T[]` passed it — `Base[]` is an `any[]` — where tsc reports that
+    // `Base` is not the caller's `T2`
+    // (`assignmentCompatWith{Call,Construct}Signatures5`/`6`).
+    //
+    // The SOURCE stays erased to its CONSTRAINTS, which is ztsc's standing
+    // stand-in for the instantiation: tsc's inference maps the source's
+    // parameter to the target's and then clamps it to the source's own
+    // constraint, and the clamp is what decides these pairs.
+    //
+    // Restricted to lists of the SAME LENGTH, because that is exactly when
+    // the stand-in lines up. `<V, K>(key: K, defaultValue: V) => V extends
+    // string ? … : V` against `<T>(feature: Features, defaultValue: T) => T
+    // extends string ? … : T` is tsc-legal — inference gives `K := Features`
+    // and `V := T`, making the two signatures identical — but the erasure
+    // sends `V` to `any` instead of to `T`, and a conditional over `any` does
+    // not satisfy the target's still-deferred conditional over `T`. With both
+    // sides erased that pair matched; with only the source erased it would be
+    // a false TS2322 (social-app's `analytics/index.tsx`). Where the lists do
+    // line up, the erased constraint IS the value inference would clamp to.
+    //
+    // …and to a target whose own parameters MENTION its type variables,
+    // which is what the source's erased parameters have to meet and
+    // therefore what pins them. `<T extends string>() => T` overriding
+    // `<T extends string>() => T | Promise<T>` mentions its variable only in
+    // the RETURN — there tsc infers `T_source := T_target | Promise<T_target>`
+    // and the erasure has nothing to line up with, so a free target return
+    // is a false TS2416 (`inferenceContextualReturnTypeUnion4`).
+    if (erase == .constraints and c.ts.fnTypeParams(s).len > 0 and
+        c.ts.fnTypeParams(s).len <= c.ts.fnTypeParams(t).len and
+        try sigParamsMentionOwnTypeParams(c, t))
+    {
+        te = t;
+    }
     // The erasure runs `instantiate`, so it is subject to the instantiation
     // budget, and a trip hands back `error_type` in place of the signature —
     // not a wider signature, no signature at all. Every step below then reads
@@ -5664,6 +5830,18 @@ pub fn eraseTypeParams(c: *Checker, sig: TypeId) Error!TypeId {
 /// params (the arrow itself is non-generic), and both sides must collapse
 /// those shared params to the same constraints to relate — tsc generalizes
 /// the arrow over the contextual signature's type params, then erases both.
+/// Does any PARAMETER type of `sig` mention one of `sig`'s own type
+/// parameters? Asked by erasing them inside each parameter type and looking
+/// for a change, which reuses the memoized erasure the relation runs anyway.
+fn sigParamsMentionOwnTypeParams(c: *Checker, sig: TypeId) Error!bool {
+    if (c.ts.fnTypeParams(sig).len == 0) return false;
+    for (0..c.ts.fnParamCount(sig)) |i| {
+        const p = c.ts.fnParam(sig, @intCast(i)).ty;
+        if (try c.eraseParamsOf(p, sig) != p) return true;
+    }
+    return false;
+}
+
 pub fn eraseParamsOf(c: *Checker, sig: TypeId, owner: TypeId) Error!TypeId {
     // Non-generic early-out before the dupe (the common case).
     const sig_tps = c.ts.fnTypeParams(owner);
