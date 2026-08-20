@@ -3055,6 +3055,54 @@ fn definitelyFalsySpread(c: *Checker, r: TypeId) Error!bool {
     };
 }
 
+/// The `this` a function-like member of an object literal sees, from the
+/// literal's already-resolved contextual type (`rctx`, `no_type` when there is
+/// none) — tsc's `getContextualThisParameterType` for an object-literal method.
+///
+/// `ThisType<T>` comes FIRST and unconditionally: the lib's empty marker
+/// interface exists only to say "the members of whatever I am intersected with
+/// run on a `T`", and tsc reads it before anything else
+/// (`getThisTypeFromContextualType`, whose result short-circuits the whole
+/// rest of the function). Without it a Vue-style
+/// `Component<D, M & ThisType<D & M>>` gave every method the OPTIONS object as
+/// its receiver, so `this.dataField` inside a method was a TS2339 for a field
+/// the marker had just promised (`vueLikeDataAndPropsInference`,
+/// `thisTypeInObjectLiterals2`).
+///
+/// Failing a marker it is the contextual type itself, taken NON-NULLABLE —
+/// tsc's `getWidenedType(getNonNullableType(contextualType))`. A nullable
+/// annotation is a statement about the VARIABLE, not about the literal being
+/// written into it: every method of `let p: Point | null = { x: 10, moveBy() {
+/// this.x += dx } }` runs on a real `Point`, and reading `this.x` through the
+/// union reported "possibly null" at every member access.
+fn objectLiteralThis(c: *Checker, rctx: TypeId) Error!TypeId {
+    if (rctx == types.no_type) return 0;
+    if (try thisTypeMarker(c, rctx)) |t| return t;
+    return c.nonNullable(rctx);
+}
+
+/// tsc's `getThisTypeFromContextualType`: the argument of a `ThisType<T>`
+/// reference anywhere in the contextual type, unions mapped and intersections
+/// searched member-wise. Null when the type names no marker.
+fn thisTypeMarker(c: *Checker, t: TypeId) Error!?TypeId {
+    switch (c.ts.kind(t)) {
+        .union_type, .intersection => {
+            for (try c.memberList(t)) |m| {
+                if (try thisTypeMarker(c, m)) |x| return x;
+            }
+            return null;
+        },
+        .ref => {
+            const args = c.ts.refArgs(t);
+            if (args.len == 0) return null;
+            const sym = c.prog.globals.lookup(try c.atom("ThisType")) orelse return null;
+            if (c.ts.refSymbol(t) != sym) return null;
+            return args[0];
+        },
+        else => return null,
+    }
+}
+
 /// One constituent of an object literal's type. `dist` names the spread
 /// elements whose source types are replaced for this constituent (see
 /// `checkObjectLiteral`); it is empty for an undistributed literal.
@@ -3206,7 +3254,7 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                 // `| undefined` and `| null | undefined` spellings).
                 const saved_this = c.this_type;
                 defer c.this_type = saved_this;
-                c.this_type = if (rctx != types.no_type) try c.nonNullable(rctx) else 0;
+                c.this_type = try objectLiteralThis(c, rctx);
                 // A SYMBOL-keyed method or accessor shorthand
                 // (`{ [Symbol.toStringTag]() {…} }`,
                 // `{ set [Symbol.toPrimitive](p) {…} }`) declares a real,
