@@ -1149,6 +1149,20 @@ pub fn weakTypeMismatch(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
             }
             props = buf.items;
         },
+        // An ARRAY or TUPLE source relates through the `Array<T>` interface's
+        // members — `length`, `push`, … — which is exactly what tsc's
+        // `getPropertiesOfType(source)` hands `hasCommonProperties`. Without
+        // this arm the source fell out of the switch entirely and every array
+        // was silently accepted by a weak target: `AOrArrA<{x?: "ok"}>` then
+        // kept BOTH constituents through `assignmentReduced`, and `arr.push`
+        // on the unreduced `{x?:"ok"} | {x?:"ok"}[]` was a phantom TS2339
+        // (`assignmentTypeNarrowing`, tsgo's TS2559 for the direct call).
+        .array, .tuple => {
+            const ap = (try c.arrayApparentObject(rs)) orelse return false;
+            for (0..c.ts.objectPropCount(ap)) |i|
+                try buf.append(c.scratch(), c.ts.objectProp(ap, @intCast(i)).name);
+            props = buf.items;
+        },
         // A PRIMITIVE (or enum) source relates through its wrapper interface's
         // apparent members, and tsc's gate admits it explicitly
         // (`source.flags & (Primitive | Object | Intersection)`). The
