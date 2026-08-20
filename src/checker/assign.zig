@@ -213,6 +213,70 @@ fn constraintChainReaches(c: *Checker, s: TypeId, t: TypeId) Error!bool {
     return false;
 }
 
+/// tsc's `strictSubtypeRelation`, to the extent `getNarrowedTypeWorker`'s
+/// `directlyRelated` consumes it (see `narrowedPick`).
+///
+/// The relation ztsc HAS is assignability. The one rule that makes tsc's two
+/// subtype relations stricter, and the only one a narrowing pick can observe,
+/// is `propertiesRelatedTo`'s `requireOptionalProperties`: for the subtype and
+/// strict-subtype relations the source must carry the target's OPTIONAL
+/// properties too, not just its required ones. Assignability is vacuously
+/// satisfied by an absent optional, which is why `{}` reads as assignable to
+/// `Partial<User>` — and why a guard `obj is Partial<User>` on `{} | undefined`
+/// kept the useless `{}` instead of the asserted type.
+///
+/// tsc exempts a FRESH object literal, an empty array literal and a tuple from
+/// the rule (`!isObjectLiteralType(source) && !isEmptyArrayLiteralType(source)
+/// && !isTupleType(source)`); the freshness and tuple exemptions are kept here,
+/// the empty-array-literal one has no ztsc spelling and would only ever make
+/// the answer stricter than tsc's.
+///
+/// Deliberately NOT a third `Relation` kind: the rule is asked at the TOP level
+/// of one pick, never threaded through a recursive walk, so paying for a second
+/// relation memo axis (and a second bit of every memo key) would buy nothing.
+fn strictSubtypeOf(c: *Checker, s: TypeId, t: TypeId) Error!bool {
+    if (!try c.isAssignable(s, t)) return false;
+    const rt = try c.resolveStructural(t);
+    if (c.ts.kind(rt) != .object) return true;
+    const n = c.ts.objectPropCount(rt);
+    if (n == 0) return true;
+    if (c.ts.objectIsFresh(s)) return true;
+    switch (c.ts.kind(s)) {
+        .tuple => return true,
+        else => {},
+    }
+    for (0..n) |i| {
+        const p = c.ts.objectProp(rt, @intCast(i));
+        // A REQUIRED property is the assignability check's business and has
+        // already been answered above; only the optionals are new here.
+        if (!p.optional()) continue;
+        if ((try c.ctxPropOfType(s, p.name)) == null) return false;
+    }
+    return true;
+}
+
+/// tsc's `directlyRelated` pick inside `getNarrowedTypeWorker`, for a TYPE
+/// PREDICATE guard (`checkDerived` false):
+///
+///     t => isTypeStrictSubtypeOf(t, c) ? t : isTypeStrictSubtypeOf(c, t) ? c
+///        : isTypeSubtypeOf(t, c) ? t : isTypeSubtypeOf(c, t) ? c : neverType
+///
+/// "When `t` and `c` are related in both directions we prefer `c`, because that
+/// is the asserted type" — but only once the STRICT direction has been tried
+/// both ways, which is what keeps a proper subtype constituent winning over the
+/// candidate it refines.
+///
+/// Called only for a constituent the caller has already found related to the
+/// candidate, so the two trailing subtype clauses collapse into "keep `t`":
+/// the answer is the candidate exactly when `t` is not a strict subtype of it
+/// and it IS a strict subtype of `t` (`{}` versus `Partial<User>`).
+pub fn narrowedPick(c: *Checker, t: TypeId, cand: TypeId) Error!TypeId {
+    if (t == cand) return t;
+    if (try strictSubtypeOf(c, t, cand)) return t;
+    if (try strictSubtypeOf(c, cand, t)) return cand;
+    return t;
+}
+
 /// tsc's `typeMaybeAssignableTo`: like `isAssignable`, except a UNION
 /// source only has to have SOME constituent assignable to the target. Used
 /// where the question is "could this value have come from that slot" rather

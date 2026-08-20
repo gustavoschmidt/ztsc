@@ -27,6 +27,7 @@ const Error = checker_zig.Error;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const isInstantiableKind = @import("expr.zig").isInstantiableKind;
 const tuple_relate = @import("tuple_relate.zig");
+const narrowedPick = @import("assign.zig").narrowedPick;
 const typeof_names = Checker.typeof_names;
 
 pub fn narrowByLiteralEquality(c: *Checker, t: TypeId, other: Node, strict: bool, sense: bool) Error!TypeId {
@@ -1043,7 +1044,16 @@ pub fn narrowByInstance(c: *Checker, t: TypeId, instance: TypeId, sense: bool, c
             // `.array` and never HAS a nominal declaration.
             if (!matches and check_derived) matches = try tuple_relate.readonlyDerivedFrom(c, m, instance);
             const kept = if (sense) matches else !matches;
-            if (kept) try parts.append(c.scratch(), m);
+            // tsc's `directlyRelated` does not keep the CONSTITUENT — it keeps
+            // the more specific of the constituent and the candidate, trying
+            // the STRICT subtype relation both ways before plain subtyping
+            // (`assign.narrowedPick`). `obj is Partial<User>` on `{} | undefined`
+            // has to land on `Partial<User>`: `{}` is only VACUOUSLY assignable
+            // to a type whose every property is optional, so keeping it dropped
+            // the asserted type outright (`partialTypeNarrowedToByTypeGuard`).
+            // Not for `instanceof`, whose pick is the nominal one above, and
+            // not for a false branch, which filters rather than refines.
+            if (kept) try parts.append(c.scratch(), if (sense and !check_derived) try narrowedPick(c, m, instance) else m);
         }
         const result = try c.ts.makeUnion(c.scratch(), parts.items);
         if (sense and result == types.never_type) {
