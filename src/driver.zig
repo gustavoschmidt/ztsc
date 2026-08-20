@@ -792,7 +792,7 @@ fn renumber(
         @memset(new_ids, modules.no_file);
         var tail: usize = 0;
         var head: usize = 0;
-        for ([2][2]usize{ .{ 0, seeded.root_end }, .{ seeded.root_end, seeded.entry_end } }) |wave| {
+        for ([2][2]usize{ .{ 0, seeded.root_end }, .{ seeded.root_end, seeded.entry_end } }, 0..) |wave, wi| {
             for (wave[0]..wave[1]) |i| {
                 if (new_ids[i] != modules.no_file) continue;
                 new_ids[i] = @intCast(tail);
@@ -802,6 +802,22 @@ fn renumber(
             while (head < tail) : (head += 1) {
                 for (tables.edges.items[order[head]]) |fid| {
                     if (new_ids[fid] != modules.no_file) continue;
+                    // A `@types/*` SEED keeps its second-wave position however
+                    // wave one reaches it. Wave one does reach them: a `node:fs`
+                    // (or bare `path`) import auto-injects `@types/node` as a
+                    // discovery EDGE of the importing file, and an edge into a
+                    // seed used to hand it a wave-one id — putting all 66 of
+                    // `@types/node`'s files in the middle of the root closure
+                    // instead of after it. Measured against tsgo's `--listFiles`
+                    // on social-app: tsc emits `@types/node` contiguously at
+                    // 4135-4243 of 5356, AFTER `expo-modules-core`'s
+                    // `declare global` at 346; ztsc emitted it at 1786/2242-2306,
+                    // BEFORE expo's at 2381. Both files reopen `NodeJS.ProcessEnv`
+                    // with a conflicting inherited string index (`Dict<string>` vs
+                    // `ExpoProcessEnv`'s `any`) and the FIRST one wins, so the
+                    // hoisting made every `process.env.X` read `string | undefined`
+                    // where tsc reads `any`.
+                    if (wi == 0 and fid >= seeded.root_end and fid < seeded.entry_end) continue;
                     new_ids[fid] = @intCast(tail);
                     order[tail] = fid;
                     tail += 1;
