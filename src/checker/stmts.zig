@@ -323,16 +323,17 @@ fn checkVarDeclStatement(c: *Checker, node: Node) Error!void {
     const is_const = c.tree.tokens.tag(c.tree.nodeMainToken(node)) == .keyword_const;
     const ambient = c.ambient_ctx or precededByDeclare(c, node);
     const let_or_const = isLetOrConst(c, node);
+    const const_like: ?[]const u8 = if (ambient) null else constLikeKeyword(c, node);
     if (c.nodeTag(node) == .var_decl_one) {
         if (ambient) try checkAmbientInitializer(c, d.lhs, is_const);
-        if (is_const and !ambient) try checkConstInitialized(c, d.lhs);
+        if (const_like) |kw| try checkConstInitialized(c, d.lhs, kw);
         if (let_or_const) try checkLetName(c, c.tree.nodeData(d.lhs).lhs);
         try checkDeclarator(c, d.lhs, is_const, ambient);
     } else {
         for (c.tree.nodeRange(node)) |decl| {
             if (decl == null_node) continue;
             if (ambient) try checkAmbientInitializer(c, decl, is_const);
-            if (is_const and !ambient) try checkConstInitialized(c, decl);
+            if (const_like) |kw| try checkConstInitialized(c, decl, kw);
             if (let_or_const) try checkLetName(c, c.tree.nodeData(decl).lhs);
             try checkDeclarator(c, decl, is_const, ambient);
         }
@@ -357,17 +358,21 @@ fn checkLetName(c: *Checker, name: Node) Error!void {
     try c.diagFmt(2480, c.tokSpan(tok), "'let' is not allowed to be used as a name in 'let' or 'const' declarations.", .{});
 }
 
-/// tsc's `checkGrammarVariableDeclaration` arm for an uninitialized `const`.
-/// Reported on the NAME, and only for a STATEMENT's declaration list — a
-/// `for…in`/`for…of` head is exempt (tsc's own guard) and never reaches here,
-/// because those heads are checked by `checkForInOfStatement`, while a C-style
-/// `for (const x;;)` does reach here and is reported, as tsc has it.
+/// tsc's `checkGrammarVariableDeclaration` arm for an uninitialized
+/// `const`-LIKE declaration. Reported on the NAME, and only for a STATEMENT's
+/// declaration list — a `for…in`/`for…of` head is exempt (tsc's own guard) and
+/// never reaches here, because those heads are checked by
+/// `checkForInOfStatement`, while a C-style `for (const x;;)` does reach here
+/// and is reported, as tsc has it.
+///
+/// `keyword` is what tsc's `isVarConstLike` matched, and the message is
+/// parameterized on it: `const`, `using`, or `await using`.
 ///
 /// A binding PATTERN with no initializer is TS1182 in tsc ("a destructuring
 /// declaration must have an initializer"), which `return`s before this arm;
 /// ztsc does not answer TS1182 yet, so a pattern stays silent rather than
 /// borrowing the wrong code.
-fn checkConstInitialized(c: *Checker, decl: Node) Error!void {
+fn checkConstInitialized(c: *Checker, decl: Node, keyword: []const u8) Error!void {
     const d = c.tree.nodeData(decl);
     const name: Node = switch (c.nodeTag(decl)) {
         .declarator => d.lhs,
@@ -380,7 +385,26 @@ fn checkConstInitialized(c: *Checker, decl: Node) Error!void {
         else => return,
     };
     if (c.nodeTag(name) != .identifier) return;
-    try c.diagFmt(1155, c.tokSpan(c.tree.nodeMainToken(name)), "'const' declarations must be initialized.", .{});
+    try c.diagFmt(1155, c.tokSpan(c.tree.nodeMainToken(name)), "'{s}' declarations must be initialized.", .{keyword});
+}
+
+/// The `const`-LIKE keyword a declaration list is introduced by — tsc's
+/// `isVarConstLike`, which is `const` plus the two explicit-resource forms
+/// (TS 5.2). Null for `var`/`let`.
+///
+/// The parser puts the list's `main_token` on `using` for BOTH resource forms
+/// and leaves `await` as the token in front, which is the same shape
+/// `Binder.declKindOfVar` reads.
+fn constLikeKeyword(c: *Checker, node: Node) ?[]const u8 {
+    const mt = c.tree.nodeMainToken(node);
+    return switch (c.tree.tokens.tag(mt)) {
+        .keyword_const => "const",
+        .keyword_using => if (mt > 0 and c.tree.tokens.tag(mt - 1) == .keyword_await)
+            "await using"
+        else
+            "using",
+        else => null,
+    };
 }
 
 /// tsc's `checkAmbientInitializer` for a variable declarator: an initializer
