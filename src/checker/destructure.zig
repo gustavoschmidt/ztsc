@@ -724,7 +724,9 @@ fn unionLiteralConstituentLacks(c: *Checker, r: TypeId, name: Atom) Error!bool {
 /// tuple: a non-array pattern, and the two shapes tsc answers
 /// `Iterable<any>`/`any[]` for, an empty pattern and a lone `[...r]`.
 pub fn patternContextualType(c: *Checker, pat: Node) Error!TypeId {
-    if (pat == null_node or c.nodeTag(pat) != .array_pattern) return types.no_type;
+    if (pat == null_node) return types.no_type;
+    if (c.nodeTag(pat) == .object_pattern) return objectPatternContextualType(c, pat);
+    if (c.nodeTag(pat) != .array_pattern) return types.no_type;
     const els = c.tree.nodeRange(pat);
     // tsc's `minLength`: one past the last position that is neither the rest,
     // omitted, nor defaulted. Everything after it is optional.
@@ -771,6 +773,63 @@ fn patternElemContextualType(c: *Checker, el0: Node) Error!TypeId {
     if (c.nodeTag(el) != .array_pattern) return types.any_type;
     const nested = try patternContextualType(c, el);
     return if (nested == types.no_type) types.any_type else nested;
+}
+
+/// The object type an OBJECT binding pattern implies, as the CONTEXTUAL TYPE
+/// of the initializer it destructures — the same
+/// `getContextualTypeForInitializerExpression` fallback the array arm above
+/// is, spelled `getTypeFromObjectBindingPattern`.
+///
+/// A pattern says WHERE, not WHAT, so a plain name contributes `any` and the
+/// whole thing is worth nothing. A DEFAULT is the exception: it says exactly
+/// what the property is expected to be, and tsc carries that into the
+/// initializer. `const { f = (x: string) => x.length } = id({ f: x => x.charAt })`
+/// is the shape — the pattern implies `{ f?: ((x: string) => number) |
+/// undefined }`, `id`'s `T` seeds from it, the argument literal's `f` is
+/// contextually a `(x: string) => …`, and `x` is not an implicit any
+/// (`objectBindingPatternContextuallyTypesArgument`,
+/// `intraBindingPatternReferences`).
+///
+/// Gated on some element actually carrying a default (or a nested pattern
+/// that does), because that is the only information this type can carry:
+/// without one every member is `any` and handing the initializer an
+/// all-`any` contextual type is not the same as handing it none — it would
+/// perturb literal freshness and inference everywhere for no benefit. tsc
+/// supplies the all-`any` type; the narrowing is deliberate and measured
+/// (the sweep moves only on the defaulted shapes).
+///
+/// The member types come from `patternImpliedType`, which is the same tsc
+/// function (`getTypeFromObjectBindingPattern`) read for its display
+/// spelling in the excess-property report — `null` there, for a rest element
+/// or a computed key, is `no_type` here for the same reason: neither shape
+/// implies a type this walk can enumerate.
+fn objectPatternContextualType(c: *Checker, pat: Node) Error!TypeId {
+    if (!patternHasDefault(c, pat)) return types.no_type;
+    return (try patternImpliedType(c, pat, .binding)) orelse types.no_type;
+}
+
+/// Does any element of `pat` — at any depth — carry a default?
+fn patternHasDefault(c: *Checker, pat: Node) bool {
+    for (c.tree.nodeRange(pat)) |el| {
+        if (el == null_node) continue;
+        const ed = c.tree.nodeData(el);
+        switch (c.nodeTag(el)) {
+            .binding_property => {
+                if (ed.rhs != 0) return true;
+                if (ed.lhs != 0 and isPattern(c, ed.lhs) and patternHasDefault(c, ed.lhs)) return true;
+            },
+            .binding_default => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn isPattern(c: *const Checker, n: Node) bool {
+    return switch (c.nodeTag(n)) {
+        .object_pattern, .array_pattern => true,
+        else => false,
+    };
 }
 
 fn checkArrayPatternProps(c: *Checker, pat: Node, whole: TypeId) Error!void {
@@ -950,7 +1009,7 @@ fn patternImpliedType(c: *Checker, pat: Node, form: PatternForm) Error!?TypeId {
         // refused above).
         if (tag == .object_property and ed.lhs != 0 and c.nodeTag(ed.lhs) == .computed_name) return null;
         const ty: TypeId = switch (form) {
-            .binding => types.any_type,
+            .binding => try bindingElemImpliedType(c, ed.lhs, ed.rhs),
             // `{ k: target }` writes through `rhs`; a shorthand `{ x }` is its
             // own target, in `lhs`.
             .assignment => (try assignTargetDeclaredType(c, if (tag == .object_property) ed.rhs else ed.lhs)) orelse return null,
@@ -969,6 +1028,50 @@ fn patternImpliedType(c: *Checker, pat: Node, form: PatternForm) Error!?TypeId {
     // and `({ } = { x: 0 })` reports against it.
     if (props.items.len == 0 and form == .binding) return null;
     return try c.ts.makeObject(props.items, 0, 0, 0);
+}
+
+/// One BINDING element's contribution to the type above — tsc's
+/// `getTypeFromBindingElement`:
+///
+/// ```ts
+/// if (element.initializer) {
+///     const contextualType = isBindingPattern(element.name) ? getTypeFromBindingPattern(element.name, true, false) : unknownType;
+///     return addOptionality(widenTypeInferredFromInitializer(element, checkDeclarationInitializer(element, CheckMode.Normal, contextualType)));
+/// }
+/// if (isBindingPattern(element.name)) return getTypeFromBindingPattern(element.name, includePatternInType, reportErrors);
+/// return includePatternInType ? nonInferrableAnyType : anyType;
+/// ```
+///
+/// `nested` is the element's own nested pattern (0 for a plain name) and
+/// `default_expr` its default (0 for none). A default is the only thing a
+/// pattern can say about a property's TYPE, and it is what makes the implied
+/// type worth handing to the initializer at all.
+///
+/// The literal is WIDENED, where tsc widens only for a non-`const`
+/// declaration (`widenTypeInferredFromInitializer` reads the element's
+/// combined node flags). ztsc has no parent pointers, so the element cannot
+/// see its declaration list from here; widening is the conservative half of
+/// the choice — an unwidened literal in a CONTEXTUAL type pins freshness on
+/// the initializer, and the only visible cost is that the excess-property
+/// report prints `{ a?: number | undefined }` where tsc prints
+/// `{ a?: 1 | undefined }`.
+fn bindingElemImpliedType(c: *Checker, nested: Node, default_expr: Node) Error!TypeId {
+    if (default_expr != 0) {
+        const inner: TypeId = if (nested != 0 and isPattern(c, nested))
+            try patternContextualType(c, nested)
+        else
+            types.no_type;
+        const t = try c.widenLiteral(try c.checkExprCached(default_expr, inner));
+        // tsc's `addOptionality`: the property is optional AND its type
+        // carries `undefined`, which is what the initializer's own property
+        // is allowed to be.
+        return try c.ts.makeUnion(c.scratch(), &.{ t, types.undefined_type });
+    }
+    if (nested != 0 and isPattern(c, nested)) {
+        const t = try patternContextualType(c, nested);
+        if (t != types.no_type) return t;
+    }
+    return types.any_type;
 }
 
 /// The type an assignment pattern's element WRITES, read off the target's own
