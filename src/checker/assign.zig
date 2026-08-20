@@ -213,6 +213,37 @@ fn constraintChainReaches(c: *Checker, s: TypeId, t: TypeId) Error!bool {
     return false;
 }
 
+/// tsc's `directlyRelated` pick inside `getNarrowedTypeWorker`, for a TYPE
+/// PREDICATE guard (`checkDerived` false):
+///
+///     t => isTypeStrictSubtypeOf(t, c) ? t : isTypeStrictSubtypeOf(c, t) ? c
+///        : isTypeSubtypeOf(t, c) ? t : isTypeSubtypeOf(c, t) ? c : neverType
+///
+/// "When `t` and `c` are related in both directions we prefer `c`, because that
+/// is the asserted type" — but only once the STRICT direction has been tried
+/// both ways, which is what keeps a proper subtype constituent winning over the
+/// candidate it refines.
+///
+/// Both of tsc's subtype relations are `infer.covSubtypeOf` here — ztsc has one
+/// subtype APPROXIMATION (assignability plus the rules where the subtype
+/// relations are strictly stronger: the target's optional properties and index
+/// signatures must be present on the source), and it is the same approximation
+/// the inference fold needs, so the two share it rather than drifting apart.
+/// That rule is the whole of what this pick observes: `{}` is only VACUOUSLY
+/// assignable to a `Partial<User>` whose every property is optional, so it is
+/// not a subtype of it, while `Partial<User>` IS a subtype of `{}`.
+///
+/// Called only for a constituent the caller has already found related to the
+/// candidate, so the two trailing subtype clauses collapse into "keep `t`":
+/// the answer is the candidate exactly when `t` is not a subtype of it and it
+/// IS a subtype of `t`.
+pub fn narrowedPick(c: *Checker, t: TypeId, cand: TypeId) Error!TypeId {
+    if (t == cand) return t;
+    if (try c.covSubtypeOf(t, cand)) return t;
+    if (try c.covSubtypeOf(cand, t)) return cand;
+    return t;
+}
+
 /// tsc's `typeMaybeAssignableTo`: like `isAssignable`, except a UNION
 /// source only has to have SOME constituent assignable to the target. Used
 /// where the question is "could this value have come from that slot" rather
@@ -1147,6 +1178,20 @@ pub fn weakTypeMismatch(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
                     else => {},
                 }
             }
+            props = buf.items;
+        },
+        // An ARRAY or TUPLE source relates through the `Array<T>` interface's
+        // members — `length`, `push`, … — which is exactly what tsc's
+        // `getPropertiesOfType(source)` hands `hasCommonProperties`. Without
+        // this arm the source fell out of the switch entirely and every array
+        // was silently accepted by a weak target: `AOrArrA<{x?: "ok"}>` then
+        // kept BOTH constituents through `assignmentReduced`, and `arr.push`
+        // on the unreduced `{x?:"ok"} | {x?:"ok"}[]` was a phantom TS2339
+        // (`assignmentTypeNarrowing`, tsgo's TS2559 for the direct call).
+        .array, .tuple => {
+            const ap = (try c.arrayApparentObject(rs)) orelse return false;
+            for (0..c.ts.objectPropCount(ap)) |i|
+                try buf.append(c.scratch(), c.ts.objectProp(ap, @intCast(i)).name);
             props = buf.items;
         },
         // A PRIMITIVE (or enum) source relates through its wrapper interface's
