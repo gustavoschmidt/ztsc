@@ -1335,11 +1335,6 @@ const Parser = struct {
             .keyword_type,
             .keyword_global,
             .keyword_accessor,
-            .keyword_public,
-            .keyword_private,
-            .keyword_protected,
-            .keyword_static,
-            .keyword_readonly,
             .keyword_abstract,
             // An unterminated block comment is TRIVIA to tsc: its scanner
             // reports TS1010 and hands the parser EOF, so nothing lands here.
@@ -1348,12 +1343,49 @@ const Parser = struct {
             // treating it as junk would add a TS1128 tsc never reports.
             .unterminated_comment,
             => true,
+            // The one group tsc does NOT wave through: a class-member modifier
+            // is a statement start only when a declaration follows it, or when
+            // the next token cannot be a member NAME. `static test()` inside a
+            // function body is neither, so tsc refuses to parse it as a
+            // statement at all — see `classMemberModifierStartsStatement`.
+            .keyword_public,
+            .keyword_private,
+            .keyword_protected,
+            .keyword_static,
+            .keyword_readonly,
+            => p.classMemberModifierStartsStatement(),
             // tsc's `isStartOfExpression`, including its error tolerance: the
             // start of a BINARY operator counts, so `* x;` is parsed as an
             // expression statement with a missing left operand (TS1109) rather
             // than skipped.
             else => |tag| canStartExpression(tag) or binaryPrec(tag, false) != 0,
         };
+    }
+
+    /// tsc's `isStartOfStatement` arm for `public`/`private`/`protected`/
+    /// `static`/`readonly`:
+    ///
+    ///     return isStartOfDeclaration() ||
+    ///         !lookAhead(nextTokenIsIdentifierOrKeywordOnSameLine);
+    ///
+    /// These words are legal identifiers, so `static;`, `readonly = 1` and
+    /// `public.x` are ordinary expression statements — but `static test()` in a
+    /// function body is neither an expression tsc wants nor a declaration, and
+    /// it is much more likely a class member written one brace too deep. tsc
+    /// answers TS1128 on the WORD and drops it, which is what returning false
+    /// here buys (`parseStatementList`'s not-a-statement arm).
+    ///
+    /// `accessor` and `abstract` belong to the same tsc group but stay
+    /// unconditionally true above: ztsc's `startsDeclarationAt` does not walk
+    /// past them, so the answer here would be a false `false` for
+    /// `accessor class C {}` — and a false `false` manufactures a TS1128 tsc
+    /// does not report, while a false `true` only keeps ztsc's existing
+    /// recovery.
+    fn classMemberModifierStartsStatement(p: *Parser) bool {
+        if (p.statementModifierRunLen() != 0) return true;
+        if (p.peekNewline(1)) return true;
+        const next = p.peekTag(1);
+        return !(next == .identifier or next.isKeyword());
     }
 
     /// The diagnostic tsc's `parseList` reports for a token that starts no list
@@ -1426,6 +1458,17 @@ const Parser = struct {
                     .expected_export
                 else
                     .expected_declaration_or_statement);
+                // tsc's `abortParsingListOrMoveToNextToken`: the token is
+                // dropped only when NO enclosing list would take it. A
+                // class-member modifier inside a class body is a member start,
+                // so tsc ends the statement list right here and lets the class
+                // body have the token — which is how `class C { m() { static x
+                // = 1; } }` ends up with `static x = 1` as a MEMBER and one
+                // extra "Declaration or statement expected." on the now-unpaired
+                // final `}`. The `}` the aborted block then fails to find lands
+                // on this same position and is dropped by `addDiag`'s
+                // one-per-position rule, exactly as in tsc.
+                if (p.class_depth > 0 and statementModifierCode(p.curTag()) != null) return;
                 _ = try p.bump();
                 continue;
             }
