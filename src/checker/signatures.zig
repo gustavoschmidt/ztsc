@@ -2542,7 +2542,17 @@ pub fn memberTypeOf(c: *Checker, sym: SymbolId) Error!TypeId {
                     };
                     c.field_init_depth += 1;
                     defer c.field_init_depth -= 1;
-                    return c.widenLiteral(try c.checkExprCached(e.init, types.no_type));
+                    const init_t = try c.checkExprCached(e.init, types.no_type);
+                    // `readonly kind = "A"` keeps `"A"`, exactly as `const kind
+                    // = "A"` does: tsc's `widenTypeInferredFromInitializer`
+                    // skips `getWidenedLiteralType` for a `const`-flagged *or*
+                    // `readonly` declaration. Object literals still widen in
+                    // both branches (`getWidenedType` runs unconditionally
+                    // afterwards), so this is `widenObjectLiterals`, not "no
+                    // widening at all". Parameter properties are excluded by
+                    // tsc and are a different arm here.
+                    if (e.flags & ast.Flags.readonly != 0) return c.widenObjectLiterals(init_t);
+                    return c.widenLiteral(init_t);
                 }
                 return types.any_type;
             },
