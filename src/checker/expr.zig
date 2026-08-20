@@ -39,6 +39,7 @@ const diagFmt = Checker.diagFmt;
 const discriminate_ctx = @import("discriminate_ctx.zig");
 const flowContainerOf = @import("flow.zig").flowContainerOf;
 const flowTypeOfReference = @import("flow.zig").flowTypeOfReference;
+const this_flow_root = @import("flow.zig").this_flow_root;
 const gatherSpreadProps = @import("typenode.zig").gatherSpreadProps;
 const globalThisType = @import("instantiate.zig").globalThisType;
 const inForHeadWriteTarget = @import("flow.zig").inForHeadWriteTarget;
@@ -245,6 +246,33 @@ fn thisBoundKey(c: *const Checker, fn_node: Node) u64 {
 /// `Checker.this_bound_fns`.
 fn markThisBound(c: *Checker, fn_node: Node) Error!void {
     try c.this_bound_fns.put(c.cm(), thisBoundKey(c, fn_node), {});
+}
+
+/// A property/element access whose RECEIVER is `this`, narrowed the way tsc's
+/// `tryGetThisTypeAt` narrows it: both of its arms — the function-like
+/// container and the class-body one — hand their answer to
+/// `getFlowTypeOfReference(node, thisType)`, so every guard that refines a
+/// named receiver refines `this` too. The one that needs it most is the
+/// `this is T` predicate: `if (this.hasData()) this.data.toLowerCase()` is
+/// only sound because the call narrowed the RECEIVER and the property was
+/// then read off the narrowed type. `flow.predicateOfCall` already hands the
+/// `this` node back as such a guard's subject, and `flow.identIsSym` already
+/// answers the `this` sentinel root with "is a `this_expr`", so the empty
+/// path over that root — the same root `buildRefKey` mints for `this.p` —
+/// is a reference the walk can match as-is.
+///
+/// The flow node queried is the ACCESS's, not the `this` keyword's: ztsc's
+/// binder attaches flow to references and accesses, and has no `ThisKeyword`
+/// arm of tsc's `bindWorker`. The two are the same flow node by construction
+/// — a member expression is bound before its own children, so `this.p` and
+/// the `this` inside it would record one and the same `currentFlow` — so
+/// standing in for it here is exact for every receiver. (A bare `this` in
+/// some other position — `const x: DatafulFoo<T> = this` — still reads the
+/// declared type; narrowing that one needs the binder to attach a flow node
+/// to the keyword itself.)
+fn narrowThisReceiver(c: *Checker, recv: Node, site: Node, t: TypeId) Error!TypeId {
+    if (c.nodeTag(recv) != .this_expr) return t;
+    return c.flowTypeOfKey(site, .{ .sym = this_flow_root }, t);
 }
 
 fn atFileTopLevel(c: *const Checker) bool {
@@ -3722,7 +3750,8 @@ fn memberChainInner(c: *Checker, node: Node, ctx: TypeId) Error!ChainLink {
             break :obj link.ty;
         }
         if (try superReceiverType(c, d.lhs)) |st| break :obj st;
-        break :obj try c.checkExprCached(d.lhs, types.no_type);
+        const base = try c.checkExprCached(d.lhs, types.no_type);
+        break :obj try narrowThisReceiver(c, d.lhs, node, base);
     };
     const name_tok: TokenIndex = d.rhs;
     const name = try c.memberAtom(name_tok);
@@ -4213,7 +4242,8 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
             if (link.chained) chained = true;
             break :obj link.ty;
         }
-        break :obj try c.checkExprCached(d.lhs, types.no_type);
+        const base = try c.checkExprCached(d.lhs, types.no_type);
+        break :obj try narrowThisReceiver(c, d.lhs, node, base);
     };
     // The index expression runs only on the chain's non-nullish branch, so
     // it sees the chain's own guards (`pushChainGuards`).
