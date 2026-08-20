@@ -2611,6 +2611,12 @@ pub const Checker = struct {
     atom_ElementChildrenAttribute: Atom = 0,
     atom_IntrinsicAttributes: Atom = 0,
     atom_IntrinsicClassAttributes: Atom = 0,
+    /// `JSX.ElementClass` — the bound a CLASS component's instance type has to
+    /// satisfy, and `JSX.ElementType` — whose mere PRESENCE (TS 5.1 /
+    /// @types/react 18.3) switches tsc from the return/instance bound to a
+    /// bound on the tag type itself. See `jsx.zig`'s `checkJsxTagBound`.
+    atom_ElementClass: Atom = 0,
+    atom_ElementType: Atom = 0,
     atom_children: Atom = 0,
     /// `Program.jsx_factory_ns` interned (0 when no `jsxFactory` is set): the
     /// container tsc reads the `JSX` namespace out of before the global one.
@@ -2845,6 +2851,8 @@ pub const Checker = struct {
         c.atom_ElementChildrenAttribute = try c.atom("ElementChildrenAttribute");
         c.atom_IntrinsicAttributes = try c.atom("IntrinsicAttributes");
         c.atom_IntrinsicClassAttributes = try c.atom("IntrinsicClassAttributes");
+        c.atom_ElementClass = try c.atom("ElementClass");
+        c.atom_ElementType = try c.atom("ElementType");
         c.atom_children = try c.atom("children");
         if (c.prog.jsx_factory_ns) |ns| c.atom_jsx_factory_ns = try c.atom(ns);
         for (typeof_names, 0..) |n, i| c.typeof_atoms[i] = try c.atom(n);

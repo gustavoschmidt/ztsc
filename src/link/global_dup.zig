@@ -214,13 +214,22 @@ pub const Contributor = struct {
 /// A declaration whose name is not a single identifier token (a destructuring
 /// pattern) is skipped: there is no span to report it at. That is an
 /// under-report, and the safe direction.
+///
+/// Two of the three codes that reach here INTERPOLATE the name — "Duplicate
+/// identifier '{0}'.", "Cannot redeclare block-scoped variable '{0}'." — and
+/// the name is exactly the span each report lands on, which is what
+/// `renderMessage`'s no-`arg` case means. Handing the raw template to
+/// `LinkDiag.msg` instead printed the placeholder verbatim: a user
+/// `class Symbol` colliding with the lib's global read
+/// `Duplicate identifier '{0}'.` (`recursiveComplicatedClasses`). Every
+/// non-interpolating code still gets its static template back untouched, with
+/// no allocation.
 pub fn reportAll(
     arena: Allocator,
     diags: []std.ArrayList(LinkDiag),
     contributors: []const Contributor,
     code: Code,
 ) Error!void {
-    const msg = code.message();
     const ts = code.tsCode();
     for (contributors) |c| {
         for (c.decls) |decl| {
@@ -230,9 +239,11 @@ pub fn reportAll(
                 .start = start,
                 .end = scanner.tokenEnd(c.src, c.tree.tokens.tag(tok), start),
             };
+            const msg = try diagnostics.renderMessage(arena, .{ .code = code, .span = span }, c.src);
             try diags[c.file].append(arena, .{ .code = ts, .span = span, .msg = msg });
         }
         for (c.spans) |span| {
+            const msg = try diagnostics.renderMessage(arena, .{ .code = code, .span = span }, c.src);
             try diags[c.file].append(arena, .{ .code = ts, .span = span, .msg = msg });
         }
     }
