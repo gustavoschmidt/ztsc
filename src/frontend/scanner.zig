@@ -1146,6 +1146,17 @@ pub const Scanner = struct {
     }
 };
 
+/// Does this (already unescaped) text spell a keyword? tsc's `textToKeyword`
+/// probe, exposed because the SCANNER deliberately answers `.identifier` for
+/// any token that carried a `\uXXXX` escape while tsc's `getIdentifierToken`
+/// looks the COOKED text up and hands back the keyword — an escaped keyword is
+/// still a keyword to tsc, and the difference is what TS1260 is about. The
+/// parser asks this at its one report site rather than the scanner changing
+/// its token kind; see `errForMissingSemicolonAfterWord`.
+pub fn isKeywordText(text: []const u8) bool {
+    return keyword_map.get(text) != null;
+}
+
 // ---------------------------------------------------------------------------
 // private implementation
 // ---------------------------------------------------------------------------

@@ -1877,9 +1877,24 @@ const Parser = struct {
             .keyword_function => return p.parseFunctionDecl(0, false),
             .keyword_class => return p.parseClassDecl(0, .declaration),
             .keyword_abstract => {
-                if (p.peekTag(1) == .keyword_class and !p.peekNewline(1)) {
-                    _ = try p.bump();
-                    return p.parseClassDecl(ast.Flags.abstract, .declaration);
+                if (!p.peekNewline(1)) {
+                    if (p.peekTag(1) == .keyword_class) {
+                        _ = try p.bump();
+                        return p.parseClassDecl(ast.Flags.abstract, .declaration);
+                    }
+                    // The `async` treatment, for the same reason and from the
+                    // same tsc code: `isDeclaration`'s modifier loop consumes
+                    // `abstract` and looks at what follows, so any OTHER
+                    // declaration behind it is parsed WITH the modifier and
+                    // `checkGrammarModifiers` answers TS1242 on the word.
+                    // `abstract interface I {}` used to be an expression
+                    // statement here, which cost the TS1242 and read the rest as
+                    // an unexpected keyword (TS1434) besides.
+                    if (p.spec == 0 and (asyncModifierTarget(p.peekTag(1)) or p.peekTag(1) == .keyword_function)) {
+                        const kw = try p.bump();
+                        try p.errAtToken(.abstract_modifier_not_valid_here, kw);
+                        return p.parseStatementUnchecked();
+                    }
                 }
                 return p.parseExpressionStatement();
             },
@@ -2265,6 +2280,16 @@ const Parser = struct {
     /// `declare` is silent: a `declare` that failed to parse has already
     /// reported. Every arm was oracle-probed against tsgo 7.0.2.
     fn errForMissingSemicolonAfterWord(p: *Parser, tok: u32) Error!void {
+        // A word that only LOOKS like an identifier because it was spelled with
+        // a `\uXXXX` escape: tsc's scanner cooks the text before consulting
+        // `textToKeyword`, so `var x = "hello"` is a keyword `var` there
+        // and a plain `var` statement — with one TS1260 for the escape and
+        // nothing else. ztsc's scanner deliberately never keyword-matches an
+        // escaped token, so the statement arrives here instead; answering the
+        // escape rather than TS1434 lands the same code at the same span
+        // (`scannerUnicodeEscapeInKeyword1`/`2`, whose seven positions already
+        // agreed and only disagreed on the code).
+        if (isEscapedKeyword(p, tok)) return p.errAtToken(.keyword_with_escape, tok);
         const blank_interface = p.curTag() == .l_brace;
         switch (p.tokTagAt(tok)) {
             .keyword_declare => {},
@@ -2284,6 +2309,17 @@ const Parser = struct {
                 .type_alias_name_reserved),
             else => try p.errAtToken(.unexpected_keyword_or_identifier, tok),
         }
+    }
+
+    /// Is `tok` an identifier whose `\uXXXX` escapes cook down to a KEYWORD —
+    /// the token tsc's scanner would have handed back as that keyword? The
+    /// backslash probe short-circuits every ordinary word before the decode.
+    fn isEscapedKeyword(p: *const Parser, tok: u32) bool {
+        const text = p.tokenTextAt(tok);
+        if (std.mem.indexOfScalar(u8, text, '\\') == null) return false;
+        var buf: [scanner.max_unescaped_ident]u8 = undefined;
+        const cooked = scanner.unescapeIdentifier(text, &buf) orelse return false;
+        return scanner.isKeywordText(cooked);
     }
 
     /// Token tags the SCANNER has already reported on, so the parser must not
@@ -2413,7 +2449,7 @@ const Parser = struct {
         // `var ;` and a `for (var in X)` head are all this shape; the last one
         // is why the code is GRAMMAR-class, since tsgo reports the RHS's TS2304
         // beside it.
-        if (!p.atStartOfDeclarator() and p.varDeclaratorListDone()) {
+        if ((!p.atStartOfDeclarator() and p.varDeclaratorListDone()) or p.atForOfWithNoDeclarator()) {
             if (p.spec > 0) return error.Backtrack;
             try p.errAtTokenEnd(.empty_var_decl_list, kw);
             return p.addNode(.{ .tag = .var_decl, .main_token = kw, .data = .{ .lhs = 0, .rhs = 0 } });
@@ -2453,6 +2489,32 @@ const Parser = struct {
         }
         const range = try p.scratchToSpan(top);
         return p.addNode(.{ .tag = .var_decl, .main_token = kw, .data = .{ .lhs = range.start, .rhs = range.end } });
+    }
+
+    /// tsc's `canFollowContextualOfKeyword`, asked by
+    /// `parseVariableDeclarationList` BEFORE the delimited list and only when
+    /// the list's first token is `of`: `nextTokenIsIdentifier() && nextToken()
+    /// === CloseParenToken`. A hit means the `of` is the for-of KEYWORD and the
+    /// declaration list is empty, not a declarator named `of`.
+    ///
+    /// `for (var of X) {}` is the shape: `of` is followed by an identifier and
+    /// then `)`, so tsc parses an empty list, answers TS1123 at the position
+    /// right after `var`, and reads `of X` as the for-of head. ztsc took `of`
+    /// as the declarator name and then wanted a second `of`, reporting two
+    /// TS1005s at the `X` instead (`parserForOfStatement2`,
+    /// `parserES5ForOfStatement2`, and the `for (var of of)` pair at 21).
+    ///
+    /// `for (var of; ;)` is deliberately NOT this shape — `;` is no identifier,
+    /// so `of` stays the declarator name, which is why `parserForOfStatement17`
+    /// already agreed.
+    ///
+    /// Not gated on being in a for-head, exactly as tsc's is not: the lookahead
+    /// already demands a `)` two tokens on, which no statement-level
+    /// declaration list can produce.
+    fn atForOfWithNoDeclarator(p: *Parser) bool {
+        return p.curTag() == .keyword_of and
+            isIdentLike(p.peekTag(1)) and
+            p.peekTag(2) == .r_paren;
     }
 
     /// tsc's `isVariableDeclaratorListTerminator`: anything a `;` could stand
@@ -4231,9 +4293,21 @@ const Parser = struct {
     /// — a ModuleExportName, so a string literal is legal there (ES2022
     /// arbitrary module namespace identifiers). Only the export side: a LOCAL
     /// binding (`import { "s" as x }`) still has to be an identifier.
+    ///
+    /// tsc parses it with `parseIdentifierName`, which takes any IdentifierName
+    /// — every reserved word included. `export * as default from "./0"` is the
+    /// spelling that needs it, and it is neither exotic nor an error: it is how
+    /// a module re-exports another's namespace AS its default, and the whole
+    /// point of `exportAsNamespace4`/`5`. Routing it through `expectIdentLike`
+    /// rejected the `default` (TS1003) and then read the rest of the line as a
+    /// statement (TS1434), two false positives against an oracle that reports
+    /// nothing at all. An IdentifierName position is also exempt from the
+    /// strict-reserved and `await` checks `expectIdentLike` performs — see
+    /// `checkStrictReserved`.
     fn expectModuleExportName(p: *Parser) PE!u32 {
-        if (p.curTag() == .string_literal) return p.bump();
-        return p.expectIdentLike();
+        if (isModuleExportName(p.curTag())) return p.bump();
+        try p.fail(.expected_identifier);
+        return p.lastIdx();
     }
 
     /// TS1212/TS1213/TS1214, tsc's `checkStrictModeIdentifier`: a future-reserved
