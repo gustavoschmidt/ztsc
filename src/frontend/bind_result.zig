@@ -124,12 +124,22 @@ pub const SymbolFlags = packed struct(u32) {
     /// class declaration is ambient.
     nonambient_class: bool = false,
     /// A class member declared `private` or `protected` (including a
-    /// `constructor(private db: …)` parameter property). tsc's
-    /// `ModifierFlags.NonPublic`. The checker does not enforce visibility at
-    /// access sites yet; what it needs the bit for is `keyof`, which excludes
-    /// non-public members outright (`getLiteralTypeFromProperty` answers
-    /// `never` for them) — and with `keyof` every mapped type over it,
-    /// `Pick<T, keyof T>` most of all.
+    /// `constructor(private db: …)` parameter property) — tsc's
+    /// `ModifierFlags.NonPublic` — or spelled with an ECMAScript `#name`.
+    ///
+    /// The bit is what `keyof` screens on: it excludes non-public members
+    /// outright (`getLiteralTypeFromProperty` answers `never` for them), and
+    /// with `keyof` every mapped type over it, `Pick<T, keyof T>` most of all.
+    /// It is also the structural relation's nominal screen
+    /// (`nominal_members.zig`) and the object-spread filter's
+    /// (`Prop.spreadable`) — tsc's `isSpreadableProperty` drops a
+    /// private-identifier member for the same reason it drops a `private` one.
+    ///
+    /// A `#name` reaches it via the TOKEN TAG, never the name text: `#x` and a
+    /// quoted `{"#x": 1}` key intern to the same atom. Access-site visibility
+    /// is NOT this bit's — `accessibility.accessOfMember` reads the modifiers,
+    /// so a `#name` answers `.public` there and an access from outside is
+    /// `checkPrivateName`'s TS18013 rather than TS2341.
     non_public: bool = false,
     /// One member of an `enum` body. tsc's `SymbolFlags.EnumMember`: a VALUE
     /// (its type is the member literal `E.A`), declared in the enum's own

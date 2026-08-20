@@ -135,6 +135,25 @@ fn stripModuleQuotes(text: []const u8) []const u8 {
 /// `ModifierFlags.NonPublic`). `public` is the default and never restricts.
 const nonpublic_mask: u32 = ast.Flags.private | ast.Flags.protected;
 
+/// An ECMAScript `#name` member carries no modifier at all, but it is
+/// non-public in the one sense `Symbol.non_public` (and the
+/// `prop_flag_non_public` the checker derives from it) is FOR: it belongs to
+/// the class that declared it and to no other, so the structural relation, the
+/// `keyof` key list and the object-spread filter must all screen it out
+/// (`nominal_members.zig` carries the wave-22 oracle for every shape).
+///
+/// The test is on the TOKEN TAG, never on the name text — `#x` and a quoted
+/// `{"#x": 1}` key intern to the same atom, and a name read would take the
+/// interner's shard mutex on a per-member path (see `nominal_members.zig`'s
+/// COST note). A member declaration is bound once, so this costs one tag load.
+///
+/// `accessOfMember` reads the MODIFIERS, so a `#name` still answers `.public`
+/// there and the TS2341/TS2445 access rules stay off it: an access from
+/// outside is `accessibility.checkPrivateName`'s TS18013, as before.
+fn isPrivateNameToken(b: *const Binder, tok: TokenIndex) bool {
+    return b.tree.tokens.tag(tok) == .private_identifier;
+}
+
 /// What kind of declaration is being bound; determines the flags a new
 /// symbol gets and which existing flags it refuses to merge with.
 const DeclKind = enum {
@@ -3208,7 +3227,7 @@ const Binder = struct {
                             .static_member = is_static,
                             .optional_member = f.flags & ast.Flags.optional != 0,
                             .readonly_member = f.flags & ast.Flags.readonly != 0,
-                            .non_public = f.flags & nonpublic_mask != 0,
+                            .non_public = f.flags & nonpublic_mask != 0 or isPrivateNameToken(b, tok),
                         });
                     }
                     try b.bindType(f.type_ann);
@@ -3245,8 +3264,28 @@ const Binder = struct {
                             try b.memberNameKey(tok, proto.flags);
                         _ = try b.declare(if (is_static) ss else ms, atom, kind, member, tok, .{
                             .static_member = is_static,
+                            // NOT SET, deliberately, and it is a known gap:
+                            // `m?(): number` is an OPTIONAL property whose type
+                            // is `(() => number) | undefined`, exactly as
+                            // `m?: () => number` is (tsc reads optionality off
+                            // the declaration in
+                            // `getTypeOfVariableOrParameterOrProperty` and does
+                            // not care whether it is a method or a field), so
+                            // `c.m()` should be TS2722 and `const d: C = {}`
+                            // legal. Setting it is a one-word change and it
+                            // measures NET NEGATIVE today, because a
+                            // `super.<name>` reference is not narrowable:
+                            // `refkey.buildRefKey` bottoms out at an identifier
+                            // or `this` and has no `super` root, so
+                            // `super.m && super.m()` cannot narrow and every
+                            // optional method reached that way becomes a false
+                            // positive (`controlFlowSuperPropertyAccess`). The
+                            // two land together: a `super_flow_root` sentinel
+                            // beside `this_flow_root` (refkey.zig) plus its two
+                            // readers in flow.zig (`identIsSym`,
+                            // `isPatternRoot`), and then this line.
                             .has_impl = md.rhs != 0 and !is_get and !is_set,
-                            .non_public = proto.flags & nonpublic_mask != 0,
+                            .non_public = proto.flags & nonpublic_mask != 0 or isPrivateNameToken(b, tok),
                         });
                     }
                     const is_ctor = b.tree.tokens.tag(tok) == .keyword_constructor and !is_static;
@@ -4551,8 +4590,11 @@ const Binder = struct {
             },
             .binary => {
                 switch (b.tree.tokens.tag(b.tree.nodeMainToken(node))) {
-                    .amp_amp, .pipe_pipe => {
+                    .amp_amp, .pipe_pipe, .question_question => {
                         // Value position: bind as condition, then join.
+                        // tsc's `bindBinaryExpressionFlow` treats all three
+                        // short-circuiting operators alike here
+                        // (`isLogicalOrCoalescingBinaryOperator`).
                         const cond = try b.bindCondition(node);
                         const pid = try b.newPending();
                         try b.pendAdd(pid, cond.t);
@@ -4768,9 +4810,59 @@ const Binder = struct {
         try b.attachFlow(node);
     }
 
+    /// tsc's `isLogicalExpression`: a `&&` / `||` / `??`, seen through
+    /// parentheses AND `!`. Those build their own condition edges, so the
+    /// enclosing `bindCondition` must not add a leaf pair on top.
+    fn isLogicalExpr(b: *const Binder, node: Node) bool {
+        var n = node;
+        while (n != null_node) {
+            const d = b.tree.nodeData(n);
+            switch (b.nodeTag(n)) {
+                .paren_expr => n = d.lhs,
+                .prefix_unary => {
+                    if (b.tree.tokens.tag(b.tree.nodeMainToken(n)) != .bang) return false;
+                    n = d.lhs;
+                },
+                .binary => return switch (b.tree.tokens.tag(b.tree.nodeMainToken(n))) {
+                    .amp_amp, .pipe_pipe, .question_question => true,
+                    else => false,
+                },
+                else => return false,
+            }
+        }
+        return false;
+    }
+
+    /// The LEFT operand of `??`, bound as a condition.
+    ///
+    /// tsc decides "this test is about NULLISHNESS, not truthiness" in
+    /// `narrowType`, by looking UP from the flow node's expression:
+    /// `isBinaryExpression(expr.parent) && parent.operatorToken === ?? &&
+    /// parent.left === expr`. ztsc's AST carries no parent links, so the two
+    /// leaf edges record the `??` node itself instead and the checker reads
+    /// the operand back off it — the marker is unambiguous because the `??`
+    /// node never appears on a flow edge any other way (as a whole condition
+    /// it contributes only its operands' joins).
+    ///
+    /// A left operand that builds its OWN edges — a nested `&&`/`||`/`??`
+    /// (through parens and `!`, exactly tsc's `isLogicalExpression`) or an
+    /// optional chain — is delegated unchanged: in tsc those inner operands'
+    /// parent is not the `??` either, so they narrow by truthiness.
+    fn bindNullishTest(b: *Binder, lhs: Node, qq: Node) Error!CondFlows {
+        if (b.isLogicalExpr(lhs) or (lhs != null_node and b.isOptionalChain(lhs))) {
+            return b.bindCondition(lhs);
+        }
+        try b.bindExpr(lhs);
+        return .{
+            .t = try b.addFlow(.cond_true, b.cur_flow, qq),
+            .f = try b.addFlow(.cond_false, b.cur_flow, qq),
+        };
+    }
+
     /// Bind a condition expression, producing the flows for its true and
-    /// false outcomes. Decomposes `&&`, `||`, `!`, and parens so the checker can
-    /// narrow each operand (truthiness/typeof/equality/discriminant).
+    /// false outcomes. Decomposes `&&`, `||`, `??`, `!`, and parens so the
+    /// checker can narrow each operand
+    /// (truthiness/nullishness/typeof/equality/discriminant).
     fn bindCondition(b: *Binder, node: Node) Error!CondFlows {
         if (node == null_node) {
             return .{ .t = b.cur_flow, .f = unreachable_flow };
@@ -4796,6 +4888,21 @@ const Binder = struct {
                 },
                 .pipe_pipe => {
                     const lhs = try b.bindCondition(d.lhs);
+                    b.cur_flow = lhs.f;
+                    const rhs = try b.bindCondition(d.rhs);
+                    const pid = try b.newPending();
+                    try b.pendAdd(pid, lhs.t);
+                    try b.pendAdd(pid, rhs.t);
+                    return .{ .t = try b.finishPending(pid), .f = rhs.f };
+                },
+                // tsc's `bindLogicalLikeExpression` routes `??` through the
+                // very same `else` arm as `||`: the right operand is reached
+                // from the left's FALSE outcome, and both operands' true
+                // outcomes join. What differs is only what "false" MEANS for
+                // the left operand — nullish, not falsy — and that is
+                // `bindNullishTest`'s job.
+                .question_question => {
+                    const lhs = try b.bindNullishTest(d.lhs, node);
                     b.cur_flow = lhs.f;
                     const rhs = try b.bindCondition(d.rhs);
                     const pid = try b.newPending();

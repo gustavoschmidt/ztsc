@@ -1027,7 +1027,10 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
             // evolving) one back — which is what lets an array keep growing
             // across `if (x.length === 0) { x.push(1) }`.
             const solid = try finalizeEvolvingArray(c, before);
-            const narrowed = try c.narrowByCondition(solid, cond, sense, key, declared);
+            const narrowed = if (isNullishTestEdge(c, cond))
+                try narrowByNullishTest(c, solid, cond, sense, key)
+            else
+                try c.narrowByCondition(solid, cond, sense, key, declared);
             return if (narrowed == solid) before else narrowed;
         },
         .switch_clause => {
@@ -1900,6 +1903,35 @@ fn constAliasInit(c: *Checker, cond: Node, key: RefKey) Error!?Node {
         },
         else => return null,
     }
+}
+
+/// Is this flow edge the `??` nullishness test the binder marks by recording
+/// the `??` node itself (see `Binder.bindNullishTest`)? A `??` never reaches a
+/// condition edge any other way, so the tag needs no side table.
+fn isNullishTestEdge(c: *const Checker, cond: Node) bool {
+    return cond != null_node and c.nodeTag(cond) == .binary and
+        c.tree.tokens.tag(c.tree.nodeMainToken(cond)) == .question_question;
+}
+
+/// tsc's `narrowTypeByOptionality`, reached from `narrowType`'s head for the
+/// LEFT operand of `??`: the operand is tested for NULLISHNESS, so the taken
+/// branch keeps the non-nullish part and the short-circuit branch keeps only
+/// `null | undefined` — never the truthy/falsy split, which would leave `""`
+/// and `0` on the right-hand side (`nullishCoalescingOperator11`).
+///
+/// The nullish filter is the same one `narrow.narrowByLiteralEquality` builds
+/// inline for `== null`; folding the two together belongs with that file.
+fn narrowByNullishTest(c: *Checker, t: TypeId, qq: Node, sense: bool, key: RefKey) Error!TypeId {
+    if (!try refMatches(c, c.tree.nodeData(qq).lhs, key)) return t;
+    if (sense) return c.nonNullable(t);
+    return c.filterUnion(t, struct {
+        fn keep(ch: *Checker, m: TypeId) bool {
+            return switch (ch.ts.kind(m)) {
+                .null, .undefined, .any, .unknown, .err => true,
+                else => false,
+            };
+        }
+    }.keep);
 }
 
 pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: RefKey, decl: TypeId) Error!TypeId {
