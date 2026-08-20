@@ -1037,6 +1037,40 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
     return .{ .ty = result, .chained = chained };
 }
 
+/// tsc's `getThisArgumentType`: what a call's receiver contributes as the
+/// `this` argument, for BOTH the `this`-parameter inference and the TS2684
+/// receiver check — the two must agree, and reading the receiver twice is how
+/// they drift.
+///
+/// ```ts
+/// function getThisArgumentType(thisArgumentNode) {
+///     if (!thisArgumentNode) return voidType;
+///     const thisArgumentType = checkExpression(thisArgumentNode);
+///     return isOptionalChainRoot(thisArgumentNode.parent) ? getNonNullableType(thisArgumentType) :
+///         isOptionalChain(thisArgumentNode.parent) ? removeOptionalTypeMarker(thisArgumentType) :
+///         thisArgumentType;
+/// }
+/// ```
+///
+/// `null` when the callee is not an access expression — a bare call has no
+/// receiver, and each caller has its own answer for that (`void` for the
+/// check, "no inference" for the inference).
+///
+/// The optional-link strip is what `callChainInference` (the #42404 repro)
+/// needs: `interface Y { foo<T>(this: T, arg: keyof T): void }` called as
+/// `value?.foo("a")` on a `Y | undefined` inferred `T = Y | undefined`, whose
+/// `keyof` is `never`, so the argument was a false TS2345 — and the receiver's
+/// own nullability is reported by the chain, not by this call.
+fn thisArgumentType(c: *Checker, callee: Node) Error!?TypeId {
+    const optional = switch (c.nodeTag(callee)) {
+        .member_expr, .index_expr => false,
+        .optional_member_expr, .optional_index_expr => true,
+        else => return null,
+    };
+    const recv = try c.checkExprCached(c.tree.nodeData(callee).lhs, types.no_type);
+    return if (optional) try c.nonNullableChain(recv) else recv;
+}
+
 /// Receiver check for a signature with an explicit `this` parameter
 /// (`f(this: T, …)`): the call's receiver must be assignable to `T`
 /// (TS2684). A member call `obj.m()` uses `obj`'s type; a bare call uses
@@ -1056,13 +1090,7 @@ fn checkThisArg(c: *Checker, node: Node, sig: TypeId) Error!void {
     // all, so `this` came out `void` and the call was a false TS2684
     // (`thisTypeSyntacticContext`'s `o.test!()`, `o.test!!!()`, `(o.test!)()`).
     const callee = expr_zig.skipOuterExprs(c, c.callShape(node).callee);
-    var recv: TypeId = types.void_type;
-    switch (c.nodeTag(callee)) {
-        .member_expr, .optional_member_expr, .index_expr, .optional_index_expr => {
-            recv = try c.checkExprCached(c.tree.nodeData(callee).lhs, types.no_type);
-        },
-        else => {},
-    }
+    const recv = try thisArgumentType(c, callee) orelse types.void_type;
     if (!try c.isAssignable(recv, this_ty)) {
         // TS7 reports the specific missing-property error (TS2741/2739) when
         // the receiver simply lacks required members; a member present with
@@ -1659,13 +1687,7 @@ pub fn instantiateSigForCall(c: *Checker, sig: TypeId, explicit_targs: []const T
         // `checkExprCached` on the member object is otherwise wasted work).
         var recv_ty: TypeId = types.no_type;
         if (c.ts.fnThisType(sig) != 0) {
-            const callee = c.callShape(node).callee;
-            switch (c.nodeTag(callee)) {
-                .member_expr, .optional_member_expr, .index_expr, .optional_index_expr => {
-                    recv_ty = try c.checkExprCached(c.tree.nodeData(callee).lhs, types.no_type);
-                },
-                else => {},
-            }
+            recv_ty = try thisArgumentType(c, c.callShape(node).callee) orelse types.no_type;
         }
         minted = try inferTypeArgs(c, sig, tps, arg_nodes, args_buf, ret_ctx, recv_ty);
     }
