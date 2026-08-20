@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-20, post wave 24)
+## Standings (2026-08-20, post wave 25)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7162 / 8628 (83.0%)** |
-| excess keys (false positives) | 3541 | ~1770 |
-| missing keys (under-reports) | 8617 | ~3510 |
-| bucketed (ztsc parse error, incomparable) | 825 | 13 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7218 / 8628 (83.6%)** |
+| excess keys (false positives) | 3541 | 1713 |
+| missing keys (under-reports) | 8617 | 3339 |
+| bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Twenty-four waves landed (3–24), every one with ZERO match→non-match regressions in
+Twenty-five waves landed (3–25), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -306,7 +306,71 @@ tsc returns the DECLARED type — that one divergence is most of the typeGuards
 under-pool, but the verdict currently lives under owned_mask and must move out
 without breaking N-checker determinism (recipe beside flow.unassignedVarType).
 
-## Ranked next queue (wave 25) — distilled from wave-24 agent reports
+Wave 25 (+56, perfectly additive; bucketed 13→9; conformance 1319→1320):
+A landed TS2454 declared-type (verdict out of owned_mask, determinism-gated;
+its +4% RSS risk caught and fixed by narrowed!=declared gating), general
+`this` narrowing, non-union directlyRelated. B opened the concrete-source→
+generic-target relation direction (36 keys; 12 residual excess confined to
+the two already-diverging higher-order-inference cases) and ANSWERED the
+contra-split mystery from tsc's source: anyFunctionType has ZERO call
+signatures so len=0 — no descent ever; the phantom enters elsewhere
+(reverse-mapped or union naked-variable arm). C landed array-pattern tuple
+contexts, TS18046/TS2571 recoding at four verdict sites, pattern-default
+contexts, and the classInstanceGeneric inference-window TS2339 hole. D landed
+the TS1434 seam PROPERLY (fixed the divergent recoveries first — the naive
+flip measured −2), the malformed-import family, TS1042, and neutralized a
+pre-existing `import a = a.b` parse-path SIGSEGV (the typespace recursion
+itself still needs fixing). DETERMINISM DEFECT NOW SCOPED: exactly 3
+pre-existing social-app lines differ between --checkers=1 and 4
+(Navigation.tsx:778 TS2322 text, StarterPackDialog.tsx:245 TS2769,
+FeedSourceCard.tsx:197 TS2353) — proven pre-existing by binary bisection.
+
+## Ranked next queue (wave 26) — distilled from wave-25 agent reports
+
+1. The mapped/indexed relation family (~55 missing keys behind ONE rule):
+   indexed access and mapped types over DISTINCT free type parameters are
+   bidirectionally assignable in ztsc where tsc rejects (T[K] vs U[K] with
+   U extends T; Partial<T>[K]; {[P in K]: T[P]} vs {[P in keyof T]: U[P]});
+   plus TS2536 (keyof.zig:797 exists, doesn't fire) and TS2542 through
+   Readonly<T> for free T. Cases: mappedTypeRelationships (20),
+   keyofAndIndexedAccess2 (11), mappedTypes6, keyofAndIndexedAccessErrors,
+   varianceAnnotations, covariantCallbacks.
+2. Higher-order inference returns a GENERIC signature (tsc infers
+   wrap(list): <A>(x:A)=>A[] and instantiates that): retires the 12 residual
+   excess keys in genericFunctionInference1/genericContextualTypes1 and the
+   assign.zig comment.
+3. `import a = a.b` SIGSEGV root fix: resolveNsContainer recursion
+   (typespace.zig); alias_cycle documents qualified entities as terminal so
+   its TS2303 pass never sees them. The parser no longer reaches it, but the
+   spelling is valid input.
+4. TS18046 general arm, re-derived with the COLUMN fixed (tsgo anchors at the
+   object expression's start, not the property): unknownType1 alone is 13
+   keys across property/arith/compare/call/new; the prior attempt traded
+   20/14 on wrong columns. Also the write-target arm (z.p = 1 → TS18046 at
+   receiver, via checkAssignmentTarget).
+5. Determinism defect — NOW TRACTABLE with 3 scoped witnesses; dedicated
+   agent: instrument the three sites, confirm/refute the instantiation-budget
+   partition hypothesis (budget charges misses not hits), fix, verify
+   social-app byte-identical across --checkers=1/2/4/8 and --file-order.
+6. JSX 2604/2607 with the CORRECT design (from D): construct-signature props
+   come from getJsxPropsTypeFromClassType (the `props` member of the RETURN
+   type), not the first parameter; TS2607 lives there too.
+7. Param-pattern default elaboration (contextuallyTypedBindingInitializerNegative,
+   7 TS2322 under): checkTypeAssignableToAndOptionallyElaborate on a pattern
+   default vs its element type — parameter patterns don't go through
+   materializePatternTypes; distinct plumbing.
+8. Harness/test fixes: gen_expected.js deletes empty-dir snapshots
+   (intersection_to_recursive_union_alias/expected churn); the conformance
+   runner lacks the driver's whole-program parse-error gate.
+9. Print fidelity: [number, (string | undefined)?] optional-tuple rendering
+   (costs a TS2493 message); TS1434 residue (48 keys / 19 cases remain).
+10. One-key census: UNDER TS2322 ×65, EXCESS TS2322 ×31, UNDER TS2339 ×13,
+    UNDER TS2345 ×12, UNDER TS1005 ×11, EXCESS TS7006 ×10, TS2353/TS2741/
+    TS2403/TS1134 ×6 each.
+11. Resolution-mode import attributes; per-frame weak rule (both deep,
+    repeatedly deferred).
+
+## Superseded queue (wave 25, kept for context)
 
 1. TS2454 declared-type-after-report (most of the typeGuards under-pool,
    ~10+ cases): move the definite-assignment VERDICT out of owned_mask (the
