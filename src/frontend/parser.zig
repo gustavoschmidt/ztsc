@@ -2160,7 +2160,7 @@ const Parser = struct {
                 if (p.nlBefore()) return;
                 if (p.spec > 0) return error.Backtrack;
                 if (expr != null_node and p.nodes.items(.tag)[expr] == .identifier and
-                    p.curTag() != .unknown and p.curTag() != .binary_content)
+                    !scannerAlreadyReported(p.curTag()))
                 {
                     const tok = p.nodes.items(.main_token)[expr];
                     const at = p.tok_starts.items[tok] & scanner.Tokens.start_mask;
@@ -2182,6 +2182,26 @@ const Parser = struct {
                 try p.errAtCur(.expected_semicolon);
             },
         }
+    }
+
+    /// Token tags the SCANNER has already reported on, so the parser must not
+    /// add a second complaint about the same text: none of them is the WORD
+    /// `expectSemicolonAfterExpression`'s misspelled-keyword theory is about.
+    /// The unterminated forms matter beyond tidiness — `f` followed by an
+    /// unterminated template is a TAGGED TEMPLATE tsc answers only TS1160 for,
+    /// so blaming `f` was a key tsgo does not have
+    /// (`taggedTemplatesWithIncompleteNoSubstitutionTemplate1`/`2`).
+    fn scannerAlreadyReported(tag: TokTag) bool {
+        return switch (tag) {
+            .unknown,
+            .binary_content,
+            .unterminated_string_literal,
+            .unterminated_template,
+            .unterminated_regexp_literal,
+            .unterminated_comment,
+            => true,
+            else => false,
+        };
     }
 
     /// ASI: `;` is consumed; `}`, EOF, or a preceding line break also
@@ -4658,9 +4678,49 @@ const Parser = struct {
         p.skipBalancedBraces();
     }
 
+    /// `export export = x` / `export declare export = y`: an export ASSIGNMENT
+    /// standing behind modifiers. Returns how many tokens sit between the
+    /// caller's `export` and the assignment's own `export` keyword (that
+    /// keyword included), plus the `ast.Flags` those modifiers carry — or null
+    /// when this is any other `export` statement.
+    ///
+    /// Positioned after the leading `export` has been consumed. tsc collects
+    /// `export`, `declare` and the member modifiers into ONE list before it
+    /// decides what the declaration is, so the run has to be recognized before
+    /// the ordinary repeat/modifier loops split it up: their answers (TS1030,
+    /// TS1184) are for a different declaration than the one that is really
+    /// here.
+    fn exportAssignModifierRun(p: *Parser) ?struct { len: usize, flags: u32 } {
+        var flags: u32 = 0;
+        var n: u32 = 0;
+        // `peekTag(n + 1)` bounds the walk; two modifiers is already more than
+        // any real code writes.
+        while (n + 1 < max_la) : (n += 1) {
+            switch (p.peekTag(n)) {
+                .keyword_export => if (p.peekTag(n + 1) == .eq)
+                    return .{ .len = n + 1, .flags = flags },
+                .keyword_declare => flags |= ast.Flags.declare,
+                .keyword_public, .keyword_private, .keyword_protected, .keyword_static, .keyword_readonly, .keyword_abstract => {},
+                else => return null,
+            }
+        }
+        return null;
+    }
+
     fn parseExportStatement(p: *Parser) PE!Node {
         const kw = try p.bump(); // `export`
         p.saw_module_syntax = true;
+        // An export assignment behind modifiers is TS1120, blamed on the
+        // statement. A `declare` among them also makes it AMBIENT, which is
+        // what drops the TS1203 an `export =` otherwise earns — tsc's ESM check
+        // is guarded on `!(node.flags & NodeFlags.Ambient)` — so the flag is
+        // recorded in the node's otherwise-unused `rhs` for the linker to read.
+        var assign_flags: u32 = 0;
+        if (p.exportAssignModifierRun()) |run| {
+            try p.errAtToken(.export_assign_with_modifiers, kw);
+            assign_flags = run.flags;
+            for (0..run.len) |_| _ = try p.bump();
+        }
         // `export export class Foo {}` — tsc collects both into one modifier
         // list and reports TS1030 on the second, then declares the class as
         // usual. Refusing the second `export` here answered "an export clause
@@ -4722,7 +4782,7 @@ const Parser = struct {
                 _ = try p.bump();
                 const entity = if (canStartExpression(p.curTag())) try p.parseAssignExpr(.{}) else 0;
                 try p.expectSemicolon();
-                return p.addNode(.{ .tag = .export_assign, .main_token = kw, .data = .{ .lhs = entity, .rhs = 0 } });
+                return p.addNode(.{ .tag = .export_assign, .main_token = kw, .data = .{ .lhs = entity, .rhs = assign_flags } });
             },
             // `export import A = B.C;` is an exported namespace alias and legal;
             // `export import d from "m"` is an ES6 import declaration with a
@@ -5003,8 +5063,20 @@ const Parser = struct {
         var delegate: u32 = 0;
         var operand: Node = null_node;
         if (!p.nlBefore()) {
-            if (try p.eat(.asterisk) != null) delegate = 1;
-            if (canStartExpression(p.curTag()) and !p.nlBefore()) {
+            const star = try p.eat(.asterisk);
+            if (star != null) delegate = 1;
+            // tsc's `parseYieldExpression` commits on the `*` alone:
+            //
+            //     if (!hasPrecedingLineBreak() && (token() === AsteriskToken || isStartOfExpression()))
+            //         yield [*] parseAssignmentExpressionOrHigher()
+            //
+            // so once a `*` is consumed the operand is MANDATORY and its
+            // absence is TS1109 at whatever follows — `yield *;` blames the
+            // `;`, and a `yield*` alone on its line blames the `}` on the next
+            // (`YieldStarExpression3_es6`, `YieldExpression5_es6`). A BARE
+            // `yield` keeps the optional reading: `function* g() { yield; }`
+            // is legal.
+            if (star != null or (canStartExpression(p.curTag()) and !p.nlBefore())) {
                 operand = try p.parseAssignExpr(ctx);
             }
         }
@@ -5412,7 +5484,12 @@ const Parser = struct {
                     const tok = try p.bump();
                     lhs = try p.addNode(.{ .tag = .non_null, .main_token = tok, .data = .{ .lhs = lhs, .rhs = 0 } });
                 },
-                .template_head, .no_substitution_template_literal => {
+                // `.unterminated_template` included: `f` followed by an
+                // unterminated template is a TAGGED TEMPLATE to tsc, which
+                // answers only the scanner's TS1160 for it. Left out, the tag
+                // ended a statement of its own and the shape earned a second,
+                // invented key (TS1434, then TS1005).
+                .template_head, .no_substitution_template_literal, .unterminated_template => {
                     const tmpl = try p.parseTemplateExpr(true);
                     lhs = try p.addNode(.{ .tag = .tagged_template, .main_token = p.nodes.items(.main_token)[tmpl], .data = .{ .lhs = lhs, .rhs = tmpl } });
                 },
@@ -6142,11 +6219,7 @@ const Parser = struct {
                 }
                 return p.leaf(.regex_literal);
             },
-            .no_substitution_template_literal, .template_head => return p.parseTemplateExpr(false),
-            .unterminated_template => {
-                try p.errAtCurEnd(.unterminated_template);
-                return p.leaf(.template_literal);
-            },
+            .no_substitution_template_literal, .template_head, .unterminated_template => return p.parseTemplateExpr(false),
             .keyword_true => return p.leaf(.true_literal),
             .keyword_false => return p.leaf(.false_literal),
             .keyword_null => return p.leaf(.null_literal),
@@ -6260,6 +6333,16 @@ const Parser = struct {
     /// `tagged` is true for the `` tag`…` `` form, whose parts admit every
     /// otherwise-invalid escape — see `checkTemplateEscapes`.
     fn parseTemplateExpr(p: *Parser, tagged: bool) PE!Node {
+        // An UNTERMINATED no-substitution template is still a template literal
+        // to tsc's parser — its scanner returns the token with `isUnterminated`
+        // set and has already reported TS1160 — so it forms the same leaf, and
+        // a tag in front of it still forms a tagged template. Escapes are not
+        // checked: the literal has no end, so its tail is not a fragment tsc
+        // ever validates.
+        if (p.curTag() == .unterminated_template) {
+            try p.errAtCurEnd(.unterminated_template);
+            return p.leaf(.template_literal);
+        }
         if (p.curTag() == .no_substitution_template_literal) {
             const tok = try p.bump();
             if (!tagged) try p.checkTemplateEscapes(tok);
@@ -8875,6 +8958,29 @@ test "TS1212/1213/1214: a strict-reserved word as an Identifier" {
     try expectDiags("enum Col { yield = 1, static = 2 }\n", .{}, &.{});
     // `yield` in expression position is a YieldExpression, not an identifier.
     try expectDiags("function* g() { yield 1; yield* [2]; }\n", .{}, &.{});
+}
+
+test "TS1120: an export assignment cannot have modifiers" {
+    try expectDiags("var x;\nexport export = x;\n", .{}, &.{.{ 1120, 2, 1 }});
+    try expectDiags("var x;\nexport declare export = x;\n", .{}, &.{.{ 1120, 2, 1 }});
+    // Not the repeat diagnostic, and not every `export export`.
+    try expectDiags("var x;\nexport = x;\n", .{}, &.{});
+    try expectDiags("export export class C {}\n", .{}, &.{.{ 1030, 1, 8 }});
+    try expectDiags("export declare const c: number;\n", .{}, &.{});
+}
+
+test "an unterminated template is still a template (and still takes a tag)" {
+    // tsc's scanner reports TS1160 and hands the parser a template token, so
+    // the tag forms a tagged template and nothing else is blamed.
+    try expectDiags("function f(x: TemplateStringsArray) {}\nf `abc", .{}, &.{.{ 1160, 2, 7 }});
+    try expectDiags("let s = `abc", .{}, &.{.{ 1160, 1, 13 }});
+}
+
+test "TS1109: `yield*` demands an operand" {
+    try expectDiags("function* g() {\n  yield *;\n}\n", .{}, &.{.{ 1109, 2, 10 }});
+    try expectDiags("function* g() {\n  yield*\n}\n", .{}, &.{.{ 1109, 3, 1 }});
+    // A BARE `yield` keeps the optional reading.
+    try expectDiags("function* g() {\n  yield;\n  yield 1;\n  yield* [2];\n}\n", .{}, &.{});
 }
 
 test "one parse diagnostic per position (tsc's parseErrorAtPosition rule)" {

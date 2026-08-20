@@ -425,6 +425,12 @@ pub const Code = enum(u16) {
     /// run can spell. Reported by `parseExportStatement`, not by the class-member
     /// walk, because `export` is not a class-member modifier at all.
     mod_seen_export,
+    /// TS1120: `export export = x` / `export declare export = y` — an export
+    /// ASSIGNMENT behind modifiers. tsc collects the run into one modifier list
+    /// and `checkGrammarModifiers` rejects any modifier on this declaration,
+    /// blaming the statement. It is not the TS1030 repeat: `export` before an
+    /// `export =` is the assignment's own keyword, not a second modifier.
+    export_assign_with_modifiers,
     /// TS1029 `'{0}' modifier must precede '{1}' modifier.` — two modifiers in
     /// the wrong order. tsc's walk reports the SECOND one and names both, so
     /// there is one code per ordered pair it can reach; the pairs below are the
@@ -1096,6 +1102,7 @@ pub const Code = enum(u16) {
             .mod_seen_abstract,
             .mod_seen_declare,
             .mod_seen_export,
+            .export_assign_with_modifiers,
             .mod_order_public_static,
             .mod_order_private_static,
             .mod_order_protected_static,
@@ -1370,6 +1377,7 @@ pub const Code = enum(u16) {
             .mod_seen_abstract => modSeenMessage("abstract"),
             .mod_seen_declare => modSeenMessage("declare"),
             .mod_seen_export => modSeenMessage("export"),
+            .export_assign_with_modifiers => "An export assignment cannot have modifiers.",
             .mod_order_public_static => modOrderMessage("public", "static"),
             .mod_order_private_static => modOrderMessage("private", "static"),
             .mod_order_protected_static => modOrderMessage("protected", "static"),
@@ -1734,6 +1742,7 @@ pub const Code = enum(u16) {
             .mod_seen_declare,
             .mod_seen_export,
             => 1030,
+            .export_assign_with_modifiers => 1120,
             .mod_order_public_static,
             .mod_order_private_static,
             .mod_order_protected_static,
