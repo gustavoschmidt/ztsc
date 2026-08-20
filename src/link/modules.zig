@@ -3832,7 +3832,11 @@ const Linker = struct {
             switch (tree.nodeTag(stmt)) {
                 .import_equals => {
                     const e = tree.extraData(ast.ImportEquals, tree.nodeData(stmt).lhs);
-                    if (e.module_token != 0) {
+                    // A TYPE-ONLY import assignment (`import type X =
+                    // require("m")`) is erased, so it is not an emit construct
+                    // and tsc exempts it: `checkImportEqualsDeclaration` guards
+                    // the rule on `!node.isTypeOnly`.
+                    if (e.module_token != 0 and e.flags & ast.Flags.type_only == 0) {
                         var span = l.nodeSpan(file, stmt);
                         // `export import x = require("m")`: tsc's declaration
                         // node starts at the MODIFIER, and `main_token` is the
@@ -3848,7 +3852,14 @@ const Linker = struct {
                         try l.diag(file, 1202, span, "Import assignment cannot be used when targeting ECMAScript modules. Consider using 'import * as ns from \"mod\"', 'import {{a}} from \"mod\"', 'import d from \"mod\"', or another module format instead.", .{});
                     }
                 },
-                .export_assign => try l.diag(file, 1203, l.nodeSpan(file, stmt), "Export assignment cannot be used when targeting ECMAScript modules. Consider using 'export default' or another module format instead.", .{}),
+                // `declare export = x` is AMBIENT, and tsc's ESM check is
+                // guarded on `!(node.flags & NodeFlags.Ambient)` — the modifier
+                // already earned its own TS1120 in the parser, and there is no
+                // emit to complain about. The parser records the modifier flags
+                // in the node's spare `rhs`.
+                .export_assign => if (tree.nodeData(stmt).rhs & ast.Flags.declare == 0) {
+                    try l.diag(file, 1203, l.nodeSpan(file, stmt), "Export assignment cannot be used when targeting ECMAScript modules. Consider using 'export default' or another module format instead.", .{});
+                },
                 else => {},
             }
         }

@@ -3,11 +3,13 @@
 //! `Checker` context as their first parameter.
 
 const std = @import("std");
+const ast = @import("../frontend/ast.zig");
 const binder = @import("../frontend/binder.zig");
 const numeric_lit = @import("../numeric_lit.zig");
 const types = @import("../types.zig");
 
 const Io = std.Io;
+const Atom = @import("../intern.zig").Atom;
 const SymbolId = binder.SymbolId;
 const TypeId = types.TypeId;
 
@@ -169,7 +171,8 @@ fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!voi
                 const p = s.objectProp(t, i);
                 if (!first) try w.writeAll(" ");
                 first = false;
-                try w.print("{s}{s}: ", .{ c.atomText(p.name), if (p.optional()) "?" else "" });
+                try writeMemberName(c, w, p.name);
+                try w.print("{s}: ", .{if (p.optional()) "?" else ""});
                 try printType(c, w, p.ty, depth + 1);
                 try w.writeAll(";");
             }
@@ -300,6 +303,32 @@ fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!voi
             try printTypeParen(c, w, s.keyofOperand(t), depth + 1, .operand);
         },
     }
+}
+
+/// How a member NAME renders inside an object type. A member declared with a
+/// computed `[…]` key is printed by tsc as the bracketed expression that named
+/// it, never as the internal key it is filed under: `{ [Symbol.iterator]: T }`,
+/// not `{ __@iterator: T }`. ztsc's synthetic key for a well-known symbol is
+/// exactly `"__@" ++ <name>` (`ast.wellKnownSymbolKey`), so round-tripping the
+/// suffix through that table is the recognizer — no second copy of the list to
+/// drift from it.
+///
+/// The other two synthetic key families still print raw, because neither
+/// carries a name to recover here: `__@u<id>` (a `unique symbol` key) is
+/// identified by a global NODE id whose declaring name lives in whichever
+/// file's tree it points into, and `__@k$…` is the placeholder for a computed
+/// key that never resolved. tsc prints the first as `[s]`.
+fn writeMemberName(c: *Checker, w: *std.Io.Writer, name: Atom) PrintErr!void {
+    const text = c.atomText(name);
+    const prefix = "__@";
+    if (std.mem.startsWith(u8, text, prefix)) {
+        const well_known = text[prefix.len..];
+        if (ast.wellKnownSymbolKey(well_known) != null) {
+            try w.print("[Symbol.{s}]", .{well_known});
+            return;
+        }
+    }
+    try w.writeAll(text);
 }
 
 fn stringMappingName(kind_idx: u32) []const u8 {

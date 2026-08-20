@@ -853,13 +853,42 @@ pub fn main(init: std.process.Init) !void {
     @memset(cursors, 0);
 
     var emitter: Emitter = .{ .out = out, .pretty = pretty };
+
+    // THE OPTIONS GATE. tsc runs `getOptionsDiagnostics` between the syntactic
+    // and the semantic pass, and each pass only runs when the one before it
+    // added nothing (see the pseudo-code at the syntactic gate above, and
+    // `tsconfig.ConfigDiag`). So a config error — currently TS5102 for an
+    // option TypeScript 7 removed — is reported only when the program parses
+    // clean, and when it is reported it is the ONLY thing reported: every
+    // bind/link/check diagnostic in the program is suppressed, because the
+    // options the checker would have run under are not the ones the user
+    // asked for. Verified against tsgo 7.0.2.
+    const config_diags: []const ztsc.tsconfig.ConfigDiag =
+        if (syntactic_error) &.{} else if (config) |c| c.config_diags else &.{};
+    if (config_diags.len != 0) {
+        const cfg = config.?;
+        var config_src = try Source.fromBytes(arena, cfg.path, cfg.text);
+        emitter.beginFile();
+        for (config_diags) |d|
+            try emitter.emit(cfg.path, &config_src, .{ .start = d.start, .end = d.end }, d.code, d.msg);
+        // Suppressed, so not reported and not counted (they drive the exit
+        // code and the `--stats` line alike).
+        parse_diags = 0;
+        bind_diags = 0;
+        link_diags = 0;
+        check_diags = 0;
+    }
+
     const Merged = struct {
         code: u16,
         start: u32,
         end: u32,
         msg: []const u8,
     };
-    for (0..n_files) |i| {
+    // Zero under the options gate: the per-file loop below is what tsc's
+    // suppressed semantic pass would have produced.
+    const n_emit_files: usize = if (config_diags.len != 0) 0 else n_files;
+    for (0..n_emit_files) |i| {
         const path = paths.items[i];
         const src = results.items[i] orelse continue;
         const tree = trees.items[i] orelse continue;
@@ -1140,7 +1169,7 @@ pub fn main(init: std.process.Init) !void {
     // failures (unloadable files, internal checker errors), 1 when any
     // diagnostics were reported, 0 for a clean check.
     if (failed > 0) std.process.exit(2);
-    if (parse_diags > 0 or bind_diags > 0 or link_diags > 0 or check_diags > 0) std.process.exit(1);
+    if (config_diags.len > 0 or parse_diags > 0 or bind_diags > 0 or link_diags > 0 or check_diags > 0) std.process.exit(1);
 }
 
 /// Why an argument was rejected. One message per case, printed by main.

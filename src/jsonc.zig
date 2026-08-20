@@ -16,7 +16,21 @@ const Allocator = std.mem.Allocator;
 /// Parse JSONC (JSON + comments + trailing commas) into an arena-backed
 /// `Value`. Strings are unescaped copies.
 pub fn parseJsonc(arena: Allocator, text: []const u8) JsonError!Value {
-    var p: JsonParser = .{ .arena = arena, .text = text };
+    return parse(arena, text, false);
+}
+
+/// `parseJsonc`, plus `Object.key_pos` on every object: the byte offset of
+/// each key's opening quote. That is what a diagnostic anchored at a config
+/// key needs (`tsconfig.zig` and its TS5102). It is a separate entry point
+/// because the offsets cost an allocation per object and the hot JSONC
+/// consumer — the `package.json` reader, thousands of files on a real project
+/// — has no use for them.
+pub fn parseJsoncKeyed(arena: Allocator, text: []const u8) JsonError!Value {
+    return parse(arena, text, true);
+}
+
+fn parse(arena: Allocator, text: []const u8, key_positions: bool) JsonError!Value {
+    var p: JsonParser = .{ .arena = arena, .text = text, .key_positions = key_positions };
     p.skipWs();
     const v = try p.parseValue(0);
     p.skipWs();
@@ -35,10 +49,23 @@ pub const Value = union(enum) {
     pub const Object = struct {
         keys: []const []const u8 = &.{},
         vals: []const Value = &.{},
+        /// Byte offset of each key's opening quote, parallel to `keys`.
+        /// Empty unless the value came from `parseJsoncKeyed`.
+        key_pos: []const u32 = &.{},
 
         pub fn get(o: Object, key: []const u8) ?Value {
             for (o.keys, o.vals) |k, v| {
                 if (std.mem.eql(u8, k, key)) return v;
+            }
+            return null;
+        }
+
+        /// Byte offset of `key`'s opening quote, or null when the key is
+        /// absent or the value was parsed without positions.
+        pub fn keyPos(o: Object, key: []const u8) ?u32 {
+            if (o.key_pos.len != o.keys.len) return null;
+            for (o.keys, o.key_pos) |k, at| {
+                if (std.mem.eql(u8, k, key)) return at;
             }
             return null;
         }
@@ -55,6 +82,8 @@ const JsonParser = struct {
     arena: Allocator,
     text: []const u8,
     pos: usize = 0,
+    /// Record each object key's opening-quote offset (see `parseJsoncKeyed`).
+    key_positions: bool = false,
 
     const max_depth = 64;
 
@@ -196,6 +225,7 @@ const JsonParser = struct {
         p.pos += 1; // '{'
         var keys: std.ArrayList([]const u8) = .empty;
         var vals: std.ArrayList(Value) = .empty;
+        var key_pos: std.ArrayList(u32) = .empty;
         while (true) {
             p.skipWs();
             if (p.pos >= p.text.len) return error.SyntaxError;
@@ -204,6 +234,7 @@ const JsonParser = struct {
                 break;
             }
             if (p.text[p.pos] != '"') return error.SyntaxError;
+            if (p.key_positions) try key_pos.append(p.arena, @intCast(p.pos));
             const key = try p.parseString();
             p.skipWs();
             if (p.pos >= p.text.len or p.text[p.pos] != ':') return error.SyntaxError;
@@ -222,6 +253,7 @@ const JsonParser = struct {
         return .{ .object = .{
             .keys = try keys.toOwnedSlice(p.arena),
             .vals = try vals.toOwnedSlice(p.arena),
+            .key_pos = try key_pos.toOwnedSlice(p.arena),
         } };
     }
 };
@@ -255,6 +287,28 @@ test "jsonc: comments, trailing commas, escapes" {
     try testing.expectEqual(@as(f64, -150), v.object.get("n").?.number);
     try testing.expect(v.object.get("z").? == .null);
     try testing.expectEqual(@as(?Value, null), v.object.get("missing"));
+}
+
+test "jsonc: key positions are opt-in" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const text =
+        \\{
+        \\  "a": 1,
+        \\  "b": { "c": 2 }
+        \\}
+    ;
+    const plain = try parseJsonc(arena.allocator(), text);
+    try testing.expectEqual(@as(usize, 0), plain.object.key_pos.len);
+    try testing.expectEqual(@as(?u32, null), plain.object.keyPos("a"));
+
+    const keyed = try parseJsoncKeyed(arena.allocator(), text);
+    try testing.expectEqual(@as(?u32, 4), keyed.object.keyPos("a"));
+    try testing.expectEqual(@as(?u32, 14), keyed.object.keyPos("b"));
+    try testing.expectEqualStrings("\"a\"", text[4..7]);
+    try testing.expectEqualStrings("\"b\"", text[14..17]);
+    try testing.expectEqual(@as(?u32, 21), keyed.object.get("b").?.object.keyPos("c"));
+    try testing.expectEqual(@as(?u32, null), keyed.object.keyPos("missing"));
 }
 
 test "jsonc: syntax errors" {
