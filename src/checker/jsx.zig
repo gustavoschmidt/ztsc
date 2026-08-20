@@ -442,13 +442,18 @@ pub fn jsxNamespaceMember(c: *Checker, member: Atom) Error!?SymbolId {
     // the namespace still gets the global's remaining members here, where tsc
     // would type them as the error type.
     if (try jsxRuntimeNamespaceMember(c, member)) |g| return g;
-    switch (c.resolveSpace(c.atom_JSX, c.cur_scope, false)) {
-        .sym => |s| if (try jsxNamespaceSym(c, s)) |ns| {
-            if (nsTypeMember(c, ns, member)) |g| return g;
-        },
-        else => {},
-    }
-    return null;
+    // GLOBALS only, never the enclosing scope chain. tsc's last resort here is
+    // `getGlobalSymbol(JsxNames.JSX, …)` — the two lookups before it are the
+    // implicit-import container and `resolveName(jsxNamespace)`, and
+    // `jsxNamespace` is the FACTORY root (`React`), not `JSX`. So a
+    // `declare namespace JSX` written at the top level of a MODULE is invisible
+    // to tsc: `jsxPropsAsIdentifierNames` declares its whole namespace inside
+    // an `export default`-bearing file and still gets TS7026 for want of
+    // `JSX.IntrinsicElements`. A script file's identical declaration IS global
+    // and still resolves, which is the shape most of the suite's fixtures use.
+    const s = c.prog.globals.lookup(c.atom_JSX) orelse return null;
+    const ns = (try jsxNamespaceSym(c, s)) orelse return null;
+    return nsTypeMember(c, ns, member);
 }
 
 /// The namespace a symbol that NAMES the JSX namespace denotes: itself when it
