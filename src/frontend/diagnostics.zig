@@ -98,6 +98,11 @@ pub const Code = enum(u16) {
     expected_binding,
     expected_string_literal,
     expected_from,
+    /// TS1005 for the `as` of a namespace import (`import * as ns from "m"`)
+    /// and of a namespace export (`export * as ns from "m"`): tsc's
+    /// `parseNamespaceImport`/`parseNamespaceExport` expect it the moment the
+    /// `*` is consumed, then read the next token as the namespace NAME.
+    expected_as,
     expected_import_clause,
     expected_export_clause,
     expected_while,
@@ -185,6 +190,12 @@ pub const Code = enum(u16) {
     /// TS1024: `readonly` in the same position, which tsc words by where the
     /// modifier DOES belong rather than by where it does not.
     readonly_not_on_property,
+    /// TS1042: `async` in front of a declaration that is not a function —
+    /// `async class C {}`, `async interface I {}`, `async var v = 1`. tsc's
+    /// parser takes the word as a MODIFIER (its `isDeclaration` lookahead says
+    /// a declaration follows) and `checkGrammarModifiers` rejects it there, so
+    /// the declaration itself still parses and binds normally.
+    async_modifier_not_allowed_here,
     /// TS1184: the same modifiers, but on a declaration whose statement list is
     /// NOT a module body (a function body, a plain block, a method body) — tsc
     /// stops naming the modifier there and blames the position instead.
@@ -975,6 +986,7 @@ pub const Code = enum(u16) {
             .protected_not_on_module_element,
             .static_not_on_module_element,
             .readonly_not_on_property,
+            .async_modifier_not_allowed_here,
             .modifiers_not_allowed_here,
             // Same funnel as TS1184: `{ import "m"; }` next to a sibling file's
             // TS2322 lets the TS2322 through, and `moduleElementsInWrongContext.ts`
@@ -1229,6 +1241,7 @@ pub const Code = enum(u16) {
             .expected_binding => "Variable declaration expected.",
             .expected_string_literal => "String literal expected.",
             .expected_from => "'from' expected.",
+            .expected_as => "'as' expected.",
             .expected_import_clause => "expected an import clause",
             .expected_export_clause => "expected an export clause",
             .expected_while => "'while' expected.",
@@ -1305,6 +1318,7 @@ pub const Code = enum(u16) {
             .protected_not_on_module_element => moduleElementModifierMessage("protected"),
             .static_not_on_module_element => moduleElementModifierMessage("static"),
             .readonly_not_on_property => "'readonly' modifier can only appear on a property declaration or index signature.",
+            .async_modifier_not_allowed_here => "'async' modifier cannot be used here.",
             .modifiers_not_allowed_here => "Modifiers cannot appear here.",
             .import_not_at_top_level => "An import declaration can only be used at the top level of a namespace or module.",
             .export_not_at_top_level => "An export declaration can only be used at the top level of a namespace or module.",
@@ -1513,6 +1527,7 @@ pub const Code = enum(u16) {
             .expected_lt_slash,
             .expected_slash,
             .expected_from,
+            .expected_as,
             .expected_while,
             .expected_eq,
             .expected_export,
@@ -1669,6 +1684,7 @@ pub const Code = enum(u16) {
             .static_not_on_module_element,
             => 1044,
             .readonly_not_on_property => 1024,
+            .async_modifier_not_allowed_here => 1042,
             .modifiers_not_allowed_here => 1184,
             .import_not_at_top_level => 1232,
             .export_not_at_top_level => 1233,
