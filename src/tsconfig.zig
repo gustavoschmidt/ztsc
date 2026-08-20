@@ -198,6 +198,11 @@ fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8) Lo
     // false false-positived TS1192 on every bundler project that omits
     // `esModuleInterop`.
     cfg.allow_synthetic_default_imports = acc.allow_synthetic_default_imports orelse acc.es_module_interop orelse true;
+    // `esModuleInterop` in its OWN right (tsc's `getESModuleInterop`), which is
+    // not the same question: the fallback above is the bundler default, while an
+    // unwritten `esModuleInterop` falls back to the module kind — and ztsc's
+    // fixed esnext model is one of the kinds tsc answers "no" for.
+    cfg.es_module_interop = acc.es_module_interop orelse false;
     if (cfg.allow_synthetic_default_imports) {
         try cx.note("'allowSyntheticDefaultImports' is on (explicit, via 'esModuleInterop', or by default under bundler resolution): a default import of a module with no default export binds to the module namespace object (the synthesized default)", .{});
     } else {
@@ -472,6 +477,17 @@ pub const Config = struct {
     /// export binds to the module namespace object (the synthesized default)
     /// instead of raising TS1192.
     allow_synthetic_default_imports: bool = true,
+    /// Effective `compilerOptions.esModuleInterop` (tsc's `getESModuleInterop`).
+    /// Distinct from `allow_synthetic_default_imports`, which it only *feeds*:
+    /// under bundler resolution synthetic defaults are on by default while
+    /// `esModuleInterop` stays OFF unless written, and the two gate different
+    /// rules. This one gates the namespace-import interop shape — `import * as
+    /// ns from "m"` where `m` is `export =` something callable/constructible
+    /// gains a `default` member equal to the whole module (tsc's
+    /// `resolveESModuleSymbol`). tsc's fallback for an unwritten value is the
+    /// module kind (node16/nodenext/preserve → on); ztsc's fixed model is
+    /// esnext, for which tsc yields undefined, so the fallback is `false`.
+    es_module_interop: bool = false,
     /// `compilerOptions.baseUrl`, resolved to a base-relative directory (null
     /// when unset). Consulted for bare `*.json` specifiers only (`public/api/
     /// x.json`); non-json baseUrl resolution is not modeled.
@@ -2583,8 +2599,35 @@ test "config: default include, node_modules excluded, unknown options warn" {
     // references warns; target is a verbose note; esModuleInterop is honored
     // (recognized, effective allowSyntheticDefaultImports on → its own note).
     try testing.expect(cfg.allow_synthetic_default_imports);
+    // …and carried in its OWN right, which is the field the namespace-import
+    // interop shape reads (`modvalue.interopNamespaceType`). The two are
+    // separate answers: the one above defaults ON under bundler resolution,
+    // this one only when the config writes it.
+    try testing.expect(cfg.es_module_interop);
     try testing.expectEqual(@as(usize, 1), cfg.warnings.len);
     try testing.expectEqual(@as(usize, 2), cfg.notes.len);
+}
+
+test "esModuleInterop is off unless written, even with synthetic defaults on" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try d.writeFile(io, .{ .sub_path = "a.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "tsconfig.json", .data =
+        \\{ "compilerOptions": { "strict": true } }
+    });
+
+    const cfg = try loadInDir(io, alloc, d, "tsconfig.json");
+    // Bundler resolution makes allowSyntheticDefaultImports default ON…
+    try testing.expect(cfg.allow_synthetic_default_imports);
+    // …while esModuleInterop stays OFF, so gating the interop reshaping on the
+    // first would have applied it to every project that never asked for it.
+    try testing.expect(!cfg.es_module_interop);
 }
 
 test "config: strict false is a hard error; missing file" {

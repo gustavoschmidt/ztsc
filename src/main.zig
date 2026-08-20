@@ -241,6 +241,10 @@ const Effective = struct {
 
     // --- link / program semantics ---
     allow_synthetic_default: bool = true,
+    /// tsconfig esModuleInterop, in its own right (NOT the synthetic-default
+    /// question above, which defaults ON under bundler while this defaults
+    /// off). See `tsconfig.Config.es_module_interop`.
+    es_module_interop: bool = false,
     no_implicit_any: bool = true,
     /// tsconfig noUncheckedSideEffectImports (default on, as tsgo 7.0.2 has it
     /// — see `tsconfig.Config`).
@@ -274,6 +278,7 @@ const Effective = struct {
     fn linkOpts(e: Effective) modules.LinkOpts {
         return .{
             .allow_synthetic_default = e.allow_synthetic_default,
+            .es_module_interop = e.es_module_interop,
             .no_implicit_any = e.no_implicit_any,
             .no_unchecked_side_effect_imports = e.no_unchecked_side_effect_imports,
             .types_wildcard = e.types_wildcard,
@@ -299,6 +304,7 @@ fn effectiveOptions(cli: Cli, cfg: ?ztsc.tsconfig.Config) Effective {
         e.jsx_runtime_module = c.jsx_runtime_module;
         e.jsx_factory_ns = c.jsx_factory_ns;
         e.allow_synthetic_default = c.allow_synthetic_default_imports;
+        e.es_module_interop = c.es_module_interop;
         e.no_implicit_any = c.no_implicit_any;
         e.no_unchecked_side_effect_imports = c.no_unchecked_side_effect_imports;
         e.types_wildcard = c.types_wildcard;

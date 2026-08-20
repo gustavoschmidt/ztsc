@@ -1122,8 +1122,14 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     if (spread_any) return;
 
     // JSX children satisfy the ElementChildrenAttribute prop (usually
-    // `children`) on component tags — count it as provided.
-    if (is_component and has_children) {
+    // `children`) — count it as provided.
+    //
+    // INTRINSIC tags included: tsc builds one attributes object per JSX element
+    // in `createJsxAttributesTypeFromAttributesProperty`, which knows nothing
+    // about intrinsic-vs-component and folds the children in either way. Gating
+    // this on components made every `<h1>text</h1>` whose declared props require
+    // `children` a false TS2741 — the children were right there in the tag.
+    if (has_children) {
         try provided.append(c.scratch(), .{ .name = try c.jsxChildrenAttrName(), .ty = types.any_type });
     }
 

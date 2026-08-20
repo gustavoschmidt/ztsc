@@ -285,6 +285,7 @@ pub fn buildProgram(
             .export_equals_atom = lr.export_equals_atom,
             .dual_targets = lr.dual_targets,
             .types_wildcard = link_opts.types_wildcard,
+            .es_module_interop = link_opts.es_module_interop,
             .experimental_decorators = link_opts.experimental_decorators,
             .jsx_runtime_file = jsx_runtime_fid,
             .jsx_runtime_module = jsx_runtime_module,
