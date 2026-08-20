@@ -133,8 +133,12 @@ fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!voi
                 if (i > 0) try w.writeAll(", ");
                 const e = s.tupleElem(t, @intCast(i));
                 if (e.rest()) try w.writeAll("...");
+                if (e.optional() and !e.rest()) {
+                    try printOptionalElem(c, w, e.ty, depth + 1);
+                    try w.writeAll("?");
+                    continue;
+                }
                 try printType(c, w, e.ty, depth + 1);
-                if (e.optional()) try w.writeAll("?");
             }
             try w.writeAll("]");
         },
@@ -376,11 +380,64 @@ fn printSigMember(c: *Checker, w: *std.Io.Writer, sig: TypeId, is_construct: boo
 /// not `B | C & A`, which reads as `B | (C & A)`).
 const PrintPos = enum { union_member, isect_member, operand, array_elem };
 
+/// The DECLARED type of an optional tuple element, rendered the way tsc
+/// renders it: `[string?]` displays as `[(string | undefined)?]`.
+///
+/// tsc adds `undefined` to an optional element's type under
+/// `strictNullChecks` (`addOptionality` on the element, which is what makes
+/// `t[1]` read `string | undefined`) and then parenthesizes, because the
+/// result is a union and `?` binds to the whole element. ztsc stores the
+/// element as WRITTEN and carries the optionality in the element flag, so the
+/// `| undefined` has to be supplied here — textually, because the printer's
+/// error set deliberately excludes interning (see `PrintErr`) and
+/// `makeUnion2` allocates.
+///
+/// Appending it textually is the same string the interned union would print:
+/// `printType`'s union arm emits `undefined` LAST, after the structurally
+/// sorted members and after `null`. The four types that absorb it are spelled
+/// out rather than unioned, matching the oracle:
+///
+///     [any?]     -> [any?]        [unknown?] -> [unknown?]
+///     [undefined?] -> [undefined?]  [never?] -> [undefined?]
+fn printOptionalElem(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!void {
+    const s = &c.ts;
+    switch (s.kind(t)) {
+        // `T | undefined` is `T` for these three: no union, so no parentheses.
+        .any, .unknown, .undefined => return printType(c, w, t, depth),
+        // `never | undefined` reduces to `undefined` (tsc prints `[undefined?]`
+        // for `[never?]`).
+        .never => return w.writeAll("undefined"),
+        .union_type => {
+            var has_undef = false;
+            for (0..s.memberCount(t)) |i| {
+                if (s.kind(s.memberAt(t, @intCast(i))) == .undefined) has_undef = true;
+            }
+            try w.writeAll("(");
+            try printType(c, w, t, depth);
+            if (!has_undef) try w.writeAll(" | undefined");
+            try w.writeAll(")");
+        },
+        else => {
+            try w.writeAll("(");
+            // As a union member: a function or an intersection takes its own
+            // parentheses inside the pair this adds — tsc's
+            // `[((() => void) | undefined)?]`.
+            try printTypeParen(c, w, t, depth, .union_member);
+            try w.writeAll(" | undefined)");
+        },
+    }
+}
+
 fn printTypeParen(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32, pos: PrintPos) PrintErr!void {
     const needs = switch (c.ts.kind(t)) {
         .function => true,
         .union_type => pos != .union_member,
-        .intersection => pos == .operand or pos == .array_elem,
+        // `&` already binds tighter than `|`, so the parentheses around an
+        // intersection written as a union member are redundant — and tsc
+        // emits them anyway (`typeToString` of `(A & B) | string` is
+        // `string | (A & B)`, oracle-verified). Matching the oracle's
+        // spelling is the whole job of this file.
+        .intersection => pos != .isect_member,
         // `readonly` binds looser than the `[]` suffix, so an array OF readonly
         // arrays is `(readonly T[])[]`. Only there: `keyof readonly T[]` and
         // `readonly T[] extends X ? …` need no parentheses and tsc prints none.
