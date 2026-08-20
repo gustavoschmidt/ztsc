@@ -430,6 +430,22 @@ fn nullishCallee(c: *Checker, t: TypeId) ?NullishCallee {
 pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Error!ChainLink {
     var chained = false;
     const shape = c.callShape(node);
+    // tsc answers an INACCESSIBLE constructor with `return
+    // resolveErrorCall(node)`, so nothing the resolution would have said
+    // about the call survives — no arity, no per-argument diagnostic. The
+    // oracle keeps the RESULT type though (see `constructorCheck`'s call
+    // site), so ztsc resolves the call as usual and withdraws only the
+    // resolution's own verdicts about it, filed anywhere inside the call.
+    var ctor_denied_at: ?usize = null;
+    defer if (ctor_denied_at) |saved| {
+        const call_span = c.nodeSpan(node);
+        c.rollbackDiags(saved, .{
+            .file = c.cur_file,
+            .lo = call_span.start,
+            .hi = call_span.end,
+            .codes = &resolve_verdict_codes,
+        });
+    };
     // `import("m")` is not an ordinary call — `import` has no type of its
     // own. tsc's `getTypeOfImportCall`: the module's namespace object,
     // wrapped in `Promise`.
@@ -649,11 +665,14 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
             // types `c` as `C` there — `c.zzz` is TS2339 on `C` and
             // `var q: number = c` is TS2322 from `C`, neither of which an
             // error type produces. So the report stands alone and the
-            // resolution continues, which is the under-suppressing half of
-            // tsgo's behaviour (it files no arity error on top; ztsc's TS2554
-            // for `new C2()` against `private constructor(x: number)` was
-            // already an excess key before this check existed, and stays one).
-            _ = try accessibility.constructorCheck(c, cls, node);
+            // resolution continues for its TYPE — but every VERDICT the
+            // resolution reaches about the call is withdrawn afterwards
+            // (`ctor_denied_at`), which is the rest of tsgo's behaviour: it
+            // files no arity error on top, where ztsc's TS2554 for `new C2()`
+            // against `private constructor(x: number)` was an excess key.
+            if (!try accessibility.constructorCheck(c, cls, node)) {
+                ctor_denied_at = c.diags.items.len;
+            }
             if (try c.classIsAbstract(cls)) {
                 // tsc's `resolveNewExpression` reports TS2511 and then
                 // `return resolveErrorCall(node)`: the arguments are checked
@@ -1453,6 +1472,14 @@ const contextual_implicit_any = [_]u16{ 7006, 7019, 7031 };
 /// "Expected N type arguments, but got M" — the one code
 /// `instantiateFallbackSig` withdraws.
 const targ_arity_code = [_]u16{2558};
+
+/// Everything signature RESOLUTION can say about a call, as opposed to what
+/// checking an argument's own subexpressions says: the arity complaints, the
+/// per-argument mismatch, and the overload-set failure. `resolveErrorCall`
+/// reaches none of them, so a call tsc diverts there (an inaccessible
+/// constructor) withdraws exactly this set and keeps the rest — a TS2304 for
+/// an undeclared name written as an argument is still an error.
+const resolve_verdict_codes = [_]u16{ 2345, 2554, 2555, 2556, 2557, 2558, 2769 };
 
 /// tsc's `getTypeArgumentArityError`, for an overload set no written
 /// type-argument list fits. It straddles the SET rather than any one
