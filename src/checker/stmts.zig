@@ -793,16 +793,39 @@ fn checkSwitch(c: *Checker, node: Node) Error!void {
         const cd = c.tree.nodeData(clause);
         if (c.nodeTag(clause) == .case_clause and cd.lhs != 0) {
             const case_t = try c.checkExprCached(cd.lhs, types.no_type);
-            // TS2678 is the same *comparable* relation as TS2367, so it
-            // goes through the same union/intersection-distributing test:
-            // a `case null:` on a non-nullable discriminant is clean in
-            // tsc, and `case 1:` on a branded `number & { _brand }` relates
-            // through the intersection's `number` constituent. Bare
-            // `isComparable` (mutual assignability) reported both.
-            if (!try c.typesHaveOverlap(case_t, disc_t)) {
-                try c.diagFmt(2678, c.nodeSpan(cd.lhs), "Type '{s}' is not comparable to type '{s}'.", .{
-                    try c.typeToString(case_t), try c.typeToString(disc_t),
-                });
+            // tsc's probe is DIRECTIONAL, and its failure arm REPORTS:
+            //
+            // ```ts
+            // if (!isTypeEqualityComparableTo(comparedExpressionType, caseType)) {
+            //     checkTypeComparableTo(caseType, comparedExpressionType, clause.expression);
+            // }
+            // ```
+            //
+            // The second call carries the clause expression as its error
+            // node, so a fresh object literal written as a case is subject
+            // to the excess-property check — and `switch (new C()) { case
+            // { id: 12, name: '' }: }` is TS2353 on `name`, not silence
+            // (`switchStatements`). The two questions line up: a literal
+            // carrying a name the discriminant lacks is exactly a
+            // discriminant that is not comparable TO the literal, which is
+            // what makes the directional probe fail.
+            //
+            // Ordered before the whole-type report for the same reason
+            // `checkAssignable` orders it before TS2322: the excess check
+            // runs at the top of `isRelatedTo` and a reported TS2353 is the
+            // only diagnostic the pair earns.
+            if (!try c.excessPropertyFailure(cd.lhs, case_t, disc_t)) {
+                // TS2678 is the same *comparable* relation as TS2367, so it
+                // goes through the same union/intersection-distributing test:
+                // a `case null:` on a non-nullable discriminant is clean in
+                // tsc, and `case 1:` on a branded `number & { _brand }` relates
+                // through the intersection's `number` constituent. Bare
+                // `isComparable` (mutual assignability) reported both.
+                if (!try c.typesHaveOverlap(case_t, disc_t)) {
+                    try c.diagFmt(2678, c.nodeSpan(cd.lhs), "Type '{s}' is not comparable to type '{s}'.", .{
+                        try c.typeToString(case_t), try c.typeToString(disc_t),
+                    });
+                }
             }
         }
         const cr = c.tree.extraData(ast.SubRange, cd.rhs);
