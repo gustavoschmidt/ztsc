@@ -32,6 +32,7 @@ const conditions = @import("conditions.zig");
 const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const buildRefKey = @import("flow.zig").buildRefKey;
+const checkAssignPatternExcessProps = @import("destructure.zig").checkAssignPatternExcessProps;
 const checkFunctionBody = @import("stmts.zig").checkFunctionBody;
 const containerOf = Checker.containerOf;
 const ctxWantsTemplate = @import("generics.zig").ctxWantsTemplate;
@@ -5371,6 +5372,14 @@ fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
     // per-element lookups are the check.
     if (op == .eq and isDestructuringPattern(c, d.lhs)) {
         const src = try c.checkExprCached(d.rhs, types.no_type);
+        // …with one thing the pattern IS a type for: it is the right
+        // operand's contextual type (`getContextualTypeForBinaryOperand`
+        // answers `getTypeOfExpression(left)`), and a pattern-shaped
+        // contextual type makes every member of the right-hand literal it
+        // does not name TS2353. Raised here rather than from inside the
+        // literal's own check, since ztsc does not hand the pattern down as a
+        // contextual type — nothing else about the right side depends on it.
+        try checkAssignPatternExcessProps(c, d.lhs, d.rhs);
         try checkDestructuringPattern(c, d.lhs, src);
         return src;
     }

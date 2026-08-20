@@ -347,19 +347,58 @@ pub fn optionalizePatternDefaults(c: *Checker, t: TypeId, pat: Node) Error!TypeI
 
 /// Does the object binding pattern `pat` destructure `name` with a default?
 pub fn patternDefaultsProp(c: *Checker, pat: Node, name: Atom) Error!bool {
-    const el = (try patternBindingProp(c, pat, name)) orelse return false;
+    const el = (try patternMemberElem(c, pat, .binding, name)) orelse return false;
     return c.tree.nodeData(el).rhs != 0;
 }
 
-/// The `binding_property` of the object pattern `pat` that names `name`, or
-/// null when the pattern does not name it. The one scan every
-/// "what does this pattern say about `name`?" question goes through.
-fn patternBindingProp(c: *Checker, pat: Node, name: Atom) Error!?Node {
+/// Which spelling of an object pattern a member walk is looking at.
+///
+///   * `.binding` — a real binding pattern (`var { x } = …`, a parameter, a
+///     `for…of` head): `object_pattern` of `binding_property` elements, and
+///     what each names is a fresh symbol, so the pattern implies nothing
+///     about its type (tsc's `getTypeFromObjectBindingPattern` gives every
+///     member `any`).
+///   * `.assignment` — the cover-grammar assignment pattern (`({ x } = …)`),
+///     which the parser keeps as an `object_literal` of `object_shorthand` /
+///     `object_property`: each element is a WRITE, so the member's type is
+///     the target's own.
+///
+/// The two reach tsc's `contextualTypeHasPattern` arm by different routes —
+/// `getTypeFromObjectBindingPattern` for the first, the `pattern` stamp
+/// `checkObjectLiteral` puts on an `inDestructuringPattern` literal for the
+/// second — but the arm itself is one piece of code, so this walk is too.
+const PatternForm = enum { binding, assignment };
+
+/// Does an element of this spelling of pattern NAME a member (as opposed to a
+/// rest element, a hole, or a form the walk does not model)?
+fn patternElemNames(tag: ast.Tag, form: PatternForm) bool {
+    return switch (form) {
+        .binding => tag == .binding_property,
+        .assignment => tag == .object_property or tag == .object_shorthand,
+    };
+}
+
+/// The element of the object pattern `pat` that names `name`, or null when the
+/// pattern does not name it. The one scan every "what does this pattern say
+/// about `name`?" question goes through.
+fn patternMemberElem(c: *Checker, pat: Node, form: PatternForm, name: Atom) Error!?Node {
     for (c.tree.nodeRange(pat)) |el| {
-        if (el == null_node or c.nodeTag(el) != .binding_property) continue;
+        if (el == null_node or !patternElemNames(c.nodeTag(el), form)) continue;
         if ((try c.memberAtom(c.tree.nodeMainToken(el))) == name) return el;
     }
     return null;
+}
+
+/// The SUB-PATTERN a matched element destructures through — the child a
+/// nested object literal initializing it is contextually typed by — or
+/// `null_node` when the element binds a plain name.
+fn patternElemNested(c: *Checker, el: Node, form: PatternForm) Node {
+    const d = c.tree.nodeData(el);
+    return switch (form) {
+        .binding => d.lhs,
+        // A shorthand's `lhs` is the target *identifier*, never a pattern.
+        .assignment => if (c.nodeTag(el) == .object_property) d.rhs else null_node,
+    };
 }
 
 // =====================================================================
@@ -587,7 +626,27 @@ pub fn checkDeclPattern(c: *Checker, decl: Node, fallback: TypeId) Error!void {
     try checkPatternProps(c, pat, src);
     // The excess half only applies when the PATTERN is the literal's
     // contextual type, i.e. when the declaration carries no annotation.
-    if (init_node != null_node and src != types.no_type) try checkPatternExcessProps(c, pat, init_node);
+    if (init_node != null_node and src != types.no_type) try checkPatternExcessProps(c, pat, .binding, init_node);
+}
+
+/// The same arm for a destructuring ASSIGNMENT (`({ x } = { x: 0, y: 0 })`).
+/// tsc reaches it through the ordinary contextual-type chain rather than
+/// through the declaration: `getContextualTypeForBinaryOperand` answers
+/// `getTypeOfExpression(left)` for the right operand of an `=`, and the left
+/// operand of a destructuring assignment is an object literal that
+/// `checkObjectLiteral` stamped with `pattern` (its `inDestructuringPattern`
+/// branch) — so `contextualTypeHasPattern` holds and every member of the
+/// right-hand literal the pattern does not name is TS2353.
+///
+/// The declaration form does NOT go through this chain, which is why the two
+/// disagree on an EMPTY pattern: `getContextualTypeForVariableLikeDeclaration`
+/// has no VariableDeclaration arm at all, so `var { } = { x: 0 }` has no
+/// contextual type and says nothing, while `({ } = { x: 0 })` is contextually
+/// typed by `{}` and reports. (`var { x } = { x: 0, y: 0 }` still reports —
+/// from `checkVariableLikeDeclaration`'s assignability check against the
+/// pattern's implied type, which `checkDeclPattern` above stands in for.)
+pub fn checkAssignPatternExcessProps(c: *Checker, pat: Node, init: Node) Error!void {
+    try checkPatternExcessProps(c, pat, .assignment, init);
 }
 
 /// The other half of tsc's `contextualTypeHasPattern` branch in
@@ -598,10 +657,14 @@ pub fn checkDeclPattern(c: *Checker, decl: Node, fallback: TypeId) Error!void {
 /// with no string index info on the pattern's implied type. Unlike the
 /// relation's excess check this one does not bail after the first find: tsc
 /// walks every member of the literal here.
-fn checkPatternExcessProps(c: *Checker, pat: Node, init: Node) Error!void {
+fn checkPatternExcessProps(c: *Checker, pat: Node, form: PatternForm, init: Node) Error!void {
     if (pat == null_node or init == null_node) return;
-    if (c.nodeTag(pat) != .object_pattern or c.nodeTag(init) != .object_literal) return;
-    const implied = (try objectPatternImpliedType(c, pat)) orelse return;
+    if (c.nodeTag(init) != .object_literal) return;
+    switch (form) {
+        .binding => if (c.nodeTag(pat) != .object_pattern) return,
+        .assignment => if (c.nodeTag(pat) != .object_literal) return,
+    }
+    const implied = (try patternImpliedType(c, pat, form)) orelse return;
     for (c.tree.nodeRange(init)) |prop| {
         if (prop == null_node) continue;
         const tag = c.nodeTag(prop);
@@ -616,7 +679,7 @@ fn checkPatternExcessProps(c: *Checker, pat: Node, init: Node) Error!void {
         if (tag != .object_shorthand and pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) continue;
         const key_tok = c.tree.nodeMainToken(prop);
         const key = try c.memberAtom(key_tok);
-        const el = (try patternBindingProp(c, pat, key)) orelse {
+        const el = (try patternMemberElem(c, pat, form, key)) orelse {
             try c.diagFmt(2353, c.tokSpan(key_tok), "Object literal may only specify known properties, and '{s}' does not exist in type '{s}'.", .{
                 c.atomText(key), try c.typeToString(implied),
             });
@@ -624,35 +687,90 @@ fn checkPatternExcessProps(c: *Checker, pat: Node, init: Node) Error!void {
         };
         // A nested literal is contextually typed by the nested pattern, so
         // the same branch runs one level down.
-        if (tag == .object_property) try checkPatternExcessProps(c, c.tree.nodeData(el).lhs, pd.rhs);
+        if (tag == .object_property) try checkPatternExcessProps(c, patternElemNested(c, el, form), form, pd.rhs);
     }
 }
 
-/// The object type an object binding pattern implies, as tsc's
-/// `getTypeFromObjectBindingPattern` builds it for the contextual type: one
-/// `any`-typed member per named property, optional where the element has a
-/// default. Null when the pattern names something this walk cannot enumerate
-/// — a rest element, whose implied type carries a `[k: string]: any` that
-/// absorbs every unnamed property, or a computed key, which sets tsc's
+/// The object type an object pattern implies as the contextual type of the
+/// literal that initializes it — one member per named property.
+///
+/// tsc builds it two ways. For a BINDING pattern it is
+/// `getTypeFromObjectBindingPattern`: every member is `any`, and optional
+/// where the element has a default. For an ASSIGNMENT pattern it is
+/// `checkObjectLiteral` on the pattern itself, so every member has the type
+/// its WRITE TARGET already has — which is what makes the message read
+/// `does not exist in type '{ x: number; }'` there and `'{ x: any; }'` here.
+///
+/// Null when the pattern names something this walk cannot enumerate — a rest
+/// element, whose implied type carries a `[k: string]: any` that absorbs
+/// every unnamed property, or a computed key, which sets tsc's
 /// `ObjectLiteralPatternWithComputedProperties` and takes the branch out of
 /// play. In both cases nothing in the literal is excess.
-fn objectPatternImpliedType(c: *Checker, pat: Node) Error!?TypeId {
+fn patternImpliedType(c: *Checker, pat: Node, form: PatternForm) Error!?TypeId {
     var props: std.ArrayList(types.Prop) = .empty;
     defer props.deinit(c.scratch());
     for (c.tree.nodeRange(pat)) |el| {
         if (el == null_node) continue;
-        if (c.nodeTag(el) != .binding_property) return null;
+        const tag = c.nodeTag(el);
+        if (!patternElemNames(tag, form)) return null;
         const ed = c.tree.nodeData(el);
+        // A computed key in the ASSIGNMENT spelling rides on the property
+        // node itself (the binding spelling has its own element tag, already
+        // refused above).
+        if (tag == .object_property and ed.lhs != 0 and c.nodeTag(ed.lhs) == .computed_name) return null;
+        const ty: TypeId = switch (form) {
+            .binding => types.any_type,
+            // `{ k: target }` writes through `rhs`; a shorthand `{ x }` is its
+            // own target, in `lhs`.
+            .assignment => (try assignTargetDeclaredType(c, if (tag == .object_property) ed.rhs else ed.lhs)) orelse return null,
+        };
         try props.append(c.scratch(), .{
             .name = try c.memberAtom(c.tree.nodeMainToken(el)),
-            .ty = types.any_type,
-            .flags = if (ed.rhs != 0) types.prop_flag_optional else 0,
+            .ty = ty,
+            .flags = if (form == .binding and ed.rhs != 0) types.prop_flag_optional else 0,
         });
     }
-    // An EMPTY pattern implies nothing and contextually types nothing:
+    // An EMPTY BINDING pattern implies nothing and contextually types nothing:
     // `getContextualTypeForInitializerExpression` only reaches
     // `getTypeFromBindingPattern` for `elements.length > 0`, so
-    // `var { } = { x: 0 }` has no pattern target to be excess against.
-    if (props.items.len == 0) return null;
+    // `var { } = { x: 0 }` has no pattern target to be excess against. An
+    // empty ASSIGNMENT pattern is an ordinary object literal of type `{}`,
+    // and `({ } = { x: 0 })` reports against it.
+    if (props.items.len == 0 and form == .binding) return null;
     return try c.ts.makeObject(props.items, 0, 0, 0);
+}
+
+/// The type an assignment pattern's element WRITES, read off the target's own
+/// declaration rather than by checking the target as an expression — which
+/// would re-run every diagnostic `checkDestructuringPattern` already raises
+/// for it, and a `let`'s definite-assignment report besides.
+///
+/// Only the shapes whose type is a symbol's own answer: a bare name, seen
+/// through parentheses and its default. Everything else — a property access,
+/// a nested pattern — answers null and the excess walk stands down, rather
+/// than print a contextual type it guessed at.
+fn assignTargetDeclaredType(c: *Checker, target0: Node) Error!?TypeId {
+    var t = target0;
+    while (t != null_node) {
+        switch (c.nodeTag(t)) {
+            .paren_expr, .binding_default => t = c.tree.nodeData(t).lhs,
+            // `({ x = 1 } = …)`: the cover grammar parses a default as a
+            // plain assignment expression.
+            .assign => {
+                if (c.tree.tokens.tag(c.tree.nodeMainToken(t)) != .eq) return null;
+                t = c.tree.nodeData(t).lhs;
+            },
+            .identifier => {
+                const tok = c.tree.nodeMainToken(t);
+                if (c.tree.tokens.tag(tok) != .identifier) return null;
+                const a = try c.atomOfToken(tok);
+                return switch (c.resolveSpace(a, c.cur_scope, true)) {
+                    .sym => |sym| try c.typeOfSymbol(sym),
+                    else => null,
+                };
+            },
+            else => return null,
+        }
+    }
+    return null;
 }
