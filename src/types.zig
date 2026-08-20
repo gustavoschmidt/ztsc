@@ -455,6 +455,21 @@ pub const fn_flag_this: u32 = 4;
 pub const param_flag_optional: u32 = 1;
 pub const param_flag_rest: u32 = 2;
 pub const param_flag_initializer: u32 = 4;
+/// tsc's `isInstantiatedGenericParameter`: this signature is an
+/// INSTANTIATION, and the parameter's type as DECLARED was an instantiable
+/// (`T`, `T[K]`, `keyof T`, a conditional, a generic mapped/tuple) rather
+/// than a written-out shape. The relation's callback rule keys off it —
+/// `{ set(value: T): void }` at `T = (x: string) => void` must NOT be read
+/// as declaring a callback parameter, because the shape came from the type
+/// ARGUMENT and not from the declaration (see `assign.signatureAssignable…`).
+///
+/// Part of the interned identity, exactly as it is in tsc, where an
+/// instantiated signature is a different `Signature` object from a written
+/// one that happens to print the same. `Param.optional`/`rest` — the two
+/// facts the identity comparison (`identity.sigIdenticalAt`) reads — are
+/// unaffected, so the two spellings still compare IDENTICAL; they just are
+/// not the same TypeId.
+pub const param_flag_inst_generic: u32 = 8;
 
 pub const Prop = struct {
     name: Atom,

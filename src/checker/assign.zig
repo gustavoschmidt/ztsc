@@ -4956,6 +4956,12 @@ pub fn instantiateSigInContextOf(c: *Checker, s: TypeId, t: TypeId) Error!?TypeI
     }
     const cand = try c.scratch().alloc(TypeId, tp_syms.len);
     for (cand) |*x| x.* = types.no_type;
+    // Everything below infers for a SIGNATURE RELATION, not for a call — the
+    // one place where a generic argument signature's own parameter bound to a
+    // variable of this inference is the answer rather than noise. See
+    // `InferCtx.sig_ctx`.
+    c.infer_ctx.sig_ctx += 1;
+    defer c.infer_ctx.sig_ctx -= 1;
     try applyToParameterTypes(c, s, t, tp_syms, cand);
     // The return position infers at tsc's `InferencePriority.ReturnType`, and a
     // priority is a *filter*, not a weight: `inferFromTypes` DISCARDS every
@@ -5616,28 +5622,43 @@ pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode
         // `getSingleCallSignature`, so a callback nested one level deeper
         // relates strictly.
         //
-        // ADDITIVE: where tsc makes the callback relation the *only* test
-        // for such a pair, ztsc falls through to the pre-existing
-        // contravariant/bivariant check when it fails. tsc's exclusivity
-        // would also start REJECTING pairs whole-signature bivariance used
-        // to accept, and every such case measured in the corpus turned out
-        // to be an unrelated inference gap surfacing (`Observable<unknown>`
-        // where tsc infers `Observable<number>`) rather than a real error —
-        // so the strict form would trade this fix for a batch of new false
-        // positives. The consequence is a documented under-report: a
-        // callback-parameter mismatch in the *contravariant* direction, and
-        // one nested a level deeper, are accepted (conformance
-        // assignability/065 + DEFERRED).
-        if (mode == .none) {
-            if (try c.callbackSigOf(sp)) |s_cb| {
-                if (try c.callbackSigOf(tp)) |t_cb| {
-                    // tsc also requires matching undefined/null facts.
-                    if ((try c.includesNullish(sp)) == (try c.includesNullish(tp))) {
-                        const inner: SigMode = if (bivariant) .bivariant_callback else .strict_callback;
-                        if (try c.signatureAssignableMode(t_cb, s_cb, inner)) continue;
-                    }
-                }
-            }
+        // EXCLUSIVE, exactly as tsc's `callbacks ? … : …` ternary is: where a
+        // pair IS recognized as two callbacks, the callback comparison is the
+        // ONLY test, and its failure is the pair's failure. That is what
+        // reports `BList1 = AList1` (`forEach(cb: (item: B) => void)` against
+        // `(item: A) => void`) and, through the variance MEASUREMENT that runs
+        // on the same rule, what makes `P<T>`/`Promise<T>` come out COVARIANT
+        // in `T` rather than bivariant (covariantCallbacks f1/f2/f11/f12/f13).
+        //
+        // The guard is tsc's `isInstantiatedGenericParameter`
+        // (`param_flag_inst_generic`), and without it exclusivity is a false
+        // positive machine: `type Bivar<T> = { set(value: T): void }` at
+        // `T = (x: unknown) => void` has a parameter that only LOOKS like a
+        // declared callback, because the function shape arrived as the type
+        // ARGUMENT. tsc suppresses `getSingleCallSignature` for such a
+        // parameter — per SIDE, so one instantiated side is enough to sink
+        // the pair back to the plain bivariant comparison — and the whole
+        // `#51620` half of covariantCallbacks (lines 81-95, 102, 110) is
+        // exactly that shape. `then(cb: (value: T) => void)` is NOT that
+        // shape: its declared parameter type is a function type, generic or
+        // not, so the rule still applies there.
+        //
+        // Exclusivity is what makes ztsc's stand-in for
+        // `instantiateSignatureInContextOf` load-bearing: a source signature
+        // whose own type parameter the inference could not bind arrives with
+        // that parameter clamped, and the callback comparison then fails on a
+        // shape tsc never sees. drizzle-orm's `transaction<T>(cb: (tx: Tx, x:
+        // T) => …)` override chain is 33 such TS2416 — every one an
+        // `x: unknown` against the base's still-free `x: T` — and the fix is
+        // in the inference (`infer.unify`'s bare-self candidate), not here.
+        if (mode == .none and !instGenericParam(c, se, i) and !instGenericParam(c, te, i)) callbacks: {
+            const s_cb = (try c.callbackSigOf(sp)) orelse break :callbacks;
+            const t_cb = (try c.callbackSigOf(tp)) orelse break :callbacks;
+            // tsc also requires matching undefined/null facts.
+            if ((try c.includesNullish(sp)) != (try c.includesNullish(tp))) break :callbacks;
+            const inner: SigMode = if (bivariant) .bivariant_callback else .strict_callback;
+            if (try c.signatureAssignableMode(t_cb, s_cb, inner)) continue;
+            return false;
         }
         if (try c.paramOptionalAt(se, i)) sp = try c.makeUnion2(sp, types.undefined_type);
         const contra = try c.isAssignable(tp, sp);
@@ -5700,6 +5721,20 @@ pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode
     // — assignable to `L1<{a}>`.
     if (mode == .bivariant_callback) return c.isAssignable(t_ret, s_ret);
     return false;
+}
+
+/// tsc's `isInstantiatedGenericParameter(signature, pos)`: was parameter `pos`
+/// of `sig` DECLARED as an instantiable (a `T`, a `T[K]`, a `keyof T`, a
+/// conditional) that some instantiation has since replaced? The fact is
+/// recorded on the parameter itself at substitution time — see
+/// `types.param_flag_inst_generic` and `subst.declaredInstantiable`.
+///
+/// A position past the stored list is a rest expansion, which no declared
+/// parameter backs: answer "no" and let the callback rule decide as it would
+/// have.
+fn instGenericParam(c: *Checker, sig: TypeId, pos: u32) bool {
+    if (pos >= c.ts.fnParamCount(sig)) return false;
+    return c.ts.fnParam(sig, pos).flags & types.param_flag_inst_generic != 0;
 }
 
 /// tsc `getSingleCallSignature(getNonNullableType(t))`: the lone call

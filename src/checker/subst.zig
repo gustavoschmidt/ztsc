@@ -1027,6 +1027,44 @@ pub fn chainRepeats(c: *const Checker, t: TypeId) bool {
     return false;
 }
 
+/// tsc's `isGenericType` — is `t` an INSTANTIABLE type (a type variable, an
+/// indexed access, a `keyof`, a conditional, a generic mapped/tuple) rather
+/// than a written-out shape?
+///
+/// The one caller is the parameter loop of `instantiateId`'s `.function` arm,
+/// which uses it to decide whether a substituted parameter carries
+/// `param_flag_inst_generic`. A function or object type that MENTIONS a type
+/// parameter is deliberately NOT instantiable here, and that is the whole
+/// point of the distinction: `then(cb: (value: T) => void)` declares a
+/// callback parameter whatever `T` becomes, while `set(value: T)` declares
+/// nothing about the shape at all.
+///
+/// Shallow by construction — one level into a union/intersection, exactly as
+/// tsc's `getGenericObjectFlags` folds its constituents — so it costs a kind
+/// switch per parameter per instantiation.
+fn declaredInstantiable(s: *const types.Store, t: TypeId) bool {
+    return switch (s.kind(t)) {
+        .type_param,
+        .index_access,
+        .conditional,
+        .keyof_op,
+        .mapped,
+        .mapped_param,
+        .infer_var,
+        .this_type,
+        .template_literal_type,
+        .string_mapping,
+        => true,
+        .union_type, .intersection => {
+            for (0..s.memberCount(t)) |i| {
+                if (declaredInstantiable(s, s.memberAt(t, i))) return true;
+            }
+            return false;
+        },
+        else => false,
+    };
+}
+
 /// Memoized recursive substitution. `map_id` (when non-null) canonically
 /// identifies `map`; it keys the memo and is threaded unchanged down the
 /// recursion. A `null` id disables the memo (`--no-inst-cache`).
@@ -1341,7 +1379,22 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
             defer c.scratch().free(params);
             for (params, 0..) |*out, i| {
                 const p = s.fnParam(t, @intCast(i));
-                out.* = .{ .name = p.name, .ty = try c.instantiateId(p.ty, sub_map, sub_id), .flags = p.flags };
+                const nty = try c.instantiateId(p.ty, sub_map, sub_id);
+                // tsc's `isInstantiatedGenericParameter` (see
+                // `types.param_flag_inst_generic`): record on the RESULT that
+                // this parameter's DECLARED type was an instantiable — the
+                // shape it now has came from a type ARGUMENT, not from the
+                // declaration, so the relation must not read it as a declared
+                // callback. Sticky, because a two-step substitution
+                // (`T := U`, then `U := (x: string) => void`) has to keep the
+                // fact the first step recorded; tsc gets the same stickiness
+                // from `signature.target` chaining.
+                const moved = nty != p.ty and declaredInstantiable(s, p.ty);
+                out.* = .{
+                    .name = p.name,
+                    .ty = nty,
+                    .flags = if (moved) p.flags | types.param_flag_inst_generic else p.flags,
+                };
             }
             const ret = try c.instantiateId(s.fnReturn(t), sub_map, sub_id);
             // Preserve the type predicate (`x is S`) through instantiation,

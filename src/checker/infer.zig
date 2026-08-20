@@ -714,6 +714,20 @@ pub const InferCtx = struct {
     /// and intersections preserve top-level-ness (tsc's
     /// `isTypeParameterAtTopLevel` descends them); everything else does not.
     nontop_depth: u32 = 0,
+    /// Non-zero while `unify` is answering for `instantiateSigInContextOf` —
+    /// tsc's `instantiateSignatureInContextOf`, the SIGNATURE-vs-SIGNATURE
+    /// inference the relation runs, as opposed to the CALL-SITE inference
+    /// `inferTypeArgs` runs.
+    ///
+    /// The two want opposite answers for one candidate: a generic ARGUMENT's
+    /// own type parameter bound to a variable of the call being solved. At a
+    /// call site that is noise (`map([1,2,3], identity)` must not leave `U`
+    /// standing as `identity`'s own `A`), and `unify`'s `.function` arm erases
+    /// it to the fallback. In a signature relation it is the ANSWER — tsc's
+    /// `getCanonicalSignature` exists precisely so the target's parameters can
+    /// be inferred into the source's — and erasing it to `unknown` poisons the
+    /// outer inference. See the `bare_self` branch there.
+    sig_ctx: u32 = 0,
     /// tsc's `InferenceInfo.impliedArity`, one entry per type parameter
     /// (`no_arity` for "not implied"): how many list elements the CALL SITE
     /// implies for a type parameter that is the signature's own rest parameter.
@@ -3804,6 +3818,41 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                     // `<T>(xs: T[])` still infers through `T`).
                     const self_ref = cand0 != types.no_type and
                         try echoesInferVar(c, cand0, tp_syms);
+                    // …with one exception, and only in a SIGNATURE relation
+                    // (`InferCtx.sig_ctx`): a candidate that IS one of the
+                    // variables being solved, BARE, is the identity mapping
+                    // between the two signatures' own parameters — exactly what
+                    // tsc's `getCanonicalSignature` + `instantiateSignatureIn
+                    // ContextOf` produce — not a self-referential type.
+                    // Clamping it to the fallback does not merely lose it, it
+                    // POISONS the outer inference: the argument signature then
+                    // presents `unknown` in the very position whose pattern is
+                    // the variable, and the outer walk records `unknown` for it.
+                    // Leaving the argument's parameter FREE lets that walk pair
+                    // the two variables directly.
+                    //
+                    // A recursive class hierarchy that redeclares a generic
+                    // method is where it shows: `class D<Q> extends B<Q>` with
+                    // `transaction<T>(cb: (tx: D<Q>) => Promise<T>)` over the
+                    // base's `(tx: B<Q>) => Promise<T>` walked `D<Q>` against
+                    // `B<Q>`, met the two `transaction`s again, erased the
+                    // base's `T` to `unknown`, and came back with `T := unknown`
+                    // for the whole instantiation. drizzle-orm's session /
+                    // transaction chain is 8 such overrides on main, and the
+                    // callback relation turns each into a TS2416 the oracle does
+                    // not report.
+                    //
+                    // At a CALL SITE the same candidate is noise and the erasure
+                    // stands: `map([1, 2, 3], identity)` must not leave `U`
+                    // standing as `identity`'s own `A` (the
+                    // `inferentialTypingWithFunctionType` /
+                    // `contextualSignatureInstantiation` /
+                    // `genericCallWithFunctionTypedArguments` families, 12 cases
+                    // measured).
+                    const bare_self = self_ref and c.infer_ctx.sig_ctx > 0 and
+                        c.ts.kind(cand0) == .type_param and
+                        tpIndex(tp_syms, c.ts.typeParamSymbol(cand0)) != null;
+                    if (bare_self) continue;
                     if (self_ref) erased_self = true;
                     const cand = if (self_ref) types.no_type else cand0;
                     if (cand != types.no_type) all_unbound = false;
