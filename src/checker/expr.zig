@@ -5008,6 +5008,14 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
             } else if (try c.typeIsNumberLike(ri)) {
                 result = try c.numberIndexType(r);
             } else {
+                // tsc's `getPropertyTypeForIndexType`, last arm: an index
+                // whose type is neither string-, number- nor symbol-like
+                // names no property at all, so the access is TS2538 at the
+                // INDEX rather than the implicit-`any` element access a
+                // key-shaped miss earns.
+                if (indexKindUnusable(c.ts.kind(ri))) {
+                    try c.diagFmt(2538, c.nodeSpan(d.rhs), "Type '{s}' cannot be used as an index type.", .{try c.typeToString(idx_t)});
+                }
                 result = types.any_type;
             }
         },
@@ -5033,6 +5041,22 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
         }
     }
     return .{ .ty = result, .chained = chained };
+}
+
+/// Is an index of this kind one tsc reports TS2538 for — a type that can name
+/// no property at all?
+///
+/// An allow-list rather than the complement of "key-like", because two of the
+/// kinds tsc would also report on are ztsc's own fallbacks and would turn a
+/// gap into a false error: `unknown` is what a failed inference leaves and
+/// `void` what an unresolved value declaration leaves. The other exclusions
+/// are tsc's own: `any`, `symbol` and an enum key are the implicit-`any`
+/// element access (TS7053), a type variable is TS2536, and `never` is silent.
+fn indexKindUnusable(k: types.Kind) bool {
+    return switch (k) {
+        .function, .overloads, .object, .array, .tuple, .class_value, .boolean, .bool_true, .bool_false, .null, .undefined => true,
+        else => false,
+    };
 }
 
 /// The write sites tsc runs `checkReferenceExpression` for. Each carries its
