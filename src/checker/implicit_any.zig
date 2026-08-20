@@ -23,6 +23,7 @@
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
 const binder = @import("../frontend/binder.zig");
+const bind_result = @import("../frontend/bind_result.zig");
 const paths = @import("../link/paths.zig");
 const types = @import("../types.zig");
 
@@ -387,13 +388,21 @@ fn nameIsRecoveredModifier(c: *Checker, name_tok: TokenIndex) bool {
     };
 }
 
-/// The VARIABLE member of the family, for the two shapes that have no flow to
-/// fall back on. tsc gives an un-annotated, un-initialized `var`/`let` the
-/// control-flow-tracked `autoType` — but only when it is neither AMBIENT nor
-/// EXPORTED (`!(getCombinedModifierFlags(declaration) & Export) &&
-/// !(declaration.flags & Ambient)`), because neither can be flow-analyzed: one
-/// describes something the runtime already provides, the other something another
-/// file may write. Both are plain `any`, reported at the name.
+/// The VARIABLE member of the family, for the three shapes that have no flow to
+/// fall back on. tsc gives an un-annotated, un-initialized declaration the
+/// control-flow-tracked `autoType`, but only past this guard:
+///
+///     !(getCombinedModifierFlags(declaration) & ModifierFlags.Export) &&
+///     !(declaration.flags & NodeFlags.Ambient) &&
+///     !(getCombinedNodeFlags(declaration) & NodeFlags.Const)
+///
+/// Each exclusion is a shape flow cannot describe: an AMBIENT declaration names
+/// something the runtime already provides, an EXPORTED one something another
+/// file may write, and a `const` one has no assignment to evolve THROUGH — its
+/// single binding is the whole story, and there isn't one. All three are plain
+/// `any`, reported at the name, so `const a;` is TS7005 where `let a;` is not
+/// (oracle-verified against tsgo 7.0.2, alongside the TS1155 the missing
+/// initializer earns on its own).
 ///
 /// Everything else stays silent here: `var x;` in a function or at a module's
 /// top level IS auto-typed, and tsc reports only where a READ cannot be resolved
@@ -403,17 +412,19 @@ pub fn reportVarImplicitAny(c: *Checker, name_node: Node, ambient: bool) Error!v
     if (!c.prog.no_implicit_any) return;
     if (name_node == null_node or c.nodeTag(name_node) != .identifier) return;
     const tok = c.tree.nodeMainToken(name_node);
-    if (!ambient and !inAmbientContext(c) and !isExportedName(c, tok)) return;
+    const f = declaredFlags(c, tok);
+    if (!ambient and !inAmbientContext(c) and !f.exported and !f.const_decl) return;
     try c.diagFmt(7005, c.tokSpan(tok), "Variable '{s}' implicitly has an 'any' type.", .{c.tokenText(tok)});
 }
 
-/// Does the name declared at `tok` carry `export`? Asked of the SYMBOL, because
-/// the modifier sits on the statement and the declarator does not see it.
-fn isExportedName(c: *Checker, tok: TokenIndex) bool {
-    const a = c.atomOfToken(tok) catch return false;
+/// The binder's flags for the name declared at `tok` — asked of the SYMBOL,
+/// because `export` and `const` both sit on the STATEMENT and the declarator
+/// node this check starts from does not see either.
+fn declaredFlags(c: *Checker, tok: TokenIndex) bind_result.SymbolFlags {
+    const a = c.atomOfToken(tok) catch return .{};
     return switch (c.resolveSpace(a, c.cur_scope, true)) {
-        .sym => |sym| c.symFlags(sym).exported,
-        else => false,
+        .sym => |sym| c.symFlags(sym),
+        else => .{},
     };
 }
 

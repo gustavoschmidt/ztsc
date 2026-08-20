@@ -381,15 +381,21 @@ fn patternBindingProp(c: *Checker, pat: Node, name: Atom) Error!?Node {
 /// the order demands arrive in. This runs once, from the declaration check.
 pub fn checkPatternProps(c: *Checker, pat: Node, whole: TypeId) Error!void {
     if (pat == null_node or whole == types.no_type) return;
-    // A TYPE PARAMETER is left alone. tsc narrows one by its constraint's
-    // constituents (`value.kind === "a"` makes `T` read as `T & { a: string }`),
-    // ztsc does not — `narrowingDestructuring`'s five pre-existing TS2339s on
-    // `value.a` are that gap — so anything this walk concluded about `T` would
-    // be about the missing narrowing rather than about the pattern.
-    if (c.ts.kind(whole) == .type_param) return;
     switch (c.nodeTag(pat)) {
         .binding_default => try checkPatternProps(c, c.tree.nodeData(pat).lhs, whole),
-        .object_pattern => try checkObjectPatternProps(c, pat, whole),
+        // A TYPE PARAMETER is left alone by the PROPERTY walk. tsc narrows one
+        // by its constraint's constituents (`value.kind === "a"` makes `T` read
+        // as `T & { a: string }`), ztsc does not — `narrowingDestructuring`'s
+        // five pre-existing TS2339s on `value.a` are that gap — so anything
+        // this walk concluded about `T` would be about the missing narrowing
+        // rather than about the pattern.
+        .object_pattern => if (c.ts.kind(whole) != .type_param)
+            try checkObjectPatternProps(c, pat, whole),
+        // The ITERABILITY walk has no such excuse: narrowing `T` to
+        // `T & { kind: "a" }` cannot add a `[Symbol.iterator]` the constraint
+        // did not have, so the answer for `T` is the answer for its apparent
+        // type either way — which is exactly what tsc asks
+        // (`checkIteratedTypeOrElementType` runs on `getApparentType`).
         .array_pattern => try checkArrayPatternProps(c, pat, whole),
         else => {},
     }
