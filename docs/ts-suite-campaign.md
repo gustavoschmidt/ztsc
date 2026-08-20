@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-19, post wave 22)
+## Standings (2026-08-19, post wave 23)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7114 / 8627 (82.5%)** |
-| excess keys (false positives) | 3541 | 1808 |
-| missing keys (under-reports) | 8617 | 3565 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7150 / 8627 (82.9%)** |
+| excess keys (false positives) | 3541 | 1774 |
+| missing keys (under-reports) | 8617 | 3529 |
 | bucketed (ztsc parse error, incomparable) | 825 | 13 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Twenty-two waves landed (3–22), every one with ZERO match→non-match regressions in
+Twenty-three waves landed (3–23), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -275,7 +275,77 @@ takes a shard mutex — NEVER put a name-text test in a per-property path; memo
 per atom and scope the question. Also: ad-hoc `--strict` triage against tsgo
 is invalid (it bails on lib.dom errors and manufactures phantom excess).
 
-## Ranked next queue (wave 23) — distilled from wave-22 agent reports
+Wave 23 (+36 cases): A landed readonly-field widening, `??` narrowing (the
+crossing correctly relocated from conditions.zig to flow.zig's edge site),
+#private non_public flags + static non-inheritance, TS2721/2722/2723; the
+optional-methods fix was measured-and-reverted pending a super flow root
+(unlock recorded beside optional_member). B landed the weak-type array arm and
+the strict-subtype narrowing pick, and killed the queue's table-flag
+prescription with measurement (+11% drizzle, zero cases — recorded in
+keyof.zig); the contra-split's one remaining bug is isolated for attempt six.
+C landed the mergedOf normalization at source, numeric-literal computed keys,
+ThisType<T>, and saved a working self-`this` patch blocked ONLY on
+generic-call argument contexts (oracle repro committed). D built
+tsconfig-anchored diagnostics end-to-end (keyed jsonc offsets → ConfigDiag →
+Emitter; tsc's two suppression gates mirrored) landing TS5102 (+7), plus
+duplicate-identifier naming, [Symbol.iterator] rendering, and a 14-key
+parser/link sweep.
+
+## Ranked next queue (wave 24) — distilled from wave-23 agent reports
+
+1. Generic-call argument contexts (THE unlock): an object-literal argument of
+   a GENERIC call gets NO contextual type — `g<T>(o: T, x: {value?: unknown})`
+   passes rctx=no_type to the literal where the non-generic spelling works
+   (oracle repro in wave-23 C's report). Fix in calls.zig/infer.zig. Then
+   re-land C's saved self-`this` patch
+   (…scratchpad/agentC/selfthis.patch applies on 4a291b8; fixes
+   looseThisTypeInFunctions + objectLiteralThisWidenedOnUse; was net −2 solely
+   from this gap).
+2. Contra-split, sixth attempt: the one remaining bug is isolated — a
+   round-one-REFUSED callback still contributes a contravariant candidate
+   which the split then prefers over the parameter default (ztsc records a
+   candidate tsc does not; TData becomes undefined). infer.zig documents all
+   four findings; fix the candidate recording, then the split + re-derivation
+   land together.
+3. #private relation finish (now unblocked by A's non_public bit): fifth
+   Mismatch variant in nominal_members.zig + elaborate.zig rendering
+   ("refers to a different member…") + the relation arm reading the bit.
+4. Optional methods + super flow root (must land together): binder sets
+   optional_member on .class_method/.method_signature; refkey.zig gains a
+   super_flow_root sentinel; flow.zig's identIsSym/isPatternRoot read it
+   (controlFlowSuperPropertyAccess is the tripwire; recipe recorded in
+   bindClass).
+5. Parameter-property initializer scope: 3 lines in signatures.memberTypeOf/
+   paramInfo — the member symbol's scope is the class member scope, so an
+   earlier parameter is invisible (parameterReferenceInInitializer1).
+6. `this` flow narrowing: expr's .this_expr arm never queries flow; the
+   `this is T` machinery already works for named receivers. Costs
+   spreadObjectOrFalsy + unknown multi-key cases.
+7. Optional-chain-root truthiness: `a?.b` still narrows its root by
+   truthiness where tsc only narrows by optionality (the other half of
+   tsc's narrowType head; wave-23 A documented it at the flow edge).
+8. esModuleInterop end-to-end: thread the option tsconfig→driver→link, then
+   C's oracle rule in resolveESModuleSymbol (spread with {default: type} for
+   callable export=; measured shapes recorded).
+9. JSX pool — the largest: 72 under-TS2322 keys in conformance/jsx, plus the
+   TS2741 pair (value elements vs JSX.IntrinsicAttributes; no global-JSX
+   fallback after TS2875). App-gated carefully (both apps are JSX).
+10. Call-signature relation: assignmentCompatWithCall/ConstructSignatures3-6
+    (43 under / 11 cases, generic signature relation); covariantCallbacks'
+    exclusive callback rule re-measure (assign.zig:5444 documents the trade).
+11. Grammar/messages: TS2389 needs the overload's name as an explicit arg
+    from the binder emission site; TS7023 circularity FP on
+    `private foo() { return this.foo }` (signatures ~2454); TS2349/2351
+    second line (calls.zig); using/await-using TS1155 (stmts).
+12. missingAndExcessProperties: TS2353 per member for an assignment-PATTERN
+    contextual type (never the declaration form) — 4 keys.
+13. materializePatternTypes contextual threading (~+2, 10 recursion sites).
+14. typeGuards pool (34 under TS2322); objectSpreadIndexSignature (tsc drops
+    index signatures in spreads — app-FP-shaped, gate hard);
+    template-literal property names TS1134 (deep recovery, thrice deferred).
+15. Determinism defect (Navigation.tsx:778:29); resolution-mode attributes.
+
+## Superseded queue (wave 23, kept for context)
 
 1. readonly class-field initializer widening: memberTypeOf's .class_field arm
    (signatures.zig:2416) calls widenLiteral unconditionally — `class A
