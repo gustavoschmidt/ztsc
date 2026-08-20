@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-19, post wave 23)
+## Standings (2026-08-20, post wave 24)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7150 / 8627 (82.9%)** |
-| excess keys (false positives) | 3541 | 1774 |
-| missing keys (under-reports) | 8617 | 3529 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7162 / 8628 (83.0%)** |
+| excess keys (false positives) | 3541 | ~1770 |
+| missing keys (under-reports) | 8617 | ~3510 |
 | bucketed (ztsc parse error, incomparable) | 825 | 13 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Twenty-three waves landed (3–23), every one with ZERO match→non-match regressions in
+Twenty-four waves landed (3–24), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -291,7 +291,62 @@ Emitter; tsc's two suppression gates mirrored) landing TS5102 (+7), plus
 duplicate-identifier naming, [Symbol.iterator] rendering, and a 14-key
 parser/link sweep.
 
-## Ranked next queue (wave 24) — distilled from wave-23 agent reports
+Wave 24 (+12 cases; conformance DEFERRED divergences 36→35): A landed
+optional methods + the super flow root together, parameter-property ctor
+scope, chain-root optionality narrowing, TS7023's frame-local fix, TS1155 for
+using, TS2389 name args. B fixed the REAL cause behind the "generic-call
+context" theory (context-free Phase-1 walks publishing member bodies into the
+memo), the ThisType outward walk, and finished the #private relation; a latent
+keyof↔mapped SIGSEGV died on the way. C landed `this` flow narrowing (with the
+one-line binder gap documented), assignment-pattern TS2353, spread index
+signatures (retiring a DEFERRED divergence), array-rest source types. D landed
+esModuleInterop end-to-end (canHaveSyntheticDefault guard caught by the app
+gate) and the first JSX family. KEY DIAGNOSIS BANKED: after reporting TS2454
+tsc returns the DECLARED type — that one divergence is most of the typeGuards
+under-pool, but the verdict currently lives under owned_mask and must move out
+without breaking N-checker determinism (recipe beside flow.unassignedVarType).
+
+## Ranked next queue (wave 25) — distilled from wave-24 agent reports
+
+1. TS2454 declared-type-after-report (most of the typeGuards under-pool,
+   ~10+ cases): move the definite-assignment VERDICT out of owned_mask (the
+   report stays owned), then expr returns the declared type after reporting.
+   Determinism tests are the tripwire; recipe beside flow.unassignedVarType.
+2. TS1434 fallback — the largest parser seam: 75 excess keys / 38 cases.
+   tsc's parseErrorForMissingSemicolonAfter answers TS1434 at the expression
+   start with same-position dedup; ztsc's expectSemicolonAfterExpression
+   deliberately answers ';' expected at the NEXT token (decision documented at
+   parser.zig:2167-2180). Revisit that decision with the dedup.
+3. Array pattern → tuple contextual type (~11 TS2493 cases + TS2322 gains):
+   one line in signatures.zig:2235 (checkExprCached(d.rhs, patternCtx)) + a
+   TS2493 arm in checkArrayPatternProps; destructure.zig:583's note names the
+   day. Wave-24 C's report has the full plan.
+4. Binder one-liner: `.this_expr => try b.attachFlow(node)` in bindExpr makes
+   `this` narrowing general (C's workaround covers receivers only).
+5. JSX seam: 26 single-key jsx cases; TS2604 type-param excusal (FIRST teach
+   collectJsxCallSigs to collect CONSTRUCT signatures, else ComponentClass
+   constraints go false-positive); TS2607 needs jsxClassComponentProps to
+   distinguish "no props member" from its @types/react escape hatch.
+6. `import * from X` recovery (3 cases): TS1005 "'as' expected" + parse the
+   next token as the namespace name.
+7. TS2698 spread-of-undefined (4 cases): an unassigned implicit-any `let x;`
+   must read `undefined` at its reference (flow; the report site is jsx/expr).
+8. Contra-split seventh attempt: B24 re-corrected the blocker — the phantom
+   contravariant candidate comes from a structural descent into the AFT
+   function's parameter positions (which tsc also performs, so the difference
+   is subtler); all findings in infer.zig.
+9. assignmentCompatWithCallSignatures3-6: the concrete-source/generic-target
+   leniency (assign.zig:5307-5335, named blockers genericContextualTypes1 /
+   genericFunctionInference1) — the real fix is instantiating generic target
+   signatures in the relation.
+10. TS18046 (`x()` on unknown is TS18046 in tsgo, not TS2349); esModuleInterop
+    default-import consumers; TS2607/2607-family.
+11. Census: TS2322 pools (~330 excess/~480 under), TS2339, TS7006; the
+    26 single-key jsx cases are the cheapest seam.
+12. Determinism defect (Navigation.tsx:778:29); resolution-mode attributes;
+    per-frame weak rule.
+
+## Superseded queue (wave 24, kept for context)
 
 1. Generic-call argument contexts (THE unlock): an object-literal argument of
    a GENERIC call gets NO contextual type — `g<T>(o: T, x: {value?: unknown})`
