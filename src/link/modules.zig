@@ -3832,7 +3832,11 @@ const Linker = struct {
             switch (tree.nodeTag(stmt)) {
                 .import_equals => {
                     const e = tree.extraData(ast.ImportEquals, tree.nodeData(stmt).lhs);
-                    if (e.module_token != 0) {
+                    // A TYPE-ONLY import assignment (`import type X =
+                    // require("m")`) is erased, so it is not an emit construct
+                    // and tsc exempts it: `checkImportEqualsDeclaration` guards
+                    // the rule on `!node.isTypeOnly`.
+                    if (e.module_token != 0 and e.flags & ast.Flags.type_only == 0) {
                         var span = l.nodeSpan(file, stmt);
                         // `export import x = require("m")`: tsc's declaration
                         // node starts at the MODIFIER, and `main_token` is the

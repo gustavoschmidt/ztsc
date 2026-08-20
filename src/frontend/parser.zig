@@ -4522,6 +4522,18 @@ const Parser = struct {
         var ns_name: u32 = 0;
         var specs: ast.SubRange = .{ .start = 0, .end = 0 };
 
+        // `import defer * as ns from "m"` (TC39 deferred module evaluation,
+        // TS 5.9): `defer` is a CONTEXTUAL keyword, not a binding, and the
+        // namespace clause is the only one the form admits. Nothing about the
+        // TYPES changes — deferral is an evaluation-order guarantee — so the
+        // token is simply dropped and `* as ns` binds as usual. Recognized
+        // only immediately before `*`: `import defer from "m"` and `import
+        // defer, * as ns from "m"` are both ordinary DEFAULT imports of a
+        // binding named `defer`, and reading `defer` as the keyword there
+        // invented a namespace and lost a TS1192.
+        if (isIdentLike(p.curTag()) and p.peekTag(1) == .asterisk and
+            std.mem.eql(u8, p.laText(0), "defer")) _ = try p.bump();
+
         if (isIdentLike(p.curTag())) {
             // `import d ...` — but `import x = require(...)` is out of subset.
             default_name = try p.bump();
@@ -4530,7 +4542,11 @@ const Parser = struct {
                 // it anchors the node: a declaration's span starts at its first
                 // MODIFIER, which is what puts TS1202 on the `export` of
                 // `export import a = require("m")` rather than on the `import`.
-                return p.finishImportEquals(export_kw orelse kw, default_name, if (export_kw != null) ast.Flags.exported else 0);
+                //
+                // `flags` (i.e. `type_only`) rides along: `import type X =
+                // require("m")` is erased, so tsc's `checkImportEqualsDeclaration`
+                // exempts it from the same TS1202 (`!node.isTypeOnly`).
+                return p.finishImportEquals(export_kw orelse kw, default_name, flags | (if (export_kw != null) ast.Flags.exported else 0));
             }
             _ = try p.eat(.comma);
         }
