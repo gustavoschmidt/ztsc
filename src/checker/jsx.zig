@@ -846,18 +846,21 @@ fn jsxConstructSigProps(
     explicit_targs: []const TypeId,
     node: Node,
 ) Error!JsxProps {
-    // No `JSX.ElementAttributesProperty` at all: tsc reads the props off the
-    // signature's first parameter instead, and reports nothing. Leave the
-    // attributes unchecked rather than invent a target — but keep resolving the
-    // signature, because its RETURN is still the instance `checkJsxTagBound`
-    // holds to `JSX.ElementClass` (`tsxElementResolution10` declares a JSX
-    // namespace with `Element`, `ElementClass` and `IntrinsicElements` and
-    // nothing else, and its `new (n: string) => { x: number }` tag is a TS2786
-    // for want of `render`).
-    const name_opt = try c.jsxPropsMemberName();
+    const sel = try jsxPropsSelector(c);
+    const name_opt: ?Atom = switch (sel) {
+        .member => |m| m,
+        else => null,
+    };
     var sig = sigs[0];
     if (explicit_targs.len > 0) {
         sig = try c.instantiateSigForCall(sig, explicit_targs, &.{}, node, types.no_type);
+    } else if (sel == .first_param and c.ts.fnTypeParams(sig).len > 0) {
+        // The signature IS the inference target here — its first parameter is
+        // the props type, so `inferJsxTargs` can take it as written rather than
+        // through a synthetic re-packaging.
+        const tp_syms = try c.scratch().dupe(u32, c.ts.fnTypeParams(sig));
+        const e = c.tree.extraData(ast.JsxElementData, c.tree.nodeData(node).lhs);
+        sig = try c.inferJsxTargs(sig, tp_syms, e);
     } else if (name_opt) |name| if (c.ts.fnTypeParams(sig).len > 0) {
         // A GENERIC construct signature infers its type arguments from the
         // attributes, exactly as the class-declaration path does — tsc's
@@ -883,8 +886,33 @@ fn jsxConstructSigProps(
         }
     };
     const inst = c.ts.fnReturn(sig);
-    const name = name_opt orelse return .{ .props = null, .elem_type = inst };
+    switch (sel) {
+        // "the type of the first parameter of the signature, which should be
+        // the els props type" — a signature that takes none has no target, and
+        // `empty_object_type` is the same answer `jsxPropsOfSig` gives a
+        // zero-parameter function component.
+        .first_param => return .{
+            .props = if (c.ts.fnParamCount(sig) == 0 or try jsxHasManagedAttributes(c))
+                null
+            else
+                c.ts.fnParam(sig, 0).ty,
+            .elem_type = inst,
+        },
+        // "If there is no e.g. 'props' member in ElementAttributesProperty, use
+        // the element class type instead."
+        .instance => return .{ .props = try c.withIntrinsicClassAttributes(inst, inst), .elem_type = inst },
+        .member => {},
+    }
+    const name = name_opt.?;
     const rinst = try c.resolveStructural(inst);
+    // `getJsxPropsTypeForSignatureFromMember`'s first line: `isTypeAny(
+    // instanceType) ? instanceType : getTypeOfPropertyOfType(…)`. An `any`
+    // instance HAS every member, so `new (n: string) => any` is a component
+    // whose attributes are unchecked rather than one missing its props member —
+    // ztsc read the failed lookup as TS2607 (`tsxElementResolution12`).
+    if (c.ts.kind(rinst) == .any or c.ts.kind(rinst) == .err) {
+        return .{ .props = rinst, .elem_type = inst };
+    }
     const p = (try c.propOfType(rinst, name)) orelse
         return .{ .props = null, .no_props_member = true, .elem_type = inst };
     return .{ .props = try c.withIntrinsicClassAttributes(p.ty, inst), .elem_type = inst };
@@ -1163,9 +1191,18 @@ pub fn inferJsxTargs(c: *Checker, sig: TypeId, tps: []const u32, e: ast.JsxEleme
 /// good instance type behind).
 pub fn jsxClassComponentProps(c: *Checker, class_val: TypeId, explicit_targs: []const TypeId, node: Node) Error!JsxProps {
     const cls = c.ts.classSymbol(class_val);
+    // With no `JSX.ElementAttributesProperty` the target is the CONSTRUCTOR's
+    // first parameter, which is a plain construct-signature question — the same
+    // one `jsxConstructSigProps` answers for a non-declaration class, so the
+    // class's own construct signatures are handed straight to it. This covers a
+    // generic class too: the signature carries the class's type parameters, and
+    // the inference from the attributes is that path's.
     var tps: std.ArrayList(TypeParamInfo) = .empty;
     defer tps.deinit(c.scratch());
     try c.typeParamsOf(cls, &tps);
+    if (try jsxPropsSelector(c) == .first_param) {
+        if (try jsxClassCtorParamProps(c, cls, tps.items, explicit_targs, node)) |r| return r;
+    }
     if (tps.items.len != 0) return jsxGenericClassComponentProps(c, cls, tps.items, explicit_targs, node);
     const inst = try c.ts.makeRef(cls, &.{});
     // The instance type is settled before the props member is looked up, so a
@@ -1188,6 +1225,62 @@ pub fn jsxClassComponentProps(c: *Checker, class_val: TypeId, explicit_targs: []
     // rather than reject every attribute against `{}` — under-report over a
     // false positive.
     return .{ .props = null, .elem_type = inst };
+}
+
+/// `getJsxPropsTypeFromClassType`'s FIRST arm for a class DECLARATION: with no
+/// `JSX.ElementAttributesProperty` in the namespace, the attributes target is
+/// the CONSTRUCTOR's first parameter — "which should be the els props type".
+///
+/// A generic class takes the same synthetic-signature route the props-member
+/// arm takes (`jsxGenericClassComponentProps`): `(props: P<T…>) => C<T…>`
+/// written in the class's own type parameters, handed to `inferJsxTargs`, so
+/// `<List data={images} keyExtractor={(item, i) => …}/>` still infers `ItemT`
+/// from `data` and contextually types the callback. Routing it through
+/// `jsxConstructSigProps` instead does NOT work: `ctorSignatures` hands back an
+/// INHERITED `constructor(props: P)` already substituted down the `extends`
+/// chain, so the signature carries no type parameters of its own and there is
+/// nothing left for the inference to bind.
+///
+/// Null when the class has no constructor at all (the default one takes no
+/// parameter, so there is no props type to speak of) — the attributes are left
+/// unchecked, which is where this path stood before.
+fn jsxClassCtorParamProps(
+    c: *Checker,
+    cls: SymbolId,
+    tps: []const TypeParamInfo,
+    explicit_targs: []const TypeId,
+    node: Node,
+) Error!?JsxProps {
+    if (try jsxHasManagedAttributes(c)) return null;
+    var csigs: std.ArrayList(TypeId) = .empty;
+    defer csigs.deinit(c.scratch());
+    try c.ctorSignatures(cls, &csigs);
+    if (csigs.items.len == 0 or c.ts.fnParamCount(csigs.items[0]) == 0) return null;
+    const p0 = c.ts.fnParam(csigs.items[0], 0).ty;
+    if (tps.len == 0) return .{ .props = p0, .elem_type = try c.ts.makeRef(cls, &.{}) };
+    if (explicit_targs.len == tps.len) {
+        const map = try c.scratch().alloc(TpMap, tps.len);
+        for (tps, 0..) |tp, i| map[i] = .{ .sym = tp.sym, .ty = explicit_targs[i] };
+        return .{
+            .props = try c.instantiate(p0, map),
+            .elem_type = try c.ts.makeRef(cls, explicit_targs),
+        };
+    }
+    const tp_syms = try c.scratch().alloc(u32, tps.len);
+    const tp_tys = try c.scratch().alloc(TypeId, tps.len);
+    for (tps, 0..) |tp, i| {
+        tp_syms[i] = tp.sym;
+        tp_tys[i] = try c.ts.makeTypeParam(tp.sym);
+    }
+    const sig = try c.ts.makeFunction(
+        &.{.{ .name = 0, .ty = p0 }},
+        try c.ts.makeRef(cls, tp_tys),
+        tp_syms,
+        0,
+    );
+    const e = c.tree.extraData(ast.JsxElementData, c.tree.nodeData(node).lhs);
+    const inst_sig = try c.inferJsxTargs(sig, tp_syms, e);
+    return .{ .props = c.ts.fnParam(inst_sig, 0).ty, .elem_type = c.ts.fnReturn(inst_sig) };
 }
 
 /// The generic half of `jsxClassComponentProps` (see its doc comment): infer
@@ -1264,12 +1357,65 @@ pub fn withIntrinsicClassAttributes(c: *Checker, props: TypeId, inst: TypeId) Er
 
 /// Name of the props member per `JSX.ElementAttributesProperty` — the name
 /// of that interface's single property (React uses `props`). Null when the
-/// interface is absent or empty.
+/// interface is absent or empty. Only the TS2607 report reads this; the props
+/// resolution itself goes through `jsxPropsSelector`, which distinguishes the
+/// two null cases.
 pub fn jsxPropsMemberName(c: *Checker) Error!?Atom {
-    const t = (try c.jsxNamespaceType(c.atom_ElementAttributesProperty)) orelse return null;
+    return switch (try jsxPropsSelector(c)) {
+        .member => |m| m,
+        else => null,
+    };
+}
+
+/// Where a CLASS component's attributes target lives — tsc's
+/// `getJsxPropsTypeFromClassType`, which reads `JSX.ElementAttributesProperty`
+/// and branches three ways, not two:
+///
+///   - no such interface at all → the construct signature's FIRST PARAMETER
+///     ("return the type of the first parameter of the signature, which should
+///     be the els props type");
+///   - the interface exists but declares no property → the signature's RETURN,
+///     i.e. the element class instance itself;
+///   - otherwise → that property, read off the return type.
+///
+/// ztsc collapsed the first two into "no target, leave the attributes
+/// unchecked", which is a real under-report: a `declare namespace JSX` that
+/// only spells `Element`/`IntrinsicElements` — the shape of every fixture
+/// written before `ElementAttributesProperty` existed, and of any program whose
+/// JSX namespace is module-scoped and therefore invisible (`jsxNamespaceMember`)
+/// — lost every attribute check AND every attribute's contextual type, so a
+/// callback attribute's parameters came back implicit `any`.
+///
+/// The FUNCTION-component path never asks: tsc's `getJsxPropsTypeFromCallSignature`
+/// takes the first parameter unconditionally.
+const JsxPropsSelector = union(enum) {
+    first_param,
+    instance,
+    member: Atom,
+};
+
+fn jsxPropsSelector(c: *Checker) Error!JsxPropsSelector {
+    const t = (try c.jsxNamespaceType(c.atom_ElementAttributesProperty)) orelse return .first_param;
     const rt = try c.resolveStructural(t);
-    if (c.ts.kind(rt) != .object or c.ts.objectPropCount(rt) == 0) return null;
-    return c.ts.objectProp(rt, 0).name;
+    if (c.ts.kind(rt) != .object) return .first_param;
+    if (c.ts.objectPropCount(rt) == 0) return .instance;
+    return .{ .member = c.ts.objectProp(rt, 0).name };
+}
+
+/// Does the JSX namespace declare `LibraryManagedAttributes`? ztsc does not
+/// apply it (tsc's `getJsxManagedAttributesFromLocatedAttributes` runs the
+/// resolved props type through it before anything checks an attribute), and the
+/// transform's whole job is to make props OPTIONAL — `Defaultize<P, typeof
+/// C.defaultProps>` and the `propTypes` widening both only ever loosen the
+/// target. So a namespace that declares one is a namespace where ztsc's
+/// un-managed props type is known to be too strict, and every missing/excess
+/// complaint against it is a false positive: `tsxLibraryManagedAttributes` grew
+/// 18 of them the moment the first-parameter arm below started answering.
+///
+/// Consulted only by the arms that had NO target at all before, so this cannot
+/// take a check away from anything that already worked.
+fn jsxHasManagedAttributes(c: *Checker) Error!bool {
+    return (try c.jsxNamespaceMember(c.atom_LibraryManagedAttributes)) != null;
 }
 
 /// One explicit (literal) JSX attribute gathered during the first pass.
