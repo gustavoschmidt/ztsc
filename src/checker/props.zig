@@ -382,7 +382,7 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, o: PropLookup) Error!?types
             // why `collection.hasOwnProperty(v)` on the `Record<T, any>`
             // constituent of `Set<T> | readonly T[] | Record<T, any> |
             // Map<T, any>` is legal; without it every name was TS2339.
-            if (try mappedKeysStillGeneric(c, t)) return c.objectInterfaceProp(name);
+            if (try mappedKeysStillGeneric(c, t, 0)) return c.objectInterfaceProp(name);
             if (s.mappedHomomorphic(t)) {
                 const src = s.mappedSource(t);
                 const bc = try c.transitiveBaseConstraint(src);
@@ -457,11 +457,19 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, o: PropLookup) Error!?types
 /// Answers "generic" only when tsc would too: anything unrecognized is
 /// reported concrete, so the existing base-constraint route below still runs
 /// and no name that resolves today starts failing.
-fn mappedKeysStillGeneric(c: *Checker, t: TypeId) Error!bool {
+/// `depth` is the CALLER's, threaded rather than reset: the three walks call
+/// each other (`keyof` of a mapped type is that map's key domain, whose own
+/// constraint can be another `keyof`), so a depth that restarts at every hop
+/// bounds nothing. A self-referential alias — `const A = object<S>()({ fields:
+/// () => ({ a: field({ type: A }) }) })`, whose contextual type is a
+/// homomorphic map over the very type being inferred — cycles between the two
+/// and overflowed the stack (`circularReferenceInReturnType2`).
+fn mappedKeysStillGeneric(c: *Checker, t: TypeId, depth: u32) Error!bool {
+    if (depth > 8) return false;
     // A homomorphic map stores `X` (of `keyof X`) as its source, not the
     // `keyof` node; its key domain is exactly `keyof src`.
-    if (c.ts.mappedHomomorphic(t)) return keyofStillGeneric(c, c.ts.mappedSource(t), 0);
-    return keyDomainStillGeneric(c, c.ts.mappedConstraint(t), 0);
+    if (c.ts.mappedHomomorphic(t)) return keyofStillGeneric(c, c.ts.mappedSource(t), depth + 1);
+    return keyDomainStillGeneric(c, c.ts.mappedConstraint(t), depth + 1);
 }
 
 /// `getLowerBoundOfKeyType` on a mapped type's constraint, asked only for
@@ -513,7 +521,7 @@ fn keyofStillGeneric(c: *Checker, t: TypeId, depth: u32) Error!bool {
         // `T`'s constraint supplies the names) from
         // `Partial<Record<T, any>>` (whose inner key domain is the naked
         // `T`, so the whole thing has no members).
-        .mapped => return mappedKeysStillGeneric(c, r),
+        .mapped => return mappedKeysStillGeneric(c, r, depth + 1),
         .union_type, .intersection => {
             for (0..s.memberCount(r)) |i| {
                 if (!try keyofStillGeneric(c, s.memberAt(r, i), depth + 1)) return false;

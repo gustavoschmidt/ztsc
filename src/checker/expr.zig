@@ -2931,9 +2931,24 @@ fn resolveCtxTypeParams(c: *Checker, node: Node, rctx: TypeId) Error!TypeId {
         const sym = c.ts.typeParamSymbol(pctx);
         // First binding wins, as tsc's first inference candidate does.
         for (map.items) |m| if (m.sym == sym) continue :props;
-        const vt = try c.checkExprCached(value, types.no_type);
+        // An UNCONSTRAINED parameter is not bound at all — the doc's "an
+        // unconstrained guess would substitute a type tsc's inference would
+        // have widened or discarded", now that an object-literal argument
+        // reaches here with the parameter as its contextual type at all.
+        // `boxed<T>(x: { v: T })` called with `{ v: true }` infers `T =
+        // boolean`, because `isLiteralOfContextualType`'s type-variable rule
+        // reads the CONSTRAINT and a bare `T` has none; binding the fresh
+        // `true` made the substituted context `{ v: true }`, which then
+        // admitted itself and pinned `T` at `true`. Substituting the WIDENED
+        // value does not help either — `{ v: boolean }` is a literal context
+        // for `true` in its own right. Leaving `T` free is what tsc does, and
+        // the widening rule then applies to it directly
+        // (`inference/088_top_level_param_still_widens`,
+        // `inference/return_context_keeps_object_prop_literal`).
         const con = try c.typeParamConstraint(sym);
-        if (con != types.no_type and !try c.isAssignable(vt, con)) continue;
+        if (con == types.no_type) continue;
+        const vt = try c.checkExprCached(value, types.no_type);
+        if (!try c.isAssignable(vt, con)) continue;
         try map.append(c.scratch(), .{ .sym = sym, .ty = vt });
     }
     if (map.items.len == 0) return rctx;
@@ -3075,9 +3090,34 @@ fn definitelyFalsySpread(c: *Checker, r: TypeId) Error!bool {
 /// written into it: every method of `let p: Point | null = { x: 10, moveBy() {
 /// this.x += dx } }` runs on a real `Point`, and reading `this.x` through the
 /// union reported "possibly null" at every member access.
-fn objectLiteralThis(c: *Checker, rctx: TypeId) Error!TypeId {
+fn objectLiteralThis(c: *Checker, rctx: TypeId, marker: TypeId) Error!TypeId {
+    // The `ThisType<T>` marker wins wherever the outward walk found it — this
+    // literal's own contextual type first, then an enclosing literal's (see
+    // `Checker.ctx_this_marker`).
+    //
+    // Either answer is REFUSED while it still names a free type variable.
+    // tsc's line is
+    //
+    // ```ts
+    // return instantiateType(thisType, getMapperFromContext(getInferenceContext(containingLiteral)));
+    // ```
+    //
+    // — the marker is instantiated through the enclosing call's inference
+    // context, which by then has every candidate, because tsc DEFERS an
+    // object-literal method's body (`checkNodeDeferred`) until the call it is
+    // an argument of has finished inferring. ztsc walks the body inline, while
+    // this argument is still the thing being inferred FROM, so the variables
+    // are all it could read: vue's `ThisType<Data & Readonly<Props> &
+    // Instance>` would answer `this.bar` against a free `Data`
+    // (`vueLikeDataAndPropsInference`, `multipleInferenceContexts`,
+    // `mappedTypeInferenceErrors`). An unresolved `this` — tsc's own fallback
+    // shape, `any` at every read — is an under-report; the uninstantiated type
+    // is a false positive.
+    if (marker != types.no_type) {
+        return if (try c.containsFreeTypeParam(marker, &.{})) 0 else marker;
+    }
     if (rctx == types.no_type) return 0;
-    if (try thisTypeMarker(c, rctx)) |t| return t;
+    if (try c.containsFreeTypeParam(rctx, &.{})) return 0;
     return c.nonNullable(rctx);
 }
 
@@ -3103,6 +3143,20 @@ fn thisTypeMarker(c: *Checker, t: TypeId) Error!?TypeId {
     }
 }
 
+/// Check an object-literal property VALUE, handing an object literal written
+/// DIRECTLY there the `ThisType<T>` marker in scope. tsc's outward walk steps
+/// through a property assignment and nothing else, so every other value — a
+/// call whose argument happens to be a literal, an array, a function — is
+/// checked with the marker cleared (see `Checker.ctx_this_marker`).
+fn checkPropValue(c: *Checker, value: Node, pctx: TypeId, marker: TypeId) Error!TypeId {
+    if (marker == types.no_type or value == null_node or c.nodeTag(value) != .object_literal) {
+        return c.checkExprCached(value, pctx);
+    }
+    c.ctx_this_marker = marker;
+    defer c.ctx_this_marker = types.no_type;
+    return c.checkExprCached(value, pctx);
+}
+
 /// One constituent of an object literal's type. `dist` names the spread
 /// elements whose source types are replaced for this constituent (see
 /// `checkObjectLiteral`); it is empty for an undistributed literal.
@@ -3112,6 +3166,19 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
     if (rctx != types.no_type and c.ts.kind(rctx) == .union_type) {
         rctx = try discriminate_ctx.byObjectMembers(c, node, rctx);
     }
+    // The `ThisType<T>` in scope for this literal's function members: its own
+    // contextual type's marker, else the one an enclosing literal handed down.
+    // Cleared for the rest of this frame so only the property VALUES that are
+    // themselves object literals see it (`Checker.ctx_this_marker`); the
+    // caller's value is restored on the way out, because a distributed spread
+    // walks the same literal once per constituent.
+    const inherited_marker = c.ctx_this_marker;
+    defer c.ctx_this_marker = inherited_marker;
+    c.ctx_this_marker = types.no_type;
+    const this_marker: TypeId = if (rctx == types.no_type)
+        inherited_marker
+    else
+        (try thisTypeMarker(c, rctx)) orelse inherited_marker;
     var props: std.ArrayList(types.Prop) = .empty;
     defer props.deinit(c.scratch());
     var prop_index: std.AutoHashMapUnmanaged(Atom, u32) = .empty;
@@ -3184,7 +3251,7 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                     };
                     if (named) |key| {
                         const pctx = try c.ctxPropType(rctx, ctx, key);
-                        var vt = try c.checkExprCached(pd.rhs, pctx);
+                        var vt = try checkPropValue(c, pd.rhs, pctx, this_marker);
                         if (c.const_ctx) {
                             vt = try c.ts.regularLiteral(vt);
                         } else if (!try propCtxKeepsLiteral(c, rctx, ctx, key, vt)) vt = try c.widenPropValue(vt);
@@ -3202,7 +3269,7 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                         .number, .number_literal, .number_literal_fresh => try ctxIndexType(c, rctx, true),
                         else => types.no_type,
                     };
-                    var vt = try c.checkExprCached(pd.rhs, pctx);
+                    var vt = try checkPropValue(c, pd.rhs, pctx, this_marker);
                     if (c.const_ctx) {
                         vt = try c.ts.regularLiteral(vt);
                     } else if (!try keepLiteral(c, vt, pctx)) vt = try c.widenPropValue(vt);
@@ -3215,7 +3282,7 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                 }
                 const key = try c.memberAtom(c.tree.nodeMainToken(prop));
                 const pctx = try c.ctxPropType(rctx, ctx, key);
-                var vt = try c.checkExprCached(pd.rhs, pctx);
+                var vt = try checkPropValue(c, pd.rhs, pctx, this_marker);
                 if (c.const_ctx) {
                     vt = try c.ts.regularLiteral(vt);
                 } else if (!try propCtxKeepsLiteral(c, rctx, ctx, key, vt)) vt = try c.widenPropValue(vt);
@@ -3254,7 +3321,7 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                 // `| undefined` and `| null | undefined` spellings).
                 const saved_this = c.this_type;
                 defer c.this_type = saved_this;
-                c.this_type = try objectLiteralThis(c, rctx);
+                c.this_type = try objectLiteralThis(c, rctx, this_marker);
                 // A SYMBOL-keyed method or accessor shorthand
                 // (`{ [Symbol.toStringTag]() {…} }`,
                 // `{ set [Symbol.toPrimitive](p) {…} }`) declares a real,

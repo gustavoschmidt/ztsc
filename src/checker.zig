@@ -2318,6 +2318,33 @@ pub const Checker = struct {
     /// authoritative top-down check reports at the narrowed type, and a
     /// narrowing query must never be the thing that files an error.
     side_query_depth: u32 = 0,
+    /// The `ThisType<T>` argument an ENCLOSING object literal's contextual type
+    /// carried, handed to the object literal written as one of its property
+    /// VALUES — tsc's `getContextualThisParameterType`, whose search for the
+    /// marker walks OUTWARD one property assignment at a time:
+    ///
+    /// ```ts
+    /// while (type) {
+    ///     const thisType = getThisTypeFromContextualType(type);
+    ///     if (thisType) return …;
+    ///     if (literal.parent.kind !== SyntaxKind.PropertyAssignment) break;
+    ///     literal = literal.parent.parent;
+    ///     type = getApparentTypeOfContextualType(literal);
+    /// }
+    /// ```
+    ///
+    /// The outward walk is expressed here as a one-hop handoff downward:
+    /// `objectLiteralType` reads it at entry, prefers a marker of its OWN
+    /// contextual type, and re-publishes the winner for exactly those property
+    /// values that are themselves object literals. Every other sub-check runs
+    /// with it cleared, so the marker never reaches a literal tsc's walk could
+    /// not have reached (an argument of a call written as a property value, an
+    /// array element, a method body).
+    ///
+    /// Mutable because the walk is a stack discipline over `objectLiteralType`
+    /// frames — the same shape `this_type` already uses — and each frame
+    /// restores its caller's value on the way out.
+    ctx_this_marker: TypeId = types.no_type,
     /// Symbols whose type memo (`sym_types`/`sym_state`) was filled from a
     /// SIDE QUERY's own parameter pins — the speculative half of the rule
     /// `checkExprCached` already applies to `node_types`.

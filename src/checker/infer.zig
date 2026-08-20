@@ -829,6 +829,11 @@ pub fn inferTypeArgs(
         // so the array literal forms a tuple, and the outer `K`/`V` then
         // infer `string`/`number` from `[string, number][]` instead of
         // collapsing to `unknown`.
+        // Does this parameter have a literal-keeping type-variable property —
+        // the shape whose contextual read must reach an object-literal
+        // argument even when handing it down costs the two-round pass below?
+        const lit_ctx_wanted = tag == .object_literal and
+            ((try c.paramWantsLiteralCtx(pt)) or (try seedResolvesParam(c, pt, tp_syms, ret_seed)));
         var arg_ctx = switch (tag) {
             .array_literal, .call_expr, .call_expr_targs, .optional_call, .new_expr, .new_expr_bare, .new_expr_targs => pt,
             // A template expression is contextually typed by the parameter
@@ -851,8 +856,13 @@ pub fn inferTypeArgs(
             // have a literal-keeping type-variable property so unrelated
             // object-literal arguments (callback bags like `openDB({ upgrade
             // })`) keep their context-free check.
-            .object_literal => if ((try c.paramWantsLiteralCtx(pt)) or
-                (try seedResolvesParam(c, pt, tp_syms, ret_seed))) pt else types.no_type,
+            // A literal that carries no un-annotated function at all has no
+            // second round to lose, so it takes the parameter unconditionally
+            // — see `lit_ctx_wanted` below for the literal-keeping half.
+            .object_literal => if (lit_ctx_wanted or !c.objLitIsContextSensitive(an))
+                pt
+            else
+                types.no_type,
             else => types.no_type,
         };
         // Fresh object literal into a bare type-param parameter (`truncate<T
