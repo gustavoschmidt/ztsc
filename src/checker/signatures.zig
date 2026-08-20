@@ -127,6 +127,15 @@ pub fn signatureOfProtoCtx(
     // arity) and stored on the signature for the receiver check / body.
     var this_ty: TypeId = 0;
     var seen_param = false;
+    // A `this` annotation governs every LATER parameter's own check, not just
+    // the body's: a default is an expression in the signature, and tsc types
+    // the `this` inside it through `tryGetThisTypeAt`, which reads the
+    // enclosing signature's `this` parameter. `class Weird { doSomething(this:
+    // Example, a = this.getNumber()) {…} }` read the default's receiver as
+    // `Weird` — where the same call in the BODY already read `Example`, which
+    // installs it (`signatureOfProtoCtx`).
+    const saved_this = c.this_type;
+    defer c.this_type = saved_this;
     for (param_nodes) |pn| {
         if (pn == null_node) continue;
         if (!seen_param) {
@@ -134,6 +143,7 @@ pub fn signatureOfProtoCtx(
             if (thisParamAnn(c, pn)) |ann_node| {
                 this_ty = if (ann_node != 0) try c.typeFromTypeNode(ann_node) else types.any_type;
                 if (this_ty == types.no_type) this_ty = types.any_type;
+                c.this_type = this_ty;
                 continue;
             }
         }
@@ -2238,7 +2248,7 @@ pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Er
         },
         .declarator_init => {
             if (try freshSymbolConstType(c, decl, d.lhs, d.rhs, is_const)) |u| return u;
-            const init_t = try c.checkExprCached(d.rhs, types.no_type);
+            const init_t = try c.checkExprCached(d.rhs, try destructure.patternContextualType(c, d.lhs));
             if (try inferredUniqueSymbol(c, decl, d.lhs, d.rhs, is_const, init_t)) |u| return u;
             const vt = try c.widenInitializer(init_t, is_const);
             if (c.nodeTag(d.lhs) == .identifier) return vt;
@@ -2251,7 +2261,7 @@ pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Er
                 vt = try c.annTypeMaybeUnique(e.type_ann, is_const, 1332, c.nodeSpan(d.lhs));
             } else if (e.init != 0) {
                 if (try freshSymbolConstType(c, decl, d.lhs, e.init, is_const)) |u| return u;
-                const init_t = try c.checkExprCached(e.init, types.no_type);
+                const init_t = try c.checkExprCached(e.init, try destructure.patternContextualType(c, d.lhs));
                 if (try inferredUniqueSymbol(c, decl, d.lhs, e.init, is_const, init_t)) |u| return u;
                 vt = try c.widenInitializer(init_t, is_const);
             }

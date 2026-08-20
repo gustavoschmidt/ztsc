@@ -35,6 +35,7 @@ const expr_zig = @import("expr.zig");
 const checkExprCached = expr_zig.checkExprCached;
 const classStaticType = @import("enums.zig").classStaticType;
 const decorators = @import("decorators.zig");
+const destructure = @import("destructure.zig");
 const diagFmt = Checker.diagFmt;
 const elaborate = @import("elaborate.zig");
 const heritage = @import("heritage.zig");
@@ -445,9 +446,11 @@ fn checkDeclarator(c: *Checker, decl: Node, is_const: bool, ambient: bool) Error
             try implicit_any.reportVarImplicitAny(c, d.lhs, ambient);
         },
         .declarator_init => {
-            _ = try c.checkExprCached(d.rhs, types.no_type);
-            // Materialize the symbol's type (infers + caches).
-            try materializePatternTypes(c, d.lhs);
+            const it = try c.checkExprCached(d.rhs, try destructure.patternContextualType(c, d.lhs));
+            // Materialize the symbol's type (infers + caches). The
+            // initializer's type is what the pattern destructures, so it is
+            // also what contextually types the pattern's defaults.
+            try materializePatternTypes(c, d.lhs, it);
         },
         .declarator_full => {
             const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
@@ -456,17 +459,26 @@ fn checkDeclarator(c: *Checker, decl: Node, is_const: bool, ambient: bool) Error
             else
                 c.nodeSpan(d.lhs);
             const ann: TypeId = if (e.type_ann != 0) try c.annTypeMaybeUnique(e.type_ann, is_const, 1332, name_span) else types.no_type;
+            // What the initializer is CHECKED against. The annotation when
+            // there is one; otherwise an array binding pattern's implied tuple
+            // (`patternContextualType`), which is a contextual type only — the
+            // assignability check below stays on `ann`.
+            const init_ctx: TypeId = if (ann != types.no_type) ann else try destructure.patternContextualType(c, d.lhs);
             // A `unique symbol` const accepts only a fresh `Symbol()` /
             // `Symbol.for()` initializer; the assignability check (a plain
             // `symbol` is not assignable to `unique symbol`) is skipped for
             // that one form, matching tsc.
             if (e.init != 0 and e.type_ann != 0 and c.nodeTag(e.type_ann) == .unique_symbol_type and c.isFreshSymbolCall(e.init)) {
                 _ = try c.checkExprCached(e.init, ann);
-                try materializePatternTypes(c, d.lhs);
+                try materializePatternTypes(c, d.lhs, ann);
                 return;
             }
+            // What the pattern destructures, for the defaults inside it: the
+            // annotation, else the initializer's own type.
+            var whole: TypeId = ann;
             if (e.init != 0) {
-                const it0 = try c.checkExprCached(e.init, ann);
+                const it0 = try c.checkExprCached(e.init, init_ctx);
+                if (whole == types.no_type) whole = it0;
                 // tsc binds `f.x = 1` onto the FUNCTION EXPRESSION's symbol,
                 // so the initializer of `const f: T = () => {}` already
                 // carries the expando members when it is checked against `T`
@@ -491,7 +503,7 @@ fn checkDeclarator(c: *Checker, decl: Node, is_const: bool, ambient: bool) Error
                     }
                 }
             }
-            try materializePatternTypes(c, d.lhs);
+            try materializePatternTypes(c, d.lhs, whole);
         },
         else => {},
     }
@@ -522,7 +534,17 @@ fn expandoInitializerType(c: *Checker, name: Node, init: Node, it: TypeId) Error
 
 /// Force typeOfSymbol for every name bound by a pattern so inference
 /// diagnostics fire deterministically at the declaration site.
-fn materializePatternTypes(c: *Checker, pat: Node) Error!void {
+///
+/// `whole` is the type the pattern destructures — the declaration's
+/// annotation when it has one and its initializer's type otherwise, i.e. the
+/// `parentType` of tsc's `getContextualTypeForBindingElement` — threaded down
+/// so a pattern element's DEFAULT is checked against the type of the property
+/// it stands in for, rather than with no contextual type at all. Without it
+/// `let { stringIdentity: id = arg => arg }: StringIdentity = …` walked the
+/// arrow with nothing to type `arg` from and reported it an implicit `any`
+/// (`contextuallyTypedBindingInitializer`). `no_type` — from a `for` head,
+/// whose binding is typed by what is iterated — simply propagates.
+fn materializePatternTypes(c: *Checker, pat: Node, whole: TypeId) Error!void {
     if (pat == null_node) return;
     switch (c.nodeTag(pat)) {
         .identifier => {
@@ -532,37 +554,67 @@ fn materializePatternTypes(c: *Checker, pat: Node) Error!void {
                 else => {},
             }
         },
-        .array_pattern, .object_pattern => {
+        .object_pattern => {
             for (c.tree.nodeRange(pat)) |el| {
-                if (el != null_node) try materializePatternTypes(c, el);
+                if (el != null_node) try materializePatternTypes(c, el, whole);
+            }
+        },
+        .array_pattern => {
+            const r = if (whole == types.no_type) types.no_type else try c.resolveStructural(whole);
+            var i: u32 = 0;
+            for (c.tree.nodeRange(pat)) |el| {
+                if (el == null_node) continue;
+                defer i += 1;
+                if (c.nodeTag(el) == .omitted) continue;
+                const et: TypeId = if (r == types.no_type)
+                    types.no_type
+                else
+                    (try destructure.patternElemType(c, r, i)) orelse types.no_type;
+                try materializePatternTypes(c, el, et);
             }
         },
         .binding_property => {
             const d = c.tree.nodeData(pat);
+            const key = try c.memberAtom(c.tree.nodeMainToken(pat));
+            const pt = (try destructure.patternPropType(c, whole, key)) orelse types.no_type;
             if (d.lhs != 0) {
-                try materializePatternTypes(c, d.lhs);
+                try materializePatternTypes(c, d.lhs, pt);
             } else {
-                const a = try c.memberAtom(c.tree.nodeMainToken(pat));
-                switch (c.resolveSpace(a, c.cur_scope, true)) {
+                switch (c.resolveSpace(key, c.cur_scope, true)) {
                     .sym => |sym| _ = try c.typeOfSymbol(sym),
                     else => {},
                 }
             }
-            if (d.rhs != 0) _ = try c.checkExprCached(d.rhs, types.no_type);
+            if (d.rhs != 0) _ = try c.checkExprCached(d.rhs, patternDefaultCtx(c, d.lhs, pt));
         },
         .binding_property_computed => {
             const d = c.tree.nodeData(pat);
             if (d.lhs != 0) _ = try c.checkExprCached(d.lhs, types.no_type);
-            if (d.rhs != 0) try materializePatternTypes(c, d.rhs);
+            // A COMPUTED key takes the element out of tsc's contextual-typing
+            // branch entirely (`isComputedNonLiteralName`), so its subtree
+            // starts over with no parent type.
+            if (d.rhs != 0) try materializePatternTypes(c, d.rhs, types.no_type);
         },
         .binding_default => {
             const d = c.tree.nodeData(pat);
-            try materializePatternTypes(c, d.lhs);
-            _ = try c.checkExprCached(d.rhs, types.no_type);
+            try materializePatternTypes(c, d.lhs, whole);
+            _ = try c.checkExprCached(d.rhs, patternDefaultCtx(c, d.lhs, whole));
         },
-        .rest_element => try materializePatternTypes(c, c.tree.nodeData(pat).lhs),
+        .rest_element => try materializePatternTypes(c, c.tree.nodeData(pat).lhs, types.no_type),
         else => {},
     }
+}
+
+/// The contextual type of a binding element's DEFAULT: the type its position
+/// destructures — except when the element's own name is itself a PATTERN,
+/// which tsc's `getContextualTypeForBindingElement` refuses outright
+/// (`isBindingPattern(name)` returns `undefined` before the property lookup).
+fn patternDefaultCtx(c: *Checker, name: Node, pt: TypeId) TypeId {
+    if (name == null_node) return pt;
+    return switch (c.nodeTag(name)) {
+        .object_pattern, .array_pattern => types.no_type,
+        else => pt,
+    };
 }
 
 fn checkForInOf(c: *Checker, node: Node) Error!void {
@@ -620,11 +672,20 @@ fn checkForInOf(c: *Checker, node: Node) Error!void {
                     },
                     .declarator_full => {
                         const ee = c.tree.extraData(ast.DeclaratorFull, dd.rhs);
+                        // A `for` head's binding has no contextual type of its
+                        // own unless it is ANNOTATED: tsc's
+                        // `getContextualTypeForVariableLikeDeclaration` reads
+                        // the annotation, then the declaration's INITIALIZER —
+                        // and a loop head has none, so what is iterated never
+                        // becomes one. `for (const { show: fs = v => v… } of
+                        // rows)` really is an implicit-any `v` (TS7006).
+                        var whole: TypeId = types.no_type;
                         if (ee.type_ann != 0) {
                             const ann = try c.typeFromTypeNode(ee.type_ann);
                             _ = try c.checkAssignable(elem_t, ann, 0, c.nodeSpan(dd.lhs));
+                            whole = ann;
                         }
-                        try materializePatternTypes(c, dd.lhs);
+                        try materializePatternTypes(c, dd.lhs, whole);
                     },
                     else => {},
                 }

@@ -26,6 +26,7 @@ const Error = checker_zig.Error;
 
 const accessibility = @import("accessibility.zig");
 const calls_zig = @import("calls.zig");
+const classes = @import("classes.zig");
 const comma = @import("comma.zig");
 const computed_key = @import("computed_key.zig");
 const conditions = @import("conditions.zig");
@@ -4003,6 +4004,14 @@ fn memberChainInner(c: *Checker, node: Node, ctx: TypeId) Error!ChainLink {
         }
         obj_t = try c.nonNullableChain(obj_t);
     } else {
+        // `checkNonNullExpression`'s unknown arm, ahead of its nullish one:
+        // `u.foo` is TS18046 at the RECEIVER, not TS2339 at the name. Only
+        // the non-optional spelling — `u?.foo` reaches
+        // `getOptionalExpressionType` first, which answers `{}` for `unknown`,
+        // so tsc reports the missing property on `{}` there (oracle-verified).
+        if (c.nodeTag(d.lhs) != .super_expr and try reportUnknownOperand(c, obj_t, d.lhs)) {
+            return .{ .ty = types.error_type, .chained = chained };
+        }
         obj_t = try checkNonNullType(c, obj_t, d.lhs);
     }
     // A compound assignment's target is re-read as an expression after
@@ -4141,6 +4150,35 @@ fn nonNullRemainder(c: *Checker, t: TypeId) Error!TypeId {
 }
 
 /// Render an entity-name-ish expression (a, a.b, a.b.c) or null.
+/// The HEAD of tsc's `checkNonNullTypeWithReporter`, which runs ahead of the
+/// nullish test above: an `unknown` operand is rejected outright, and the
+/// position continues on the error type rather than reaching its own verdict.
+/// tsc names the operand when it is an entity name and the name is short
+/// enough to print (TS18046 "'x' is of type 'unknown'.") and says "Object"
+/// otherwise (TS2571). `false` — nothing reported — for every other type.
+///
+/// `checkNonNullType` deliberately does NOT call it: over the TypeScript test
+/// suite the general gate traded 20 missing keys for 14 spurious ones, because
+/// it turns every position where ztsc infers `unknown` and tsc infers a real
+/// type into a diagnostic that did not exist (see the note there). What is
+/// safe is a position that ALREADY has a verdict for `unknown` — a call's
+/// callee, which was reporting the generic TS2349 — where this only changes
+/// the code, text, and span of a diagnostic that was going to be reported
+/// either way.
+pub fn reportUnknownOperand(c: *Checker, t: TypeId, node: Node) Error!bool {
+    if (c.ts.kind(try c.resolveStructural(t)) != .unknown) return false;
+    // `this` is not an `isEntityNameExpression`, so it takes the object form
+    // even though `entityNameOf` can spell it (the same split
+    // `checkNonNullType` makes for TS2531-3 vs TS18047-9).
+    const name_opt: ?[]const u8 = if (c.nodeTag(node) == .this_expr) null else entityNameOf(c, node);
+    if (name_opt) |name| {
+        try c.diagFmt(18046, c.nodeSpan(node), "'{s}' is of type 'unknown'.", .{name});
+    } else {
+        try c.diagFmt(2571, c.nodeSpan(node), "Object is of type 'unknown'.", .{});
+    }
+    return true;
+}
+
 fn entityNameOf(c: *Checker, node: Node) ?[]const u8 {
     switch (c.nodeTag(node)) {
         .identifier => return c.tokenText(c.tree.nodeMainToken(node)),
@@ -4291,7 +4329,21 @@ fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex, site
                 }
             }
             const r = try c.resolveStructural(t);
-            if (c.ts.kind(r) == .any or c.ts.kind(r) == .err) return types.any_type;
+            if (c.ts.kind(r) == .any or c.ts.kind(r) == .err) {
+                // …unless the receiver is a class whose table is open further
+                // down this stack, where the error type is the WINDOW and not
+                // an answer: the declarations can still say the member is
+                // absent (`inProgressMemberAbsent`).
+                if (try classes.inProgressMemberAbsent(c, t, name)) {
+                    // Named the way tsc names it: the report prints
+                    // `getApparentType(leftType)`, and the apparent type of a
+                    // polymorphic `this` is the class instance — "does not
+                    // exist on type 'Bar'", not "on type 'this'".
+                    const shown = if (c.ts.kind(t) == .this_type) c.ts.thisTypeInstance(t) else t;
+                    return reportMissingProp(c, shown, r, name, name_tok);
+                }
+                return types.any_type;
+            }
             if (try c.propOfType(r, name)) |p| {
                 if (p.nonPublic()) try accessibility.check(c, t, name, name_tok, site);
                 var pt = try c.substThis(p.ty, t);
@@ -4329,18 +4381,27 @@ fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex, site
                 }
                 return types.any_type;
             }
-            if (c.suggestProp(name, r)) |sugg| {
-                try c.diagFmt(2551, c.tokSpan(name_tok), "Property '{s}' does not exist on type '{s}'. Did you mean '{s}'?", .{
-                    c.atomText(name), try c.typeToString(t), c.atomText(sugg),
-                });
-            } else {
-                try c.diagFmt(2339, c.tokSpan(name_tok), "Property '{s}' does not exist on type '{s}'.", .{
-                    c.atomText(name), try c.typeToString(t),
-                });
-            }
-            return types.error_type;
+            return reportMissingProp(c, t, r, name, name_tok);
         },
     }
+}
+
+/// The not-found verdict of a property access: TS2339, or TS2551 when a
+/// near-miss member suggests itself (tsc's
+/// `getSuggestionForNonexistentProperty`). `t` is the receiver AS WRITTEN —
+/// what the message names — and `r` its resolved structure, which is what the
+/// suggestion searches.
+fn reportMissingProp(c: *Checker, t: TypeId, r: TypeId, name: Atom, name_tok: TokenIndex) Error!TypeId {
+    if (c.suggestProp(name, r)) |sugg| {
+        try c.diagFmt(2551, c.tokSpan(name_tok), "Property '{s}' does not exist on type '{s}'. Did you mean '{s}'?", .{
+            c.atomText(name), try c.typeToString(t), c.atomText(sugg),
+        });
+    } else {
+        try c.diagFmt(2339, c.tokSpan(name_tok), "Property '{s}' does not exist on type '{s}'.", .{
+            c.atomText(name), try c.typeToString(t),
+        });
+    }
+    return types.error_type;
 }
 
 /// The member a NUMBER-LITERAL key names, if `r` declares one. tsc's
@@ -4499,6 +4560,11 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
         if (c.containsNullish(obj_t)) chained = true;
         obj_t = try c.nonNullableChain(obj_t);
     } else {
+        // The same unknown-receiver gate a property access runs — `u["k"]`
+        // is TS18046 at `u`, where the index walk below reaches TS7053.
+        if (try reportUnknownOperand(c, obj_t, d.lhs)) {
+            return .{ .ty = types.error_type, .chained = chained };
+        }
         obj_t = try checkNonNullType(c, obj_t, d.lhs);
     }
     const r = try c.resolveStructural(obj_t);
