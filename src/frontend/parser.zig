@@ -2227,13 +2227,50 @@ const Parser = struct {
                     // look right (`import Foo From "m"` and a declarator list
                     // cut short at a missing comma) now follow tsc's own shape.
                     const tok = p.nodes.items(.main_token)[expr];
-                    if (p.tokTagAt(tok) != .keyword_declare) {
-                        try p.errAtToken(.unexpected_keyword_or_identifier, tok);
-                    }
+                    try p.errForMissingSemicolonAfterWord(tok);
                     return;
                 }
                 try p.errAtCur(.expected_semicolon);
             },
+        }
+    }
+
+    /// The word half of tsc's `parseErrorForMissingSemicolonAfter`: a statement
+    /// that is nothing but a bare identifier, followed by something other than
+    /// `;`. tsc switches on the WORD before falling back to TS1434, because a
+    /// word that names a DECLARATION form is far more likely a declaration
+    /// whose name the grammar rejected than a misspelled identifier — and then
+    /// it answers about the NAME, at the token that should have been one.
+    ///
+    /// `parseErrorForInvalidName`'s two arms are the `blank` case (the name
+    /// position holds the token that would have FOLLOWED a name — `{` for a
+    /// namespace or interface, `=` for a type alias, i.e. the declaration has no
+    /// name at all) and the reserved-word case (there IS a token there, it just
+    /// cannot be a name — `type void`, `interface void`). The interpolating
+    /// codes take their `{0}` from the reported span, which is exactly that
+    /// token.
+    ///
+    /// `declare` is silent: a `declare` that failed to parse has already
+    /// reported. Every arm was oracle-probed against tsgo 7.0.2.
+    fn errForMissingSemicolonAfterWord(p: *Parser, tok: u32) Error!void {
+        const blank_interface = p.curTag() == .l_brace;
+        switch (p.tokTagAt(tok)) {
+            .keyword_declare => {},
+            .keyword_var, .keyword_let, .keyword_const => try p.errAtToken(.variable_declaration_not_allowed_here, tok),
+            .keyword_is => try p.errAtToken(.type_predicate_not_allowed_here, tok),
+            .keyword_interface => try p.errAtCur(if (blank_interface)
+                .interface_needs_a_name
+            else
+                .interface_name_reserved),
+            .keyword_namespace, .keyword_module => try p.errAtCur(if (blank_interface)
+                .namespace_needs_a_name
+            else
+                .namespace_name_reserved),
+            .keyword_type => try p.errAtCur(if (p.curTag() == .eq)
+                .expected_type
+            else
+                .type_alias_name_reserved),
+            else => try p.errAtToken(.unexpected_keyword_or_identifier, tok),
         }
     }
 

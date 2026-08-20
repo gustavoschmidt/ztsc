@@ -384,6 +384,23 @@ pub const Code = enum(u16) {
     /// "s"` in the same file, and a TS2322 in a SIBLING file, are both silent
     /// once any file spells `module { }`.
     namespace_needs_a_name,
+    /// The rest of `parseErrorForMissingSemicolonAfter`'s keyword switch (see
+    /// `unexpected_keyword_or_identifier`): a bare-identifier expression
+    /// statement whose word NAMES a declaration form is read as a declaration
+    /// whose name the grammar rejected, and tsc answers about the name — at the
+    /// token that should have been one, which is where `renderMessage` finds
+    /// the `{0}` for the three interpolating ones. Every code and position here
+    /// was oracle-probed against tsgo 7.0.2 (`type void = number` is TS2457 on
+    /// `void`, not TS1434 on `type`).
+    interface_needs_a_name,
+    interface_name_reserved,
+    namespace_name_reserved,
+    type_alias_name_reserved,
+    /// TS1440, the `var`/`let`/`const` arm — blamed on the WORD rather than on
+    /// the name, because there may not be one.
+    variable_declaration_not_allowed_here,
+    /// TS1228, the `is` arm.
+    type_predicate_not_allowed_here,
     /// TS1107: `while (c) { function f() { break; } }` — a `break`/`continue`
     /// whose target lies outside the function it sits in. tsc walks out of the
     /// statement and answers as soon as it reaches a function-like, before it
@@ -1372,6 +1389,12 @@ pub const Code = enum(u16) {
             .module_keyword_for_namespace => "A 'namespace' declaration should not be declared using the 'module' keyword. Please use the 'namespace' keyword instead.",
             .quoted_module_name_needs_ambient => "Only ambient modules can use quoted names.",
             .namespace_needs_a_name => "Namespace must be given a name.",
+            .interface_needs_a_name => "Interface must be given a name.",
+            .interface_name_reserved => "Interface name cannot be '{0}'.",
+            .namespace_name_reserved => "Namespace name cannot be '{0}'.",
+            .type_alias_name_reserved => "Type alias name cannot be '{0}'.",
+            .variable_declaration_not_allowed_here => "Variable declaration not allowed at this location.",
+            .type_predicate_not_allowed_here => "A type predicate is only allowed in return type position for functions and methods.",
             .const_class_member => "A class member cannot have the 'const' keyword.",
             .jump_crosses_function_boundary => "Jump target cannot cross function boundary.",
             .break_outside_iteration_or_switch => "A 'break' statement can only be used within an enclosing iteration or switch statement.",
@@ -1737,6 +1760,12 @@ pub const Code = enum(u16) {
             .module_keyword_for_namespace => 1540,
             .quoted_module_name_needs_ambient => 1035,
             .namespace_needs_a_name => 1437,
+            .interface_needs_a_name => 1438,
+            .interface_name_reserved => 2427,
+            .namespace_name_reserved => 2819,
+            .type_alias_name_reserved => 2457,
+            .variable_declaration_not_allowed_here => 1440,
+            .type_predicate_not_allowed_here => 1228,
             .const_class_member => 1248,
             .jump_crosses_function_boundary => 1107,
             .break_outside_iteration_or_switch => 1105,
