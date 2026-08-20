@@ -1269,10 +1269,14 @@ pub fn containerFromImportTarget(c: *Checker, tgt0: modules.Target) ?NsContainer
 /// preact publishes its JSX namespace this way (`declare global { export
 /// import JSX = JSXInternal }`), which left `JSX.Element` /
 /// `JSX.IntrinsicElements` resolving to nothing at all.
+///
+/// `entity_alias_stack` cuts the self-reference `import a = a.b`, whose
+/// qualifier resolves straight back to the alias being resolved.
 pub fn importEqualsEntityContainer(c: *Checker, sym0: SymbolId) Error!?NsContainer {
     const sym = c.reprSym(sym0);
     if (!c.symFlags(sym).import_binding) return null;
     if (c.importTarget(sym) != null) return null; // module form: not ours
+    if (std.mem.indexOfScalar(SymbolId, c.entity_alias_stack.items, sym) != null) return null;
     for (c.declsOf(sym)) |decl| {
         if (c.prog.files[c.symFile(sym)].tree.nodeTag(decl) != .import_equals) continue;
         const saved = c.enterSymFile(sym);
@@ -1280,6 +1284,8 @@ pub fn importEqualsEntityContainer(c: *Checker, sym0: SymbolId) Error!?NsContain
         c.cur_scope = c.symScope(sym);
         const e = c.tree.extraData(ast.ImportEquals, c.tree.nodeData(decl).lhs);
         if (e.module_token != 0 or e.entity == null_node) return null;
+        try c.entity_alias_stack.append(c.cm(), sym);
+        defer _ = c.entity_alias_stack.pop();
         return try c.resolveNsContainer(e.entity);
     }
     return null;

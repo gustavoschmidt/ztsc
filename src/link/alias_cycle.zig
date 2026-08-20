@@ -22,9 +22,12 @@
 //! sealed bind data, and writes nothing but diagnostics: it cannot change what
 //! any name resolves to.
 //!
+//! A qualified entity alias (`import G = H.I`) contributes the edge `G → H`:
+//! which MEMBER of `H` the alias names needs checker-side lookup, but the cycle
+//! question does not — tsc resolves the qualifier first, and that step is a
+//! `resolveAlias` when the qualifier is an alias (see `entitySite`).
+//!
 //! What is deliberately terminal (an under-report, never an over-report):
-//!   - a qualified entity alias (`import G = H.I`) — resolving `H.I` needs
-//!     namespace-member lookup, which is checker territory;
 //!   - `export * as ns from "m"` (the alias is a module namespace object);
 //!   - `export as namespace N` (its name lives in the global merge, not in a
 //!     module's own tables);
@@ -301,32 +304,54 @@ fn exportSite(c: *Ctx, file: FileId, rec: bind_result.ExportRec) ?Site {
     }
 }
 
+/// The `import X = Entity` site an `import_equals` declaration of `sym`
+/// describes, or null when `decl` is the `require("m")` form (which has an
+/// import record and is handled there).
+///
+/// The edge leaves from the entity's LEFTMOST identifier, not the whole name:
+/// tsc's `resolveEntityName` resolves the qualifier of `A.B.C` first, and
+/// resolving it means `resolveAlias` when it is itself an alias — so a cycle
+/// running through `import G = H.I` is a cycle through `H`. Which member of the
+/// resolved namespace `X` ends up naming is irrelevant to the cycle: the walk
+/// either returns to a site already on the path (through the qualifiers alone)
+/// or leaves the alias graph. Verified against tsgo: `import a = a.b` reports
+/// once, `import G = H.I; import H = G` reports twice, and an alias merely
+/// *upstream* of a cycle (`import X = A.foo` beside `import A = B; import B =
+/// A`) reports not at all.
+fn entitySite(c: *Ctx, file: FileId, sym: SymbolId, decl: Node) ?Site {
+    const f = &c.files[file];
+    if (f.tree.nodeTag(decl) != .import_equals) return null;
+    const e = f.tree.extraData(ast.ImportEquals, f.tree.nodeData(decl).lhs);
+    if (e.module_token != 0 or e.entity == ast.null_node) return null;
+    var root = e.entity;
+    while (f.tree.nodeTag(root) == .qualified_name) root = f.tree.nodeData(root).lhs;
+    if (f.tree.nodeTag(root) != .identifier) return null;
+    const text = f.tree.tokenSlice(f.src, f.tree.nodeMainToken(root));
+    const ref = c.interner.intern(c.io, c.gpa, text) catch return null;
+    return .{
+        .file = file,
+        .node = decl,
+        .kind = .import_entity,
+        .name = f.bind.symbol_names[sym],
+        .ref = ref,
+        .scope = f.bind.symbol_scopes[sym],
+    };
+}
+
 /// The file's `import X = Entity` aliases. They carry no import record (there is
 /// no module to follow), so they are recovered from the symbols they declare:
 /// an import binding whose declaration is an `import_equals` with no specifier.
 fn entityAliases(c: *Ctx, file: FileId) Error![]const Site {
-    const f = &c.files[file];
-    const b = f.bind;
+    const b = c.files[file].bind;
     var out: std.ArrayListUnmanaged(Site) = .empty;
     for (b.symbol_flags, 0..) |flags, si| {
         if (!flags.import_binding) continue;
         const sym: SymbolId = @intCast(si);
         for (b.declsOf(sym)) |decl| {
-            if (f.tree.nodeTag(decl) != .import_equals) continue;
-            const e = f.tree.extraData(ast.ImportEquals, f.tree.nodeData(decl).lhs);
-            if (e.module_token != 0 or e.entity == ast.null_node) continue;
-            if (f.tree.nodeTag(e.entity) != .identifier) continue; // qualified: terminal
-            const text = f.tree.tokenSlice(f.src, f.tree.nodeMainToken(e.entity));
-            const ref = c.interner.intern(c.io, c.gpa, text) catch return Error.OutOfMemory;
-            try out.append(c.scratch, .{
-                .file = file,
-                .node = decl,
-                .kind = .import_entity,
-                .name = b.symbol_names[sym],
-                .ref = ref,
-                .scope = b.symbol_scopes[sym],
-            });
-            break;
+            if (entitySite(c, file, sym, decl)) |s| {
+                try out.append(c.scratch, s);
+                break;
+            }
         }
     }
     return out.items;
@@ -504,20 +529,7 @@ fn localSite(c: *Ctx, file: FileId, scope: ScopeId, name: Atom, sym0: SymbolId) 
     }
     // No import record: an entity alias (`import X = Entity`).
     for (b.declsOf(sym)) |decl| {
-        if (f.tree.nodeTag(decl) != .import_equals) continue;
-        const e = f.tree.extraData(ast.ImportEquals, f.tree.nodeData(decl).lhs);
-        if (e.module_token != 0 or e.entity == ast.null_node) continue;
-        if (f.tree.nodeTag(e.entity) != .identifier) return null;
-        const text = f.tree.tokenSlice(f.src, f.tree.nodeMainToken(e.entity));
-        const ref = c.interner.intern(c.io, c.gpa, text) catch return null;
-        return .{
-            .file = file,
-            .node = decl,
-            .kind = .import_entity,
-            .name = b.symbol_names[sym],
-            .ref = ref,
-            .scope = home,
-        };
+        if (entitySite(c, file, sym, decl)) |s| return s;
     }
     return null;
 }

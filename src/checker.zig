@@ -1336,6 +1336,14 @@ pub const Checker = struct {
     /// Default)`, TS2716. A parameter already on the stack answers `any`
     /// instead of re-entering.
     tp_default_stack: std.ArrayListUnmanaged(SymbolId) = .empty,
+    /// Entity-name import aliases whose right-hand side `resolveNsContainer` is
+    /// presently resolving, innermost last. `import a = a.b` names itself: the
+    /// qualifier `a` resolves back to the alias, whose RHS is the very name
+    /// being resolved, and the walk never terminates. tsc's `resolveAlias`
+    /// guards the same recursion with its resolving-alias marker and reports
+    /// TS2303; a symbol already on this stack answers "not a container", which
+    /// is what tsc's `unknownSymbol` result amounts to here.
+    entity_alias_stack: std.ArrayListUnmanaged(SymbolId) = .empty,
     /// Type parameters whose CONSTRAINT `typeParamConstraint` is resolving,
     /// innermost last. A constraint that reads back through its own parameter
     /// — `<T extends Foo | T["hello"]>`, tsc's TS2313 — re-enters the
