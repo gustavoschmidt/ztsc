@@ -52,6 +52,7 @@ pub fn aliasInstance(c: *Checker, sym: SymbolId, args: []const TypeId, tok: Toke
         // In-progress: recursive alias; leave a lazy ref. Record the
         // self-recursion so `fixTypeArgs` can scope its accumulator-default
         // substitution to genuinely recursive aliases.
+        if (c.trace_expand_err) std.debug.print("ALIASCUT\t{s}\n", .{c.symbolName(sym)});
         try c.alias_recursive.put(c.cm(), sym, {});
         const fixed = try c.fixTypeArgs(sym, args, tok) orelse return types.error_type;
         return c.ts.makeRef(sym, fixed);
