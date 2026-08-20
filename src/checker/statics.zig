@@ -709,6 +709,47 @@ pub fn ctorSignatures(c: *Checker, sym: SymbolId, out: *std.ArrayList(TypeId)) E
     }
 }
 
+/// The class that DECLARES the constructor a `new C(…)` resolves against,
+/// with that constructor's own modifier flags — tsc reads
+/// `constructSignatures[0].declaration` and its `declaration.parent.symbol`
+/// (`isConstructorAccessible`).
+pub const DeclaringCtor = struct { cls: SymbolId, flags: u32 };
+
+/// `ctorSignatures`' walk asked for the DECLARATION rather than the
+/// signature: the first class up the `extends` chain that writes a
+/// `constructor`, and the flags of its first declaration of one. Null when
+/// no class in the chain declares one — the implicit constructor, which is
+/// always public.
+///
+/// Kept beside `ctorSignatures` because it is the same chain walk, minus the
+/// heritage-argument bookkeeping (a modifier carries no type arguments). It
+/// is what lets `class Concrete extends Abstract {}` report
+/// `Abstract`'s protected constructor for `new Concrete()` (`noCrashOnMixin`),
+/// where the class the `new` names declares nothing itself.
+pub fn declaringCtor(c: *Checker, sym: SymbolId) Error!?DeclaringCtor {
+    var cur = sym;
+    var depth: u32 = 0;
+    while (depth < 16) : (depth += 1) {
+        const saved = c.enterSymFile(cur);
+        defer c.restoreCtx(saved);
+        if (c.bind.membersScopeOf(c.localOf(cur))) |ms| {
+            const lo = c.bind.scope_members_start[ms];
+            const hi = c.bind.scope_members_start[ms + 1];
+            for (lo..hi) |i| {
+                if (!isCtorName(c, c.bind.member_atoms[i])) continue;
+                for (c.bind.declsOf(c.bind.member_syms[i])) |decl| {
+                    if (c.nodeTag(decl) != .class_method) continue;
+                    const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(decl).lhs);
+                    return .{ .cls = cur, .flags = proto.flags };
+                }
+            }
+        }
+        const base = try c.baseClassRef(cur) orelse return null;
+        cur = c.ts.refSymbol(base);
+    }
+    return null;
+}
+
 /// A constructor signature with the accumulated heritage-argument
 /// substitution applied. Empty map (the class's own constructors) is the
 /// identity, so nothing is instantiated that does not need to be.

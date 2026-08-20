@@ -28,6 +28,7 @@ const identity = @import("identity.zig");
 const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const tuple_relate = @import("tuple_relate.zig");
+const accessibility = @import("accessibility.zig");
 const ambientNamespaceType = @import("signatures.zig").ambientNamespaceType;
 const ChainLink = @import("expr.zig").ChainLink;
 const checkExprCached = @import("expr.zig").checkExprCached;
@@ -199,13 +200,20 @@ fn iifeContextualSig(c: *Checker, shape: CallShape) Error!TypeId {
 /// the namespace object is the same one `import * as ns from "m"` gets, so
 /// an `export =` module reaches its export-assigned entity.
 ///
-/// Everything else stays `any`: a non-literal specifier (tsc cannot
-/// resolve it either), an unresolved module (already TS2307 at the
-/// statement level, or deliberately opaque), and a program with no lib
-/// (no global `Promise` to wrap with). No diagnostic is reported here —
-/// resolution failures belong to the resolver.
+/// Everything else is `Promise<any>` — a missing argument, a non-literal
+/// specifier (tsc cannot resolve it either), and an unresolved module
+/// (already TS2307 at the statement level, or deliberately opaque). Every
+/// exit from tsc's `checkImportCallExpression` goes through
+/// `createPromiseReturnType(node, …)`, so the payload degrades but the
+/// promise does not: `import(getSpecifier()).then(zero => …)` still types
+/// `zero` from `Promise<any>.then`, where a bare `any` callee leaves the
+/// callback's parameters implicitly `any`
+/// (`importCallExpressionReturnPromiseOfAny`, `dynamicImportDefer`,
+/// `importCallExpressionShouldNotGetParen`). A program with no lib has no
+/// global `Promise` to wrap with and stays `any` (`makePromise`). No
+/// diagnostic is reported here — resolution failures belong to the resolver.
 fn importCallType(c: *Checker, arg_nodes: []const Node) Error!TypeId {
-    if (arg_nodes.len == 0) return types.any_type;
+    if (arg_nodes.len == 0) return c.makePromise(types.any_type);
     const spec_node = arg_nodes[0];
     // A no-substitution template literal is a literal specifier too, and the
     // binder registers it as a dependency (`bindDynamicImport`); `memberAtom`
@@ -213,13 +221,13 @@ fn importCallType(c: *Checker, arg_nodes: []const Node) Error!TypeId {
     const spec = switch (c.nodeTag(spec_node)) {
         .string_literal => try c.memberAtom(c.tree.nodeMainToken(spec_node)),
         .template_literal => try c.templateAtom(c.tree.nodeMainToken(spec_node)),
-        else => return types.any_type,
+        else => return c.makePromise(types.any_type),
     };
     var m: ModuleRef = blk: {
         if (c.prog.files.len != 0) {
             if (c.prog.files[c.cur_file].specs.get(spec)) |mfile| break :blk .{ .file = mfile };
         }
-        break :blk .{ .ambient = c.ambientIndex(spec) orelse return types.any_type };
+        break :blk .{ .ambient = c.ambientIndex(spec) orelse return c.makePromise(types.any_type) };
     };
     // A JS-only dependency resolves to a file ztsc loads as a synthetic
     // opaque `any` module. An ambient `declare module "m"` that describes it
@@ -634,6 +642,18 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
             try sigs.appendSlice(c.scratch(), isect_sigs.items);
         } else if (rk == .class_value) {
             const cls = c.ts.classSymbol(r);
+            // tsc asks `isConstructorAccessible(node, constructSignatures[0])`
+            // ahead of the abstract screen below, and answers a failure with
+            // `return resolveErrorCall(node)`. The ORACLE does not follow it
+            // all the way: `var c = new C()` on a private constructor still
+            // types `c` as `C` there — `c.zzz` is TS2339 on `C` and
+            // `var q: number = c` is TS2322 from `C`, neither of which an
+            // error type produces. So the report stands alone and the
+            // resolution continues, which is the under-suppressing half of
+            // tsgo's behaviour (it files no arity error on top; ztsc's TS2554
+            // for `new C2()` against `private constructor(x: number)` was
+            // already an excess key before this check existed, and stays one).
+            _ = try accessibility.constructorCheck(c, cls, node);
             if (try c.classIsAbstract(cls)) {
                 // tsc's `resolveNewExpression` reports TS2511 and then
                 // `return resolveErrorCall(node)`: the arguments are checked

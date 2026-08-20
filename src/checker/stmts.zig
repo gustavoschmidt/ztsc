@@ -793,16 +793,39 @@ fn checkSwitch(c: *Checker, node: Node) Error!void {
         const cd = c.tree.nodeData(clause);
         if (c.nodeTag(clause) == .case_clause and cd.lhs != 0) {
             const case_t = try c.checkExprCached(cd.lhs, types.no_type);
-            // TS2678 is the same *comparable* relation as TS2367, so it
-            // goes through the same union/intersection-distributing test:
-            // a `case null:` on a non-nullable discriminant is clean in
-            // tsc, and `case 1:` on a branded `number & { _brand }` relates
-            // through the intersection's `number` constituent. Bare
-            // `isComparable` (mutual assignability) reported both.
-            if (!try c.typesHaveOverlap(case_t, disc_t)) {
-                try c.diagFmt(2678, c.nodeSpan(cd.lhs), "Type '{s}' is not comparable to type '{s}'.", .{
-                    try c.typeToString(case_t), try c.typeToString(disc_t),
-                });
+            // tsc's probe is DIRECTIONAL, and its failure arm REPORTS:
+            //
+            // ```ts
+            // if (!isTypeEqualityComparableTo(comparedExpressionType, caseType)) {
+            //     checkTypeComparableTo(caseType, comparedExpressionType, clause.expression);
+            // }
+            // ```
+            //
+            // The second call carries the clause expression as its error
+            // node, so a fresh object literal written as a case is subject
+            // to the excess-property check — and `switch (new C()) { case
+            // { id: 12, name: '' }: }` is TS2353 on `name`, not silence
+            // (`switchStatements`). The two questions line up: a literal
+            // carrying a name the discriminant lacks is exactly a
+            // discriminant that is not comparable TO the literal, which is
+            // what makes the directional probe fail.
+            //
+            // Ordered before the whole-type report for the same reason
+            // `checkAssignable` orders it before TS2322: the excess check
+            // runs at the top of `isRelatedTo` and a reported TS2353 is the
+            // only diagnostic the pair earns.
+            if (!try c.excessPropertyFailure(cd.lhs, case_t, disc_t)) {
+                // TS2678 is the same *comparable* relation as TS2367, so it
+                // goes through the same union/intersection-distributing test:
+                // a `case null:` on a non-nullable discriminant is clean in
+                // tsc, and `case 1:` on a branded `number & { _brand }` relates
+                // through the intersection's `number` constituent. Bare
+                // `isComparable` (mutual assignability) reported both.
+                if (!try c.typesHaveOverlap(case_t, disc_t)) {
+                    try c.diagFmt(2678, c.nodeSpan(cd.lhs), "Type '{s}' is not comparable to type '{s}'.", .{
+                        try c.typeToString(case_t), try c.typeToString(disc_t),
+                    });
+                }
             }
         }
         const cr = c.tree.extraData(ast.SubRange, cd.rhs);
@@ -1082,6 +1105,118 @@ pub fn contextualIteration(c: *Checker, ctx: TypeId, is_async: bool) Error!?Iter
     return .{ .yield = y, .ret = if (args.len >= 2) args[1] else types.no_type };
 }
 
+/// The `<T, TReturn, TNext>` arguments of a type written with one of the
+/// lib's iteration interfaces — `Generator`/`Iterator`/`IterableIterator`
+/// and the named built-in iterators (via `iteration.generatorYieldType`),
+/// plus `Iterable`, which spells its parameters the same way but is not an
+/// iterator so the yield helper deliberately leaves it out. Null for
+/// anything else.
+fn libIterationArgs(c: *Checker, t: TypeId, is_async: bool) Error!?[]const TypeId {
+    if (c.ts.kind(t) != .ref) return null;
+    const y = if (is_async) c.asyncGeneratorYieldType(t) else c.generatorYieldType(t);
+    if (y == 0) {
+        const name = try c.atom(if (is_async) "AsyncIterable" else "Iterable");
+        const g = c.prog.globals.lookup(name) orelse return null;
+        if (c.ts.refSymbol(t) != g) return null;
+    }
+    const args = c.ts.refArgs(t);
+    return if (args.len == 0) null else args;
+}
+
+/// tsc's `getIterationTypesOfGeneratorFunctionReturnType` for a WRITTEN
+/// generator return type, with `no_type` standing in for each of tsc's
+/// `undefined` iteration types (the caller supplies the fallbacks).
+///
+/// tsc resolves the ITERABLE protocol first and only then the ITERATOR one,
+/// which is what makes `interface BadGenerator extends Iterator<number>,
+/// Iterable<string>` yield `string`: `[Symbol.iterator]()` comes off the
+/// `Iterable<string>` half, and the mismatch against the `Iterator<number>`
+/// half is exactly the error this check exists to find. The same order falls
+/// out here — the structural arm reads `[Symbol.iterator]`'s return type.
+fn generatorReturnIterationTypes(c: *Checker, ann: TypeId, is_async: bool) Error!IterationTypes {
+    const r = try c.resolveStructural(ann);
+    switch (c.ts.kind(r)) {
+        .any, .err => return .{ .yield = types.any_type, .ret = types.any_type, .next = types.any_type },
+        else => {},
+    }
+    // Written as one of the lib interfaces: the three types ARE its arguments.
+    if (try libIterationArgs(c, ann, is_async)) |args| return spellIterationArgs(args);
+    // Otherwise the protocol supplies them: `[Symbol.iterator]()` (or
+    // `[Symbol.asyncIterator]()`) returns the iterator whose arguments they
+    // are. A user interface that merely EXTENDS `IterableIterator<number>`
+    // reaches its `T` this way (`generatorTypeCheck7`).
+    const key = if (is_async) c.atom_sym_asyncIterator else c.atom_sym_iterator;
+    if (try c.propOfType(r, key)) |p| {
+        const iter = try c.callableReturn(p.ty);
+        if (iter != 0) {
+            if (try libIterationArgs(c, iter, is_async)) |args| return spellIterationArgs(args);
+        }
+    }
+    // Neither: only the element type is recoverable, through the general
+    // `next(): { value }` walk `for..of` uses.
+    const elem = if (is_async) try c.asyncIterationElementType(r) else try c.iterationElementType(r);
+    return .{ .yield = elem orelse types.no_type, .ret = types.no_type, .next = types.no_type };
+}
+
+/// A lib iteration interface's `<T, TReturn, TNext>` read positionally.
+fn spellIterationArgs(args: []const TypeId) IterationTypes {
+    return .{
+        .yield = args[0],
+        .ret = if (args.len >= 2) args[1] else types.no_type,
+        .next = if (args.len >= 3) args[2] else types.no_type,
+    };
+}
+
+/// The three iteration types of a generator's return type, `no_type` where
+/// tsc has none.
+const IterationTypes = struct { yield: TypeId, ret: TypeId, next: TypeId };
+
+/// tsc's generator arm of `checkSignatureDeclaration`: a WRITTEN generator
+/// return type must be something the generator's own `Generator<Y, R, N>`
+/// is assignable to.
+///
+/// ```ts
+/// if (returnType === voidType) error(returnTypeNode, A_generator_cannot_have_a_void_type_annotation);
+/// else {
+///     const generatorYieldType  = getIterationTypeOfGeneratorFunctionReturnType(Yield,  returnType, isAsync) || anyType;
+///     const generatorReturnType = getIterationTypeOfGeneratorFunctionReturnType(Return, returnType, isAsync) || generatorYieldType;
+///     const generatorNextType   = getIterationTypeOfGeneratorFunctionReturnType(Next,   returnType, isAsync) || unknownType;
+///     checkTypeAssignableTo(createGeneratorReturnType(...), returnType, returnTypeNode);
+/// }
+/// ```
+///
+/// The round trip is the point, and tsc's own comment says why a plain
+/// "`Generator<any, any, any>` is assignable to the annotation" probe is not
+/// enough: `interface BadGenerator extends Iterator<number>, Iterable<string>
+/// {}` is self-contradictory, and only re-forming a `Generator` out of the
+/// types the annotation ITSELF implies exposes it. ztsc checked nothing here,
+/// so `function* g(): number {}` and `function* g(): void {}` were silent
+/// (`generatorTypeCheck6`/`7`/`8`/`9`).
+///
+/// Nothing is reported when the annotation is an error/`any` type (already
+/// diagnosed, or deliberately opaque) or when the program has no lib to name
+/// `Generator` with.
+fn checkGeneratorReturnAnnotation(c: *Checker, ret_node: Node, ann: TypeId, is_async: bool) Error!void {
+    switch (c.ts.kind(ann)) {
+        .void => {
+            try c.diagFmt(2505, c.nodeSpan(ret_node), "A generator cannot have a 'void' type annotation.", .{});
+            return;
+        },
+        .any, .err, .none => return,
+        else => {},
+    }
+    const gen_sym = c.prog.globals.lookup(
+        if (is_async) c.atom_AsyncGenerator else c.atom_Generator,
+    ) orelse return;
+    if (!c.symFlags(gen_sym).interface) return;
+    const it = try generatorReturnIterationTypes(c, ann, is_async);
+    const y = if (it.yield == types.no_type) types.any_type else it.yield;
+    const r = if (it.ret == types.no_type) y else it.ret;
+    const n = if (it.next == types.no_type) types.unknown_type else it.next;
+    const inst = try c.ts.makeRef(gen_sym, &.{ y, r, n });
+    _ = try c.checkAssignable(inst, ann, null_node, c.nodeSpan(ret_node));
+}
+
 /// `ret_ctx` is the contextual signature's return type when this function
 /// has no return annotation (0 otherwise / when there is no context). It
 /// only supplies a contextual type to the return expressions — the
@@ -1193,6 +1328,14 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
         // values (→ TReturn) are unchecked (gap).
         yield_type = c.generatorYieldType(ann);
         eff_ann = types.no_type;
+    }
+    // A WRITTEN generator return type has to be something a generator can
+    // actually produce — see `checkGeneratorReturnAnnotation`. Only with a
+    // body: tsc's `getFunctionFlags` marks a bodyless declaration `Invalid`
+    // and the check is gated on `(flags & (Invalid | Generator)) ===
+    // Generator`, so an overload signature and `declare function*` are exempt.
+    if (is_generator and proto.return_type != 0) {
+        try checkGeneratorReturnAnnotation(c, proto.return_type, ann, is_async);
     }
     // No contextual fallback for an un-annotated generator's yield type.
     // tsc's `getContextualIterationType` exists, but taking it here (plus a
