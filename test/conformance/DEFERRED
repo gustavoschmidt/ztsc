@@ -122,33 +122,6 @@ assignability/065_callback_parameter_variance.ts  -TS2322 74
 # sixth cast since.) Line 14, whose operands are not deferred, still reports.
 indexed/032_cast_to_deferred_indexed_access_negatives.ts  -TS2352 8
 
-# A NUMBER-literal key that names no member is not reported. The string-literal
-# arm of element access reports the implicit-'any' miss (TS7053); the numeric
-# arm falls back to the receiver's numeric index signature, which for an object
-# without one is `any`, silently. Reporting there needs the numeric key space to
-# be modelled as exactly as the named one is — arrays, tuples, enum objects and
-# lib types all index numerically through paths ztsc approximates — so a
-# "cannot index" verdict on this arm would be a false positive on correct code,
-# which policy forbids.
-#
-# Measured 2026-08-02, with the report added under the same guard the
-# string-literal arm uses (object receiver, no numeric or string index
-# signature, not `globalThis`). Conformance stays clean, and so do the
-# 16-package corpus and excalidraw — but a targeted probe against the oracle
-# finds two shapes immediately:
-#
-#   enum E { A, B }        E[0]        oracle: `string` (REVERSE MAPPING),
-#                                      ztsc: false TS7053
-#   Map<number, string>    m[0]        oracle: TS7052 ("no index signature"),
-#                                      ztsc: TS7053 — the wrong code, i.e. one
-#                                      excess key and one under
-#
-# The enum-object arm alone is a false positive on correct code, so the arm
-# stays silent. Deterministic under-report of one report; the ELEMENT TYPE the
-# same access produces is exact (that is what lines 7, 11 and 19 pin, and what
-# `constassert/006` as a whole is about).
-constassert/006_template_expr_const_context_negatives.ts  -TS7053 16
-
 # TS2344 decides a written type argument against its parameter's constraint
 # when that constraint is a PRIMITIVE OR LITERAL SET (a primitive, a literal,
 # an enum member, `never`, or a union/intersection of those) or a STRUCTURAL

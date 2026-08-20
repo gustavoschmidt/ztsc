@@ -32,6 +32,7 @@ const conditions = @import("conditions.zig");
 const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const buildRefKey = @import("flow.zig").buildRefKey;
+const checkAssignPatternExcessProps = @import("destructure.zig").checkAssignPatternExcessProps;
 const checkFunctionBody = @import("stmts.zig").checkFunctionBody;
 const containerOf = Checker.containerOf;
 const ctxWantsTemplate = @import("generics.zig").ctxWantsTemplate;
@@ -39,6 +40,7 @@ const diagFmt = Checker.diagFmt;
 const discriminate_ctx = @import("discriminate_ctx.zig");
 const flowContainerOf = @import("flow.zig").flowContainerOf;
 const flowTypeOfReference = @import("flow.zig").flowTypeOfReference;
+const this_flow_root = @import("flow.zig").this_flow_root;
 const gatherSpreadProps = @import("typenode.zig").gatherSpreadProps;
 const globalThisType = @import("instantiate.zig").globalThisType;
 const inForHeadWriteTarget = @import("flow.zig").inForHeadWriteTarget;
@@ -61,6 +63,7 @@ const resolveStructural = @import("instantiate.zig").resolveStructural;
 const scratch = Checker.scratch;
 const sig_zig = @import("signatures.zig");
 const signatureOfProtoCtx = sig_zig.signatureOfProtoCtx;
+const sliceTuple = @import("typenode.zig").sliceTuple;
 const templateExprType = @import("generics.zig").templateExprType;
 const tuple_relate = @import("tuple_relate.zig");
 const tupleElemTypeAt = @import("assign.zig").tupleElemTypeAt;
@@ -245,6 +248,33 @@ fn thisBoundKey(c: *const Checker, fn_node: Node) u64 {
 /// `Checker.this_bound_fns`.
 fn markThisBound(c: *Checker, fn_node: Node) Error!void {
     try c.this_bound_fns.put(c.cm(), thisBoundKey(c, fn_node), {});
+}
+
+/// A property/element access whose RECEIVER is `this`, narrowed the way tsc's
+/// `tryGetThisTypeAt` narrows it: both of its arms — the function-like
+/// container and the class-body one — hand their answer to
+/// `getFlowTypeOfReference(node, thisType)`, so every guard that refines a
+/// named receiver refines `this` too. The one that needs it most is the
+/// `this is T` predicate: `if (this.hasData()) this.data.toLowerCase()` is
+/// only sound because the call narrowed the RECEIVER and the property was
+/// then read off the narrowed type. `flow.predicateOfCall` already hands the
+/// `this` node back as such a guard's subject, and `flow.identIsSym` already
+/// answers the `this` sentinel root with "is a `this_expr`", so the empty
+/// path over that root — the same root `buildRefKey` mints for `this.p` —
+/// is a reference the walk can match as-is.
+///
+/// The flow node queried is the ACCESS's, not the `this` keyword's: ztsc's
+/// binder attaches flow to references and accesses, and has no `ThisKeyword`
+/// arm of tsc's `bindWorker`. The two are the same flow node by construction
+/// — a member expression is bound before its own children, so `this.p` and
+/// the `this` inside it would record one and the same `currentFlow` — so
+/// standing in for it here is exact for every receiver. (A bare `this` in
+/// some other position — `const x: DatafulFoo<T> = this` — still reads the
+/// declared type; narrowing that one needs the binder to attach a flow node
+/// to the keyword itself.)
+fn narrowThisReceiver(c: *Checker, recv: Node, site: Node, t: TypeId) Error!TypeId {
+    if (c.nodeTag(recv) != .this_expr) return t;
+    return c.flowTypeOfKey(site, .{ .sym = this_flow_root }, t);
 }
 
 fn atFileTopLevel(c: *const Checker) bool {
@@ -3157,6 +3187,98 @@ fn checkPropValue(c: *Checker, value: Node, pctx: TypeId, marker: TypeId) Error!
     return c.checkExprCached(value, pctx);
 }
 
+/// tsc's `getUnionIndexInfos`, which is what decides an object literal's
+/// index signatures once the literal SPREADS.
+///
+/// `getSpreadType` folds the literal left to right, and its parts are the
+/// spread sources interleaved with the runs of own properties between them
+/// (`checkObjectLiteral` flushes `propertiesArray` into a part before each
+/// spread and once more at the end). An index signature survives only when
+/// EVERY part declares one: `getUnionIndexInfos` seeds its candidate list
+/// from the accumulated left and drops any key type `every(types, …)` does
+/// not answer for. The first fold is the exception that makes part 0 a SEED
+/// rather than a filter — `left === emptyObjectType` takes the right's infos
+/// verbatim.
+///
+/// So `{ ...indexed1, b: 11 }` has no index signature at all, because the
+/// `{ b: 11 }` part has none, and `i[101]` on the result is TS7053
+/// (`objectSpreadIndexSignature`). Carrying one anyway silences exactly the
+/// reads tsc refuses. `{ ...indexed1, ...indexed2 }` keeps one, with the
+/// UNION of the two value types.
+///
+/// A literal with no spread never reaches `getSpreadType`: its index
+/// signatures come from its computed keys alone
+/// (`getObjectLiteralIndexInfo`), which is the `!started` case.
+const SpreadIndexFold = struct {
+    /// Has any part been folded in? While false there is nothing to filter,
+    /// and the literal's own computed-key indexes stand unchanged.
+    started: bool = false,
+    /// Does EVERY part so far declare this index kind? Once false the kind is
+    /// gone: `getUnionIndexInfos` never re-seeds.
+    str_all: bool = true,
+    num_all: bool = true,
+    /// One value type per part, unioned into the result. Meaningful only
+    /// while the matching `*_all` still holds.
+    str: std.ArrayList(TypeId) = .empty,
+    num: std.ArrayList(TypeId) = .empty,
+
+    fn deinit(f: *SpreadIndexFold, c: *Checker) void {
+        f.str.deinit(c.scratch());
+        f.num.deinit(c.scratch());
+    }
+
+    /// Fold one part in. `str`/`num` are its own index value types, `0` where
+    /// the part declares no index of that kind.
+    fn part(f: *SpreadIndexFold, c: *Checker, str: TypeId, num: TypeId) Error!void {
+        f.started = true;
+        if (str == 0) f.str_all = false else if (f.str_all) try f.str.append(c.scratch(), str);
+        if (num == 0) f.num_all = false else if (f.num_all) try f.num.append(c.scratch(), num);
+    }
+
+    fn result(f: *const SpreadIndexFold, c: *Checker, comptime numeric: bool) Error!TypeId {
+        const live = if (numeric) f.num_all else f.str_all;
+        const vals = if (numeric) f.num.items else f.str.items;
+        if (!live or vals.len == 0) return 0;
+        return c.ts.makeUnion(c.scratch(), vals);
+    }
+};
+
+/// Fold the run of own properties accumulated since the last spread in as one
+/// part — tsc's `spread = getSpreadType(spread, createObjectLiteralType())`,
+/// which `checkObjectLiteral` runs before each spread and once at the end,
+/// guarded on `propertiesArray.length > 0`. The run's own index signatures
+/// are whatever its computed keys contributed.
+fn flushOwnIndexPart(
+    c: *Checker,
+    fold: *SpreadIndexFold,
+    pending: *bool,
+    str_vals: *std.ArrayList(TypeId),
+    num_vals: *std.ArrayList(TypeId),
+) Error!void {
+    if (!pending.*) return;
+    pending.* = false;
+    const s = if (str_vals.items.len > 0) try c.ts.makeUnion(c.scratch(), str_vals.items) else 0;
+    const n = if (num_vals.items.len > 0) try c.ts.makeUnion(c.scratch(), num_vals.items) else 0;
+    str_vals.clearRetainingCapacity();
+    num_vals.clearRetainingCapacity();
+    try fold.part(c, s, n);
+}
+
+/// Fold a spread SOURCE's gathered index signatures in as one part. A source
+/// can contribute several (an intersection is walked constituent by
+/// constituent), and they are one operand of the spread between them, so they
+/// union into a single part rather than filtering each other.
+fn foldSpreadPart(
+    c: *Checker,
+    fold: *SpreadIndexFold,
+    str_vals: *std.ArrayList(TypeId),
+    num_vals: *std.ArrayList(TypeId),
+) Error!void {
+    const s = if (str_vals.items.len > 0) try c.ts.makeUnion(c.scratch(), str_vals.items) else 0;
+    const n = if (num_vals.items.len > 0) try c.ts.makeUnion(c.scratch(), num_vals.items) else 0;
+    try fold.part(c, s, n);
+}
+
 /// One constituent of an object literal's type. `dist` names the spread
 /// elements whose source types are replaced for this constituent (see
 /// `checkObjectLiteral`); it is empty for an undistributed literal.
@@ -3196,6 +3318,17 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
     defer str_index_vals.deinit(c.scratch());
     var num_index_vals: std.ArrayList(TypeId) = .empty;
     defer num_index_vals.deinit(c.scratch());
+    // …and, once the literal spreads, one PART of `getSpreadType`'s fold (see
+    // `SpreadIndexFold`): the two lists above accumulate the run of own
+    // properties since the last spread, and `idx_fold` folds each completed
+    // run and each spread source in turn.
+    var idx_fold: SpreadIndexFold = .{};
+    defer idx_fold.deinit(c);
+    // Is there an own-property run to flush? tsc's `propertiesArray.length >
+    // 0` guard on the flush, so a spread that directly follows another one
+    // contributes no empty part between them.
+    var own_pending = false;
+    var saw_spread = false;
     // Spreading an `any`-typed source poisons the whole object literal to
     // `any` (tsc: `{ ...anyVal, x }` has type `any`), so member access on
     // it is unchecked. Tracked here and short-circuited after the loop.
@@ -3212,6 +3345,9 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
     for (c.tree.nodeRange(node)) |prop| {
         if (prop == null_node) continue;
         const pd = c.tree.nodeData(prop);
+        // Every non-spread member joins tsc's `propertiesArray`, and so the
+        // own-property part waiting to be folded (see `SpreadIndexFold`).
+        if (c.nodeTag(prop) != .spread_element) own_pending = true;
         // tsc's `getContainingObjectLiteral`: a function-like written as an
         // object-literal MEMBER — a `m() {}` shorthand (whose body the parser
         // hangs off it as a `function_expr`) or a `function () {}` property
@@ -3440,6 +3576,17 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                 }
                 const st = try c.resolveStructural(src);
                 if (c.ts.kind(st) == .any or c.ts.kind(st) == .err) spread_any = true;
+                // The own-property run this spread ends is a part of
+                // `getSpreadType`'s fold, and the spread's source is the next
+                // one (see `SpreadIndexFold`). The source's index signatures
+                // are gathered into lists of their own so they can be folded
+                // as ONE part rather than merged into the running union.
+                saw_spread = true;
+                try flushOwnIndexPart(c, &idx_fold, &own_pending, &str_index_vals, &num_index_vals);
+                var sp_str: std.ArrayList(TypeId) = .empty;
+                defer sp_str.deinit(c.scratch());
+                var sp_num: std.ArrayList(TypeId) = .empty;
+                defer sp_num.deinit(c.scratch());
                 // tsc's `getSpreadType`: when either side `isGenericObject
                 // Type` the spread is an INTERSECTION, not a flattened
                 // object — the generic half has no members to copy yet, and
@@ -3450,6 +3597,10 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                 // contributed NOTHING at all, so the literal lost every
                 // property the spread carried.
                 switch (c.ts.kind(st)) {
+                    // A generic source is folded as no part at all: tsc leaves
+                    // `getUnionIndexInfos` behind entirely here and answers
+                    // `getIntersectionType([left, right])`, so the left half
+                    // keeps whatever index signatures it had.
                     .type_param, .mapped, .index_access, .conditional => {
                         try generic_spreads.append(c.scratch(), st);
                         continue;
@@ -3475,19 +3626,30 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                             }
                         }
                         if (any_generic) {
+                            // The concrete constituents are ONE part between
+                            // them: they are one operand of tsc's spread.
                             for (try c.memberList(st)) |m| {
                                 const rm = try c.resolveStructural(m);
                                 switch (c.ts.kind(rm)) {
                                     .type_param, .mapped, .index_access, .conditional => {},
-                                    else => try c.gatherSpreadProps(rm, &props, &prop_index, &str_index_vals, &num_index_vals),
+                                    else => try c.gatherSpreadProps(rm, &props, &prop_index, &sp_str, &sp_num),
                                 }
                             }
+                            try foldSpreadPart(c, &idx_fold, &sp_str, &sp_num);
                             continue;
                         }
                     },
                     else => {},
                 }
-                try c.gatherSpreadProps(st, &props, &prop_index, &str_index_vals, &num_index_vals);
+                try c.gatherSpreadProps(st, &props, &prop_index, &sp_str, &sp_num);
+                // A nullish or primitive source is `getSpreadType`'s `return
+                // left`: not a part of the fold at all, so it neither supplies
+                // an index signature nor filters one out. Those are exactly
+                // the sources `gatherSpreadProps` walks nothing for.
+                switch (c.ts.kind(st)) {
+                    .object, .intersection, .union_type => try foldSpreadPart(c, &idx_fold, &sp_str, &sp_num),
+                    else => {},
+                }
             },
             else => _ = try c.checkExprCached(prop, types.no_type),
         }
@@ -3503,8 +3665,23 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
     if (c.const_ctx) {
         for (props.items) |*p| p.flags |= types.prop_flag_readonly;
     }
-    const sidx = if (str_index_vals.items.len > 0) try c.ts.makeUnion(c.scratch(), str_index_vals.items) else 0;
-    const nidx = if (num_index_vals.items.len > 0) try c.ts.makeUnion(c.scratch(), num_index_vals.items) else 0;
+    // A literal that SPREADS takes its index signatures from the fold — every
+    // part has to declare one (`SpreadIndexFold`). One that does not spread
+    // never reaches `getSpreadType` and keeps whatever its computed keys gave
+    // it.
+    if (saw_spread) try flushOwnIndexPart(c, &idx_fold, &own_pending, &str_index_vals, &num_index_vals);
+    const sidx = if (saw_spread)
+        try idx_fold.result(c, false)
+    else if (str_index_vals.items.len > 0)
+        try c.ts.makeUnion(c.scratch(), str_index_vals.items)
+    else
+        0;
+    const nidx = if (saw_spread)
+        try idx_fold.result(c, true)
+    else if (num_index_vals.items.len > 0)
+        try c.ts.makeUnion(c.scratch(), num_index_vals.items)
+    else
+        0;
     const obj = try c.ts.makeObject(props.items, sidx, nidx, types.obj_flag_fresh | types.obj_flag_literal_origin);
     // A type-parameter spread (`{ ...data, extra }`, `data: T`) yields
     // `T & { extra }` so the literal stays assignable to `T`.
@@ -3789,7 +3966,8 @@ fn memberChainInner(c: *Checker, node: Node, ctx: TypeId) Error!ChainLink {
             break :obj link.ty;
         }
         if (try superReceiverType(c, d.lhs)) |st| break :obj st;
-        break :obj try c.checkExprCached(d.lhs, types.no_type);
+        const base = try c.checkExprCached(d.lhs, types.no_type);
+        break :obj try narrowThisReceiver(c, d.lhs, node, base);
     };
     const name_tok: TokenIndex = d.rhs;
     const name = try c.memberAtom(name_tok);
@@ -4280,7 +4458,8 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
             if (link.chained) chained = true;
             break :obj link.ty;
         }
-        break :obj try c.checkExprCached(d.lhs, types.no_type);
+        const base = try c.checkExprCached(d.lhs, types.no_type);
+        break :obj try narrowThisReceiver(c, d.lhs, node, base);
     };
     // The index expression runs only on the chain's non-nullish branch, so
     // it sees the chain's own guards (`pushChainGuards`).
@@ -4433,6 +4612,40 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
                 // number-keyed lookup table lost its element type.
                 result = if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
             } else {
+                // No property of that numeric name and no index signature to
+                // reach through: the numeric-literal counterpart of the
+                // string-literal arm above, and the same implicit-'any'
+                // element access for tsc (TS7053). It is what makes
+                // `{ ...indexed, b: 11 }[101]` an error once the spread has
+                // dropped the index signature (`SpreadIndexFold`).
+                //
+                // Only for a plain object receiver: an array/tuple/string has
+                // its own numeric domain (answered above), and `globalThis`
+                // has its own code (TS7017), exactly as in the `string` arm.
+                //
+                // And only where the miss is CERTAIN, because two of ztsc's
+                // approximations show up right here:
+                //
+                //   * a key `numericKeyProp` declines — a fraction, or a
+                //     magnitude past the safe-integer range — still names a
+                //     property for tsc, whose `getPropertyNameFromIndex`
+                //     renders the literal the way JS does. `class C { 1.1:
+                //     string }` indexed `c[1.1]` reads that member;
+                //   * a FRESH object literal's own index signatures come from
+                //     its computed keys, which ztsc types more coarsely than
+                //     tsc (a `this` inside a class computed name has no type
+                //     at all, so `{ [this.bar()]: 1 }` loses the numeric index
+                //     tsc gives it).
+                //
+                // Both stay silent — an under-report rather than an invention.
+                const v = c.ts.numberValue(rl);
+                if (rk == .object and c.ts.objectNumberIndex(r) == 0 and c.ts.objectStringIndex(r) == 0 and
+                    c.ts.objectFlags(r) & types.obj_flag_global_this == 0 and
+                    !c.ts.objectIsLiteralOrigin(r) and
+                    v == @floor(v) and @abs(v) < 9007199254740992.0)
+                {
+                    try reportIndexImplicitAny(c, node, d.lhs, idx_t, obj_t);
+                }
                 result = try c.numberIndexType(r);
             }
         },
@@ -5408,6 +5621,14 @@ fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
     // per-element lookups are the check.
     if (op == .eq and isDestructuringPattern(c, d.lhs)) {
         const src = try c.checkExprCached(d.rhs, types.no_type);
+        // …with one thing the pattern IS a type for: it is the right
+        // operand's contextual type (`getContextualTypeForBinaryOperand`
+        // answers `getTypeOfExpression(left)`), and a pattern-shaped
+        // contextual type makes every member of the right-hand literal it
+        // does not name TS2353. Raised here rather than from inside the
+        // literal's own check, since ztsc does not hand the pattern down as a
+        // contextual type — nothing else about the right side depends on it.
+        try checkAssignPatternExcessProps(c, d.lhs, d.rhs);
         try checkDestructuringPattern(c, d.lhs, src);
         return src;
     }
@@ -6402,11 +6623,30 @@ fn checkArrayDestructuringElement(c: *Checker, el: Node, src: TypeId, iterated: 
     if (el == null_node) return;
     switch (c.nodeTag(el)) {
         .omitted, .error_node, .unsupported => {},
-        // `[a, ...rest] = src`: the rest is an array of the remaining
-        // elements, not the element at `index`.
-        .spread_element, .rest_element => try checkDestructuringTarget(c, c.tree.nodeData(el).lhs, types.no_type, .assignment),
+        // `[a, ...rest] = src`: the rest is the remaining elements, not the
+        // element at `index`.
+        .spread_element, .rest_element => try checkDestructuringTarget(c, c.tree.nodeData(el).lhs, try arrayRestSourceType(c, src, iterated, index), .assignment),
         else => try checkDestructuringTarget(c, el, try destructuringElementType(c, src, iterated, index), .assignment),
     }
+}
+
+/// The type an array-pattern REST position reads, tsc's
+/// `checkArrayLiteralDestructuringElementAssignment`:
+/// `everyType(sourceType, isTupleType) ? sliceTupleType(t, elementIndex) :
+/// createArrayType(elementType)`. A tuple source keeps its remaining
+/// positions — which is what tells `[...{ 0: a, b }] = tuple` that
+/// `[string, number]` has no `b` — and anything else is an array of the
+/// iterated element type.
+///
+/// `no_type` where the source is unknown, which is what every rest position
+/// used to read: a nested pattern under one then resolves nothing, exactly
+/// as it did before.
+fn arrayRestSourceType(c: *Checker, src: TypeId, iterated: TypeId, index: u32) Error!TypeId {
+    if (src == types.no_type) return types.no_type;
+    const r = try c.resolveStructural(src);
+    if (c.ts.kind(r) == .tuple) return sliceTuple(c, r, index, 0);
+    if (iterated == types.no_type) return types.no_type;
+    return c.ts.makeArray(iterated);
 }
 
 /// The assignment target of one pattern element, peeled through its default
