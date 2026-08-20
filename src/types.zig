@@ -2301,12 +2301,25 @@ pub const Store = struct {
     }
 
     /// tsc's `TypeFlags.DisjointDomains`: the primitive domains no value can
-    /// belong to two of. `boolean` is deliberately absent — tsc leaves it out
-    /// too — and so is `TypeFlags.Object`, which is why a branded
+    /// belong to two of. `TypeFlags.Object` is absent, which is why a branded
     /// `string & { __brand }` and `NonNullable<T>`'s `T & {}` survive.
     ///
-    /// An enum has no bit: a member's domain follows its VALUE, which the
-    /// store cannot read, so an enum-bearing intersection is left alone.
+    /// BOOLEAN carries one, which tsc's flag set does not spell out: it reaches
+    /// the same answer by distributing `boolean` into `true | false` and
+    /// intersecting the primitive unions element-wise
+    /// (`intersectUnionsOfPrimitiveTypes`), so `boolean & string`,
+    /// `boolean & 1`, `true & number` — every boolean-vs-other-domain pair —
+    /// is `never` in tsgo 7.0.2 (oracle-verified, the whole matrix). Without
+    /// the bit those intersections stayed live: `string & boolean` was NOT
+    /// assignable to anything the two halves are not, so a value of that
+    /// (uninhabited) type was a false TS2322, and
+    /// `(number | boolean) & (string | boolean)` printed as its unreduced
+    /// cross product instead of `boolean` (`signatureCombiningRestParameters5`).
+    /// `boolean & {}` and `boolean & { __brand }` keep working: an object has
+    /// no bit, so the pair is not two DIFFERENT domains.
+    ///
+    /// An enum has no bit either: a member's domain follows its VALUE, which
+    /// the store cannot read, so an enum-bearing intersection is left alone.
     fn disjointDomain(s: *const Store, t: TypeId) u32 {
         return switch (s.kind(t)) {
             .object_keyword => 1, // NonPrimitive
@@ -2316,6 +2329,7 @@ pub const Store = struct {
             .symbol, .unique_symbol => 16,
             .void, .undefined => 32,
             .null => 64,
+            .boolean, .bool_true, .bool_false => 128,
             else => 0,
         };
     }
