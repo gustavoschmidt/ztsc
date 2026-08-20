@@ -164,10 +164,7 @@ pub fn findBindingType(c: *Checker, pat: Node, name: Atom, whole: TypeId, bf: ?B
                 switch (c.nodeTag(el)) {
                     .binding_property => {
                         const key = try c.memberAtom(c.tree.nodeMainToken(el));
-                        var pt: TypeId = types.any_type;
-                        if (try c.propOfType(try c.resolveStructural(whole), key)) |p| {
-                            pt = if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
-                        }
+                        var pt: TypeId = (try patternPropType(c, whole, key)) orelse types.any_type;
                         // Inherit the narrowing of `<initializer>.key` at the
                         // declaration (see `bindingFlowBase`).
                         var sub_bf: ?BindFlow = null;
@@ -219,12 +216,7 @@ pub fn findBindingType(c: *Checker, pat: Node, name: Atom, whole: TypeId, bf: ?B
                 if (el == null_node) continue;
                 defer i += 1;
                 if (c.nodeTag(el) == .omitted) continue;
-                var et: TypeId = types.any_type;
-                switch (c.ts.kind(r)) {
-                    .array => et = c.ts.arrayElem(r),
-                    .tuple => et = try tupleBindingElemType(c, r, i),
-                    else => {},
-                }
+                const et: TypeId = (try patternElemType(c, r, i)) orelse types.any_type;
                 if (c.nodeTag(el) == .rest_element) {
                     const ed = c.tree.nodeData(el);
                     // tsc's `getTypeForBindingElement`: a rest over a TUPLE is
@@ -251,6 +243,28 @@ pub fn findBindingType(c: *Checker, pat: Node, name: Atom, whole: TypeId, bf: ?B
         .rest_element => return c.findBindingType(d.lhs, name, whole, null),
         else => return null,
     }
+}
+
+/// What an OBJECT pattern's `key` element destructures out of `whole` — tsc's
+/// `getTypeOfPropertyOfType(parentType, name)`, with `undefined` folded in for
+/// an optional property. Null when the source has no such property, which is
+/// "no answer": `findBindingType` reads that as `any` and continues, while a
+/// CONTEXTUAL use reads it as no contextual type at all.
+pub fn patternPropType(c: *Checker, whole: TypeId, key: Atom) Error!?TypeId {
+    if (whole == types.no_type) return null;
+    const p = (try c.propOfType(try c.resolveStructural(whole), key)) orelse return null;
+    return if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
+}
+
+/// The same for an ARRAY pattern's position `i` of a RESOLVED source `r` —
+/// tsc's `getContextualTypeForElementExpression(parentType, index)`. Null for
+/// a source that is neither an array nor a tuple.
+pub fn patternElemType(c: *Checker, r: TypeId, i: u32) Error!?TypeId {
+    return switch (c.ts.kind(r)) {
+        .array => c.ts.arrayElem(r),
+        .tuple => try tupleBindingElemType(c, r, i),
+        else => null,
+    };
 }
 
 /// What a binding element with a DEFAULT reads, given `et`, what the source
