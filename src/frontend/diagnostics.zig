@@ -138,6 +138,13 @@ pub const Code = enum(u16) {
     /// the token after it, on the theory that `foo bar` is a misspelled keyword
     /// rather than a forgotten semicolon.
     unexpected_keyword_or_identifier,
+    /// TS1260: a keyword spelled with a `\uXXXX` escape (`var x = 1`).
+    /// tsc's scanner looks the COOKED text up and answers the KEYWORD token, so
+    /// the word is a keyword that merely cannot be written that way; `nextToken`
+    /// reports this every time such a token is consumed in keyword position
+    /// (`createIdentifier` uses `nextTokenWithoutCheck`, which is why the same
+    /// spelling is fine as a NAME: `var await = 12`).
+    keyword_with_escape,
     /// `a ?? b || c` without parentheses (TS(5076)-style grammar error).
     nullish_mixed_with_logical,
     /// Tagged template in an optional chain: `a?.b`c`` is a syntax error.
@@ -1293,6 +1300,7 @@ pub const Code = enum(u16) {
             .expected_of_or_in => "expected 'of' or 'in'",
             .unexpected_token => "unexpected token",
             .unexpected_keyword_or_identifier => "Unexpected keyword or identifier.",
+            .keyword_with_escape => "Keywords cannot contain escape characters.",
             .nullish_mixed_with_logical => "'??' and '||' operations cannot be mixed without parentheses.",
             .tagged_template_in_optional_chain => "Tagged template expressions are not permitted in an optional chain.",
             .newline_before_arrow => "Line terminator not permitted before arrow.",
@@ -1607,6 +1615,7 @@ pub const Code = enum(u16) {
             .regex_unicode_escape_needs_flag => 1538,
             .expected_declaration_or_statement => 1128,
             .unexpected_keyword_or_identifier => 1434,
+            .keyword_with_escape => 1260,
             .expected_statement => 1129,
             .expected_expression => 1109,
             .expected_identifier => 1003,
