@@ -56,12 +56,7 @@ pub fn ownStaticMemberProp(c: *Checker, cls: SymbolId, name: Atom) Error!?types.
     for (lo..hi) |i| {
         if (try c.nominalizeComputedKey(c.bind.member_atoms[i], kscope) != name) continue;
         const msym = c.toGlobal(c.bind.member_syms[i]);
-        const mf = c.symFlags(msym);
-        var flags: u32 = 0;
-        if (mf.readonly_member) flags |= types.prop_flag_readonly;
-        if (mf.getter and !mf.setter) flags |= types.prop_flag_readonly;
-        flags |= visibilityPropFlags(c, msym, mf.non_public);
-        if (mf.method or mf.getter or mf.setter) flags |= types.prop_flag_class_fn;
+        const flags = staticPropFlags(c, msym);
         // `this` inside a static member is the class's constructor type,
         // exactly as `classStaticType` sets it before resolving one.
         const saved_this = c.this_type;
@@ -70,6 +65,27 @@ pub fn ownStaticMemberProp(c: *Checker, cls: SymbolId, name: Atom) Error!?types.
         return .{ .name = name, .ty = try c.typeOfSymbol(msym), .flags = flags };
     }
     return null;
+}
+
+/// The `Prop` flag word one static member symbol contributes.
+///
+/// ONE definition for the two readers — `ownStaticMemberProp`'s single-member
+/// fast path and `classStaticType`'s whole-table build — which were two copies
+/// of the same five lines, one demand apart, with nothing keeping them in step.
+///
+/// `prop_flag_optional` is missing from BOTH and belongs here: `static s?: T`
+/// is an optional property and the static side has never said so. It is left
+/// out until a `super.<name>` reference can be narrowed — see the note beside
+/// `optional_member` in `Binder.bindClass`, which is the same one-word fix on
+/// the instance side and measures net negative without it.
+fn staticPropFlags(c: *Checker, msym: SymbolId) u32 {
+    const mf = c.symFlags(msym);
+    var flags: u32 = 0;
+    if (mf.readonly_member) flags |= types.prop_flag_readonly;
+    if (mf.getter and !mf.setter) flags |= types.prop_flag_readonly;
+    flags |= visibilityPropFlags(c, msym, mf.non_public);
+    if (mf.method or mf.getter or mf.setter) flags |= types.prop_flag_class_fn;
+    return flags;
 }
 
 /// Contextually type the STATIC fields of a class EXPRESSION — tsc's
@@ -290,12 +306,6 @@ pub fn classStaticType(c: *Checker, sym0: SymbolId) Error!TypeId {
         const hi = c.bind.scope_members_start[ss + 1];
         for (lo..hi) |i| {
             const msym = c.toGlobal(c.bind.member_syms[i]);
-            const mf = c.symFlags(msym);
-            var flags: u32 = 0;
-            if (mf.readonly_member) flags |= types.prop_flag_readonly;
-            if (mf.getter and !mf.setter) flags |= types.prop_flag_readonly;
-            flags |= visibilityPropFlags(c, msym, mf.non_public);
-            if (mf.method or mf.getter or mf.setter) flags |= types.prop_flag_class_fn;
             try props.append(c.scratch(), .{
                 .name = try c.nominalizeComputedKey(c.bind.member_atoms[i], kscope),
                 // Route through typeOfSymbol (not memberTypeOf directly) so a
@@ -307,7 +317,7 @@ pub fn classStaticType(c: *Checker, sym0: SymbolId) Error!TypeId {
                 // Statics can't reference the class type params, so the
                 // per-symbol type cache is sound here.
                 .ty = try c.typeOfSymbol(msym),
-                .flags = flags,
+                .flags = staticPropFlags(c, msym),
             });
         }
     }
@@ -378,7 +388,7 @@ pub fn classStaticType(c: *Checker, sym0: SymbolId) Error!TypeId {
             const base_static = try c.classStaticType(base);
             cut = c.class_static_cut;
             c.class_static_stack.items[my_frame].in_base = false;
-            result = try c.mergeBaseObject(result, base_static, false);
+            result = try c.mergeBaseObject(result, try withoutPrivateNames(c, base, base_static), false);
         } else if (blk: {
             c.class_static_stack.items[my_frame].in_base = true;
             defer c.class_static_stack.items[my_frame].in_base = false;
@@ -430,6 +440,71 @@ pub fn classStaticType(c: *Checker, sym0: SymbolId) Error!TypeId {
         try noteStaticOwner(c, sym, result);
     }
     return result;
+}
+
+/// `base_static` with the base's own `#name` statics removed — the one thing a
+/// derived class does NOT inherit.
+///
+/// tsc puts a private INSTANCE member on every derived instance type (`x:
+/// Derived` reads `Base`'s `#prop`, which is `privateNameFieldDerivedClasses`'
+/// TS18013) but a `static #name` on no derived STATIC type at all: the private
+/// identifier's escaped name is mangled per class, so
+/// `getPropertyOfType(typeof Child, "#bar")` simply finds nothing and
+/// `Child.#bar` is a plain TS2339 (`privateNamesConstructorChain-1`/`-2`,
+/// `privateNameStaticAccessorssDerivedClasses`).
+///
+/// The rule is about the SPELLING, not about visibility: a `private static` IS
+/// inherited (reaching it from outside a derived class is TS2341, not TS2339),
+/// so this cannot screen on `prop_flag_non_public` — it asks the base's own
+/// static member DECLARATIONS whether their name token is a `#name`.
+///
+/// Transitively correct without a transitive walk: each level drops its own
+/// `#name` statics on the way down, so `base_static` never carries one from
+/// further up the chain.
+///
+/// COST. Reached only for a class that has a base class, and only past the
+/// base's static SCOPE existing at all; then one token-tag load per own static
+/// member declaration of the base — no name text is read (see the interner
+/// note in `nominal_members.zig`) and no type is resolved. A base with no
+/// `#name` static — every class in every app benchmark — returns
+/// `base_static` itself and allocates nothing.
+pub fn withoutPrivateNames(c: *Checker, base: SymbolId, base_static: TypeId) Error!TypeId {
+    if (c.ts.kind(base_static) != .object) return base_static;
+    var hidden: std.ArrayList(Atom) = .empty;
+    defer hidden.deinit(c.scratch());
+    {
+        const saved = c.enterSymFile(base);
+        defer c.restoreCtx(saved);
+        const ss = c.bind.staticsScopeOf(c.localOf(base)) orelse return base_static;
+        const lo = c.bind.scope_members_start[ss];
+        const hi = c.bind.scope_members_start[ss + 1];
+        for (lo..hi) |i| {
+            const msym = c.toGlobal(c.bind.member_syms[i]);
+            for (c.declsOf(msym)) |decl| {
+                if (c.tree.tokens.tag(c.tree.nodeMainToken(decl)) != .private_identifier) continue;
+                try hidden.append(c.scratch(), c.bind.member_atoms[i]);
+                break;
+            }
+        }
+    }
+    if (hidden.items.len == 0) return base_static;
+    const n = c.ts.objectPropCount(base_static);
+    var props: std.ArrayList(types.Prop) = .empty;
+    defer props.deinit(c.scratch());
+    next: for (0..n) |i| {
+        const p = c.ts.objectProp(base_static, @intCast(i));
+        for (hidden.items) |h| {
+            if (h == p.name) continue :next;
+        }
+        try props.append(c.scratch(), p);
+    }
+    if (props.items.len == n) return base_static;
+    return c.ts.makeObject(
+        props.items,
+        c.ts.objectStringIndex(base_static),
+        c.ts.objectNumberIndex(base_static),
+        c.ts.objectFlags(base_static),
+    );
 }
 
 /// The poison value of `Checker.class_static_owner`: a static table two classes

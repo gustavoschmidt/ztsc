@@ -135,6 +135,25 @@ fn stripModuleQuotes(text: []const u8) []const u8 {
 /// `ModifierFlags.NonPublic`). `public` is the default and never restricts.
 const nonpublic_mask: u32 = ast.Flags.private | ast.Flags.protected;
 
+/// An ECMAScript `#name` member carries no modifier at all, but it is
+/// non-public in the one sense `Symbol.non_public` (and the
+/// `prop_flag_non_public` the checker derives from it) is FOR: it belongs to
+/// the class that declared it and to no other, so the structural relation, the
+/// `keyof` key list and the object-spread filter must all screen it out
+/// (`nominal_members.zig` carries the wave-22 oracle for every shape).
+///
+/// The test is on the TOKEN TAG, never on the name text — `#x` and a quoted
+/// `{"#x": 1}` key intern to the same atom, and a name read would take the
+/// interner's shard mutex on a per-member path (see `nominal_members.zig`'s
+/// COST note). A member declaration is bound once, so this costs one tag load.
+///
+/// `accessOfMember` reads the MODIFIERS, so a `#name` still answers `.public`
+/// there and the TS2341/TS2445 access rules stay off it: an access from
+/// outside is `accessibility.checkPrivateName`'s TS18013, as before.
+fn isPrivateNameToken(b: *const Binder, tok: TokenIndex) bool {
+    return b.tree.tokens.tag(tok) == .private_identifier;
+}
+
 /// What kind of declaration is being bound; determines the flags a new
 /// symbol gets and which existing flags it refuses to merge with.
 const DeclKind = enum {
@@ -3208,7 +3227,7 @@ const Binder = struct {
                             .static_member = is_static,
                             .optional_member = f.flags & ast.Flags.optional != 0,
                             .readonly_member = f.flags & ast.Flags.readonly != 0,
-                            .non_public = f.flags & nonpublic_mask != 0,
+                            .non_public = f.flags & nonpublic_mask != 0 or isPrivateNameToken(b, tok),
                         });
                     }
                     try b.bindType(f.type_ann);
@@ -3245,8 +3264,28 @@ const Binder = struct {
                             try b.memberNameKey(tok, proto.flags);
                         _ = try b.declare(if (is_static) ss else ms, atom, kind, member, tok, .{
                             .static_member = is_static,
+                            // NOT SET, deliberately, and it is a known gap:
+                            // `m?(): number` is an OPTIONAL property whose type
+                            // is `(() => number) | undefined`, exactly as
+                            // `m?: () => number` is (tsc reads optionality off
+                            // the declaration in
+                            // `getTypeOfVariableOrParameterOrProperty` and does
+                            // not care whether it is a method or a field), so
+                            // `c.m()` should be TS2722 and `const d: C = {}`
+                            // legal. Setting it is a one-word change and it
+                            // measures NET NEGATIVE today, because a
+                            // `super.<name>` reference is not narrowable:
+                            // `refkey.buildRefKey` bottoms out at an identifier
+                            // or `this` and has no `super` root, so
+                            // `super.m && super.m()` cannot narrow and every
+                            // optional method reached that way becomes a false
+                            // positive (`controlFlowSuperPropertyAccess`). The
+                            // two land together: a `super_flow_root` sentinel
+                            // beside `this_flow_root` (refkey.zig) plus its two
+                            // readers in flow.zig (`identIsSym`,
+                            // `isPatternRoot`), and then this line.
                             .has_impl = md.rhs != 0 and !is_get and !is_set,
-                            .non_public = proto.flags & nonpublic_mask != 0,
+                            .non_public = proto.flags & nonpublic_mask != 0 or isPrivateNameToken(b, tok),
                         });
                     }
                     const is_ctor = b.tree.tokens.tag(tok) == .keyword_constructor and !is_static;

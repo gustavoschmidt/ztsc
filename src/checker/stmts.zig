@@ -47,6 +47,7 @@ const reachability = @import("reachability.zig");
 const reserved_names = @import("reserved_names.zig");
 const static_block = @import("static_block.zig");
 const signatures = @import("signatures.zig");
+const statics = @import("statics.zig");
 const typeOfSymbol = signatures.typeOfSymbol;
 const typespace = @import("typespace.zig");
 
@@ -1582,7 +1583,15 @@ fn checkStaticSideExtends(c: *Checker, class_sym: SymbolId, name_token: ast.Toke
     if (name_token == 0) return;
     const base = try c.baseClassSym(class_sym) orelse return;
     const derived_static = try c.classStaticType(class_sym);
-    const base_static = try c.classStaticType(base);
+    // The base's `static #name` members are not on `typeof D` — a private
+    // identifier is mangled per class, so a derived class inherits none of them
+    // (`statics.withoutPrivateNames`) — and they are not on the TARGET side of
+    // this relation either: tsc's `getPropertiesOfType` drops them as reserved
+    // member names, so `propertiesRelatedTo` never asks the derived side for
+    // one. Relating against the unfiltered table instead made every `class D
+    // extends B {}` under a `static #p` a false TS2417
+    // (`privateNamesConstructorChain-1`, `privateNameStaticAccessorssDerivedClasses`).
+    const base_static = try statics.withoutPrivateNames(c, base, try c.classStaticType(base));
     if (derived_static == base_static) return;
     if (try relatesToBase(c, derived_static, base_static)) return;
     try c.diagFmt(2417, c.tokSpan(name_token), "Class static side 'typeof {s}' incorrectly extends base class static side 'typeof {s}'.{s}", .{
