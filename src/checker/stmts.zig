@@ -35,6 +35,7 @@ const expr_zig = @import("expr.zig");
 const checkExprCached = expr_zig.checkExprCached;
 const classStaticType = @import("enums.zig").classStaticType;
 const decorators = @import("decorators.zig");
+const destructure = @import("destructure.zig");
 const diagFmt = Checker.diagFmt;
 const elaborate = @import("elaborate.zig");
 const heritage = @import("heritage.zig");
@@ -445,7 +446,7 @@ fn checkDeclarator(c: *Checker, decl: Node, is_const: bool, ambient: bool) Error
             try implicit_any.reportVarImplicitAny(c, d.lhs, ambient);
         },
         .declarator_init => {
-            _ = try c.checkExprCached(d.rhs, types.no_type);
+            _ = try c.checkExprCached(d.rhs, try destructure.patternContextualType(c, d.lhs));
             // Materialize the symbol's type (infers + caches).
             try materializePatternTypes(c, d.lhs);
         },
@@ -456,6 +457,11 @@ fn checkDeclarator(c: *Checker, decl: Node, is_const: bool, ambient: bool) Error
             else
                 c.nodeSpan(d.lhs);
             const ann: TypeId = if (e.type_ann != 0) try c.annTypeMaybeUnique(e.type_ann, is_const, 1332, name_span) else types.no_type;
+            // What the initializer is CHECKED against. The annotation when
+            // there is one; otherwise an array binding pattern's implied tuple
+            // (`patternContextualType`), which is a contextual type only — the
+            // assignability check below stays on `ann`.
+            const init_ctx: TypeId = if (ann != types.no_type) ann else try destructure.patternContextualType(c, d.lhs);
             // A `unique symbol` const accepts only a fresh `Symbol()` /
             // `Symbol.for()` initializer; the assignability check (a plain
             // `symbol` is not assignable to `unique symbol`) is skipped for
@@ -466,7 +472,7 @@ fn checkDeclarator(c: *Checker, decl: Node, is_const: bool, ambient: bool) Error
                 return;
             }
             if (e.init != 0) {
-                const it0 = try c.checkExprCached(e.init, ann);
+                const it0 = try c.checkExprCached(e.init, init_ctx);
                 // tsc binds `f.x = 1` onto the FUNCTION EXPRESSION's symbol,
                 // so the initializer of `const f: T = () => {}` already
                 // carries the expando members when it is checked against `T`

@@ -179,7 +179,7 @@ pub fn findBindingType(c: *Checker, pat: Node, name: Atom, whole: TypeId, bf: ?B
                                 }
                             }
                         }
-                        if (ed.rhs != 0) pt = try c.removeUndefined(pt); // default strips undefined
+                        if (ed.rhs != 0) pt = try defaultedElemType(c, ed.rhs, pt);
                         if (ed.lhs != 0) {
                             if (try c.findBindingType(ed.lhs, name, pt, sub_bf)) |t| return t;
                         } else if (key == name) {
@@ -222,18 +222,25 @@ pub fn findBindingType(c: *Checker, pat: Node, name: Atom, whole: TypeId, bf: ?B
                 var et: TypeId = types.any_type;
                 switch (c.ts.kind(r)) {
                     .array => et = c.ts.arrayElem(r),
-                    .tuple => {
-                        if (i < c.ts.tupleLen(r)) et = c.ts.tupleElem(r, i).ty;
-                    },
+                    .tuple => et = try tupleBindingElemType(c, r, i),
                     else => {},
                 }
                 if (c.nodeTag(el) == .rest_element) {
                     const ed = c.tree.nodeData(el);
-                    const rest_t = try c.ts.makeArray(et);
+                    // tsc's `getTypeForBindingElement`: a rest over a TUPLE is
+                    // `sliceTupleType(parent, index)` — the remaining positions
+                    // with their own flags, not an array of position `index`'s
+                    // type. `var [, ...r] = [1, "x", true]` is `[string,
+                    // boolean]`; the array reading dropped every position but
+                    // the first.
+                    const rest_t = if (c.ts.kind(r) == .tuple)
+                        try tupleSlice(c, r, i)
+                    else
+                        try c.ts.makeArray(et);
                     if (try c.findBindingType(ed.lhs, name, rest_t, null)) |t| return t;
                 } else if (c.nodeTag(el) == .binding_default) {
                     const ed = c.tree.nodeData(el);
-                    if (try c.findBindingType(ed.lhs, name, try c.removeUndefined(et), null)) |t| return t;
+                    if (try c.findBindingType(ed.lhs, name, try defaultedElemType(c, ed.rhs, et), null)) |t| return t;
                 } else {
                     if (try c.findBindingType(el, name, et, null)) |t| return t;
                 }
@@ -244,6 +251,52 @@ pub fn findBindingType(c: *Checker, pat: Node, name: Atom, whole: TypeId, bf: ?B
         .rest_element => return c.findBindingType(d.lhs, name, whole, null),
         else => return null,
     }
+}
+
+/// What a binding element with a DEFAULT reads, given `et`, what the source
+/// gives its position. tsc's `getBindingElementTypeFromParentType` tail is
+/// `getUnionType([getNonUndefinedType(type), <the default's own type>])`;
+/// ztsc keeps only the source side, which is the same answer whenever the
+/// source carries the position at all.
+///
+/// It is not the same answer when the source carries NOTHING there. An
+/// out-of-range tuple position reads `undefined` — tsc accesses it with
+/// `AccessFlags.AllowMissing` precisely BECAUSE a default is present, which
+/// is also why it is not the TS2493 the undefaulted position gets — and
+/// stripping `undefined` off it leaves `never`, a type `var [a, b = 9] = [1]`
+/// plainly does not have. Where the source side reduces to `never` the union
+/// IS the default's type, so that is what this answers.
+fn defaultedElemType(c: *Checker, def: Node, et: TypeId) Error!TypeId {
+    const stripped = try c.removeUndefined(et);
+    if (def == null_node or c.ts.kind(stripped) != .never) return stripped;
+    return c.widenLiteral(try c.checkExprCached(def, types.no_type));
+}
+
+/// Position `i` of a TUPLE as a binding element reads it — tsc's
+/// `getIndexedAccessTypeOrUndefined(parentType, getNumberLiteralType(index))`.
+/// An OPTIONAL position also holds `undefined`, a REST position holds its own
+/// element type (its stored type is the array), and a position past the end
+/// falls to the tuple's rest element if it has one and to `undefined`
+/// otherwise (`getRestTypeOfTupleType(t) || undefinedType`) — the same answer
+/// whose report is TS2493.
+fn tupleBindingElemType(c: *Checker, r: TypeId, i: u32) Error!TypeId {
+    if (i < c.ts.tupleLen(r)) {
+        const e = c.ts.tupleElem(r, i);
+        if (e.rest()) return (try c.tupleElemTypeAt(r, i)) orelse types.any_type;
+        return if (e.optional()) try c.makeUnion2(e.ty, types.undefined_type) else e.ty;
+    }
+    return (try c.tupleElemTypeAt(r, i)) orelse types.undefined_type;
+}
+
+/// tsc's `sliceTupleType(type, index)`: the tuple's positions from `index`
+/// on, keeping each one's flags (and the source tuple's readonly-ness).
+fn tupleSlice(c: *Checker, r: TypeId, from: u32) Error!TypeId {
+    const len = c.ts.tupleLen(r);
+    var elems: std.ArrayList(types.TupleElem) = .empty;
+    defer elems.deinit(c.scratch());
+    var i = from;
+    while (i < len) : (i += 1) try elems.append(c.scratch(), c.ts.tupleElem(r, i));
+    return c.ts.makeTupleLike(r, elems.items);
 }
 
 /// Object binding-pattern rest type: `whole` with every key named by a
@@ -552,6 +605,79 @@ fn unionLiteralConstituentLacks(c: *Checker, r: TypeId, name: Atom) Error!bool {
     return false;
 }
 
+/// The TUPLE an ARRAY binding pattern implies, as the CONTEXTUAL TYPE of the
+/// initializer it destructures: tsc's `getTypeFromArrayBindingPattern`,
+/// reached from `getContextualTypeForInitializerExpression`, which falls back
+/// to `getTypeFromBindingPattern(name, /*includePatternInType*/ true)` when
+/// the declaration carries no annotation of its own.
+///
+/// It is what makes `var [a, b] = [1, "x"]` give `a: number` and `b: string`.
+/// Without it the literal is checked with no context, widens to
+/// `(string | number)[]`, and every name the pattern binds gets that union —
+/// and a position past the end silently gets it too, instead of the TS2493
+/// an out-of-range tuple index earns.
+///
+/// Every position is `any`: a pattern says WHERE, never WHAT
+/// (`getTypeFromBindingElement` answers `nonInferrableAnyType` for a plain
+/// name). The exception is a nested ARRAY pattern, which recurses so an inner
+/// literal is in tuple context too — a nested OBJECT pattern stays `any`,
+/// because its implied type is `pattern`-stamped and contextually typing a
+/// literal by one turns on tsc's `contextualTypeHasPattern` excess branch,
+/// which `checkPatternExcessProps` already runs from the declaration.
+///
+/// `no_type` — no contextual type at all — for anything that implies no
+/// tuple: a non-array pattern, and the two shapes tsc answers
+/// `Iterable<any>`/`any[]` for, an empty pattern and a lone `[...r]`.
+pub fn patternContextualType(c: *Checker, pat: Node) Error!TypeId {
+    if (pat == null_node or c.nodeTag(pat) != .array_pattern) return types.no_type;
+    const els = c.tree.nodeRange(pat);
+    // tsc's `minLength`: one past the last position that is neither the rest,
+    // omitted, nor defaulted. Everything after it is optional.
+    var min_len: u32 = 0;
+    var n: u32 = 0;
+    for (els) |el| {
+        if (el == null_node) continue;
+        n += 1;
+        switch (c.nodeTag(el)) {
+            .omitted, .rest_element, .binding_default => {},
+            else => min_len = n,
+        }
+    }
+    var elems: std.ArrayList(types.TupleElem) = .empty;
+    defer elems.deinit(c.scratch());
+    var i: u32 = 0;
+    for (els) |el| {
+        if (el == null_node) continue;
+        defer i += 1;
+        if (c.nodeTag(el) == .rest_element) {
+            try elems.append(c.scratch(), .{
+                .ty = try c.ts.makeArray(types.any_type),
+                .flags = types.elem_flag_rest,
+            });
+            continue;
+        }
+        try elems.append(c.scratch(), .{
+            .ty = try patternElemContextualType(c, el),
+            .flags = if (i >= min_len) types.elem_flag_optional else 0,
+        });
+    }
+    if (elems.items.len == 0) return types.no_type;
+    if (elems.items.len == 1 and elems.items[0].flags & types.elem_flag_rest != 0) return types.no_type;
+    return try c.ts.makeTuple(elems.items);
+}
+
+/// One position of the tuple above. A DEFAULT is looked through rather than
+/// typed: tsc types `[a] = [0]` from the default expression, but the only
+/// part of that answer this contextual type can use is its SHAPE, and the
+/// pattern under the default carries the same one.
+fn patternElemContextualType(c: *Checker, el0: Node) Error!TypeId {
+    var el = el0;
+    while (c.nodeTag(el) == .binding_default) el = c.tree.nodeData(el).lhs;
+    if (c.nodeTag(el) != .array_pattern) return types.any_type;
+    const nested = try patternContextualType(c, el);
+    return if (nested == types.no_type) types.any_type else nested;
+}
+
 fn checkArrayPatternProps(c: *Checker, pat: Node, whole: TypeId) Error!void {
     const r = try c.resolveStructural(whole);
     if (patternSourceOpaque(c, r)) return;
@@ -573,15 +699,25 @@ fn checkArrayPatternProps(c: *Checker, pat: Node, whole: TypeId) Error!void {
             continue;
         }
         // Only a TUPLE source gives an element position its own exact type. An
-        // ARRAY source is what an array literal widens to here, whereas tsc
-        // contextually types that literal by the pattern's implied TUPLE
-        // (`getTypeFromArrayBindingPattern`) and so sees each position
-        // separately — descending with the widened element UNION instead would
-        // report a property missing from a sibling's type
-        // (`destructuringVariableDeclaration2`). Left to the day the pattern's
-        // implied type becomes a real contextual type.
+        // ARRAY source is the widened element type, and descending with that
+        // union would report a property missing from a sibling's type
+        // (`destructuringVariableDeclaration2`) — a literal initializer is a
+        // tuple here precisely because the pattern contextually types it
+        // (`patternContextualType`).
         if (c.ts.kind(r) != .tuple) continue;
-        if (i >= c.ts.tupleLen(r)) continue;
+        if (i >= c.ts.tupleLen(r)) {
+            // Past the end, with no rest element to absorb it: the same
+            // out-of-range indexed access `tupleBindingElemType` answers
+            // `undefined` for, and tsc reports it from there. A DEFAULT
+            // silences it — that is `AccessFlags.AllowMissing`, which
+            // `hasDefaultValue(declaration)` turns on.
+            if (c.nodeTag(el) == .binding_default) continue;
+            if ((try c.tupleElemTypeAt(r, i)) != null) continue;
+            try c.diagFmt(2493, c.nodeSpan(el), "Tuple type '{s}' of length '{d}' has no element at index '{d}'.", .{
+                try c.typeToString(r), c.ts.tupleLen(r), i,
+            });
+            continue;
+        }
         try checkPatternProps(c, el, c.ts.tupleElem(r, i).ty);
     }
 }
@@ -613,14 +749,14 @@ pub fn checkDeclPattern(c: *Checker, decl: Node, fallback: TypeId) Error!void {
         .declarator => fallback,
         .declarator_init => blk: {
             init_node = d.rhs;
-            break :blk try c.checkExprCached(d.rhs, types.no_type);
+            break :blk try c.checkExprCached(d.rhs, try patternContextualType(c, pat));
         },
         else => blk: {
             const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
             if (e.type_ann != 0) break :blk try c.typeFromTypeNode(e.type_ann);
             if (e.init == 0) break :blk fallback;
             init_node = e.init;
-            break :blk try c.checkExprCached(e.init, types.no_type);
+            break :blk try c.checkExprCached(e.init, try patternContextualType(c, pat));
         },
     };
     try checkPatternProps(c, pat, src);

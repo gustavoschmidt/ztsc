@@ -2238,7 +2238,7 @@ pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Er
         },
         .declarator_init => {
             if (try freshSymbolConstType(c, decl, d.lhs, d.rhs, is_const)) |u| return u;
-            const init_t = try c.checkExprCached(d.rhs, types.no_type);
+            const init_t = try c.checkExprCached(d.rhs, try destructure.patternContextualType(c, d.lhs));
             if (try inferredUniqueSymbol(c, decl, d.lhs, d.rhs, is_const, init_t)) |u| return u;
             const vt = try c.widenInitializer(init_t, is_const);
             if (c.nodeTag(d.lhs) == .identifier) return vt;
@@ -2251,7 +2251,7 @@ pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Er
                 vt = try c.annTypeMaybeUnique(e.type_ann, is_const, 1332, c.nodeSpan(d.lhs));
             } else if (e.init != 0) {
                 if (try freshSymbolConstType(c, decl, d.lhs, e.init, is_const)) |u| return u;
-                const init_t = try c.checkExprCached(e.init, types.no_type);
+                const init_t = try c.checkExprCached(e.init, try destructure.patternContextualType(c, d.lhs));
                 if (try inferredUniqueSymbol(c, decl, d.lhs, e.init, is_const, init_t)) |u| return u;
                 vt = try c.widenInitializer(init_t, is_const);
             }
