@@ -2459,6 +2459,31 @@ fn reportMemberCycle(c: *Checker, cycle: []const SymbolId) Error!void {
     }
 }
 
+/// The scope of the constructor whose parameter list a PARAMETER PROPERTY of
+/// member scope `ms` is written in, or null when the class has no constructor
+/// IMPLEMENTATION (an overload declares no parameter property — the binder
+/// gates that on `home.ctor and home.body`).
+///
+/// Found through the member table rather than through a parent pointer, which
+/// the tree does not carry: the constructor sits in that same table under
+/// `member_names.ctor_member_name`, and `isCtorMember` recognises its
+/// declaration from the token alone (no atom text, no interner lock).
+fn ctorScopeOfMemberScope(c: *Checker, ms: ScopeId) Error!?ScopeId {
+    const lo = c.bind.scope_members_start[ms];
+    const hi = c.bind.scope_members_start[ms + 1];
+    for (lo..hi) |i| {
+        for (c.bind.declsOf(c.bind.member_syms[i])) |d| {
+            if (c.nodeTag(d) != .class_method) continue;
+            const nd = c.tree.nodeData(d);
+            if (nd.rhs == 0) continue; // an overload: no parameter properties
+            const proto = c.tree.extraData(ast.FnProto, nd.lhs);
+            if (!c.isCtorMember(d, proto.flags)) continue;
+            return c.scopeOf(d);
+        }
+    }
+    return null;
+}
+
 /// Type of a class/interface member symbol (unsubstituted).
 pub fn memberTypeOf(c: *Checker, sym: SymbolId) Error!TypeId {
     // A member whose type demands itself: `a: A["a"]` through the lazy
@@ -2564,6 +2589,19 @@ pub fn memberTypeOf(c: *Checker, sym: SymbolId) Error!TypeId {
                 return types.any_type;
             },
             .param, .param_full => {
+                // A parameter property is DECLARED in the class member table
+                // but WRITTEN in the constructor, and its annotation and
+                // initializer read the constructor's scope — an earlier
+                // parameter (`constructor(y: Y, public x = y)`), a constructor
+                // type parameter (`constructor<T>(public x: T)`). `cur_scope`
+                // above is the member scope, where none of those is visible, so
+                // every such initializer was a false TS2304
+                // (`parameterReferenceInInitializer1`). tsc has no equivalent
+                // switch: `getTypeForVariableLikeDeclaration` resolves a
+                // declaration where it is written.
+                const saved_scope = c.cur_scope;
+                defer c.cur_scope = saved_scope;
+                if (try ctorScopeOfMemberScope(c, c.symScope(sym))) |s| c.cur_scope = s;
                 const p = try paramInfo(c, decl, 0, types.no_type, false, types.no_type);
                 return p.ty;
             },
