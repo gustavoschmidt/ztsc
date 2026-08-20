@@ -2733,14 +2733,12 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         // Both rewrites must land somewhere new: a branch that reduces back to
         // this very access would re-ask this frame's own question and read its
         // in-progress mark as a yes.
-        if (c.ts.kind(c.ts.indexAccessObj(s)) == .conditional) {
-            const cond = c.ts.indexAccessObj(s);
-            const idx = c.ts.indexAccessIndex(s);
-            const tru = try c.reduceIndexedAccess(try condTrueSubstituted(c, cond), idx);
-            const fls = try c.reduceIndexedAccess(c.ts.condFalse(cond), idx);
-            if (tru != s and fls != s and
-                try c.isAssignable(tru, t) and try c.isAssignable(fls, t)) return true;
-        }
+        //
+        // Runs AFTER the constraint route below, not before it as tsc's own
+        // simplification does: the two are alternatives for one boolean, both
+        // purely additive, and the constraint route answers the overwhelming
+        // majority of accesses without materializing two branches. Ordering it
+        // first cost drizzle measurably and bought nothing.
         const obj_bc = try relationIndexObjConstraint(c, c.ts.indexAccessObj(s));
         // Same two guards as the target rule: neither side may still be
         // generic after taking base constraints.
@@ -2748,6 +2746,14 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         if (!try c.isGenericObjectForIndex(obj_bc) and !try c.containsFreeTypeParam(idx_bc, &.{})) {
             const bc = try c.reduceIndexedAccess(obj_bc, idx_bc);
             if (bc != s and c.ts.kind(bc) != .unknown and try c.isAssignable(bc, t)) return true;
+        }
+        if (c.ts.kind(c.ts.indexAccessObj(s)) == .conditional) {
+            const cond = c.ts.indexAccessObj(s);
+            const idx = c.ts.indexAccessIndex(s);
+            const tru = try c.reduceIndexedAccess(try condTrueSubstituted(c, cond), idx);
+            const fls = try c.reduceIndexedAccess(c.ts.condFalse(cond), idx);
+            if (tru != s and fls != s and
+                try c.isAssignable(tru, t) and try c.isAssignable(fls, t)) return true;
         }
     }
     // A generic TEMPLATE-LITERAL source, the same rule one kind over: a

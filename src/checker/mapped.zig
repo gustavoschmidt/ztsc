@@ -616,6 +616,12 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
     // `Checker.key_name_types`.
     var name_types: std.ArrayList(types.Prop) = .empty;
     defer name_types.deinit(c.scratch());
+    // Which property slot each ENUM-MEMBER key landed in, and the key type it
+    // was instantiated with — the state the `.enum_type` arm's duplicate-name
+    // merge needs (see there). Only that arm can collide, so only that arm
+    // records anything here.
+    var enum_keys: std.ArrayList(struct { name: Atom, slot: usize, key: TypeId }) = .empty;
+    defer enum_keys.deinit(c.scratch());
     var sindex: TypeId = 0;
     var nindex: TypeId = 0;
     for (keys) |key_lit| {
@@ -638,9 +644,60 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
                 if (mod_src != 0) {
                     if (try c.propOfTypeEx(mod_src, name, false)) |sp| base = sp.flags & mod_mask;
                 }
-                const pt = try stripMappedOptional(c, try c.substMappedKey(value, key_id, key_lit), base, flags);
-                try props.append(c.scratch(), .{ .name = name, .ty = pt, .flags = applyPropModifiers(base, flags) });
-                if (as_clause == 0) try name_types.append(c.scratch(), .{ .name = name, .ty = key_lit });
+                // Two enum MEMBERS can share a VALUE, and the property is named
+                // by the value — so `[V in TerrestrialAnimalTypes |
+                // AlienAnimalTypes]` reaches the name `cat` twice, once per
+                // enum's `CAT`. tsc's `addMemberForKeyType` merges the second
+                // into the first by UNIONING the key types and instantiating
+                // the template once:
+                //
+                // ```ts
+                // if (existingProp) {
+                //     existingProp.links.nameType = getUnionType([existingProp.links.nameType!, keyType]);
+                //     existingProp.links.keyType = getUnionType([existingProp.links.keyType, keyType]);
+                // }
+                // ```
+                //
+                // Letting the second key simply overwrite the first (what
+                // `objectFromProps`' later-wins dedup does) instantiates the
+                // template with ONE of the two members, and a template that
+                // reads the key — `Extract<Cats, { type: V }>[]`, issue #37859's
+                // `CatMap` — then admits only that enum's cat: the object
+                // literal's other element was a false TS2322. Unioning first
+                // gives `Extract<Cats, { type: T.CAT | A.CAT }>[]`, which is
+                // what the value must be for both to fit.
+                //
+                // The scan is linear in the props built so far and lives in
+                // this arm alone: every other key kind names its property after
+                // a distinct literal, so no two of them can collide.
+                var key_ty = key_lit;
+                var dup: ?usize = null;
+                for (enum_keys.items) |*e| {
+                    if (e.name != name) continue;
+                    dup = e.slot;
+                    key_ty = try c.makeUnion2(e.key, key_lit);
+                    e.key = key_ty;
+                    break;
+                }
+                const pt = try stripMappedOptional(c, try c.substMappedKey(value, key_id, key_ty), base, flags);
+                const prop: types.Prop = .{ .name = name, .ty = pt, .flags = applyPropModifiers(base, flags) };
+                if (dup) |i| {
+                    props.items[i] = prop;
+                } else {
+                    try enum_keys.append(c.scratch(), .{ .name = name, .slot = props.items.len, .key = key_ty });
+                    try props.append(c.scratch(), prop);
+                }
+                if (as_clause == 0) {
+                    // `keyof` of the result answers with the same union.
+                    var nt_dup = false;
+                    for (name_types.items) |*nt| {
+                        if (nt.name != name) continue;
+                        nt.ty = key_ty;
+                        nt_dup = true;
+                        break;
+                    }
+                    if (!nt_dup) try name_types.append(c.scratch(), .{ .name = name, .ty = key_ty });
+                }
             },
             // A SYMBOL-named key (`{ [P in keyof I]: … }` over an interface
             // with a `[s]: …` member). The property is stored under the
