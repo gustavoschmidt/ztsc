@@ -4541,6 +4541,94 @@ fn checkIndexExpr(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Type
     return link.ty;
 }
 
+/// tsc's `isGenericIndexType` — the `IsGenericIndexType` bit of
+/// `getGenericObjectFlags` — asked of the INDEX of an element access: an
+/// instantiable non-primitive (a type variable, a deferred access, a
+/// conditional), a `keyof`, a template-literal pattern or a string mapping.
+///
+/// A generic MAPPED type is deliberately absent: it carries the *object*-side
+/// bit only, and the object side of an element-access expression does not
+/// defer (see `indexChainInner`). A union or intersection is generic when any
+/// constituent is, which is what `getGenericObjectFlags` ORs over — and what
+/// keeps a BRANDED key (`string & { _brand }`, both constituents concrete)
+/// on the eager path it has always taken.
+fn indexTypeIsGeneric(c: *Checker, t: TypeId) Error!bool {
+    const s = &c.ts;
+    return switch (s.kind(t)) {
+        .type_param,
+        .infer_var,
+        .mapped_param,
+        .index_access,
+        .conditional,
+        .keyof_op,
+        .template_literal_type,
+        .string_mapping,
+        => true,
+        .union_type, .intersection => blk: {
+            for (0..s.memberCount(t)) |i| {
+                if (try indexTypeIsGeneric(c, s.memberAt(t, i))) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+/// tsc's `checkIndexedAccessIndexType` for the access an element-access
+/// EXPRESSION just deferred: "is every constituent of the index assignable to
+/// `keyof` the object" — or, failing that, applicable to a number index
+/// signature the object has. Answers whether it reported TS2536, in which case
+/// the caller substitutes `error_type` exactly as tsc does.
+///
+/// `keyof.checkIndexedAccessIndexType` is the same tsc function reached from a
+/// type NODE, where ztsc deliberately restricts itself to a decidable
+/// literal-key shape (see there). The two do not overlap: the object side of an
+/// element-access expression never defers, so an access that gets here always
+/// has a GENERIC index — the case that check declines to look at — and one
+/// that gets there never does.
+///
+/// The `writing` arm is tsc's, and lives inside this function there too: a
+/// write through a generic mapped type that ADDS `readonly` is TS2542, which
+/// is the only way `AccessFlags.Writing` shows up in an element access on a
+/// still-deferred receiver (`Readonly<T>[K]`). A readonly INDEX SIGNATURE on a
+/// concrete receiver is `readonlyIndexWriteAt`'s, and a bare type parameter
+/// gets neither — tsc sets `AccessFlags.NoIndexSignatures` for a generic object
+/// receiver, so `T extends { readonly [s: string]: number }` writes silently.
+fn checkDeferredIndexType(c: *Checker, acc: TypeId, node: Node, writing: bool) Error!bool {
+    const s = &c.ts;
+    const obj = s.indexAccessObj(acc);
+    const idx = s.indexAccessIndex(acc);
+    const keys = try c.keyofType(obj);
+    // tsc's `getIndexInfoOfType(objectType, numberType)`, asked of the
+    // apparent type: a numeric key reaches a number index signature even
+    // when `keyof` does not spell it out.
+    const apparent = try c.resolveStructural(try c.indexObjBaseConstraint(obj));
+    const has_number_index = switch (s.kind(apparent)) {
+        .array, .tuple => true,
+        .object => s.objectNumberIndex(apparent) != 0,
+        else => false,
+    };
+    var one = [_]TypeId{idx};
+    const parts: []const TypeId = if (s.kind(idx) == .union_type) try c.memberList(idx) else one[0..];
+    for (parts) |p| {
+        if (try c.isAssignable(p, keys)) continue;
+        if (has_number_index and try c.typeIsNumberLike(try c.resolveStructural(p))) continue;
+        try c.diagFmt(2536, c.nodeSpan(node), "Type '{s}' cannot be used to index type '{s}'.", .{
+            try c.typeToString(idx), try c.typeToString(obj),
+        });
+        return true;
+    }
+    if (writing) {
+        const m = try c.resolveStructural(obj);
+        if (s.kind(m) == .mapped and s.mappedFlags(m) & types.mapped_flag_readonly_add != 0) {
+            try c.diagFmt(2542, c.nodeSpan(node), "Index signature in type '{s}' only permits reading.", .{
+                try c.typeToString(obj),
+            });
+        }
+    }
+    return false;
+}
+
 /// Element access as an optional-chain link (see `memberChainInner`).
 fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!ChainLink {
     const d = c.tree.nodeData(node);
@@ -4630,6 +4718,31 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
         return .{ .ty = result, .chained = chained };
     }
     const ik = c.ts.kind(try c.ts.regularLiteral(idx_t));
+    // tsc's `getIndexedAccessTypeOrUndefined`, element-access-EXPRESSION arm:
+    // a GENERIC index — a type variable, `keyof T`, another deferred access,
+    // a conditional — makes the access DEFERRED, `Obj[Idx]`, instead of being
+    // resolved against a member table that does not exist yet. `x[k]` under
+    // `<T, K extends keyof T>` is `T[K]`, and `let n: number = x[k]` is the
+    // TS2322 tsc reports; classifying `k` by `typeIsStringLike` instead
+    // (the `else` arm below) answered `any` and said nothing at all.
+    //
+    // Only the INDEX side defers. For an element-access *expression* tsc gates
+    // the object side on `isGenericTupleType` alone — the `accessNode.kind !==
+    // SyntaxKind.IndexedAccessType` branch — so a concrete key still resolves
+    // through the apparent type: `x["a"]` under `T extends { a: string }` is
+    // `string`, not a deferred `T["a"]`. That is the one place this differs
+    // from the type-NODE path, which reaches `reduceIndexedAccess` with the
+    // generic-object test enabled as well.
+    //
+    // `reduceIndexedAccess` is the shared builder, so a key that reduces
+    // anyway (a concrete template pattern, a `never` key set) takes the
+    // ordinary arms below unchanged — only an access that actually stayed
+    // deferred is adopted here.
+    const deferred: ?TypeId = def: {
+        if (!try indexTypeIsGeneric(c, idx_t)) break :def null;
+        const acc = try c.reduceIndexedAccess(obj_t, idx_t);
+        break :def if (c.ts.kind(acc) == .index_access) acc else null;
+    };
     // tsc's `getIndexedAccessType` distributes over a UNION index type:
     // `o[k]` with `k: "a" | "b"` is `o["a"] | o["b"]`. Without this arm a
     // union key matched none of the kinds below and fell through to the
@@ -4644,7 +4757,7 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
     // certain shapes reach here (see `UnionIndexMiss`); the fallback type
     // below is unchanged either way, so whatever the access already reported
     // downstream still reports.
-    const distributed: ?TypeId = switch (try c.unionIndexElemType(r, idx_t)) {
+    const distributed: ?TypeId = if (deferred != null) null else switch (try c.unionIndexElemType(r, idx_t)) {
         .resolved => |ut| ut,
         .miss => |m| blk: {
             switch (m) {
@@ -4657,7 +4770,11 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
             break :blk null;
         },
     };
-    if (distributed) |ut| {
+    if (deferred) |acc| {
+        // tsc's `checkIndexedAccessIndexType`, which `checkElementAccess-
+        // Expression` runs on the access it just built.
+        result = if (try checkDeferredIndexType(c, acc, node, !narrow)) types.error_type else acc;
+    } else if (distributed) |ut| {
         result = ut;
     } else switch (ik) {
         .string_literal => {

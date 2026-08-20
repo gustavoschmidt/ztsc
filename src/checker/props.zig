@@ -426,6 +426,40 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, o: PropLookup) Error!?types
             if (u == t) return null;
             return propOfTypeIdx(c, u, name, o);
         },
+        // A still-deferred indexed access `T[K]` has the apparent members of
+        // its BASE CONSTRAINT — tsc's `getApparentType` is
+        // `getBaseConstraintOfType` for every `TypeFlags.Instantiable`, and
+        // `computeBaseConstraint`'s IndexedAccess arm is "index the object's
+        // base constraint by the index's base constraint". Under
+        // `<T extends { [x: string]: Item }, K extends keyof T>`, `obj[key]`
+        // is `T[K]`, whose base constraint is `Item` — so `obj[key].name`
+        // reads a real member instead of being TS2339.
+        //
+        // Both sides take the TRANSITIVE constraint (tsc's `getBaseConstraint`
+        // recurses), unlike the relation's `indexAccessTargetConstraint`,
+        // which stops the index after one step on purpose: there, collapsing
+        // `K extends keyof T` through `keyof unknown` to `never` would make an
+        // unresolvable access accept every source. Here the answer is only a
+        // member LOOKUP — an over-eager constraint can add apparent members,
+        // never silence a diagnostic — and stopping early would leave every
+        // `T[K]` memberless, which is the whole point of the arm.
+        //
+        // Member access only (`allow_index`), like the `.mapped` arm above:
+        // the structural relation reaches a deferred access through its own
+        // rules in `assign.zig` and must not also see invented members.
+        .index_access => {
+            if (!allow_index) return null;
+            const obj_bc = try c.indexObjBaseConstraint(s.indexAccessObj(t));
+            const idx_bc = try c.transitiveBaseConstraint(s.indexAccessIndex(t));
+            // Still generic after taking constraints — an UNCONSTRAINED `T`
+            // is its own base constraint — so there is nothing to look in.
+            // tsc's `getApparentType` falls back to `unknownType`, which has
+            // no members either.
+            if (try c.isGenericObjectForIndex(obj_bc) or try c.containsFreeTypeParam(idx_bc, &.{})) return null;
+            const bc = try c.reduceIndexedAccess(obj_bc, idx_bc);
+            if (bc == t) return null;
+            return propOfTypeIdx(c, try c.resolveStructural(bc), name, o);
+        },
         .ref => return propOfTypeIdx(c, try c.resolveStructural(t), name, o),
         .class_value => return classValueProp(c, s.classSymbol(t), name, o),
         .enum_type => {
