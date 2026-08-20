@@ -616,7 +616,18 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
                     const eff_vt = if (in_async) try c.awaitedType(vt) else vt;
                     _ = try c.checkAssignable(eff_vt, yt, d.lhs, c.nodeSpan(d.lhs));
                 }
+            } else if (yt != 0 and yt != types.no_type and yt != types.error_type and c.ts.kind(yt) != .any) {
+                // A BARE `yield;` still yields a value: tsc's
+                // `checkYieldExpression` types a missing operand as
+                // `undefinedWideningType` and relates it to the signature's
+                // yield type just like an operand — so `function*
+                // g(): IterableIterator<Foo> { yield; }` is TS2322 "Type
+                // 'undefined' is not assignable to type 'Foo'". The blame
+                // node is `node.expression || node`, i.e. the whole `yield`
+                // expression when there is no operand.
+                _ = try c.checkAssignable(types.undefined_type, yt, node, c.nodeSpan(node));
             }
+            try checkYieldImplicitAny(c, node, ctx, delegate);
             return types.any_type;
         },
         .spread_element => {
@@ -632,6 +643,53 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     }
 }
 
+/// TS7057, the tail of tsc's `checkYieldExpression`: a plain `yield` whose
+/// containing generator has neither a return-type ANNOTATION nor a contextual
+/// return type has nothing to give the expression but `any`, so under
+/// `noImplicitAny` reading that value is an error. Four guards come with it:
+///
+///   * a DELEGATION (`yield* xs`) takes its type from the operand's iterable,
+///     never from the generator's own next type, so it never reports;
+///   * the value has to be READ — `yield x;` discards it (`discarded_expr`),
+///     while `f(yield x)` and `r = yield x` do not;
+///   * a contextual type for the yield expression itself supplies the missing
+///     type, unless it is `any` and so supplies nothing;
+///   * the generator has to be a function DECLARATION.
+///
+/// That last one stands in for tsc's `getContextualIterationType(Next, func)`,
+/// which ztsc is in no position to answer at this node: the return-type
+/// INFERENCE probe (`signatures.zig`) walks these same yields with none of the
+/// contextual types the body check installs, and MEMOIZES the answer, so
+/// whichever of the two runs first would decide whether a context was
+/// "missing". A declaration settles it syntactically — nothing contextually
+/// types one, so its lack of an annotation really is a lack of any type at all
+/// — and it is the shape every generator this diagnostic is about has. A
+/// generator EXPRESSION keeps its silence, which is the safe half.
+fn checkYieldImplicitAny(c: *Checker, node: Node, ctx: TypeId, delegate: bool) Error!void {
+    if (delegate or !c.prog.no_implicit_any) return;
+    if (node == c.discarded_expr) return;
+    const fn_node = enclosingFnNode(c);
+    if (fn_node == null_node or c.nodeTag(fn_node) != .function_decl) return;
+    // `gen_ret_ctx` is the WRITTEN annotation when there is one, which is
+    // tsc's `getReturnTypeFromAnnotation` — the other half of the same test.
+    const gen_ret = if (c.fn_ctx) |fc| fc.gen_ret_ctx else 0;
+    if (gen_ret != 0 and gen_ret != types.no_type) return;
+    if (ctx != 0 and ctx != types.no_type and c.ts.kind(ctx) != .any) return;
+    try c.diagFmt(7057, c.nodeSpan(node), "'yield' expression implicitly results in an 'any' type because its containing generator lacks a return-type annotation.", .{});
+}
+
+/// The function-like that lexically contains the node now being checked —
+/// tsc's `getContainingFunction`, which an arrow is NOT transparent to.
+/// `null_node` at the top level of a file.
+fn enclosingFnNode(c: *const Checker) Node {
+    var cur = c.cur_scope;
+    while (cur != binder.file_scope) {
+        if (c.bind.scope_kinds[cur] == .function) return c.bind.scope_owners[cur];
+        cur = c.bind.scope_parents[cur];
+    }
+    return null_node;
+}
+
 /// Is the function lexically enclosing the node now being checked a
 /// generator? False at the top level of the file (no enclosing function) —
 /// the sibling of `Checker.enclosingFnIsAsync`, and syntactic for the same
@@ -643,24 +701,16 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
 /// has the ARROW as its containing function, which is exactly why the
 /// `yield` there is not a yield at all.
 fn enclosingFnIsGenerator(c: *const Checker) bool {
-    var cur = c.cur_scope;
-    while (cur != binder.file_scope) {
-        if (c.bind.scope_kinds[cur] == .function) {
-            const owner = c.bind.scope_owners[cur];
-            if (owner == ast.null_node) return false;
-            const flags = switch (c.tree.nodeTag(owner)) {
-                .arrow_fn, .function_expr, .function_decl, .class_method, .function_type => c.tree.extraData(ast.FnProto, c.tree.nodeData(owner).lhs).flags,
-                // A class `static { … }` block — the one `.function` scope
-                // owned by a `.block` (see `bindClass`). It is function-like
-                // to tsc's `getContainingFunction` and never a generator.
-                .block => return false,
-                else => return false,
-            };
-            return flags & ast.Flags.generator != 0;
-        }
-        cur = c.bind.scope_parents[cur];
-    }
-    return false;
+    const owner = enclosingFnNode(c);
+    if (owner == null_node) return false;
+    const flags = switch (c.tree.nodeTag(owner)) {
+        .arrow_fn, .function_expr, .function_decl, .class_method, .function_type => c.tree.extraData(ast.FnProto, c.tree.nodeData(owner).lhs).flags,
+        // A class `static { … }` block — the one `.function` scope owned by a
+        // `.block` (see `bindClass`). It is function-like to tsc's
+        // `getContainingFunction` and never a generator.
+        else => return false,
+    };
+    return flags & ast.Flags.generator != 0;
 }
 
 // =====================================================================
@@ -5083,15 +5133,27 @@ pub fn checkReferenceExpression(c: *Checker, expr: Node, site: RefSite) Error!bo
 /// arithmetic check from piling a TS2356 on top of `E++`, and what keeps the
 /// write-back from reporting an unassignable result.
 pub fn checkWriteTargetRefused(c: *Checker, target: Node) Error!bool {
+    return (try writeTargetType(c, target)) == types.error_type;
+}
+
+/// The type a WRITE to `target` stores into, with the refusals above reported:
+/// tsc's `checkExpression` on a target whose `getAssignmentTargetKind` is
+/// `Definite`, which answers `getTypeOfSymbol` and skips narrowing entirely.
+/// That is the difference between `let x: string | number; x = true; for (x of
+/// numbers)` reporting nothing (the declared union accepts `number`) and
+/// reporting TS2322 against the `boolean` the flow says is there.
+///
+/// `no_type` when the target is not a reference at all — a pattern or a call
+/// — which is somebody else's diagnostic (`checkReferenceExpression`,
+/// `checkDestructuringPattern`).
+pub fn writeTargetType(c: *Checker, target: Node) Error!TypeId {
     var n = target;
     while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
     switch (c.nodeTag(n)) {
         .identifier, .member_expr, .index_expr => {},
-        // A pattern or a non-reference is somebody else's diagnostic
-        // (`checkReferenceExpression`, `checkDestructuringPattern`).
-        else => return false,
+        else => return types.no_type,
     }
-    return (try checkAssignmentTarget(c, n)) == types.error_type;
+    return checkAssignmentTarget(c, n);
 }
 
 fn incrementOperandType(c: *Checker, operand: Node) Error!TypeId {
@@ -5785,24 +5847,17 @@ fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // TS2322 naming both types, not the old flat TS2360.
             const key_union = try c.ts.makeUnion(c.scratch(), &.{ types.string_type, types.number_type, types.symbol_type });
             _ = try c.checkAssignable(lt, key_union, d.lhs, c.nodeSpan(d.lhs));
-            const rk = c.ts.kind(try c.resolveStructural(rt));
-            // `never` is not a primitive for this test. tsc asks
-            // `allTypesAssignableToKind(rightType, NonPrimitive |
-            // InstantiableNonPrimitive)`, which ends in
-            // `isTypeAssignableTo(source, nonPrimitiveType)` — and `never` is
-            // assignable to everything, so tsc never reports here. A kind test
-            // has to say so explicitly.
-            //
-            // The operand reaches `never` through ordinary narrowing, not
-            // through an error: social-app's `EmptyState` writes
-            // `typeof icon === 'function' || (typeof icon === 'object' && icon
-            // && 'render' in icon)` over `ComponentType<any> | ReactElement`,
-            // and the FALSE branch of the first disjunct drops both callable
-            // constituents (tsc's `TypeofNEFunction` facts do the same), so the
-            // second disjunct is checked against `never`.
-            if (!isNonPrimitiveKind(rk) and rk != .any and rk != .err and rk != .never and rk != .type_param and rk != .union_type and rk != .unknown) {
-                try c.diagFmt(2361, c.nodeSpan(d.rhs), "The right-hand side of an 'in' expression must not be a primitive.", .{});
-            }
+            // …and the RIGHT operand is related to `object` the same way,
+            // which is the whole of tsc's test: `isTypeAssignableTo(rightType,
+            // nonPrimitiveType)`, carrying its own TS2322 rather than the flat
+            // TS2361 an older tsc reported. Relating instead of testing KINDS
+            // is what reaches the generic operands — `<T>(t: T) => "k" in t` is
+            // an error because `T`'s constraint admits primitives, and
+            // `<T extends object>` is not — and what makes `never` (which
+            // ordinary narrowing produces: social-app's `typeof icon ===
+            // 'object' && icon && 'render' in icon` over `ComponentType<any> |
+            // ReactElement` reaches it) silent for free.
+            _ = try c.checkAssignable(rt, types.object_keyword_type, d.rhs, c.nodeSpan(d.rhs));
             return types.boolean_type;
         },
         else => {
@@ -6236,7 +6291,7 @@ pub fn skipOuterExprs(c: *const Checker, node: Node) Node {
 }
 
 /// Does this assignment target name an evolving (`auto`-typed) variable?
-fn assignTargetIsEvolving(c: *Checker, target0: Node) bool {
+pub fn assignTargetIsEvolving(c: *Checker, target0: Node) bool {
     const n = skipParens(c, target0);
     if (n == null_node or c.nodeTag(n) != .identifier) return false;
     const a = c.atomOfToken(c.tree.nodeMainToken(n)) catch return false;
@@ -6714,7 +6769,24 @@ fn setterParamOfProto(c: *Checker, decl: Node, proto_idx: u32) Error!?TypeId {
 /// Every lookup below is a no-op on `no_type` (`propertyTypeOf` answers
 /// `any` for kind `.none`), so an unknown source degrades to exactly the
 /// element walk this used to be.
-fn checkDestructuringPattern(c: *Checker, node: Node, src: TypeId) Error!void {
+/// What one destructuring position reads out of the value being destructured.
+///
+/// `exact` says whether `ty` is the type that position REALLY holds, as
+/// opposed to a stand-in ztsc fell back to. Only an exact reading may be
+/// related to the target (TS2322, tsc's `checkReferenceAssignment`): tsc
+/// contextually types the right-hand side of `[a, [b]] = [1, [2]]` by the
+/// pattern's implied tuple and reads `number` and `number[]` out of it, while
+/// ztsc types the literal with no context at all and reads the widened
+/// `number | number[]` out of an ARRAY — a type no position holds, and one
+/// that would report against every target. The lookups the position drives
+/// (TS2339, member accessibility, nested patterns) are unaffected: those ask
+/// what is THERE, and the stand-in answers that well enough.
+const DestructSrc = struct {
+    ty: TypeId = types.no_type,
+    exact: bool = false,
+};
+
+pub fn checkDestructuringPattern(c: *Checker, node: Node, src: TypeId) Error!void {
     switch (c.nodeTag(node)) {
         .object_literal, .object_pattern => {
             for (c.tree.nodeRange(node)) |el| try checkObjectDestructuringProperty(c, el, src);
@@ -6833,12 +6905,20 @@ fn destructuringHasDefault(c: *Checker, el0: Node) bool {
 /// by indexed access only where `isArrayLikeType(source)` holds and otherwise
 /// hands every element that one iterated type, so a source with no numeric
 /// domain (a `Set`, a `Generator`) still types its positions.
-fn destructuringElementType(c: *Checker, src: TypeId, iterated: TypeId, index: u32) Error!TypeId {
-    if (src == types.no_type) return types.no_type;
+fn destructuringElementType(c: *Checker, src: TypeId, iterated: TypeId, index: u32) Error!DestructSrc {
+    if (src == types.no_type) return .{};
     const r = try c.resolveStructural(src);
     const rk = c.ts.kind(r);
-    if (rk == .any or rk == .err) return types.any_type;
-    return (try numericIndexHit(c, r, rk, @floatFromInt(index))) orelse iterated;
+    if (rk == .any or rk == .err) return .{ .ty = types.any_type };
+    // Only a TUPLE position is exact. tsc types the right-hand side of a
+    // destructuring assignment by the pattern's implied tuple, so it reaches
+    // every position through one; ztsc types it with no contextual type at
+    // all, so `[a, [b]] = [1, [2]]` has an ARRAY source whose element is the
+    // widened `number | number[]` union — a type no position really holds.
+    if (try numericIndexHit(c, r, rk, @floatFromInt(index))) |t| {
+        return .{ .ty = t, .exact = rk == .tuple };
+    }
+    return .{ .ty = iterated };
 }
 
 /// One property of an object destructuring pattern. A property KEY is a
@@ -6853,14 +6933,24 @@ fn checkObjectDestructuringProperty(c: *Checker, prop: Node, src: TypeId) Error!
         .object_property => {
             const key = try destructuringKey(c, prop, d.lhs);
             const elem = try destructuringMemberType(c, src, key, destructuringHasDefault(c, d.rhs));
-            try checkDestructuringTarget(c, d.rhs, elem, .assignment);
+            try checkDestructuringTarget(c, d.rhs, namedSource(elem), .assignment);
         },
         // `{ a }` / `{ a = init }` — the name is both key and target; lhs is
-        // the target identifier, rhs the default.
+        // the target identifier, rhs the default. tsc's
+        // `checkDestructuringAssignment` runs `checkBinaryLikeExpression(name,
+        // =, objectAssignmentInitializer)` on the shorthand default, so the
+        // initializer is related to the TARGET just as `a = init` would be,
+        // and the source then loses `undefined`.
         .object_shorthand => {
-            if (d.rhs != null_node) _ = try c.checkExprCached(d.rhs, types.no_type);
             const key = try destructuringKey(c, prop, null_node);
-            const elem = try destructuringMemberType(c, src, key, d.rhs != null_node);
+            var elem = namedSource(try destructuringMemberType(c, src, key, d.rhs != null_node));
+            if (d.rhs != null_node) {
+                const target_t = try checkAssignmentTarget(c, d.lhs);
+                const init_t = try c.checkExprCached(d.rhs, target_t);
+                if (target_t != types.any_type and target_t != types.error_type)
+                    _ = try c.checkAssignable(init_t, target_t, d.rhs, c.nodeSpan(d.lhs));
+                elem = try defaultedSource(c, elem);
+            }
             try checkDestructuringTarget(c, d.lhs, elem, .assignment);
         },
         // Declaration-shaped pattern nodes (a `for (…of…)` head can carry
@@ -6869,17 +6959,17 @@ fn checkObjectDestructuringProperty(c: *Checker, prop: Node, src: TypeId) Error!
         // (`destructure.zig`), so no source lookup runs here.
         .binding_property => {
             if (d.rhs != null_node) _ = try c.checkExprCached(d.rhs, types.no_type);
-            if (d.lhs != null_node) try checkDestructuringTarget(c, d.lhs, types.no_type, .assignment);
+            if (d.lhs != null_node) try checkDestructuringTarget(c, d.lhs, .{}, .assignment);
         },
         // `{[k]: target}` — the key IS evaluated; lhs is it, rhs the target.
         .binding_property_computed => {
             if (d.lhs != null_node) _ = try c.checkExprCached(d.lhs, types.no_type);
-            if (d.rhs != null_node) try checkDestructuringTarget(c, d.rhs, types.no_type, .assignment);
+            if (d.rhs != null_node) try checkDestructuringTarget(c, d.rhs, .{}, .assignment);
         },
         // `{ ...rest } = src`: the rest object is `src` minus the names its
         // siblings take (tsc's `getRestType`), which is not computed here.
         // An object rest target has its OWN pair of reference diagnostics.
-        .spread_element, .rest_element => try checkDestructuringTarget(c, d.lhs, types.no_type, .object_rest),
+        .spread_element, .rest_element => try checkDestructuringTarget(c, d.lhs, .{}, .object_rest),
         .omitted, .error_node, .unsupported => {},
         else => _ = try checkAssignmentTarget(c, prop),
     }
@@ -6907,13 +6997,15 @@ fn checkArrayDestructuringElement(c: *Checker, el: Node, src: TypeId, iterated: 
 ///
 /// `no_type` where the source is unknown, which is what every rest position
 /// used to read: a nested pattern under one then resolves nothing, exactly
-/// as it did before.
-fn arrayRestSourceType(c: *Checker, src: TypeId, iterated: TypeId, index: u32) Error!TypeId {
-    if (src == types.no_type) return types.no_type;
+/// as it did before. Only the TUPLE slice is exact (`DestructSrc`) — the
+/// array fallback is built from the same widened element the numeric
+/// positions get.
+fn arrayRestSourceType(c: *Checker, src: TypeId, iterated: TypeId, index: u32) Error!DestructSrc {
+    if (src == types.no_type) return .{};
     const r = try c.resolveStructural(src);
-    if (c.ts.kind(r) == .tuple) return sliceTuple(c, r, index, 0);
-    if (iterated == types.no_type) return types.no_type;
-    return c.ts.makeArray(iterated);
+    if (c.ts.kind(r) == .tuple) return .{ .ty = try sliceTuple(c, r, index, 0), .exact = true };
+    if (iterated == types.no_type) return .{};
+    return .{ .ty = try c.ts.makeArray(iterated) };
 }
 
 /// The assignment target of one pattern element, peeled through its default
@@ -6922,37 +7014,73 @@ fn arrayRestSourceType(c: *Checker, src: TypeId, iterated: TypeId, index: u32) E
 /// expression walker checked the target identifier as a *read*, so writing a
 /// not-yet-assigned `let` through a destructuring assignment reported TS2454
 /// at the write site itself.
-fn checkDestructuringTarget(c: *Checker, el0: Node, src: TypeId, site: RefSite) Error!void {
+///
+/// `src` is what the position reads out of the value being destructured; its
+/// `ty` is `no_type` where that could not be resolved, which is tsc's
+/// `errorType` and relates to anything.
+fn checkDestructuringTarget(c: *Checker, el0: Node, src: DestructSrc, site: RefSite) Error!void {
     const el = skipParens(c, el0);
     if (el == null_node) return;
     const d = c.tree.nodeData(el);
     switch (c.nodeTag(el)) {
         .binding_default => {
             if (d.rhs != null_node) _ = try c.checkExprCached(d.rhs, types.no_type);
-            try checkDestructuringTarget(c, d.lhs, src, site);
+            try checkDestructuringTarget(c, d.lhs, try defaultedSource(c, src), site);
         },
         // `[a = init] = …`: the cover grammar parses the default as a plain
-        // assignment expression.
+        // assignment expression, and tsc checks it AS one
+        // (`checkDestructuringAssignment` runs the whole
+        // `checkBinaryExpression` before peeling to `target.left`) — that is
+        // where `[a = 1] = ["x"]` gets its "number is not assignable to
+        // string" at `a`. The default having run, the source can no longer be
+        // `undefined` at the target.
         .assign => {
             if (c.tree.tokens.tag(c.tree.nodeMainToken(el)) == .eq) {
-                _ = try c.checkExprCached(d.rhs, types.no_type);
-                try checkDestructuringTarget(c, d.lhs, src, site);
+                _ = try c.checkExprCached(el, types.no_type);
+                try checkDestructuringTarget(c, d.lhs, try defaultedSource(c, src), site);
             } else {
                 _ = try c.checkExprCached(el, types.no_type);
             }
         },
         .array_literal, .object_literal, .array_pattern, .object_pattern => {
-            try checkDestructuringPattern(c, el, src);
+            try checkDestructuringPattern(c, el, src.ty);
         },
         .omitted, .error_node, .unsupported => {},
         // tsc's `checkReferenceAssignment`: a leaf pattern element is a write,
         // and the same reference rules apply to it as to `x = v` — reported at
-        // the element AS WRITTEN, parentheses included.
+        // the element AS WRITTEN, parentheses included…
         else => {
-            _ = try checkAssignmentTarget(c, el);
-            _ = try checkReferenceExpression(c, el0, site);
+            const target_t = try checkAssignmentTarget(c, el);
+            const is_ref = try checkReferenceExpression(c, el0, site);
+            // …and the value written is the position's source type, related
+            // to the target exactly as `x = v` relates `v`. Gated on the
+            // reference check, so an illegal target reports once, and on the
+            // reading being EXACT (`DestructSrc`).
+            if (is_ref and src.exact and
+                src.ty != types.no_type and src.ty != types.any_type and src.ty != types.error_type and
+                target_t != types.any_type and target_t != types.error_type)
+            {
+                _ = try c.checkAssignable(src.ty, target_t, el, c.nodeSpan(el));
+            }
         },
     }
+}
+
+/// The source type a destructuring position hands its target once a DEFAULT
+/// initializer stands between them — tsc's `getTypeWithFacts(sourceType,
+/// TypeFacts.NEUndefined)`. The default is precisely what the target receives
+/// when the position holds `undefined`, so `undefined` never reaches it.
+fn defaultedSource(c: *Checker, src: DestructSrc) Error!DestructSrc {
+    if (src.ty == types.no_type) return src;
+    return .{ .ty = try c.removeUndefined(src.ty), .exact = src.exact };
+}
+
+/// A position reached by NAME — an object pattern's property. tsc looks the
+/// property up on the source type itself, exactly as ztsc's
+/// `destructuringMemberType` does, so the reading is exact whenever it
+/// resolved at all.
+fn namedSource(ty: TypeId) DestructSrc {
+    return .{ .ty = ty, .exact = ty != types.no_type };
 }
 
 /// tsc's `getContextualCallSignature` for an INTERSECTION contextual type:

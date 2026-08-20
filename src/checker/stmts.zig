@@ -98,7 +98,16 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
             for (c.tree.nodeRange(node)) |stmt| try c.checkStatement(stmt);
         },
         .var_decl_one, .var_decl => try checkVarDeclStatement(c, node),
-        .expr_stmt => _ = try c.checkExprCached(d.lhs, types.no_type),
+        .expr_stmt => {
+            // An expression statement throws its value away — announce that
+            // downward (`Checker.discarded_expr`, tsc's
+            // `expressionResultIsUnused`), since the expression itself has no
+            // parent to ask.
+            const saved_discarded = c.discarded_expr;
+            defer c.discarded_expr = saved_discarded;
+            c.discarded_expr = expr_zig.skipParens(c, d.lhs);
+            _ = try c.checkExprCached(d.lhs, types.no_type);
+        },
         .empty_stmt, .debugger_stmt, .error_node, .unsupported, .omitted => {},
         .if_stmt => {
             const cond_t = try checkIfCondition(c, d.lhs, d.rhs);
@@ -615,6 +624,17 @@ fn materializePatternTypes(c: *Checker, pat: Node, whole: TypeId, mode: destruct
     }
 }
 
+/// Is `head` a variable-declaration list with NO declarations? That is what
+/// `for (var of X)` parses to once the lookahead takes `of` as the keyword
+/// rather than as the declared name (tsc's `canFollowContextualOfKeyword`).
+fn headDeclarationsEmpty(c: *const Checker, head: Node) bool {
+    return switch (c.nodeTag(head)) {
+        .var_decl_one => c.tree.nodeData(head).lhs == null_node,
+        .var_decl => c.tree.nodeRange(head).len == 0,
+        else => false,
+    };
+}
+
 fn checkForInOf(c: *Checker, node: Node) Error!void {
     const d = c.tree.nodeData(node);
     const e = c.tree.extraData(ast.ForInOf, d.lhs);
@@ -622,6 +642,15 @@ fn checkForInOf(c: *Checker, node: Node) Error!void {
     const saved = c.cur_scope;
     defer c.cur_scope = saved;
     if (try c.scopeOf(node)) |s| c.cur_scope = s;
+
+    // `for (var of X)`: the parser takes `of` as the keyword and leaves the
+    // declaration list EMPTY (TS1123). tsc's `checkForOfStatement` reaches
+    // the right-hand side only through `checkForInOrForOfVariableDeclaration`
+    // — which guards on `declarations.length >= 1` — so `X` is never checked
+    // at all, and a `for…of` over an undeclared name reports nothing but the
+    // empty-list grammar error. (`for…in` reads its right-hand side
+    // unconditionally, so this is a `for…of`-only early-out.)
+    if (is_of and headDeclarationsEmpty(c, e.left)) return c.checkStatement(d.rhs);
 
     const rt = try c.checkExprCached(e.right, types.no_type);
     var elem_t: TypeId = types.any_type;
@@ -677,30 +706,64 @@ fn checkForInOf(c: *Checker, node: Node) Error!void {
                         // and a loop head has none, so what is iterated never
                         // becomes one. `for (const { show: fs = v => v… } of
                         // rows)` really is an implicit-any `v` (TS7006).
+                        // The annotation itself is never RELATED to what is
+                        // iterated: a `for` head's one declaration may not
+                        // carry a type annotation at all, so the annotation is
+                        // already TS2404/TS2483 (`checkGrammarForInOrForOfStatement`,
+                        // raised in the parser) and tsc reports nothing else
+                        // about it. It still TYPES the binding, so the pattern
+                        // walk below keeps reading it.
                         var whole: TypeId = types.no_type;
-                        if (ee.type_ann != 0) {
-                            const ann = try c.typeFromTypeNode(ee.type_ann);
-                            _ = try c.checkAssignable(elem_t, ann, 0, c.nodeSpan(dd.lhs));
-                            whole = ann;
-                        }
+                        if (ee.type_ann != 0) whole = try c.typeFromTypeNode(ee.type_ann);
                         try materializePatternTypes(c, dd.lhs, whole, if (ee.type_ann != 0) .relate else .contextual_only);
                     },
                     else => {},
                 }
             }
         },
-        // A destructuring pattern head checks its own elements; anything else
-        // is a write, and tsc runs `checkReferenceExpression` on it.
+        // A destructuring pattern head is a destructuring ASSIGNMENT whose
+        // source is the iterated type: tsc's `checkForOfStatement` hands
+        // `varExpr` straight to `checkDestructuringAssignment(varExpr,
+        // iteratedType || errorType)`, so every position is resolved through
+        // the element type instead of being typed as the expression it
+        // syntactically is. `for ({ x, y = E.x } of array)` gets its
+        // per-property TS2322 from that walk and nowhere else.
+        // `for..in` has no source to hand down (the head is TS2491 there),
+        // so it keeps the plain expression check.
         .array_literal, .object_literal, .array_pattern, .object_pattern => {
-            _ = try c.checkExprCached(e.left, types.no_type);
+            if (is_of) {
+                try expr_zig.checkDestructuringPattern(c, e.left, elem_t);
+            } else {
+                _ = try c.checkExprCached(e.left, types.no_type);
+            }
         },
         else => {
-            const left_t = try c.checkExprCached(e.left, types.no_type);
+            const expr_t = try c.checkExprCached(e.left, types.no_type);
             // The head WRITES its target on every iteration, so the same
-            // refusals an assignment applies (TS2588/2628-32/2540/2542) apply.
-            _ = try expr_zig.checkWriteTargetRefused(c, e.left);
+            // refusals an assignment applies (TS2588/2628-32/2540/2542) apply
+            // — and the type it writes INTO is the target's declared one, not
+            // the flow-narrowed one a read would see (`writeTargetType`).
+            const write_t = try expr_zig.writeTargetType(c, e.left);
+            const left_t = if (write_t == types.no_type) expr_t else write_t;
             if (is_of) {
                 _ = try expr_zig.checkReferenceExpression(c, e.left, .for_of);
+                // …and what it writes is the ITERATED type, so tsc's
+                // `checkForOfStatement` relates the two exactly as an
+                // assignment relates its right operand to its target — the
+                // one check a non-declaration head has, since there is no
+                // declaration for `checkVariableLikeDeclaration` to run on.
+                // `any` on either side is tsc's "iteratedType is undefined"
+                // (the right-hand side was not iterable, already TS2488) and
+                // its `isTypeAny` short-circuit; neither may cascade. An
+                // EVOLVING target has no declared type to check against at
+                // all — its `undefined` is where the flow starts, not a
+                // constraint (tsc's `convertAutoToAny`).
+                if (elem_t != types.any_type and elem_t != types.error_type and
+                    left_t != types.any_type and left_t != types.error_type and
+                    !expr_zig.assignTargetIsEvolving(c, e.left))
+                {
+                    _ = try c.checkAssignable(elem_t, left_t, e.left, c.nodeSpan(e.left));
+                }
             } else if (try c.isAssignable(types.string_type, left_t)) {
                 // tsc reaches the reference check for `for…in` only after the
                 // key type fits the target ("run check only if the former

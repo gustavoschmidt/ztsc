@@ -1916,6 +1916,17 @@ pub const Checker = struct {
     /// Cleared by `checkFunctionBody`, since a function written inside the name
     /// IS a container (`{ [(() => super())()]: 1 }` is TS2337 again).
     in_computed_key: bool = false,
+    /// The one expression node whose VALUE the enclosing construct throws away
+    /// (`ast.null_node` = none) — tsc's `expressionResultIsUnused`, which walks
+    /// PARENTS from the expression up through parentheses, `void`, assertions
+    /// and a comma's left operand until it meets an expression statement or a
+    /// `for` head. ztsc has no parent pointers, so the discarding construct
+    /// announces itself downward instead: `checkStatement`'s `.expr_stmt` arm
+    /// sets this to the statement's (paren-unwrapped) expression. Only
+    /// `checkYieldExpression`'s TS7057 asks — an unannotated generator's bare
+    /// `yield` is an implicit `any` only when someone READS it, so `yield x;`
+    /// is silent where `f(yield x)` is not.
+    discarded_expr: ast.Node = ast.null_node,
     /// The property-access node a COMPOUND assignment is currently writing, as
     /// a `nodeKey` (0 = none). tsc runs one member-accessibility check per access node,
     /// against the setter when the node is an assignment target
