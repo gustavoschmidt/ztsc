@@ -3381,8 +3381,35 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                             const pa = try c.scratch().dupe(TypeId, s.refArgs(po));
                             const aa = try c.scratch().dupe(TypeId, s.refArgs(ao));
                             const n = @min(pa.len, aa.len);
-                            for (0..n) |i| try c.unify(pa[i], aa[i], tp_syms, candidates, depth + 1);
-                            return;
+                            // …UNLESS the application is an IDENTITY on that
+                            // argument. `Omit<X, K>` where `K` names no key of
+                            // `X` expands to a member table identical to `X`'s,
+                            // and interning hands back `X` itself — so the
+                            // origin's first type argument IS the type we are
+                            // standing on, on both sides. Pairing it re-enters
+                            // `unify` with the very pair that got here, which
+                            // spins to the depth limit and returns having paired
+                            // nothing, while the `return` below suppresses the
+                            // structural walk that would have answered.
+                            //
+                            // That is the whole of `FeedPage.tsx:101`: the
+                            // parameter `Omit<Helpers<T, NavState<T>>,
+                            // 'getParent'> & {…}` and its argument both carry an
+                            // `Omit` origin whose expansion is its own first
+                            // argument, `T` took no candidate, and its
+                            // `Extract<keyof T, string>` positions collapsed to
+                            // `never`. Falling through to the property walk
+                            // reaches `NavState<T>` vs `NavState<AllParams>`,
+                            // where this same rule fires on a REAL
+                            // decomposition and binds `T`.
+                            var identity_app = false;
+                            for (0..n) |i| {
+                                if (pa[i] == param and (aa[i] == arg or aa[i] == ra)) identity_app = true;
+                            }
+                            if (!identity_app) {
+                                for (0..n) |i| try c.unify(pa[i], aa[i], tp_syms, candidates, depth + 1);
+                                return;
+                            }
                         }
                     }
                 }
