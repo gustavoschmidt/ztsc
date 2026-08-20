@@ -146,6 +146,9 @@ fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8) Lo
         if (!s) return error.StrictFalse;
     }
 
+    cfg.text = acc.root_text;
+    cfg.config_diags = try removedOptionDiags(arena, acc.removed, acc.root_obj);
+
     cfg.lib = acc.lib;
     if (acc.module_suffixes) |ms| cfg.module_suffixes = ms;
     // Effective noImplicitAny = explicit value ?? strict. ztsc only runs strict
@@ -491,6 +494,14 @@ pub const Config = struct {
     /// the root matters: the rest of the entity name is the emit factory,
     /// which ztsc never uses.
     jsx_factory_ns: ?[]const u8 = null,
+    /// tsc *options* diagnostics anchored in this config file (currently
+    /// TS5102 for a removed option). Positions are byte offsets into `text`.
+    /// See `ConfigDiag` for the two gates around them.
+    config_diags: []const ConfigDiag = &.{},
+    /// The root config file's source text, retained only so `config_diags`
+    /// have something to resolve their offsets against (and to underline
+    /// under `--pretty`). Arena-owned like every other field here.
+    text: []const u8 = "",
     /// Non-fatal warnings (unknown options, bad shapes) for stderr.
     warnings: []const []const u8 = &.{},
     /// Accepted-and-ignored option notes, shown under --verbose only.
@@ -604,6 +615,98 @@ fn findUpwardInDir(io: Io, arena: Allocator, base: Io.Dir, max_levels: usize) Er
 pub const parseJsonc = jsonc.parseJsonc;
 pub const Value = jsonc.Value;
 pub const JsonError = jsonc.JsonError;
+
+// ===========================================================================
+// options diagnostics (TS5102)
+// ===========================================================================
+
+/// A diagnostic anchored in the config file itself — tsc's *options*
+/// diagnostics, the pass that runs between the syntactic and the semantic one:
+///
+///     addRange(allDiagnostics, program.getSyntacticDiagnostics(...));
+///     if (allDiagnostics.length === configFileParsingDiagnosticsLength) {
+///         ... getOptionsDiagnostics / getGlobalDiagnostics ...
+///         if (allDiagnostics.length === configFileParsingDiagnosticsLength)
+///             ... getSemanticDiagnostics ...
+///     }
+///
+/// Both gates are observable and both are mirrored in `main.zig`: a syntax
+/// error anywhere in the program hides these, and one of these hides every
+/// semantic diagnostic in the program. Verified against tsgo 7.0.2 (a project
+/// with `baseUrl` and a TS2322 reports only the TS5102; adding a syntax error
+/// leaves only the TS1109).
+pub const ConfigDiag = struct {
+    code: u16,
+    /// Fully rendered, including any indented sub-message lines.
+    msg: []const u8,
+    /// Byte range in `Config.text` (the root config file's source).
+    start: u32,
+    end: u32,
+};
+
+/// Options TypeScript 7 *removed* while still recognizing the name, so tsc
+/// answers TS5102 rather than TS5023 "unknown compiler option". Verified one
+/// by one against tsgo 7.0.2; the rest of the historically-removed set (`out`,
+/// `charset`, `keyofStringsOnly`, `importsNotUsedAsValues`,
+/// `preserveValueImports`, `noImplicitUseStrict`, `noStrictGenericChecks`,
+/// `suppress*`, `prepend`) is simply unknown to it and takes the TS5023 path.
+///
+/// `hint` is tsc's indented second line, empty when it has none.
+const removed_options = [_]struct { name: []const u8, hint: []const u8 }{
+    .{ .name = "baseUrl", .hint = "Use '\"paths\": {\"*\": [\"./*\"]}' instead." },
+    .{ .name = "downlevelIteration", .hint = "" },
+    .{ .name = "outFile", .hint = "" },
+};
+
+/// Byte range of the `compilerOptions` key `name` in the ROOT config's own
+/// text, for anchoring its TS5102.
+///
+/// An option inherited through `extends` has no node in the root config at
+/// all; tsc falls back to the root's `compilerOptions` key rather than
+/// pointing into the base file (verified against tsgo 7.0.2 — moving the key
+/// inside the base did not move the reported position). A root with no
+/// `compilerOptions` object at all anchors at offset 0.
+fn removedOptionSpan(root: ?Value.Object, name: []const u8) struct { start: u32, end: u32 } {
+    const obj = root orelse return .{ .start = 0, .end = 0 };
+    if (obj.get("compilerOptions")) |co| {
+        if (co == .object) {
+            if (co.object.keyPos(name)) |at|
+                return .{ .start = at, .end = at + @as(u32, @intCast(name.len)) + 2 };
+        }
+    }
+    if (obj.keyPos("compilerOptions")) |at|
+        return .{ .start = at, .end = at + @as(u32, "compilerOptions".len) + 2 };
+    return .{ .start = 0, .end = 0 };
+}
+
+/// Render the TS5102 for every removed option the merged chain set, in
+/// `removed_options` order. Pure: `present` is the bitset `applyOwn`
+/// accumulated, `root` and its text come from the root config.
+fn removedOptionDiags(
+    arena: Allocator,
+    present: RemovedSet,
+    root: ?Value.Object,
+) Error![]const ConfigDiag {
+    if (present == 0) return &.{};
+    var out: std.ArrayList(ConfigDiag) = .empty;
+    for (removed_options, 0..) |ro, i| {
+        if (present & (@as(RemovedSet, 1) << @intCast(i)) == 0) continue;
+        const span = removedOptionSpan(root, ro.name);
+        const msg = if (ro.hint.len == 0)
+            try std.fmt.allocPrint(arena, "Option '{s}' has been removed. Please remove it from your configuration.", .{ro.name})
+        else
+            try std.fmt.allocPrint(arena, "Option '{s}' has been removed. Please remove it from your configuration.\n  {s}", .{ ro.name, ro.hint });
+        try out.append(arena, .{ .code = 5102, .msg = msg, .start = span.start, .end = span.end });
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// One bit per `removed_options` entry.
+const RemovedSet = u8;
+
+comptime {
+    std.debug.assert(removed_options.len <= @bitSizeOf(RemovedSet));
+}
 
 // ===========================================================================
 // glob matcher (re-exports)
@@ -818,6 +921,13 @@ const Merged = struct {
     // `@types` root directories (base-relative, anchored to `type_roots_dir`).
     type_roots: ?[]const []const u8 = null,
     type_roots_dir: []const u8 = "",
+    /// Which `removed_options` any config in the chain set. tsc diagnoses the
+    /// merged option set, so a base declaring one counts.
+    removed: RemovedSet = 0,
+    /// The ROOT config's parsed object and text — where a TS5102 anchors
+    /// (`removedOptionSpan`) and what `Config.text` carries out.
+    root_obj: ?Value.Object = null,
+    root_text: []const u8 = "",
 };
 
 /// Read, parse, and merge `config_path` (base-relative, directory `dir`) into
@@ -846,7 +956,13 @@ fn mergeConfig(
             return;
         },
     };
-    const root = parseJsonc(cx.arena, text) catch |err| switch (err) {
+    // Only the ROOT config pays for key positions: they exist to anchor a
+    // TS5102, and tsc anchors every one of those in the root file even when a
+    // base is what set the option (`removedOptionSpan`).
+    const root = (if (is_root)
+        jsonc.parseJsoncKeyed(cx.arena, text)
+    else
+        parseJsonc(cx.arena, text)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.SyntaxError => {
             if (is_root) return error.SyntaxError;
@@ -858,6 +974,10 @@ fn mergeConfig(
         if (is_root) return error.SyntaxError;
         try cx.warn("{s}: config referenced by 'extends' is not an object (ignored)", .{config_path});
         return;
+    }
+    if (is_root) {
+        acc.root_obj = root.object;
+        acc.root_text = text;
     }
 
     // Resolve `extends` bases first so their options apply before this config's.
@@ -932,6 +1052,18 @@ fn applyOwn(
                 continue;
             }
             for (val.object.keys, val.object.vals) |okey, oval| {
+                // Removed-but-recognized options are TS5102 (see
+                // `removed_options`). The option is still parsed below when
+                // ztsc understands it — a TS5102 stops the run at the report
+                // stage, so nothing downstream ever consults the value, and
+                // keeping one code path avoids two readings of `baseUrl`.
+                var is_removed = false;
+                for (removed_options, 0..) |ro, ri| {
+                    if (std.mem.eql(u8, okey, ro.name)) {
+                        acc.removed |= @as(RemovedSet, 1) << @intCast(ri);
+                        is_removed = true;
+                    }
+                }
                 if (std.mem.eql(u8, okey, "strict")) {
                     if (oval == .boolean) {
                         acc.strict = oval.boolean;
@@ -1104,7 +1236,7 @@ fn applyOwn(
                     } else {
                         try cx.warn("{s}: 'paths' must be an object (ignored)", .{config_path});
                     }
-                } else {
+                } else if (!is_removed) {
                     try cx.warn("{s}: unknown compiler option '{s}' (ignored)", .{ config_path, okey });
                 }
             }
