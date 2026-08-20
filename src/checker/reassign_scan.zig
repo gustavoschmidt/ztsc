@@ -28,6 +28,7 @@ const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
 const this_flow_root = @import("refkey.zig").this_flow_root;
+const super_flow_root = @import("refkey.zig").super_flow_root;
 
 /// Populate `reassigned_syms` for the current file: the set of value
 /// symbols that are ever the target of a reassignment (`x = …`, `x += …`,
@@ -366,6 +367,11 @@ pub fn markMemberWriteRoot(c: *Checker, target: Node, scope: ScopeId) Error!void
             }
         },
         .this_expr => try c.recordMemberWrite(this_flow_root, scope),
+        // `super.p = …` is a legal write, and `super` is its own reference
+        // root (tsc's `isMatchingReference` matches a SuperKeyword only
+        // against another one), so it invalidates `super.p` narrowings and
+        // deliberately not `this.p` ones.
+        .super_expr => try c.recordMemberWrite(super_flow_root, scope),
         else => {},
     }
 }

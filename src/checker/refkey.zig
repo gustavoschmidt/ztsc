@@ -132,9 +132,9 @@ pub const PathElem = struct {
 /// the innermost link (closest to the root), `path[len-1]` the outermost.
 /// Each link is a dotted member (`.p`) or a constant element access (`[i]`),
 /// so `data.Legend[0].rules` is a depth-3 reference (`Legend`, `[0]`,
-/// `rules`). A `this`-rooted path uses the sentinel root `this_flow_root`
-/// (flow graphs are per-function, so the sentinel never crosses a
-/// `this`-rebind boundary).
+/// `rules`). A `this`- or `super`-rooted path uses the sentinel root
+/// `this_flow_root` / `super_flow_root` (flow graphs are per-function, so
+/// neither sentinel crosses a `this`-rebind boundary).
 ///
 /// Up to `max_ref_depth` links live in `path`, with trailing slots past
 /// `len` left default so the struct hashes/compares canonically as an
@@ -228,6 +228,21 @@ pub const DeepPath = struct {
 /// Sentinel `RefKey.sym` for `this`-rooted property paths.
 pub const this_flow_root: SymbolId = std.math.maxInt(SymbolId);
 
+/// Sentinel `RefKey.sym` for `super`-rooted property paths.
+///
+/// tsc tracks `super.p` as a reference exactly as it tracks `this.p`
+/// (`isMatchingReference` compares a SuperKeyword root by kind, the same way it
+/// compares a ThisKeyword one), so `super.m && super.m()` narrows away the
+/// `undefined` an optional method carries. `super` names the SAME object as
+/// `this` at runtime, but it is deliberately a DISTINCT root here: a write
+/// through `this.p` does not invalidate what a guard proved about `super.p` in
+/// tsc either, and keeping them apart is the conservative direction — the two
+/// spellings simply never narrow each other.
+///
+/// Like `this`, the sentinel never crosses a rebind boundary: flow graphs are
+/// per-function and `super` is only meaningful inside a class member.
+pub const super_flow_root: SymbolId = std.math.maxInt(SymbolId) - 1;
+
 /// Base of the sentinel `RefKey.sym` range for OBJECT-BINDING-PATTERN
 /// pseudo-references — tsc's `getNarrowedTypeOfSymbol`, which narrows the
 /// destructured *parent* (`function f({ kind, data }: A | B)`) by a guard on
@@ -244,8 +259,9 @@ pub const this_flow_root: SymbolId = std.math.maxInt(SymbolId);
 /// `isPatternRoot` first, exactly as it already tests `this_flow_root`.
 pub const pattern_root_base: SymbolId = std.math.maxInt(SymbolId) - (1 << 20);
 
-/// Is this a sentinel root (`this`, or a binding pattern) rather than a real
-/// symbol? Guards every `symFlags`/`symFile`/`declsOf` read in a flow walk.
+/// Is this a sentinel root (`this`, `super`, or a binding pattern) rather than
+/// a real symbol? Guards every `symFlags`/`symFile`/`declsOf` read in a flow
+/// walk.
 pub inline fn isPseudoRoot(sym: SymbolId) bool {
     return sym >= pattern_root_base;
 }
@@ -475,6 +491,8 @@ pub fn buildRefKey(c: *Checker, node: Node) Error!?RefKey {
         }
     } else if (c.nodeTag(n) == .this_expr) {
         root = this_flow_root;
+    } else if (c.nodeTag(n) == .super_expr) {
+        root = super_flow_root;
     } else return null;
     // Links were collected outermost-first; reverse so `path[0]` is the
     // innermost link (closest to the root).

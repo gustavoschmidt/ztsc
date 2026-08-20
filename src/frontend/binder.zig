@@ -3264,26 +3264,26 @@ const Binder = struct {
                             try b.memberNameKey(tok, proto.flags);
                         _ = try b.declare(if (is_static) ss else ms, atom, kind, member, tok, .{
                             .static_member = is_static,
-                            // NOT SET, deliberately, and it is a known gap:
                             // `m?(): number` is an OPTIONAL property whose type
                             // is `(() => number) | undefined`, exactly as
-                            // `m?: () => number` is (tsc reads optionality off
+                            // `m?: () => number` is — tsc reads optionality off
                             // the declaration in
                             // `getTypeOfVariableOrParameterOrProperty` and does
-                            // not care whether it is a method or a field), so
-                            // `c.m()` should be TS2722 and `const d: C = {}`
-                            // legal. Setting it is a one-word change and it
-                            // measures NET NEGATIVE today, because a
-                            // `super.<name>` reference is not narrowable:
-                            // `refkey.buildRefKey` bottoms out at an identifier
-                            // or `this` and has no `super` root, so
-                            // `super.m && super.m()` cannot narrow and every
-                            // optional method reached that way becomes a false
-                            // positive (`controlFlowSuperPropertyAccess`). The
-                            // two land together: a `super_flow_root` sentinel
-                            // beside `this_flow_root` (refkey.zig) plus its two
-                            // readers in flow.zig (`identIsSym`,
-                            // `isPatternRoot`), and then this line.
+                            // not care whether it is a method or a field. So
+                            // `c.m()` is TS2722 and `const d: C = {}` is legal.
+                            //
+                            // (wave-24 A) This one word could not land before a
+                            // `super.<name>` reference was narrowable:
+                            // `refkey.buildRefKey` bottomed out at an
+                            // identifier or `this` and had no `super` root, so
+                            // `super.m && super.m()` narrowed nothing and every
+                            // optional method reached that way was a false
+                            // TS2722 (`controlFlowSuperPropertyAccess`). The
+                            // `super_flow_root` sentinel beside
+                            // `this_flow_root` (refkey.zig), read by
+                            // `identIsSym`/`isPatternRoot` in flow.zig, is what
+                            // made it net positive.
+                            .optional_member = proto.flags & ast.Flags.optional != 0,
                             .has_impl = md.rhs != 0 and !is_get and !is_set,
                             .non_public = proto.flags & nonpublic_mask != 0 or isPrivateNameToken(b, tok),
                         });

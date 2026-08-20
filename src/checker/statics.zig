@@ -73,14 +73,14 @@ pub fn ownStaticMemberProp(c: *Checker, cls: SymbolId, name: Atom) Error!?types.
 /// fast path and `classStaticType`'s whole-table build — which were two copies
 /// of the same five lines, one demand apart, with nothing keeping them in step.
 ///
-/// `prop_flag_optional` is missing from BOTH and belongs here: `static s?: T`
-/// is an optional property and the static side has never said so. It is left
-/// out until a `super.<name>` reference can be narrowed — see the note beside
-/// `optional_member` in `Binder.bindClass`, which is the same one-word fix on
-/// the instance side and measures net negative without it.
+/// `static s?: T` / `static s?(): T` is an optional property, and the static
+/// side says so here — the instance side's equivalent is `optional_member` in
+/// `Binder.bindClass`, and the two landed together with the `super_flow_root`
+/// reference root that lets `super.s && super.s()` narrow (wave-24 A).
 fn staticPropFlags(c: *Checker, msym: SymbolId) u32 {
     const mf = c.symFlags(msym);
     var flags: u32 = 0;
+    if (mf.optional_member) flags |= types.prop_flag_optional;
     if (mf.readonly_member) flags |= types.prop_flag_readonly;
     if (mf.getter and !mf.setter) flags |= types.prop_flag_readonly;
     flags |= visibilityPropFlags(c, msym, mf.non_public);

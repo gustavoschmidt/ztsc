@@ -59,6 +59,7 @@ pub const RefQ = refkey.RefQ;
 pub const SymLoop = refkey.SymLoop;
 pub const LoopFrame = refkey.LoopFrame;
 pub const this_flow_root = refkey.this_flow_root;
+pub const super_flow_root = refkey.super_flow_root;
 pub const pattern_root_base = refkey.pattern_root_base;
 pub const isPseudoRoot = refkey.isPseudoRoot;
 pub const makeRefKey = refkey.makeRefKey;
@@ -109,10 +110,10 @@ pub const markMemberWriteRoot = reassign_scan.markMemberWriteRoot;
 pub const recordMemberWrite = reassign_scan.recordMemberWrite;
 
 /// Is `sym` a binding-pattern pseudo-root (`pattern_root_base`), as opposed to
-/// a real symbol or the `this` sentinel? Only the flow walk mints and consumes
-/// these, so unlike `isPseudoRoot` it has no reader outside this file.
+/// a real symbol or the `this`/`super` sentinels? Only the flow walk mints and
+/// consumes these, so unlike `isPseudoRoot` it has no reader outside this file.
 inline fn isPatternRoot(sym: SymbolId) bool {
-    return sym >= pattern_root_base and sym != this_flow_root;
+    return sym >= pattern_root_base and sym != this_flow_root and sym != super_flow_root;
 }
 
 /// Intern `decl` (a parameter or declarator whose name is an object binding
@@ -123,7 +124,9 @@ fn patternRoot(c: *Checker, decl: Node) Error!?SymbolId {
     if (c.fresh_tp_base != 0 and c.fresh_tp_base >= pattern_root_base) return null;
     const gop = try c.pattern_root_ids.getOrPut(c.cm(), c.nodeKey(decl));
     if (!gop.found_existing) {
-        if (c.pattern_root_decls.items.len >= this_flow_root - pattern_root_base) {
+        // The cap is `super_flow_root`, the LOWEST of the two fixed sentinels
+        // above the pattern range — one past it would alias `super`.
+        if (c.pattern_root_decls.items.len >= super_flow_root - pattern_root_base) {
             _ = c.pattern_root_ids.remove(c.nodeKey(decl));
             return null;
         }
@@ -2507,6 +2510,7 @@ fn aliasedDiscriminantAtom(c: *Checker, node: Node, key: RefKey) Error!?Atom {
 pub fn identIsSym(c: *Checker, node: Node, sym: SymbolId) Error!bool {
     if (node == null_node) return false;
     if (sym == this_flow_root) return c.nodeTag(node) == .this_expr;
+    if (sym == super_flow_root) return c.nodeTag(node) == .super_expr;
     // A binding pattern is never itself written as an expression, so no
     // identifier ever *is* a pattern pseudo-root (its bindings are matched by
     // `discriminantOfRef` instead).
