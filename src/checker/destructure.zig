@@ -609,7 +609,15 @@ fn checkObjectPatternProps(c: *Checker, pat: Node, whole: TypeId) Error!void {
             // A DEFAULT makes the property optional to begin with: tsc passes
             // `AccessFlags.AllowMissing` for `hasDefaultValue(declaration)`,
             // which is what keeps `var { x = 1 } = {}` clean.
-            if (c.tree.nodeData(el).rhs != 0) continue;
+            //
+            // `AllowMissing` relaxes a property LOOKUP, though, and a NULLISH
+            // constituent has no property table for the lookup to be relaxed
+            // against — `getIndexedAccessTypeOrUndefined` still fails on it
+            // and names the whole union. `function test({ nested: { p = 'c' }
+            // }: { nested?: { p: 'a' | 'b' } })` destructures
+            // `{ p: "a" | "b" } | undefined`, and `p` is TS2339 there despite
+            // its default (`destructuringParameterDeclaration8`).
+            if (c.tree.nodeData(el).rhs != 0 and !c.containsNullish(r)) continue;
             // A NUMERIC-looking name reaches the number index signature (and a
             // tuple/array element) as well — `isApplicableIndexType`'s
             // numeric-name disjunct, the same one the `o["0"]` read takes. It
