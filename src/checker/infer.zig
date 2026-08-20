@@ -1059,22 +1059,57 @@ pub fn inferTypeArgs(
                         // Giving the probe its OWN `contra`/`contra_sup` and
                         // running tsc's `getInferredType` choice
                         // (`preferContravariant`) over the pair is faithful and
-                        // is MEASURABLY worse: react-query's
-                        // `useInfiniteQuery({queryFn: ({pageParam}:
-                        // {pageParam?: string}) => …, initialPageParam:
-                        // undefined, getNextPageParam: lastPage => …})` pins
-                        // `TPageParam` at the covariant `undefined` — which is
-                        // a subtype of the annotated `string | undefined`, so
-                        // tsc's own rule picks it — and `getNextPageParam`'s
-                        // `string | undefined` return then fits no overload
-                        // (4 diagnostics on social-app). What supplies
-                        // `string | undefined` today is exactly this fold of
-                        // the contravariant candidate into the covariant
-                        // accumulator. Making the split hold here needs the
-                        // half tsc has and ztsc does not: pass two re-deriving
-                        // its own candidates rather than reading the probe's
-                        // published answer, so the callback's RETURN can still
-                        // contribute after the parameter has been fixed.
+                        // is MEASURABLY worse. Five attempts have now been made
+                        // at it; the fifth got all the way to green apps and a
+                        // NET-POSITIVE sweep before a conformance case stopped
+                        // it, so what it learned is worth keeping:
+                        //
+                        //  1. Re-point the WHOLE context (`owner`, `contra`,
+                        //     `contra_sup`, `keyof_contra`, `top_flags`), not
+                        //     just `rev` — `contraSlot` keys on `owner`.
+                        //  2. Every reader of "the probe's answer" must then
+                        //     read the `preferContravariant` FOLD of the two
+                        //     sets, not `probe_cands`: a parameter whose only
+                        //     evidence is contravariant is absent from the
+                        //     covariant array entirely, and the post-pass
+                        //     fix-up below left `useMutation`'s `TVariables` at
+                        //     its `void` default — 40 social-app diagnostics.
+                        //  3. Round one's covariant set is INCOMPLETE by
+                        //     construction (it skipped every context-sensitive
+                        //     property) and folding papered over that, because
+                        //     the contravariant candidate supplied the missing
+                        //     width. WEIGHING an unfinished covariant answer
+                        //     picks the wrong one: react-query's
+                        //     `useInfiniteQuery({queryFn: ({pageParam}:
+                        //     {pageParam?: string}) => …, initialPageParam:
+                        //     undefined, getNextPageParam: lastPage => …})`
+                        //     pins `TPageParam` at the covariant `undefined`,
+                        //     which IS a subtype of the annotated
+                        //     `string | undefined`, so tsc's own rule picks it.
+                        //     Completing the set from a second skip-off read and
+                        //     letting pass two speak for a parameter named in a
+                        //     context-sensitive RETURN (not just `cs_ret_only`)
+                        //     fixes it: both apps byte-empty, ts-suite +1 on
+                        //     `coAndContraVariantInferences7`.
+                        //  4. What it does NOT survive is a contravariant
+                        //     candidate ztsc records and tsc does not. With the
+                        //     fold, such a candidate was harmless — it merged
+                        //     into a covariant answer that outweighed it. Split
+                        //     out, `preferContravariant` hands it the parameter
+                        //     whenever the covariant side is empty, ahead of the
+                        //     type parameter's DEFAULT. `useQuery`'s
+                        //     `placeholderData: (prev) => prev || {…}` is the
+                        //     case: round one refuses the callback, the walk
+                        //     still reaches `PlaceholderFn<NonFunctionGuard<
+                        //     TData>>`'s parameter position, and `TData` comes
+                        //     out `undefined` instead of defaulting to
+                        //     `TQueryFnData` (conformance
+                        //     inference/two_round_context_sensitive_object_literal).
+                        //
+                        // So the sixth attempt starts at (4), not at the split:
+                        // find why the skipped round records a contravariant
+                        // candidate for a refused property at all, and the rest
+                        // of the fifth attempt's shape should hold.
                         const probe_rev = try c.scratch().alloc(bool, tp_syms.len);
                         for (probe_rev) |*x| x.* = false;
                         const outer_rev = c.infer_ctx.rev;
