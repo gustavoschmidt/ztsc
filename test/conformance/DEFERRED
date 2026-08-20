@@ -61,8 +61,8 @@ instantiation/018_growing_template_hole_no_loop.ts  -TS2589 16
 # packages and on excalidraw. Zero *there* is not zero: every remaining entry
 # in this file is a line where the oracle considers a directive used and ztsc
 # would consider it unused — a numeric-literal key (`constassert/006`), a cast
-# through a deferred `T[K]` (`indexed/032`), a callback-parameter direction
-# (`assignability/065`), TS2589 at a recursion cap (`instantiation/003`, `010`,
+# through a deferred `T[K]` (`indexed/032`), TS2589 at a recursion cap
+# (`instantiation/003`, `010`,
 # `018`), a still-deferred type argument (`instantiation/052`). TS2578 on that
 # basis is a false positive on correct code — the one thing project policy
 # forbids — so the prerequisite is unchanged: this file empty of `-` entries,
@@ -75,36 +75,6 @@ instantiation/018_growing_template_hole_no_loop.ts  -TS2589 16
 #
 # Deterministic under-report of a whole check.
 directives/012_ts_expect_error_unused.ts  -TS2578 7
-
-# The callback-parameter relation is ADDITIVE in ztsc, where tsc makes it the
-# only test for a pair of single-call-signature parameters. When the callback
-# comparison fails, ztsc falls back to the pre-existing
-# contravariant/bivariant parameter check instead of rejecting, so the two
-# directions tsc rejects *because* the callback relation is exclusive are
-# under-reported: a method callback related in the contravariant direction
-# (line 25), and a callback nested one level deeper, which tsc relates
-# strictly (line 74).
-#
-# Re-measured 2026-08-02, after the B1 relation work (memo-key
-# canonicalization, the growing-instantiation guard, measured variance) — the
-# fixes that were the standing reason to re-evaluate. Making the rule
-# exclusive (the fall-through below `signatureAssignableMode`'s callback arm
-# replaced by `return false`) does fix exactly these two lines and regresses
-# no other conformance case, but it still costs more than it buys: on the
-# 16-package corpus it is byte-identical on fifteen packages and adds TEN new
-# false positives on rxjs 7.8.1 —
-#
-#   Notification.ts:180, concatWith.ts:47, delayWhen.ts:98, elementAt.ts:62,
-#   first.ts:86, ignoreElements.ts:42, last.ts:84, mergeWith.ts:48,
-#   onErrorResumeNextWith.ts:93 (TS2322) and catchError.ts:117 (TS2345)
-#
-# — every one of them the same unrelated inference gap the exclusivity merely
-# surfaces: ztsc infers `Observable<unknown>` / `OperatorFunction<…, unknown>`
-# where tsc infers the element type. The prerequisite is that inference gap,
-# not the relation. The 7 positives in the same case prove the callback
-# relation itself is in place.
-assignability/065_callback_parameter_variance.ts  -TS2322 25
-assignability/065_callback_parameter_variance.ts  -TS2322 74
 
 # A cast whose source or target is a DEFERRED indexed access (`T[K]`) is
 # conceded outright (indexed/031): tsc rejects one only when

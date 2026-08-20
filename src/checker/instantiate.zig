@@ -121,14 +121,58 @@ pub fn aliasInstance(c: *Checker, sym: SymbolId, args: []const TypeId, tok: Toke
     //   * Drop this rule entirely — always materialize outside the cycle.
     //     social-app comes out 95 / 95, `Navigation.tsx:778` converges, and
     //     the cost is ONE new false positive (`FeedPage.tsx:101`, a TS2345
-    //     the ref spelling used to relate away): a relation gap on the
-    //     structural spelling, in `assign.zig`, not a fault of this rule.
+    //     the ref spelling used to relate away).
     //
-    // Note what that pair proves: NO partition-independent rule reproduces
-    // today's 94-diagnostic social-app baseline, because the 94 is itself an
-    // artifact of the asymmetric marking. Fixing this necessarily moves the
-    // app baseline, and the cheapest correct move is "always materialize"
-    // once `FeedPage.tsx:101` is closed.
+    // ===== WAVE-27 FOLLOW-UP (agent B): WHAT `FeedPage.tsx:101` ACTUALLY IS
+    //
+    // It is an INFERENCE gap in `infer.unify`, not a relation gap in
+    // `assign.zig`, and it is NOT a fault of this rule — it reproduces with
+    // the rule ON. Standalone repro, oracle-clean, ztsc reports one TS2345:
+    //
+    // ```ts
+    // type Keyof<P extends {}> = Extract<keyof P, string>;
+    // type NavState<P extends {} = {}> = { routeNames: Keyof<P>[] };
+    // type Helpers<P extends {}, S extends NavState = NavState> = {
+    //   getState(): S; reset(state: S): void;
+    // };
+    // type NavProp<P extends {}, S extends NavState = NavState<P>> =
+    //   Omit<Helpers<P, S>, 'getParent'> & { setOptions(): void };
+    // type Native<P extends {}> = NavProp<P, NavState<P>>;
+    // declare const nav: Native<{ A: undefined; B: undefined }>;
+    // declare function getRoot<T extends {}>(n: NavProp<T>): NavProp<T>;
+    // getRoot(nav);      // ztsc: TS2345.  tsgo 7.0.2: clean.
+    // ```
+    //
+    // `T` takes NO candidate and falls back to its `{}` constraint, so
+    // `Extract<keyof {}, string>` is `never` and the parameter's route names
+    // are `never[]` — nothing can meet it. Measured, in order:
+    //
+    //   * the intersection arm of `unify` DOES pair the two `Omit`-materialized
+    //     constituents (`intersectionMembersPair` returns true, both carry a
+    //     `.ref` origin naming `Omit`), and the `unify` under that pair still
+    //     records nothing;
+    //   * drop the `& { setOptions(): void }` and it PASSES — without the
+    //     intersection the parameter stays a deferred `.mapped` and
+    //     `inferReverseMapped`'s same-alias rule binds `T`. The intersection is
+    //     what forces the mapped type to materialize into a plain object;
+    //   * drop the `Omit` and it passes (the `Helpers<…>` reference pairs
+    //     directly); put the extras only on `Native` and it passes.
+    //
+    // So the missing rule is somewhere in the object-vs-object walk under a
+    // materialized mapped application: the alias identity that would answer
+    // (`NavState<T>` vs `NavState<AllParams>`) is intact at the top of the pair
+    // but not recoverable at the property where `T` actually occurs. Two
+    // tsc-faithful additions were tried and did NOT close it — tsc's
+    // `source.aliasSymbol === target.aliasSymbol` rule at the head of `unify`
+    // via `refFacetOf`, and the same rule ahead of the kind test in
+    // `intersectionMembersPair` — so the next step is to instrument which
+    // property pair loses the identity, not to add a third guess.
+    //
+    // Note what the pair of variants proves: NO partition-independent rule
+    // reproduces today's 94-diagnostic social-app baseline, because the 94 is
+    // itself an artifact of the asymmetric marking. Fixing this necessarily
+    // moves the app baseline, and the cheapest correct move is "always
+    // materialize" once the inference gap above is closed.
     //
     // Two social-app divergences are NOT explained by any of this and survive
     // every variant above — `StarterPackDialog.tsx:245` (TS2769) and

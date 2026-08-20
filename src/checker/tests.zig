@@ -826,12 +826,18 @@ test "printer goldens via diagnostics" {
     var t = try TestCheck.init("const x: { a: number; b?: string } = 1;");
     defer t.deinit();
     try testing.expectEqual(@as(usize, 1), t.result.diagnostics.len);
-    try testing.expectEqualStrings("Type '1' is not assignable to type '{ a: number; b?: string; }'.", t.result.diagnostics[0].msg);
+    // The source is named by its BASE type: tsc's `reportRelationError`
+    // generalizes a literal source unless the target could hold a singleton
+    // (`typeCouldHaveTopLevelSingletonTypes`), and an object type cannot.
+    // Oracle-checked against tsgo 7.0.2, which prints `Type 'number'` here.
+    try testing.expectEqualStrings("Type 'number' is not assignable to type '{ a: number; b?: string; }'.", t.result.diagnostics[0].msg);
 
     var t2 = try TestCheck.init("declare function f(cb: (x: number) => string): void; f(3);");
     defer t2.deinit();
     try testing.expectEqual(@as(usize, 1), t2.result.diagnostics.len);
-    try testing.expectEqualStrings("Argument of type '3' is not assignable to parameter of type '(x: number) => string'.", t2.result.diagnostics[0].msg);
+    // Same generalization in argument position — tsc passes the head message
+    // into the very `reportRelationError` that does it. Oracle: `'number'`.
+    try testing.expectEqualStrings("Argument of type 'number' is not assignable to parameter of type '(x: number) => string'.", t2.result.diagnostics[0].msg);
 
     var t3 = try TestCheck.init("const x: [number, string] | null = true;");
     defer t3.deinit();

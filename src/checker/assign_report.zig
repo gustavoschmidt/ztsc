@@ -1086,15 +1086,90 @@ pub fn reportNotAssignable(c: *Checker, code: u16, src_t: TypeId, target: TypeId
     // no structural story (`elaborate.zig`). Computed BEFORE `diagFmt` so the
     // whole message is one interpolation.
     const chain = if (c.diagAlreadyFiled(code, span)) "" else try elaborate.chainText(c, src_t, target);
+    const named_src = try generalizedSourceForMessage(c, src_t, target);
     if (code == 2345) {
         try c.diagFmt(2345, span, "Argument of type '{s}' is not assignable to parameter of type '{s}'.{s}", .{
-            try c.typeToString(src_t), try c.typeToString(target), chain,
+            try c.typeToString(named_src), try c.typeToString(target), chain,
         });
     } else {
         try c.diagFmt(code, span, "Type '{s}' is not assignable to type '{s}'.{s}", .{
-            try c.typeToString(src_t), try c.typeToString(target), chain,
+            try c.typeToString(named_src), try c.typeToString(target), chain,
         });
     }
+}
+
+/// The type the HEADLINE names on the source side — tsc's `reportRelationError`:
+///
+/// ```ts
+/// if (isLiteralType(source) && !typeCouldHaveTopLevelSingletonTypes(target)) {
+///     generalizedSource = getBaseTypeOfLiteralType(source);
+///     generalizedSourceType = getTypeNameForErrorDisplay(generalizedSource);
+/// }
+/// ```
+///
+/// A literal source is named by its BASE type unless the target is somewhere a
+/// singleton could have landed — `const x: number = 1` cannot fail, so a pair
+/// that DID fail against a non-singleton target failed on the primitive, and
+/// saying `Type '1'` points at a distinction that is not the reason. Message
+/// only: nothing here decides a relation.
+fn generalizedSourceForMessage(c: *Checker, src_t: TypeId, target: TypeId) Error!TypeId {
+    if (!try isLiteralTypeForMessage(c, src_t)) return src_t;
+    if (try couldHaveTopLevelSingletons(c, target)) return src_t;
+    return c.baseTypeOfLiteral(src_t);
+}
+
+/// tsc's `isUnitType`: one of the types a `===` can decide outright.
+fn isUnitKind(k: types.Kind) bool {
+    return switch (k) {
+        .string_literal,
+        .number_literal,
+        .number_literal_fresh,
+        .bigint_literal,
+        .bool_true,
+        .bool_false,
+        .enum_type,
+        .unique_symbol,
+        .undefined,
+        .null,
+        => true,
+        else => false,
+    };
+}
+
+/// tsc's `isLiteralType`: `boolean` (the `true | false` union spelled as one
+/// type), a union of unit types, or a unit type.
+fn isLiteralTypeForMessage(c: *Checker, t: TypeId) Error!bool {
+    const k = c.ts.kind(t);
+    if (k == .boolean) return true;
+    if (k == .union_type) {
+        for (try c.memberList(t)) |m| {
+            if (!isUnitKind(c.ts.kind(m))) return false;
+        }
+        return true;
+    }
+    return isUnitKind(k);
+}
+
+/// tsc's `typeCouldHaveTopLevelSingletonTypes`: is there a position in `t`
+/// where a singleton could sit? `boolean` is deliberately NOT one, "yes,
+/// 'boolean' is a union of 'true | false', but that's not useful here".
+fn couldHaveTopLevelSingletons(c: *Checker, t: TypeId) Error!bool {
+    const k = c.ts.kind(t);
+    if (k == .boolean) return false;
+    if (k == .union_type or k == .intersection) {
+        for (try c.memberList(t)) |m| {
+            if (try couldHaveTopLevelSingletons(c, m)) return true;
+        }
+        return false;
+    }
+    switch (k) {
+        .type_param, .index_access, .conditional, .keyof_op => {
+            const con = try c.transitiveBaseConstraint(t);
+            if (con != types.no_type and con != t) return couldHaveTopLevelSingletons(c, con);
+        },
+        else => {},
+    }
+    return isUnitKind(k) or k == .template_literal_type or k == .string_mapping;
 }
 
 /// tsc's getSuggestedTypeForNonexistentStringLiteralType: when a string
@@ -1447,6 +1522,56 @@ fn lastSpreadIndex(c: *const Checker, members: []const Node) usize {
     return 0;
 }
 
+/// The branches of an expression whose TYPE is a union of its operands'
+/// types — `a || b`, `a ?? b`, `a && b`, `c ? a : b` — in source order, or
+/// null for anything else.
+///
+/// These are the only expressions that put more than one FRESH object literal
+/// behind a single node, which is what the excess-property check needs the
+/// list for: it reports on a literal, and a union source is related one
+/// constituent at a time.
+fn sourceUnionBranches(c: *const Checker, node: Node) Error!?[2]Node {
+    const d = c.tree.nodeData(node);
+    switch (c.nodeTag(node)) {
+        .binary => switch (c.tree.tokens.tag(c.tree.nodeMainToken(node))) {
+            .pipe_pipe, .amp_amp, .question_question => return .{ d.lhs, d.rhs },
+            else => return null,
+        },
+        .cond_expr => {
+            const e = c.tree.extraData(ast.CondExpr, d.rhs);
+            return .{ e.then_expr, e.else_expr };
+        },
+        else => return null,
+    }
+}
+
+/// The excess-property check over the branches of a union-valued expression,
+/// in SOURCE order, stopping at the first that reports — see the call site.
+///
+/// A branch whose own type the union no longer contains is skipped: the union
+/// is built with subtype reduction, so `{ a: '' } || { a: '', c: 2 }` has one
+/// constituent and the second branch is never related to anything. Comparing
+/// TypeIds is exactly the right test here — the constituents ARE the branches'
+/// node types, freshness and all, because that is what the union was built
+/// from.
+fn branchExcessScan(c: *Checker, branches: [2]Node, src_t: TypeId, target: TypeId, report: bool) Error!bool {
+    for (branches) |b| {
+        if (b == null_node) continue;
+        const bt = c.nodeType(b) orelse continue;
+        if (bt != src_t and !unionHasConstituent(c, src_t, bt)) continue;
+        if (try excessPropertyScan(c, b, bt, target, report)) return true;
+    }
+    return false;
+}
+
+fn unionHasConstituent(c: *const Checker, u: TypeId, m: TypeId) bool {
+    if (c.ts.kind(u) != .union_type) return false;
+    for (0..c.ts.memberCount(u)) |i| {
+        if (c.ts.memberAt(u, i) == m) return true;
+    }
+    return false;
+}
+
 pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: TypeId, report: bool) Error!bool {
     var node = expr_node;
     // Unwrap parens and a JSX expression container (`prop={{ … }}`): the
@@ -1458,6 +1583,23 @@ pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: T
             else => break,
         }
         if (node == null_node) return false;
+    }
+    // A source UNION written as `a || b`, `a ?? b`, `a && b` or `c ? a : b`
+    // relates CONSTITUENT BY CONSTITUENT (tsc's `eachTypeRelatedToType`), and
+    // each constituent that is a fresh literal gets its own excess check on the
+    // way past. The first one that fails ends the relation — `eachTypeRelated
+    // ToType` returns `Ternary.False` and the remaining constituents are never
+    // asked — so `const x: T = { a: '', b: 1 } || { a: '', c: 2 }` is exactly
+    // ONE TS2353, on `b`.
+    //
+    // Reached from the SYNTAX rather than from the union, because that is where
+    // the literal to report on lives; `branchExcessScan` keeps the two in step
+    // by skipping a branch whose own type the union no longer contains (subtype
+    // reduction drops `{ a: string, c: number }` from `{ a: string } | { a:
+    // string, c: number }` outright, which is why `{ a: '' } || { a: '', c: 2 }`
+    // is clean in the oracle).
+    if (try sourceUnionBranches(c, node)) |branches| {
+        return branchExcessScan(c, branches, src_t, target, report);
     }
     // An ARRAY literal is not excess-checked itself — it has no property names
     // — but each ELEMENT is: tsc's relation recurses into the elements with each
