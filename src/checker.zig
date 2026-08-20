@@ -2225,8 +2225,6 @@ pub const Checker = struct {
     /// would make the total depend on which side of it a memoized first visit
     /// happened to fall on, i.e. on traversal order (see
     /// `tagInstantiatedOrigin`).
-    /// TEMPORARY determinism instrumentation (wave 26).
-    trace_expand_err: bool = false,
     inst_count: u64 = 0,
     /// The cap `inst_count` is measured against for the window in flight:
     /// `max_instantiation_count` for a source element,
@@ -2649,7 +2647,6 @@ pub const Checker = struct {
             .io = io,
             .gpa = gpa,
             .interner = interner,
-            .trace_expand_err = std.c.getenv("ZTSC_EXPANDERR") != null,
             .prog = prog,
             .owned = owned,
             .cur_file = first,
