@@ -4717,12 +4717,21 @@ const Binder = struct {
 
             .super_expr => {},
 
-            // A leaf as far as names go, but inside a derived class's
-            // constructor its position relative to the `super(...)` call is a
-            // diagnostic (TS17009) — recorded with the flow in effect and
-            // answered once the file's flow graph is complete. The `super`
-            // half of the same rule is `noteSuperProperty`.
+            // A leaf as far as names go, but a NARROWABLE reference all the
+            // same: tsc's `checkThisExpression` hands `tryGetThisTypeAt`'s
+            // answer to `getFlowTypeOfReference`, so `if (this.isFoo()) { const
+            // f: Foo = this }` refines the bare keyword exactly as it refines
+            // `this.p`. The checker's `this_flow_root` sentinel is the key that
+            // matches it (`flow.identIsSym`), and it can only be queried at a
+            // node the binder gave a flow to.
+            //
+            // Inside a derived class's constructor the keyword's position
+            // relative to the `super(...)` call is also a diagnostic (TS17009)
+            // — recorded with the flow in effect and answered once the file's
+            // flow graph is complete. The `super` half of that rule is
+            // `noteSuperProperty`.
             .this_expr => {
+                try b.attachFlow(node);
                 if (b.in_derived_ctor) {
                     try b.this_in_derived_ctor.append(b.scratch, .{ .value = node, .next = b.cur_flow });
                 }
