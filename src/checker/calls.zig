@@ -372,6 +372,49 @@ fn declaredNeverCallee(c: *Checker, callee: Node) Error!bool {
     return c.ts.kind(try c.resolveStructural(try c.typeOfSymbol(sym))) == .never;
 }
 
+/// Which of tsc's three "cannot invoke a possibly-nullish object" diagnostics a
+/// callee type earns, or null when it is not nullish at all.
+const NullishCallee = enum {
+    null_only,
+    undefined_only,
+    both,
+
+    fn number(k: NullishCallee) u16 {
+        return switch (k) {
+            .null_only => 2721,
+            .undefined_only => 2722,
+            .both => 2723,
+        };
+    }
+    fn text(k: NullishCallee) []const u8 {
+        return switch (k) {
+            .null_only => "'null'",
+            .undefined_only => "'undefined'",
+            .both => "'null' or 'undefined'",
+        };
+    }
+};
+
+/// tsc's `getFalsyFlags(type) & TypeFlags.Nullable` for a callee.
+///
+/// `void` is deliberately NOT nullish here: `TypeFlags.Nullable` is
+/// `Undefined | Null` and nothing else, so `let e: (() => void) | void; e()`
+/// is the ordinary TS2349 with a "Type 'void' has no call signatures."
+/// elaboration — oracled both ways. That is why this cannot reuse
+/// `containsUndefinedish`, which folds `void` in for the member-access rules.
+fn nullishCallee(c: *Checker, t: TypeId) ?NullishCallee {
+    const has_null = c.containsNull(t);
+    const has_undef = c.unionAnyMember(t, struct {
+        fn f(ch: *Checker, m: TypeId) bool {
+            return ch.ts.kind(m) == .undefined;
+        }
+    }.f);
+    if (has_null and has_undef) return .both;
+    if (has_null) return .null_only;
+    if (has_undef) return .undefined_only;
+    return null;
+}
+
 /// Call/new as an optional-chain link (see `memberChainInner`). Answers the
 /// return type WITHOUT the chain's short-circuit `undefined`, plus `chained`
 /// when this `?.()` — or an earlier link in the callee spine — short-circuits
@@ -396,6 +439,28 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
     if (shape.optional) {
         if (c.containsNullish(callee_t)) chained = true;
         callee_t = try c.nonNullableChain(callee_t);
+    }
+    // tsc's `resolveCallExpression`, before anything is resolved:
+    //
+    //     funcType = checkNonNullTypeWithReporter(funcType, node.expression,
+    //         reportCannotInvokePossiblyNullOrUndefinedError);
+    //
+    // A possibly-nullish CALLEE has its own three diagnostics rather than the
+    // generic "not callable", and the call stops right there: the reporter's
+    // `getNonNullableType` answers `errorType` when nothing is left, and
+    // `resolveCallExpression` returns `resolveErrorCall(node)` for it. Without
+    // this every `a()` on `(() => void) | undefined` was a TS2349.
+    if (!is_new and !shape.optional and c.nodeTag(shape.callee) != .super_expr) {
+        if (nullishCallee(c, callee_t)) |code| {
+            try c.diagFmt(code.number(), c.nodeSpan(shape.callee), "Cannot invoke an object which is possibly {s}.", .{code.text()});
+            callee_t = try c.nonNullable(callee_t);
+            if (c.ts.kind(callee_t) == .never or c.containsNullish(callee_t)) {
+                for (shape.arg_nodes) |an| {
+                    if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+                }
+                return .{ .ty = types.error_type, .chained = chained };
+            }
+        }
     }
     var r = try c.resolveStructural(callee_t);
     var rk = c.ts.kind(r);
