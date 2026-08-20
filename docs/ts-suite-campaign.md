@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-20, post wave 25)
+## Standings (2026-08-20, post wave 26)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7218 / 8628 (83.6%)** |
-| excess keys (false positives) | 3541 | 1713 |
-| missing keys (under-reports) | 8617 | 3339 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7235 / 8632 (83.8%)** |
+| excess keys (false positives) | 3541 | 1694 |
+| missing keys (under-reports) | 8617 | 3287 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Twenty-five waves landed (3–25), every one with ZERO match→non-match regressions in
+Twenty-six waves landed (3–26), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -325,7 +325,78 @@ pre-existing social-app lines differ between --checkers=1 and 4
 (Navigation.tsx:778 TS2322 text, StarterPackDialog.tsx:245 TS2769,
 FeedSourceCard.tsx:197 TS2353) — proven pre-existing by binary bisection.
 
-## Ranked next queue (wave 26) — distilled from wave-25 agent reports
+Wave 26 (+17; conformance 1320→1322; social-app baseline refreshed 94→92
+check errors — two tsgo-proven Navigation.tsx FPs removed — plus
+message-text-only intersection-parens rendering): A landed the mapped-family
+RELATION half (root: unconstrained-param base-constraint collapse making
+T[keyof T] = never) + the generic-source/generic-target gate. B landed THE
+CONTRA-SPLIT ON ATTEMPT EIGHT (three simultaneous rules: probe answers
+preferContravariant over its own pair; aft infers nothing on EVERY unify arm;
+markFixedByParams fixes only written parameter positions) and root-fixed the
+`import a = a.b` SIGSEGV with TS2303 cycle edges. C landed the TS18046
+general arm (zero spurious this time — the prior 20/14 trade was a column
+artifact), pattern-default elaboration, and fixed gen_expected.js silently
+retiring snapshots on oracle failure. D REFUTED the instantiation-budget
+determinism hypothesis with measurement and found the TWO real root causes:
+(1) checkers axis — aliasInstance's alias_recursive is marked only for the
+cycle member each checker ENTERED at, so mutually-recursive aliases print
+different identities per partition (Navigation.tsx:778; no partition-
+independent rule reproduces the old baseline — fixing it MOVES the app
+baseline, cheapest correct move is always-materialize once FeedPage.tsx:101's
+relation gap closes); (2) file-order axis — interfaceGeneric folds merged
+bases in linker file-id order (ProcessEnv: Dict<string> vs ExpoProcessEnv
+any-index; needs canonical constituent order in link/modules.zig).
+StarterPackDialog.tsx:245 + FeedSourceCard.tsx:197 need their own hunt.
+⚠ PERF NOTE: D's JSX construct-signature checking (real checks tsc performs,
+previously skipped; removed the 2 Navigation FPs) costs social-app ~+2% wall
+(measurements 1.9%-2.4% across runs; RSS flat; all other targets flat).
+social-app has been outside the headline wall bar since staging (~70% of
+tsgo vs the ≤50% bar). Optimization queued.
+
+## Ranked next queue (wave 27) — distilled from wave-26 agent reports
+
+1. expr.zig element access must produce DEFERRED T[K] (the mapped-family
+   bulk, ~29 keys now unblocked — the relation side is ready): indexChainInner
+   classifies by typeIsStringLike/NumberLike and falls to `any` for a generic
+   receiver with keyof-typed index; no getIndexedAccessType deferral, no
+   AccessFlags.Writing for TS2542. Four probes committed in wave-26 A's report.
+2. Higher-order generic signature inference (12 keys):
+   instantiateTypeWithSingleGenericCallSignature → getUniqueTypeParameters →
+   attach inferred params to the RETURNED signature (calls.zig; the assign.zig
+   comment names the cases).
+3. Determinism fixes, now designed: (a) canonical merged-constituent order in
+   link/modules.zig (file-order axis, ProcessEnv witness); (b) close
+   FeedPage.tsx:101's relation gap (assign.zig) then flip aliasInstance to
+   always-materialize (checkers axis; MOVES the social-app baseline — expect
+   Navigation.tsx:778 to converge); (c) hunt StarterPackDialog.tsx:245
+   (TS2769) and FeedSourceCard.tsx:197 (TS2353) separately.
+4. covariantCallbacks unlock: extend variance.zig's measured variance to
+   ALIAS origin refs (tsc probes object/conditional aliases), then the
+   exclusive callback rule (SignatureCheckMode.Callback) is a clean +1;
+   assign.zig:5475's warning stands until then.
+5. TS2353 via a reporting comparable-relation entry (switch-case literals:
+   tsc runs checkTypeComparableTo whose excess pass reports TS2353 instead of
+   TS2678; union-source excess stops at the FIRST constituent — 3+ cases,
+   assign.zig).
+6. Message fidelity with conformance impact: literal widening in TS2322 text
+   (assign_report.zig — tsc generalizes a literal source unless the target
+   could have singletons); TS2694 qualified-name rendering (Namespace 'M.N').
+7. contextualCallSig needs getIntersectedSignatures (expr.zig:6981 — an
+   intersection contextual type combines arity-applicable sigs with
+   intersected params); call signatures off a deferred conditional's
+   constraint (callOfConditionalTypeWithConcreteBranches).
+8. Clusters: for-of/ES5For-of ×9 (iteration.zig); generatorTypeCheck ×6
+   (yield/stmts); jsx ×7; TS1434 residue (48 keys/19 cases).
+9. social-app JSX-check cost recovery (~2%): cache the construct-signature
+   props target per component symbol (the naive memo recovered nothing —
+   the cost is the checking itself; consider narrowing which attributes
+   re-check under identical instantiations).
+10. One-key census pools; binding-pattern-default contextual typing
+    (destructure.zig: objectBindingPatternContextuallyTypesArgument,
+    intraBindingPatternReferences).
+11. resolution-mode import attributes; per-frame weak rule (deep, deferred).
+
+## Superseded queue (wave 26, kept for context)
 
 1. The mapped/indexed relation family (~55 missing keys behind ONE rule):
    indexed access and mapped types over DISTINCT free type parameters are
