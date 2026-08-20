@@ -475,6 +475,34 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, o: PropLookup) Error!?types
 /// memberless, which is the whole point.
 pub fn indexAccessApparent(c: *Checker, t: TypeId) Error!?TypeId {
     const s = &c.ts;
+    const idx = s.indexAccessIndex(t);
+    // An INTERSECTION object DISTRIBUTES. tsc reads `(A & B)[K]` through
+    // `getReducedApparentType`, whose members are every constituent's, so a
+    // constituent that reduces supplies members even while its sibling stays
+    // deferred: `SpyObj<T> = T & { [k in keyof T]: Spy }` indexed by `keyof T`
+    // has `Spy`'s members, from the mapped half alone — the bare `T` half
+    // cannot answer and does not have to. Taking the whole intersection's base
+    // constraint instead substituted `T := unknown` through it and collapsed
+    // the map's key domain to `never`, so the access had no members at all.
+    const obj0 = try c.resolveStructural(s.indexAccessObj(t));
+    if (s.kind(obj0) == .intersection) {
+        var parts: std.ArrayList(TypeId) = .empty;
+        defer parts.deinit(c.scratch());
+        for (try c.memberList(obj0)) |m| {
+            var acc = try c.reduceIndexedAccess(m, idx);
+            // A generic MAP constituent defers, and its answer is its template
+            // with the key substituted (`getSimplifiedIndexedAccessType`) —
+            // the `{ [k in keyof T]: Spy }` half is exactly this shape.
+            if (s.kind(acc) == .index_access) {
+                acc = (try c.simplifyMappedIndexAccess(acc)) orelse acc;
+            }
+            // Still deferred (or circular): that constituent has nothing to
+            // contribute, and the others still might.
+            if (s.kind(acc) == .index_access or acc == t) continue;
+            try parts.append(c.scratch(), acc);
+        }
+        if (parts.items.len != 0) return try s.makeIntersection(c.scratch(), parts.items);
+    }
     const obj_bc = try c.indexObjBaseConstraint(s.indexAccessObj(t));
     // tsc's `getSimplifiedIndexedAccessType`, which `getSimplifiedTypeOr-
     // Constraint` asks for BEFORE the constraint route: an access whose object
@@ -486,12 +514,12 @@ pub fn indexAccessApparent(c: *Checker, t: TypeId) Error!?TypeId {
     // when the constraint IS such a map, so nothing else pays the intern.
     const obj_r = try c.resolveStructural(obj_bc);
     if (s.kind(obj_r) == .mapped and s.mappedAs(obj_r) == 0) {
-        const lifted = try s.makeIndexAccess(obj_r, s.indexAccessIndex(t));
+        const lifted = try s.makeIndexAccess(obj_r, idx);
         if (try c.simplifyMappedIndexAccess(lifted)) |sim| {
             if (sim != t) return sim;
         }
     }
-    const idx_bc = try c.transitiveBaseConstraint(s.indexAccessIndex(t));
+    const idx_bc = try c.transitiveBaseConstraint(idx);
     if (try c.isGenericObjectForIndex(obj_bc) or try c.containsFreeTypeParam(idx_bc, &.{})) return null;
     const bc = try c.reduceIndexedAccess(obj_bc, idx_bc);
     return if (bc == t) null else bc;
