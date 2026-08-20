@@ -75,6 +75,65 @@ pub fn aliasInstance(c: *Checker, sym: SymbolId, args: []const TypeId, tok: Toke
     // A union body must stay materialized: a `.ref` standing in for a union
     // is NOT interchangeable, because discriminant narrowing and the
     // union-source relation arms switch on `.union_type` directly.
+    //
+    // ===== WAVE-26 DETERMINISM FINDING (agent D) — READ BEFORE TOUCHING =====
+    //
+    // The rule above is still PARTITION-DEPENDENT, and it is the confirmed
+    // root cause of social-app's `Navigation.tsx:778` moving between
+    // `--checkers=1` and `--checkers=4`. `alias_recursive` is written by ONE
+    // place — the cycle-cut arm above — so in a cluster of MUTUALLY recursive
+    // aliases exactly one member is ever marked: whichever the checker
+    // instance happened to materialize first. @react-navigation is the
+    // measured pair. `NativeStackNavigationProp` reaches
+    // `NativeStackHeaderProps` through its options; `NativeStackHeaderProps`
+    // declares `navigation: NativeStackNavigationProp<…>` straight back.
+    // Enter at the first and the first is marked (and keeps the ref
+    // spelling), enter at the second and the second is. Instrumented tallies
+    // of this function's three arms, social-app:
+    //
+    //     --checkers=1   NativeStackNavigationProp  cut+ref, HeaderProps  struct
+    //     --checkers=4   NativeStackNavigationProp  struct,  HeaderProps  cut+ref
+    //
+    // and the TS2322 printed `NativeStackNavigationProp<{…}>` at one checker
+    // and the expanded 40-member object at four. Same program, same file
+    // order, two type identities.
+    //
+    // What is NOT the cause, measured and ruled out this wave — the campaign
+    // doc's long-standing "instantiation budget charges misses not hits"
+    // hypothesis. Raising BOTH caps to 250 M (`max_instantiation_count` and
+    // `max_decl_instantiation_count`, so nothing in the run can trip) left all
+    // three divergent social-app lines byte-identical to the bounded run;
+    // so did disabling `lazyIndexedProp` outright, and so did refusing to
+    // memoize a `typeOfSymbol` result computed across a circular cut.
+    //
+    // Two ORDER-INDEPENDENT rules were built and measured; neither is
+    // landable as it stands, and the second is the one to finish:
+    //
+    //   * Mark the WHOLE cycle — push the `alias_state == 1` set as a stack
+    //     and, on a re-entry, mark the suffix from the re-entered alias up.
+    //     That set IS a property of the alias graph (entering the pair above
+    //     at either end yields both members). But giving both the lazy `.ref`
+    //     spelling costs three fresh social-app false positives — an
+    //     `AnimatedRef<AnimatedComponentType<…>>` TS2322 and two
+    //     `Property '…' does not exist on type '{}'` — and left the two
+    //     checker counts FURTHER apart (97 vs 99 check errors, was 94/94).
+    //
+    //   * Drop this rule entirely — always materialize outside the cycle.
+    //     social-app comes out 95 / 95, `Navigation.tsx:778` converges, and
+    //     the cost is ONE new false positive (`FeedPage.tsx:101`, a TS2345
+    //     the ref spelling used to relate away): a relation gap on the
+    //     structural spelling, in `assign.zig`, not a fault of this rule.
+    //
+    // Note what that pair proves: NO partition-independent rule reproduces
+    // today's 94-diagnostic social-app baseline, because the 94 is itself an
+    // artifact of the asymmetric marking. Fixing this necessarily moves the
+    // app baseline, and the cheapest correct move is "always materialize"
+    // once `FeedPage.tsx:101` is closed.
+    //
+    // Two social-app divergences are NOT explained by any of this and survive
+    // every variant above — `StarterPackDialog.tsx:245` (TS2769) and
+    // `FeedSourceCard.tsx:197` (TS2353). They need their own hunt.
+    // =======================================================================
     if (c.alias_recursive.contains(sym) and originTaggable(c.ts.kind(generic))) {
         return c.ts.makeRef(sym, fixed);
     }

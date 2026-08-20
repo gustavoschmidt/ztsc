@@ -140,6 +140,26 @@ pub fn interfaceGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
     if (result == types.no_type) result = try c.ts.makeObject(&.{}, 0, 0, types.obj_flag_not_inferable);
     // Phase 2: merge every constituent's `extends` bases; the phase-1 direct
     // members win, so an own member overrides an inherited one.
+    //
+    // WAVE-26 DETERMINISM FINDING (agent D): this loop walks `parts` in
+    // MERGE order, which the linker builds by walking files in file-id order
+    // (`eachGlobalDecl`), which `--file-order` permutes. Where two
+    // constituents contribute CONFLICTING inherited index signatures the
+    // first one wins (`mergeBaseResolved` keeps the accumulator's), so the
+    // answer moves with the root order. Measured on social-app: `ProcessEnv`
+    // is `@types/node`'s `extends Dict<string>` merged with expo's
+    // `extends ExpoProcessEnv`, whose string index is `any`. Source order
+    // folds `Dict<string>` first and every `process.env.X` reads
+    // `string | undefined`; `--file-order=reverse` (and shuffle=3) folds the
+    // expo half first and every `process.env.X` reads `any` — which is then
+    // frozen into `iface_generic` and into the `sym_types` of the three
+    // `export const …_DEV_URL = process.env.…` bindings, so the two
+    // `src/env/common.ts` TS2322s vanish for the rest of the run.
+    //
+    // tsc has the same first-base-wins rule, so the fix is not here: it is
+    // that `parts` must not be a function of the ROOT ORDER. That means a
+    // canonical constituent order in `src/link/modules.zig` (by file PATH,
+    // not by file id), which was out of this agent's edit surface.
     for (parts) |csym| {
         if (!c.symFlags(csym).interface) continue;
         result = try c.interfaceConstituentApplyBases(csym, result, owner);
