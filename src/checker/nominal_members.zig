@@ -198,6 +198,11 @@ pub const Mismatch = union(enum) {
     /// '{tgt}'.` — the whole SOURCE and TARGET types, not the declaring classes,
     /// each in its DISPLAY form (`displayType`).
     protected_vs_public: struct { src: TypeId, tgt: TypeId },
+    /// `Property '{name}' in type '{src}' refers to a different member that
+    /// cannot be accessed from within type '{tgt}'.` — the ECMAScript `#name`
+    /// rule. Same two DISPLAY types, source first, as tsc's
+    /// `Property_0_in_type_1_refers_to_a_different_member_that_cannot_be_accessed_from_within_type_2`.
+    private_name_different_member: struct { src: TypeId, tgt: TypeId },
 };
 
 /// The type as tsc PRINTS it in the messages above. A class's static side is a
@@ -232,6 +237,30 @@ fn nonPublicPropMismatch(
     if (t) |x| {
         t_access = accessibility.accessOfMember(c, x.msym, false);
     } else if (dst_non_public or !try declaresOwnMember(c, dst, name)) return null;
+    // An ECMAScript `#name` member, on EITHER side. The binder flags it
+    // non-public but it carries no modifier, so `accessOfMember` answers
+    // `.public` — which is exactly the pair (non-public flag, public
+    // accessibility) that identifies it here, with no second declaration read.
+    //
+    // A private name is scoped to the class that declared it, so two members
+    // that merely SPELL it the same are different members and neither side
+    // can reach the other's. Both `#x` atoms intern to one `Atom`, so the
+    // relation pairs them by name and only this test separates them:
+    // `class A { #x = 1 }` and `class B { #x = 1 }` are mutually unassignable
+    // (tsc's `Property_0_in_type_1_refers_to_a_different_member_…`), while
+    // `class D extends C {}` still relates to `C` — one declaration reached
+    // from both sides, which the `s.?.msym == t.?.msym` guard above returns on.
+    //
+    // A side that DECLARES the name without a private-identifier token — a
+    // type literal with a quoted `"#x"` key — is not the same member either,
+    // and falls in here through the other side's flag, which is tsc's answer
+    // for it too.
+    if ((src_non_public and s_access == .public) or (dst_non_public and t_access == .public)) {
+        return .{ .private_name_different_member = .{
+            .src = try displayType(c, src),
+            .tgt = try displayType(c, dst),
+        } };
+    }
     if (s_access == .private and t_access == .private) return .separate_private;
     if (s_access == .private) return .{ .private_one_side = .{
         .private_cls = s.?.cls,

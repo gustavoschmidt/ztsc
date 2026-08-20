@@ -524,7 +524,7 @@ fn atomTextLess(c: *Checker, a: Atom, b: Atom) bool {
     return std.mem.order(u8, c.atomText(a), c.atomText(b)) == .lt;
 }
 
-/// tsc's four `propertiesRelatedTo` accessibility messages, verbatim. Which one
+/// tsc's five `propertiesRelatedTo` accessibility messages, verbatim. Which one
 /// applies is decided where the rule is (`nominal_members.zig`); this only
 /// spells it. The type names follow tsc's own arguments: the DECLARING CLASS for
 /// the private/derived-from messages (`typeToString(getDeclaringClass(prop))`,
@@ -565,6 +565,11 @@ fn nominalText(c: *Checker, s: TypeId, m: nominal_members.Named) Error![]const u
         .protected_vs_public => |p| std.fmt.allocPrint(
             c.scratch(),
             "Property '{s}' is protected in type '{s}' but public in type '{s}'.",
+            .{ name, try c.typeToString(p.src), try c.typeToString(p.tgt) },
+        ) catch error.OutOfMemory,
+        .private_name_different_member => |p| std.fmt.allocPrint(
+            c.scratch(),
+            "Property '{s}' in type '{s}' refers to a different member that cannot be accessed from within type '{s}'.",
             .{ name, try c.typeToString(p.src), try c.typeToString(p.tgt) },
         ) catch error.OutOfMemory,
     };
@@ -813,7 +818,14 @@ fn needsBrackets(text: []const u8) bool {
 
 fn isIdentifierText(text: []const u8) bool {
     if (text.len == 0) return false;
-    for (text, 0..) |ch, i| {
+    // An ECMAScript `#name` is spellable as written — `this.#x`, and
+    // `Property '#x'` in a message — so the `#` is part of the identifier, not
+    // a character that forces quoting. tsc's `symbolToString` prints a private
+    // name bare, which is already what the missing-property message
+    // (`Property '#z' is missing …`) renders through its own path.
+    const body = if (text[0] == '#') text[1..] else text;
+    if (body.len == 0) return false;
+    for (body, 0..) |ch, i| {
         const ok = std.ascii.isAlphabetic(ch) or ch == '_' or ch == '$' or
             (i > 0 and std.ascii.isDigit(ch));
         if (!ok) return false;
