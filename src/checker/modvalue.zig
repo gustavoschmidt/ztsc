@@ -503,8 +503,18 @@ pub fn targetValueType(c: *Checker, tgt: modules.Target) Error!TypeId {
             const inner = c.tree.nodeData(tgt.payload).lhs;
             switch (c.nodeTag(inner)) {
                 .function_decl => return c.signatureOfProto(inner, c.tree.nodeData(inner).lhs, false, true),
-                // Unnamed `export default class`: documented cut.
-                .class_decl => return types.any_type,
+                // An UNNAMED `export default class {}` has no name to look up
+                // in the file scope, but the binder still declares it in the
+                // class's OWN scope under the reserved class-expression key —
+                // which is exactly what `classSymbolOf` asks for a class
+                // expression, and what makes the export a class value rather
+                // than the `any` that accepted everything and could not be
+                // TS2511 (`newAbstractInstance2`).
+                .class_decl => {
+                    const sym = try c.classSymbolOf(inner, binder.file_scope);
+                    if (sym == binder.no_symbol) return types.any_type;
+                    return c.typeOfSymbol(sym);
+                },
                 else => return c.widenLiteral(try c.checkExprCached(inner, types.no_type)),
             }
         },
