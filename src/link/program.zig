@@ -36,6 +36,10 @@ pub const LinkOpts = struct {
     /// import of a module with no default export binds to the module namespace
     /// object. See `linkImports`.
     allow_synthetic_default: bool = false,
+    /// tsconfig `esModuleInterop`. Carried here only to reach the `Program` the
+    /// driver builds from these options (like `jsx_factory_ns`); the link phase
+    /// itself never reads it. See `Program.es_module_interop`.
+    es_module_interop: bool = false,
     /// tsconfig `noImplicitAny`. Gates TS7016 ("Could not find a declaration
     /// file for module …"), the link-phase member of the implicit-any family;
     /// the checker gates TS7006/TS7053 on `Program.no_implicit_any`, which the
@@ -120,6 +124,14 @@ pub const Program = struct {
     /// checker (`importCallType`) and needs the same rule for the `default`
     /// property it hands back. See `LinkOpts.allow_synthetic_default`.
     allow_synthetic_default: bool = false,
+    /// Effective `esModuleInterop` — a DIFFERENT question from the synthetic
+    /// default above (which is on by default under bundler resolution, while
+    /// this is off unless the tsconfig writes it). Gates tsc's
+    /// `resolveESModuleSymbol` interop shape: `import * as ns from "m"` where
+    /// `m` is `export =` something callable/constructible (or already carries a
+    /// `default`) types as the module spread with `{ default: <module> }`, so
+    /// `ns.default` resolves. See `modvalue.namespaceImportType`.
+    es_module_interop: bool = false,
     /// Effective `types: [… "*" …]` (tsc's `usesWildcardTypes`). Picks TS2580
     /// over TS2591 for the node-flavoured not-found diagnostics; the checker
     /// reads it in `reportNameNotFound`/`reportModuleNotFound`. See

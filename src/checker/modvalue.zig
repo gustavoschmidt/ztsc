@@ -30,6 +30,7 @@ const Error = checker_zig.Error;
 const FileId = checker_zig.FileId;
 
 const names = @import("names.zig");
+const typenode = @import("typenode.zig");
 const hasValueMeaning = names.hasValueMeaning;
 
 /// tsc's `checkAndReportErrorForUsingNamespaceAsTypeOrValue`, value half:
@@ -210,7 +211,133 @@ pub fn aliasValueVerdict(c: *Checker, sym: SymbolId, f: binder.SymbolFlags) Erro
 pub fn importedSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
     const tgt = c.importTarget(sym) orelse return types.any_type; // unlinked
     if (tgt.kind == .any) try reportNamespaceRequireMiss(c, sym);
-    return c.targetValueType(tgt);
+    const ty = try c.targetValueType(tgt);
+    if (!c.prog.es_module_interop or !starImportBinding(c, sym)) return ty;
+    if (!try canHaveSyntheticDefault(c, tgt)) return ty;
+    return interopNamespaceType(c, ty);
+}
+
+/// tsc's `canHaveSyntheticDefault`, the guard on the interop reshaping below:
+/// a module that already declares `default` SYNTACTICALLY (`export default`,
+/// `export { x as default }`, `export * as default`) gets no synthesized one,
+/// and neither does one that declares `__esModule` — both are the author
+/// stating the module's runtime shape, which the `__importStar` helper then
+/// passes through untouched.
+///
+/// This is what keeps `import type * as Hls from "hls.js"` — a `.d.ts` with
+/// `export default class Hls` alongside its named exports — spelling
+/// `Hls.default` as the class rather than as the whole module namespace.
+///
+/// `linkImports` gives a `.namespace` import record one of four target shapes,
+/// and each answers the question directly: `.namespace`/`.ambient_ns` name the
+/// module's own export table (walk it); `.any` is an opaque ambient module (no
+/// shape to reason about); and ANY other kind means the linker followed the
+/// module's `export =`, which is tsc's `hasExportAssignment` — the one case
+/// where a source file (not just a `.d.ts`) can have a synthesized default, and
+/// a module with `export =` can declare no `default` of its own.
+fn canHaveSyntheticDefault(c: *Checker, tgt: modules.Target) Error!bool {
+    const es_module_atom = try c.atom("__esModule");
+    switch (tgt.kind) {
+        .any => return false,
+        .namespace => {
+            if (c.prog.links.len == 0) return false;
+            const l = &c.prog.links[tgt.file];
+            return l.exportTarget(c.atom_default) == null and l.exportTarget(es_module_atom) == null;
+        },
+        .ambient_ns => {
+            const ae = c.prog.ambient_exports[tgt.payload];
+            for (ae.atoms) |name| {
+                if (name == c.atom_default or name == es_module_atom) return false;
+            }
+            return true;
+        },
+        else => return true,
+    }
+}
+
+/// Is `sym` the star of an `import * as ns from "m"` clause?
+///
+/// tsc's `resolveESModuleSymbol` applies the interop shape below only to that
+/// syntax (and to a dynamic `import()`); `import ns = require("m")`, a plain
+/// named import and an `export * as ns` re-export all keep the module's own
+/// type, so the test is on the DECLARATION, not on the link target — every one
+/// of those forms can point at the very same `.namespace` target.
+///
+/// `import d, * as ns from "m"` declares two symbols on the one `import_decl`,
+/// so the name is compared as well. The comparison is on raw token text, which
+/// a `\uXXXX`-escaped binding name would fail — that answers "not the star",
+/// i.e. the pre-interop type, which is the safe side of the branch.
+fn starImportBinding(c: *Checker, sym: SymbolId) bool {
+    const s = c.reprSym(sym);
+    const f = c.symFile(s);
+    const pf = &c.prog.files[f];
+    const decls = pf.bind.declsOf(s - c.prog.sym_base[f]);
+    if (decls.len != 1) return false;
+    if (pf.tree.nodeTag(decls[0]) != .import_decl) return false;
+    const d = pf.tree.extraData(ast.ImportData, pf.tree.nodeData(decls[0]).lhs);
+    if (d.ns_name_token == 0) return false;
+    if (d.default_name_token == 0) return true;
+    return std.mem.eql(u8, pf.tree.tokenSlice(pf.src, d.ns_name_token), c.atomText(c.symNameAtom(s)));
+}
+
+/// tsc's `resolveESModuleSymbol` interop shape: under `esModuleInterop`, the
+/// namespace object of `import * as ns from "m"` is `getSpreadType([m, {
+/// default: m }])` when `m`'s type is callable/constructible or already carries
+/// a `default`. That is the shape of what the emitted `__importStar` helper
+/// hands back at runtime for a CommonJS module, so `ns.default` names the whole
+/// module (`esModuleInteropImportNamespace`).
+///
+/// Being a SPREAD is load-bearing in both directions: it adds `default` and it
+/// DROPS the call/construct signatures, so `import * as f from "./fn"` under
+/// interop is no longer callable — `f()` is TS2349 and `f.default()` is the
+/// working spelling (`esModuleInteropDefaultImports`).
+///
+/// Gated on `esModuleInterop` alone, never on `allowSyntheticDefaultImports`:
+/// the latter is ON by default under bundler resolution (ztsc's fixed model),
+/// so gating on it would give every project this reshaping.
+/// tsc's condition for the reshaping below: the module type has a call or a
+/// construct signature, or already carries a `default`. Restricted to the
+/// shapes `gatherSpreadProps` can reproduce faithfully — a class value's static
+/// side, a bare `ref` or a union keeps the module's own type, since a namespace
+/// object missing half its members is worse than one missing `default`.
+///
+/// The `function`/`overloads` shapes carry no own members, so their spread is
+/// exactly `{ default: m }` and the empty gather is the right answer. An
+/// `intersection` is the `export =` of a function/namespace merge (`(() =>
+/// void) & typeof foo`), which is the ordinary spelling of a CommonJS module
+/// that is both callable and a namespace.
+fn interopReshapes(c: *Checker, st: TypeId) Error!bool {
+    return switch (c.ts.kind(st)) {
+        .function, .overloads => true,
+        .object => c.ts.objectHasSigs(st) or c.ts.objectPropByName(st, c.atom_default) != null,
+        .intersection => blk: {
+            for (try c.memberList(st)) |m| {
+                if (try interopReshapes(c, try c.resolveStructural(m))) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+fn interopNamespaceType(c: *Checker, t: TypeId) Error!TypeId {
+    const st = try c.resolveStructural(t);
+    if (!try interopReshapes(c, st)) return t;
+    var props: std.ArrayList(types.Prop) = .empty;
+    defer props.deinit(c.scratch());
+    var prop_index: std.AutoHashMapUnmanaged(Atom, u32) = .empty;
+    defer prop_index.deinit(c.scratch());
+    var str_index_vals: std.ArrayList(TypeId) = .empty;
+    defer str_index_vals.deinit(c.scratch());
+    var num_index_vals: std.ArrayList(TypeId) = .empty;
+    defer num_index_vals.deinit(c.scratch());
+    try c.gatherSpreadProps(st, &props, &prop_index, &str_index_vals, &num_index_vals);
+    // The right-hand `{ default: m }` wins over any `default` the module
+    // already exported (tsc's `createDefaultPropertyWrapperForModule`).
+    try typenode.upsertProp(c.scratch(), &props, &prop_index, .{ .name = c.atom_default, .ty = t, .flags = 0 });
+    const sidx = if (str_index_vals.items.len > 0) try c.ts.makeUnion(c.scratch(), str_index_vals.items) else 0;
+    const nidx = if (num_index_vals.items.len > 0) try c.ts.makeUnion(c.scratch(), num_index_vals.items) else 0;
+    return c.ts.makeObject(props.items, sidx, nidx, 0);
 }
 
 /// TS2307 for `import x = require("missing")` written inside a PLAIN namespace,

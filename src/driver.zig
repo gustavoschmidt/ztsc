@@ -937,6 +937,7 @@ fn linkProgram(
         .dual_targets = lr.dual_targets,
         .no_implicit_any = link_opts.no_implicit_any,
         .allow_synthetic_default = link_opts.allow_synthetic_default,
+        .es_module_interop = link_opts.es_module_interop,
         .types_wildcard = link_opts.types_wildcard,
         .experimental_decorators = link_opts.experimental_decorators,
         .jsx_runtime_file = jsx_runtime_file,
