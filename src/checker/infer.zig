@@ -420,6 +420,11 @@ fn markMentionedTps(c: *Checker, t: TypeId, tp_syms: []const u32, fixed: []bool,
 /// in `ret_only` still records the covariant candidate that other property's
 /// return carries.
 ///
+/// "The parameter positions" is `markFixedByParams`, not every position the
+/// contextual signature declares: `assignContextualParameterTypes` asks for one
+/// contextual type per parameter the CALLBACK writes, so a position past the
+/// callback's own arity is never read and fixes nothing.
+///
 /// The one thing this does not model is tsc's ORDER sensitivity — there the
 /// fixing happens as each property is checked, so a `T`-fixing property
 /// written BEFORE the property whose return supplies `T` pins `T` at its
@@ -470,9 +475,7 @@ fn markCtxSensitiveFixed(
                 for (mine) |*x| x.* = false;
                 const th = c.ts.fnThisType(sig);
                 if (th != 0) try markMentionedTps(c, th, tp_syms, mine, 0);
-                for (0..c.ts.fnParamCount(sig)) |i| {
-                    try markMentionedTps(c, c.ts.fnParam(sig, @intCast(i)).ty, tp_syms, mine, 0);
-                }
+                try markFixedByParams(c, val, sig, tp_syms, mine);
                 const rets = try c.scratch().alloc(bool, tp_syms.len);
                 defer c.scratch().free(rets);
                 for (rets) |*x| x.* = false;
@@ -484,6 +487,69 @@ fn markCtxSensitiveFixed(
             .object_literal => try markCtxSensitiveFixed(c, val, prop_ty, tp_syms, param_pos, ret_only, depth + 1),
             else => {},
         }
+    }
+}
+
+/// Mark every type parameter the FIXING mapper actually runs over when `fn_node`
+/// adopts `sig` as its contextual signature.
+///
+/// tsc's `assignContextualParameterTypes` decides that, and it reads the
+/// contextual signature BY POSITION, one position per parameter the callback
+/// itself declares:
+///
+/// ```ts
+/// const len = signature.parameters.length - (signatureHasRestParameter(signature) ? 1 : 0);
+/// for (let i = 0; i < len; i++) {
+///     const parameter = signature.parameters[i];
+///     if (!getEffectiveTypeAnnotationNode(parameter.valueDeclaration)) {
+///         assignParameterType(parameter, tryGetTypeAtPosition(context, i));
+///     }
+/// }
+/// if (signatureHasRestParameter(signature)) assignParameterType(parameter, getRestTypeAtPosition(context, len));
+/// ```
+///
+/// So a contextual parameter position the callback never DECLARES is never
+/// asked for, and the fixing mapper never touches the type parameters that live
+/// there. react-query's `getNextPageParam: lastPage => lastPage.cursor` is that
+/// shape: the contextual `GetNextPageParamFunction<TPageParam, TQueryFnData>`
+/// names `TPageParam` at positions 2 and 3, the arrow declares ONE parameter,
+/// so only position 0 (`TQueryFnData`) is read and `TPageParam` stays free —
+/// which is how its covariant set picks up the `string | undefined` the arrow's
+/// RETURN supplies, on top of the `undefined` that `initialPageParam` gave it.
+/// Marking every position instead pinned `TPageParam` at `undefined` and every
+/// `useInfiniteQuery` in social-app failed to resolve.
+///
+/// A parameter that carries its OWN annotation is skipped for the same reason
+/// tsc skips it: nothing is assigned to it, so nothing is fixed. A REST
+/// parameter is the one position that reads the whole tail (`getRestTypeAtPosition`).
+fn markFixedByParams(c: *Checker, fn_node: Node, sig: TypeId, tp_syms: []const u32, mine: []bool) Error!void {
+    const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(fn_node).lhs);
+    const n_ctx = c.ts.fnParamCount(sig);
+    var i: usize = 0;
+    for (c.tree.extraRange(proto.params_start, proto.params_end)) |p| {
+        if (p == null_node) continue;
+        const pd = c.tree.nodeData(p);
+        var ann: Node = 0;
+        var rest = false;
+        switch (c.nodeTag(p)) {
+            .param => ann = pd.rhs,
+            .param_full => {
+                const pf = c.tree.extraData(ast.ParamFull, pd.rhs);
+                ann = pf.type_ann;
+                rest = pf.flags & ast.Flags.rest != 0;
+            },
+            else => {},
+        }
+        if (rest) {
+            // The tail: every remaining contextual position feeds this one.
+            while (i < n_ctx) : (i += 1) {
+                try markMentionedTps(c, c.ts.fnParam(sig, @intCast(i)).ty, tp_syms, mine, 0);
+            }
+            return;
+        }
+        if (i >= n_ctx) return;
+        if (ann == 0) try markMentionedTps(c, c.ts.fnParam(sig, @intCast(i)).ty, tp_syms, mine, 0);
+        i += 1;
     }
 }
 
@@ -983,6 +1049,18 @@ pub fn inferTypeArgs(
         {
             const probe_cands = try c.scratch().alloc(TypeId, tp_syms.len);
             for (candidates, 0..) |cd, i| probe_cands[i] = cd;
+            // The probe's OWN co-/contravariant split. It is this call's
+            // inference run into a scratch accumulator, so it needs the whole
+            // side-table set, not just the priority tier: `contraSlot` and
+            // friends key on `InferCtx.owner`, and leaving that pointed at the
+            // real accumulator makes every side table decline for the probe —
+            // which quietly WIDENS a parameter-position candidate into the
+            // probe's covariant array, the one place a contravariant candidate
+            // must never land.
+            const probe_contra = try c.scratch().alloc(TypeId, tp_syms.len);
+            const probe_contra_sup = try c.scratch().alloc(TypeId, tp_syms.len);
+            const probe_keyof = try c.scratch().alloc(TypeId, tp_syms.len);
+            const probe_top = try c.scratch().alloc(bool, tp_syms.len);
             // What pass two FEEDS each parameter, plus the pre-pass state —
             // read by the contravariant echo guard after the re-check.
             const fed2 = try c.scratch().alloc(TypeId, tp_syms.len);
@@ -1038,6 +1116,12 @@ pub fn inferTypeArgs(
                 var attempt: u8 = 0;
                 while (true) : (attempt += 1) {
                     for (candidates, 0..) |cd, i| probe_cands[i] = cd;
+                    for (0..tp_syms.len) |i| {
+                        probe_contra[i] = types.no_type;
+                        probe_contra_sup[i] = types.no_type;
+                        probe_keyof[i] = types.no_type;
+                        probe_top[i] = true;
+                    }
                     map2.clearRetainingCapacity();
                     {
                         const saved_skip = c.skip_ctx_sensitive;
@@ -1055,76 +1139,81 @@ pub fn inferTypeArgs(
                         c.aft_seen = false;
                         defer c.skip_ctx_sensitive = saved_skip;
                         // The probe is THIS call's inference, just accumulated
-                        // into a scratch array, so the priority tier has to
-                        // hold for it — otherwise a candidate tsc records at
-                        // `NakedTypeVariable` priority lands here at full
-                        // priority and pins the very parameter the probe's
-                        // answer will hand every context-sensitive callback.
-                        // Only the priority half is re-registered: the rest of
-                        // the context keeps pointing at the real accumulator,
-                        // so the probe's walk records no contravariant
-                        // candidate and clears no top-level flag (see
-                        // `InferCtx.Rev`).
+                        // into a scratch array, so the WHOLE inference context
+                        // is re-registered against it: the priority tier
+                        // (`rev`), the co-/contravariant split (`contra`,
+                        // `contra_sup`), the `LiteralKeyof` set and the
+                        // top-level flags. Every one of those side tables keys
+                        // on `InferCtx.owner` and declines for a foreign array,
+                        // so leaving `owner` pointed at the real accumulator was
+                        // not "no side tables" — it QUIETLY WIDENED: a candidate
+                        // found in a parameter position, which `contraSlot`
+                        // should have caught, fell through into the probe's
+                        // COVARIANT array instead, and a candidate tsc records
+                        // at `NakedTypeVariable` priority landed at full
+                        // priority and pinned the very parameter the probe's
+                        // answer hands every context-sensitive callback.
                         //
-                        // Giving the probe its OWN `contra`/`contra_sup` and
-                        // running tsc's `getInferredType` choice
-                        // (`preferContravariant`) over the pair is faithful and
-                        // is MEASURABLY worse. Five attempts have now been made
-                        // at it; the fifth got all the way to green apps and a
-                        // NET-POSITIVE sweep before a conformance case stopped
-                        // it, so what it learned is worth keeping:
+                        // Splitting it took seven earlier attempts, because the
+                        // split alone is not the whole rule — three other things
+                        // have to be true at the same time, all of them tsc's:
                         //
-                        //  1. Re-point the WHOLE context (`owner`, `contra`,
-                        //     `contra_sup`, `keyof_contra`, `top_flags`), not
-                        //     just `rev` — `contraSlot` keys on `owner`.
-                        //  2. Every reader of "the probe's answer" must then
-                        //     read the `preferContravariant` FOLD of the two
-                        //     sets, not `probe_cands`: a parameter whose only
-                        //     evidence is contravariant is absent from the
-                        //     covariant array entirely, and the post-pass
-                        //     fix-up below left `useMutation`'s `TVariables` at
-                        //     its `void` default — 40 social-app diagnostics.
-                        //  3. Round one's covariant set is INCOMPLETE by
-                        //     construction (it skipped every context-sensitive
-                        //     property) and folding papered over that, because
-                        //     the contravariant candidate supplied the missing
-                        //     width. WEIGHING an unfinished covariant answer
-                        //     picks the wrong one: react-query's
-                        //     `useInfiniteQuery({queryFn: ({pageParam}:
-                        //     {pageParam?: string}) => …, initialPageParam:
-                        //     undefined, getNextPageParam: lastPage => …})`
-                        //     pins `TPageParam` at the covariant `undefined`,
-                        //     which IS a subtype of the annotated
-                        //     `string | undefined`, so tsc's own rule picks it.
-                        //     Completing the set from a second skip-off read and
-                        //     letting pass two speak for a parameter named in a
-                        //     context-sensitive RETURN (not just `cs_ret_only`)
-                        //     fixes it: both apps byte-empty, ts-suite +1 on
-                        //     `coAndContraVariantInferences7`.
-                        //  4. What it does NOT survive is a contravariant
-                        //     candidate ztsc records and tsc does not. With the
-                        //     fold, such a candidate was harmless — it merged
-                        //     into a covariant answer that outweighed it. Split
-                        //     out, `preferContravariant` hands it the parameter
-                        //     whenever the covariant side is empty, ahead of the
-                        //     type parameter's DEFAULT. `useQuery`'s
-                        //     `placeholderData: (prev) => prev || {…}` is the
-                        //     case: round one refuses the callback, the walk
-                        //     still reaches `PlaceholderFn<NonFunctionGuard<
-                        //     TData>>`'s parameter position, and `TData` comes
-                        //     out `undefined` instead of defaulting to
-                        //     `TQueryFnData` (conformance
-                        //     inference/two_round_context_sensitive_object_literal).
-                        //
-                        // So the sixth attempt starts at (4), not at the split:
-                        // find why the skipped round records a contravariant
-                        // candidate for a refused property at all, and the rest
-                        // of the fifth attempt's shape should hold.
+                        //  1. The probe's ANSWER is `getInferredType` over the
+                        //     pair, not its covariant array (the fold below).
+                        //     `useMutation({mutationFn: async ({id}: {id:
+                        //     string}) => …})` names `TVars` nowhere but that
+                        //     annotated callback's parameter, so the covariant
+                        //     array has nothing for it at all.
+                        //  2. `anyFunctionType` infers NOTHING, on every arm.
+                        //     tsc builds it with zero properties, zero
+                        //     signatures and zero index infos, so its descent
+                        //     yields nothing; ztsc only refused it at the
+                        //     inference-position arm, and the reverse-mapped
+                        //     walk and the union arm's naked-variable fallback
+                        //     reach a candidate slot without passing there. Once
+                        //     the probe keeps its own contravariant set, such a
+                        //     candidate is no longer harmless — it is preferred
+                        //     over the type parameter's DEFAULT (`useQuery`'s
+                        //     `placeholderData: (prev) => prev || {…}` came out
+                        //     `undefined`). Guarded at the top of `unify`.
+                        //  3. Only the contextual parameter positions the
+                        //     callback actually DECLARES are fixed
+                        //     (`markFixedByParams`), and an OPTIONAL source
+                        //     property contributes `| undefined` just as tsc's
+                        //     `getTypeOfSymbol` does. Both are needed by
+                        //     react-query's `useInfiniteQuery({queryFn:
+                        //     ({pageParam}: {pageParam?: string}) => …,
+                        //     initialPageParam: undefined, getNextPageParam:
+                        //     lastPage => …})`: `TPageParam` must stay free
+                        //     through `getNextPageParam` (which declares one
+                        //     parameter and names `TPageParam` at positions 2
+                        //     and 3) so its RETURN can widen the covariant
+                        //     `undefined` to `string | undefined`, and the
+                        //     contravariant candidate must be `string |
+                        //     undefined` rather than `string` or nothing is a
+                        //     subtype of it.
                         const probe_rev = try c.scratch().alloc(bool, tp_syms.len);
                         for (probe_rev) |*x| x.* = false;
                         const outer_rev = c.infer_ctx.rev;
                         c.infer_ctx.rev = .{ .owner = probe_cands.ptr, .flags = probe_rev };
                         defer c.infer_ctx.rev = outer_rev;
+                        const sv_owner = c.infer_ctx.owner;
+                        const sv_contra = c.infer_ctx.contra;
+                        const sv_sup = c.infer_ctx.contra_sup;
+                        const sv_keyof = c.infer_ctx.keyof_contra;
+                        const sv_top = c.infer_ctx.top_flags;
+                        c.infer_ctx.owner = probe_cands.ptr;
+                        c.infer_ctx.contra = probe_contra;
+                        c.infer_ctx.contra_sup = probe_contra_sup;
+                        c.infer_ctx.keyof_contra = probe_keyof;
+                        c.infer_ctx.top_flags = probe_top;
+                        defer {
+                            c.infer_ctx.owner = sv_owner;
+                            c.infer_ctx.contra = sv_contra;
+                            c.infer_ctx.contra_sup = sv_sup;
+                            c.infer_ctx.keyof_contra = sv_keyof;
+                            c.infer_ctx.top_flags = sv_top;
+                        }
                         const probe = try c.checkExprCached(an, arg_ctx);
                         try c.unify(pt, probe, tp_syms, probe_cands, 0);
                     }
@@ -1170,6 +1259,25 @@ pub fn inferTypeArgs(
                                 probe_cands[i] = ro_cands[i];
                             }
                         }
+                    }
+                    // The probe's ANSWER is `getInferredType` over its own
+                    // pair, not its covariant array: a parameter whose only
+                    // evidence in round one is contravariant — react-query's
+                    // `useMutation({mutationFn: async ({id}: {id: string}) =>
+                    // …})`, where `TVars` appears nowhere but that annotated
+                    // callback's parameter — is absent from the covariant array
+                    // entirely, and reading that array alone fed pass two the
+                    // `unknown` default and reported TS2322 on the callback.
+                    // Same choice as the authoritative fold below, including
+                    // the `LiteralKeyof` fallback.
+                    for (0..tp_syms.len) |i| {
+                        if (probe_cands[i] == types.no_type and probe_contra[i] == types.no_type and
+                            probe_keyof[i] != types.no_type)
+                        {
+                            probe_cands[i] = probe_keyof[i];
+                            continue;
+                        }
+                        probe_cands[i] = try preferContravariant(c, probe_cands[i], probe_contra[i], probe_contra_sup[i]);
                     }
                     // Every type parameter is FIXED for pass two: one the
                     // probe could not infer takes its default/constraint (tsc
@@ -2615,6 +2723,20 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
     // just one of `tp_syms`) and is memoized per type, so the gate is a hash
     // lookup on the hot path.
     if (!try c.containsTypeParam(param)) return;
+    // tsc's `anyFunctionType` is `createAnonymousType(undefined, emptySymbols,
+    // emptyArray, emptyArray, emptyArray)`: zero properties, zero call and
+    // construct signatures, zero index infos. So however `inferFromTypes`
+    // descends into it — signature pairing, property pairing, index pairing,
+    // the reverse-mapped walk — it finds nothing to pair and records nothing.
+    // The only arm that would have spoken, the inference-position one, refuses
+    // it outright on `ObjectFlags.NonInferrableType`.
+    //
+    // The `.type_param` arm's `containsAnyFunctionType` covers the case where a
+    // placeholder is BURIED in the source (an object literal carrying one);
+    // this covers the source that IS one, on every other arm — the reverse-
+    // mapped walk and the union arm's naked-variable fallback among them, which
+    // reach a candidate slot without passing through that check.
+    if (arg == types.any_function_type) return;
     const s = &c.ts;
     // An `any` source infers `any` for every inference position in the
     // pattern (tsc's inferFromTypes). Without this, `any` slips past the
@@ -3286,15 +3408,28 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                         // `undefined` to pair with: an absent one cannot
                         // subtract anything, and the extra union member would
                         // only cost interning.
+                        // The SOURCE side of the same rule. `queryFn: ({
+                        // pageParam }: { pageParam?: string }) => …` handed
+                        // react-query's `QueryFunctionContext<TPageParam>`
+                        // (whose `pageParam` is REQUIRED) contributed the
+                        // contravariant `string`, so the covariant `undefined`
+                        // that `initialPageParam: undefined` supplies was not a
+                        // subtype of it and `getInferredType` took the
+                        // contravariant answer — `initialPageParam` then failed
+                        // against its own inference.
+                        const at = if (ap.optional())
+                            try c.makeUnion2(ap.ty, types.undefined_type)
+                        else
+                            ap.ty;
                         var pt = pp.ty;
-                        if (pp.optional() and c.unionAnyMember(ap.ty, struct {
+                        if (pp.optional() and c.unionAnyMember(at, struct {
                             fn f(ch: *Checker, m: TypeId) bool {
                                 return ch.ts.kind(m) == .undefined;
                             }
                         }.f)) {
                             pt = try c.makeUnion2(pt, types.undefined_type);
                         }
-                        try c.unify(pt, ap.ty, tp_syms, candidates, depth + 1);
+                        try c.unify(pt, at, tp_syms, candidates, depth + 1);
                     }
                 }
                 const pidx = s.objectStringIndex(param);
