@@ -450,7 +450,7 @@ fn checkDeclarator(c: *Checker, decl: Node, is_const: bool, ambient: bool) Error
             // Materialize the symbol's type (infers + caches). The
             // initializer's type is what the pattern destructures, so it is
             // also what contextually types the pattern's defaults.
-            try materializePatternTypes(c, d.lhs, it);
+            try materializePatternTypes(c, d.lhs, it, .contextual_only);
         },
         .declarator_full => {
             const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
@@ -470,7 +470,7 @@ fn checkDeclarator(c: *Checker, decl: Node, is_const: bool, ambient: bool) Error
             // that one form, matching tsc.
             if (e.init != 0 and e.type_ann != 0 and c.nodeTag(e.type_ann) == .unique_symbol_type and c.isFreshSymbolCall(e.init)) {
                 _ = try c.checkExprCached(e.init, ann);
-                try materializePatternTypes(c, d.lhs, ann);
+                try materializePatternTypes(c, d.lhs, ann, .relate);
                 return;
             }
             // What the pattern destructures, for the defaults inside it: the
@@ -503,7 +503,7 @@ fn checkDeclarator(c: *Checker, decl: Node, is_const: bool, ambient: bool) Error
                     }
                 }
             }
-            try materializePatternTypes(c, d.lhs, whole);
+            try materializePatternTypes(c, d.lhs, whole, if (ann != types.no_type) .relate else .contextual_only);
         },
         else => {},
     }
@@ -544,7 +544,7 @@ fn expandoInitializerType(c: *Checker, name: Node, init: Node, it: TypeId) Error
 /// arrow with nothing to type `arg` from and reported it an implicit `any`
 /// (`contextuallyTypedBindingInitializer`). `no_type` — from a `for` head,
 /// whose binding is typed by what is iterated — simply propagates.
-fn materializePatternTypes(c: *Checker, pat: Node, whole: TypeId) Error!void {
+fn materializePatternTypes(c: *Checker, pat: Node, whole: TypeId, mode: destructure.DefaultCheck) Error!void {
     if (pat == null_node) return;
     switch (c.nodeTag(pat)) {
         .identifier => {
@@ -556,7 +556,7 @@ fn materializePatternTypes(c: *Checker, pat: Node, whole: TypeId) Error!void {
         },
         .object_pattern => {
             for (c.tree.nodeRange(pat)) |el| {
-                if (el != null_node) try materializePatternTypes(c, el, whole);
+                if (el != null_node) try materializePatternTypes(c, el, whole, mode);
             }
         },
         .array_pattern => {
@@ -570,7 +570,7 @@ fn materializePatternTypes(c: *Checker, pat: Node, whole: TypeId) Error!void {
                     types.no_type
                 else
                     (try destructure.patternElemType(c, r, i)) orelse types.no_type;
-                try materializePatternTypes(c, el, et);
+                try materializePatternTypes(c, el, et, mode);
             }
         },
         .binding_property => {
@@ -578,43 +578,41 @@ fn materializePatternTypes(c: *Checker, pat: Node, whole: TypeId) Error!void {
             const key = try c.memberAtom(c.tree.nodeMainToken(pat));
             const pt = (try destructure.patternPropType(c, whole, key)) orelse types.no_type;
             if (d.lhs != 0) {
-                try materializePatternTypes(c, d.lhs, pt);
+                try materializePatternTypes(c, d.lhs, pt, mode);
             } else {
                 switch (c.resolveSpace(key, c.cur_scope, true)) {
                     .sym => |sym| _ = try c.typeOfSymbol(sym),
                     else => {},
                 }
             }
-            if (d.rhs != 0) _ = try c.checkExprCached(d.rhs, patternDefaultCtx(c, d.lhs, pt));
+            if (d.rhs != 0) try destructure.checkPatternDefault(c, pat, pt, mode);
         },
         .binding_property_computed => {
             const d = c.tree.nodeData(pat);
-            if (d.lhs != 0) _ = try c.checkExprCached(d.lhs, types.no_type);
-            // A COMPUTED key takes the element out of tsc's contextual-typing
-            // branch entirely (`isComputedNonLiteralName`), so its subtree
-            // starts over with no parent type.
-            if (d.rhs != 0) try materializePatternTypes(c, d.rhs, types.no_type);
+            // tsc's `getContextualTypeForBindingElement` drops out on
+            // `isComputedNonLiteralName` — a computed key whose expression is
+            // NOT a string/numeric literal. One that IS still names a
+            // property, so `{ ["show"]: r = v => v }` is contextually typed
+            // exactly as `{ show: r = v => v }` is; without the lookup the
+            // arrow's `v` was an implicit `any`
+            // (`contextuallyTypedBindingInitializer`).
+            var pt = types.no_type;
+            if (d.lhs != 0) {
+                const kt = try c.checkExprCached(d.lhs, types.no_type);
+                if (try c.literalKeyAtom(kt)) |key| {
+                    pt = (try destructure.patternPropType(c, whole, key)) orelse types.no_type;
+                }
+            }
+            if (d.rhs != 0) try materializePatternTypes(c, d.rhs, pt, mode);
         },
         .binding_default => {
             const d = c.tree.nodeData(pat);
-            try materializePatternTypes(c, d.lhs, whole);
-            _ = try c.checkExprCached(d.rhs, patternDefaultCtx(c, d.lhs, whole));
+            try materializePatternTypes(c, d.lhs, whole, mode);
+            try destructure.checkPatternDefault(c, pat, whole, mode);
         },
-        .rest_element => try materializePatternTypes(c, c.tree.nodeData(pat).lhs, types.no_type),
+        .rest_element => try materializePatternTypes(c, c.tree.nodeData(pat).lhs, types.no_type, mode),
         else => {},
     }
-}
-
-/// The contextual type of a binding element's DEFAULT: the type its position
-/// destructures — except when the element's own name is itself a PATTERN,
-/// which tsc's `getContextualTypeForBindingElement` refuses outright
-/// (`isBindingPattern(name)` returns `undefined` before the property lookup).
-fn patternDefaultCtx(c: *Checker, name: Node, pt: TypeId) TypeId {
-    if (name == null_node) return pt;
-    return switch (c.nodeTag(name)) {
-        .object_pattern, .array_pattern => types.no_type,
-        else => pt,
-    };
 }
 
 fn checkForInOf(c: *Checker, node: Node) Error!void {
@@ -685,7 +683,7 @@ fn checkForInOf(c: *Checker, node: Node) Error!void {
                             _ = try c.checkAssignable(elem_t, ann, 0, c.nodeSpan(dd.lhs));
                             whole = ann;
                         }
-                        try materializePatternTypes(c, dd.lhs, whole);
+                        try materializePatternTypes(c, dd.lhs, whole, if (ee.type_ann != 0) .relate else .contextual_only);
                     },
                     else => {},
                 }
@@ -1242,12 +1240,39 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
 
     // Check parameter initializers against annotations.
     for (c.tree.extraRange(proto.params_start, proto.params_end)) |pn| {
-        if (pn == null_node or c.nodeTag(pn) != .param_full) continue;
         const pd = c.tree.nodeData(pn);
-        const e = c.tree.extraData(ast.ParamFull, pd.rhs);
-        if (e.init != 0 and e.type_ann != 0) {
-            const ann_t = try c.typeFromTypeNode(e.type_ann);
-            const it = try c.checkExprCached(e.init, ann_t);
+        // `.param` is the plain spelling (`x`, `x: T`) and carries its
+        // annotation directly; `.param_full` is everything with a default,
+        // a modifier or a `?`.
+        const name: Node, const type_ann: Node, const init: Node = switch (c.nodeTag(pn)) {
+            .param => .{ pd.lhs, pd.rhs, null_node },
+            .param_full => blk: {
+                const e = c.tree.extraData(ast.ParamFull, pd.rhs);
+                break :blk .{ pd.lhs, e.type_ann, e.init };
+            },
+            else => continue,
+        };
+        // A DESTRUCTURED parameter's own elements each carry a declaration of
+        // their own (tsc's `checkVariableLikeDeclaration` runs on every
+        // `BindingElement`), so each default inside the pattern is checked and
+        // related just as a `var`/`let` pattern's is. Nothing else walked
+        // them: `pinPatternParamSyms` only publishes the bound TYPES, so
+        // `function f({ a = xyz }: A)` never even resolved `xyz`.
+        //
+        // Only when the parameter is ANNOTATED: tsc's
+        // `getTypeForBindingElementParent` reads the parameter's declaration
+        // alone and never consults a contextual signature, so a callback's
+        // `({ s = 1 }) => …` has no parent type and reports nothing.
+        if (implicit_any.isBindingPattern(c, name)) {
+            if (type_ann != 0) {
+                try materializePatternTypes(c, name, try c.typeFromTypeNode(type_ann), .relate);
+            } else {
+                try materializePatternTypes(c, name, types.no_type, .contextual_only);
+            }
+        }
+        if (init != 0 and type_ann != 0) {
+            const ann_t = try c.typeFromTypeNode(type_ann);
+            const it = try c.checkExprCached(init, ann_t);
             // tsc's `checkVariableLikeDeclaration` anchors an initializer
             // mismatch at the DECLARATION (`errorNode = node`), not at the
             // initializer, and only descends into the initializer when the
@@ -1255,9 +1280,9 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
             // `var`/`const` declarator already does here. A parameter's
             // declaration starts at its name, so `function f<T extends
             // Number>(x: T = 1)` reports on `x`, not on the `1`.
-            _ = try c.checkAssignable(it, ann_t, e.init, c.nodeSpan(pn));
-        } else if (e.init != 0) {
-            _ = try c.checkExprCached(e.init, types.no_type);
+            _ = try c.checkAssignable(it, ann_t, init, c.nodeSpan(pn));
+        } else if (init != 0) {
+            _ = try c.checkExprCached(init, types.no_type);
         }
     }
 

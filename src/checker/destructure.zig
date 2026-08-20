@@ -412,6 +412,77 @@ pub fn optionalizePatternDefaults(c: *Checker, t: TypeId, pat: Node) Error!TypeI
     return c.ts.makeObject(props.items, c.ts.objectStringIndex(t), c.ts.objectNumberIndex(t), c.ts.objectFlags(t));
 }
 
+/// Whether a pattern element's DEFAULT is RELATED to the type of the position
+/// it stands in for, or merely typed by it.
+///
+/// Only a declaration whose type is WRITTEN relates it. When the type is
+/// inferred from an initializer instead, `getBindingElementTypeFromParentType`
+/// unions the default's own type into the element's — `let { a: v = 1 } = src`
+/// binds `string | number` where `let { a: v = 1 }: A = src` binds `string`
+/// (oracle-verified) — and the relation is then vacuous by construction: the
+/// source of the check is the very type the target just absorbed. So the two
+/// spellings differ by one TS2322, and skipping is exactly equivalent to
+/// building the union and relating against it.
+pub const DefaultCheck = enum { relate, contextual_only };
+
+/// A binding element's DEFAULT: checked under the contextual type of the
+/// position it stands in for, then related to that position's declared type.
+/// `el` is a `.binding_property` or a `.binding_default`, `pt` the type the
+/// element's position destructures (`no_type` when nothing declares it — an
+/// unannotated parameter, a `for` head — which is tsc's "no parent type" and
+/// reports nothing).
+///
+/// tsc's `checkVariableLikeDeclaration` tail:
+/// `checkTypeAssignableToAndOptionallyElaborate(checkExpressionCached(init),
+/// type, node, node.initializer)` — the error node is the ELEMENT, whose
+/// span `getErrorSpanForNode` narrows to its NAME, and the initializer is the
+/// elaboration root, so a mismatch inside an object/array literal or an arrow
+/// body is blamed there instead. `function h({ prop = "baz" }: StringUnion)`
+/// reports on `prop`, while `({ prop = [101, 1234] }: Tuples)` reports twice
+/// inside the array literal.
+///
+/// `undefined` comes off the target exactly where tsc takes it off
+/// (`getBindingElementTypeFromParentType`): a default is what supplies the
+/// missing value, so `{ a = 1 }: { a?: string }` is TS2322 against `string` —
+/// unless the default is ITSELF possibly-undefined, in which case the
+/// position keeps it and `{ a = undefined }` is clean.
+///
+/// The same stripped type is what CONTEXTUALLY types the default: tsc's
+/// `getContextualTypeForBindingElement` ends in `getTypeOfPropertyOfType`,
+/// which answers the property's declared type — an optional property's
+/// `undefined` is folded in by the destructuring walk, not by that lookup.
+/// A class expression's static members are contextually typed through it
+/// (`staticFieldWithInterfaceContext`'s `{ c: c4 = class { static x = { a:
+/// "a" } } }: { c?: I }`), and a `I | undefined` context hid that.
+pub fn checkPatternDefault(c: *Checker, el: Node, pt: TypeId, mode: DefaultCheck) Error!void {
+    const d = c.tree.nodeData(el);
+    const declared = if (pt == types.no_type or pt == types.error_type)
+        pt
+    else
+        try c.removeUndefined(pt);
+    const it = try c.checkExprCached(d.rhs, defaultContextualType(c, d.lhs, declared));
+    if (mode == .contextual_only or pt == types.no_type or pt == types.error_type) return;
+    const target = if (c.containsUndefinedish(it)) pt else declared;
+    // The element's NAME — for a shorthand `{ a = 1 }` the key token itself,
+    // which is where tsc's `BindingElement` error span lands either way.
+    const span = if (d.lhs != 0) c.nodeSpan(d.lhs) else c.tokSpan(c.tree.nodeMainToken(el));
+    _ = try c.checkAssignable(it, target, d.rhs, span);
+}
+
+/// The contextual type of a binding element's DEFAULT: the type its position
+/// destructures — except when the element's own name is itself a PATTERN,
+/// which tsc's `getContextualTypeForBindingElement` refuses outright
+/// (`isBindingPattern(name)` returns `undefined` before the property lookup).
+/// The ASSIGNABILITY target above is unaffected: `{ a: { z } = 1 }` is still
+/// checked against `{ z: string }`, it just does not type `1` from it.
+pub fn defaultContextualType(c: *Checker, name: Node, pt: TypeId) TypeId {
+    if (name == null_node) return pt;
+    return switch (c.nodeTag(name)) {
+        .object_pattern, .array_pattern => types.no_type,
+        else => pt,
+    };
+}
+
 /// Does the object binding pattern `pat` destructure `name` with a default?
 pub fn patternDefaultsProp(c: *Checker, pat: Node, name: Atom) Error!bool {
     const el = (try patternMemberElem(c, pat, .binding, name)) orelse return false;
