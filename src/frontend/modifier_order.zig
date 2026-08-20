@@ -163,7 +163,19 @@ pub fn check(already: u32, bit: u32, member: Member, in_abstract_class: bool) ?C
         },
 
         F.readonly => if (already & F.readonly != 0) .mod_seen_readonly else null,
-        F.async => if (already & F.async != 0) .mod_seen_async else null,
+        F.async => blk: {
+            if (already & F.async != 0) break :blk .mod_seen_async;
+            // TS1042: `async` describes a BODY, so a member that has none —
+            // a field, an auto-accessor field, a `get`/`set` — cannot carry
+            // it. A method may; a constructor takes `ctor_mod_async` from
+            // `walk`'s trailing block; an index signature (`.other`) answered
+            // TS1071 before the walk began. Measured against tsgo 7.0.2 for
+            // all four member kinds, in a class and in an object literal.
+            break :blk switch (member) {
+                .accessor, .property => .async_modifier_not_allowed_here,
+                .constructor, .method, .other => null,
+            };
+        },
         F.declare => if (already & F.declare != 0) .mod_seen_declare else null,
 
         else => null,

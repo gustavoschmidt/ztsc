@@ -1335,11 +1335,6 @@ const Parser = struct {
             .keyword_type,
             .keyword_global,
             .keyword_accessor,
-            .keyword_public,
-            .keyword_private,
-            .keyword_protected,
-            .keyword_static,
-            .keyword_readonly,
             .keyword_abstract,
             // An unterminated block comment is TRIVIA to tsc: its scanner
             // reports TS1010 and hands the parser EOF, so nothing lands here.
@@ -1348,12 +1343,49 @@ const Parser = struct {
             // treating it as junk would add a TS1128 tsc never reports.
             .unterminated_comment,
             => true,
+            // The one group tsc does NOT wave through: a class-member modifier
+            // is a statement start only when a declaration follows it, or when
+            // the next token cannot be a member NAME. `static test()` inside a
+            // function body is neither, so tsc refuses to parse it as a
+            // statement at all — see `classMemberModifierStartsStatement`.
+            .keyword_public,
+            .keyword_private,
+            .keyword_protected,
+            .keyword_static,
+            .keyword_readonly,
+            => p.classMemberModifierStartsStatement(),
             // tsc's `isStartOfExpression`, including its error tolerance: the
             // start of a BINARY operator counts, so `* x;` is parsed as an
             // expression statement with a missing left operand (TS1109) rather
             // than skipped.
             else => |tag| canStartExpression(tag) or binaryPrec(tag, false) != 0,
         };
+    }
+
+    /// tsc's `isStartOfStatement` arm for `public`/`private`/`protected`/
+    /// `static`/`readonly`:
+    ///
+    ///     return isStartOfDeclaration() ||
+    ///         !lookAhead(nextTokenIsIdentifierOrKeywordOnSameLine);
+    ///
+    /// These words are legal identifiers, so `static;`, `readonly = 1` and
+    /// `public.x` are ordinary expression statements — but `static test()` in a
+    /// function body is neither an expression tsc wants nor a declaration, and
+    /// it is much more likely a class member written one brace too deep. tsc
+    /// answers TS1128 on the WORD and drops it, which is what returning false
+    /// here buys (`parseStatementList`'s not-a-statement arm).
+    ///
+    /// `accessor` and `abstract` belong to the same tsc group but stay
+    /// unconditionally true above: ztsc's `startsDeclarationAt` does not walk
+    /// past them, so the answer here would be a false `false` for
+    /// `accessor class C {}` — and a false `false` manufactures a TS1128 tsc
+    /// does not report, while a false `true` only keeps ztsc's existing
+    /// recovery.
+    fn classMemberModifierStartsStatement(p: *Parser) bool {
+        if (p.statementModifierRunLen() != 0) return true;
+        if (p.peekNewline(1)) return true;
+        const next = p.peekTag(1);
+        return !(next == .identifier or next.isKeyword());
     }
 
     /// The diagnostic tsc's `parseList` reports for a token that starts no list
@@ -1426,6 +1458,17 @@ const Parser = struct {
                     .expected_export
                 else
                     .expected_declaration_or_statement);
+                // tsc's `abortParsingListOrMoveToNextToken`: the token is
+                // dropped only when NO enclosing list would take it. A
+                // class-member modifier inside a class body is a member start,
+                // so tsc ends the statement list right here and lets the class
+                // body have the token — which is how `class C { m() { static x
+                // = 1; } }` ends up with `static x = 1` as a MEMBER and one
+                // extra "Declaration or statement expected." on the now-unpaired
+                // final `}`. The `}` the aborted block then fails to find lands
+                // on this same position and is dropped by `addDiag`'s
+                // one-per-position rule, exactly as in tsc.
+                if (p.class_depth > 0 and statementModifierCode(p.curTag()) != null) return;
                 _ = try p.bump();
                 continue;
             }
@@ -1833,6 +1876,18 @@ const Parser = struct {
                     _ = try p.bump();
                     return p.parseFunctionDecl(ast.Flags.async, false);
                 }
+                // Any OTHER declaration behind `async` is tsc's TS1042: its
+                // `isDeclaration` lookahead sees the declaration, so `async` is
+                // parsed as a MODIFIER and `checkGrammarModifiers` rejects it
+                // on the word — while the declaration itself parses and binds
+                // as if the modifier were not there. `async class C {}` used to
+                // be an expression statement here, which cost the TS1042 and
+                // the class both.
+                if (p.spec == 0 and !p.peekNewline(1) and asyncModifierTarget(p.peekTag(1))) {
+                    const kw = try p.bump();
+                    try p.errAtToken(.async_modifier_not_allowed_here, kw);
+                    return p.parseStatementUnchecked();
+                }
                 return p.parseExpressionStatement();
             },
             .keyword_interface => {
@@ -2162,25 +2217,60 @@ const Parser = struct {
                 if (expr != null_node and p.nodes.items(.tag)[expr] == .identifier and
                     !scannerAlreadyReported(p.curTag()))
                 {
+                    // At the WORD unconditionally, even when a diagnostic
+                    // already sits there: tsc reports at that position too and
+                    // its `parseErrorAtPosition` drops the duplicate, so the
+                    // statement goes unreported in tsc as well. ztsc used to
+                    // answer "';' expected" at the NEXT token instead, to keep
+                    // the statement from going silent — but that is a key tsgo
+                    // does not have, and the two recoveries that made the guard
+                    // look right (`import Foo From "m"` and a declarator list
+                    // cut short at a missing comma) now follow tsc's own shape.
                     const tok = p.nodes.items(.main_token)[expr];
-                    const at = p.tok_starts.items[tok] & scanner.Tokens.start_mask;
-                    // Only when the word's own position is still free. If a
-                    // diagnostic already sits there, the one-per-position rule
-                    // would drop the TS1434 and this statement would go
-                    // unreported — while tsc, which reached that state through a
-                    // different recovery (a missing `,` in a declarator list, an
-                    // `import X` it turns into `import X =`), still answers at
-                    // the NEXT token. Keeping ztsc's "';' expected" there is the
-                    // closer answer of the two.
-                    if (p.last_syntactic_start != at) {
-                        if (p.tokTagAt(tok) != .keyword_declare) {
-                            try p.errAtToken(.unexpected_keyword_or_identifier, tok);
-                        }
-                        return;
-                    }
+                    try p.errForMissingSemicolonAfterWord(tok);
+                    return;
                 }
                 try p.errAtCur(.expected_semicolon);
             },
+        }
+    }
+
+    /// The word half of tsc's `parseErrorForMissingSemicolonAfter`: a statement
+    /// that is nothing but a bare identifier, followed by something other than
+    /// `;`. tsc switches on the WORD before falling back to TS1434, because a
+    /// word that names a DECLARATION form is far more likely a declaration
+    /// whose name the grammar rejected than a misspelled identifier — and then
+    /// it answers about the NAME, at the token that should have been one.
+    ///
+    /// `parseErrorForInvalidName`'s two arms are the `blank` case (the name
+    /// position holds the token that would have FOLLOWED a name — `{` for a
+    /// namespace or interface, `=` for a type alias, i.e. the declaration has no
+    /// name at all) and the reserved-word case (there IS a token there, it just
+    /// cannot be a name — `type void`, `interface void`). The interpolating
+    /// codes take their `{0}` from the reported span, which is exactly that
+    /// token.
+    ///
+    /// `declare` is silent: a `declare` that failed to parse has already
+    /// reported. Every arm was oracle-probed against tsgo 7.0.2.
+    fn errForMissingSemicolonAfterWord(p: *Parser, tok: u32) Error!void {
+        const blank_interface = p.curTag() == .l_brace;
+        switch (p.tokTagAt(tok)) {
+            .keyword_declare => {},
+            .keyword_var, .keyword_let, .keyword_const => try p.errAtToken(.variable_declaration_not_allowed_here, tok),
+            .keyword_is => try p.errAtToken(.type_predicate_not_allowed_here, tok),
+            .keyword_interface => try p.errAtCur(if (blank_interface)
+                .interface_needs_a_name
+            else
+                .interface_name_reserved),
+            .keyword_namespace, .keyword_module => try p.errAtCur(if (blank_interface)
+                .namespace_needs_a_name
+            else
+                .namespace_name_reserved),
+            .keyword_type => try p.errAtCur(if (p.curTag() == .eq)
+                .expected_type
+            else
+                .type_alias_name_reserved),
+            else => try p.errAtToken(.unexpected_keyword_or_identifier, tok),
         }
     }
 
@@ -2309,8 +2399,28 @@ const Parser = struct {
             if (pattern_code) |code| {
                 if (p.curTag() == .l_brace or p.curTag() == .l_bracket) try p.errAtCur(code);
             }
+            const before = p.curIdx();
             try p.pushScratch(try p.parseDeclarator(no_in));
-            if (try p.eat(.comma) == null) break;
+            if (try p.eat(.comma) != null) continue;
+            // tsc's `parseDelimitedList` does NOT end the list on a missing
+            // comma: it reports one and keeps reading declarators, so `var y: z
+            // is number` is three of them with two "',' expected" between,
+            // where ztsc used to hand the rest of the line to the statement
+            // list and answer for it there. The list ends only where
+            // `isVariableDeclaratorListTerminator` says it does.
+            if (p.varDeclaratorListDone()) break;
+            try p.fail(.expected_comma);
+            // tsc's own zero-length-element guard: a declarator that consumed
+            // nothing would spin here forever.
+            if (p.curIdx() == before) _ = try p.bump();
+            // `parseDelimitedList` re-asks `isListElement` at the top of every
+            // iteration, and a token that starts no declarator sends it to
+            // `abortParsingListOrMoveToNextToken` — which, for a token the
+            // enclosing STATEMENT list would take, ends the declarator list and
+            // leaves it there. `var a = q~;` is that shape: the `~` is not a
+            // binding name, so the list stops and `~;` becomes its own
+            // statement (whose missing operand is tsc's TS1109).
+            if (!p.atStartOfDeclarator()) break;
         }
         const items = p.scratch.items[top..];
         if (items.len == 1) {
@@ -2318,6 +2428,50 @@ const Parser = struct {
         }
         const range = try p.scratchToSpan(top);
         return p.addNode(.{ .tag = .var_decl, .main_token = kw, .data = .{ .lhs = range.start, .rhs = range.end } });
+    }
+
+    /// tsc's `isVariableDeclaratorListTerminator`: anything a `;` could stand
+    /// in for (ASI included), the `in`/`of` of a for-head, or an `=>` — tsc's
+    /// own "error recovery tweak", which stops the list dead so an arrow
+    /// function whose parameter list was mistaken for a declaration does not
+    /// swallow the body.
+    fn varDeclaratorListDone(p: *Parser) bool {
+        return switch (p.curTag()) {
+            .semicolon, .r_brace, .eof, .arrow, .keyword_in, .keyword_of => true,
+            else => p.nlBefore(),
+        };
+    }
+
+    /// Declarations that `async` may stand in front of and earn TS1042 —
+    /// tsc's `isDeclaration` lookahead minus `function` (where `async` is
+    /// legal) and minus `declare`, which takes tsc's ambient-context arm and
+    /// answers TS1040 on the `declare` instead.
+    fn asyncModifierTarget(tag: TokTag) bool {
+        return switch (tag) {
+            .keyword_class,
+            .keyword_enum,
+            .keyword_interface,
+            .keyword_namespace,
+            .keyword_module,
+            .keyword_var,
+            .keyword_let,
+            .keyword_const,
+            .keyword_type,
+            .keyword_abstract,
+            .keyword_import,
+            => true,
+            else => false,
+        };
+    }
+
+    /// tsc's `isListElement(VariableDeclarations)`, i.e.
+    /// `isBindingIdentifierOrPrivateIdentifierOrPattern` — exactly the tags
+    /// `parseBindingName` accepts without complaint.
+    fn atStartOfDeclarator(p: *Parser) bool {
+        return switch (p.curTag()) {
+            .l_bracket, .l_brace, .private_identifier => true,
+            else => |tag| isIdentLike(tag),
+        };
     }
 
     fn parseDeclarator(p: *Parser, no_in: bool) PE!Node {
@@ -4557,22 +4711,34 @@ const Parser = struct {
         if (isIdentLike(p.curTag())) {
             // `import d ...` — but `import x = require(...)` is out of subset.
             default_name = try p.bump();
-            if (p.curTag() == .eq) {
-                // The ImportEqualsDeclaration arm — `export` belongs here, and
-                // it anchors the node: a declaration's span starts at its first
-                // MODIFIER, which is what puts TS1202 on the `export` of
-                // `export import a = require("m")` rather than on the `import`.
-                //
-                // `flags` (i.e. `type_only`) rides along: `import type X =
-                // require("m")` is erased, so tsc's `checkImportEqualsDeclaration`
-                // exempts it from the same TS1202 (`!node.isTypeOnly`).
+            // The ImportEqualsDeclaration arm — `export` belongs here, and it
+            // anchors the node: a declaration's span starts at its first
+            // MODIFIER, which is what puts TS1202 on the `export` of
+            // `export import a = require("m")` rather than on the `import`.
+            //
+            // `flags` (i.e. `type_only`) rides along: `import type X =
+            // require("m")` is erased, so tsc's `checkImportEqualsDeclaration`
+            // exempts it from the same TS1202 (`!node.isTypeOnly`).
+            //
+            // Reached without an `=` too, which is tsc's
+            // `tokenAfterImportedIdentifierDefinitelyProducesImportDeclaration`:
+            // after `import <name>`, ONLY `,` and `from` keep the ES form, so
+            // every other token makes this an import-equals whose `=` is
+            // missing. That is the whole of tsc's recovery for `import Foo From
+            // "./x"` — "'=' expected" on `From`, `From` read as the module
+            // reference, and "';' expected" on the string — where ztsc used to
+            // guess "'from' expected" and then trip over the rest of the line.
+            if (p.curTag() != .comma and p.curTag() != .keyword_from) {
                 return p.finishImportEquals(export_kw orelse kw, default_name, flags | (if (export_kw != null) ast.Flags.exported else 0));
             }
             _ = try p.eat(.comma);
         }
         if (p.curTag() == .asterisk) {
             _ = try p.bump();
-            if (try p.eat(.keyword_as) == null) try p.fail(.expected_import_clause);
+            // tsc's `parseNamespaceImport` expects `as` and then reads the next
+            // token as the namespace NAME whether or not it found one, so
+            // `import * from N from "m"` binds `from` and carries on.
+            if (try p.eat(.keyword_as) == null) try p.fail(.expected_as);
             ns_name = try p.expectIdentLike();
         } else if (p.curTag() == .l_brace) {
             specs = try p.parseImportSpecifiers();
@@ -4585,6 +4751,16 @@ const Parser = struct {
             mod = try p.expect(.string_literal, .expected_string_literal);
         } else if (default_name != 0 or ns_name != 0 or specs.start != specs.end) {
             try p.fail(.expected_from);
+            // tsc's `parseModuleSpecifier` runs whether or not `parseExpected`
+            // found the `from`, and it accepts ANY expression ("we check to
+            // ensure that it is only a string literal later in the grammar
+            // check pass"). Consuming it is what keeps the rest of the line
+            // from being read as a fresh statement: `import * from N from "m"`
+            // takes `N` as the specifier and answers "';' expected" on the
+            // SECOND `from`, where ztsc used to leave `N` behind and blame it.
+            // The token is dropped rather than recorded — a non-literal
+            // specifier names no module.
+            if (canStartExpression(p.curTag()) and !p.nlBefore()) _ = try p.parseExpression(.{});
         }
         try p.skipImportAttributes();
         try p.expectSemicolon();
@@ -4606,7 +4782,10 @@ const Parser = struct {
     /// when there is one, else the `import` — which is where the node's span
     /// begins. `flags` carries `Flags.exported` for the `export import` form.
     fn finishImportEquals(p: *Parser, anchor_kw: u32, name_tok: u32, flags: u32) PE!Node {
-        _ = try p.bump(); // '='
+        // tsc's `parseImportEqualsDeclaration` opens with `parseExpected(=)`:
+        // the caller decides this is an import-equals from the token AFTER the
+        // name, so the `=` itself may well be missing.
+        _ = try p.expect(.eq, .expected_eq);
         var module_token: u32 = 0;
         var entity: Node = 0;
         if (isIdentLike(p.curTag()) and std.mem.eql(u8, p.laText(0), "require") and p.peekTag(1) == .l_paren) {
@@ -4614,8 +4793,18 @@ const Parser = struct {
             _ = try p.expect(.l_paren, .expected_l_paren);
             module_token = try p.expect(.string_literal, .expected_string_literal);
             _ = try p.expect(.r_paren, .expected_r_paren);
-        } else {
+        } else if (isIdentLike(p.curTag())) {
             entity = try p.parseEntityName();
+        } else {
+            // tsc's `parseEntityName` makes a MISSING identifier here and
+            // consumes nothing, leaving the token to whoever comes next — which
+            // is what lets `import abstract class D {}` recover into
+            // `import abstract = <missing>` plus a clean `class D {}`.
+            // `parseEntityName`'s unconditional `leaf` would have eaten the
+            // `class`. The node is left null rather than anchored at the last
+            // consumed token: that token is `name_tok` itself, so the alias
+            // would name ITSELF and the resolver would chase the cycle.
+            try p.fail(.expected_identifier);
         }
         try p.expectSemicolon();
         const extra = try p.addExtra(ast.ImportEquals{

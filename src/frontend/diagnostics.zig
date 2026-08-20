@@ -98,6 +98,11 @@ pub const Code = enum(u16) {
     expected_binding,
     expected_string_literal,
     expected_from,
+    /// TS1005 for the `as` of a namespace import (`import * as ns from "m"`)
+    /// and of a namespace export (`export * as ns from "m"`): tsc's
+    /// `parseNamespaceImport`/`parseNamespaceExport` expect it the moment the
+    /// `*` is consumed, then read the next token as the namespace NAME.
+    expected_as,
     expected_import_clause,
     expected_export_clause,
     expected_while,
@@ -185,6 +190,12 @@ pub const Code = enum(u16) {
     /// TS1024: `readonly` in the same position, which tsc words by where the
     /// modifier DOES belong rather than by where it does not.
     readonly_not_on_property,
+    /// TS1042: `async` in front of a declaration that is not a function —
+    /// `async class C {}`, `async interface I {}`, `async var v = 1`. tsc's
+    /// parser takes the word as a MODIFIER (its `isDeclaration` lookahead says
+    /// a declaration follows) and `checkGrammarModifiers` rejects it there, so
+    /// the declaration itself still parses and binds normally.
+    async_modifier_not_allowed_here,
     /// TS1184: the same modifiers, but on a declaration whose statement list is
     /// NOT a module body (a function body, a plain block, a method body) — tsc
     /// stops naming the modifier there and blames the position instead.
@@ -373,6 +384,23 @@ pub const Code = enum(u16) {
     /// "s"` in the same file, and a TS2322 in a SIBLING file, are both silent
     /// once any file spells `module { }`.
     namespace_needs_a_name,
+    /// The rest of `parseErrorForMissingSemicolonAfter`'s keyword switch (see
+    /// `unexpected_keyword_or_identifier`): a bare-identifier expression
+    /// statement whose word NAMES a declaration form is read as a declaration
+    /// whose name the grammar rejected, and tsc answers about the name — at the
+    /// token that should have been one, which is where `renderMessage` finds
+    /// the `{0}` for the three interpolating ones. Every code and position here
+    /// was oracle-probed against tsgo 7.0.2 (`type void = number` is TS2457 on
+    /// `void`, not TS1434 on `type`).
+    interface_needs_a_name,
+    interface_name_reserved,
+    namespace_name_reserved,
+    type_alias_name_reserved,
+    /// TS1440, the `var`/`let`/`const` arm — blamed on the WORD rather than on
+    /// the name, because there may not be one.
+    variable_declaration_not_allowed_here,
+    /// TS1228, the `is` arm.
+    type_predicate_not_allowed_here,
     /// TS1107: `while (c) { function f() { break; } }` — a `break`/`continue`
     /// whose target lies outside the function it sits in. tsc walks out of the
     /// statement and answers as soon as it reaches a function-like, before it
@@ -975,6 +1003,7 @@ pub const Code = enum(u16) {
             .protected_not_on_module_element,
             .static_not_on_module_element,
             .readonly_not_on_property,
+            .async_modifier_not_allowed_here,
             .modifiers_not_allowed_here,
             // Same funnel as TS1184: `{ import "m"; }` next to a sibling file's
             // TS2322 lets the TS2322 through, and `moduleElementsInWrongContext.ts`
@@ -1229,6 +1258,7 @@ pub const Code = enum(u16) {
             .expected_binding => "Variable declaration expected.",
             .expected_string_literal => "String literal expected.",
             .expected_from => "'from' expected.",
+            .expected_as => "'as' expected.",
             .expected_import_clause => "expected an import clause",
             .expected_export_clause => "expected an export clause",
             .expected_while => "'while' expected.",
@@ -1305,6 +1335,7 @@ pub const Code = enum(u16) {
             .protected_not_on_module_element => moduleElementModifierMessage("protected"),
             .static_not_on_module_element => moduleElementModifierMessage("static"),
             .readonly_not_on_property => "'readonly' modifier can only appear on a property declaration or index signature.",
+            .async_modifier_not_allowed_here => "'async' modifier cannot be used here.",
             .modifiers_not_allowed_here => "Modifiers cannot appear here.",
             .import_not_at_top_level => "An import declaration can only be used at the top level of a namespace or module.",
             .export_not_at_top_level => "An export declaration can only be used at the top level of a namespace or module.",
@@ -1358,6 +1389,12 @@ pub const Code = enum(u16) {
             .module_keyword_for_namespace => "A 'namespace' declaration should not be declared using the 'module' keyword. Please use the 'namespace' keyword instead.",
             .quoted_module_name_needs_ambient => "Only ambient modules can use quoted names.",
             .namespace_needs_a_name => "Namespace must be given a name.",
+            .interface_needs_a_name => "Interface must be given a name.",
+            .interface_name_reserved => "Interface name cannot be '{0}'.",
+            .namespace_name_reserved => "Namespace name cannot be '{0}'.",
+            .type_alias_name_reserved => "Type alias name cannot be '{0}'.",
+            .variable_declaration_not_allowed_here => "Variable declaration not allowed at this location.",
+            .type_predicate_not_allowed_here => "A type predicate is only allowed in return type position for functions and methods.",
             .const_class_member => "A class member cannot have the 'const' keyword.",
             .jump_crosses_function_boundary => "Jump target cannot cross function boundary.",
             .break_outside_iteration_or_switch => "A 'break' statement can only be used within an enclosing iteration or switch statement.",
@@ -1513,6 +1550,7 @@ pub const Code = enum(u16) {
             .expected_lt_slash,
             .expected_slash,
             .expected_from,
+            .expected_as,
             .expected_while,
             .expected_eq,
             .expected_export,
@@ -1669,6 +1707,7 @@ pub const Code = enum(u16) {
             .static_not_on_module_element,
             => 1044,
             .readonly_not_on_property => 1024,
+            .async_modifier_not_allowed_here => 1042,
             .modifiers_not_allowed_here => 1184,
             .import_not_at_top_level => 1232,
             .export_not_at_top_level => 1233,
@@ -1721,6 +1760,12 @@ pub const Code = enum(u16) {
             .module_keyword_for_namespace => 1540,
             .quoted_module_name_needs_ambient => 1035,
             .namespace_needs_a_name => 1437,
+            .interface_needs_a_name => 1438,
+            .interface_name_reserved => 2427,
+            .namespace_name_reserved => 2819,
+            .type_alias_name_reserved => 2457,
+            .variable_declaration_not_allowed_here => 1440,
+            .type_predicate_not_allowed_here => 1228,
             .const_class_member => 1248,
             .jump_crosses_function_boundary => 1107,
             .break_outside_iteration_or_switch => 1105,
