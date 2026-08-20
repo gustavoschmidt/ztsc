@@ -28,6 +28,7 @@ const identity = @import("identity.zig");
 const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const tuple_relate = @import("tuple_relate.zig");
+const accessibility = @import("accessibility.zig");
 const ambientNamespaceType = @import("signatures.zig").ambientNamespaceType;
 const ChainLink = @import("expr.zig").ChainLink;
 const checkExprCached = @import("expr.zig").checkExprCached;
@@ -641,6 +642,18 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
             try sigs.appendSlice(c.scratch(), isect_sigs.items);
         } else if (rk == .class_value) {
             const cls = c.ts.classSymbol(r);
+            // tsc asks `isConstructorAccessible(node, constructSignatures[0])`
+            // ahead of the abstract screen below, and answers a failure with
+            // `return resolveErrorCall(node)`. The ORACLE does not follow it
+            // all the way: `var c = new C()` on a private constructor still
+            // types `c` as `C` there — `c.zzz` is TS2339 on `C` and
+            // `var q: number = c` is TS2322 from `C`, neither of which an
+            // error type produces. So the report stands alone and the
+            // resolution continues, which is the under-suppressing half of
+            // tsgo's behaviour (it files no arity error on top; ztsc's TS2554
+            // for `new C2()` against `private constructor(x: number)` was
+            // already an excess key before this check existed, and stays one).
+            _ = try accessibility.constructorCheck(c, cls, node);
             if (try c.classIsAbstract(cls)) {
                 // tsc's `resolveNewExpression` reports TS2511 and then
                 // `return resolveErrorCall(node)`: the arguments are checked

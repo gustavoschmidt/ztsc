@@ -48,6 +48,7 @@ const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
 const names = @import("names.zig");
+const statics_zig = @import("statics.zig");
 
 /// tsc's `ModifierFlags.AccessibilityModifier`, as the ordered lattice the
 /// accessor-pair check (TS2808) compares on: `public` > `protected` > `private`.
@@ -596,6 +597,55 @@ pub fn accessOfMember(c: *Checker, msym: SymbolId, writing: bool) Access {
         if (flags & want != 0 and wanted == null) wanted = flags;
     }
     return Access.of(wanted orelse first orelse 0);
+}
+
+/// tsc's `isConstructorAccessible`, the `new C(…)` half of this module: the
+/// constructor `C` resolves against — its own, or the first one up its
+/// `extends` chain — must be reachable from where the `new` is written.
+///
+/// ```ts
+/// const modifiers = getSelectedEffectiveModifierFlags(declaration, ModifierFlags.NonPublicAccessibilityModifier);
+/// if (!modifiers || declaration.kind !== SyntaxKind.Constructor) return true;
+/// const declaringClassDeclaration = getClassLikeDeclarationOfSymbol(declaration.parent.symbol)!;
+/// if (!isNodeWithinClass(node, declaringClassDeclaration)) {
+///     const containingClass = getContainingClass(node);
+///     if (containingClass && modifiers & ModifierFlags.Protected) {
+///         if (typeHasProtectedAccessibleBase(declaration.parent.symbol, getTypeOfNode(containingClass))) return true;
+///     }
+///     if (modifiers & ModifierFlags.Private)   error(node, Constructor_of_class_0_is_private_…);
+///     if (modifiers & ModifierFlags.Protected) error(node, Constructor_of_class_0_is_protected_…);
+///     return false;
+/// }
+/// ```
+///
+/// The two rules are the property ones with the receiver dropped: `private`
+/// needs the declaring class itself lexically enclosing (`withinClass`),
+/// `protected` any enclosing class derived from it (`enclosingDerived` —
+/// tsc's `typeHasProtectedAccessibleBase` walks the CONTAINING class's base
+/// chain, and an enclosing class that IS the declaring one already passed the
+/// first test). There is no instance-receiver rule to add: a `new` has no
+/// receiver, which is why TS2673/2674 have no TS2446 sibling.
+///
+/// Returns true when the `new` may proceed; false when it reported, and then
+/// the caller resolves the call to the error type (tsc's
+/// `return resolveErrorCall(node)`) so no arity or per-argument diagnostic
+/// follows.
+pub fn constructorCheck(c: *Checker, cls: SymbolId, node: Node) Error!bool {
+    const found = (try statics_zig.declaringCtor(c, cls)) orelse return true;
+    const access = Access.of(found.flags);
+    if (access == .public) return true;
+    if (try withinClass(c, found.cls, false)) return true;
+    if (access == .protected) {
+        if (try enclosingDerived(c, found.cls) != null) return true;
+        try c.diagFmt(2674, c.nodeSpan(node), "Constructor of class '{s}' is protected and only accessible within the class declaration.", .{
+            try declaringClassName(c, found.cls),
+        });
+        return false;
+    }
+    try c.diagFmt(2673, c.nodeSpan(node), "Constructor of class '{s}' is private and only accessible within the class declaration.", .{
+        try declaringClassName(c, found.cls),
+    });
+    return false;
 }
 
 /// `private` is tsc's `isNodeWithinClass(location, declaringClassDeclaration)`
