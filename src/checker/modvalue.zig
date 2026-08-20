@@ -207,9 +207,68 @@ pub fn aliasValueVerdict(c: *Checker, sym: SymbolId, f: binder.SymbolFlags) Erro
     return .has_value;
 }
 
+/// The VALUE type of an `import X = A.B` alias — the ENTITY-NAME form, which
+/// names something already in the program and so has no module for the linker
+/// to record. `importedSymbolType` saw an unlinked binding and answered `any`,
+/// which is a value that accepts everything: `import myA = M.A` on an abstract
+/// `M.A` was `new`-able where `new M.A` is TS2511, and the alias of a class
+/// lost its statics, its construct signature and its instance type all at once.
+///
+/// tsc's `resolveAlias` → `resolveEntityName` in the VALUE meaning: the alias
+/// denotes exactly what its right-hand side denotes, so this resolves the
+/// entity in the ALIAS's own file and scope (which is not the use site's) and
+/// answers the target's own type. Null when there is no entity form here, or
+/// when the entity names nothing in value space — `checkImportEqualsEntity`
+/// owns the diagnostics for that, and the old `any` is the right silence.
+///
+/// `entity_alias_stack` cuts the self-reference `import a = a.b`, exactly as
+/// it does for the type-space walk (`importEqualsEntityContainer`).
+fn entityAliasValueType(c: *Checker, sym0: SymbolId) Error!?TypeId {
+    const sym = c.reprSym(sym0);
+    if (std.mem.indexOfScalar(SymbolId, c.entity_alias_stack.items, sym) != null) return null;
+    for (c.declsOf(sym)) |decl| {
+        if (c.prog.files[c.symFile(sym)].tree.nodeTag(decl) != .import_equals) continue;
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        c.cur_scope = c.symScope(sym);
+        const e = c.tree.extraData(ast.ImportEquals, c.tree.nodeData(decl).lhs);
+        if (e.module_token != 0 or e.entity == null_node) return null;
+        try c.entity_alias_stack.append(c.cm(), sym);
+        defer _ = c.entity_alias_stack.pop();
+        const target = (try entityValueSym(c, e.entity)) orelse return null;
+        if (target == sym) return null;
+        return try c.typeOfSymbol(target);
+    }
+    return null;
+}
+
+/// The symbol an `import X = …` right-hand side denotes in VALUE space: a bare
+/// name resolves lexically, a dotted one through its namespace container.
+fn entityValueSym(c: *Checker, entity: Node) Error!?SymbolId {
+    switch (c.nodeTag(entity)) {
+        .identifier => {
+            const a = try c.atomOfToken(c.tree.nodeMainToken(entity));
+            return switch (c.resolveSpace(a, c.cur_scope, true)) {
+                .sym => |s| c.toGlobal(s),
+                else => null,
+            };
+        },
+        .qualified_name, .member_expr => {
+            const d = c.tree.nodeData(entity);
+            const outer = (try c.resolveNsContainer(d.lhs)) orelse return null;
+            return c.containerMemberSym(outer, try c.memberAtom(d.rhs));
+        },
+        else => return null,
+    }
+}
+
 /// Value type of an import binding, via the sealed link tables.
 pub fn importedSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
-    const tgt = c.importTarget(sym) orelse return types.any_type; // unlinked
+    const tgt = c.importTarget(sym) orelse {
+        // Unlinked: either the entity-name form (resolved above) or a module
+        // reference that did not link at all, which stays `any`.
+        return (try entityAliasValueType(c, sym)) orelse types.any_type;
+    };
     if (tgt.kind == .any) try reportNamespaceRequireMiss(c, sym);
     const ty = try c.targetValueType(tgt);
     if (!c.prog.es_module_interop or !starImportBinding(c, sym)) return ty;
