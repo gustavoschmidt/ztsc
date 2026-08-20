@@ -28,6 +28,7 @@ const RefKey = @import("flow.zig").RefKey;
 const containsAtom = @import("expr.zig").containsAtom;
 const markSpeculativePin = @import("signatures.zig").markSpeculativePin;
 const max_deep_ref_depth = @import("flow.zig").max_deep_ref_depth;
+const subst = @import("subst.zig");
 
 /// Pin every symbol bound by a destructured parameter's pattern to the type
 /// the parameter (contextual or annotated) gives it. The counterpart of the
@@ -560,13 +561,17 @@ pub fn checkPatternProps(c: *Checker, pat: Node, whole: TypeId) Error!void {
     if (pat == null_node or whole == types.no_type) return;
     switch (c.nodeTag(pat)) {
         .binding_default => try checkPatternProps(c, c.tree.nodeData(pat).lhs, whole),
-        // A TYPE PARAMETER is left alone by the PROPERTY walk. tsc narrows one
-        // by its constraint's constituents (`value.kind === "a"` makes `T` read
-        // as `T & { a: string }`), ztsc does not — `narrowingDestructuring`'s
-        // five pre-existing TS2339s on `value.a` are that gap — so anything
-        // this walk concluded about `T` would be about the missing narrowing
-        // rather than about the pattern.
-        .object_pattern => if (c.ts.kind(whole) != .type_param)
+        // Anything still GENERIC is left alone by the PROPERTY walk. A bare
+        // type parameter, because tsc narrows one by its constraint's
+        // constituents (`value.kind === "a"` makes `T` read as `T & { a:
+        // string }`) and ztsc does not — `narrowingDestructuring`'s five
+        // pre-existing TS2339s on `value.a` are that gap. And any type that
+        // merely CARRIES one, because tsc's `getIndexedAccessType` defers on
+        // it rather than answering: `correlatedUnions`' `{ letter, caller }:
+        // LetterCaller<K>` destructures `{ [P in K]: … }[K]`, which has no
+        // resolved member table to be missing a property from.
+        .object_pattern => if (c.ts.kind(whole) != .type_param and
+            !try subst.containsTypeParam(c, whole))
             try checkObjectPatternProps(c, pat, whole),
         // The ITERABILITY walk has no such excuse: narrowing `T` to
         // `T & { kind: "a" }` cannot add a `[Symbol.iterator]` the constraint
@@ -639,14 +644,19 @@ fn checkObjectPatternProps(c: *Checker, pat: Node, whole: TypeId) Error!void {
         if (p.nonPublic()) {
             try accessibility.check(c, whole, key, key_tok, .{ .dir = .read });
         }
-        // A nested pattern destructures the property's own type — with nullish
-        // stripped first, because a possibly-undefined intermediate is tsc's
-        // TS2532 (the access's own diagnostic), not a missing property, and
-        // `never` has no member to be missing.
+        // A nested pattern destructures exactly what the element BINDS
+        // (`patternPropType`, then the default's `undefined` strip), and a
+        // nullish remainder is NOT taken off: tsc types the element through
+        // `getIndexedAccessType`, which has no property to find on `undefined`
+        // or `null`, so `const { a: { b } } = o` on `{ a?: { b: string } }` is
+        // TS2339 naming `{ b: string; } | undefined` — not the TS2532 a dotted
+        // `o.a.b` would get. A DEFAULT is what makes it clean, and it does so
+        // by supplying the missing value, which is the same strip
+        // `defaultedElemType` performs. `never` has no member to be missing.
         const sub = c.tree.nodeData(el).lhs;
         if (sub == 0) continue;
-        var pt = p.ty;
-        if (c.containsNullish(pt)) pt = try c.nonNullable(pt);
+        var pt = if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
+        if (c.tree.nodeData(el).rhs != 0) pt = try defaultedElemType(c, c.tree.nodeData(el).rhs, pt);
         if (c.ts.kind(pt) == .never) continue;
         try checkPatternProps(c, sub, pt);
     }

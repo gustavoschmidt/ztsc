@@ -162,27 +162,9 @@ pub fn signatureOfProtoCtx(
             sig_p.ty = try c.makeUnion2(p.ty, types.undefined_type);
         }
         try params.append(c.scratch(), sig_p);
-        // tsc's `removeOptionalityFromDeclaredType`, the mirror image of the
-        // widening just above: inside the BODY a parameter with an
-        // initializer never observes `undefined`, because passing
-        // `undefined` is exactly what runs the default. So strip it from the
-        // declared type here even when the ANNOTATION itself spells it —
-        // which an alias routinely does (`ImportedDataState["libraryItems"]`
-        // is `readonly LibraryItem[] | undefined`, and `(xs = [])` then still
-        // read as possibly-undefined in the body). tsc's one carve-out is an
-        // initializer that can itself be `undefined`, which leaves the
-        // parameter genuinely undefined-able.
-        var body_ty = p.ty;
-        if (p.flags & types.param_flag_initializer != 0 and
-            p.flags & types.param_flag_optional == 0)
-        {
-            const stripped = try c.removeUndefined(p.ty);
-            if (stripped != p.ty and stripped != types.never_type and
-                !try paramInitCanBeUndefined(c, pn))
-            {
-                body_ty = stripped;
-            }
-        }
+        // The mirror image of the widening just above (see `paramBodyType`).
+        const body_ty = try paramBodyType(c, pn, p.ty, p.flags & types.param_flag_initializer != 0 and
+            p.flags & types.param_flag_optional == 0);
         // Pin the parameter symbol's type so body checking sees the
         // contextual/inferred type (not a re-derivation without ctx). When a
         // contextual signature is supplied (`ctx_sig`), FORCE-overwrite any
@@ -596,6 +578,30 @@ fn predicateFromNode(c: *Checker, node: Node, params: []const types.Param) Error
         }
     }
     return .{ .param = param, .ty = target, .asserts = asserts };
+}
+
+/// tsc's `removeOptionalityFromDeclaredType`: what a parameter's DECLARED
+/// type reads as inside the BODY. A parameter with an initializer never
+/// observes `undefined` there, because passing `undefined` is exactly what
+/// runs the default — so `undefined` comes off even when the ANNOTATION
+/// itself spells it, which an alias routinely does
+/// (`ImportedDataState["libraryItems"]` is `readonly LibraryItem[] |
+/// undefined`, and `(xs = [])` still read as possibly-undefined in the body).
+/// tsc's one carve-out is an initializer that can ITSELF be `undefined`,
+/// which leaves the parameter genuinely undefined-able.
+///
+/// `has_default` is the parameter's initializer-and-not-optional test, which
+/// the two callers already have in different forms. Everything the body
+/// derives from the annotation must ask here — the pin below, and a
+/// destructured parameter's pattern demands and element defaults
+/// (`checkFunctionBody`), which otherwise reported a TS2339 on the
+/// `| undefined` the default had just removed.
+pub fn paramBodyType(c: *Checker, pn: Node, ann: TypeId, has_default: bool) Error!TypeId {
+    if (!has_default or ann == types.no_type) return ann;
+    const stripped = try c.removeUndefined(ann);
+    if (stripped == ann or stripped == types.never_type) return ann;
+    if (try paramInitCanBeUndefined(c, pn)) return ann;
+    return stripped;
 }
 
 /// tsc's `parameterInitializerContainsUndefined`: can the parameter's

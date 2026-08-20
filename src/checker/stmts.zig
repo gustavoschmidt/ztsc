@@ -1265,7 +1265,16 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
         // `({ s = 1 }) => …` has no parent type and reports nothing.
         if (implicit_any.isBindingPattern(c, name)) {
             if (type_ann != 0) {
-                try materializePatternTypes(c, name, try c.typeFromTypeNode(type_ann), .relate);
+                // What the pattern destructures is what the BODY sees, which
+                // a default takes `undefined` off of
+                // (`signatures.paramBodyType`).
+                const ann_t = try signatures.paramBodyType(c, pn, try c.typeFromTypeNode(type_ann), init != 0);
+                try materializePatternTypes(c, name, ann_t, .relate);
+                // …and what the pattern DEMANDS of that type (TS2339/TS2551
+                // per element, TS2488 for a non-iterable array pattern), the
+                // parameter's half of what `checkDeclPattern` runs for a
+                // `var`/`let`. `function f({ q }: { a: number })` was silent.
+                try destructure.checkPatternProps(c, name, ann_t);
             } else {
                 try materializePatternTypes(c, name, types.no_type, .contextual_only);
             }
