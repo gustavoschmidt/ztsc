@@ -1242,6 +1242,42 @@ pub fn keyofInProgressRef(c: *Checker, t: TypeId) Error!?TypeId {
     return declaredKeyUnion(c, sym);
 }
 
+/// Is `name` genuinely ABSENT from the receiver `recv`, whose class member
+/// table is being built further down this stack?
+///
+/// That window is why `class B { bar() { return this._t.length; } }` said
+/// nothing: `bar`'s return type is INFERRED, so its body is checked while
+/// `classInstanceGeneric` still holds `B`'s table open, `resolveStructural`
+/// can only answer the error type there, and a property access on the error
+/// type degrades to `any` — the same degradation `lazyThisProp` exists to
+/// avoid for a member that DOES exist. Annotating the return type made the
+/// very same access TS2339, so the report depended on nothing but whether the
+/// table happened to be open.
+///
+/// The declarations can still answer, exactly as they answer `keyof` in the
+/// same window (`keyofInProgressRef`): `walkDeclaredKeys` resolves no
+/// annotation and checks no initializer, so it cannot re-enter the
+/// materialization it is answering inside of. `false` — no verdict — for
+/// every shape it declines (a mixin or expression base, an `extends` naming
+/// an alias) and for any index signature, which answers every name.
+pub fn inProgressMemberAbsent(c: *Checker, recv: TypeId, name: Atom) Error!bool {
+    const t = if (c.ts.kind(recv) == .this_type) c.ts.thisTypeInstance(recv) else recv;
+    if (!refExpansionActive(c, t)) return false;
+    const sym = c.ts.refSymbol(t);
+    if (!c.symFlags(sym).class) return false;
+    if (c.declared_keys_active) return false; // see `Checker.declared_keys_active`
+    c.declared_keys_active = true;
+    defer c.declared_keys_active = false;
+    var w = DeclKeyWalk{};
+    defer w.deinit(c.scratch());
+    if (!try walkDeclaredKeys(c, sym, &w, 0)) return false;
+    if (w.str_index or w.sym_index or w.num_index) return false;
+    // Every declared name, `private` and `protected` included: a non-public
+    // member EXISTS, and the access's own verdict on it is TS2341's, not this
+    // one's.
+    return !w.index.contains(name);
+}
+
 /// The key union of a class or interface symbol, derived from its
 /// declarations. Null when some part of the shape is not derivable.
 pub fn declaredKeyUnion(c: *Checker, sym: SymbolId) Error!?TypeId {

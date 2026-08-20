@@ -26,6 +26,7 @@ const Error = checker_zig.Error;
 
 const accessibility = @import("accessibility.zig");
 const calls_zig = @import("calls.zig");
+const classes = @import("classes.zig");
 const comma = @import("comma.zig");
 const computed_key = @import("computed_key.zig");
 const conditions = @import("conditions.zig");
@@ -4302,7 +4303,21 @@ fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex, site
                 }
             }
             const r = try c.resolveStructural(t);
-            if (c.ts.kind(r) == .any or c.ts.kind(r) == .err) return types.any_type;
+            if (c.ts.kind(r) == .any or c.ts.kind(r) == .err) {
+                // …unless the receiver is a class whose table is open further
+                // down this stack, where the error type is the WINDOW and not
+                // an answer: the declarations can still say the member is
+                // absent (`inProgressMemberAbsent`).
+                if (try classes.inProgressMemberAbsent(c, t, name)) {
+                    // Named the way tsc names it: the report prints
+                    // `getApparentType(leftType)`, and the apparent type of a
+                    // polymorphic `this` is the class instance — "does not
+                    // exist on type 'Bar'", not "on type 'this'".
+                    const shown = if (c.ts.kind(t) == .this_type) c.ts.thisTypeInstance(t) else t;
+                    return reportMissingProp(c, shown, r, name, name_tok);
+                }
+                return types.any_type;
+            }
             if (try c.propOfType(r, name)) |p| {
                 if (p.nonPublic()) try accessibility.check(c, t, name, name_tok, site);
                 var pt = try c.substThis(p.ty, t);
@@ -4340,18 +4355,27 @@ fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex, site
                 }
                 return types.any_type;
             }
-            if (c.suggestProp(name, r)) |sugg| {
-                try c.diagFmt(2551, c.tokSpan(name_tok), "Property '{s}' does not exist on type '{s}'. Did you mean '{s}'?", .{
-                    c.atomText(name), try c.typeToString(t), c.atomText(sugg),
-                });
-            } else {
-                try c.diagFmt(2339, c.tokSpan(name_tok), "Property '{s}' does not exist on type '{s}'.", .{
-                    c.atomText(name), try c.typeToString(t),
-                });
-            }
-            return types.error_type;
+            return reportMissingProp(c, t, r, name, name_tok);
         },
     }
+}
+
+/// The not-found verdict of a property access: TS2339, or TS2551 when a
+/// near-miss member suggests itself (tsc's
+/// `getSuggestionForNonexistentProperty`). `t` is the receiver AS WRITTEN —
+/// what the message names — and `r` its resolved structure, which is what the
+/// suggestion searches.
+fn reportMissingProp(c: *Checker, t: TypeId, r: TypeId, name: Atom, name_tok: TokenIndex) Error!TypeId {
+    if (c.suggestProp(name, r)) |sugg| {
+        try c.diagFmt(2551, c.tokSpan(name_tok), "Property '{s}' does not exist on type '{s}'. Did you mean '{s}'?", .{
+            c.atomText(name), try c.typeToString(t), c.atomText(sugg),
+        });
+    } else {
+        try c.diagFmt(2339, c.tokSpan(name_tok), "Property '{s}' does not exist on type '{s}'.", .{
+            c.atomText(name), try c.typeToString(t),
+        });
+    }
+    return types.error_type;
 }
 
 /// The member a NUMBER-LITERAL key names, if `r` declares one. tsc's
