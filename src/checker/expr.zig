@@ -250,31 +250,29 @@ fn markThisBound(c: *Checker, fn_node: Node) Error!void {
     try c.this_bound_fns.put(c.cm(), thisBoundKey(c, fn_node), {});
 }
 
-/// A property/element access whose RECEIVER is `this`, narrowed the way tsc's
-/// `tryGetThisTypeAt` narrows it: both of its arms — the function-like
-/// container and the class-body one — hand their answer to
-/// `getFlowTypeOfReference(node, thisType)`, so every guard that refines a
-/// named receiver refines `this` too. The one that needs it most is the
-/// `this is T` predicate: `if (this.hasData()) this.data.toLowerCase()` is
-/// only sound because the call narrowed the RECEIVER and the property was
-/// then read off the narrowed type. `flow.predicateOfCall` already hands the
-/// `this` node back as such a guard's subject, and `flow.identIsSym` already
-/// answers the `this` sentinel root with "is a `this_expr`", so the empty
-/// path over that root — the same root `buildRefKey` mints for `this.p` —
-/// is a reference the walk can match as-is.
-///
-/// The flow node queried is the ACCESS's, not the `this` keyword's: ztsc's
-/// binder attaches flow to references and accesses, and has no `ThisKeyword`
-/// arm of tsc's `bindWorker`. The two are the same flow node by construction
-/// — a member expression is bound before its own children, so `this.p` and
-/// the `this` inside it would record one and the same `currentFlow` — so
-/// standing in for it here is exact for every receiver. (A bare `this` in
-/// some other position — `const x: DatafulFoo<T> = this` — still reads the
-/// declared type; narrowing that one needs the binder to attach a flow node
-/// to the keyword itself.)
+/// `this`, narrowed the way tsc's `checkThisExpression` narrows it: both arms
+/// of `tryGetThisTypeAt` — the function-like container and the class-body one —
+/// hand their answer to `getFlowTypeOfReference(node, thisType)`, so every
+/// guard that refines a named reference refines `this` too. The one that needs
+/// it most is the `this is T` predicate: `if (this.hasData()) { const d:
+/// Dataful = this }`. `flow.predicateOfCall` already hands the `this` node back
+/// as such a guard's subject, and `flow.identIsSym` already answers the `this`
+/// sentinel root with "is a `this_expr`", so the empty path over that root —
+/// the same root `buildRefKey` mints for `this.p` — is a reference the walk can
+/// match as-is; the binder's `.this_expr` arm gives the keyword the flow node
+/// to query it at.
+fn narrowThis(c: *Checker, node: Node, t: TypeId) Error!TypeId {
+    return c.flowTypeOfKey(node, .{ .sym = this_flow_root }, t);
+}
+
+/// The same narrowing for a property/element access whose RECEIVER is `this`,
+/// queried at the ACCESS rather than at the keyword. The two are the same flow
+/// node by construction — a member expression is bound before its own children,
+/// so `this.p` and the `this` inside it record one and the same `currentFlow` —
+/// and the access is where the receiver's type is wanted.
 fn narrowThisReceiver(c: *Checker, recv: Node, site: Node, t: TypeId) Error!TypeId {
     if (c.nodeTag(recv) != .this_expr) return t;
-    return c.flowTypeOfKey(site, .{ .sym = this_flow_root }, t);
+    return narrowThis(c, site, t);
 }
 
 fn atFileTopLevel(c: *const Checker) bool {
@@ -335,11 +333,11 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
                 // exactly the shape tsc reports (`class C { m() { function
                 // inner() { this } } }`).
                 .function => |fn_node| {
-                    if (thisFrameOwnsThis(c, fn_node)) return c.this_type;
+                    if (thisFrameOwnsThis(c, fn_node)) return narrowThis(c, node, c.this_type);
                 },
                 .namespace, .enum_body => {},
                 .class_body, .file => {
-                    if (c.this_type != 0) return c.this_type;
+                    if (c.this_type != 0) return narrowThis(c, node, c.this_type);
                     // tsc's `tryGetThisTypeAt(node, /*includeGlobalThis*/
                     // true)`: at the TOP LEVEL of a plain script — no enclosing
                     // function, class or namespace to own a `this` — `this` is
@@ -929,23 +927,37 @@ fn checkIdentifier(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
                     try checkTdz(c, sym, node, tok);
                 }
             }
+            // Flow narrowing. A binding destructured out of a discriminated
+            // union has no flow of its own that a guard on a SIBLING binding
+            // touches, so its parent union is narrowed as a pseudo-reference
+            // first (tsc's `getNarrowedTypeOfSymbol`); the ordinary walk still
+            // runs on top of whatever that yields.
+            const walk_from = (try c.narrowedPatternBinding(node, sym)) orelse declared;
+            const narrowed = try c.flowTypeOfReference(node, sym, walk_from);
             // Definite assignment (TS2454) is NOT `void`: tsc returns the
             // DECLARED type for a reference it convicts, "to reduce follow-on
             // errors", so the narrowing that would otherwise apply is dropped
-            // and the follow-on assignability errors survive. That makes the
-            // VERDICT part of the answer, and an answer may not depend on
-            // which checker owns the file — so the verdict is computed
-            // unconditionally here and only the REPORT stays owned. Every
-            // checker pays the definite-assignment walk; it is memoized per
-            // (flow, sym) and only reached by a `let`/`var`/`const` read whose
-            // declared type excludes undefined.
+            // and the follow-on assignability errors survive. The VERDICT is
+            // therefore part of this identifier's TYPE, and a type may not
+            // depend on which checker got the file — so unlike the two `void`
+            // diagnostics around it, the verdict cannot live under
+            // `owned_mask`. Only the REPORT does.
+            //
+            // Outside the owning checker the walk is still skipped whenever
+            // narrowing did not MOVE the type: `narrowed == declared` is the
+            // answer either way then, convicted or not. That is what keeps the
+            // cost off the ordinary reference — a `const x = f(); … x` under no
+            // guard never reaches the definite-assignment walk in the three
+            // checkers that only need its type (measured: without the gate,
+            // social-app's peak RSS rose 4%).
             var unassigned = false;
             if ((f.let_decl or f.var_decl or f.const_decl) and !f.param and
                 // A computed member name is evaluated outside its
                 // container's flow, so nothing read there is "used before
                 // being assigned" (`Checker.in_computed_member_name`).
                 // (wave-10 A: one flagged guard.)
-                !c.in_computed_member_name)
+                !c.in_computed_member_name and
+                (c.owned_mask[c.cur_file] or narrowed != declared))
             {
                 // A `const` is asked too: its initializer is what makes it
                 // definitely assigned, and a read in its TEMPORAL DEAD ZONE
@@ -962,16 +974,7 @@ fn checkIdentifier(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             }
             // "Return the declared type to reduce follow-on errors"
             // (`checkIdentifier`, right after the TS2454 `error()`).
-            if (unassigned) return declared;
-            // Flow narrowing. A binding destructured out of a discriminated
-            // union has no flow of its own that a guard on a SIBLING binding
-            // touches, so its parent union is narrowed as a pseudo-reference
-            // first (tsc's `getNarrowedTypeOfSymbol`); the ordinary walk still
-            // runs on top of whatever that yields.
-            if (try c.narrowedPatternBinding(node, sym)) |t| {
-                return c.flowTypeOfReference(node, sym, t);
-            }
-            return c.flowTypeOfReference(node, sym, declared);
+            return if (unassigned) declared else narrowed;
         },
         .wrong_space => |sym| {
             const wf = c.symFlags(sym);
