@@ -764,6 +764,14 @@ const Binder = struct {
         try b.diags.append(b.scratch, .{ .code = code, .span = b.tokSpan(tok) });
     }
 
+    /// A diagnostic whose message interpolates the text of ANOTHER token —
+    /// `Diagnostic.arg`, the parser's `errAtSpanArg` on this side of the fence.
+    /// Only for codes whose template carries a `{0}` naming something other
+    /// than the span it is reported on.
+    fn diagArg(b: *Binder, code: Code, tok: TokenIndex, arg_tok: TokenIndex) Error!void {
+        try b.diags.append(b.scratch, .{ .code = code, .span = b.tokSpan(tok), .arg = b.tokSpan(arg_tok) });
+    }
+
     fn nodeTag(b: *const Binder, node: Node) ast.Tag {
         return b.tree.nodeTag(node);
     }
@@ -1619,7 +1627,10 @@ const Binder = struct {
         /// A sibling that explains the missing body without a diagnostic of its
         /// own — tsc's "we should already report error in binder" arm.
         silent,
-        report: struct { code: Code, tok: TokenIndex },
+        /// `arg` is 0 for the codes whose message names nothing but itself, and
+        /// the token whose TEXT fills `{0}` for the one that does (TS2389 names
+        /// the overload the implementation should have been called).
+        report: struct { code: Code, tok: TokenIndex, arg: TokenIndex = 0 },
     };
 
     fn overloadSiblingDiag(b: *Binder, node: Node) SiblingVerdict {
@@ -1653,7 +1664,7 @@ const Binder = struct {
         // name is simply an unrelated declaration, and tsc keeps looking (which
         // for ztsc means falling through to TS2391).
         if (b.tree.nodeData(next).rhs == 0) return .fall_through;
-        return .{ .report = .{ .code = .overload_impl_name_mismatch, .tok = next_tok } };
+        return .{ .report = .{ .code = .overload_impl_name_mismatch, .tok = next_tok, .arg = name_tok } };
     }
 
     /// tsc's `reportImplementationExpectedError`, whole: the sharper sibling arms
@@ -1679,7 +1690,7 @@ const Binder = struct {
         switch (b.overloadSiblingDiag(node)) {
             .fall_through => {},
             .silent => return,
-            .report => |r| return b.diag(r.code, r.tok),
+            .report => |r| return if (r.arg == 0) b.diag(r.code, r.tok) else b.diagArg(r.code, r.tok, r.arg),
         }
         if (b.scope_kinds.items[b.sym_scopes.items[sym]] == .class_members and
             b.tree.tokens.tag(name_tok) == .keyword_constructor)

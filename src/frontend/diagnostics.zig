@@ -573,10 +573,9 @@ pub const Code = enum(u16) {
     catch_redeclare,
     /// TS2389: the declaration immediately after an overload signature HAS a
     /// body but a different name, so the set never got its implementation and
-    /// the body belongs to something else. tsc's message names the expected
-    /// name; a Diagnostic here is a code plus a span, so the invariant half of
-    /// the sentence is what is reported (the policy TS2300 already follows).
-    /// Blamed on the misnamed implementation, not on the signature.
+    /// the body belongs to something else. Blamed on the misnamed
+    /// implementation, not on the signature; `{0}` is the OVERLOAD's name, which
+    /// the emission site passes as the diagnostic's `arg` span.
     overload_impl_name_mismatch,
     /// TS2387/TS2388: a mixed static/instance overload set — two same-named
     /// methods of one class, one `static` and one not, so neither side has an
@@ -1439,7 +1438,7 @@ pub const Code = enum(u16) {
             .namespace_prior_to_merge => "A namespace declaration cannot be located prior to a class or function with which it is merged.",
             .namespace_split_across_files => "A namespace declaration cannot be in a different file from a class or function with which it is merged.",
             .catch_redeclare => "cannot redeclare identifier in catch clause",
-            .overload_impl_name_mismatch => "function implementation name must match the overload it follows",
+            .overload_impl_name_mismatch => "Function implementation name must be '{0}'.",
             .overload_must_be_static => "Function overload must be static.",
             .overload_must_not_be_static => "Function overload must not be static.",
             .param_property_outside_ctor_impl => "A parameter property is only allowed in a constructor implementation.",
