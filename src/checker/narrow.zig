@@ -1125,9 +1125,27 @@ pub fn narrowByInstance(c: *Checker, t: TypeId, instance: TypeId, sense: bool, c
         // `readonly T[]` yields `any[]`, not `readonly T[]`. ztsc's
         // relation is deliberately readonly-blind, so both directions are
         // "assignable" here and the subject would win instead.
-        if (k == .array and c.ts.arrayIsReadonly(t) and
-            c.ts.kind(instance) == .array and !c.ts.arrayIsReadonly(instance))
-            return instance;
+        // tsc's `directlyRelated` pick runs on a NON-union subject too — it is
+        // `mapType(type, …)`, and `mapType` applies its mapper directly to a
+        // non-union — and only a `never` from it falls through to the
+        // assignability tail below. That pick is `assign.narrowedPick`, the
+        // same one the union arm above makes per constituent; skipping it here
+        // was what kept `declare const o: {}; if (isObject(o))` — with
+        // `isObject(v): v is Record<string, unknown>` — at `{}` instead of the
+        // asserted type: `{}` is only VACUOUSLY assignable to a type whose
+        // every member is an index signature, so the first clause below fired
+        // and dropped the guard, and `o['attr']` was TS7053
+        // (`controlFlowFavorAssertedTypeThroughTypePredicate`).
+        //
+        // `narrowedPick` answers `t` both when `t` is the more specific of the
+        // two and when the two are unrelated, and only the first of those is a
+        // decision — so a `t` answer falls through to the tail, which reaches
+        // the same conclusion for it. Not for `instanceof`, whose pick is the
+        // nominal one above.
+        if (!check_derived) {
+            const pick = try narrowedPick(c, t, instance);
+            if (pick != t) return pick;
+        }
         if (try c.isAssignable(t, instance)) return t;
         if (try c.isAssignable(instance, t)) return instance;
         // Unrelated `t` and guard `C`: tsc narrows to the intersection
