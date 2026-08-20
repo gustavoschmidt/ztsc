@@ -5473,6 +5473,43 @@ pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode
             te = t;
         }
     }
+    // The same rule for a GENERIC source: tsc instantiates it in the target's
+    // context and leaves the target's own parameters standing, so what the
+    // source has to satisfy is `<T2>(x: { a: T2 }) => T2[]` with `T2` free,
+    // not that signature erased to `any`. Erased, `<T extends Base>(x: {a: T})
+    // => T[]` passed it — `Base[]` is an `any[]` — where tsc reports that
+    // `Base` is not the caller's `T2`
+    // (`assignmentCompatWith{Call,Construct}Signatures5`/`6`).
+    //
+    // The SOURCE stays erased to its CONSTRAINTS, which is ztsc's standing
+    // stand-in for the instantiation: tsc's inference maps the source's
+    // parameter to the target's and then clamps it to the source's own
+    // constraint, and the clamp is what decides these pairs.
+    //
+    // Restricted to lists of the SAME LENGTH, because that is exactly when
+    // the stand-in lines up. `<V, K>(key: K, defaultValue: V) => V extends
+    // string ? … : V` against `<T>(feature: Features, defaultValue: T) => T
+    // extends string ? … : T` is tsc-legal — inference gives `K := Features`
+    // and `V := T`, making the two signatures identical — but the erasure
+    // sends `V` to `any` instead of to `T`, and a conditional over `any` does
+    // not satisfy the target's still-deferred conditional over `T`. With both
+    // sides erased that pair matched; with only the source erased it would be
+    // a false TS2322 (social-app's `analytics/index.tsx`). Where the lists do
+    // line up, the erased constraint IS the value inference would clamp to.
+    //
+    // …and to a target whose own parameters MENTION its type variables,
+    // which is what the source's erased parameters have to meet and
+    // therefore what pins them. `<T extends string>() => T` overriding
+    // `<T extends string>() => T | Promise<T>` mentions its variable only in
+    // the RETURN — there tsc infers `T_source := T_target | Promise<T_target>`
+    // and the erasure has nothing to line up with, so a free target return
+    // is a false TS2416 (`inferenceContextualReturnTypeUnion4`).
+    if (erase == .constraints and c.ts.fnTypeParams(s).len > 0 and
+        c.ts.fnTypeParams(s).len == c.ts.fnTypeParams(t).len and
+        try sigParamsMentionOwnTypeParams(c, t))
+    {
+        te = t;
+    }
     // The erasure runs `instantiate`, so it is subject to the instantiation
     // budget, and a trip hands back `error_type` in place of the signature —
     // not a wider signature, no signature at all. Every step below then reads
@@ -5793,6 +5830,18 @@ pub fn eraseTypeParams(c: *Checker, sig: TypeId) Error!TypeId {
 /// params (the arrow itself is non-generic), and both sides must collapse
 /// those shared params to the same constraints to relate — tsc generalizes
 /// the arrow over the contextual signature's type params, then erases both.
+/// Does any PARAMETER type of `sig` mention one of `sig`'s own type
+/// parameters? Asked by erasing them inside each parameter type and looking
+/// for a change, which reuses the memoized erasure the relation runs anyway.
+fn sigParamsMentionOwnTypeParams(c: *Checker, sig: TypeId) Error!bool {
+    if (c.ts.fnTypeParams(sig).len == 0) return false;
+    for (0..c.ts.fnParamCount(sig)) |i| {
+        const p = c.ts.fnParam(sig, @intCast(i)).ty;
+        if (try c.eraseParamsOf(p, sig) != p) return true;
+    }
+    return false;
+}
+
 pub fn eraseParamsOf(c: *Checker, sig: TypeId, owner: TypeId) Error!TypeId {
     // Non-generic early-out before the dupe (the common case).
     const sig_tps = c.ts.fnTypeParams(owner);
