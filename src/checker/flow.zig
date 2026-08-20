@@ -59,6 +59,7 @@ pub const RefQ = refkey.RefQ;
 pub const SymLoop = refkey.SymLoop;
 pub const LoopFrame = refkey.LoopFrame;
 pub const this_flow_root = refkey.this_flow_root;
+pub const super_flow_root = refkey.super_flow_root;
 pub const pattern_root_base = refkey.pattern_root_base;
 pub const isPseudoRoot = refkey.isPseudoRoot;
 pub const makeRefKey = refkey.makeRefKey;
@@ -109,10 +110,10 @@ pub const markMemberWriteRoot = reassign_scan.markMemberWriteRoot;
 pub const recordMemberWrite = reassign_scan.recordMemberWrite;
 
 /// Is `sym` a binding-pattern pseudo-root (`pattern_root_base`), as opposed to
-/// a real symbol or the `this` sentinel? Only the flow walk mints and consumes
-/// these, so unlike `isPseudoRoot` it has no reader outside this file.
+/// a real symbol or the `this`/`super` sentinels? Only the flow walk mints and
+/// consumes these, so unlike `isPseudoRoot` it has no reader outside this file.
 inline fn isPatternRoot(sym: SymbolId) bool {
-    return sym >= pattern_root_base and sym != this_flow_root;
+    return sym >= pattern_root_base and sym != this_flow_root and sym != super_flow_root;
 }
 
 /// Intern `decl` (a parameter or declarator whose name is an object binding
@@ -123,7 +124,9 @@ fn patternRoot(c: *Checker, decl: Node) Error!?SymbolId {
     if (c.fresh_tp_base != 0 and c.fresh_tp_base >= pattern_root_base) return null;
     const gop = try c.pattern_root_ids.getOrPut(c.cm(), c.nodeKey(decl));
     if (!gop.found_existing) {
-        if (c.pattern_root_decls.items.len >= this_flow_root - pattern_root_base) {
+        // The cap is `super_flow_root`, the LOWEST of the two fixed sentinels
+        // above the pattern range — one past it would alias `super`.
+        if (c.pattern_root_decls.items.len >= super_flow_root - pattern_root_base) {
             _ = c.pattern_root_ids.remove(c.nodeKey(decl));
             return null;
         }
@@ -997,8 +1000,9 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
             if (target == null_node or !try identIsSym(c, target, key.sym)) return before;
             return evolveArray(c, before, mutation);
         },
-        .cond_true, .cond_false => {
+        .cond_true, .cond_false, .chain_taken, .chain_short => {
             const cond = b.flowNode(flow);
+            const chain = b.flow_tags[flow] == .chain_taken or b.flow_tags[flow] == .chain_short;
             const ante = b.flow_a[flow];
             // tsc's `createFlowCondition`: the edge that contradicts a literal
             // `true`/`false` KEYWORD does not exist. That is what makes
@@ -1018,7 +1022,7 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
             }
             const before = try flowType(c, ante, key, declared, depth + 1);
             if (before == types.never_type) return before;
-            const sense = b.flow_tags[flow] == .cond_true;
+            const sense = b.flow_tags[flow] == .cond_true or b.flow_tags[flow] == .chain_taken;
             const saved = c.cur_scope;
             defer c.cur_scope = saved;
             c.cur_scope = b.flowScope(flow);
@@ -1029,6 +1033,8 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
             const solid = try finalizeEvolvingArray(c, before);
             const narrowed = if (isNullishTestEdge(c, cond))
                 try narrowByNullishTest(c, solid, cond, sense, key)
+            else if (chain and try refMatches(c, cond, key))
+                try narrowByOptionality(c, solid, sense)
             else
                 try c.narrowByCondition(solid, cond, sense, key, declared);
             return if (narrowed == solid) before else narrowed;
@@ -1448,6 +1454,34 @@ pub fn thisPropUnassigned(c: *Checker, flow: FlowId, name: Atom, declared: TypeI
 ///
 /// `undefined` still enters only at the top of the flow, which is what makes
 /// "the answer still admits `undefined`" mean "some path left it unwritten".
+///
+/// KNOWN GAP, diagnosed in wave-24 A and NOT landed (the fix is one line in
+/// `expr.zig`, which that wave did not own). A reference this walk convicts is
+/// one tsc reports TS2454 on — and tsc then returns the DECLARED type for it,
+/// not the narrowed one:
+///
+/// ```ts
+/// // checkIdentifier, after the TS2454 error():
+/// //   "Return the declared type to reduce follow-on errors"
+/// var sb: string | boolean;
+/// var b: boolean;
+/// if (typeof sb === "string") {} else { b = sb; }  // tsc: TS2322 *and* TS2454
+/// ```
+///
+/// ztsc narrows `sb` to `boolean` in the `else` and answers TS2454 alone, so
+/// the assignment's TS2322 goes missing. That single divergence is most of the
+/// `typeGuards*` under-pool — `typeGuardOfFormTypeOf{String,Number,Boolean}`,
+/// `…IsOrderIndependent`, `typeGuardsIn{Module,Global,ExternalModule}` and
+/// `typeGuardOfForm{InstanceOf,NotExpr}` all report a missing TS2322 on exactly
+/// the lines where a `var` with no assignment is read under a guard.
+///
+/// The catch, and the reason it is not a one-liner after all: `expr.zig` runs
+/// `checkUseBeforeAssigned` only under `owned_mask`, deliberately, because a
+/// diagnostic contributes nothing to a node's TYPE. Tying the type to the
+/// verdict breaks that invariant — the answer would depend on which checker got
+/// the file, which the determinism tests forbid — so the VERDICT (not the
+/// report) has to move out of the ownership guard first, and pay for the
+/// definite-assignment walk in every checker.
 pub fn unassignedVarType(c: *Checker, node: Node, sym: SymbolId, optional: TypeId) Error!TypeId {
     return c.flowTypeOfKey(node, .{ .sym = sym, .opt_init = true }, optional);
 }
@@ -1923,6 +1957,22 @@ fn isNullishTestEdge(c: *const Checker, cond: Node) bool {
 /// inline for `== null`; folding the two together belongs with that file.
 fn narrowByNullishTest(c: *Checker, t: TypeId, qq: Node, sense: bool, key: RefKey) Error!TypeId {
     if (!try refMatches(c, c.tree.nodeData(qq).lhs, key)) return t;
+    return narrowByOptionality(c, t, sense);
+}
+
+/// tsc's `narrowTypeByOptionality` for the reference the test is ON: a `?.`
+/// receiver is tested for NULLISHNESS, so the non-short-circuited branch keeps
+/// the non-nullish part and the short-circuit branch keeps only `null |
+/// undefined`.
+///
+/// Never the truthy/falsy split, which `?.` does not perform: `a?.b` with `a:
+/// 0 | 1 | undefined` dereferences `0` quite happily, so the branch inside
+/// `if (a?.b)` knows only that `a` is not nullish — tsc keeps `0 | 1` there and
+/// `cond_true` narrowing left `1`.
+///
+/// The same filter `narrowByNullishTest` applies to a `??` left operand, which
+/// is the other place tsc routes to `narrowTypeByOptionality`.
+fn narrowByOptionality(c: *Checker, t: TypeId, sense: bool) Error!TypeId {
     if (sense) return c.nonNullable(t);
     return c.filterUnion(t, struct {
         fn keep(ch: *Checker, m: TypeId) bool {
@@ -2507,6 +2557,7 @@ fn aliasedDiscriminantAtom(c: *Checker, node: Node, key: RefKey) Error!?Atom {
 pub fn identIsSym(c: *Checker, node: Node, sym: SymbolId) Error!bool {
     if (node == null_node) return false;
     if (sym == this_flow_root) return c.nodeTag(node) == .this_expr;
+    if (sym == super_flow_root) return c.nodeTag(node) == .super_expr;
     // A binding pattern is never itself written as an expression, so no
     // identifier ever *is* a pattern pseudo-root (its bindings are matched by
     // `discriminantOfRef` instead).
@@ -3709,7 +3760,7 @@ fn definitelyAssignedInner(c: *Checker, flow: FlowId, sym: SymbolId) Error!bool 
         },
         // An array mutation writes an ELEMENT, never the variable itself, so
         // it is a pass-through for both assignment questions.
-        .cond_true, .cond_false, .switch_clause, .call_stmt, .array_mutation => {
+        .cond_true, .cond_false, .chain_taken, .chain_short, .switch_clause, .call_stmt, .array_mutation => {
             return c.definitelyAssigned(b.flow_a[flow], sym);
         },
         // A pass-through: the target label keeps its full antecedent list, so
@@ -3800,7 +3851,7 @@ fn saReaches(c: *Checker, flow: FlowId, sym: SymbolId, seen: []bool) Error!bool 
             if (try assignTargetsSymForDa(c, b.flowNode(flow), sym)) return true;
             return saReaches(c, b.flow_a[flow], sym, seen);
         },
-        .cond_true, .cond_false, .switch_clause, .call_stmt, .switch_no_match, .array_mutation => {
+        .cond_true, .cond_false, .chain_taken, .chain_short, .switch_clause, .call_stmt, .switch_no_match, .array_mutation => {
             return saReaches(c, b.flow_a[flow], sym, seen);
         },
         // Pass-through (some-path question, so the un-reduced target can only

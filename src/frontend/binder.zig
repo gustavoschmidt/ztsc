@@ -764,6 +764,14 @@ const Binder = struct {
         try b.diags.append(b.scratch, .{ .code = code, .span = b.tokSpan(tok) });
     }
 
+    /// A diagnostic whose message interpolates the text of ANOTHER token —
+    /// `Diagnostic.arg`, the parser's `errAtSpanArg` on this side of the fence.
+    /// Only for codes whose template carries a `{0}` naming something other
+    /// than the span it is reported on.
+    fn diagArg(b: *Binder, code: Code, tok: TokenIndex, arg_tok: TokenIndex) Error!void {
+        try b.diags.append(b.scratch, .{ .code = code, .span = b.tokSpan(tok), .arg = b.tokSpan(arg_tok) });
+    }
+
     fn nodeTag(b: *const Binder, node: Node) ast.Tag {
         return b.tree.nodeTag(node);
     }
@@ -1619,7 +1627,10 @@ const Binder = struct {
         /// A sibling that explains the missing body without a diagnostic of its
         /// own — tsc's "we should already report error in binder" arm.
         silent,
-        report: struct { code: Code, tok: TokenIndex },
+        /// `arg` is 0 for the codes whose message names nothing but itself, and
+        /// the token whose TEXT fills `{0}` for the one that does (TS2389 names
+        /// the overload the implementation should have been called).
+        report: struct { code: Code, tok: TokenIndex, arg: TokenIndex = 0 },
     };
 
     fn overloadSiblingDiag(b: *Binder, node: Node) SiblingVerdict {
@@ -1653,7 +1664,7 @@ const Binder = struct {
         // name is simply an unrelated declaration, and tsc keeps looking (which
         // for ztsc means falling through to TS2391).
         if (b.tree.nodeData(next).rhs == 0) return .fall_through;
-        return .{ .report = .{ .code = .overload_impl_name_mismatch, .tok = next_tok } };
+        return .{ .report = .{ .code = .overload_impl_name_mismatch, .tok = next_tok, .arg = name_tok } };
     }
 
     /// tsc's `reportImplementationExpectedError`, whole: the sharper sibling arms
@@ -1679,7 +1690,7 @@ const Binder = struct {
         switch (b.overloadSiblingDiag(node)) {
             .fall_through => {},
             .silent => return,
-            .report => |r| return b.diag(r.code, r.tok),
+            .report => |r| return if (r.arg == 0) b.diag(r.code, r.tok) else b.diagArg(r.code, r.tok, r.arg),
         }
         if (b.scope_kinds.items[b.sym_scopes.items[sym]] == .class_members and
             b.tree.tokens.tag(name_tok) == .keyword_constructor)
@@ -1958,7 +1969,7 @@ const Binder = struct {
                         for (ps.super_flows) |s| if (s == f) return true;
                         f = ps.a[f];
                     },
-                    .assign, .cond_true, .cond_false, .switch_clause, .switch_no_match, .array_mutation => f = ps.a[f],
+                    .assign, .cond_true, .cond_false, .chain_taken, .chain_short, .switch_clause, .switch_no_match, .array_mutation => f = ps.a[f],
                     // Pass through to the continuation. The target label is
                     // walked with its full antecedent list, which can only
                     // make the answer more conservative ("super may not have
@@ -3264,26 +3275,26 @@ const Binder = struct {
                             try b.memberNameKey(tok, proto.flags);
                         _ = try b.declare(if (is_static) ss else ms, atom, kind, member, tok, .{
                             .static_member = is_static,
-                            // NOT SET, deliberately, and it is a known gap:
                             // `m?(): number` is an OPTIONAL property whose type
                             // is `(() => number) | undefined`, exactly as
-                            // `m?: () => number` is (tsc reads optionality off
+                            // `m?: () => number` is — tsc reads optionality off
                             // the declaration in
                             // `getTypeOfVariableOrParameterOrProperty` and does
-                            // not care whether it is a method or a field), so
-                            // `c.m()` should be TS2722 and `const d: C = {}`
-                            // legal. Setting it is a one-word change and it
-                            // measures NET NEGATIVE today, because a
-                            // `super.<name>` reference is not narrowable:
-                            // `refkey.buildRefKey` bottoms out at an identifier
-                            // or `this` and has no `super` root, so
-                            // `super.m && super.m()` cannot narrow and every
-                            // optional method reached that way becomes a false
-                            // positive (`controlFlowSuperPropertyAccess`). The
-                            // two land together: a `super_flow_root` sentinel
-                            // beside `this_flow_root` (refkey.zig) plus its two
-                            // readers in flow.zig (`identIsSym`,
-                            // `isPatternRoot`), and then this line.
+                            // not care whether it is a method or a field. So
+                            // `c.m()` is TS2722 and `const d: C = {}` is legal.
+                            //
+                            // (wave-24 A) This one word could not land before a
+                            // `super.<name>` reference was narrowable:
+                            // `refkey.buildRefKey` bottomed out at an
+                            // identifier or `this` and had no `super` root, so
+                            // `super.m && super.m()` narrowed nothing and every
+                            // optional method reached that way was a false
+                            // TS2722 (`controlFlowSuperPropertyAccess`). The
+                            // `super_flow_root` sentinel beside
+                            // `this_flow_root` (refkey.zig), read by
+                            // `identIsSym`/`isPatternRoot` in flow.zig, is what
+                            // made it net positive.
+                            .optional_member = proto.flags & ast.Flags.optional != 0,
                             .has_impl = md.rhs != 0 and !is_get and !is_set,
                             .non_public = proto.flags & nonpublic_mask != 0 or isPrivateNameToken(b, tok),
                         });
@@ -4417,7 +4428,7 @@ const Binder = struct {
         }
 
         if (b.isChainRoot(node)) {
-            const taken = try b.addFlow(.cond_true, b.cur_flow, recv);
+            const taken = try b.addFlow(.chain_taken, b.cur_flow, recv);
             try b.chain_sc.append(b.scratch, .{ .ante = b.cur_flow, .expr = recv, .taken = taken });
             b.cur_flow = taken;
         }
@@ -4460,7 +4471,7 @@ const Binder = struct {
             return;
         }
         const pid = try b.newPending();
-        for (tests) |t| try b.pendAdd(pid, try b.addFlow(.cond_false, t.ante, t.expr));
+        for (tests) |t| try b.pendAdd(pid, try b.addFlow(.chain_short, t.ante, t.expr));
         try b.pendAdd(pid, try b.addFlow(.cond_true, b.cur_flow, node));
         try b.pendAdd(pid, try b.addFlow(.cond_false, b.cur_flow, node));
         b.cur_flow = try b.finishPending(pid);
@@ -4489,7 +4500,7 @@ const Binder = struct {
         const t = try b.addFlow(.cond_true, b.cur_flow, node);
         const pid = try b.newPending();
         for (b.chain_sc.items[base..]) |sc| {
-            try b.pendAdd(pid, try b.addFlow(.cond_false, sc.ante, sc.expr));
+            try b.pendAdd(pid, try b.addFlow(.chain_short, sc.ante, sc.expr));
         }
         try b.pendAdd(pid, try b.addFlow(.cond_false, b.cur_flow, node));
         b.cur_flow = pre;
@@ -6339,7 +6350,7 @@ fn checkBinderOnArbitraryBytes(alloc: Allocator, interner: *Interner, input: []c
                 }
                 try testing.expectEqual(FlowTag.branch_label, b.flow_tags[b.reduceTarget(@intCast(f))]);
             },
-            .assign, .cond_true, .cond_false, .switch_clause, .switch_no_match, .call_stmt, .array_mutation => {
+            .assign, .cond_true, .cond_false, .chain_taken, .chain_short, .switch_clause, .switch_no_match, .call_stmt, .array_mutation => {
                 try testing.expect(b.flow_a[f] < n_flows);
                 try testing.expect(b.flow_b[f] < tree.nodes.len);
             },

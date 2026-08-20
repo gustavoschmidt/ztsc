@@ -283,6 +283,20 @@ pub const FlowTag = enum(u8) {
     cond_true,
     /// Condition took the false branch. a = antecedent, b = condition node.
     cond_false,
+    /// An optional chain did NOT short-circuit: its `?.` receiver was
+    /// non-nullish. a = antecedent, b = the RECEIVER node.
+    ///
+    /// Its own tag rather than a `cond_true`, because the test a `?.` performs
+    /// is nullishness, not truthiness — tsc's `narrowType` routes an
+    /// `isExpressionOfOptionalChainRoot` operand to `narrowTypeByOptionality`,
+    /// exactly as it routes a `??` left operand there. Spelling it `cond_true`
+    /// made `if (a?.b)` narrow `a: 0 | 1 | undefined` all the way to `1`, since
+    /// truthiness also rules out the falsy `0` the chain would happily have
+    /// dereferenced.
+    chain_taken,
+    /// An optional chain DID short-circuit: its `?.` receiver was nullish.
+    /// a = antecedent, b = the RECEIVER node. The `chain_taken` mirror.
+    chain_short,
     /// Join point. a..b = antecedent list range in `flow_extra`.
     branch_label,
     /// Loop head join (has loop-back antecedents). a..b = range in extra.
@@ -794,7 +808,7 @@ pub const Bind = struct {
     /// The AST node a flow node references (assign/condition/switch), or 0.
     pub fn flowNode(b: *const Bind, flow: FlowId) Node {
         return switch (b.flow_tags[flow]) {
-            .assign, .cond_true, .cond_false, .switch_clause, .switch_no_match, .start, .call_stmt, .array_mutation => b.flow_b[flow],
+            .assign, .cond_true, .cond_false, .chain_taken, .chain_short, .switch_clause, .switch_no_match, .start, .call_stmt, .array_mutation => b.flow_b[flow],
             else => 0,
         };
     }

@@ -272,8 +272,15 @@ pub fn signatureOfProtoCtx(
     {
         // Reserve the cache slot to break recursion (self-recursive
         // unannotated functions infer any, TS7023-adjacent).
-        try c.sig_cache.put(c.cm(), c.nodeKey(node), .{ .ty = try c.ts.makeFunction(params.items, types.any_type, tps.items, if (is_method) types.fn_flag_method else 0), .ctx = ctx_sig });
+        const reserved = try c.ts.makeFunction(params.items, types.any_type, tps.items, if (is_method) types.fn_flag_method else 0);
+        try c.sig_cache.put(c.cm(), c.nodeKey(node), .{ .ty = reserved, .ctx = ctx_sig });
         ret = try inferReturnType(c, node, c.tree.nodeData(node).rhs, ret_ctx);
+        // A member circle `memberTypeOf` cut without reporting is this frame's
+        // to judge: inferring exactly the reserved signature back means the
+        // body returned the METHOD, whose type tsc resolves without ever
+        // asking what it returns. Anything else came out of the deferred
+        // return, which is tsc's TS7023.
+        if (takeMethodRetCut(c, node) and ret != reserved) try reportDeferredReturnCycle(c, node);
     } else if (proto.flags & (ast.Flags.get) != 0) {
         ret = types.any_type;
     } else if (c.tree.nodeData(node).rhs == 0 and c.nodeTag(node) != .function_type and c.nodeTag(node) != .method_signature) {
@@ -2459,6 +2466,121 @@ fn reportMemberCycle(c: *Checker, cycle: []const SymbolId) Error!void {
     }
 }
 
+/// The scope of the constructor whose parameter list a PARAMETER PROPERTY of
+/// member scope `ms` is written in, or null when the class has no constructor
+/// IMPLEMENTATION (an overload declares no parameter property — the binder
+/// gates that on `home.ctor and home.body`).
+///
+/// Found through the member table rather than through a parent pointer, which
+/// the tree does not carry: the constructor sits in that same table under
+/// `member_names.ctor_member_name`, and `isCtorMember` recognises its
+/// declaration from the token alone (no atom text, no interner lock).
+fn ctorScopeOfMemberScope(c: *Checker, ms: ScopeId) Error!?ScopeId {
+    const lo = c.bind.scope_members_start[ms];
+    const hi = c.bind.scope_members_start[ms + 1];
+    for (lo..hi) |i| {
+        for (c.bind.declsOf(c.bind.member_syms[i])) |d| {
+            if (c.nodeTag(d) != .class_method) continue;
+            const nd = c.tree.nodeData(d);
+            if (nd.rhs == 0) continue; // an overload: no parameter properties
+            const proto = c.tree.extraData(ast.FnProto, nd.lhs);
+            if (!c.isCtorMember(d, proto.flags)) continue;
+            return c.scopeOf(d);
+        }
+    }
+    return null;
+}
+
+/// Is the circle this member closes NOT a circle in tsc — a METHOD whose
+/// signature object already exists and whose only pending part is its INFERRED
+/// return type?
+///
+///     class C { private foo() { return this.foo; } }
+///
+/// tsc reports nothing here. A method symbol's TYPE is an object with a call
+/// signature (`getTypeOfFuncClassEnumModule`), built without ever asking what
+/// the signature RETURNS; `getReturnTypeOfSignature` is a separate, separately
+/// guarded demand. So `this.foo` inside `foo`'s body answers with `foo`'s own
+/// type and nothing recurses.
+///
+/// ztsc's equivalent of that split is `signatureOfProtoCtx`'s reservation: it
+/// writes an `any`-returning signature into `sig_cache` *before* walking the
+/// body, precisely so a self-reference terminates. That cut is already in place
+/// by the time this member is re-entered, so `memberTypeOf` must not
+/// second-guess it with a report — recomputing simply reads the reserved
+/// signature back.
+///
+/// Only unannotated methods qualify. A method whose return type is WRITTEN
+/// takes no reservation (`m(): typeof this.m` is a real TS2502 circle), a
+/// getter has no reservation of its own, and a field's initializer circle is
+/// tsc's TS7022.
+fn methodReturnDeferred(c: *Checker, sym: SymbolId) bool {
+    if (!c.symFlags(sym).method) return false;
+    const saved = c.enterSymFile(sym);
+    defer c.restoreCtx(saved);
+    var seen = false;
+    for (c.declsOf(sym)) |decl| {
+        const tag = c.nodeTag(decl);
+        if (tag != .class_method and tag != .method_signature) continue;
+        seen = true;
+        const cached = c.sig_cache.get(c.nodeKey(decl)) orelse return false;
+        // `memberTypeOf` asks with no contextual signature, so only a
+        // no-context reservation is the one it would read back.
+        if (cached.ctx != types.no_type) return false;
+    }
+    return seen;
+}
+
+/// Hand every unannotated-method frame of a cut circle its own deferred-return
+/// key (`Checker.method_ret_cuts`). Each frame decides for itself, once its
+/// body has been walked, whether the deferred return was actually consumed.
+fn recordMethodRetCut(c: *Checker, cycle: []const SymbolId) Error!void {
+    for (cycle) |msym| {
+        const saved = c.enterSymFile(msym);
+        defer c.restoreCtx(saved);
+        if (!c.symFlags(msym).method) continue;
+        for (c.declsOf(msym)) |decl| {
+            if (c.nodeTag(decl) != .class_method) continue;
+            const d = c.tree.nodeData(decl);
+            if (d.rhs == 0) continue; // an overload: nothing inferred
+            if (c.tree.extraData(ast.FnProto, d.lhs).return_type != 0) continue;
+            try c.method_ret_cuts.append(c.cm(), c.nodeKey(decl));
+        }
+    }
+}
+
+/// Did `node`'s return-type inference run under a cut circle
+/// (`recordMethodRetCut`)? Drains the key, so the answer is given once.
+fn takeMethodRetCut(c: *Checker, node: Node) bool {
+    const key = c.nodeKey(node);
+    const items = c.method_ret_cuts.items;
+    var i = items.len;
+    while (i > 0) {
+        i -= 1;
+        if (items[i] != key) continue;
+        _ = c.method_ret_cuts.orderedRemove(i);
+        return true;
+    }
+    return false;
+}
+
+/// TS7023 for a method whose inferred return type really did close a circle —
+/// the delayed half of `methodReturnDeferred`, reported here because only this
+/// frame can see whether the deferred return was CONSUMED.
+///
+///     m() { return this.m; }    // the method's own type: tsc reports nothing
+///     m() { return this.m(); }  // the method's RETURN type: TS7023
+///
+/// The two are indistinguishable at the moment the circle closes — both reach
+/// `memberTypeOf` through the same property access — and they separate only in
+/// the answer: the first infers exactly the signature this frame reserved, the
+/// second infers whatever came out of calling it.
+fn reportDeferredReturnCycle(c: *Checker, node: Node) Error!void {
+    if (!c.prog.no_implicit_any) return;
+    const tok = c.tree.nodeMainToken(node);
+    try c.diagFmt(7023, c.tokSpan(tok), "'{s}' implicitly has return type 'any' because it does not have a return type annotation and is referenced directly or indirectly in one of its return expressions.", .{c.tokenText(tok)});
+}
+
 /// Type of a class/interface member symbol (unsubstituted).
 pub fn memberTypeOf(c: *Checker, sym: SymbolId) Error!TypeId {
     // A member whose type demands itself: `a: A["a"]` through the lazy
@@ -2472,6 +2594,10 @@ pub fn memberTypeOf(c: *Checker, sym: SymbolId) Error!TypeId {
     for (c.member_type_stack.items, 0..) |m, i| {
         if (m != sym) continue;
         if (try spuriousIndexCycle(c)) break;
+        if (methodReturnDeferred(c, sym)) {
+            try recordMethodRetCut(c, c.member_type_stack.items[i..]);
+            break;
+        }
         try reportMemberCycle(c, c.member_type_stack.items[i..]);
         return types.any_type;
     }
@@ -2564,6 +2690,19 @@ pub fn memberTypeOf(c: *Checker, sym: SymbolId) Error!TypeId {
                 return types.any_type;
             },
             .param, .param_full => {
+                // A parameter property is DECLARED in the class member table
+                // but WRITTEN in the constructor, and its annotation and
+                // initializer read the constructor's scope — an earlier
+                // parameter (`constructor(y: Y, public x = y)`), a constructor
+                // type parameter (`constructor<T>(public x: T)`). `cur_scope`
+                // above is the member scope, where none of those is visible, so
+                // every such initializer was a false TS2304
+                // (`parameterReferenceInInitializer1`). tsc has no equivalent
+                // switch: `getTypeForVariableLikeDeclaration` resolves a
+                // declaration where it is written.
+                const saved_scope = c.cur_scope;
+                defer c.cur_scope = saved_scope;
+                if (try ctorScopeOfMemberScope(c, c.symScope(sym))) |s| c.cur_scope = s;
                 const p = try paramInfo(c, decl, 0, types.no_type, false, types.no_type);
                 return p.ty;
             },
