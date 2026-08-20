@@ -1406,10 +1406,16 @@ pub const Code = enum(u16) {
             .ctor_type_in_union => "Constructor type notation must be parenthesized when used in a union type.",
             .fn_type_in_intersection => "Function type notation must be parenthesized when used in an intersection type.",
             .ctor_type_in_intersection => "Constructor type notation must be parenthesized when used in an intersection type.",
-            .duplicate_identifier => "duplicate identifier",
-            .block_scoped_redeclare => "cannot redeclare block-scoped variable",
+            // The `{0}` is the reported span itself — the binder anchors all
+            // three at the NAME token (`Binder.diag`), and `renderMessage`
+            // falls back to the span when no explicit `arg` is set. That also
+            // gets tsc's spelling for free on the names that are not plain
+            // identifiers: a string-literal member renders `'"d-x"'` and a
+            // private one `'#e'`, exactly as `declarationNameToString` does.
+            .duplicate_identifier => "Duplicate identifier '{0}'.",
+            .block_scoped_redeclare => "Cannot redeclare block-scoped variable '{0}'.",
             .enum_merge_conflict => "Enum declarations can only merge with namespace or other enum declarations.",
-            .duplicate_function_implementation => "duplicate function implementation",
+            .duplicate_function_implementation => "Duplicate function implementation.",
             .duplicate_constructor_implementation => "Multiple constructor implementations are not allowed.",
             .class_cannot_implement_overloads => "Class declaration cannot implement overload list.",
             .function_merge_needs_ambient_class => "Function with bodies can only merge with classes that are ambient.",
