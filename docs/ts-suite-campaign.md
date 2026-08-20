@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-20, post wave 26)
+## Standings (2026-08-20, post wave 27)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7235 / 8632 (83.8%)** |
-| excess keys (false positives) | 3541 | 1694 |
-| missing keys (under-reports) | 8617 | 3287 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7269 / 8632 (84.2%)** |
+| excess keys (false positives) | 3541 | 1675 |
+| missing keys (under-reports) | 8617 | 3222 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Twenty-six waves landed (3–26), every one with ZERO match→non-match regressions in
+Twenty-seven waves landed (3–27), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -353,7 +353,72 @@ previously skipped; removed the 2 Navigation FPs) costs social-app ~+2% wall
 social-app has been outside the headline wall bar since staging (~70% of
 tsgo vs the ≤50% bar). Optimization queued.
 
-## Ranked next queue (wave 27) — distilled from wave-26 agent reports
+Wave 27 (+34; social-app baseline 92→90 — two more tsgo-proven FPs;
+DEFERRED accepted divergences 35→33; drizzle package FPs 8→1): A landed
+deferred `T[K]` element accesses (conservatively scoped; each exclusion
+documents the exact relation gap) + the authorized narrow.zig typeof
+generalization. B landed the EXCLUSIVE callback rule via tsc's real #51620
+mechanism (param_flag_inst_generic — the alias-variance premise was wrong),
+literal generalization in TS2322/TS2345 text, union-source excess; FeedPage
+:101 re-diagnosed as an INFERENCE gap that reproduces on main (15-line repro
+committed; two non-fixes recorded). C landed generator returns,
+binding-default contexts, case-clause excess, import() promises, TS2673/74;
+higher-order inference re-filed at infer.zig with TWO named mechanisms.
+D closed most of the file-order determinism axis by matching tsc's
+DISCOVERY-WAVE structure (the canonical path-sort prescription measurably
+wrong; tsc itself is root-order-dependent — proof committed), plus the for-of
+parser sub-cluster; order-dependent social-app keys 3→1.
+PROTOCOL ADDITION: bench/parity_sweep.sh is now a standing combined gate — it
+had been silently failing (2 single-key package FPs at head, see wave-28 #1).
+
+## Ranked next queue (wave 28) — distilled from wave-27 agent reports
+
+1. PRIORITY package FPs (parity ratchet, both single-key): (a) @types/node
+   stream.d.ts:1025 TS2430 DuplexOptions-extends-WritableOptions —
+   pre-existing before wave 27; bisect the introducing wave, fix the relation
+   shape; (b) drizzle insert.d.ts:102 TS2416 — `execute:
+   ReturnType<this['prepare']>['execute']`, a deferred this-indexed
+   conditional the relation does not reduce (B27's diagnosis).
+2. FeedPage.tsx:101 inference gap (blocks the checkers-axis determinism fix):
+   repro in instantiate.zig's commit 621ac96; T takes NO candidate under an
+   Omit-materialized intersection pair; two tsc-faithful non-fixes recorded —
+   instrument which property pair loses identity in unify.
+3. assign.zig indexAccessTargetConstraint must constrain ONE side at a time
+   (A27's last excess key, mappedTypeRelationships:109:9; unblocks widening
+   the T[K] deferral toward tsc's rule).
+4. calls.zig:488 apparent-type resolution for a `.conditional` callee
+   (callOfConditionalTypeWithConcreteBranches TS7006).
+5. TS2786 JSX cluster (20 keys / 6 cases, D27's scoped design): JsxProps
+   carries the chosen signature's return/instance type + a ref-kind, then
+   checkJsxReturnAssignableToAppropriateBound vs JSX.Element|null /
+   JSX.ElementClass at the tag-name span. Fires on every React component —
+   needs its own app+perf cycle.
+6. Higher-order inference, re-filed at infer.zig with two mechanisms (C27):
+   (a) per-argument INTERLEAVED instantiateTypeWithSingleGenericCallSignature
+   (each firing mutates the shared context the next argument reads);
+   (b) return-context inference binding the outer parameter to the contextual
+   type's OWN free parameter (assign.zig:5452 anticipates it).
+7. expr `.yield_expr` one-liners (~5 cases: bare `yield;` relates
+   undefinedWideningType to the yield type; TS7057); modvalue entity-alias
+   value-space `any` (classAbstractImportInstantiation, newAbstractInstance2).
+8. for-of TS2322 sub-cluster (~9 cases): stmts.zig:697 needs checkAssignable
+   on non-declaration lvalue heads + nested-destructuring TS2488;
+   parserForInStatement5 one-line TS2322 early-out after TS2404;
+   `for (var of X)` lookahead pair (parser+stmts halves together).
+9. Determinism residue: StarterPackDialog.tsx:245 TS2769 (last
+   order-dependent key, a false positive some orders avoid); the
+   always-materialize alias decision (checkers axis) once #2 lands.
+10. TS2673/74 arity suppression (rollbackDiags hook in checkCallExpr tail,
+    2 keys); (number|boolean)&(string|boolean) not reduced to boolean;
+    `Duplicate identifier '{0}'` placeholder printed UNSUBSTITUTED
+    (recursiveComplicatedClasses — frontend message bug).
+11. Census clusters: in-operator on primitives (10 keys, expr);
+    tsxLibraryManagedAttributes (15, jsx); divergent accessors (5,
+    classes/props); mappedTypeConstraints2 as-clause remapping (5);
+    TS1434 residue (48→? keys); one-key pools.
+12. resolution-mode attributes; per-frame weak rule (deep, deferred).
+
+## Superseded queue (wave 27, kept for context)
 
 1. expr.zig element access must produce DEFERRED T[K] (the mapped-family
    bulk, ~29 keys now unblocked — the relation side is ready): indexChainInner
