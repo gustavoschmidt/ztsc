@@ -3764,6 +3764,17 @@ pub fn indexObjBaseConstraint(c: *Checker, t: TypeId) Error!TypeId {
     var cur = t;
     var i: u32 = 0;
     while (i < 8 and c.ts.kind(cur) == .type_param) : (i += 1) {
+        // An UNCONSTRAINED parameter is its own base constraint. tsc's
+        // `computeBaseConstraint` returns `undefined` for it, and both
+        // callers then keep the parameter and see a generic object, which
+        // stops the rule. `baseConstraintOf` instead substitutes it with
+        // `unknown` — and `unknown[never]` (the index side of `T[keyof T]`
+        // collapses the same way) reduces to `never`, a source assignable
+        // to absolutely everything. That is what made `T[keyof T]` and
+        // `U[keyof T]` interchangeable, and `T[keyof T]` assignable to any
+        // annotation at all (`mappedTypeRelationships` f3–f13,
+        // `keyofAndIndexedAccess2`).
+        if (try c.typeParamConstraint(c.ts.typeParamSymbol(cur)) == types.no_type) break;
         const next = try c.baseConstraintOf(cur);
         if (next == cur) break;
         cur = next;
