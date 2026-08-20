@@ -5505,7 +5505,7 @@ pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode
     // and the erasure has nothing to line up with, so a free target return
     // is a false TS2416 (`inferenceContextualReturnTypeUnion4`).
     if (erase == .constraints and c.ts.fnTypeParams(s).len > 0 and
-        c.ts.fnTypeParams(s).len == c.ts.fnTypeParams(t).len and
+        c.ts.fnTypeParams(s).len <= c.ts.fnTypeParams(t).len and
         try sigParamsMentionOwnTypeParams(c, t))
     {
         te = t;
