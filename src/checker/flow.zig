@@ -1000,8 +1000,9 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
             if (target == null_node or !try identIsSym(c, target, key.sym)) return before;
             return evolveArray(c, before, mutation);
         },
-        .cond_true, .cond_false => {
+        .cond_true, .cond_false, .chain_taken, .chain_short => {
             const cond = b.flowNode(flow);
+            const chain = b.flow_tags[flow] == .chain_taken or b.flow_tags[flow] == .chain_short;
             const ante = b.flow_a[flow];
             // tsc's `createFlowCondition`: the edge that contradicts a literal
             // `true`/`false` KEYWORD does not exist. That is what makes
@@ -1021,7 +1022,7 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
             }
             const before = try flowType(c, ante, key, declared, depth + 1);
             if (before == types.never_type) return before;
-            const sense = b.flow_tags[flow] == .cond_true;
+            const sense = b.flow_tags[flow] == .cond_true or b.flow_tags[flow] == .chain_taken;
             const saved = c.cur_scope;
             defer c.cur_scope = saved;
             c.cur_scope = b.flowScope(flow);
@@ -1032,6 +1033,8 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
             const solid = try finalizeEvolvingArray(c, before);
             const narrowed = if (isNullishTestEdge(c, cond))
                 try narrowByNullishTest(c, solid, cond, sense, key)
+            else if (chain and try refMatches(c, cond, key))
+                try narrowByOptionality(c, solid, sense)
             else
                 try c.narrowByCondition(solid, cond, sense, key, declared);
             return if (narrowed == solid) before else narrowed;
@@ -1926,6 +1929,22 @@ fn isNullishTestEdge(c: *const Checker, cond: Node) bool {
 /// inline for `== null`; folding the two together belongs with that file.
 fn narrowByNullishTest(c: *Checker, t: TypeId, qq: Node, sense: bool, key: RefKey) Error!TypeId {
     if (!try refMatches(c, c.tree.nodeData(qq).lhs, key)) return t;
+    return narrowByOptionality(c, t, sense);
+}
+
+/// tsc's `narrowTypeByOptionality` for the reference the test is ON: a `?.`
+/// receiver is tested for NULLISHNESS, so the non-short-circuited branch keeps
+/// the non-nullish part and the short-circuit branch keeps only `null |
+/// undefined`.
+///
+/// Never the truthy/falsy split, which `?.` does not perform: `a?.b` with `a:
+/// 0 | 1 | undefined` dereferences `0` quite happily, so the branch inside
+/// `if (a?.b)` knows only that `a` is not nullish — tsc keeps `0 | 1` there and
+/// `cond_true` narrowing left `1`.
+///
+/// The same filter `narrowByNullishTest` applies to a `??` left operand, which
+/// is the other place tsc routes to `narrowTypeByOptionality`.
+fn narrowByOptionality(c: *Checker, t: TypeId, sense: bool) Error!TypeId {
     if (sense) return c.nonNullable(t);
     return c.filterUnion(t, struct {
         fn keep(ch: *Checker, m: TypeId) bool {
@@ -3713,7 +3732,7 @@ fn definitelyAssignedInner(c: *Checker, flow: FlowId, sym: SymbolId) Error!bool 
         },
         // An array mutation writes an ELEMENT, never the variable itself, so
         // it is a pass-through for both assignment questions.
-        .cond_true, .cond_false, .switch_clause, .call_stmt, .array_mutation => {
+        .cond_true, .cond_false, .chain_taken, .chain_short, .switch_clause, .call_stmt, .array_mutation => {
             return c.definitelyAssigned(b.flow_a[flow], sym);
         },
         // A pass-through: the target label keeps its full antecedent list, so
@@ -3804,7 +3823,7 @@ fn saReaches(c: *Checker, flow: FlowId, sym: SymbolId, seen: []bool) Error!bool 
             if (try assignTargetsSymForDa(c, b.flowNode(flow), sym)) return true;
             return saReaches(c, b.flow_a[flow], sym, seen);
         },
-        .cond_true, .cond_false, .switch_clause, .call_stmt, .switch_no_match, .array_mutation => {
+        .cond_true, .cond_false, .chain_taken, .chain_short, .switch_clause, .call_stmt, .switch_no_match, .array_mutation => {
             return saReaches(c, b.flow_a[flow], sym, seen);
         },
         // Pass-through (some-path question, so the un-reduced target can only

@@ -1958,7 +1958,7 @@ const Binder = struct {
                         for (ps.super_flows) |s| if (s == f) return true;
                         f = ps.a[f];
                     },
-                    .assign, .cond_true, .cond_false, .switch_clause, .switch_no_match, .array_mutation => f = ps.a[f],
+                    .assign, .cond_true, .cond_false, .chain_taken, .chain_short, .switch_clause, .switch_no_match, .array_mutation => f = ps.a[f],
                     // Pass through to the continuation. The target label is
                     // walked with its full antecedent list, which can only
                     // make the answer more conservative ("super may not have
@@ -4417,7 +4417,7 @@ const Binder = struct {
         }
 
         if (b.isChainRoot(node)) {
-            const taken = try b.addFlow(.cond_true, b.cur_flow, recv);
+            const taken = try b.addFlow(.chain_taken, b.cur_flow, recv);
             try b.chain_sc.append(b.scratch, .{ .ante = b.cur_flow, .expr = recv, .taken = taken });
             b.cur_flow = taken;
         }
@@ -4460,7 +4460,7 @@ const Binder = struct {
             return;
         }
         const pid = try b.newPending();
-        for (tests) |t| try b.pendAdd(pid, try b.addFlow(.cond_false, t.ante, t.expr));
+        for (tests) |t| try b.pendAdd(pid, try b.addFlow(.chain_short, t.ante, t.expr));
         try b.pendAdd(pid, try b.addFlow(.cond_true, b.cur_flow, node));
         try b.pendAdd(pid, try b.addFlow(.cond_false, b.cur_flow, node));
         b.cur_flow = try b.finishPending(pid);
@@ -4489,7 +4489,7 @@ const Binder = struct {
         const t = try b.addFlow(.cond_true, b.cur_flow, node);
         const pid = try b.newPending();
         for (b.chain_sc.items[base..]) |sc| {
-            try b.pendAdd(pid, try b.addFlow(.cond_false, sc.ante, sc.expr));
+            try b.pendAdd(pid, try b.addFlow(.chain_short, sc.ante, sc.expr));
         }
         try b.pendAdd(pid, try b.addFlow(.cond_false, b.cur_flow, node));
         b.cur_flow = pre;
@@ -6339,7 +6339,7 @@ fn checkBinderOnArbitraryBytes(alloc: Allocator, interner: *Interner, input: []c
                 }
                 try testing.expectEqual(FlowTag.branch_label, b.flow_tags[b.reduceTarget(@intCast(f))]);
             },
-            .assign, .cond_true, .cond_false, .switch_clause, .switch_no_match, .call_stmt, .array_mutation => {
+            .assign, .cond_true, .cond_false, .chain_taken, .chain_short, .switch_clause, .switch_no_match, .call_stmt, .array_mutation => {
                 try testing.expect(b.flow_a[f] < n_flows);
                 try testing.expect(b.flow_b[f] < tree.nodes.len);
             },

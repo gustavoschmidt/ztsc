@@ -43,7 +43,7 @@ pub fn dump(
     for (b.flow_tags) |t| switch (t) {
         .start => n_start += 1,
         .assign => n_assign += 1,
-        .cond_true, .cond_false => n_cond += 1,
+        .cond_true, .cond_false, .chain_taken, .chain_short => n_cond += 1,
         .branch_label => n_branch += 1,
         .loop_label => n_loop += 1,
         .switch_clause, .switch_no_match => n_switch += 1,
