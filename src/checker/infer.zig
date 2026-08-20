@@ -728,6 +728,28 @@ pub const InferCtx = struct {
     /// be inferred into the source's — and erasing it to `unknown` poisons the
     /// outer inference. See the `bare_self` branch there.
     sig_ctx: u32 = 0,
+    /// tsc's `instantiateTypeWithSingleGenericCallSignature` gate: this call
+    /// RETURNS a single non-generic call signature, so a type parameter minted
+    /// for a generic function argument has somewhere to be generalized to.
+    ///
+    /// ```ts
+    /// const returnType = context.signature && getReturnTypeOfSignature(context.signature);
+    /// const returnSignature = returnType && getSingleCallOrConstructSignature(returnType);
+    /// if (returnSignature && !returnSignature.typeParameters && …)
+    /// ```
+    ///
+    /// Without it a minted parameter would end up inside a result that has no
+    /// signature to carry it and would print as a free, unbindable name.
+    ho_result_fn: bool = false,
+    /// The unique type parameters minted for this call's generic function
+    /// arguments — tsc's `InferenceContext.inferredTypeParameters`, which
+    /// `getSignatureInstantiation` re-attaches to the returned signature.
+    ///
+    /// An ACCUMULATOR, owned by `inferTypeArgs` for the duration of one call's
+    /// inference and read once on the way out; null in every context that is
+    /// not a call-site inference (a signature relation, a reverse-mapped
+    /// element), which is also what disables the minting.
+    ho_minted: ?*std.ArrayList(u32) = null,
     /// tsc's `InferenceInfo.impliedArity`, one entry per type parameter
     /// (`no_arity` for "not implied"): how many list elements the CALL SITE
     /// implies for a type parameter that is the signature's own rest parameter.
@@ -780,7 +802,7 @@ pub fn inferTypeArgs(
     out: []TypeId,
     ret_ctx: TypeId,
     recv_ty: TypeId,
-) Error!void {
+) Error![]const u32 {
     const candidates = try c.scratch().alloc(TypeId, tp_syms.len);
     for (candidates) |*x| x.* = types.no_type;
 
@@ -806,6 +828,19 @@ pub fn inferTypeArgs(
     const arity = try c.scratch().alloc(u32, tp_syms.len);
     for (arity) |*x| x.* = InferCtx.no_arity;
     try fillImpliedArity(c, sig, tp_syms, arg_nodes, arity);
+    // tsc's `instantiateTypeWithSingleGenericCallSignature` gate and the
+    // accumulator its type-parameter-propagating half writes into — see
+    // `InferCtx.ho_result_fn` / `InferCtx.ho_minted` and the `.function` arm of
+    // `unify`. The gate is a two-field read on a signature this function
+    // already has in hand; the list stays empty on every call that is not a
+    // combinator, which is all but a handful.
+    var ho_minted: std.ArrayList(u32) = .empty;
+    defer ho_minted.deinit(c.scratch());
+    const ho_result_fn = blk: {
+        if (c.ts.kind(sig) != .function) break :blk false;
+        const r = try c.resolveStructural(c.ts.fnReturn(sig));
+        break :blk c.ts.kind(r) == .function and c.ts.fnTypeParamCount(r) == 0;
+    };
     // Publish the whole context at once, and put the enclosing call's back
     // when this one is done.
     const saved_ctx = c.infer_ctx;
@@ -817,6 +852,8 @@ pub fn inferTypeArgs(
         .top_flags = top_flags,
         .implied_arity = arity,
         .rev = .{ .owner = candidates.ptr, .flags = rev_flags },
+        .ho_result_fn = ho_result_fn,
+        .ho_minted = &ho_minted,
     };
     defer c.infer_ctx = saved_ctx;
 
@@ -1963,6 +2000,77 @@ pub fn inferTypeArgs(
         prov[i].ty = out[i];
         if (alias_slot[i] != prov.len) prov[alias_slot[i]].ty = out[i];
     }
+    // Only the minted parameters that SURVIVED the folds above are worth
+    // generalizing over: a slot the constraint clamp or the widening replaced
+    // no longer names one.
+    var kept: std.ArrayList(u32) = .empty;
+    defer kept.deinit(c.scratch());
+    for (ho_minted.items) |m| {
+        for (out) |o| {
+            if (c.ts.kind(o) == .type_param and c.ts.typeParamSymbol(o) == m) {
+                try kept.append(c.scratch(), m);
+                break;
+            }
+        }
+    }
+    return c.scratch().dupe(u32, kept.items);
+}
+
+/// tsc's `getSignatureInstantiation` tail: re-attach the type parameters the
+/// call's inference MINTED (`InferenceContext.inferredTypeParameters`) to the
+/// single call signature the call returns.
+///
+/// ```ts
+/// const returnSignature = getSingleCallOrConstructSignature(getReturnTypeOfSignature(instantiatedSignature));
+/// if (returnSignature) {
+///     const newReturnSignature = cloneSignature(returnSignature);
+///     newReturnSignature.typeParameters = inferredTypeParameters;
+///     …
+/// }
+/// ```
+///
+/// This is what makes `compose(list, box)` a GENERIC `<T>(a: T) => Box<T[]>`
+/// rather than the `(a: unknown) => Box<unknown>` an erasing inference gives.
+/// `inst` unchanged whenever there is nothing to attach — no minted parameter,
+/// a non-function result, or a result that mentions none of them.
+pub fn generalizeCallResult(c: *Checker, inst: TypeId, minted: []const u32) Error!TypeId {
+    const s = &c.ts;
+    if (minted.len == 0) return inst;
+    if (s.kind(inst) != .function) return inst;
+    const ret = s.fnReturn(inst);
+    if (s.kind(ret) != .function or s.fnTypeParamCount(ret) != 0) return inst;
+    // Which of them the result actually mentions. `instantiate` is the occurs
+    // check ztsc already has: a term that CHANGES under `m := unknown` names
+    // `m` (assign.zig's `instantiateSigInContextOf` uses the same probe).
+    var kept: std.ArrayList(u32) = .empty;
+    defer kept.deinit(c.scratch());
+    for (minted) |m| {
+        const probe = [1]TpMap{.{ .sym = m, .ty = types.unknown_type }};
+        if ((try c.instantiate(ret, &probe)) != ret) try kept.append(c.scratch(), m);
+    }
+    if (kept.items.len == 0) return inst;
+    const params = try c.scratch().alloc(types.Param, s.fnParamCount(ret));
+    defer c.scratch().free(params);
+    for (params, 0..) |*p, i| p.* = s.fnParam(ret, @intCast(i));
+    const gen = try s.makeFunctionThis(
+        params,
+        s.fnReturn(ret),
+        kept.items,
+        s.fnFlags(ret),
+        if (s.fnHasPredicate(ret)) s.fnPredicate(ret) else null,
+        s.fnThisType(ret),
+    );
+    const outer = try c.scratch().alloc(types.Param, s.fnParamCount(inst));
+    defer c.scratch().free(outer);
+    for (outer, 0..) |*p, i| p.* = s.fnParam(inst, @intCast(i));
+    return s.makeFunctionThis(
+        outer,
+        gen,
+        s.fnTypeParams(inst),
+        s.fnFlags(inst),
+        if (s.fnHasPredicate(inst)) s.fnPredicate(inst) else null,
+        s.fnThisType(inst),
+    );
 }
 
 /// Does any of these (raw, unsubstituted) type-parameter bounds mention `sym`?
@@ -3752,6 +3860,30 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
         },
         .function => {
             var ra = try c.resolveStructural(arg);
+            // tsc's `InferenceInfo.isFixed`, for the one place ztsc needs it —
+            // the spec paragraph `contextualSignatureInstantiation.ts` opens
+            // with: "any inferences made for type parameters referenced by the
+            // PARAMETERS of T's call signature are FIXED, and e's type is
+            // changed to a function type with e's call signature instantiated
+            // in the context of T's call signature".
+            //
+            // The instantiation below hands the argument's signature what this
+            // call has already inferred, so everything the ensuing walk reads
+            // out of a PARAMETER position of it is our own guess coming home.
+            // `bar<T, U, V>(x: T, y: U, cb: (x: T, y: U) => V)` fed
+            // `bar(1, "one", g)` with `g: <W>(x: W, y: W) => W` is the shape:
+            // `W` takes `T`'s `1`, the instantiated `(x: 1, y: 1) => 1` is
+            // walked against `(x: T, y: U) => V`, and `U` — already `"one"` —
+            // reads `1` back out of the second parameter.
+            //
+            // So the slots the contextual signature's parameters mention are
+            // snapshotted and restored on the way out, EXCEPT the one the
+            // instantiation itself just determined. Armed only when that
+            // instantiation actually substituted something (`FixedSlots.arm`
+            // is never called otherwise), so every argument that does not
+            // reach it keeps its prior behaviour exactly.
+            var ho_fix: FixedSlots = .{};
+            defer ho_fix.restore(c, candidates);
             // A callable intersection (`Reducer<S> & { … }` — RTK's
             // `ReducerWithInitialState`): infer against its function
             // constituent. Without this a reducer passed as a slice value
@@ -3880,6 +4012,102 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                         c.ts.kind(cand0) == .type_param and
                         tpIndex(tp_syms, c.ts.typeParamSymbol(cand0)) != null;
                     if (bare_self) continue;
+                    // …and at a CALL SITE the same bare candidate is tsc's
+                    // `instantiateTypeWithSingleGenericCallSignature`, not
+                    // noise, whenever the call RETURNS a single non-generic
+                    // signature (`InferCtx.ho_result_fn`). The argument is a
+                    // generic function handed a contextual signature whose
+                    // parameter IS one of the variables being solved:
+                    // `compose<A, B, C>(f: (a: A) => B, g: (b: B) => C)` fed
+                    // `compose(list, box)`.
+                    //
+                    // Two answers, and which one applies is decided by whether
+                    // the outer variable already has a candidate — tsc's
+                    // `hasOverlappingInferences` / `mergeInferences` pair, read
+                    // one slot at a time:
+                    //
+                    //   * ALREADY DETERMINED — substitute what this call has
+                    //     already inferred, which is `instantiateSignatureIn
+                    //     ContextOf` reading the contextual type through
+                    //     `context.nonFixingMapper`. `box`'s `V` takes `B`'s
+                    //     `T'[]`, so its return contributes `Box<T'[]>` instead
+                    //     of the `Box<unknown>` the erasure gives.
+                    //   * STILL FREE — mint a UNIQUE type parameter (tsc's
+                    //     `getUniqueTypeParameters`) and record it as the outer
+                    //     variable's candidate. `list`'s `T` becomes `T'`, `A`
+                    //     takes `T'`, and the parameter walk below then reads
+                    //     `B := T'[]` off the instantiated `(a: T') => T'[]`.
+                    //     `generalizeCallResult` re-attaches `T'` to the
+                    //     returned signature, so `compose(list, box)` is
+                    //     `<T'>(a: T') => Box<T'[]>` — assignable to the
+                    //     `<T>(x: T) => Box<T[]>` the annotation asks for,
+                    //     where the erasing answer was not.
+                    //
+                    // The erasure still stands wherever this does not apply: a
+                    // call whose result is not a signature has nowhere to carry
+                    // a minted parameter, and `map([1, 2, 3], identity)` — whose
+                    // `T` is already `number` by the time `identity` is read —
+                    // takes the first branch, not the mint.
+                    // NOT for a REST-tuple contextual signature. tsc pairs
+                    // positions through `getTypeAtPosition`, which reads a rest
+                    // parameter's ELEMENT; this arm pairs `fnParam(param, i).ty`
+                    // raw, so `pipe<A extends any[], B>(ab: (...args: A) => B)`
+                    // hands `list`'s `T` the whole TUPLE variable `A` as its
+                    // candidate. Adopting that binds a rest-tuple parameter to a
+                    // scalar and every `pipe` overload stops resolving; the
+                    // erasure below is the right answer there.
+                    const pcount0 = s.fnParamCount(param);
+                    const param_rest = pcount0 != 0 and s.fnParam(param, pcount0 - 1).rest();
+                    if (self_ref and c.infer_ctx.sig_ctx == 0 and
+                        c.ts.kind(cand0) == .type_param and
+                        s.fnTypeParamCount(param) == 0 and !param_rest)
+                    {
+                        if (tpIndex(tp_syms, c.ts.typeParamSymbol(cand0))) |oi| {
+                            if (candidates[oi] != types.no_type and c.infer_ctx.ho_result_fn) {
+                                try ho_fix.arm(c, param, tp_syms, candidates);
+                                all_unbound = false;
+                                try map_list.append(c.scratch(), .{ .sym = sym, .ty = candidates[oi] });
+                                continue;
+                            }
+                            if (c.infer_ctx.ho_result_fn) if (c.infer_ctx.ho_minted) |list| {
+                                try ho_fix.arm(c, param, tp_syms, candidates);
+                                const ft = try s.makeTypeParam(try uniqueTypeParam(c, sym, list));
+                                candidates[oi] = ft;
+                                // The slot this instantiation DETERMINED is not
+                                // fixed — it is the answer, and restoring it
+                                // would undo the adoption.
+                                ho_fix.release(oi);
+                                all_unbound = false;
+                                try map_list.append(c.scratch(), .{ .sym = sym, .ty = ft });
+                                continue;
+                            };
+                        }
+                    }
+                    // The same adoption for an own parameter the contextual
+                    // signature said NOTHING about. tsc mints unique parameters
+                    // for ALL of a generic argument's own parameters, not only
+                    // the ones a variable of this call happened to pair with,
+                    // and infers from the whole instantiated signature —
+                    // `compose(unbox, unlist)` with `unbox<W>(x: Box<W>): W`
+                    // has nothing to pair `W` with (`Box<W>` against the bare
+                    // `A` yields no candidate), yet the answer tsc reaches is
+                    // `A := Box<W'>`, `B := W'`, which is what makes the result
+                    // relate to `<T>(x: Box<T[]>) => T`. Erasing `W` to
+                    // `unknown` instead leaves `A := Box<unknown>`.
+                    //
+                    // No slot to release from the fix set here: the minted
+                    // parameter is the one thing the walk below legitimately
+                    // teaches this call.
+                    if (cand0 == types.no_type and c.infer_ctx.sig_ctx == 0 and
+                        c.infer_ctx.ho_result_fn and s.fnTypeParamCount(param) == 0 and !param_rest)
+                    {
+                        if (c.infer_ctx.ho_minted) |list| {
+                            const ft = try s.makeTypeParam(try uniqueTypeParam(c, sym, list));
+                            all_unbound = false;
+                            try map_list.append(c.scratch(), .{ .sym = sym, .ty = ft });
+                            continue;
+                        }
+                    }
                     if (self_ref) erased_self = true;
                     const cand = if (self_ref) types.no_type else cand0;
                     if (cand != types.no_type) all_unbound = false;
@@ -4734,6 +4962,130 @@ pub fn stripSourceParam(c: *Checker, t: TypeId, sym: u32) Error!TypeId {
     }
     if (kept.items.len == 0) return types.unknown_type;
     return s.makeUnion(c.scratch(), kept.items);
+}
+
+/// tsc's `InferenceInfo.isFixed`, scoped to one argument: the inference state
+/// of the slots a contextual signature's PARAMETERS mention, snapshotted before
+/// `unify`'s `.function` arm instantiates the argument's signature with this
+/// call's own answers and restored after it walks the result. See the comment
+/// at the `.function` arm for why.
+///
+/// `arm` is idempotent (the second firing within one argument keeps the first
+/// snapshot) and `restore` is a no-op until it has run, so an argument that
+/// never reaches the instantiation is untouched.
+///
+/// Only the covariant candidate and its contravariant twin are restored. The
+/// `contra_sup` union and the `top_level` flags are NOT: restoring those too
+/// was measured and is strictly worse (`contextualSignatureInstantiation`'s
+/// `bar`/`baz` family went from four keys to thirteen) — the walk's own
+/// top-level bookkeeping is legitimate even when its candidate is an echo.
+const FixedSlots = struct {
+    mask: []bool = &.{},
+    cand: []TypeId = &.{},
+    contra: []TypeId = &.{},
+
+    fn arm(f: *FixedSlots, c: *Checker, param: TypeId, tp_syms: []const u32, candidates: []TypeId) Error!void {
+        if (f.mask.len != 0) return;
+        const mask = try c.scratch().alloc(bool, tp_syms.len);
+        for (mask) |*x| x.* = false;
+        var pi: u32 = 0;
+        while (pi < c.ts.fnParamCount(param)) : (pi += 1) {
+            try markMentionedTps(c, c.ts.fnParam(param, pi).ty, tp_syms, mask, 0);
+        }
+        f.cand = try c.scratch().alloc(TypeId, tp_syms.len);
+        f.contra = try c.scratch().alloc(TypeId, tp_syms.len);
+        const owns = c.infer_ctx.owner == candidates.ptr;
+        for (0..tp_syms.len) |i| {
+            f.cand[i] = candidates[i];
+            f.contra[i] = if (owns) c.infer_ctx.contra[i] else types.no_type;
+        }
+        f.mask = mask;
+    }
+
+    /// This slot is the instantiation's ANSWER, not one of its echoes.
+    fn release(f: *FixedSlots, i: usize) void {
+        if (i < f.mask.len) f.mask[i] = false;
+    }
+
+    fn restore(f: *const FixedSlots, c: *Checker, candidates: []TypeId) void {
+        const owns = c.infer_ctx.owner == candidates.ptr;
+        for (f.mask, 0..) |m, i| {
+            if (!m) continue;
+            candidates[i] = f.cand[i];
+            if (!owns) continue;
+            c.infer_ctx.contra[i] = f.contra[i];
+        }
+    }
+};
+
+/// tsc's `getUniqueTypeParameters`: which type parameter this call ADOPTS for a
+/// generic function argument's own parameter `src`, appending it to `adopted`
+/// (tsc's `InferenceContext.inferredTypeParameters`) the first time.
+///
+/// ```ts
+/// const name = tp.symbol.escapedName;
+/// if (hasTypeParameterByName(context.inferredTypeParameters, name) || hasTypeParameterByName(result, name)) {
+///     … create a renamed clone …
+/// } else {
+///     result.push(tp);
+/// }
+/// ```
+///
+/// ztsc departs from tsc's `else` branch and ALWAYS clones. tsc can reuse the
+/// argument's own parameter because it instantiates a generic method's
+/// parameters with fresh clones whenever the declaring type is instantiated
+/// (`createCanonicalSignature`); ztsc keys a type parameter by its DECLARATION
+/// symbol and does not clone, so reusing `list`'s own `T` as the answer for
+/// `A` makes the source and the target of the ensuing relation name ONE symbol
+/// — `instantiateSigInContextOf`'s occurs check then declines the pair and
+/// `<T>(x: T) => T` stopped relating to `(a: T) => T` (`genericFunctionInference1`,
+/// `pipe2(foo, foo)`, measured at +14 keys).
+///
+/// The clone must nevertheless be STABLE. One call's inference runs more than
+/// once (the return-context seed, the post-argument fill, an overload retry),
+/// and a fresh clone per run would leave the seed's answer and the committed one
+/// naming two different parameters: `compose(a => list(a), b => box(b))` then
+/// typed its second callback against the first run's clone and reported `T[]`
+/// not assignable to `T[]`. So an already-adopted clone is recognised by its
+/// ORIGIN and reused.
+fn uniqueTypeParam(c: *Checker, src: u32, adopted: *std.ArrayList(u32)) Error!u32 {
+    const origin = c.tpOrigin(src);
+    for (adopted.items) |m| {
+        if (c.tpOrigin(m) == origin) return m;
+    }
+    const use = try mintUniqueTypeParam(c, src);
+    try adopted.append(c.scratch(), use);
+    return use;
+}
+
+/// A clone of a generic argument's own type parameter. Carries the source's
+/// name — it is what the result prints — and its (renamed) constraint; the
+/// default is dropped, exactly as the instantiated signature tsc builds has no
+/// type arguments to default.
+fn mintUniqueTypeParam(c: *Checker, src: u32) Error!u32 {
+    const id = c.fresh_tp_next;
+    c.fresh_tp_next += 1;
+    // The bound is RENAMED onto the clone. `foo<T extends { value: T }>` is
+    // self-referential, and a clone carrying the bound verbatim is constrained
+    // by the ORIGINAL `T` — a parameter nothing in the instantiated signature
+    // binds, so every argument fails it.
+    const con0 = try c.typeParamConstraint(src);
+    try c.fresh_tp_info.append(c.cm(), .{
+        .name = c.symNameAtom(src),
+        .constraint = con0,
+        .default = types.no_type,
+        .has_default = false,
+        // The declaration this clone stands in for (`FreshTp.orig`). Without
+        // it every mint would answer `tpOrigin == 0`, and `sameSigTypeParams`
+        // would read two UNRELATED minted signatures as two instantiations of
+        // one declaration and erase the pair to `any`.
+        .orig = c.tpOrigin(src),
+    });
+    if (con0 != types.no_type) {
+        const ren = [1]TpMap{.{ .sym = src, .ty = try c.ts.makeTypeParam(id) }};
+        c.fresh_tp_info.items[id - c.fresh_tp_base].constraint = try c.instantiate(con0, &ren);
+    }
+    return id;
 }
 
 /// Mint a throwaway element inference variable for `inferReverseMapped`.

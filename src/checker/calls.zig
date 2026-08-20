@@ -730,7 +730,11 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
                     const self_args = try c.scratch().alloc(TypeId, tps.items.len);
                     for (tps.items, 0..) |tp, i| self_args[i] = try c.ts.makeTypeParam(tp.sym);
                     const self_sig = try c.sigWithReturn(ctor, try c.ts.makeRef(cls, self_args));
-                    try inferTypeArgs(c, self_sig, tp_syms, shape.arg_nodes, inst_args, ctx, types.no_type);
+                    // A `new` expression's result is the instance, never a
+                    // signature, so there is nothing to generalize a minted
+                    // parameter onto: the list is discarded (and `unify`'s
+                    // `ho_result_fn` gate keeps it empty anyway).
+                    _ = try inferTypeArgs(c, self_sig, tp_syms, shape.arg_nodes, inst_args, ctx, types.no_type);
                 } else {
                     for (inst_args) |*x| x.* = types.any_type;
                 }
@@ -1592,6 +1596,10 @@ pub fn instantiateSigForCall(c: *Checker, sig: TypeId, explicit_targs: []const T
     const tps = try c.scratch().dupe(u32, c.ts.fnTypeParams(sig));
     if (tps.len == 0) return sig;
     var args_buf = try c.scratch().alloc(TypeId, tps.len);
+    // The unique type parameters inference minted for a generic function
+    // argument (see `infer.generalizeCallResult`). Empty for an explicitly
+    // instantiated call, which does no inference at all.
+    var minted: []const u32 = &.{};
     if (explicit_targs.len > 0) {
         const min = c.sigMinTargs(tps);
         if (explicit_targs.len < min or explicit_targs.len > tps.len) {
@@ -1659,11 +1667,15 @@ pub fn instantiateSigForCall(c: *Checker, sig: TypeId, explicit_targs: []const T
                 else => {},
             }
         }
-        try inferTypeArgs(c, sig, tps, arg_nodes, args_buf, ret_ctx, recv_ty);
+        minted = try inferTypeArgs(c, sig, tps, arg_nodes, args_buf, ret_ctx, recv_ty);
     }
     var map = try c.scratch().alloc(TpMap, tps.len);
     for (tps, 0..) |tp, i| map[i] = .{ .sym = tp, .ty = args_buf[i] };
-    return c.instantiate(sig, map);
+    // tsc's `getSignatureInstantiation` tail: a type parameter this call's
+    // inference MINTED for a generic function argument is re-attached to the
+    // single signature the call returns. `&.{}` on every other call, which is
+    // all but a combinator.
+    return infer_zig.generalizeCallResult(c, try c.instantiate(sig, map), minted);
 }
 
 /// tsc's `getUnionSignatures`: calling a UNION does not resolve against the
