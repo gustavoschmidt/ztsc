@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-20, post wave 28)
+## Standings (2026-08-23, post wave 29)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7321 / 8632 (84.8%)** |
-| excess keys (false positives) | 3541 | 1642 |
-| missing keys (under-reports) | 8617 | 3103 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7352 / 8631 (85.2%)** |
+| excess keys (false positives) | 3541 | 1632 |
+| missing keys (under-reports) | 8617 | 3049 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Twenty-eight waves landed (3–28), every one with ZERO match→non-match regressions in
+Twenty-nine waves landed (3–29), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -387,7 +387,73 @@ were never TS2322-checked), in-on-primitives, TS2673/74 verdict withdrawal.
 D landed TS2786 with the JSX.ElementType gate (both apps on it — no perf
 hit), the placeholder bug, and both halves of for(var of X) composed.
 
-## Ranked next queue (wave 29) — distilled from wave-28 agent reports
+Wave 29 (+31; parity stays 0/0; this wave rode through a weekly-usage-limit
+cutoff and multiple machine sleeps — all four agents resumed from worktree
+commits each time): B landed four one-FP relation fixes (comparable retry at
+EVERY relation level, boolean-discriminant cross product, tuple comparable
+via element union, comma/=-unwrapping elaboration). C landed the corrected
+destructuring pattern-context model (binding vs assignment patterns imply
+DIFFERENT tuples), yield* delegation, TS1187 from scratch — and re-diagnosed
+"this typed any" as a class-member MATERIALIZATION cycle (this_type unwraps
+to error mid-probe; lazyRefProp is the precedent). D found target 1 was
+misdiagnosed: no merge-fold gap — buildAmbient resolved `export = X` with a
+BLOCK-scope-only lookup, so every UMD typing (react!) made React.Component
+resolve to nothing; fixed at the link (+13 jsx cases, guard deleted), plus
+discriminant optional-undefined and TS2490. A did NOT close determinism but
+converted it to measured engineering: both order-independent keyings ARE
+deterministic; each is blocked by ONE localized gap (union-collapse under
+Mutable<NonNullable<…>>; property lookup through intersection-with-ref);
+fixTypeArgs' shallow_default must test the default's SYNTAX (scoped to
+cyclic aliases — unconditional costs drizzle +12.8%); and the remaining
+witnesses are an infer.zig bug — mapped-target-with-literal-key-set inference
+takes candidates from only the FIRST matching property (9-line repro
+committed; explains StarterPackDialog + AppLanguageDropdown). FeedPage
+returns under deterministic keying (wave-28's fix was necessary not
+sufficient).
+
+## Ranked next queue (wave 30) — distilled from wave-29 agent reports
+
+1. infer.zig: mapped-target-with-literal-key-set inference must UNION
+   candidates across ALL matching properties (inferMappedKeySet returns
+   early unless the constraint is a type param). The 9-line repro is in
+   wave-29 A's report; this is now THE determinism unlock for the remaining
+   witnesses.
+2. Deterministic alias keying, the two blocking gaps: (a) mutual-cluster
+   union collapse — `Mutable<NonNullable<readonly A[] | readonly B[] | null>>`
+   answering {} (restore.ts/newElement.ts shapes); (b) property lookup
+   through an intersection containing a .ref that doesn't intersect the
+   ref's members ({containerId} & ExcalidrawTextElement answering
+   string|null). THEN land whole-cycle keying + the syntax-based
+   shallow_default scoped to cyclic aliases (A's matrix tooling is in its
+   scratchpad — promote matrix.sh/norm.py/cmp.py/perf.py into bench/).
+3. this_type→error materialization cycle (C's repro: `m() { return this(); }`
+   silent vs annotated reporting): fix at classInstanceGeneric's in-progress
+   window (lazyRefProp precedent). Unlocks tsxDynamicTagName7 + the last
+   jsxComponentTypeErrors key.
+4. Higher-order preserve-generic-signature (pipe family, 27 excess keys in
+   genericFunctionInference1): tsc's isGenericFunctionReturningFunction +
+   instantiateSignatureInContextOf — infer.zig.
+5. Literal/flow narrowing gap (B's find — BIG): a const/let reference NEVER
+   narrows to its initializer's literal; `=== E.Member` doesn't narrow an
+   enum param. Root cause behind numericEnumMappedType,
+   contextuallyTypeLogicalAnd01 and likely much of the TS2322 pools.
+6. C's queue: TS2335 (3 cases, expr); TS2537 computed destructuring keys (2);
+   TS2347 gated on DECLARED any (2). D's: defaultProps missing-prop
+   suppression (jsx, pure suppression, ~1-2 cases); TS1434 parseArguments
+   force-advance (4 keys; bucketed at tripwire — careful); for-of53/54 TS2481
+   (redeclare).
+7. B's handoffs: isConstTypeVar needs indexed-access/intersection arms
+   (names.zig:450); explicit type-arg failure must SUPPRESS argument checking
+   (calls.zig chooseOverload); divergent accessors need real write_ty on
+   types.Prop (cross-cutting — needs one owner spanning the member builders);
+   array-literal context from a tuple-like INTERFACE (numeric-named members).
+8. Census: 84 one-FP cases; 256 mixed-with-one-excess; TS2322 pools
+   (44 under one-key / 317 excess total); parser families (TS1005 199/185,
+   TS1109 83/72, TS1134 29/12, TS1434 22/7).
+9. Substitution types (needs an owner spanning generics+instantiate+subst+
+   memo+print); resolution-mode attributes; per-frame weak rule.
+
+## Superseded queue (wave 29, kept for context)
 
 1. DETERMINISM ENDGAME (unblocked by FeedPage): (a) replace alias_recursive's
    asymmetric marking with always-materialize (moves the social-app baseline —
