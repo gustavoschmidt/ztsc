@@ -1688,7 +1688,40 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!RelAnswer {
                 if (try c.nominalHeritageRelated(sref, tref)) break :blk .yes;
             }
         }
-        break :blk if (try c.isAssignableInner(s, t, sk, tk)) .yes else .no;
+        if (try c.isAssignableInner(s, t, sk, tk)) break :blk .yes;
+        // tsc's comparable-relation retry, in `isRelatedTo` and therefore at
+        // EVERY level of the walk, not just the top:
+        //
+        // ```ts
+        // if (relation === comparableRelation && !(targetFlags & TypeFlags.Never) &&
+        //     isSimpleTypeRelatedTo(target, source, relation) ||
+        //     isSimpleTypeRelatedTo(source, target, relation, …)) return Ternary.True;
+        // ```
+        //
+        // `isSimpleTypeRelatedTo` alone — primitives, literals and enums,
+        // decided on flags (`simpleRelationKind`), never an object shape — so
+        // `{ a: 1, b: string }` and `{ a: number, b: "a" }` overlap (each
+        // PROPERTY is comparable in one direction or the other, independently
+        // of the others: `conformance/…/comparable/independentPropertyVariance`)
+        // while `{ x: {} }` does not become comparable to `{ x: { z } }` just
+        // because `{ z }` fits `{}`.
+        //
+        // The reversed probe runs under the ASSIGNABLE relation: it is a full
+        // `relate` (the literal→base-primitive and trivial-target fast paths
+        // that decide most simple pairs live there, not in
+        // `isAssignableInner`), and a both-simple pair asked under `.comparable`
+        // would re-enter this same rule with the operands swapped and bounce
+        // forever. The two relations agree on everything `simpleRelationKind`
+        // admits except tsc's numeric-enum clause, which is the direction the
+        // forward probe already took.
+        if (c.rel_kind == .comparable and tk != .never and
+            simpleRelationKind(sk) and simpleRelationKind(tk))
+        {
+            const saved_rk = enterRelation(c, .assignable);
+            defer c.rel_kind = saved_rk;
+            if (try relateFolded(c, t, s, true)) break :blk .yes;
+        }
+        break :blk .no;
     };
     // tsc's `Ternary.Maybe`: a verdict the walk could only reach by ASSUMING
     // an in-progress pair (or by taking a growth/depth cut) is not published.
@@ -3148,12 +3181,28 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
             if (sk == .array) return c.isAssignable(c.ts.arrayElem(s), c.ts.arrayElem(t));
             if (sk == .tuple) {
                 const elem = c.ts.arrayElem(t);
-                for (0..c.ts.tupleLen(s)) |i| {
+                // A tuple has no element list in tsc: it is an object whose
+                // NUMERIC INDEX type is the union of its element types, and
+                // `indexSignaturesRelatedTo` relates that union to the array's
+                // element type. Under the comparable relation a union source
+                // only needs SOME constituent to relate
+                // (`someTypeRelatedToType`), which is why
+                // `<number[]>someNumStrTuple` is not a TS2352 in tsgo
+                // (`conformance/types/tuple/castingTuple`) even though the
+                // `string` position fits nothing in `number[]`. Assignability
+                // keeps needing every element.
+                const some = c.rel_kind == .comparable;
+                const n_elems = c.ts.tupleLen(s);
+                for (0..n_elems) |i| {
                     const e = c.ts.tupleElem(s, @intCast(i));
                     const et = if (e.rest()) try c.elemOfArrayish(e.ty) else e.ty;
-                    if (!try c.isAssignable(et, elem)) return false;
+                    const rel = try c.isAssignable(et, elem);
+                    if (some) {
+                        if (rel) return true;
+                    } else if (!rel) return false;
                 }
-                return true;
+                // An empty tuple has no numeric index type to disagree with.
+                return !some or n_elems == 0;
             }
             return false;
         },
@@ -4741,8 +4790,22 @@ pub fn discriminatedUnionAssignable(c: *Checker, s: TypeId, t: TypeId) Error!boo
         // accept the source.
         const src_disc = try c.resolveStructural(dprop.ty);
         const singleton = [_]TypeId{src_disc};
+        // tsc has no `boolean` type: `booleanType` IS the union
+        // `true | false` (`getUnionType([regularFalseType, regularTrueType])`),
+        // so a `boolean` discriminant reaches
+        // `typeRelatedToDiscriminatedType`'s cross product already split in
+        // two. ztsc keeps `boolean` as one kind, so the product had a single
+        // element that matched neither `{ flag: true }` nor `{ flag: false }`
+        // and the whole split never ran — `class B extends A<Model>` where
+        // `A<T extends {flag: true} | {flag: false}>` and `Model` declares
+        // `flag: boolean` was a phantom TS2344
+        // (`compiler/relatedViaDiscriminatedTypeNoError`). Expanded here only,
+        // exactly where the enum expansion below is, and for the same reason.
+        const bool_consts = [_]TypeId{ types.true_type, types.false_type };
         var src_consts: []const TypeId = if (c.ts.kind(src_disc) == .union_type)
             try c.memberList(src_disc)
+        else if (c.ts.kind(src_disc) == .boolean)
+            &bool_consts
         else
             &singleton;
         // tsc models an enum TYPE as the UNION of its member literal types, so
