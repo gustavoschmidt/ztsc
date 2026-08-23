@@ -53,83 +53,112 @@ pub fn aliasInstance(c: *Checker, sym: SymbolId, args: []const TypeId, tok: Toke
         // self-recursion so `fixTypeArgs` can scope its accumulator-default
         // substitution to genuinely recursive aliases.
         try c.alias_recursive.put(c.cm(), sym, {});
-        // …and, separately, whether the loop closes through `sym`'s OWN body.
-        // `alias_gen_stack`'s innermost frame is the alias whose body this
-        // reference was written in, so `sym == top` says the alias names itself.
-        // That is a property of the program; `alias_recursive` is not (it names
-        // whichever member of a mutual cluster was entered first). See
-        // `Checker.alias_self_recursive`.
-        if (c.alias_gen_stack.items.len != 0 and
-            c.alias_gen_stack.items[c.alias_gen_stack.items.len - 1] == sym)
-        {
-            try c.alias_self_recursive.put(c.cm(), sym, {});
-        }
         const fixed = try c.fixTypeArgs(sym, args, tok) orelse return types.error_type;
         return c.ts.makeRef(sym, fixed);
     }
     const fixed = try c.fixTypeArgs(sym, args, tok) orelse return types.error_type;
     const generic = try c.aliasGeneric(sym);
-    // ===== WHY THERE IS NO "KEEP THE REF" ARM HERE (waves 26-29) =====
+    // ONE spelling for a recursive alias whose body is an INTERSECTION.
     //
-    // Between waves 21 and 28 this function had a third arm: a reference to an
-    // alias already recorded in `alias_recursive`, whose body is
-    // `originTaggable`, answered with the lazy `.ref` instead of the
-    // materialization — an attempt to give a recursive alias ONE spelling, so
-    // that a reference taken inside the cycle and one taken after it could not
-    // land in the same union as two distinct `TypeId`s.
+    // The cycle-cut arm above leaves a lazy `.ref` for every reference taken
+    // while the body was still materializing; a reference taken afterwards
+    // gets a separately interned structural materialization. Both denote the
+    // same type, but they are distinct `TypeId`s, so `makeUnion` /
+    // `makeIntersection` cannot dedupe them and a union can carry the same
+    // type under both spellings — and WHICH references fall inside the cycle
+    // depends on the order files are visited, i.e. on the checker count.
     //
-    // It could not work, because `alias_recursive` is not a property of the
-    // program. It is written by exactly one place — the cycle-cut arm above —
-    // so in a cluster of MUTUALLY recursive aliases only ONE member is ever
-    // marked: whichever the checker instance happened to materialize first.
-    // @react-navigation is the measured pair. `NativeStackNavigationProp`
-    // reaches `NativeStackHeaderProps` through its options;
-    // `NativeStackHeaderProps` declares `navigation:
-    // NativeStackNavigationProp<…>` straight back. Enter at the first and the
-    // first is marked; enter at the second and the second is. Which one a
-    // checker instance enters first depends on its file partition, so
-    // social-app's `Navigation.tsx:778` printed `NativeStackNavigationProp<{…}>`
+    // Answering with the ref in BOTH cases makes the spelling of a recursive
+    // alias one thing. Scoped to an `originTaggable` body — object, function
+    // or intersection — which is exactly the set the `origin` machinery
+    // already treats as "a ref and its materialization are interchangeable".
+    // A union body must stay materialized: a `.ref` standing in for a union
+    // is NOT interchangeable, because discriminant narrowing and the
+    // union-source relation arms switch on `.union_type` directly.
+    //
+    // ===== THIS RULE IS PARTITION-DEPENDENT AND THE FIX IS NOT A GATE =====
+    //
+    // `alias_recursive` is written by ONE place — the cycle-cut arm above — so
+    // in a cluster of MUTUALLY recursive aliases exactly one member is ever
+    // marked: whichever this checker instance materialized first. That is the
+    // confirmed root cause of social-app's `Navigation.tsx:778` moving between
+    // partitions. @react-navigation is the measured pair:
+    // `NativeStackNavigationProp` reaches `NativeStackHeaderProps` through its
+    // options and `NativeStackHeaderProps` declares `navigation:
+    // NativeStackNavigationProp<…>` straight back, so entering at either end
+    // marks that end and the diagnostic prints `NativeStackNavigationProp<{…}>`
     // under one partition and the expanded 40-member object under another.
-    // Same program, two type identities.
     //
-    // Two order-INDEPENDENT repairs were built and measured (wave 26) and both
-    // are worse than removal: marking the whole cycle (a genuine graph
-    // property) costs three fresh false positives, and no ref-keeping rule can
-    // reproduce the old app baseline at all, because that baseline was itself
-    // an artifact of the asymmetric marking.
+    // WAVE 29 built the two order-INDEPENDENT keyings this needs and MEASURED
+    // all three. Both are cheap, and the recipe is the same: push `sym` onto a
+    // stack in `aliasGeneric` and pop it on the way out, so that when the cut
+    // above fires, the stack suffix from `sym`'s own frame to the innermost one
+    // IS the cycle that reference just closed. "Self-recursive" is then `sym ==
+    // top`, and "whole cycle" is the whole suffix — both properties of the
+    // alias GRAPH (`aliasGeneric` walks the same body from every entry point),
+    // where `alias_recursive` names only the member entered first. Excalidraw,
+    // `--checkers=1`, against its 17-diagnostic baseline:
     //
-    // So the rule is now keyed on `alias_self_recursive` — the aliases whose
-    // OWN body names them, a cycle of length one, which `aliasGeneric` finds
-    // identically from every entry point. A mutual cluster is no longer
-    // spelled by whoever got there first: NOBODY in it keeps the ref.
+    //   * this rule (`alias_recursive`, partition-dependent)  17  — baseline
+    //   * SELF-recursive only (cycle length one)              21  (+4)
+    //   * WHOLE cycle                                         22  (+5)
     //
-    // What the surviving arm is for. tsc never materializes `Foo3<unknown>` at
-    // all — it keeps an object carrying `aliasSymbol`/`aliasTypeArguments` and
-    // relates two of them through `getAliasVariances`, so a self-recursive
-    // alias is compared by its ARGUMENTS and its body is never walked. ztsc
-    // interns structurally, so the only spelling that survives interning as
-    // "this is alias A at these arguments" is the `.ref` itself, and
-    // `assign.relate` deliberately asks for variance only on a declared
-    // `.ref`/`.ref` pair (an `origin` tag cannot stand in — a hand-written
-    // structural type interns equal to an alias's expansion and would inherit
-    // its variance; see the `Record<string, unknown>` note there).
+    // Both deterministic keyings are byte-identical across `--checkers=1/2/4/8`
+    // and every file order — they DO close the defect — and both cost fresh
+    // false positives, which is why neither shipped. What each costs:
     //
-    // Materialize a self-recursive alias and the top-level pair stops being
-    // refs, the variance shortcut is skipped, and the walk descends into a
-    // body that names the alias again one level down — where the pair IS two
-    // refs, variance answers, and the arguments (now one contravariant hop
-    // further in) do not relate. `compiler/varianceMeasurement.ts` is exactly
-    // that: `type Foo3<T> = {x: T; y: Foo3<(arg: T) => void>}`, whose header
-    // comment records that tsc measures it covariant precisely because it
-    // "doesn't analyze recursive references", and `Foo3<string>` therefore
-    // flows to `Foo3<unknown>`.
+    //   * SELF-recursive only leaves a mutual cluster with NO member keeping
+    //     the ref, so the mixing this rule exists to prevent comes back inside
+    //     that cluster: excalidraw's `BoundElement` ↔ `ExcalidrawLinearElement`
+    //     pair lands both spellings in one union and prints it —
+    //     `readonly { id: string; type: "arrow" | "text"; }[] | readonly
+    //     BoundElement[] | null` — after which `Mutable<NonNullable<…>>` over
+    //     it reduces to `{}` and four diagnostics follow (restore.ts:404/417,
+    //     newElement.ts:749/756).
+    //   * WHOLE cycle fixes exactly that (both members keep the ref, nothing
+    //     mixes) and exposes a different gap one layer down: a property lookup
+    //     through an INTERSECTION that still contains a `.ref` does not
+    //     intersect the ref's members, so `{containerId: string} &
+    //     ExcalidrawTextElement` answers `string | null` for `containerId`
+    //     instead of `string` — five TS2345 in resize.test.tsx.
     //
-    // The one false positive removal used to cost (`FeedPage.tsx:101`, a
-    // TS2345 the ref spelling related away) is unrelated to this arm: it was a
-    // `fixTypeArgs` leak that keyed a soundness guard on the same
-    // materialization, and is fixed there (`shallow_default`).
+    // So the whole-cycle keying plus that intersection-lookup fix is the
+    // landable path, and it is the one to finish.
+    //
+    // Two more things the next attempt needs, both measured here:
+    //
+    //   * `fixTypeArgs`' `shallow_default` guard rides on this rule. It asks
+    //     whether a type parameter's DEFAULT resolved to a `.ref`, which is
+    //     true only while a recursive alias answers with one — so the moment a
+    //     mutual cluster materializes, `NavigationProp`'s `State extends
+    //     NavigationState = NavigationState<ParamList>` comes back an
+    //     `.object`, the guard misses, and the default is left UNSUBSTITUTED
+    //     with the alias's own `ParamList` free. `getRootNavigation(navigation)`
+    //     at social-app's `FeedPage.tsx:101` then has a parameter nothing can
+    //     meet (TS2345, oracle-clean). Testing the default's SYNTAX instead
+    //     (`c.nodeTag(tp.default) == .type_ref`) fixes it and is
+    //     partition-proof, but as an unconditional widening it costs drizzle
+    //     +12.8% wall (3.73 s -> 4.20 s over 9 samples of 20 runs, RSS flat) —
+    //     it pulls drizzle's ordinary `.d.ts` defaults onto the substituting
+    //     branch, which is the re-materialization hazard that branch exists to
+    //     avoid. It has to be scoped to the cyclic aliases, not applied to
+    //     every named default.
+    //   * `compiler/varianceMeasurement.ts` pins this arm's PURPOSE and must
+    //     keep passing. tsc never materializes `Foo3<unknown>` at all — it
+    //     keeps an object carrying `aliasSymbol`/`aliasTypeArguments` and
+    //     relates two of them by `getAliasVariances`, so the body is never
+    //     walked. ztsc interns structurally, so the `.ref` is the only spelling
+    //     that survives interning as "alias A at these arguments", and
+    //     `assign.relate` asks for variance only on a declared `.ref`/`.ref`
+    //     pair (an `origin` tag cannot stand in — a hand-written structural
+    //     type interns equal to an alias's expansion and would inherit its
+    //     variance; see the `Record<string, unknown>` note there). Materialize
+    //     a self-recursive alias and the top-level pair stops being refs, the
+    //     variance shortcut is skipped, and the walk descends into a body that
+    //     names the alias one level down, where the arguments are a
+    //     contravariant hop further in and no longer relate.
     // =======================================================================
-    if (c.alias_self_recursive.contains(sym) and originTaggable(c.ts.kind(generic))) {
+    if (c.alias_recursive.contains(sym) and originTaggable(c.ts.kind(generic))) {
         return c.ts.makeRef(sym, fixed);
     }
     var tps: std.ArrayList(TypeParamInfo) = .empty;
@@ -157,11 +186,6 @@ pub fn aliasGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
     prof_zig.declAsk(c, sym, .alias, sym);
     if (c.alias_generic.get(sym)) |t| return t;
     try c.alias_state.put(c.cm(), sym, 1);
-    // The frame `aliasInstance` reads to tell a cycle through THIS alias's own
-    // body from one that runs through another alias's — see
-    // `alias_self_recursive`.
-    try c.alias_gen_stack.append(c.cm(), sym);
-    defer _ = c.alias_gen_stack.pop();
     const dwin = prof_zig.declEnter(c, sym, .alias, prof_zig.dupKey(.alias, sym));
     defer prof_zig.declExit(c, dwin);
     const saved_ctx = c.enterSymFile(sym);
