@@ -29,6 +29,7 @@ const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const tuple_relate = @import("tuple_relate.zig");
 const accessibility = @import("accessibility.zig");
+const classes = @import("classes.zig");
 const ambientNamespaceType = @import("signatures.zig").ambientNamespaceType;
 const ChainLink = @import("expr.zig").ChainLink;
 const checkExprCached = @import("expr.zig").checkExprCached;
@@ -452,7 +453,16 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
     if (!is_new and c.nodeTag(shape.callee) == .import_expr) {
         return .{ .ty = try importCallType(c, shape.arg_nodes), .chained = chained };
     }
-    var callee_t = if (c.isOptionalChain(shape.callee)) blk: {
+    // A super CALL's callee is never typed as a value (tsc's
+    // `resolveCallExpression` resolves against the base's construct signatures
+    // instead — see below), and `checkExpr`'s `.super_expr` arm — which would
+    // answer `any` here anyway — carries the TS2335 that a super call's own
+    // TS2337 supersedes. Routing past it keeps the two mutually exclusive, as
+    // `checkSuperExpression`'s early return does.
+    const super_call = !is_new and c.nodeTag(shape.callee) == .super_expr;
+    var callee_t = if (super_call)
+        types.any_type
+    else if (c.isOptionalChain(shape.callee)) blk: {
         const link = try c.chainObjType(shape.callee);
         if (link.chained) chained = true;
         break :blk link.ty;
@@ -525,7 +535,7 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
     // baseTypeNode.typeArguments)`) — see `superCtorSigs`.
     var super_sigs: std.ArrayList(TypeId) = .empty;
     defer super_sigs.deinit(c.scratch());
-    if (!is_new and c.nodeTag(shape.callee) == .super_expr) {
+    if (super_call) {
         // TS2337 — tsc's `checkSuperExpression`: a super CALL is permitted only
         // when its container (`getSuperContainer(node, /*stopOnFunctions*/
         // true)`, so arrows count) is a constructor. A `super()` in a field
@@ -539,14 +549,22 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
         // The arguments are still resolved against the base constructor below,
         // which is where any further diagnostic about them comes from.
         //
-        // A WRITTEN type-argument list takes the call out of this check
+        // A WRITTEN type-argument list takes BOTH of these checks out
         // entirely: `super<T>(0)` is TS2754 ("'super' may not use type
         // arguments") and nothing else, tsgo-verified on
         // `parserSuperExpression2`. ztsc does not implement TS2754, so the
         // choice here is between silence and a different code at a different
         // span — and silence is the one that is not wrong.
-        if (!c.in_ctor_body and !c.in_computed_key and shape.targ_nodes.len == 0) {
-            try c.diagFmt(2337, c.nodeSpan(shape.callee), "Super calls are not permitted outside constructors or in nested functions inside constructors.", .{});
+        if (!c.in_computed_key and shape.targ_nodes.len == 0) {
+            if (!c.in_ctor_body) {
+                try c.diagFmt(2337, c.nodeSpan(shape.callee), "Super calls are not permitted outside constructors or in nested functions inside constructors.", .{});
+            } else {
+                // …and TS2335 once the container IS legal: a class that writes
+                // no `extends` has no `super` to call. tsc's
+                // `checkSuperExpression` returns `errorType` at either one, so
+                // exactly one of the two is ever reported.
+                _ = try classes.reportSuperWithoutBase(c, shape.callee);
+            }
         }
         if (try superCtorSigs(c, &super_sigs)) {
             r = if (super_sigs.items.len == 1)

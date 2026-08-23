@@ -1594,6 +1594,55 @@ fn heritageArgCount(c: *Checker, hd: ast.Data) usize {
     return n;
 }
 
+/// tsc's `checkSuperExpression` tail, once the container has been accepted as
+/// a legal one:
+///
+///     const classLikeDeclaration = container.parent as ClassLikeDeclaration;
+///     if (!getClassExtendsHeritageElement(classLikeDeclaration)) {
+///         error(node, Diagnostics.super_can_only_be_referenced_in_a_derived_class);
+///         return errorType;
+///     }
+///
+/// The test is SYNTACTIC — "is there an `extends` clause on this class
+/// declaration" — not "did a base type resolve". That distinction is the whole
+/// of `superCallFromClassThatHasNoBaseTypeButWithSameSymbolInterface`: an
+/// `interface Foo extends Array<number> {}` merged into `class Foo {}` gives
+/// the SYMBOL a base type, but the class declaration still writes no
+/// `extends`, so `super()` in its constructor is TS2335.
+///
+/// The container is read off `c.this_type` rather than walked to from the
+/// `super` node (ztsc has no parent pointers): a class member binds it to the
+/// class's instance ref, a STATIC one to the class value. Anything else — an
+/// object-literal method (tsc types `super` there as `any` and reports
+/// nothing), a `this` parameter naming an interface, a free function — answers
+/// null and reports nothing, which is the conservative half of the rule.
+pub fn reportSuperWithoutBase(c: *Checker, super_node: Node) Error!bool {
+    const sym = superHomeClassSym(c) orelse return false;
+    for (c.declsOf(sym)) |decl| {
+        if (c.nodeTag(decl) != .class_decl) continue;
+        if (c.tree.extraData(ast.ClassData, c.tree.nodeData(decl).lhs).extends != 0) return false;
+        try c.diagFmt(2335, c.nodeSpan(super_node), "'super' can only be referenced in a derived class.", .{});
+        return true;
+    }
+    return false;
+}
+
+/// The class whose body lexically encloses the expression being checked, as
+/// `c.this_type` records it — see `reportSuperWithoutBase`.
+fn superHomeClassSym(c: *Checker) ?SymbolId {
+    if (c.this_type == 0) return null;
+    const inst = if (c.ts.kind(c.this_type) == .this_type)
+        c.ts.thisTypeInstance(c.this_type)
+    else
+        c.this_type;
+    const sym: SymbolId = switch (c.ts.kind(inst)) {
+        .ref => c.ts.refSymbol(inst),
+        .class_value => c.ts.classSymbol(inst),
+        else => return null,
+    };
+    return if (c.symFlags(sym).class) sym else null;
+}
+
 /// The `extends` base of a class as a ref (or null). The base name
 /// resolves in the class's own file (so imported bases work).
 pub fn baseClassRef(c: *Checker, sym: SymbolId) Error!?TypeId {

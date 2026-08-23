@@ -367,7 +367,18 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             try c.diagFmt(2683, c.nodeSpan(node), "'this' implicitly has type 'any' because it does not have a type annotation.", .{});
             return types.any_type;
         },
-        .super_expr => return types.any_type,
+        // A `super` REFERENCE — `super.x`, `super[k]`, or the keyword on its
+        // own. Reached only when no base type was found for it (a
+        // property-access receiver with a base never gets here; see
+        // `superReceiverType`), so this is where tsc's TS2335 lands. A super
+        // CALL is routed past this arm by `calls.zig`, which owns the TS2337
+        // that supersedes it; inside a computed property NAME the answer is
+        // TS2466 instead (`Checker.in_computed_key`), which ztsc does not
+        // implement — silence is the one that is not wrong.
+        .super_expr => {
+            if (!c.in_computed_key) _ = try classes.reportSuperWithoutBase(c, node);
+            return types.any_type;
+        },
         // `new.target`: tsc types it as the enclosing constructor's own
         // type (the class's static side in a constructor, `typeof f` in a
         // plain function). The checker has no enclosing-function *symbol*
