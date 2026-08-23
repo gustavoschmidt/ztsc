@@ -976,6 +976,7 @@ pub fn fixTypeArgs(c: *Checker, sym: SymbolId, args: []const TypeId, tok: TokenI
             // `default_sym`, not `sym`: a merged symbol may take the default
             // from a different block than the parameter list (`typeParamsOf`).
             var def: TypeId = undefined;
+            var default_is_named_ref = false;
             {
                 const dsym = if (tp.default_sym != 0) tp.default_sym else tp.sym;
                 const saved = c.enterSymFile(dsym);
@@ -984,6 +985,11 @@ pub fn fixTypeArgs(c: *Checker, sym: SymbolId, args: []const TypeId, tok: TokenI
                 try c.tp_default_stack.append(c.cm(), tp.sym);
                 defer _ = c.tp_default_stack.pop();
                 def = try c.typeFromTypeNode(tp.default);
+                // Classified HERE, while the declaring file's tree is the
+                // current one: `c.nodeTag` reads `c.tree`, and `tp.default`
+                // indexes the tree the parameter was declared in, which the
+                // `enterSymFile` above installed. See `shallow_default`.
+                default_is_named_ref = c.nodeTag(tp.default) == .type_ref;
             }
             // A *bare* default reference to an earlier own param (`Tr = T`)
             // whose alias is *self-recursive* is the recursion accumulator of
@@ -1083,14 +1089,25 @@ pub fn fixTypeArgs(c: *Checker, sym: SymbolId, args: []const TypeId, tok: TokenI
                 }
                 break :blk true;
             };
-            // A default that resolved to a bare NAMED REFERENCE is a third
-            // safe case whatever the earlier arguments are: instantiating a
-            // `.ref` rewrites its argument list and expands nothing, so it can
-            // neither re-materialize a recursive `.d.ts` term nor unmask a
-            // deferred reduction — the two hazards the lenient branch exists
-            // for. It is also the shape that most often carries the leak,
-            // `State extends NavigationState = NavigationState<ParamList>`.
-            const shallow_default = c.ts.kind(def) == .ref;
+            // A default WRITTEN as a bare named reference (`State extends
+            // NavigationState = NavigationState<ParamList>`) is a third safe
+            // case whatever the earlier arguments are: substituting into one
+            // rewrites an argument list and expands nothing, so it can neither
+            // re-materialize a recursive `.d.ts` term nor unmask a deferred
+            // reduction — the two hazards the lenient branch exists for. It is
+            // also the shape that most often carries the leak the branch above
+            // describes.
+            //
+            // Tested on the DEFAULT'S SYNTAX, not on the kind `def` resolved
+            // to. Those two used to coincide, because a reference to a
+            // recursive alias came back as a lazy `.ref`; since `aliasInstance`
+            // always materializes (see its header comment) the very same
+            // `NavigationState<ParamList>` resolves to an `.object` instead.
+            // Keying on the resolved kind therefore made this guard fire or not
+            // depending on whether some other file had already driven the alias
+            // into its cycle — i.e. on the file partition. The source spelling
+            // is a property of the program and cannot move.
+            const shallow_default = default_is_named_ref or c.ts.kind(def) == .ref;
             if (bare_earlier != null and (swappable_earlier or recursive or !c.symInDeclFile(sym))) {
                 out[i] = out[bare_earlier.?];
             } else if (c.symInDeclFile(sym) and !ground_earlier and !shallow_default) {
