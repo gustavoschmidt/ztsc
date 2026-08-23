@@ -875,13 +875,26 @@ pub fn isDiscriminantProp(c: *Checker, t: TypeId, prop: Atom) Error!bool {
     for (try c.memberList(t)) |m| {
         const rm = try c.resolveStructural(m);
         const p = (try c.propOfType(rm, prop)) orelse continue;
-        if (try c.containsTypeParam(p.ty)) return false;
+        // tsc reads `getTypeOfSymbol(prop)`, which under strictNullChecks
+        // already carries the `| undefined` an OPTIONAL member implies;
+        // `Prop.ty` here is the DECLARED type with the optionality kept
+        // beside it. The difference is the whole verdict for the
+        // `never`-payload discriminant the ecosystem writes for a disjoint
+        // union — `{ value: string; err?: never } | { value?: never; err: E }`
+        // — where the declared `never` is not a unit type but the `undefined`
+        // it really has is. Without folding it in, `err` was not a
+        // discriminant at all, so `if (result.err) throw result.err;` left the
+        // union whole and `return result.value` was a false TS2322
+        // (`narrowingIntersection`). `err?: undefined`, spelled explicitly,
+        // always worked — the two must not disagree.
+        const pt = if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
+        if (try c.containsTypeParam(pt)) return false;
         if (first == types.no_type) {
-            first = p.ty;
-        } else if (p.ty != first) {
+            first = pt;
+        } else if (pt != first) {
             non_uniform = true;
         }
-        if (try isLiteralTypeLike(c, p.ty)) has_literal = true;
+        if (try isLiteralTypeLike(c, pt)) has_literal = true;
     }
     return non_uniform and has_literal;
 }

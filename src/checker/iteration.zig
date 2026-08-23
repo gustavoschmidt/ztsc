@@ -173,7 +173,23 @@ pub fn forOfElementType(c: *Checker, rt: TypeId, right_node: Node, is_await: boo
         }
         return types.any_type;
     }
-    if (try c.iterationElementType(rt)) |e| return e;
+    switch (try iterationOutcome(c, rt)) {
+        .element => |e| return e,
+        // tsc's `getIterationTypesOfMethod` splits the two failures: a type
+        // with no `[Symbol.iterator]()` at all is TS2488, but one that HAS the
+        // protocol and whose `next()` merely returns the wrong shape gets the
+        // more specific `mustHaveAValueDiagnostic` — and then carries on with
+        // `any` rather than bailing. `class MyStringIterator { next() { return
+        // ""; } [Symbol.iterator]() { return this; } }` is exactly that
+        // (`for-of15`).
+        .next_result_lacks_value => {
+            if (right_node != 0) {
+                try c.diagFmt(2490, c.nodeSpan(right_node), "The type returned by the '{s}()' method of an iterator must have a 'value' property.", .{"next"});
+            }
+            return types.any_type;
+        },
+        .not_iterable => {},
+    }
     if (right_node != 0) {
         try c.diagFmt(2488, c.nodeSpan(right_node), "Type '{s}' must have a '[Symbol.iterator]()' method that returns an iterator.", .{try c.typeToString(rt)});
     }
@@ -212,20 +228,47 @@ pub fn contextualIterationElementType(c: *Checker, rt: TypeId) Error!?TypeId {
 /// refs, and the general `[Symbol.iterator]() -> { next(): { value } }`
 /// protocol (so `Map`/`Set` and user-defined iterables work).
 pub fn iterationElementType(c: *Checker, rt: TypeId) Error!?TypeId {
+    return switch (try iterationOutcome(c, rt)) {
+        .element => |e| e,
+        // A caller with no diagnostic site of its own (contextual typing, a
+        // spread) keeps the pre-TS2490 answer: "not iterable". tsc would
+        // substitute `any` after reporting, and reporting is what these
+        // callers do not do — an under-report is the safe direction.
+        else => null,
+    };
+}
+
+/// Why `iterationElementType` could not produce an element, or the element.
+/// Split out because tsc's two failures carry DIFFERENT diagnostics and only
+/// `forOfElementType` has a node to hang them on.
+pub const IterationOutcome = union(enum) {
+    element: TypeId,
+    /// No `[Symbol.iterator]()` protocol reached at all — tsc's TS2488.
+    not_iterable,
+    /// The protocol is present and `next()` is callable, but what it returns
+    /// has no `value` property — tsc's TS2490.
+    next_result_lacks_value,
+};
+
+fn iterationOutcome(c: *Checker, rt: TypeId) Error!IterationOutcome {
     const r = try c.resolveStructural(rt);
     switch (c.ts.kind(r)) {
-        .array => return c.ts.arrayElem(r),
-        .tuple => return try c.numberIndexType(r),
-        .string, .string_literal => return types.string_type,
-        .any, .err => return types.any_type,
+        .array => return .{ .element = c.ts.arrayElem(r) },
+        .tuple => return .{ .element = try c.numberIndexType(r) },
+        .string, .string_literal => return .{ .element = types.string_type },
+        .any, .err => return .{ .element = types.any_type },
         .union_type => {
             var parts: std.ArrayList(TypeId) = .empty;
             defer parts.deinit(c.scratch());
             for (try c.memberList(r)) |m| {
-                const e = (try c.iterationElementType(m)) orelse return null;
-                try parts.append(c.scratch(), e);
+                switch (try iterationOutcome(c, m)) {
+                    .element => |e| try parts.append(c.scratch(), e),
+                    // One bad constituent decides the whole union, and its
+                    // reason is the one worth reporting.
+                    else => |why| return why,
+                }
             }
-            return try c.ts.makeUnion(c.scratch(), parts.items);
+            return .{ .element = try c.ts.makeUnion(c.scratch(), parts.items) };
         },
         // An INTERSECTION iterates through whichever constituents carry the
         // protocol, and the element is their intersection. tsc gets this for
@@ -239,11 +282,15 @@ pub fn iterationElementType(c: *Checker, rt: TypeId) Error!?TypeId {
         .intersection => {
             var parts: std.ArrayList(TypeId) = .empty;
             defer parts.deinit(c.scratch());
+            var why: IterationOutcome = .not_iterable;
             for (try c.memberList(r)) |m| {
-                if (try c.iterationElementType(m)) |e| try parts.append(c.scratch(), e);
+                switch (try iterationOutcome(c, m)) {
+                    .element => |e| try parts.append(c.scratch(), e),
+                    else => |w| why = w,
+                }
             }
-            if (parts.items.len == 0) return null;
-            return try c.ts.makeIntersection(c.scratch(), parts.items);
+            if (parts.items.len == 0) return why;
+            return .{ .element = try c.ts.makeIntersection(c.scratch(), parts.items) };
         },
         else => {},
     }
@@ -253,23 +300,27 @@ pub fn iterationElementType(c: *Checker, rt: TypeId) Error!?TypeId {
         // member's type with `| undefined` folded in, and a union with
         // `undefined` has no call signatures at all — so `{ [Symbol.iterator]?():
         // Iterator<string> }` is TS2488 (`for-of29`).
-        if (p.optional()) return null;
+        if (p.optional()) return .not_iterable;
         // A member of type `any` satisfies the protocol outright, at either
         // hop: tsc's `getIterationTypesOfIterable` / `…OfMethod` answer
         // `anyIterationTypes` the moment the method (or its return) is `any`,
         // and never look for `next` (`for-of25`, `for-of27`).
-        if (isAnyLike(c, try c.resolveStructural(p.ty))) return types.any_type;
+        if (isAnyLike(c, try c.resolveStructural(p.ty))) return .{ .element = types.any_type };
         const ret = try c.callableReturn(p.ty);
         if (ret != 0) {
-            if (isAnyLike(c, try c.resolveStructural(ret))) return types.any_type;
+            if (isAnyLike(c, try c.resolveStructural(ret))) return .{ .element = types.any_type };
             // Lib iterables return `IterableIterator<E>`/`Iterator<E>`.
             const y2 = c.generatorYieldType(ret);
-            if (y2 != 0) return y2;
+            if (y2 != 0) return .{ .element = y2 };
             // General protocol: the iterator's `next()` result `value`.
-            if (try c.iteratorNextValue(ret, false)) |v| return v;
+            switch (try iteratorNextOutcome(c, ret, false)) {
+                .value => |v| return .{ .element = v },
+                .no_value => return .next_result_lacks_value,
+                .no_next => {},
+            }
         }
     }
-    return null;
+    return .not_iterable;
 }
 
 fn isAnyLike(c: *const Checker, t: TypeId) bool {
@@ -326,16 +377,29 @@ pub fn callableReturn(c: *Checker, ty: TypeId) Error!TypeId {
 /// `next(): { value }` shape. With `is_async`, `next()`'s `Promise<…>`
 /// return is unwrapped first (the `AsyncIterator` protocol).
 pub fn iteratorNextValue(c: *Checker, iter: TypeId, is_async: bool) Error!?TypeId {
+    return switch (try iteratorNextOutcome(c, iter, is_async)) {
+        .value => |v| v,
+        else => null,
+    };
+}
+
+/// `iteratorNextValue` with tsc's two failures kept apart: `no_next` is "this
+/// is not an iterator" (no `next` member, or one that is not callable), while
+/// `no_value` is "it IS an iterator, but its result has no `value`" — the
+/// distinction between TS2488 and TS2490 at the `for..of` site.
+const NextOutcome = union(enum) { value: TypeId, no_next, no_value };
+
+fn iteratorNextOutcome(c: *Checker, iter: TypeId, is_async: bool) Error!NextOutcome {
     const r = try c.resolveStructural(iter);
-    const nextp = (try c.propOfType(r, c.atom_next)) orelse return null;
+    const nextp = (try c.propOfType(r, c.atom_next)) orelse return .no_next;
     // `next: any` — or a `next()` that returns `any` — is tsc's
     // `anyIterationTypes` (`for-of26`, `for-of28`), not a missing protocol.
-    if (isAnyLike(c, try c.resolveStructural(nextp.ty))) return types.any_type;
+    if (isAnyLike(c, try c.resolveStructural(nextp.ty))) return .{ .value = types.any_type };
     var ret = try c.callableReturn(nextp.ty);
-    if (ret == 0) return null;
+    if (ret == 0) return .no_next;
     if (is_async) ret = try c.awaitedType(ret);
     const rr = try c.resolveStructural(ret);
-    if (isAnyLike(c, rr)) return types.any_type;
+    if (isAnyLike(c, rr)) return .{ .value = types.any_type };
     if (c.ts.kind(rr) == .union_type) {
         // The lib's `next(): IteratorResult<T, TReturn>` is the union
         // `IteratorYieldResult<T> | IteratorReturnResult<TReturn>`,
@@ -351,9 +415,9 @@ pub fn iteratorNextValue(c: *Checker, iter: TypeId, is_async: bool) Error!?TypeI
             const vp = (try c.propOfType(rm, c.atom_value)) orelse continue;
             try parts.append(c.scratch(), vp.ty);
         }
-        if (parts.items.len == 0) return null;
-        return try c.ts.makeUnion(c.scratch(), parts.items);
+        if (parts.items.len == 0) return .no_value;
+        return .{ .value = try c.ts.makeUnion(c.scratch(), parts.items) };
     }
-    const valp = (try c.propOfType(rr, c.atom_value)) orelse return null;
-    return valp.ty;
+    const valp = (try c.propOfType(rr, c.atom_value)) orelse return .no_value;
+    return .{ .value = valp.ty };
 }
