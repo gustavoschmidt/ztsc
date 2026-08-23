@@ -3145,9 +3145,27 @@ const Linker = struct {
                             if (tbl.contains(l.atom_export_equals)) continue;
                             var tgt: Target = .{ .kind = .any };
                             if (rec.local != 0) {
-                                if (b.lookupInScope(am.scope, rec.local)) |ls| {
-                                    tgt = try l.finalizeLocal(fid, ls, rec.local, false, 0);
-                                }
+                                // The entity is routinely declared OUTSIDE the
+                                // block: `declare namespace __React { … }
+                                // declare module "react" { export = __React }`
+                                // is the shape of every UMD typing in the
+                                // ecosystem, and the block-scope lookup alone
+                                // never finds it — the reserved key stored
+                                // `any`, so `React.Component` resolved to
+                                // nothing and `class X extends React.Component`
+                                // inherited zero members.
+                                //
+                                // A file-scope fallback is the whole walk that
+                                // is needed: `buildAmbient` only visits blocks
+                                // whose parent scope IS the file scope (a
+                                // nested block is an augmentation and seeds no
+                                // specifier), so there is no third scope
+                                // between the two. `export as namespace X`
+                                // resolves its own entity the same way
+                                // (`Bind.umd_sym`).
+                                const found = b.lookupInScope(am.scope, rec.local) orelse
+                                    b.lookupInScope(binder.file_scope, rec.local);
+                                if (found) |ls| tgt = try l.finalizeLocal(fid, ls, rec.local, false, 0);
                             }
                             try tbl.put(l.scratch, l.atom_export_equals, tgt);
                         },

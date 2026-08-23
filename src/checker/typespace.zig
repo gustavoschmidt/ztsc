@@ -1319,8 +1319,19 @@ pub fn nestNsContainer(c: *Checker, outer: NsContainer, name: Atom) ?NsContainer
             return null;
         },
         .module => |m| {
-            const tgt = c.moduleExportTarget(m, name) orelse return null;
-            return c.containerFromImportTarget(tgt);
+            if (c.moduleExportTarget(m, name)) |tgt| {
+                if (c.containerFromImportTarget(tgt)) |ct| return ct;
+            }
+            // `export =` module: the members live on the ASSIGNED entity, not
+            // in the module's own export table (which holds only the reserved
+            // `export=` key). See `containerMemberSym` for the full story.
+            const g = c.exportEqualsMemberSym(m, name) orelse return null;
+            const mf = c.symFlags(g);
+            if (mf.namespace_decl) return .{ .ns = g };
+            if (mf.import_binding) {
+                if (c.importTarget(g)) |t2| return c.containerFromImportTarget(t2);
+            }
+            return null;
         },
     }
 }
@@ -1335,8 +1346,23 @@ pub fn containerMemberSym(c: *Checker, container: NsContainer, name: Atom) ?Symb
             return if (c.symFlags(g).exported) g else null;
         },
         .module => |m| {
-            const tgt = c.moduleExportTarget(m, name) orelse return null;
-            return c.targetTypeSym(tgt);
+            if (c.moduleExportTarget(m, name)) |tgt| {
+                if (c.targetTypeSym(tgt)) |g| return g;
+            }
+            // A module that publishes its contents by ASSIGNMENT — `declare
+            // namespace __React { … } declare module "react" { export =
+            // __React }` — keeps nothing but the reserved `export=` key in its
+            // own export table, so the lookup above misses every member. tsc
+            // resolves `React.Component` by following the alias to the
+            // assigned entity and taking ITS exports; `exportEqualsMemberSym`
+            // is that walk, already used for `import("m").T`.
+            //
+            // The miss was silent and expensive: `class X extends
+            // React.Component<…>` resolved to no base symbol at all, so every
+            // React class component in the corpus inherited zero members —
+            // no `props`, `state`, `setState`, `forceUpdate`, `context` or
+            // `refs` — and `JSX.ElementClass` could never be satisfied.
+            return c.exportEqualsMemberSym(m, name);
         },
     }
 }

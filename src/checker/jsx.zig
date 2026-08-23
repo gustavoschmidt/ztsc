@@ -698,7 +698,6 @@ fn checkJsxTagBound(c: *Checker, tag: Node, chosen: JsxProps, tag_ty: TypeId) Er
     // `getJsxStatelessElementTypeAt` / `getJsxElementClassTypeAt` both answer
     // `undefined` when their member is missing, and an absent bound is no
     // check — a JSX namespace with no `Element` cannot say what a component is.
-    if (try derivedClassInstance(c, chosen.elem_type)) return;
     const bound: TypeId = switch (try jsxRefKind(c, tag_ty)) {
         .function => try sfcBound(c) orelse return,
         .component => (try c.jsxNamespaceType(c.atom_ElementClass)) orelse return,
@@ -713,44 +712,6 @@ fn checkJsxTagBound(c: *Checker, tag: Node, chosen: JsxProps, tag_ty: TypeId) Er
     // `getTextOfNode(node.tagName)` — the tag as WRITTEN, so a qualified tag
     // keeps its dots (and even its interior spaces: `<obj. Member/>`).
     try c.diagFmt(2786, span, "'{s}' cannot be used as a JSX component.", .{c.src[span.start..span.end]});
-}
-
-/// KNOWN GAP, and the reason `checkJsxTagBound` says nothing about a class that
-/// `extends` anything: ztsc does not fold a class+interface DECLARATION MERGE
-/// into a DERIVED class's instance type, and `@types/react`'s `Component` is
-/// exactly that merge —
-///
-///     interface Component<P, S> extends ComponentLifecycle<P, S> {}
-///     class Component<P, S> { props: …; state: …; setState(…); … }
-///
-/// so `class Poisoned extends React.Component<{}, {}>` has an instance type
-/// missing `props`, `state`, `setState`, `forceUpdate`, `context` and `refs`,
-/// none of which it is missing in tsc. `JSX.ElementClass` requires every one of
-/// them (`interface ElementClass extends React.Component<any, any>`), so the
-/// bound would fail on EVERY React class component in the corpus: 18 exactly-
-/// matching tsx cases turned into false positives when this check ran without
-/// the guard. Reported for a class that declares no base — where the instance
-/// type is ztsc's own members and nothing else, which is what
-/// `jsxComponentTypeErrors`' `ClassComponent` and the object literal's
-/// `class {}` are — and silent otherwise.
-///
-/// Scoped to a class DECLARATION's instance: a component that is a bare
-/// construct signature (`new (n: string) => { x: number }`,
-/// `tsxElementResolution10`) has no heritage to lose and keeps its check.
-///
-/// Delete this the day the merge lands; the check underneath it is tsc's.
-fn derivedClassInstance(c: *Checker, elem: TypeId) Error!bool {
-    if (c.ts.kind(elem) != .ref) return false;
-    const cls = c.ts.refSymbol(elem);
-    if (!c.symFlags(cls).class) return false;
-    const saved = c.enterSymFile(cls);
-    defer c.restoreCtx(saved);
-    for (c.declsOf(cls)) |decl| {
-        if (c.tree.nodeTag(decl) != .class_decl) continue;
-        const e = c.tree.extraData(ast.ClassData, c.tree.nodeData(decl).lhs);
-        if (e.extends != null_node) return true;
-    }
-    return false;
 }
 
 /// `getJsxStatelessElementTypeAt`: `JSX.Element | null`, the bound a FUNCTION
@@ -1072,11 +1033,43 @@ fn jsxPropsOfSig(c: *Checker, sig_in: TypeId, explicit_targs: []const TypeId, no
 /// its default, else its constraint, else `unknown` — so an un-inferred
 /// `Controller<TFieldValues, TName>` resolves to concrete
 /// `ControllerProps<Form, FieldPath<Form>, …>` whose props relate reflexively.
+/// The index into `tps` of the type parameter the attributes object infers to
+/// WHOLE — `p0` itself, or the single bare parameter among an intersection's
+/// constituents — or null when the target has no such naked position.
+///
+/// Null too when any SPREAD attribute is present: the object built from the
+/// written attributes would then be missing the spread's members, and a
+/// candidate that under-describes the attributes is worse than none (the
+/// spread's own members would each read as excess against it). Such an element
+/// keeps the pre-existing default/constraint fallback.
+fn nakedTypeParamTarget(c: *Checker, p0: TypeId, tps: []const u32, e: ast.JsxElementData) Error!?usize {
+    if (tps.len == 0) return null;
+    for (c.tree.extraRange(e.attrs_start, e.attrs_end)) |attr| {
+        if (c.nodeTag(attr) == .jsx_spread_attribute) return null;
+    }
+    if (c.ts.kind(p0) == .type_param) return tpIndex(tps, c.ts.typeParamSymbol(p0));
+    if (c.ts.kind(p0) != .intersection) return null;
+    var found: ?usize = null;
+    for (try c.memberList(p0)) |m| {
+        if (c.ts.kind(m) != .type_param) continue;
+        const i = tpIndex(tps, c.ts.typeParamSymbol(m)) orelse continue;
+        if (found != null) return null; // two naked parameters: ambiguous, bail
+        found = i;
+    }
+    return found;
+}
+
 pub fn inferJsxTargs(c: *Checker, sig: TypeId, tps: []const u32, e: ast.JsxElementData) Error!TypeId {
     if (c.ts.fnParamCount(sig) == 0) return sig;
-    const rp0 = try c.resolveStructural(c.ts.fnParam(sig, 0).ty);
+    const p0 = c.ts.fnParam(sig, 0).ty;
+    const rp0 = try c.resolveStructural(p0);
     const candidates = try c.scratch().alloc(TypeId, tps.len);
     for (candidates) |*x| x.* = types.no_type;
+    // The attributes as an object type, collected alongside phase 1 and used
+    // only by `nakedTypeParamTarget` below.
+    var attrs_obj: std.ArrayList(types.Prop) = .empty;
+    defer attrs_obj.deinit(c.scratch());
+    const naked = try nakedTypeParamTarget(c, p0, tps, e);
     // Phase 1: unify each non-function attribute value against its target prop.
     for (c.tree.extraRange(e.attrs_start, e.attrs_end)) |attr| {
         if (c.nodeTag(attr) == .jsx_spread_attribute) continue;
@@ -1088,9 +1081,22 @@ pub fn inferJsxTargs(c: *Checker, sig: TypeId, tps: []const u32, e: ast.JsxEleme
         // context-free would pollute the candidates.
         if (ad.lhs != null_node and c.nodeTag(ad.lhs) == .jsx_expr_container) {
             const cd = c.tree.nodeData(ad.lhs);
-            if (cd.lhs != null_node and (c.nodeTag(cd.lhs) == .arrow_fn or c.nodeTag(cd.lhs) == .function_expr)) continue;
+            if (cd.lhs != null_node and (c.nodeTag(cd.lhs) == .arrow_fn or c.nodeTag(cd.lhs) == .function_expr)) {
+                // The naked-parameter object still needs the NAME (or the
+                // attribute reads as excess against the inferred `P`); `any`
+                // stands in for the type it would have got from a contextual
+                // pass that has not happened yet.
+                if (naked != null) try attrs_obj.append(c.scratch(), .{ .name = try c.memberAtom(name_tok), .ty = types.any_type });
+                continue;
+            }
         }
-        const pt = (try c.propOfType(rp0, try c.memberAtom(name_tok))) orelse continue;
+        const pt = (try c.propOfType(rp0, try c.memberAtom(name_tok))) orelse {
+            if (naked != null) {
+                const vt = try c.jsxAttributeValueType(ad.lhs, types.no_type);
+                try attrs_obj.append(c.scratch(), .{ .name = try c.memberAtom(name_tok), .ty = vt });
+            }
+            continue;
+        };
         // A TEMPLATE-LITERAL attribute value is contextually typed by the
         // target prop, exactly as `inferTypeArgs`' Phase 1 does for a
         // template-expression argument: `ctxWantsTemplate` needs to see the
@@ -1119,7 +1125,26 @@ pub fn inferJsxTargs(c: *Checker, sig: TypeId, tps: []const u32, e: ast.JsxEleme
             };
         };
         const vty = try c.jsxAttributeValueType(ad.lhs, vctx);
+        if (naked != null) try attrs_obj.append(c.scratch(), .{ .name = try c.memberAtom(name_tok), .ty = vty });
         try c.unify(pt.ty, vty, tps, candidates, 0);
+    }
+    // Phase 1b, tsc's `InferencePriority.NakedTypeVariable`: when the target
+    // is a bare type parameter — on its own or as a constituent of an
+    // intersection — the WHOLE attributes object is its candidate. That is the
+    // only inference a class component's props target admits in the corpus's
+    // `react.d.ts`, whose `Component<P, S>` declares `props: P & { children?:
+    // ReactNode }`: phase 1 reads the intersection's members and finds only
+    // `children`, so `P` collected nothing and fell back to its DEFAULT.
+    // `declare class MyComp<P = Prop> extends React.Component<P, {}>` then
+    // checked `<MyComp />` against `Prop` and reported two false TS2322s that
+    // tsc does not (`tsxReactComponentWithDefaultTypeParameter2`).
+    //
+    // Verified against tsgo: `<Cons q={1}/>` over `Cons<P extends {k:number}>`
+    // renders as `Cons<{k: number}>` in the message — the candidate `{q:
+    // number}` WAS formed and then clamped to the constraint, which is exactly
+    // the resolution loop below.
+    if (naked) |idx| {
+        if (candidates[idx] == types.no_type) candidates[idx] = try jsxAttrsObject(c, attrs_obj.items);
     }
     // Resolve each param: inferred candidate (clamped to its constraint when
     // it violates it), else default, else constraint, else `unknown`. Mirrors
