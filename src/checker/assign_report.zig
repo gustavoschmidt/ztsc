@@ -243,6 +243,31 @@ pub fn elaborateLiteralError(c: *Checker, expr_node0: Node, src_t: TypeId, targe
     while (true) {
         switch (c.nodeTag(expr_node)) {
             .paren_expr, .jsx_expr_container => expr_node = c.tree.nodeData(expr_node).lhs,
+            // tsc's `elaborateError`, `BinaryExpression` arm: a comma sequence
+            // and a plain `=` assignment both elaborate through their RIGHT
+            // operand, because that operand IS the value being related.
+            //
+            // ```ts
+            // case SyntaxKind.BinaryExpression:
+            //     switch (node.operatorToken.kind) {
+            //         case SyntaxKind.EqualsToken:
+            //         case SyntaxKind.CommaToken:
+            //             return elaborateError(node.right, …);
+            //     }
+            // ```
+            //
+            // Without it `const x: Foo = (void 0, { a: q = { b: … } })` lost
+            // the per-property walk at the very first step and was reported
+            // whole at the declaration, ON TOP of the deep `d: 42` error the
+            // contextual check found anyway
+            // (`compiler/slightlyIndirectedDeepObjectLiteralElaborations`).
+            // A COMPOUND assignment (`+=`, `&&=`, …) is not in tsc's list —
+            // its right operand is not the assigned value.
+            .seq_expr => expr_node = c.tree.nodeData(expr_node).rhs,
+            .assign => {
+                if (c.tree.tokens.tag(c.tree.nodeMainToken(expr_node)) != .eq) break;
+                expr_node = c.tree.nodeData(expr_node).rhs;
+            },
             else => break,
         }
         if (expr_node == null_node) return false;
