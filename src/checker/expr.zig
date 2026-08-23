@@ -34,6 +34,7 @@ const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const buildRefKey = @import("flow.zig").buildRefKey;
 const checkAssignPatternExcessProps = @import("destructure.zig").checkAssignPatternExcessProps;
+const patternContextualType = @import("destructure.zig").patternContextualType;
 const checkFunctionBody = @import("stmts.zig").checkFunctionBody;
 const containerOf = Checker.containerOf;
 const ctxWantsTemplate = @import("generics.zig").ctxWantsTemplate;
@@ -581,8 +582,9 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         },
         .yield_expr => {
             // `yield x`: relate `x` to the generator's yield type `T`
-            // (`Generator<T>`). Delegation `yield* x` (rhs=1) is unchecked
-            // (iterable-protocol; a gap). `yield`'s own value type is `any`
+            // (`Generator<T>`). A DELEGATION `yield* xs` (rhs=1) relates what
+            // `xs` ITERATES instead (`delegatedYieldType`). `yield`'s own
+            // value type is `any`
             // (the caller-supplied `.next(v)` value — TNext, out of subset).
             // …but only inside a generator. tsc's `checkYieldExpression`
             // bails to `any` the moment `getContainingFunction` yields
@@ -610,11 +612,20 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
                     yt
                 else if (c.fn_ctx) |fc| fc.yield_ctx else 0;
                 const vt = try c.checkExprCached(d.lhs, ctx_yt);
-                if (!delegate and yt != 0 and yt != types.no_type and yt != types.error_type and c.ts.kind(yt) != .any) {
-                    // Async generators may yield `T | PromiseLike<T>`:
-                    // the yielded value is awaited before it is emitted.
-                    const eff_vt = if (in_async) try c.awaitedType(vt) else vt;
-                    _ = try c.checkAssignable(eff_vt, yt, d.lhs, c.nodeSpan(d.lhs));
+                // tsc's `getYieldedTypeOfYieldExpression`: what the expression
+                // yields is the operand itself for a plain `yield`, and what
+                // the operand ITERATES for a delegation — which is where a
+                // non-iterable `yield* x` earns its TS2488.
+                const yielded = if (delegate)
+                    try c.forOfElementType(vt, d.lhs, in_async)
+                else
+                    // Async generators may yield `T | PromiseLike<T>`: the
+                    // yielded value is awaited before it is emitted. A
+                    // delegation's element is already awaited by the async
+                    // iteration protocol.
+                    (if (in_async) try c.awaitedType(vt) else vt);
+                if (yt != 0 and yt != types.no_type and yt != types.error_type and c.ts.kind(yt) != .any) {
+                    _ = try c.checkAssignable(yielded, yt, d.lhs, c.nodeSpan(d.lhs));
                 }
             } else if (yt != 0 and yt != types.no_type and yt != types.error_type and c.ts.kind(yt) != .any) {
                 // A BARE `yield;` still yields a value: tsc's
@@ -5942,13 +5953,22 @@ fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
     const op = c.tree.tokens.tag(c.tree.nodeMainToken(node));
     // A destructuring assignment is not an ordinary one: tsc's
     // `checkBinaryLikeExpression` diverts `=` with a pattern on the left to
-    // `checkDestructuringAssignment`, which checks the RIGHT side first and
-    // with NO contextual type (the pattern is not a type), resolves every
-    // element against that source type, and answers the source type as the
-    // expression's own. No whole-pattern assignability check runs — the
-    // per-element lookups are the check.
+    // `checkDestructuringAssignment`, which checks the RIGHT side first,
+    // resolves every element against that source type, and answers the source
+    // type as the expression's own. No whole-pattern assignability check runs
+    // — the per-element lookups are the check.
+    //
+    // The right side is checked with the pattern's implied TUPLE as its
+    // contextual type: tsc reaches it through the ordinary chain
+    // (`getContextualTypeForBinaryOperand` -> `getTypeOfExpression(left)`,
+    // and `checkArrayLiteral`'s `inDestructuringPattern` branch builds a
+    // tuple out of the target positions). It is what makes `[a, [b]] = [1,
+    // [2]]` read `number` and `[number]` out of the right side instead of the
+    // widened `(number | number[])[]` an uncontextualized literal produces —
+    // a union no position really holds, which the element walk then had to
+    // defend against everywhere.
     if (op == .eq and isDestructuringPattern(c, d.lhs)) {
-        const src = try c.checkExprCached(d.rhs, types.no_type);
+        const src = try c.checkExprCached(d.rhs, try patternContextualType(c, d.lhs));
         // …with one thing the pattern IS a type for: it is the right
         // operand's contextual type (`getContextualTypeForBinaryOperand`
         // answers `getTypeOfExpression(left)`), and a pattern-shaped
@@ -6793,23 +6813,6 @@ fn setterParamOfProto(c: *Checker, decl: Node, proto_idx: u32) Error!?TypeId {
 /// Every lookup below is a no-op on `no_type` (`propertyTypeOf` answers
 /// `any` for kind `.none`), so an unknown source degrades to exactly the
 /// element walk this used to be.
-/// What one destructuring position reads out of the value being destructured.
-///
-/// `exact` says whether `ty` is the type that position REALLY holds, as
-/// opposed to a stand-in ztsc fell back to. Only an exact reading may be
-/// related to the target (TS2322, tsc's `checkReferenceAssignment`): tsc
-/// contextually types the right-hand side of `[a, [b]] = [1, [2]]` by the
-/// pattern's implied tuple and reads `number` and `number[]` out of it, while
-/// ztsc types the literal with no context at all and reads the widened
-/// `number | number[]` out of an ARRAY — a type no position holds, and one
-/// that would report against every target. The lookups the position drives
-/// (TS2339, member accessibility, nested patterns) are unaffected: those ask
-/// what is THERE, and the stand-in answers that well enough.
-const DestructSrc = struct {
-    ty: TypeId = types.no_type,
-    exact: bool = false,
-};
-
 pub fn checkDestructuringPattern(c: *Checker, node: Node, src: TypeId) Error!void {
     switch (c.nodeTag(node)) {
         .object_literal, .object_pattern => {
@@ -6844,18 +6847,6 @@ fn arrayPatternIteratedType(c: *Checker, pat: Node, src: TypeId) Error!TypeId {
         else => {},
     }
     if (try c.iterationElementType(r)) |e| return e;
-    // A PARTLY iterable union is ztsc's own gap, not the code's: tsc types the
-    // right-hand side by the pattern's implied TUPLE, so a nested position
-    // reads its own element, while ztsc types the literal with no contextual
-    // type at all and hands the nested pattern the widened element UNION.
-    // `[this.#field, [this.#field]] = [1, [2]]` is that shape — the inner
-    // pattern's source is `number | number[]` here and `number[]` in tsc — so
-    // a union with any iterable constituent stays silent.
-    if (c.ts.kind(r) == .union_type) {
-        for (try c.memberList(r)) |m| {
-            if ((try c.iterationElementType(m)) != null) return types.no_type;
-        }
-    }
     try c.diagFmt(2488, c.nodeSpan(pat), "Type '{s}' must have a '[Symbol.iterator]()' method that returns an iterator.", .{
         try c.typeToString(src),
     });
@@ -6929,20 +6920,13 @@ fn destructuringHasDefault(c: *Checker, el0: Node) bool {
 /// by indexed access only where `isArrayLikeType(source)` holds and otherwise
 /// hands every element that one iterated type, so a source with no numeric
 /// domain (a `Set`, a `Generator`) still types its positions.
-fn destructuringElementType(c: *Checker, src: TypeId, iterated: TypeId, index: u32) Error!DestructSrc {
-    if (src == types.no_type) return .{};
+fn destructuringElementType(c: *Checker, src: TypeId, iterated: TypeId, index: u32) Error!TypeId {
+    if (src == types.no_type) return types.no_type;
     const r = try c.resolveStructural(src);
     const rk = c.ts.kind(r);
-    if (rk == .any or rk == .err) return .{ .ty = types.any_type };
-    // Only a TUPLE position is exact. tsc types the right-hand side of a
-    // destructuring assignment by the pattern's implied tuple, so it reaches
-    // every position through one; ztsc types it with no contextual type at
-    // all, so `[a, [b]] = [1, [2]]` has an ARRAY source whose element is the
-    // widened `number | number[]` union — a type no position really holds.
-    if (try numericIndexHit(c, r, rk, @floatFromInt(index))) |t| {
-        return .{ .ty = t, .exact = rk == .tuple };
-    }
-    return .{ .ty = iterated };
+    if (rk == .any or rk == .err) return types.any_type;
+    if (try numericIndexHit(c, r, rk, @floatFromInt(index))) |t| return t;
+    return iterated;
 }
 
 /// One property of an object destructuring pattern. A property KEY is a
@@ -6957,7 +6941,7 @@ fn checkObjectDestructuringProperty(c: *Checker, prop: Node, src: TypeId) Error!
         .object_property => {
             const key = try destructuringKey(c, prop, d.lhs);
             const elem = try destructuringMemberType(c, src, key, destructuringHasDefault(c, d.rhs));
-            try checkDestructuringTarget(c, d.rhs, namedSource(elem), .assignment);
+            try checkDestructuringTarget(c, d.rhs, elem, .assignment);
         },
         // `{ a }` / `{ a = init }` — the name is both key and target; lhs is
         // the target identifier, rhs the default. tsc's
@@ -6967,7 +6951,7 @@ fn checkObjectDestructuringProperty(c: *Checker, prop: Node, src: TypeId) Error!
         // and the source then loses `undefined`.
         .object_shorthand => {
             const key = try destructuringKey(c, prop, null_node);
-            var elem = namedSource(try destructuringMemberType(c, src, key, d.rhs != null_node));
+            var elem = try destructuringMemberType(c, src, key, d.rhs != null_node);
             if (d.rhs != null_node) {
                 const target_t = try checkAssignmentTarget(c, d.lhs);
                 const init_t = try c.checkExprCached(d.rhs, target_t);
@@ -6983,17 +6967,17 @@ fn checkObjectDestructuringProperty(c: *Checker, prop: Node, src: TypeId) Error!
         // (`destructure.zig`), so no source lookup runs here.
         .binding_property => {
             if (d.rhs != null_node) _ = try c.checkExprCached(d.rhs, types.no_type);
-            if (d.lhs != null_node) try checkDestructuringTarget(c, d.lhs, .{}, .assignment);
+            if (d.lhs != null_node) try checkDestructuringTarget(c, d.lhs, types.no_type, .assignment);
         },
         // `{[k]: target}` — the key IS evaluated; lhs is it, rhs the target.
         .binding_property_computed => {
             if (d.lhs != null_node) _ = try c.checkExprCached(d.lhs, types.no_type);
-            if (d.rhs != null_node) try checkDestructuringTarget(c, d.rhs, .{}, .assignment);
+            if (d.rhs != null_node) try checkDestructuringTarget(c, d.rhs, types.no_type, .assignment);
         },
         // `{ ...rest } = src`: the rest object is `src` minus the names its
         // siblings take (tsc's `getRestType`), which is not computed here.
         // An object rest target has its OWN pair of reference diagnostics.
-        .spread_element, .rest_element => try checkDestructuringTarget(c, d.lhs, .{}, .object_rest),
+        .spread_element, .rest_element => try checkDestructuringTarget(c, d.lhs, types.no_type, .object_rest),
         .omitted, .error_node, .unsupported => {},
         else => _ = try checkAssignmentTarget(c, prop),
     }
@@ -7021,15 +7005,13 @@ fn checkArrayDestructuringElement(c: *Checker, el: Node, src: TypeId, iterated: 
 ///
 /// `no_type` where the source is unknown, which is what every rest position
 /// used to read: a nested pattern under one then resolves nothing, exactly
-/// as it did before. Only the TUPLE slice is exact (`DestructSrc`) — the
-/// array fallback is built from the same widened element the numeric
-/// positions get.
-fn arrayRestSourceType(c: *Checker, src: TypeId, iterated: TypeId, index: u32) Error!DestructSrc {
-    if (src == types.no_type) return .{};
+/// as it did before.
+fn arrayRestSourceType(c: *Checker, src: TypeId, iterated: TypeId, index: u32) Error!TypeId {
+    if (src == types.no_type) return types.no_type;
     const r = try c.resolveStructural(src);
-    if (c.ts.kind(r) == .tuple) return .{ .ty = try sliceTuple(c, r, index, 0), .exact = true };
-    if (iterated == types.no_type) return .{};
-    return .{ .ty = try c.ts.makeArray(iterated) };
+    if (c.ts.kind(r) == .tuple) return sliceTuple(c, r, index, 0);
+    if (iterated == types.no_type) return types.no_type;
+    return c.ts.makeArray(iterated);
 }
 
 /// The assignment target of one pattern element, peeled through its default
@@ -7039,10 +7021,10 @@ fn arrayRestSourceType(c: *Checker, src: TypeId, iterated: TypeId, index: u32) E
 /// not-yet-assigned `let` through a destructuring assignment reported TS2454
 /// at the write site itself.
 ///
-/// `src` is what the position reads out of the value being destructured; its
-/// `ty` is `no_type` where that could not be resolved, which is tsc's
-/// `errorType` and relates to anything.
-fn checkDestructuringTarget(c: *Checker, el0: Node, src: DestructSrc, site: RefSite) Error!void {
+/// `src` is what the position reads out of the value being destructured;
+/// `no_type` where that could not be resolved, which is tsc's `errorType` and
+/// relates to anything.
+fn checkDestructuringTarget(c: *Checker, el0: Node, src: TypeId, site: RefSite) Error!void {
     const el = skipParens(c, el0);
     if (el == null_node) return;
     const d = c.tree.nodeData(el);
@@ -7067,7 +7049,7 @@ fn checkDestructuringTarget(c: *Checker, el0: Node, src: DestructSrc, site: RefS
             }
         },
         .array_literal, .object_literal, .array_pattern, .object_pattern => {
-            try checkDestructuringPattern(c, el, src.ty);
+            try checkDestructuringPattern(c, el, src);
         },
         .omitted, .error_node, .unsupported => {},
         // tsc's `checkReferenceAssignment`: a leaf pattern element is a write,
@@ -7078,13 +7060,12 @@ fn checkDestructuringTarget(c: *Checker, el0: Node, src: DestructSrc, site: RefS
             const is_ref = try checkReferenceExpression(c, el0, site);
             // …and the value written is the position's source type, related
             // to the target exactly as `x = v` relates `v`. Gated on the
-            // reference check, so an illegal target reports once, and on the
-            // reading being EXACT (`DestructSrc`).
-            if (is_ref and src.exact and
-                src.ty != types.no_type and src.ty != types.any_type and src.ty != types.error_type and
+            // reference check, so an illegal target reports once.
+            if (is_ref and
+                src != types.no_type and src != types.any_type and src != types.error_type and
                 target_t != types.any_type and target_t != types.error_type)
             {
-                _ = try c.checkAssignable(src.ty, target_t, el, c.nodeSpan(el));
+                _ = try c.checkAssignable(src, target_t, el, c.nodeSpan(el));
             }
         },
     }
@@ -7094,17 +7075,9 @@ fn checkDestructuringTarget(c: *Checker, el0: Node, src: DestructSrc, site: RefS
 /// initializer stands between them — tsc's `getTypeWithFacts(sourceType,
 /// TypeFacts.NEUndefined)`. The default is precisely what the target receives
 /// when the position holds `undefined`, so `undefined` never reaches it.
-fn defaultedSource(c: *Checker, src: DestructSrc) Error!DestructSrc {
-    if (src.ty == types.no_type) return src;
-    return .{ .ty = try c.removeUndefined(src.ty), .exact = src.exact };
-}
-
-/// A position reached by NAME — an object pattern's property. tsc looks the
-/// property up on the source type itself, exactly as ztsc's
-/// `destructuringMemberType` does, so the reading is exact whenever it
-/// resolved at all.
-fn namedSource(ty: TypeId) DestructSrc {
-    return .{ .ty = ty, .exact = ty != types.no_type };
+fn defaultedSource(c: *Checker, src: TypeId) Error!TypeId {
+    if (src == types.no_type) return src;
+    return c.removeUndefined(src);
 }
 
 /// tsc's `getContextualCallSignature` for an INTERSECTION contextual type:

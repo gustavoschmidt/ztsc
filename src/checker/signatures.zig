@@ -1159,12 +1159,15 @@ fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) Erro
 /// body, and `N` is `unknown` — the value a caller hands to `.next()`,
 /// which nothing in the body can pin down.
 ///
-/// A `yield*` delegation is deliberately NOT inferred: its yield type is
-/// the delegated iterable's element type, which needs the iterator
-/// protocol, and guessing it would be inventing. Such a body keeps the old
-/// `any`, so this narrows the gap rather than trading it for a wrong
-/// answer. Same for `async function*` (`AsyncGenerator`'s own shape) and
-/// for a generator without a body.
+/// A `yield*` delegation contributes what its operand ITERATES, which is
+/// the same `checkIteratedTypeOrElementType` reading the body check relates
+/// against an annotation (`expr.zig`'s `yield_expr` arm) — so `function* ()
+/// { yield *[new Baz] }` infers `Generator<Baz, …>`. Diagnostics are the
+/// body check's job, never this probe's: it runs with none of the contexts
+/// the body installs and memoizes its answer, so `forOfElementType` is
+/// called with no blame node here and a non-iterable operand simply
+/// contributes `any`. `async function*` (`AsyncGenerator`'s own shape) and
+/// a generator without a body still keep the old `any`.
 ///
 /// `ret_ctx` is the CONTEXTUAL return type (0 when there is none). Its
 /// generator arm supplies the yield and return contexts the operands are typed
@@ -1180,7 +1183,7 @@ fn inferGeneratorReturn(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId)
     const base_scope = (try c.scopeOf(fn_node)) orelse c.cur_scope;
     var yields = try collectYields(c, c.tree.nodeRange(body), base_scope);
     defer yields.deinit(c.scratch());
-    if (yields.delegated) return types.any_type;
+    if (yields.unresolved) return types.any_type;
 
     const iter_ctx = try contextualIteration(c, ret_ctx, false);
     const yield_ctx: TypeId = if (iter_ctx) |it| it.yield else 0;
@@ -1203,9 +1206,14 @@ fn inferGeneratorReturn(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId)
         defer c.cur_scope = saved_scope;
         var parts: std.ArrayList(TypeId) = .empty;
         defer parts.deinit(c.scratch());
-        for (yields.exprs.items, yields.scopes.items) |y, sc| {
-            c.cur_scope = sc;
-            try parts.append(c.scratch(), try c.widenLiteral(try c.checkExprCached(y, yield_ctx)));
+        for (yields.sites.items) |y| {
+            c.cur_scope = y.scope;
+            // A delegation types its operand by the generator's whole
+            // contextual return type, exactly as the body check does.
+            const operand_ctx: TypeId = if (y.delegate) ret_ctx else yield_ctx;
+            const vt = try c.checkExprCached(y.expr, operand_ctx);
+            const contributed = if (y.delegate) try c.forOfElementType(vt, null_node, false) else vt;
+            try parts.append(c.scratch(), try c.widenLiteral(contributed));
         }
         if (yields.bare) try parts.append(c.scratch(), types.undefined_type);
         yield_ty = try c.ts.makeUnion(c.scratch(), parts.items);
@@ -1214,20 +1222,22 @@ fn inferGeneratorReturn(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId)
     return c.ts.makeRef(gen_sym, &.{ yield_ty, ret_ty, types.unknown_type });
 }
 
-/// The `yield` operands of one generator body: each yielded expression with
-/// the scope it resolves in, whether a BARE `yield` (which contributes
-/// `undefined`) occurred, and whether a `yield*` delegation did — the last
-/// abandons inference entirely, so it is a property of the whole body rather
-/// than of any one site.
-pub const YieldSites = struct {
-    exprs: std.ArrayList(Node) = .empty,
-    scopes: std.ArrayList(ScopeId) = .empty,
-    bare: bool = false,
-    delegated: bool = false,
+/// One `yield` operand of a generator body: the expression, the scope it
+/// resolves in, and whether it is a DELEGATION (`yield* xs`), which
+/// contributes what `xs` iterates rather than `xs` itself.
+const YieldSite = struct { expr: Node, scope: ScopeId, delegate: bool };
 
-    pub fn deinit(self: *YieldSites, gpa: std.mem.Allocator) void {
-        self.exprs.deinit(gpa);
-        self.scopes.deinit(gpa);
+/// The `yield` operands of one generator body, plus whether a BARE `yield`
+/// (which contributes `undefined`) occurred and whether any site is
+/// UNRESOLVABLE — a `yield*` with no operand, which only parse recovery
+/// produces and which abandons inference for the whole body.
+const YieldSites = struct {
+    sites: std.ArrayList(YieldSite) = .empty,
+    bare: bool = false,
+    unresolved: bool = false,
+
+    fn deinit(self: *YieldSites, gpa: std.mem.Allocator) void {
+        self.sites.deinit(gpa);
     }
 };
 
@@ -1260,13 +1270,10 @@ fn walkYields(c: *Checker, node: Node, sites: *YieldSites, scope: ScopeId) Error
     switch (c.nodeTag(node)) {
         .yield_expr => {
             const d = c.tree.nodeData(node);
-            if (d.rhs != 0) {
-                sites.delegated = true;
-                return;
-            }
             if (d.lhs != 0) {
-                try sites.exprs.append(c.scratch(), d.lhs);
-                try sites.scopes.append(c.scratch(), scope);
+                try sites.sites.append(c.scratch(), .{ .expr = d.lhs, .scope = scope, .delegate = d.rhs != 0 });
+            } else if (d.rhs != 0) {
+                sites.unresolved = true;
             } else sites.bare = true;
         },
         // Don't descend into nested functions/classes: their yields belong
