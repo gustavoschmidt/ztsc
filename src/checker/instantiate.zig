@@ -76,107 +76,87 @@ pub fn aliasInstance(c: *Checker, sym: SymbolId, args: []const TypeId, tok: Toke
     // is NOT interchangeable, because discriminant narrowing and the
     // union-source relation arms switch on `.union_type` directly.
     //
-    // ===== WAVE-26 DETERMINISM FINDING (agent D) — READ BEFORE TOUCHING =====
+    // ===== THIS RULE IS PARTITION-DEPENDENT AND THE FIX IS NOT A GATE =====
     //
-    // The rule above is still PARTITION-DEPENDENT, and it is the confirmed
-    // root cause of social-app's `Navigation.tsx:778` moving between
-    // `--checkers=1` and `--checkers=4`. `alias_recursive` is written by ONE
-    // place — the cycle-cut arm above — so in a cluster of MUTUALLY recursive
-    // aliases exactly one member is ever marked: whichever the checker
-    // instance happened to materialize first. @react-navigation is the
-    // measured pair. `NativeStackNavigationProp` reaches
-    // `NativeStackHeaderProps` through its options; `NativeStackHeaderProps`
-    // declares `navigation: NativeStackNavigationProp<…>` straight back.
-    // Enter at the first and the first is marked (and keeps the ref
-    // spelling), enter at the second and the second is. Instrumented tallies
-    // of this function's three arms, social-app:
+    // `alias_recursive` is written by ONE place — the cycle-cut arm above — so
+    // in a cluster of MUTUALLY recursive aliases exactly one member is ever
+    // marked: whichever this checker instance materialized first. That is the
+    // confirmed root cause of social-app's `Navigation.tsx:778` moving between
+    // partitions. @react-navigation is the measured pair:
+    // `NativeStackNavigationProp` reaches `NativeStackHeaderProps` through its
+    // options and `NativeStackHeaderProps` declares `navigation:
+    // NativeStackNavigationProp<…>` straight back, so entering at either end
+    // marks that end and the diagnostic prints `NativeStackNavigationProp<{…}>`
+    // under one partition and the expanded 40-member object under another.
     //
-    //     --checkers=1   NativeStackNavigationProp  cut+ref, HeaderProps  struct
-    //     --checkers=4   NativeStackNavigationProp  struct,  HeaderProps  cut+ref
+    // WAVE 29 built the two order-INDEPENDENT keyings this needs and MEASURED
+    // all three. Both are cheap, and the recipe is the same: push `sym` onto a
+    // stack in `aliasGeneric` and pop it on the way out, so that when the cut
+    // above fires, the stack suffix from `sym`'s own frame to the innermost one
+    // IS the cycle that reference just closed. "Self-recursive" is then `sym ==
+    // top`, and "whole cycle" is the whole suffix — both properties of the
+    // alias GRAPH (`aliasGeneric` walks the same body from every entry point),
+    // where `alias_recursive` names only the member entered first. Excalidraw,
+    // `--checkers=1`, against its 17-diagnostic baseline:
     //
-    // and the TS2322 printed `NativeStackNavigationProp<{…}>` at one checker
-    // and the expanded 40-member object at four. Same program, same file
-    // order, two type identities.
+    //   * this rule (`alias_recursive`, partition-dependent)  17  — baseline
+    //   * SELF-recursive only (cycle length one)              21  (+4)
+    //   * WHOLE cycle                                         22  (+5)
     //
-    // What is NOT the cause, measured and ruled out this wave — the campaign
-    // doc's long-standing "instantiation budget charges misses not hits"
-    // hypothesis. Raising BOTH caps to 250 M (`max_instantiation_count` and
-    // `max_decl_instantiation_count`, so nothing in the run can trip) left all
-    // three divergent social-app lines byte-identical to the bounded run;
-    // so did disabling `lazyIndexedProp` outright, and so did refusing to
-    // memoize a `typeOfSymbol` result computed across a circular cut.
+    // Both deterministic keyings are byte-identical across `--checkers=1/2/4/8`
+    // and every file order — they DO close the defect — and both cost fresh
+    // false positives, which is why neither shipped. What each costs:
     //
-    // Two ORDER-INDEPENDENT rules were built and measured; neither is
-    // landable as it stands, and the second is the one to finish:
+    //   * SELF-recursive only leaves a mutual cluster with NO member keeping
+    //     the ref, so the mixing this rule exists to prevent comes back inside
+    //     that cluster: excalidraw's `BoundElement` ↔ `ExcalidrawLinearElement`
+    //     pair lands both spellings in one union and prints it —
+    //     `readonly { id: string; type: "arrow" | "text"; }[] | readonly
+    //     BoundElement[] | null` — after which `Mutable<NonNullable<…>>` over
+    //     it reduces to `{}` and four diagnostics follow (restore.ts:404/417,
+    //     newElement.ts:749/756).
+    //   * WHOLE cycle fixes exactly that (both members keep the ref, nothing
+    //     mixes) and exposes a different gap one layer down: a property lookup
+    //     through an INTERSECTION that still contains a `.ref` does not
+    //     intersect the ref's members, so `{containerId: string} &
+    //     ExcalidrawTextElement` answers `string | null` for `containerId`
+    //     instead of `string` — five TS2345 in resize.test.tsx.
     //
-    //   * Mark the WHOLE cycle — push the `alias_state == 1` set as a stack
-    //     and, on a re-entry, mark the suffix from the re-entered alias up.
-    //     That set IS a property of the alias graph (entering the pair above
-    //     at either end yields both members). But giving both the lazy `.ref`
-    //     spelling costs three fresh social-app false positives — an
-    //     `AnimatedRef<AnimatedComponentType<…>>` TS2322 and two
-    //     `Property '…' does not exist on type '{}'` — and left the two
-    //     checker counts FURTHER apart (97 vs 99 check errors, was 94/94).
+    // So the whole-cycle keying plus that intersection-lookup fix is the
+    // landable path, and it is the one to finish.
     //
-    //   * Drop this rule entirely — always materialize outside the cycle.
-    //     social-app comes out 95 / 95, `Navigation.tsx:778` converges, and
-    //     the cost is ONE new false positive (`FeedPage.tsx:101`, a TS2345
-    //     the ref spelling used to relate away).
+    // Two more things the next attempt needs, both measured here:
     //
-    // ===== WAVE-27 FOLLOW-UP (agent B): WHAT `FeedPage.tsx:101` ACTUALLY IS
-    //
-    // It is an INFERENCE gap in `infer.unify`, not a relation gap in
-    // `assign.zig`, and it is NOT a fault of this rule — it reproduces with
-    // the rule ON. Standalone repro, oracle-clean, ztsc reports one TS2345:
-    //
-    // ```ts
-    // type Keyof<P extends {}> = Extract<keyof P, string>;
-    // type NavState<P extends {} = {}> = { routeNames: Keyof<P>[] };
-    // type Helpers<P extends {}, S extends NavState = NavState> = {
-    //   getState(): S; reset(state: S): void;
-    // };
-    // type NavProp<P extends {}, S extends NavState = NavState<P>> =
-    //   Omit<Helpers<P, S>, 'getParent'> & { setOptions(): void };
-    // type Native<P extends {}> = NavProp<P, NavState<P>>;
-    // declare const nav: Native<{ A: undefined; B: undefined }>;
-    // declare function getRoot<T extends {}>(n: NavProp<T>): NavProp<T>;
-    // getRoot(nav);      // ztsc: TS2345.  tsgo 7.0.2: clean.
-    // ```
-    //
-    // `T` takes NO candidate and falls back to its `{}` constraint, so
-    // `Extract<keyof {}, string>` is `never` and the parameter's route names
-    // are `never[]` — nothing can meet it. Measured, in order:
-    //
-    //   * the intersection arm of `unify` DOES pair the two `Omit`-materialized
-    //     constituents (`intersectionMembersPair` returns true, both carry a
-    //     `.ref` origin naming `Omit`), and the `unify` under that pair still
-    //     records nothing;
-    //   * drop the `& { setOptions(): void }` and it PASSES — without the
-    //     intersection the parameter stays a deferred `.mapped` and
-    //     `inferReverseMapped`'s same-alias rule binds `T`. The intersection is
-    //     what forces the mapped type to materialize into a plain object;
-    //   * drop the `Omit` and it passes (the `Helpers<…>` reference pairs
-    //     directly); put the extras only on `Native` and it passes.
-    //
-    // So the missing rule is somewhere in the object-vs-object walk under a
-    // materialized mapped application: the alias identity that would answer
-    // (`NavState<T>` vs `NavState<AllParams>`) is intact at the top of the pair
-    // but not recoverable at the property where `T` actually occurs. Two
-    // tsc-faithful additions were tried and did NOT close it — tsc's
-    // `source.aliasSymbol === target.aliasSymbol` rule at the head of `unify`
-    // via `refFacetOf`, and the same rule ahead of the kind test in
-    // `intersectionMembersPair` — so the next step is to instrument which
-    // property pair loses the identity, not to add a third guess.
-    //
-    // Note what the pair of variants proves: NO partition-independent rule
-    // reproduces today's 94-diagnostic social-app baseline, because the 94 is
-    // itself an artifact of the asymmetric marking. Fixing this necessarily
-    // moves the app baseline, and the cheapest correct move is "always
-    // materialize" once the inference gap above is closed.
-    //
-    // Two social-app divergences are NOT explained by any of this and survive
-    // every variant above — `StarterPackDialog.tsx:245` (TS2769) and
-    // `FeedSourceCard.tsx:197` (TS2353). They need their own hunt.
+    //   * `fixTypeArgs`' `shallow_default` guard rides on this rule. It asks
+    //     whether a type parameter's DEFAULT resolved to a `.ref`, which is
+    //     true only while a recursive alias answers with one — so the moment a
+    //     mutual cluster materializes, `NavigationProp`'s `State extends
+    //     NavigationState = NavigationState<ParamList>` comes back an
+    //     `.object`, the guard misses, and the default is left UNSUBSTITUTED
+    //     with the alias's own `ParamList` free. `getRootNavigation(navigation)`
+    //     at social-app's `FeedPage.tsx:101` then has a parameter nothing can
+    //     meet (TS2345, oracle-clean). Testing the default's SYNTAX instead
+    //     (`c.nodeTag(tp.default) == .type_ref`) fixes it and is
+    //     partition-proof, but as an unconditional widening it costs drizzle
+    //     +12.8% wall (3.73 s -> 4.20 s over 9 samples of 20 runs, RSS flat) —
+    //     it pulls drizzle's ordinary `.d.ts` defaults onto the substituting
+    //     branch, which is the re-materialization hazard that branch exists to
+    //     avoid. It has to be scoped to the cyclic aliases, not applied to
+    //     every named default.
+    //   * `compiler/varianceMeasurement.ts` pins this arm's PURPOSE and must
+    //     keep passing. tsc never materializes `Foo3<unknown>` at all — it
+    //     keeps an object carrying `aliasSymbol`/`aliasTypeArguments` and
+    //     relates two of them by `getAliasVariances`, so the body is never
+    //     walked. ztsc interns structurally, so the `.ref` is the only spelling
+    //     that survives interning as "alias A at these arguments", and
+    //     `assign.relate` asks for variance only on a declared `.ref`/`.ref`
+    //     pair (an `origin` tag cannot stand in — a hand-written structural
+    //     type interns equal to an alias's expansion and would inherit its
+    //     variance; see the `Record<string, unknown>` note there). Materialize
+    //     a self-recursive alias and the top-level pair stops being refs, the
+    //     variance shortcut is skipped, and the walk descends into a body that
+    //     names the alias one level down, where the arguments are a
+    //     contravariant hop further in and no longer relate.
     // =======================================================================
     if (c.alias_recursive.contains(sym) and originTaggable(c.ts.kind(generic))) {
         return c.ts.makeRef(sym, fixed);
