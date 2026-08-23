@@ -961,6 +961,29 @@ pub fn isCtorMember(c: *Checker, member: ast.Node, flags: u32) bool {
     return member_names.isCtorMethod(c.tree, member, flags);
 }
 
+/// TS1187, tsc's grammar check on a constructor's parameter list: a parameter
+/// property DECLARES a class member, and a member needs one name — a binding
+/// pattern names several (or none), so the two spellings cannot combine.
+///
+/// The binder already declares the member for the identifier spelling only
+/// (`bindParam` gates on `.identifier`), so a pattern-named parameter
+/// property declares nothing either way; this is the diagnostic that says so.
+/// Blamed on the PARAMETER, whose `main_token` is its first — the modifier
+/// itself, which is where tsc's parameter-node span starts.
+pub fn checkCtorParamPropertyPatterns(c: *Checker, proto: ast.FnProto) Error!void {
+    for (c.tree.extraRange(proto.params_start, proto.params_end)) |pn| {
+        if (pn == null_node or c.nodeTag(pn) != .param_full) continue;
+        const d = c.tree.nodeData(pn);
+        const e = c.tree.extraData(ast.ParamFull, d.rhs);
+        if (e.flags & member_names.param_property_mask == 0) continue;
+        switch (c.nodeTag(d.lhs)) {
+            .array_pattern, .object_pattern => {},
+            else => continue,
+        }
+        try c.diagFmt(1187, c.tokSpan(c.tree.nodeMainToken(pn)), "A parameter property may not be declared using a binding pattern.", .{});
+    }
+}
+
 /// Ceiling on the `extends` walk in `lazyRefProp`. A base chain is already
 /// acyclic by construction (a cyclic `extends` is a bind error), but the
 /// lazy path runs *inside* an in-progress materialization where the usual
