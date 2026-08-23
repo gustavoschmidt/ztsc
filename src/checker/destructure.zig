@@ -708,19 +708,24 @@ fn unionLiteralConstituentLacks(c: *Checker, r: TypeId, name: Atom) Error!bool {
     return false;
 }
 
-/// The TUPLE an ARRAY binding pattern implies, as the CONTEXTUAL TYPE of the
-/// initializer it destructures: tsc's `getTypeFromArrayBindingPattern`,
-/// reached from `getContextualTypeForInitializerExpression`, which falls back
-/// to `getTypeFromBindingPattern(name, /*includePatternInType*/ true)` when
-/// the declaration carries no annotation of its own.
+/// The type a destructuring pattern implies, as the CONTEXTUAL TYPE of the
+/// value it destructures. Both spellings arrive here — a declaration's
+/// BINDING pattern (`var [a, b] = …`) and the expression cover grammar an
+/// ASSIGNMENT pattern parses as (`[a, b] = …`) — and tsc reaches the two by
+/// different routes with different answers, which `arrayPatternContextualType`
+/// spells out.
 ///
-/// It is what makes `var [a, b] = [1, "x"]` give `a: number` and `b: string`.
-/// Without it the literal is checked with no context, widens to
-/// `(string | number)[]`, and every name the pattern binds gets that union —
-/// and a position past the end silently gets it too, instead of the TS2493
-/// an out-of-range tuple index earns.
+/// For a binding pattern it is `getTypeFromArrayBindingPattern`, reached from
+/// `getContextualTypeForInitializerExpression`, which falls back to
+/// `getTypeFromBindingPattern(name, /*includePatternInType*/ true)` when the
+/// declaration carries no annotation of its own. It is what makes
+/// `var [a, b] = [1, "x"]` give `a: number` and `b: string`. Without it the
+/// literal is checked with no context, widens to `(string | number)[]`, and
+/// every name the pattern binds gets that union — and a position past the end
+/// silently gets it too, instead of the TS2493 an out-of-range tuple index
+/// earns.
 ///
-/// Every position is `any`: a pattern says WHERE, never WHAT
+/// Every BINDING position is `any`: such a pattern says WHERE, never WHAT
 /// (`getTypeFromBindingElement` answers `nonInferrableAnyType` for a plain
 /// name). The exception is a nested ARRAY pattern, which recurses so an inner
 /// literal is in tuple context too — a nested OBJECT pattern stays `any`,
@@ -730,11 +735,57 @@ fn unionLiteralConstituentLacks(c: *Checker, r: TypeId, name: Atom) Error!bool {
 ///
 /// `no_type` — no contextual type at all — for anything that implies no
 /// tuple: a non-array pattern, and the two shapes tsc answers
-/// `Iterable<any>`/`any[]` for, an empty pattern and a lone `[...r]`.
+/// `Iterable<any>`/`any[]` for, an empty pattern and a lone `[...r]` that
+/// says nothing about its target.
 pub fn patternContextualType(c: *Checker, pat: Node) Error!TypeId {
     if (pat == null_node) return types.no_type;
-    if (c.nodeTag(pat) == .object_pattern) return objectPatternContextualType(c, pat);
-    if (c.nodeTag(pat) != .array_pattern) return types.no_type;
+    return switch (c.nodeTag(pat)) {
+        .object_pattern => objectPatternContextualType(c, pat),
+        .array_pattern, .array_literal => arrayPatternContextualType(c, pat),
+        else => types.no_type,
+    };
+}
+
+/// How one position of an array pattern behaves, over BOTH vocabularies: a
+/// declaration's binding pattern (`.rest_element`, `.binding_default`) and
+/// the expression cover grammar an assignment pattern parses as
+/// (`.spread_element`, and a plain `=` assignment for a default).
+const ArrayElemRole = enum { rest, hole, defaulted, plain };
+
+fn arrayElemRole(c: *const Checker, el: Node) ArrayElemRole {
+    return switch (c.nodeTag(el)) {
+        .rest_element, .spread_element => .rest,
+        .omitted => .hole,
+        .binding_default => .defaulted,
+        .assign => if (c.tree.tokens.tag(c.tree.nodeMainToken(el)) == .eq) .defaulted else .plain,
+        else => .plain,
+    };
+}
+
+/// An ASSIGNMENT pattern's implied type is `checkArrayLiteral`'s
+/// `inDestructuringPattern` tuple, not `getTypeFromArrayBindingPattern`, and
+/// the two differ in what a position CONTRIBUTES. A binding pattern declares
+/// its names, so a position says WHERE and not WHAT (`any`); an assignment
+/// pattern WRITES names that already have types, and tsc puts each target's
+/// own type at its position — `checkExpressionForMutableLocation(element)`.
+/// That is what makes `[, multiSkillB] = ["roomba", ["vacuum", "mopping"]]`
+/// read the inner literal as the tuple `multiSkillB` is declared to be
+/// instead of widening it to `string[]`.
+///
+/// The target types are read off the DECLARATION
+/// (`assignTargetDeclaredType`), never by checking the target as an
+/// expression — a bare name only, everything else contributing `any`. The
+/// reason is the same one that helper already carries for the object arm:
+/// checking a target as an expression re-runs its diagnostics as a READ,
+/// which is exactly what `checkDestructuringTarget` peels apart to avoid.
+///
+/// A REST element takes the same reading with `ElementFlags.Variadic`
+/// semantics: a target that is itself an array pattern SPREADS its tuple
+/// into these positions, and a target declared as an array becomes this
+/// tuple's rest — so `[...multiRobotAInfo] = ["trimmer", ["trimming", ""]]`
+/// contextually types the inner literal by `multiRobotAInfo`'s element.
+fn arrayPatternContextualType(c: *Checker, pat: Node) Error!TypeId {
+    const assignment = c.nodeTag(pat) == .array_literal;
     const els = c.tree.nodeRange(pat);
     // tsc's `minLength`: one past the last position that is neither the rest,
     // omitted, nor defaulted. Everything after it is optional.
@@ -743,44 +794,97 @@ pub fn patternContextualType(c: *Checker, pat: Node) Error!TypeId {
     for (els) |el| {
         if (el == null_node) continue;
         n += 1;
-        switch (c.nodeTag(el)) {
-            .omitted, .rest_element, .binding_default => {},
-            else => min_len = n,
-        }
+        if (arrayElemRole(c, el) == .plain) min_len = n;
     }
     var elems: std.ArrayList(types.TupleElem) = .empty;
     defer elems.deinit(c.scratch());
+    // Whether any position carries more than the `any` a binding pattern
+    // contributes — the test the two "implies nothing" bails below use.
+    var informative = false;
     var i: u32 = 0;
     for (els) |el| {
         if (el == null_node) continue;
         defer i += 1;
-        if (c.nodeTag(el) == .rest_element) {
+        if (arrayElemRole(c, el) == .rest) {
+            const target = c.tree.nodeData(el).lhs;
+            if (assignment) {
+                if (try restTargetTuple(c, target)) |spread| {
+                    for (0..c.ts.tupleLen(spread)) |j| {
+                        try elems.append(c.scratch(), c.ts.tupleElem(spread, @intCast(j)));
+                    }
+                    informative = true;
+                    continue;
+                }
+                if (try assignTargetDeclaredType(c, target)) |t| {
+                    if (c.ts.kind(try c.resolveStructural(t)) == .array) {
+                        try elems.append(c.scratch(), .{ .ty = t, .flags = types.elem_flag_rest });
+                        informative = true;
+                        continue;
+                    }
+                }
+            }
             try elems.append(c.scratch(), .{
                 .ty = try c.ts.makeArray(types.any_type),
                 .flags = types.elem_flag_rest,
             });
             continue;
         }
+        const ty = try patternElemContextualType(c, el, assignment);
+        if (ty != types.any_type) informative = true;
         try elems.append(c.scratch(), .{
-            .ty = try patternElemContextualType(c, el),
+            .ty = ty,
             .flags = if (i >= min_len) types.elem_flag_optional else 0,
         });
     }
     if (elems.items.len == 0) return types.no_type;
-    if (elems.items.len == 1 and elems.items[0].flags & types.elem_flag_rest != 0) return types.no_type;
+    if (!informative and elems.items.len == 1 and elems.items[0].flags & types.elem_flag_rest != 0) return types.no_type;
     return try c.ts.makeTuple(elems.items);
+}
+
+/// The tuple a rest element's target implies, when that target is itself an
+/// array pattern — the operand of `ElementFlags.Variadic` above. Null for
+/// anything else (a plain name, an object pattern, a member expression).
+fn restTargetTuple(c: *Checker, target: Node) Error!?TypeId {
+    if (target == null_node) return null;
+    var t = target;
+    while (c.nodeTag(t) == .paren_expr) t = c.tree.nodeData(t).lhs;
+    switch (c.nodeTag(t)) {
+        .array_pattern, .array_literal => {},
+        else => return null,
+    }
+    const nested = try patternContextualType(c, t);
+    if (nested == types.no_type or c.ts.kind(nested) != .tuple) return null;
+    return nested;
 }
 
 /// One position of the tuple above. A DEFAULT is looked through rather than
 /// typed: tsc types `[a] = [0]` from the default expression, but the only
 /// part of that answer this contextual type can use is its SHAPE, and the
 /// pattern under the default carries the same one.
-fn patternElemContextualType(c: *Checker, el0: Node) Error!TypeId {
+fn patternElemContextualType(c: *Checker, el0: Node, assignment: bool) Error!TypeId {
     var el = el0;
-    while (c.nodeTag(el) == .binding_default) el = c.tree.nodeData(el).lhs;
-    if (c.nodeTag(el) != .array_pattern) return types.any_type;
-    const nested = try patternContextualType(c, el);
-    return if (nested == types.no_type) types.any_type else nested;
+    while (true) {
+        switch (c.nodeTag(el)) {
+            .binding_default => el = c.tree.nodeData(el).lhs,
+            .assign => {
+                if (c.tree.tokens.tag(c.tree.nodeMainToken(el)) != .eq) break;
+                el = c.tree.nodeData(el).lhs;
+            },
+            .paren_expr => el = c.tree.nodeData(el).lhs,
+            else => break,
+        }
+    }
+    switch (c.nodeTag(el)) {
+        .array_pattern, .array_literal => {
+            const nested = try patternContextualType(c, el);
+            return if (nested == types.no_type) types.any_type else nested;
+        },
+        else => {},
+    }
+    if (assignment) {
+        if (try assignTargetDeclaredType(c, el)) |t| return t;
+    }
+    return types.any_type;
 }
 
 /// The object type an OBJECT binding pattern implies, as the CONTEXTUAL TYPE

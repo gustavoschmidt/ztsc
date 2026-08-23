@@ -33,6 +33,7 @@ const computed_key = @import("computed_key.zig");
 const conditions = @import("conditions.zig");
 const expr_zig = @import("expr.zig");
 const checkExprCached = expr_zig.checkExprCached;
+const checkCtorParamPropertyPatterns = @import("classes.zig").checkCtorParamPropertyPatterns;
 const classStaticType = @import("enums.zig").classStaticType;
 const decorators = @import("decorators.zig");
 const destructure = @import("destructure.zig");
@@ -2750,6 +2751,7 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
                 if (is_abstract and md.rhs != 0 and !c.isCtorMember(member, proto.flags)) {
                     try c.diagFmt(1245, c.tokSpan(c.tree.nodeMainToken(member)), "Method '{s}' cannot have an implementation because it is marked abstract.", .{c.tokenText(c.tree.nodeMainToken(member))});
                 }
+                if (c.isCtorMember(member, proto.flags)) try checkCtorParamPropertyPatterns(c, proto);
                 c.this_type = if (is_static and class_sym != binder.no_symbol)
                     try c.ts.makeClassValue(class_sym)
                 else
