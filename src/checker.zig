@@ -846,7 +846,8 @@ pub const map_containers = [_][]const u8{
     "class_inst_generic",       "class_static_cache",     "class_static_owner",
     "class_static_stack",       "class_ctor_cache",       "enum_value_cache",
     "enum_info_cache",          "enum_relation_cache",    "alias_generic",
-    "alias_state",              "alias_recursive",        "flow_same",
+    "alias_state",              "alias_recursive",        "alias_stack",
+    "flow_same",
     "flow_narrow",              "ref_keys",               "flow_loop_stack",
     "flow_stack",               "flow_tmp",               "flow_reduce",
     "da_cache",                 "ctp_cache",              "cmp_cache",
@@ -1399,12 +1400,31 @@ pub const Checker = struct {
     enum_relation_cache: IntMap(u64, bool) = .empty,
     alias_generic: IntMap(SymbolId, TypeId) = .empty,
     alias_state: IntMap(SymbolId, u8) = .empty,
-    /// Alias symbols found to be (transitively) self-recursive while their
-    /// generic body was materialized — marked when `aliasInstance` re-enters an
-    /// in-progress alias (state == 1). Used to scope the recursion-accumulator
-    /// default substitution in `fixTypeArgs` (RHF `PathInternal<T, Tr = T>`)
-    /// away from non-recursive library defaults (redux `Reducer<S, A, P = S>`).
+    /// Alias symbols that lie ON a cycle of the alias graph. Written by
+    /// `aliasInstance`'s cycle-cut arm: when a reference re-enters an
+    /// in-progress alias (state == 1), the suffix of `alias_stack` from that
+    /// alias's own frame up to the innermost one IS the cycle the reference
+    /// just closed, and EVERY member of it is marked.
+    ///
+    /// Marking the whole cycle rather than only its entry point is what makes
+    /// this set a property of the alias GRAPH instead of of the visit order —
+    /// `aliasGeneric` walks the same body from every entry point, so whichever
+    /// member a checker instance happens to materialize first, the same set
+    /// comes out. See `aliasInstance` for why that matters (one spelling per
+    /// recursive alias, identical under `--checkers=1/2/4/8`).
+    ///
+    /// Used to give a recursive alias with an `originTaggable` body ONE
+    /// spelling, to scope `fixTypeArgs`' recursion-accumulator default
+    /// substitution (RHF `PathInternal<T, Tr = T>`) away from non-recursive
+    /// library defaults (redux `Reducer<S, A, P = S>`), and to scope the same
+    /// function's `shallow_default` syntax test.
     alias_recursive: IntMap(SymbolId, void) = .empty,
+    /// Cycle-detection stack: the alias symbols whose generic body is being
+    /// materialized right now, outermost first. Pushed/popped by
+    /// `aliasGeneric`; read only by `aliasInstance`'s cut arm, to name the
+    /// cycle a back-reference closes. Mutable state, justified as a
+    /// cycle-detection stack (see CLAUDE.md).
+    alias_stack: std.ArrayList(SymbolId) = .empty,
     /// Narrowed-type cache per `(flow, reference, declared)` query, split by
     /// outcome so the overwhelmingly common one costs no value slot. See
     /// `FlowQ` for the packed key and why the split is behaviour-preserving.

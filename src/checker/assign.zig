@@ -4571,13 +4571,46 @@ pub fn intersectionPairAssignable(c: *Checker, s: TypeId, t: TypeId) Error!?bool
 
 /// Does this intersection still carry a `null`/`undefined` constituent?
 pub fn hasNullishMember(c: *Checker, t: TypeId) Error!bool {
-    for (try c.memberList(t)) |m| {
-        switch (c.ts.kind(try c.resolveStructural(m))) {
+    var mem: std.ArrayList(TypeId) = .empty;
+    defer mem.deinit(c.scratch());
+    try flattenIntersection(c, t, &mem, 0);
+    for (mem.items) |m| {
+        switch (c.ts.kind(m)) {
             .null, .undefined => return true,
             else => {},
         }
     }
     return false;
+}
+
+/// The RESOLVED constituents of an intersection, with nested intersections
+/// spliced in rather than left as one opaque member.
+///
+/// `makeIntersection` flattens what it can SEE, but a constituent that was a
+/// lazy alias `.ref` at construction time is one member then and an
+/// intersection after `resolveStructural` — and every rule that walks the
+/// constituent list saw the unflattened form and skipped it. Excalidraw is the
+/// measured case: `{ type: "arrow" } & ExcalidrawLinearElement &
+/// ExcalidrawTextElement`, where both aliases have INTERSECTION bodies
+/// (`_ExcalidrawElementBase & Readonly<{ type: "text"; … }>`), so the
+/// `type: "arrow"` / `type: "text"` conflict that makes the whole thing
+/// uninhabited lived one level below what `computeIntersectionIsNever` looked
+/// at, and five TS2345 followed in `resize.test.tsx`.
+///
+/// `depth` bounds a `type A = A & B` chain the same way `resolveStructural`
+/// bounds a `.ref` chain; a member past the cap is kept unflattened, which is
+/// the conservative answer for every caller (they only ever ADD evidence).
+fn flattenIntersection(c: *Checker, t: TypeId, out: *std.ArrayList(TypeId), depth: u32) Error!void {
+    const members = try c.scratch().dupe(TypeId, try c.memberList(t));
+    defer c.scratch().free(members);
+    for (members) |m| {
+        const rm = try c.resolveStructural(m);
+        if (c.ts.kind(rm) == .intersection and depth < 8) {
+            try flattenIntersection(c, rm, out, depth + 1);
+        } else {
+            try out.append(c.scratch(), rm);
+        }
+    }
 }
 
 pub fn computeIntersectionIsNever(c: *Checker, t: TypeId) Error!bool {
@@ -4589,11 +4622,17 @@ pub fn computeIntersectionIsNever(c: *Checker, t: TypeId) Error!bool {
     // inhabitants. A member that is still instantiable (a type parameter, a
     // deferred conditional/mapped/indexed access) is left alone, exactly as
     // the store leaves it: `null & T` stays a real, non-empty type.
+    // Nested intersections spliced in: a constituent that was a lazy alias
+    // `.ref` when the intersection was interned resolves to an intersection
+    // here, and both rules below must see ITS constituents. See
+    // `flattenIntersection`.
+    var flat: std.ArrayList(TypeId) = .empty;
+    defer flat.deinit(c.scratch());
+    try flattenIntersection(c, t, &flat, 0);
     {
         var nullish = false;
         var other_domain = false;
-        for (try c.memberList(t)) |m| {
-            const rm = try c.resolveStructural(m);
+        for (flat.items) |rm| {
             switch (c.ts.kind(rm)) {
                 .null, .undefined => nullish = true,
                 .object, .array, .tuple, .function, .overloads, .class_value, .object_keyword, .void, .string, .number, .boolean, .bigint, .symbol, .bool_true, .bool_false, .string_literal, .number_literal, .number_literal_fresh, .bigint_literal, .enum_type, .unique_symbol, .template_literal_type, .string_mapping => other_domain = true,
@@ -4605,8 +4644,7 @@ pub fn computeIntersectionIsNever(c: *Checker, t: TypeId) Error!bool {
     var mem: std.ArrayList(TypeId) = .empty;
     defer mem.deinit(c.scratch());
     var n_obj: usize = 0;
-    for (try c.memberList(t)) |m| {
-        const rm = try c.resolveStructural(m);
+    for (flat.items) |rm| {
         switch (c.ts.kind(rm)) {
             .object => {
                 n_obj += 1;
