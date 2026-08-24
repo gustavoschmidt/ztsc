@@ -4444,7 +4444,24 @@ pub fn structuralAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
                     for (0..c.ts.objectPropCount(s)) |i| {
                         const sp = c.ts.objectProp(s, @intCast(i));
                         if (!isNumericPropName(c.atomText(sp.name))) continue;
-                        if (!try c.isAssignable(sp.ty, nidx)) return false;
+                        // An OPTIONAL property keeps its `| undefined` against a
+                        // NUMBER index signature. tsc's `membersRelatedToIndexInfo`
+                        // strips the `undefined` an optional property carries
+                        // (`getTypeWithFacts(propType, NEUndefined)`) — but not
+                        // when `keyType === numberType`, which is a separate
+                        // clause of the same condition. So `{ [k: string]: string }`
+                        // accepts `{ k1?: string }` and `{ [k: number]: string }`
+                        // refuses `{ 1?: string }`
+                        // (`optionalPropertyAssignableToStringIndexSignature`).
+                        // ztsc keeps the `| undefined` out of the stored property
+                        // type and unions it in at read time, so the string arm
+                        // above already reads as tsc's stripped form and only this
+                        // one has to put it back.
+                        const spt = if (sp.optional())
+                            try c.makeUnion2(sp.ty, types.undefined_type)
+                        else
+                            sp.ty;
+                        if (!try c.isAssignable(spt, nidx)) return false;
                     }
                 } else return false; // interface / class instance, no index sig
             },
