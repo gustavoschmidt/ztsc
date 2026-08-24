@@ -905,9 +905,43 @@ pub fn inferTypeArgs(
     const empty_seed = try c.scratch().alloc(TypeId, tp_syms.len);
     for (empty_seed) |*x| x.* = types.no_type;
     const pre_seed = try c.scratch().alloc(TypeId, tp_syms.len);
+    // A GENERIC-function argument written to the RIGHT of a context-sensitive
+    // one is inferred LAST, not first. tsc runs `inferTypeArguments` twice:
+    // round one carries `CheckMode.SkipGenericFunctions` alongside
+    // `SkipContextSensitive`, so *both* kinds of argument answer
+    // `anyFunctionType` and infer nothing (`instantiateTypeWithSingle
+    // GenericCallSignature`'s `skippedGenericFunction` arm); round two then
+    // walks every argument in SOURCE ORDER with both skips off. Splitting the
+    // walk by argument SHAPE — non-functions first, function expressions
+    // second — inverts that order for exactly one pair, and the higher-order
+    // mint below is where the inversion shows:
+    //
+    //     pipe<A extends any[], B, C>(ab: (...args: A) => B, bc: (b: B) => C)
+    //     pipe(x => list(x), box)
+    //
+    // Read box-then-arrow, `B` is still free when `box` arrives, so its `V`
+    // MINTS `V'` and `B := V'`; the arrow is then contextually typed
+    // `(...args: A) => V'`, its `list(x)` answers `any[]`, and `any[]` is not
+    // assignable to `V'` (nine keys of `genericFunctionInference1`, plus the
+    // same shape in `pipe(getString, s => orUndefined(s), identity)`). Read in
+    // source order, the arrow supplies `B := any[]` first, and `box` then takes
+    // the SUBSTITUTING branch — tsc's `instantiateSignatureInContextOf` — for
+    // `(x: any[]) => { value: any[] }`, which is tsgo's answer exactly.
+    //
+    // Only the arguments that can take the mint are moved, and only past a
+    // context-sensitive argument that really precedes them: every other Phase-1
+    // argument keeps its position, so the seeds Phase 2 reads are unchanged.
+    //
+    // Answered LAZILY — the scan walks every argument and asks each function one
+    // for its context sensitivity, and the shape that needs the answer (a
+    // combinator handed a generic function value) is rare enough that paying for
+    // it on every generic call is measurable on drizzle.
+    var cs_first: ?usize = null;
+    var deferred_ho: std.ArrayList(struct { pt: TypeId, at: TypeId }) = .empty;
+    defer deferred_ho.deinit(c.scratch());
     // Phase 1: non-function arguments.
     var ai: u32 = 0;
-    for (arg_nodes) |an| {
+    for (arg_nodes, 0..) |an, ord| {
         if (an == null_node) continue;
         defer ai += 1;
         const tag = c.nodeTag(an);
@@ -1490,6 +1524,22 @@ pub fn inferTypeArgs(
             }
             continue;
         }
+        // The source-order repair described at `cs_first`: hold this argument's
+        // evidence back until Phase 2 has run. The test is tsc's own —
+        // `getSingleSignature(type, Call)` with type parameters, against a
+        // contextual signature that has none — because that pair is exactly
+        // what reaches `instantiateTypeWithSingleGenericCallSignature`, and so
+        // exactly what round one skips.
+        if (ho_result_fn and c.ts.kind(at) == .function and c.ts.fnTypeParamCount(at) > 0) {
+            if (cs_first == null) cs_first = firstContextSensitiveArg(c, arg_nodes);
+            if (ord > cs_first.?) {
+                const rp = try c.resolveStructural(pt);
+                if (c.ts.kind(rp) == .function and c.ts.fnTypeParamCount(rp) == 0) {
+                    try deferred_ho.append(c.scratch(), .{ .pt = pt, .at = at });
+                    continue;
+                }
+            }
+        }
         try c.unify(pt, at, tp_syms, candidates, 0);
     }
     // Phase 1.75: a NON-ARRAY rest parameter takes the trailing arguments as
@@ -1765,6 +1815,12 @@ pub fn inferTypeArgs(
         for (partial, 0..) |*p, i| {
             if (!seeded[i] and candidates[i] != types.no_type) p.ty = candidates[i];
         }
+    }
+    // Phase 2.5: the generic-function arguments Phase 1 held back (see
+    // `cs_first`), now read in their written order with the context-sensitive
+    // arguments' inferences already committed — tsc's round two.
+    for (deferred_ho.items) |d| {
+        try c.unify(d.pt, d.at, tp_syms, candidates, 0);
     }
     // Demoted candidates fill what nothing else constrained.
     for (candidates, 0..) |*cd, i| {
@@ -2283,6 +2339,18 @@ fn anyFunctionArg(c: *const Checker, arg_nodes: []const Node) bool {
         if (an != null_node and isFunctionArg(c, an)) return true;
     }
     return false;
+}
+
+/// Index of the first CONTEXT-SENSITIVE function argument, or `maxInt` when the
+/// call has none — the boundary Phase 1's generic-function deferral reads (see
+/// the note at `cs_first`). An index into `arg_nodes`, so it compares directly
+/// against the Phase-1 walk's own position.
+fn firstContextSensitiveArg(c: *Checker, arg_nodes: []const Node) usize {
+    for (arg_nodes, 0..) |an, i| {
+        if (an == null_node or !isFunctionArg(c, an)) continue;
+        if (c.fnExprIsContextSensitive(skipParens(c, an))) return i;
+    }
+    return std.math.maxInt(usize);
 }
 
 /// Is `an` an argument Phase 2 owns — an arrow or function expression, through
