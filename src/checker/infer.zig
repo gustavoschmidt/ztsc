@@ -728,6 +728,19 @@ pub const InferCtx = struct {
     /// be inferred into the source's — and erasing it to `unknown` poisons the
     /// outer inference. See the `bare_self` branch there.
     sig_ctx: u32 = 0,
+    /// Live while the walk is reading an argument that was CHECKED against a
+    /// contextual type still carrying this call's free inference variables —
+    /// `inferTypeArgs` Phase 1's `arg_ctx`. What such an argument hands back can
+    /// be the contextual type itself coming home rather than evidence, and the
+    /// one shape that is unambiguously so is a candidate that IS the variable it
+    /// is a candidate FOR (see `unify`'s `.type_param` arm).
+    ///
+    /// Zero everywhere else, which is what keeps ztsc's un-cloned type
+    /// parameters working: a recursive call inside its own generic function's
+    /// body (`function Generate<U>(func: Generator<U>): U { return Generate(func) }`)
+    /// legitimately infers `U := U`, because the `U` the argument carries is the
+    /// enclosing signature's fixed one and only shares a symbol with the call's.
+    ctx_echo: u32 = 0,
     /// tsc's `instantiateTypeWithSingleGenericCallSignature` gate: this call
     /// RETURNS a single non-generic call signature, so a type parameter minted
     /// for a generic function argument has somewhere to be generalized to.
@@ -916,6 +929,15 @@ pub fn inferTypeArgs(
     const empty_seed = try c.scratch().alloc(TypeId, tp_syms.len);
     for (empty_seed) |*x| x.* = types.no_type;
     const pre_seed = try c.scratch().alloc(TypeId, tp_syms.len);
+    // Which slots took a candidate that still NAMES one of this call's own
+    // parameters, from an argument CHECKED against a contextual type carrying
+    // that parameter free (`InferCtx.ctx_echo`). Those are the ones the
+    // resolution loop substitutes; every other self-naming candidate is left
+    // exactly as written, because ztsc's un-cloned type parameters make an
+    // identity candidate the ANSWER as often as not (see the loop).
+    const ctx_echoed = try c.scratch().alloc(bool, tp_syms.len);
+    @memset(ctx_echoed, false);
+    const before_ctx = try c.scratch().alloc(TypeId, tp_syms.len);
     // A GENERIC-function argument written to the RIGHT of a context-sensitive
     // one is inferred LAST, not first. tsc runs `inferTypeArguments` twice:
     // round one carries `CheckMode.SkipGenericFunctions` alongside
@@ -1551,7 +1573,22 @@ pub fn inferTypeArgs(
                 }
             }
         }
+        // This argument was checked against a contextual type built out of this
+        // call's own parameters, so what it hands back may be that type coming
+        // home — see `InferCtx.ctx_echo`.
+        const echo_live = arg_ctx != types.no_type;
+        if (echo_live) {
+            for (candidates, 0..) |cd, i| before_ctx[i] = cd;
+            c.infer_ctx.ctx_echo += 1;
+        }
         try c.unify(pt, at, tp_syms, candidates, 0);
+        if (echo_live) {
+            c.infer_ctx.ctx_echo -= 1;
+            for (candidates, 0..) |cd, i| {
+                if (cd == before_ctx[i]) continue;
+                if (try echoesInferVar(c, cd, tp_syms)) ctx_echoed[i] = true;
+            }
+        }
     }
     // Phase 1.75: a NON-ARRAY rest parameter takes the trailing arguments as
     // a TUPLE. tsc's `getNonArrayRestType` / `getSpreadArgumentType`: when
@@ -2020,6 +2057,41 @@ pub fn inferTypeArgs(
         }
         if (candidates[i] != types.no_type) {
             out[i] = candidates[i];
+            // A candidate that still NAMES one of this call's own earlier
+            // parameters takes that parameter's answer. tsc never records such
+            // a candidate in the first place: by the time an argument is walked,
+            // every variable inferred to its left has been substituted into the
+            // contextual type it was checked against (`instantiateContextualType`
+            // through `nonFixingMapper`), so what comes back already mentions the
+            // ANSWER, not the variable. ztsc walks non-function arguments before
+            // context-sensitive ones, so an argument that is itself a nested call
+            // can be typed while a variable to its left is still free and hand it
+            // straight back inside a larger type:
+            //
+            //     pipe(x => list(x), pipe(x => box(x)))
+            //
+            // whose inner `pipe`, contextually typed `(b: B) => C`, answers
+            // `(...args: [B]) => { value: B }` and so makes `C := { value: B }`.
+            // Left standing, `B` printed inside the call's result type and
+            // nothing downstream could relate to it (`genericFunctionInference1`
+            // g08). Substituted, `C` is `{ value: any[] }` — tsgo's answer.
+            //
+            // Earlier parameters only: `prov[0..i]` holds exactly the slots this
+            // loop has already resolved, so the substitution is a single pass in
+            // declaration order with no cycle to chase.
+            //
+            // And only for a slot the contextual-type walk actually marked
+            // (`ctx_echoed`). Everywhere else a candidate naming a sibling is
+            // the ANSWER, because ztsc keys a type parameter by its declaration
+            // symbol and never clones: a generic function that calls ITSELF
+            // (`toThenableInferred`'s `then` handing its own `onFulfilled` back)
+            // infers `Input := Result` from the enclosing signature's fixed
+            // `Result`, and substituting that identity replaces it with whatever
+            // the recursive call inferred for its own `Result`
+            // (`genericCallWithinOwnBodyCastTypeParameterIdentity`).
+            if (i != 0 and ctx_echoed[i] and try echoesInferVar(c, out[i], tp_syms[0..i])) {
+                out[i] = try c.instantiate(out[i], prov[0..i]);
+            }
             // tsc's `getCovariantInference` widens a fresh-literal inference
             // candidate (`getWidenedLiteralType`) before fixing the param —
             // UNLESS the param has a primitive/literal constraint (which
@@ -3171,6 +3243,42 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 // `CR` free after round one instead of pinned to a bag of
                 // placeholders.
                 if (c.aft_seen and try containsAnyFunctionType(c, arg, 0)) return;
+                // An inference from a variable to ITSELF is not evidence when the
+                // argument was CHECKED against a contextual type carrying that
+                // very variable (`InferCtx.ctx_echo`). A still-free inference
+                // variable stands unsubstituted there (`instantiateKnownParams`
+                // leaves it free, tsc's `nonFixingMapper`), so a nested call that
+                // simply threads it through its own signature hands it straight
+                // back as its own candidate:
+                //
+                //     pipe<A extends any[], B, C>(ab: (...args: A) => B,
+                //                                 bc: (b: B) => C)
+                //     pipe(x => list(x), pipe(x => box(x)))
+                //
+                // The inner `pipe` is contextually typed `(b: B) => C`, seeds its
+                // own `A` from `[B]`, and so answers `(...args: [B]) => { value:
+                // B }`. Pairing that with `bc` records `B := B` — CONTRAVARIANTLY,
+                // in a parameter position — and a contravariant candidate outranks
+                // the covariant `any[]` the first argument then supplies, so `B`
+                // resolved to the bare parameter and the arrow's `list(x)` was
+                // reported as `any[]` not assignable to `B`. tsc never sees the
+                // echo: `getInferredType` reads the variable through the inference
+                // context, and a candidate list holding only the variable itself
+                // is the same as no candidate at all.
+                //
+                // Nowhere else. Since ztsc keys a type parameter by its
+                // DECLARATION symbol and never clones, the identity candidate is
+                // routinely the ANSWER: `function Generate<U>(func: Generator<U>):
+                // U { return Generate(func) }` infers `U := U` from an argument
+                // whose `U` is the enclosing signature's fixed one, and the
+                // contextual-RETURN pass reads `Either<L, B>` back into
+                // `new Right(…)`'s own `L` the same way. Both go through this arm
+                // with no contextual type of this call's own in play, so
+                // `ctx_echo` is zero and the candidate stands. A SIGNATURE relation
+                // (`sig_ctx`) needs it too — `getCanonicalSignature` exists so the
+                // target's parameters can be inferred into the source's (the same
+                // distinction the `.function` arm's `bare_self` branch draws).
+                if (c.infer_ctx.sig_ctx == 0 and c.infer_ctx.ctx_echo > 0 and arg == param) return;
                 const cand = arg;
                 // An inference was MADE here, whatever it does to the slot —
                 // see `Checker.infer_writes`.
@@ -4790,9 +4898,69 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 try c.unify(naked, arg, tp_syms, candidates, depth + 1);
             }
         },
-        .mapped => try c.inferReverseMapped(param, arg, tp_syms, candidates, depth),
+        .mapped => {
+            const before_writes = c.infer_writes;
+            try c.inferReverseMapped(param, arg, tp_syms, candidates, depth);
+            if (c.infer_writes == before_writes) {
+                try inferMappedNamedKeys(c, param, arg, tp_syms, candidates, depth);
+            }
+        },
         .keyof_op => try inferToKeyof(c, param, arg, tp_syms, candidates),
         else => {},
+    }
+}
+
+/// The ordinary PROPERTY-WISE walk for a mapped parameter none of the
+/// reverse-mapping rules could invert. tsc's `inferFromObjectTypes` runs
+/// `inferToMappedType` first and falls through to `inferFromProperties` when it
+/// answers false — and `getPropertiesOfObjectType` on a mapped type simply
+/// RESOLVES its members, so a key set that names literals contributes those
+/// properties whatever else it also names.
+///
+/// `Pick<Readonly<FormikConfig<Values> & ExtraProps>, "validate" |
+/// "initialValues" | Exclude<keyof ExtraProps, "validateOnChange">>` is the shape
+/// (`complicatedIndexesOfIntersectionsAreInferencable`): the constraint is not a
+/// bare variable (so the `Pick`-key rule declines) and carries no `keyof T`
+/// operand (so the homomorphic rule declines), while `ExtraProps` keeps it from
+/// materializing at all. Its two LITERAL keys still name real members, and each
+/// one's type — `Readonly<FormikConfig<Values> & ExtraProps>["initialValues"]` —
+/// is exactly the pattern `simplifiedIndexPattern` distributes down to a naked
+/// `Values`. Without this walk `Values` took no candidate anywhere in the call
+/// and fell back to its `object` default, so the `validate` callback's parameter
+/// had no members at all.
+///
+/// Only the literal keys, and only against an OBJECT argument: a key the
+/// constraint leaves symbolic names no property to pair with, and a non-object
+/// argument has no properties either. A key REMAP (`as`) is refused outright —
+/// the constraint's literals are then not the member names.
+fn inferMappedNamedKeys(
+    c: *Checker,
+    m: TypeId,
+    arg: TypeId,
+    tp_syms: []const u32,
+    candidates: []TypeId,
+    depth: u32,
+) Error!void {
+    const s = &c.ts;
+    if (s.mappedAs(m) != 0) return;
+    const ra = try c.resolveStructural(arg);
+    if (s.kind(ra) != .object or s.objectPropCount(ra) == 0) return;
+    const con = s.mappedConstraint(m);
+    if (con == 0) return;
+    const keys: []const TypeId = switch (s.kind(con)) {
+        .union_type => try c.scratch().dupe(TypeId, try c.memberList(con)),
+        .string_literal => try c.scratch().dupe(TypeId, &.{con}),
+        else => return,
+    };
+    defer c.scratch().free(keys);
+    const key_id = s.mappedParamId(s.mappedKeyParam(m));
+    const value = s.mappedValue(m);
+    for (keys) |k| {
+        if (s.kind(k) != .string_literal) continue;
+        const ap = s.objectPropByName(ra, s.literalAtom(k)) orelse continue;
+        const pt = try c.substMappedKey(value, key_id, k);
+        if (pt == value) continue;
+        try c.unify(pt, ap.ty, tp_syms, candidates, depth + 1);
     }
 }
 
@@ -5101,6 +5269,18 @@ pub fn intersectionMembersPair(c: *Checker, pm: TypeId, am: TypeId) Error!bool {
     // `inferFromExtends`' `.object` arm bridges the same nominal/structural gap
     // for a conditional's construct-signature pattern (`InstanceType<T>`).
     if (pk == .object and s.kind(ra) == .class_value and s.objectConstructSigCount(rp) > 0) return true;
+    // A still-DEFERRED mapped constituent against an OBJECT argument. A mapped
+    // type is an object once its key set is known — tsc's
+    // `getPropertiesOfObjectType` resolves one on demand and pairs the members
+    // like any other — so the kind test below is an artifact of ztsc keeping the
+    // map unmaterialized while its constraint still mentions a free variable.
+    // `Pick<Readonly<C<V> & E>, …> & Partial<Pick<…>>` is written exactly that
+    // way (`complicatedIndexesOfIntersectionsAreInferencable`), and with no pair
+    // neither constituent said anything about `V` at all.
+    //
+    // Answering true only routes the pair into `unify`, whose `.mapped` arm
+    // decides for itself what a mapped pattern can take from an object.
+    if (pk == .mapped and s.kind(ra) == .object) return true;
     if (pk != s.kind(ra)) return false;
     return switch (pk) {
         .object => try c.constituentRelatesTo(rp, ra),
