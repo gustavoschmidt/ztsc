@@ -837,40 +837,40 @@ pub const LazyStat = enum(u8) {
 };
 
 pub const map_containers = [_][]const u8{
-    "node_types",             "sig_cache",                "node_scopes",
-    "reassigned_syms",        "reassigned_in_loop",       "member_written_syms",
-    "member_written_in_loop", "ns_types",                 "ambient_ns_types",
-    "relation",               "expansions",               "overload_groups",
-    "construct_groups",       "origin",                   "iface_generic",
-    "overload_group_pool",    "iface_stack",              "pending_class_decos",
-    "class_inst_generic",     "class_static_cache",       "class_static_owner",
-    "class_static_stack",     "class_ctor_cache",         "enum_value_cache",
-    "enum_info_cache",        "enum_relation_cache",      "alias_generic",
-    "alias_state",            "alias_recursive",          "alias_stack",
-    "flow_same",              "flow_narrow",              "ref_keys",
-    "flow_loop_stack",        "flow_stack",               "flow_tmp",
-    "flow_reduce",            "da_cache",                 "ctp_cache",
-    "cmp_cache",              "ctt_cache",                "ci_cache",
-    "infer_visited",          "subst_this_cache",         "mmp_cache",
-    "arrayish_elem_cache",    "tp_constraint_cache",      "erase_cache",
-    "erase_any_cache",        "inst_map_ids",             "fresh_tp_ids",
-    "this_tp_ids",            "fresh_tp_info",            "type_node_cache",
-    "atom_cache",             "infer_ids",                "infer_constraints",
-    "infer_scopes",           "mapped_key_ids",           "mapped_key_scopes",
-    "inst_diag_at",           "infer_active",             "lazy_member_active",
-    "this_bound_fns",         "chain_guards",             "never_isect",
-    "deep_path_list",         "deep_path_ids",            "flow_reach",
-    "member_type_stack",      "method_ret_cuts",          "lazy_index_objs",
-    "pending_type_args",      "pending_type_args_pool",   "pending_type_args_seen",
-    "tp_constrained_cache",   "nominal_bases",            "nominal_base_pool",
-    "keyof_mapped_active",    "ctp_syms_seen",            "weak_types",
-    "base_ref_active",        "lazy_member",              "trunc_lazy_member",
-    "lazy_map",               "pattern_root_decls",       "pattern_root_ids",
-    "pattern_narrow_busy",    "key_name_types",           "enum_members",
-    "keyof_obj_cache",        "sym_key_cache",            "trunc_expansions",
-    "inst_map_bytes",         "tp_mentions",              "smk_cache",
-    "rel_maybe",              "spec_sym_types",           "spec_tainted",
-    "last_assign_pos",        "definitely_assigned_syms",
+    "node_types",               "sig_cache",              "node_scopes",
+    "reassigned_syms",          "reassigned_in_loop",     "member_written_syms",
+    "member_written_in_loop",   "ns_types",               "ambient_ns_types",
+    "relation",                 "expansions",             "overload_groups",
+    "construct_groups",         "origin",                 "iface_generic",
+    "overload_group_pool",      "iface_stack",            "pending_class_decos",
+    "class_inst_generic",       "class_static_cache",     "class_static_owner",
+    "class_static_stack",       "class_ctor_cache",       "enum_value_cache",
+    "enum_info_cache",          "enum_relation_cache",    "alias_generic",
+    "alias_state",              "alias_recursive",        "flow_same",
+    "flow_narrow",              "ref_keys",               "flow_loop_stack",
+    "flow_stack",               "flow_tmp",               "flow_reduce",
+    "da_cache",                 "ctp_cache",              "cmp_cache",
+    "ctt_cache",                "ci_cache",               "infer_visited",
+    "subst_this_cache",         "mmp_cache",              "arrayish_elem_cache",
+    "tp_constraint_cache",      "erase_cache",            "erase_any_cache",
+    "inst_map_ids",             "fresh_tp_ids",           "this_tp_ids",
+    "fresh_tp_info",            "type_node_cache",        "atom_cache",
+    "infer_ids",                "infer_constraints",      "infer_scopes",
+    "mapped_key_ids",           "mapped_key_scopes",      "inst_diag_at",
+    "infer_active",             "lazy_member_active",     "this_bound_fns",
+    "chain_guards",             "never_isect",            "deep_path_list",
+    "deep_path_ids",            "flow_reach",             "member_type_stack",
+    "method_ret_cuts",          "lazy_index_objs",        "pending_type_args",
+    "pending_type_args_pool",   "pending_type_args_seen", "tp_constrained_cache",
+    "nominal_bases",            "nominal_base_pool",      "keyof_mapped_active",
+    "ctp_syms_seen",            "weak_types",             "base_ref_active",
+    "lazy_member",              "trunc_lazy_member",      "lazy_map",
+    "pattern_root_decls",       "pattern_root_ids",       "pattern_narrow_busy",
+    "key_name_types",           "enum_members",           "keyof_obj_cache",
+    "sym_key_cache",            "trunc_expansions",       "inst_map_bytes",
+    "tp_mentions",              "smk_cache",              "rel_maybe",
+    "spec_sym_types",           "spec_tainted",           "last_assign_pos",
+    "definitely_assigned_syms",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -1399,31 +1399,12 @@ pub const Checker = struct {
     enum_relation_cache: IntMap(u64, bool) = .empty,
     alias_generic: IntMap(SymbolId, TypeId) = .empty,
     alias_state: IntMap(SymbolId, u8) = .empty,
-    /// Alias symbols that lie ON a cycle of the alias graph. Written by
-    /// `aliasInstance`'s cycle-cut arm: when a reference re-enters an
-    /// in-progress alias (state == 1), the suffix of `alias_stack` from that
-    /// alias's own frame up to the innermost one IS the cycle the reference
-    /// just closed, and EVERY member of it is marked.
-    ///
-    /// Marking the whole cycle rather than only its entry point is what makes
-    /// this set a property of the alias GRAPH instead of of the visit order —
-    /// `aliasGeneric` walks the same body from every entry point, so whichever
-    /// member a checker instance happens to materialize first, the same set
-    /// comes out. See `aliasInstance` for why that matters (one spelling per
-    /// recursive alias, identical under `--checkers=1/2/4/8`).
-    ///
-    /// Used to give a recursive alias with an `originTaggable` body ONE
-    /// spelling, to scope `fixTypeArgs`' recursion-accumulator default
-    /// substitution (RHF `PathInternal<T, Tr = T>`) away from non-recursive
-    /// library defaults (redux `Reducer<S, A, P = S>`), and to scope the same
-    /// function's `shallow_default` syntax test.
+    /// Alias symbols found to be (transitively) self-recursive while their
+    /// generic body was materialized — marked when `aliasInstance` re-enters an
+    /// in-progress alias (state == 1). Used to scope the recursion-accumulator
+    /// default substitution in `fixTypeArgs` (RHF `PathInternal<T, Tr = T>`)
+    /// away from non-recursive library defaults (redux `Reducer<S, A, P = S>`).
     alias_recursive: IntMap(SymbolId, void) = .empty,
-    /// Cycle-detection stack: the alias symbols whose generic body is being
-    /// materialized right now, outermost first. Pushed/popped by
-    /// `aliasGeneric`; read only by `aliasInstance`'s cut arm, to name the
-    /// cycle a back-reference closes. Mutable state, justified as a
-    /// cycle-detection stack (see CLAUDE.md).
-    alias_stack: std.ArrayList(SymbolId) = .empty,
     /// Narrowed-type cache per `(flow, reference, declared)` query, split by
     /// outcome so the overwhelmingly common one costs no value slot. See
     /// `FlowQ` for the packed key and why the split is behaviour-preserving.
