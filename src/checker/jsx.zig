@@ -1443,6 +1443,32 @@ fn jsxHasManagedAttributes(c: *Checker) Error!bool {
     return (try c.jsxNamespaceMember(c.atom_LibraryManagedAttributes)) != null;
 }
 
+/// The type of the tag's `defaultProps` static, or `no_type` when the tag has
+/// none (or is intrinsic, which cannot carry one). Its property NAMES are the
+/// props tsc's `Defaultize` turns optional; only the missing-required-prop
+/// loop consults it, and only to take a complaint away, so a wrong answer here
+/// can never manufacture a diagnostic.
+///
+/// Reads the tag's ALREADY-CHECKED type out of the memo rather than checking
+/// the tag again: `checkJsxElement` types the tag before any of this runs, and
+/// a second `checkExprCached` from inside the attribute walk would re-enter
+/// signature selection for an overloaded component.
+fn jsxDefaultPropsType(c: *Checker, tag: Node, is_component: bool) Error!TypeId {
+    if (!is_component or tag == null_node) return types.no_type;
+    // `Defaultize` is not a rule of the language — it is whatever the JSX
+    // namespace's `LibraryManagedAttributes` says, and React's is what turns
+    // `defaultProps` names optional. A namespace that declares no such member
+    // gets NO transform, and the oracle duly reports the missing prop even
+    // when a `defaultProps` static supplies it (verified on a hand-rolled
+    // namespace). So the suppression is gated on the same member
+    // `jsxHasManagedAttributes` looks for.
+    if (!try jsxHasManagedAttributes(c)) return types.no_type;
+    const tag_ty = c.nodeType(tag) orelse return types.no_type;
+    const p = (try c.propOfType(try c.resolveStructural(tag_ty), try c.atom("defaultProps"))) orelse
+        return types.no_type;
+    return c.resolveStructural(p.ty);
+}
+
 /// One explicit (literal) JSX attribute gathered during the first pass.
 pub const JsxAttr = struct {
     name: Atom,
@@ -1737,13 +1763,31 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
         }
     }
 
+    // A prop the tag's own `defaultProps` supplies is never missing: tsc's
+    // `getJsxManagedAttributesFromLocatedAttributes` runs the props type
+    // through `Defaultize<P, typeof C.defaultProps>` BEFORE anything checks a
+    // required prop, which turns exactly those names optional. ztsc does not
+    // apply the transform (see `jsxHasManagedAttributes`), so the same names
+    // are excused here instead — `BackButton.defaultProps = { text: … }` is
+    // what makes `<BackButton />` legal against a required `text`.
+    //
+    // Resolved LAZILY — `jsxNamespaceMember` re-walks the factory and runtime
+    // modules on every call, and an element that supplies all its required
+    // props must not pay for that. `null` means "not looked up yet"; the
+    // lookup happens at most once, on the first prop that would be reported.
+    var defaults: ?TypeId = null;
     var any_missing = false;
     for (target_props.items) |tp| {
         if (tp.optional()) continue;
-        if (!providedHas(provided.items, tp.name)) {
-            any_missing = true;
-            break;
-        }
+        if (providedHas(provided.items, tp.name)) continue;
+        const d = defaults orelse blk: {
+            const t = try jsxDefaultPropsType(c, e.tag, is_component);
+            defaults = t;
+            break :blk t;
+        };
+        if (d != types.no_type and (try c.propOfType(d, tp.name)) != null) continue;
+        any_missing = true;
+        break;
     }
     if (!any_missing) return;
     const span = if (e.tag != null_node) c.nodeSpan(e.tag) else c.nodeSpan(node);
