@@ -676,20 +676,63 @@ fn checkObjectPatternProps(c: *Checker, pat: Node, whole: TypeId) Error!void {
 /// `getIndexedAccessType` — the key node is the anchor (`main_token` is its
 /// `[`).
 ///
-/// Only the accessibility half: a computed key that names nothing static
-/// legitimately lands on an index signature (`Record<string, T>`
-/// destructuring), so there is no missing-property verdict to make here.
-/// `whole` is the source type AS WRITTEN and `r` its resolved structure: the
-/// first is what names the declaring class for `accessibility.check`, the
-/// second is what carries the property.
+/// A key that names nothing static must land on an INDEX SIGNATURE, which is
+/// the TS2537 half (`Record<string, T>` destructuring is the legitimate
+/// shape). `whole` is the source type AS WRITTEN and `r` its resolved
+/// structure: the first is what names the declaring class for
+/// `accessibility.check` and what the message prints, the second is what
+/// carries the property.
 fn checkComputedPatternProp(c: *Checker, el: Node, whole: TypeId, r: TypeId) Error!void {
     const key_expr = c.tree.nodeData(el).lhs;
     if (key_expr == null_node) return;
     const kt = try c.checkExprCached(key_expr, types.no_type);
-    const key = (try c.uniqueSymAtom(kt)) orelse (try c.literalKeyAtom(kt)) orelse return;
+    const key = (try c.uniqueSymAtom(kt)) orelse (try c.literalKeyAtom(kt)) orelse {
+        return reportNoMatchingIndex(c, key_expr, whole, r, kt);
+    };
     const p = (try c.propOfType(r, key)) orelse return;
     if (!p.nonPublic()) return;
     try accessibility.check(c, whole, key, c.tree.nodeMainToken(el), .{ .dir = .read });
+}
+
+/// TS2537 for a binding element whose computed key is a WHOLE primitive
+/// domain rather than one name. A pattern element is typed through tsc's
+/// `getIndexedAccessType` with the key node as the access node, and its
+/// no-access-expression reporting path is:
+///
+/// ```
+/// else if (indexType.flags & (TypeFlags.String | TypeFlags.Number)) {
+///     error(indexNode, Diagnostics.Type_0_has_no_matching_index_signature_for_type_1,
+///           typeToString(objectType), typeToString(indexType));
+/// }
+/// ```
+///
+/// so `let { [foo()]: bar } = {}` with `foo(): string` is an error while
+/// `let { ["bar"]: bar } = { bar: 1 }` (a literal key, handled by the caller)
+/// and `let { [k]: v } = r` on a `Record<string, T>` are not.
+///
+/// Deliberately only the `string`/`number` kinds tsc names. A key that is a
+/// union of literals distributes over its members, a generic one defers, and
+/// an `any` one is tsc's TS2538 — none of which this answers, so each keeps
+/// today's silence.
+fn reportNoMatchingIndex(c: *Checker, key_expr: Node, whole: TypeId, r: TypeId, kt: TypeId) Error!void {
+    const k = c.ts.kind(try c.resolveStructural(kt));
+    if (k != .string and k != .number) return;
+    // An `any`/`error`/`never` source has no shape to be missing an index
+    // signature — tsc returns the object type itself for those.
+    switch (c.ts.kind(r)) {
+        .any, .err, .never, .unknown => return,
+        // A tuple/array carries the numeric domain; a `string` receiver carries
+        // it through lib's `interface String`. Only a real member table can be
+        // short an index signature.
+        .object => {},
+        else => return,
+    }
+    if (c.ts.objectStringIndex(r) != 0) return;
+    if (k == .number and c.ts.objectNumberIndex(r) != 0) return;
+    try c.diagFmt(2537, c.nodeSpan(key_expr), "Type '{s}' has no matching index signature for type '{s}'.", .{
+        try c.typeToString(whole),
+        try c.typeToString(if (k == .string) types.string_type else types.number_type),
+    });
 }
 
 /// Does a union constituent that was written as an OBJECT LITERAL lack `name`?
