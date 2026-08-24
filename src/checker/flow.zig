@@ -222,7 +222,15 @@ pub fn isEvolvingArrayVar(c: *Checker, sym: SymbolId) bool {
     if (f.param or f.catch_param or f.exported) return false;
     if (c.symFile(sym) != c.cur_file) return false;
     const decls = c.declsOf(sym);
-    if (decls.len != 1) return false;
+    // tsc reads the auto-array off `symbol.valueDeclaration` alone —
+    // `getTypeOfVariableOrParameterOrPropertyWorker` calls
+    // `getTypeForVariableLikeDeclaration(symbol.valueDeclaration)` — so a `var`
+    // DECLARED TWICE evolves exactly as one declared once does. Requiring a
+    // single declaration cost `var x = []; var x = []; x.push(5)` its
+    // `number[]` and the two implicit-`any[]` reports that go with an evolving
+    // array (`var x = []; if (c) { var x = []; }` is the same shape one block
+    // down), all three tsgo-verified.
+    if (decls.len == 0) return false;
     const decl = decls[0];
     const d = c.tree.nodeData(decl);
     const init_node: Node = switch (c.nodeTag(decl)) {
@@ -1657,6 +1665,16 @@ const AssignResult = union(enum) {
     base_of_antecedent,
 };
 
+/// tsc's `isEmptyArrayAssignment` on its VariableDeclaration arm: a declarator
+/// whose initializer is a bare `[]` RESTARTS the evolving array rather than
+/// leaving it whatever the walk had accumulated. It matters only for a REDECLARED
+/// `var` — `var x = []; x.push(5); if (c) { var x = []; }` reads `any[]` at the
+/// join, not `number[]` — because the first declarator of an evolving variable
+/// meets an element type that is already `never`.
+fn emptyArrayRestart(c: *Checker, declared: TypeId, init_node: Node) bool {
+    return c.ts.kind(declared) == .evolving_array and isEmptyArrayLiteral(c, init_node);
+}
+
 /// If the assign-flow node writes the reference (or invalidates a
 /// property path by writing its root), what the reference is worth after the
 /// assignment; null when it is unrelated.
@@ -1669,6 +1687,9 @@ fn assignNarrows(c: *Checker, flow: FlowId, target: Node, key: RefKey, declared:
             if (!try patternBindsSym(c, d.lhs, root_sym)) return null;
             if (key.len != 0) return .{ .ty = declared }; // root re-init: reset path
             if (c.nodeTag(d.lhs) != .identifier) return .{ .ty = declared };
+            if (emptyArrayRestart(c, declared, d.rhs)) {
+                return .{ .ty = try c.ts.makeEvolvingArray(types.never_type) };
+            }
             if (!assignmentRefines(c, declared)) return .{ .ty = declared };
             const vt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
             return .{ .ty = try assignmentReduced(c, declared, vt) };
@@ -1680,6 +1701,9 @@ fn assignNarrows(c: *Checker, flow: FlowId, target: Node, key: RefKey, declared:
             if (key.len != 0) return .{ .ty = declared };
             if (e.init == 0) return .{ .ty = declared };
             if (c.nodeTag(d.lhs) != .identifier) return .{ .ty = declared };
+            if (emptyArrayRestart(c, declared, e.init)) {
+                return .{ .ty = try c.ts.makeEvolvingArray(types.never_type) };
+            }
             if (!assignmentRefines(c, declared)) return .{ .ty = declared };
             // Reading this variable can reach its declaration's flow node
             // BEFORE the declaration statement itself is checked — a JSX
