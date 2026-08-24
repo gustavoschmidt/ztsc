@@ -3061,6 +3061,25 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
         try c.unify(s.indexAccessIndex(param), s.indexAccessIndex(arg), tp_syms, candidates, depth + 1);
         return;
     }
+    // A PATTERN indexed access over an INTERSECTION, or over a deferred
+    // homomorphic map, is what tsc's `getSimplifiedType` distributes before
+    // inference ever reads it: `(A<V> & E)["k"]` becomes `V & E["k"]`, whose
+    // naked `V` is the thing a candidate can pair with. Left opaque, the whole
+    // access binds nothing — `Pick<Readonly<FormikConfig<Values> & ExtraProps>,
+    // "initialValues">` gave `Values` no candidate at all, so the callback
+    // written for `validate` saw `props: object`
+    // (`complicatedIndexesOfIntersectionsAreInferencable`).
+    //
+    // Asked as a QUERY, never baked into the type's identity: the RELATION
+    // reads the same access structurally and wants it whole, and interning the
+    // simplification also drops `Partial<T>[K]`'s `| undefined` — the map's
+    // value template is where that lives, so substituting the key here keeps
+    // it.
+    if (s.kind(param) == .index_access) {
+        if (try simplifiedIndexPattern(c, param, 0)) |sp| {
+            return c.unify(sp, arg, tp_syms, candidates, depth + 1);
+        }
+    }
     const arg_instantiable = switch (s.kind(arg)) {
         .type_param, .index_access, .conditional => true,
         else => false,
@@ -5105,6 +5124,39 @@ pub fn constituentRelatesTo(c: *Checker, param: TypeId, m: TypeId) Error!bool {
     if (s.objectStringIndex(param) != 0 and s.objectStringIndex(rm) != 0) return true;
     if (s.objectNumberIndex(param) != 0 and s.objectNumberIndex(rm) != 0) return true;
     return false;
+}
+
+/// tsc's `getSimplifiedIndexedAccessType`, asked as a QUERY over an inference
+/// PATTERN rather than interned (see the call site for why the type's identity
+/// must keep the access whole):
+///
+///   * a deferred homomorphic map on the object side substitutes the key into
+///     the map's value template — `Readonly<X>[K]` -> `X[K]`, `Partial<X>[K]`
+///     -> `X[K] | undefined` — and the result is simplified again, because that
+///     is how the intersection underneath a `Readonly<A & E>` surfaces;
+///   * an INTERSECTION on the object side distributes — `(A & E)[K]` ->
+///     `A[K] & E[K]`.
+///
+/// Null when neither applies or the simplification is the access itself.
+fn simplifiedIndexPattern(c: *Checker, acc: TypeId, depth: u32) Error!?TypeId {
+    if (depth > 4) return null;
+    const s = &c.ts;
+    if (s.kind(acc) != .index_access) return null;
+    const idx = s.indexAccessIndex(acc);
+    const obj = try c.resolveStructural(s.indexAccessObj(acc));
+    if (s.kind(obj) == .mapped and s.mappedAs(obj) == 0) {
+        const val = try c.substMappedKey(s.mappedValue(obj), s.mappedParamId(s.mappedKeyParam(obj)), idx);
+        if (val == acc) return null;
+        return (try simplifiedIndexPattern(c, val, depth + 1)) orelse val;
+    }
+    if (s.kind(obj) != .intersection) return null;
+    var parts: std.ArrayList(TypeId) = .empty;
+    defer parts.deinit(c.scratch());
+    const ms = try c.scratch().dupe(TypeId, try c.memberList(obj));
+    defer c.scratch().free(ms);
+    for (ms) |mm| try parts.append(c.scratch(), try c.reduceIndexedAccess(mm, idx));
+    const out = try s.makeIntersection(c.scratch(), parts.items);
+    return if (out == acc) null else out;
 }
 
 /// One element of a reverse-mapped rebuild: match `src_ty` against the value
