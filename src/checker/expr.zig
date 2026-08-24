@@ -2752,7 +2752,9 @@ pub fn contextAdmitsLiteral(c: *Checker, ctx: TypeId, lit: TypeId) Error!bool {
         // rather than being carried unexercised. What still clamps —
         // `...keys: [...K]` inferring `K` as its constraint instead of the
         // argument tuple — is a variadic-tuple inference gap, not this test.
+        .index_access => return c.isConstTypeVar(r),
         .type_param => {
+            if (c.isConstTypeParamSym(c.ts.typeParamSymbol(r))) return true;
             const constraint = try c.typeParamConstraint(c.ts.typeParamSymbol(r));
             if (constraint == types.no_type) return false;
             if (try c.contextAdmitsLiteral(constraint, lit)) return true;

@@ -741,6 +741,14 @@ pub const InferCtx = struct {
     /// Without it a minted parameter would end up inside a result that has no
     /// signature to carry it and would print as a free, unbindable name.
     ho_result_fn: bool = false,
+    /// The signature's RETURN type, for the one mid-walk decision that needs it:
+    /// a candidate handed to a generic function argument (tsc's
+    /// `instantiateSignatureInContextOf` reading `context.mapper`) is the
+    /// parameter's INFERRED type, which `getInferredType` has already widened —
+    /// and `getCovariantInference`'s widening test asks whether the parameter
+    /// occurs at the top level of this return. `no_type` outside a call-site
+    /// inference.
+    sig_ret: TypeId = types.no_type,
     /// The unique type parameters minted for this call's generic function
     /// arguments — tsc's `InferenceContext.inferredTypeParameters`, which
     /// `getSignatureInstantiation` re-attaches to the returned signature.
@@ -854,6 +862,7 @@ pub fn inferTypeArgs(
         .rev = .{ .owner = candidates.ptr, .flags = rev_flags },
         .ho_result_fn = ho_result_fn,
         .ho_minted = &ho_minted,
+        .sig_ret = if (c.ts.kind(sig) == .function) c.ts.fnReturn(sig) else types.no_type,
     };
     defer c.infer_ctx = saved_ctx;
 
@@ -1460,6 +1469,22 @@ pub fn inferTypeArgs(
             try c.unify(pt, at, tp_syms, candidates, 0);
             for (candidates, 0..) |*cd, i| {
                 if (cd.* == pre_seed[i]) continue;
+                // …EXCEPT a `never` candidate, which the demotion does not
+                // need and which the arguments to its RIGHT do. `never` is the
+                // identity of ztsc's union fold, so leaving it in place buries
+                // nothing — any later covariant candidate simply absorbs it —
+                // while demoting it hides the seed from the contextual type
+                // those later arguments are checked against. tsc reads it
+                // exactly there: `context.mapper` FIXES a type parameter that
+                // already has a candidate before the next argument is
+                // contextually typed, so `_.all([], _.identity)` types
+                // `identity` against `Iterator<never, boolean>` and answers
+                // `T = never`. Demoted, `identity` saw a free `T`, was erased
+                // to `(value: unknown) => unknown`, and its CONTRAVARIANT
+                // `unknown` then outranked the seed outright — the covariant
+                // `never` loses that comparison by tsc's own rule
+                // (`genericTypeArgumentInference1`).
+                if (c.ts.kind(cd.*) == .never) continue;
                 if (empty_seed[i] == types.no_type) empty_seed[i] = cd.*;
                 cd.* = pre_seed[i];
             }
@@ -1635,6 +1660,24 @@ pub fn inferTypeArgs(
             partial_ctx[i] = p;
             if (!ret_only or param_mentioned[i]) continue;
             if (seeded[i] or p.ty != types.any_type) continue;
+            // A `const` type parameter is left FREE, not replaced by anything.
+            // tsc's `nonFixingMapper` leaves an un-inferred variable standing,
+            // and `isConstContext` is then `isValidConstAssertionArgument(node)
+            // && isConstTypeVariable(getContextualType(node))` — the contextual
+            // type has to still BE the parameter for that test to see the
+            // `const`. Substituting the `any` placeholder erases exactly the
+            // thing `const` exists to preserve: `test1<const T>(create: () => T)`
+            // handed `() => 'a'` typed the arrow's return against `any`, the
+            // fresh `'a'` widened on the way out, and `T` came back `string`
+            // (the whole `typeParameterConstModifiersReturnsAndYields` family —
+            // literals, template literals, array and object literals, `async`
+            // and generator bodies alike). An unconstrained `const T` also has
+            // no constraint for the substitution below to reach for, so this is
+            // the only reading available.
+            if (c.isConstTypeParamSym(tp_syms[i])) {
+                partial_ctx[i] = .{ .sym = tp_syms[i], .ty = try c.ts.makeTypeParam(tp_syms[i]) };
+                continue;
+            }
             const con = try c.typeParamConstraint(tp_syms[i]);
             if (con == types.no_type) continue;
             const ci = try c.instantiate(con, partial);
@@ -2003,11 +2046,19 @@ pub fn inferTypeArgs(
     // Only the minted parameters that SURVIVED the folds above are worth
     // generalizing over: a slot the constraint clamp or the widening replaced
     // no longer names one.
+    //
+    // "Names one" is a MENTION, not an identity. A rest-tuple combinator answers
+    // `A := [T']`, `B := T'[]` — the minted parameter is buried one constructor
+    // deep in every slot — and an identity test read that as "did not survive",
+    // dropped the whole list, and left `pipe(list)` printing the non-generic
+    // `(...args: [T]) => T[]` where tsc answers `<T>(x: T) => T[]`. The probe is
+    // the same occurs check `generalizeCallResult` runs on the result.
     var kept: std.ArrayList(u32) = .empty;
     defer kept.deinit(c.scratch());
     for (ho_minted.items) |m| {
+        const probe = [1]TpMap{.{ .sym = m, .ty = types.unknown_type }};
         for (out) |o| {
-            if (c.ts.kind(o) == .type_param and c.ts.typeParamSymbol(o) == m) {
+            if ((try c.instantiate(o, &probe)) != o) {
                 try kept.append(c.scratch(), m);
                 break;
             }
@@ -3985,11 +4036,29 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 const own_syms = try c.scratch().dupe(u32, own);
                 const own_cands = try c.scratch().alloc(TypeId, own.len);
                 for (own_cands) |*v| v.* = types.no_type;
-                const np = @min(s.fnParamCount(param), s.fnParamCount(ra));
+                // Positions, not declared parameters — see `restTupleOf`. A
+                // combinator's own result is spelled `(...args: [V]) => …`, and
+                // reading `fnParam(ra, 0).ty` raw handed the pattern the
+                // one-element TUPLE where the position holds `V`, so the
+                // pairing found nothing and `pipe(list, pipe(box))` minted a
+                // fresh parameter instead of adopting what its first argument
+                // had already inferred.
+                const own_rest_tuple = try restTupleOf(c, ra);
+                const pat_rest_tuple = try restTupleOf(c, param);
+                const np = @min(
+                    paramPositions(c, param, pat_rest_tuple),
+                    paramPositions(c, ra, own_rest_tuple),
+                );
                 for (0..np) |i| {
                     // Reversed roles: the arg's param types are the pattern,
                     // the expected param types the source.
-                    try c.unify(s.fnParam(ra, @intCast(i)).ty, s.fnParam(param, @intCast(i)).ty, own_syms, own_cands, depth + 1);
+                    try c.unify(
+                        paramTypeAt(c, ra, own_rest_tuple, @intCast(i)),
+                        paramTypeAt(c, param, pat_rest_tuple, @intCast(i)),
+                        own_syms,
+                        own_cands,
+                        depth + 1,
+                    );
                 }
                 var map_list: std.ArrayList(TpMap) = .empty;
                 defer map_list.deinit(c.scratch());
@@ -4094,35 +4163,74 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                     // a minted parameter, and `map([1, 2, 3], identity)` — whose
                     // `T` is already `number` by the time `identity` is read —
                     // takes the first branch, not the mint.
-                    // NOT for a REST-tuple contextual signature. tsc pairs
-                    // positions through `getTypeAtPosition`, which reads a rest
-                    // parameter's ELEMENT; this arm pairs `fnParam(param, i).ty`
-                    // raw, so `pipe<A extends any[], B>(ab: (...args: A) => B)`
-                    // hands `list`'s `T` the whole TUPLE variable `A` as its
-                    // candidate. Adopting that binds a rest-tuple parameter to a
-                    // scalar and every `pipe` overload stops resolving; the
-                    // erasure below is the right answer there.
+                    //
+                    // A REST-TUPLE contextual parameter mints but does NOT
+                    // adopt. tsc pairs positions through `getTypeAtPosition`,
+                    // which reads a rest parameter's ELEMENT; this arm pairs
+                    // `fnParam(param, i).ty` raw, so `pipe<A extends any[], B>(
+                    // ab: (...args: A) => B)` hands `list`'s `T` the whole
+                    // TUPLE variable `A` as its candidate. Recording `A := T'`
+                    // would bind a rest-tuple parameter to a scalar and every
+                    // `pipe` overload would stop resolving.
+                    //
+                    // The MINT is still right, and it is the whole of what tsc
+                    // does here: `getUniqueTypeParameters` renames `list`'s `T`
+                    // to `T'` unconditionally, and the ensuing walk infers the
+                    // call's own variables from the INSTANTIATED signature
+                    // `(a: T') => T'[]`. That walk already reads a rest pattern
+                    // through `getRestTypeAtPosition` (the `pat_has_rest` block
+                    // below), so it answers `A := [T']`, `B := T'[]` — where
+                    // erasing `T` to its `unknown` fallback answered `A :=
+                    // [unknown]` and `pipe(list)` printed `(...args: [unknown])
+                    // => unknown[]` instead of `<T>(x: T) => T[]`.
+                    //
+                    // Nothing of THIS call's own inference was substituted into
+                    // `ra`, so there is no fix set to arm either: a minted
+                    // parameter is not our guess coming home.
                     const pcount0 = s.fnParamCount(param);
                     const param_rest = pcount0 != 0 and s.fnParam(param, pcount0 - 1).rest();
                     if (self_ref and c.infer_ctx.sig_ctx == 0 and
                         c.ts.kind(cand0) == .type_param and
-                        s.fnTypeParamCount(param) == 0 and !param_rest)
+                        s.fnTypeParamCount(param) == 0)
                     {
                         if (tpIndex(tp_syms, c.ts.typeParamSymbol(cand0))) |oi| {
-                            if (candidates[oi] != types.no_type and c.infer_ctx.ho_result_fn) {
+                            // The SUBSTITUTING half is not gated on
+                            // `ho_result_fn`. tsc reaches
+                            // `instantiateSignatureInContextOf(signature,
+                            // contextualSignature, context)` for EVERY generic
+                            // argument under a non-generic contextual signature
+                            // — the single-non-generic-return test only decides
+                            // between merging a separate inference set and this
+                            // fallback, and the fallback's mapper is the FIXING
+                            // one, which is exactly "hand the argument what we
+                            // have already inferred". `_.all<T>(list: T[],
+                            // iterator?: Iterator<T, boolean>)` fed
+                            // `_.all([], _.identity)` needs it: with `T` already
+                            // `never` from the empty array, `identity`
+                            // instantiates to `(value: never) => never` and `T`
+                            // stays `never`. Erased instead, it presented
+                            // `(value: unknown) => unknown`, whose CONTRAVARIANT
+                            // `unknown` then outranked the covariant `never`
+                            // (`genericTypeArgumentInference1`).
+                            if (!param_rest and candidates[oi] != types.no_type) {
                                 try ho_fix.arm(c, param, tp_syms, candidates);
                                 all_unbound = false;
-                                try map_list.append(c.scratch(), .{ .sym = sym, .ty = candidates[oi] });
+                                try map_list.append(c.scratch(), .{
+                                    .sym = sym,
+                                    .ty = try fixedInference(c, tp_syms[oi], candidates[oi]),
+                                });
                                 continue;
                             }
                             if (c.infer_ctx.ho_result_fn) if (c.infer_ctx.ho_minted) |list| {
-                                try ho_fix.arm(c, param, tp_syms, candidates);
+                                if (!param_rest) try ho_fix.arm(c, param, tp_syms, candidates);
                                 const ft = try s.makeTypeParam(try uniqueTypeParam(c, sym, list));
-                                candidates[oi] = ft;
-                                // The slot this instantiation DETERMINED is not
-                                // fixed — it is the answer, and restoring it
-                                // would undo the adoption.
-                                ho_fix.release(oi);
+                                if (!param_rest) {
+                                    candidates[oi] = ft;
+                                    // The slot this instantiation DETERMINED is
+                                    // not fixed — it is the answer, and
+                                    // restoring it would undo the adoption.
+                                    ho_fix.release(oi);
+                                }
                                 all_unbound = false;
                                 try map_list.append(c.scratch(), .{ .sym = sym, .ty = ft });
                                 continue;
@@ -4145,7 +4253,7 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                     // parameter is the one thing the walk below legitimately
                     // teaches this call.
                     if (cand0 == types.no_type and c.infer_ctx.sig_ctx == 0 and
-                        c.infer_ctx.ho_result_fn and s.fnTypeParamCount(param) == 0 and !param_rest)
+                        c.infer_ctx.ho_result_fn and s.fnTypeParamCount(param) == 0)
                     {
                         if (c.infer_ctx.ho_minted) |list| {
                             const ft = try s.makeTypeParam(try uniqueTypeParam(c, sym, list));
@@ -4207,7 +4315,19 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
             const src_count = s.fnParamCount(ra);
             const pat_has_rest = pat_count != 0 and s.fnParam(param, pat_count - 1).rest();
             const pat_fixed = if (pat_has_rest) pat_count - 1 else pat_count;
-            const n = @min(src_count, pat_fixed);
+            // …and a trailing rest in the SOURCE whose type is a FIXED tuple is
+            // not a rest at all as far as position pairing goes: tsc's
+            // `getParameterCount` counts it as that tuple's arity and
+            // `getTypeAtPosition` hands out its ELEMENTS one at a time
+            // (`getEffectiveRestType` answers `undefined` for it).
+            //
+            // A combinator's own result is exactly that shape. `pipe(box)` is
+            // `(...args: [V]) => { value: V }`, and pairing the pattern's `b: B`
+            // against the raw rest type gave `B := [V]` — a one-element TUPLE
+            // where the answer is `V` — so `pipe(list, pipe(box))` then rejected
+            // its FIRST argument against `(...args: [T]) => [V]`.
+            const src_rest_tuple = try restTupleOf(c, ra);
+            const n = @min(paramPositions(c, ra, src_rest_tuple), pat_fixed);
             {
                 // Parameters are a contravariant position — unless the
                 // signature was written as a METHOD, whose parameters tsc
@@ -4218,7 +4338,8 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                     c.infer_ctx.contra_pos -= 1;
                 };
                 for (0..n) |i| {
-                    try c.unify(s.fnParam(param, @intCast(i)).ty, s.fnParam(ra, @intCast(i)).ty, tp_syms, candidates, depth + 1);
+                    const at = paramTypeAt(c, ra, src_rest_tuple, @intCast(i));
+                    try c.unify(s.fnParam(param, @intCast(i)).ty, at, tp_syms, candidates, depth + 1);
                 }
                 if (pat_has_rest and src_count >= pat_fixed) {
                     const rest_pat = s.fnParam(param, pat_count - 1).ty;
@@ -4406,6 +4527,61 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
         .keyof_op => try inferToKeyof(c, param, arg, tp_syms, candidates),
         else => {},
     }
+}
+
+/// What tsc's `context.mapper` answers for a type parameter that already has a
+/// candidate: `getInferredType`, whose covariant half WIDENS a fresh literal
+/// unless the parameter has a primitive constraint or occurs at the top level of
+/// the signature's return type (`getCovariantInference`'s three-way choice, the
+/// same test the resolution loop runs at the end of `inferTypeArgs`).
+///
+/// Handing the RAW candidate over instead is what made `bar<T, U, V>(x: T, y: U,
+/// cb: (x: T, y: U) => V)` fed `bar(1, "one", h)` instantiate its generic
+/// argument against `(x: 1, y: "one") => …` — so `V` came back `1[] | "one"[]`
+/// where tsc answers `number[] | string[]` (`contextualSignatureInstantiation`).
+fn fixedInference(c: *Checker, tp: u32, cand: TypeId) Error!TypeId {
+    if (!c.ts.isFreshLiteral(cand) and c.ts.kind(cand) != .union_type) return cand;
+    if (c.isConstTypeParamSym(tp)) return cand;
+    if (try c.constraintIsPrimitive(try c.typeParamConstraint(tp))) return cand;
+    const sr = c.infer_ctx.sig_ret;
+    if (sr != types.no_type and try c.typeParamAtTopLevel(sr, tp)) return cand;
+    return c.widenLiteral(cand);
+}
+
+/// The FIXED tuple a signature's trailing rest parameter is spelled with, if it
+/// is one — tsc's `getEffectiveRestType` answering `undefined`, read from the
+/// other side: `(...args: [T, U])` declares two ordinary positions, and only a
+/// rest element (`[T, ...U[]]`) or a non-tuple rest type is a rest for
+/// position-pairing purposes. Null for every signature with no rest parameter,
+/// which is the overwhelming majority — the resolve only runs past that check.
+fn restTupleOf(c: *Checker, sig: TypeId) Error!?TypeId {
+    const s = &c.ts;
+    const n = s.fnParamCount(sig);
+    if (n == 0 or !s.fnParam(sig, n - 1).rest()) return null;
+    const rt = try c.resolveStructural(s.fnParam(sig, n - 1).ty);
+    if (s.kind(rt) != .tuple) return null;
+    var i: u32 = 0;
+    while (i < s.tupleLen(rt)) : (i += 1) {
+        const e = s.tupleElem(rt, i);
+        if (e.flags & (types.elem_flag_rest | types.elem_flag_optional) != 0) return null;
+    }
+    return rt;
+}
+
+/// How many positions a signature offers once `restTupleOf` has been read —
+/// tsc's `getParameterCount`.
+fn paramPositions(c: *Checker, sig: TypeId, rest_tuple: ?TypeId) u32 {
+    const n = c.ts.fnParamCount(sig);
+    return if (rest_tuple) |t| n - 1 + c.ts.tupleLen(t) else n;
+}
+
+/// tsc's `getTypeAtPosition`, restricted to what `restTupleOf` recognises:
+/// positions past the last declared parameter read the rest tuple's elements.
+fn paramTypeAt(c: *Checker, sig: TypeId, rest_tuple: ?TypeId, i: u32) TypeId {
+    const n = c.ts.fnParamCount(sig);
+    const t = rest_tuple orelse return c.ts.fnParam(sig, i).ty;
+    if (i + 1 < n) return c.ts.fnParam(sig, i).ty;
+    return c.ts.tupleElem(t, i - (n - 1)).ty;
 }
 
 /// tsc's `inferFromTypes` literal-keyof arm:
@@ -4818,6 +4994,42 @@ pub fn inferReverseMapped(c: *Checker, m: TypeId, arg: TypeId, tp_syms: []const 
     if (s.kind(ra) == .mapped and s.mappedAs(ra) == 0 and s.mappedHomomorphic(ra)) {
         return c.unify(src, s.mappedSource(ra), tp_syms, candidates, depth + 1);
     }
+    // HANDOFF (wave 31 B, built and measured, REVERTED on the app gate). Three
+    // changes turn this into tsc's `inferToMappedType` + `createReverseMappedType`
+    // and are worth +3 exact on the corpus (`reverseMappedTupleContext`,
+    // `objectFromEntries`, `reverseMappedTypeLimitedConstraint`), zero corpus
+    // regressions — but EACH of them, alone or together, moves social-app:
+    //
+    //   1. a COMPOSITE key set. tsc walks a union/intersection constraint
+    //      constituent by constituent (`result ||= inferToMappedType(source,
+    //      target, type)`) and takes the homomorphic path for any `keyof T` it
+    //      finds, so `{ [K in keyof T & keyof CompilerOptions]: … }` infers `T`.
+    //      The walk must descend BOTH connectives to any depth — ztsc's
+    //      intersection normalizer distributes over a union, storing that
+    //      constraint as `("allowUnreachableCode" & keyof T) | …`. Split this
+    //      function so the source is a parameter and call it with the operand.
+    //   2. `substElemAccess` needs a `.mapped` arm (rebuild constraint / value /
+    //      `as` / source), or a mapped type NESTED in the template keeps its
+    //      `S[K]` and the element variable never enters the template at all.
+    //   3. the rebuild must cover ARRAY and TUPLE sources, not just `.object`
+    //      ("for arrays and tuples we infer new arrays and tuples where the
+    //      reverse mapping has been applied to the element type(s)") — which is
+    //      what a nested map resolves to once (2) puts the element variable in
+    //      its source.
+    //
+    // MEASURED on social-app at the committed baseline (87 check errors):
+    //   * 1+2+3 -> 93: six fresh FPs in Composer.tsx (a react-query
+    //     `QueryBehavior<{…}>` vs `QueryBehavior<unknown>` variance failure plus
+    //     five `Property … does not exist on type '{}'`).
+    //   * 1 alone -> 98: eleven fresh FPs in ageAssurance/data.tsx instead.
+    //   * 2+3 without 1 -> 193. (2) is destructive without (3) to complete the
+    //     inversion; they are one change, not two.
+    // So (3) does not merely add — it also MASKS what (1) breaks. tsc's guard
+    // that ztsc does not have is `isPartiallyInferableType` /
+    // `getIndexInfoOfType(source, stringType)` at the head of
+    // `createReverseMappedType`; the next attempt should start there, and
+    // should treat social-app's `useInfiniteQuery` options object as the
+    // witness rather than the corpus.
     if (s.kind(ra) != .object) return;
     const key_param = s.mappedKeyParam(m);
     const key_id = s.mappedParamId(key_param);
