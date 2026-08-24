@@ -1390,6 +1390,44 @@ fn unionHasExcessCheckTarget(c: *Checker, rt: TypeId) Error!bool {
 /// wholesale (tsc's `!matched` restore), which is what keeps a literal with a
 /// wrong tag reported as a plain mismatch rather than measured against an
 /// arbitrary arm. Returns the original union when nothing was reduced away.
+/// Does the source's discriminant value `sv` select the constituent whose
+/// discriminant property has type `tv`?
+///
+/// A discriminant written as a UNION of units selects every constituent SOME of
+/// its members reaches, not only the ones ALL of them do. The reduction is a
+/// filter over the target ("which arms could this literal still be?"), so a
+/// two-valued tag has to keep both arms in the running:
+///
+/// ```ts
+/// type U = { k: "a"; aa: number } | { k: "b"; bb: number };
+/// declare const ab: "a" | "b";
+/// const x: U = { k: ab, aa: 1, bb: 1 };   // clean: `ab` keeps BOTH arms, so
+///                                         // `aa` and `bb` are both known
+/// ```
+///
+/// Asking plain assignability instead reduced that target to nothing it could
+/// name — every arm disagreed with the *whole* union — and social-app's
+/// `ageAssurance` config paid for it 34 times over: its `$type` is
+/// `Record<string, AgeAssuranceRuleID>`'s value type, i.e. the union of all
+/// seven rule tags, against a target union of the seven matching rule shapes
+/// plus a `{ $type: string }` catch-all. Only the catch-all took the whole
+/// union, so the reduction threw away every arm that had an `age`, a `date` or
+/// an `access` to know.
+///
+/// The oracle keeps the "some member reaches it" reading exactly: `"a" | "c"`
+/// against that same `U` keeps the `"a"` arm and drops the `"b"` one.
+fn discriminantSelects(c: *Checker, sv: TypeId, tv: TypeId) Error!bool {
+    if (c.ts.kind(sv) != .union_type) return c.isAssignable(sv, tv);
+    // `memberList` hands out a borrowed slice and `isAssignable` re-enters the
+    // checker, which can invalidate it.
+    const ms = try c.scratch().dupe(TypeId, try c.memberList(sv));
+    defer c.scratch().free(ms);
+    for (ms) |m| {
+        if (try c.isAssignable(m, tv)) return true;
+    }
+    return false;
+}
+
 fn epcReducedUnion(c: *Checker, src_t: TypeId, rt: TypeId) Error!TypeId {
     const ms = try c.memberList(rt);
     if (ms.len < 2) return rt;
@@ -1431,7 +1469,7 @@ fn epcReducedUnion(c: *Checker, src_t: TypeId, rt: TypeId) Error!TypeId {
             // `{ num: 1 }` in the running (it has no `str` to disagree with),
             // and `num` is then known there (`missingDiscriminants`).
             const tp = (try c.targetPropType(rm, sp.name)) orelse continue;
-            if (try c.isAssignable(sp.ty, tp)) {
+            if (try discriminantSelects(c, sp.ty, tp)) {
                 matched = true;
             } else {
                 maybe[i] = true;

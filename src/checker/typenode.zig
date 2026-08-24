@@ -92,6 +92,7 @@ pub const typeofEntity = typespace_zig.typeofEntity;
 pub const TypeParamInfo = typeparams_zig.TypeParamInfo;
 pub const buildInstMap = typeparams_zig.buildInstMap;
 pub const canonicalizeClassTypeParams = typeparams_zig.canonicalizeClassTypeParams;
+pub const checkFileCircularConstraints = typeparams_zig.checkFileCircularConstraints;
 pub const checkFileTypeParamDefaults = typeparams_zig.checkFileTypeParamDefaults;
 pub const checkSigTypeArgConstraints = typeparams_zig.checkSigTypeArgConstraints;
 pub const checkTypeArgConstraints = typeparams_zig.checkTypeArgConstraints;

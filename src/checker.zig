@@ -2989,6 +2989,9 @@ pub const Checker = struct {
             // it must not depend on anything demanding the declaration's type
             // (see `checkFileTypeParamDefaults`); same once-per-file shape.
             try typenode_zig.checkFileTypeParamDefaults(c);
+            // TS2313 is the same kind of rule about the same lists, and runs
+            // off the same `scope_owners` walk.
+            try typenode_zig.checkFileCircularConstraints(c);
         }
         // Every class instance type is now complete, so the written type
         // arguments collected along the way can be judged against their
@@ -4051,6 +4054,7 @@ pub const Checker = struct {
     pub const eraseParamsOf = assign_zig.eraseParamsOf;
     pub const paramTypeAt = assign_zig.paramTypeAt;
     pub const paramTypeAtInferred = assign_zig.paramTypeAtInferred;
+    pub const paramContextualTypeAt = assign_zig.paramContextualTypeAt;
     pub const paramTotal = assign_zig.paramTotal;
     pub const effParamCount = assign_zig.effParamCount;
     pub const requiredParams = assign_zig.requiredParams;

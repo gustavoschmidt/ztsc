@@ -4,9 +4,9 @@
 // has nothing to answer with and the resolution re-entered forever.
 //
 // tsc cuts with `pushTypeResolution(tp, Constraint)` and reports TS2313;
-// ztsc takes the same cut, answering "no constraint", and has no TS2313 of
-// its own — the oracle's is recorded in DEFERRED. What this case gates is
-// that the declarations resolve at all.
+// ztsc takes the same cut, answering "no constraint". Its own TS2313 reads
+// the parameter list SYNTACTICALLY, and a constraint spelled as an indexed
+// access is not on that chain, so the oracle's stays in DEFERRED.
 interface Foo {
     hello: boolean;
 }
