@@ -130,9 +130,15 @@ pub fn aliasInstance(c: *Checker, sym: SymbolId, args: []const TypeId, tok: Toke
     //     that resolved to an intersection into its member scan, so the
     //     resize.test.tsx five are closed.
     //   * `materializeMapped`'s union arm (mapped.zig) now distributes over an
-    //     ARRAY or TUPLE constituent, so `Mutable<readonly A[] | readonly B[]>`
-    //     is `A[] | B[]` instead of `{}` and the restore/newElement four are
-    //     closed.
+    //     ARRAY constituent, so `Mutable<readonly A[] | readonly B[]>` is
+    //     `A[] | B[]` instead of `{}` and the restore/newElement four are
+    //     closed. (Tuples stay off that arm — see the note there.)
+    //
+    // The KEYING itself is not in the tree: the `alias_stack` / `markCycle`
+    // machinery was built, measured, and REVERTED, because it costs the false
+    // positives below. Wave 31 rebuilds it — it is a dozen lines. Push `sym` in
+    // `aliasGeneric` and pop on the way out; when the cut arm fires, mark the
+    // stack suffix from `sym`'s own frame to the innermost one.
     //
     // With both landed, excalidraw is byte-identical to its baseline under the
     // whole-cycle keying AND under the narrower `.intersection`-body-only
