@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-23, post wave 29)
+## Standings (2026-08-24, post wave 30)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7352 / 8631 (85.2%)** |
-| excess keys (false positives) | 3541 | 1632 |
-| missing keys (under-reports) | 8617 | 3049 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7389 / 8631 (85.6%)** |
+| excess keys (false positives) | 3541 | 1592 |
+| missing keys (under-reports) | 8617 | 2979 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Twenty-nine waves landed (3–29), every one with ZERO match→non-match regressions in
+Thirty waves landed (3–30), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -411,7 +411,69 @@ committed; explains StarterPackDialog + AppLanguageDropdown). FeedPage
 returns under deterministic keying (wave-28's fix was necessary not
 sufficient).
 
-## Ranked next queue (wave 30) — distilled from wave-29 agent reports
+Wave 30 (+37; social-app baseline 90→87 — three more tsgo-proven FPs;
+DETERMINISM MILESTONE: social-app's diagnostic SETS are now identical at
+--checkers=1 vs 4; the sole residual is Navigation.tsx:778's message-text
+spelling, pending the alias keying): A found the mapped-key-set premise
+WRONG — inference was already correct; the partition-dependence was the
+excess-property reporter picking ONE union arm in interning order; fixed
+per-arm à la typeRelatedToSomeType (all four witnesses dead at both checker
+counts). B closed both keying blockers (computeIntersectionIsNever skipped
+lazy-alias intersection constituents; materializeMapped's union arm sank
+array constituents to {}), attempted the keying itself and reverted with a
+12-line rebuild recipe (intersection-body gating leaves exactly ONE FP;
+fixTypeArgs' substituting branch needs a DEPTH GUARD first — two scopings
+segfault social-app; materialize-before-defaults reorder measured neutral),
+and upgraded order_sweep.sh with a whole-grid text-included pass. C landed
+TS2335/TS2537/TS2347/TS2348, verdict-ending on type-arg failure,
+apparent-type suggestions (+26). D landed boolean/enum atomic-union
+narrowing, TS2481 from scratch, defaultProps suppression (oracle-corrected),
+TS1434 parseArguments (+11).
+MEASUREMENT LESSON: never diff a --checkers=1 run against the default-
+checkers baseline — compare same binary at same checker count.
+
+## Ranked next queue (wave 31) — distilled from wave-30 agent reports
+
+1. Alias keying, the finish (recipe committed in instantiate.zig): rebuild
+   markCycle via the aliasGeneric stack; keep the ref ONLY for an
+   .intersection body; add the DEPTH GUARD to fixTypeArgs' substituting
+   branch (both prior scopings stack-overflowed social-app), reorder
+   materialize-before-defaults (measured neutral), then the scoped
+   shallow_default syntax test closes FeedPage.tsx:101. Expected result:
+   Navigation.tsx:778's message converges → social-app fully byte-identical
+   across checkers; excalidraw already is (12/12 grid cells).
+2. infer.zig's .ref PARAMETER arm needs an INTERSECTION-argument identity
+   pairing mirroring the union arm above it (AnimatedRef family: 3 FPs under
+   the wider originTaggable keying; ExtractElementRef infer recovery).
+3. Pipe / preserve-generic-signature — wave-sized, now fully spec'd (A30):
+   single-call-signature detection, non-generic contextual signature,
+   getUniqueTypeParameters + getSignatureInstantiationWithoutFillingIn
+   TypeArguments, separate inference set merged via mergeInferences when
+   non-overlapping, else instantiateSignatureInContextOf. 27 keys.
+4. Mapped target with a MATERIALIZABLE key set must fall through to
+   property-by-property inference (complicatedIndexesOfIntersections
+   AreInferencable — Exclude-keyed Pick over a free param).
+5. genericTypeArgumentInference1: instrument empty_seed/contra at
+   infer.zig:1727-1772 for the two-argument case (T should be never; the
+   Iterator<T,boolean> second argument displaces the empty-array seed).
+6. TS1134 template-literal property names (D30's recipe: parseVarDecl
+   force-advance with a startsArgument-style element check + re-check;
+   6 keys; bucketed tripwire).
+7. Small mapped items: const-context for bare literals at RETURN positions
+   (const_ctx consults only array/object/template literals); the
+   resolveSpace/toGlobal latent double-conversion at modvalue.zig:252;
+   TS2559 deferred-constraint suppression (eager probe or drain-time
+   rollback, 1 case); mask_let_const_class false positive; var-transit
+   blame direction (needs a real struct instead of the reused Link).
+8. this-type cycle, calls half (no corpus witness of its own; the two jsx
+   witnesses need the same in-progress-window answer — classes.
+   inProgressMemberNames is the started pattern).
+9. Census: 84→? one-FP cases; TS2322 pools; parser families (TS1005 199/185,
+   TS1109 83/72, TS1134 next).
+10. Substitution types (owner spanning generics+instantiate+subst+memo+print);
+    resolution-mode attributes; per-frame weak rule.
+
+## Superseded queue (wave 30, kept for context)
 
 1. infer.zig: mapped-target-with-literal-key-set inference must UNION
    candidates across ALL matching properties (inferMappedKeySet returns
