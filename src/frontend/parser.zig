@@ -677,9 +677,35 @@ const Parser = struct {
     }
 
     /// Record a diagnostic at the current token, or Backtrack if speculating.
+    ///
+    /// TS1359, tsc's `createIdentifier`: when the blame for a missing
+    /// identifier falls on a RESERVED word, the message names it — "Identifier
+    /// expected. 'null' is a reserved word that cannot be used here." — instead
+    /// of the bare TS1003. Every `expected_identifier` reported here IS a
+    /// `createIdentifier` site (the two callers that pass a message of their
+    /// own — `parsePrimaryExpression`'s "Expression expected",
+    /// `parseEntityNameOfTypeReference`'s "Type expected" — already spell
+    /// different codes), and the ONE site that is tsc's explicit
+    /// `parseErrorAt(…, Identifier_expected)` goes through
+    /// `failIdentifierLiteral` instead. Measured against tsgo: `import q =
+    /// null` and `import s = this` answer TS1359.
     fn fail(p: *Parser, code: Code) PE!void {
         if (p.spec > 0) return error.Backtrack;
+        if (code == .expected_identifier and p.curTag().isReservedKeyword()) {
+            return p.errAtCur(.reserved_word_identifier);
+        }
         try p.errAtCur(code);
+    }
+
+    /// `fail(.expected_identifier)` WITHOUT the TS1359 substitution — for the
+    /// sites where tsc writes `parseErrorAt(…, Diagnostics.Identifier_expected)`
+    /// itself rather than letting `createIdentifier` choose. ztsc has one: the
+    /// import-specifier keyword check, so `import { default } from "m"` answers
+    /// TS1003 on the `default` even though `default` is a reserved word
+    /// (measured, `es6ImportNamedImportIdentifiersParsing`).
+    fn failIdentifierLiteral(p: *Parser) PE!void {
+        if (p.spec > 0) return error.Backtrack;
+        try p.errAtCur(.expected_identifier);
     }
 
     /// Append a diagnostic, applying tsc's one-per-position rule for the
@@ -5313,11 +5339,26 @@ const Parser = struct {
             // any ModuleExportName — are silent (`es6ImportNamedImport
             // IdentifiersParsing`, `arbitraryModuleNamespaceIdentifiers_syntax`).
             if (!isIdentLike(p.curTag()) and p.peekTag(1) != .keyword_as) {
-                try p.fail(.expected_identifier);
+                try p.failIdentifierLiteral();
             }
             const name = try p.bump();
             var alias: u32 = 0;
-            if (try p.eat(.keyword_as) != null) alias = try p.expectIdentLike();
+            // The ALIAS is the name an IMPORT specifier BINDS, so it goes
+            // through the same explicit check as the bare form above — tsc's
+            // `parseNameWithKeywordCheck` records the token and the
+            // `checkIdentifierIsKeyword` branch answers TS1003 on it, not the
+            // TS1359 `createIdentifier` would choose. `import { yield as
+            // default }` and `import { default as default }` both land here.
+            if (try p.eat(.keyword_as) != null) {
+                if (isIdentLike(p.curTag())) {
+                    try p.checkStrictReserved();
+                    try p.checkAwaitReservedName();
+                    alias = try p.bump();
+                } else {
+                    try p.failIdentifierLiteral();
+                    alias = p.lastIdx();
+                }
+            }
             try p.pushScratch(try p.addNode(.{ .tag = .import_specifier, .main_token = name, .data = .{ .lhs = alias, .rhs = spec_flags } }));
             if (try p.eat(.comma) == null and p.curTag() != .r_brace) {
                 try p.fail(.expected_comma);
@@ -7236,7 +7277,8 @@ const Parser = struct {
             _ = try p.bump();
             flags |= bit;
         }
-        if (try p.eat(.asterisk) != null) flags |= ast.Flags.generator;
+        const star = try p.eat(.asterisk);
+        if (star != null) flags |= ast.Flags.generator;
 
         // Key. tsc reads `tokenIsIdentifier = isIdentifier()` BEFORE consuming
         // the property name, because only a real identifier can stand alone as
@@ -7277,6 +7319,19 @@ const Parser = struct {
                     if (p.curTag() == .private_identifier) try p.errAtCur(.private_name_outside_class);
                     key_tok = p.curIdx();
                     key = try p.leaf(.identifier);
+                } else if (star != null) {
+                    // tsc's `parseObjectLiteralElement` reads the `*` first and
+                    // then calls `parsePropertyName()` unconditionally, so a
+                    // missing name behind a generator star is
+                    // `createIdentifier`'s TS1003 — not the TS1136 that answers
+                    // "nothing here starts a property at all". The element then
+                    // keeps parsing as a method, which is what holds
+                    // `{ *() {} }` to that single diagnostic. Measured against
+                    // tsgo: `{ *() {} }`, `{ *{ } }`, `{ * }` and
+                    // `{ *<T>() {} }` all answer TS1003 alone.
+                    try p.fail(.expected_identifier);
+                    key_tok = star.?;
+                    key = try p.addNode(.{ .tag = .identifier, .main_token = key_tok, .data = .{ .lhs = 0, .rhs = 0 } });
                 } else {
                     try p.fail(.expected_property_name);
                     return p.errorNode();

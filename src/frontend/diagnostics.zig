@@ -842,6 +842,18 @@ pub const Code = enum(u16) {
     /// reads it back off the span; like them, it is a GRAMMAR diagnostic
     /// (measured — see `class`), despite reading as parser code in tsc.
     reserved_word_here,
+    /// TS1359 again, same number and same wording, but from tsc's PARSER:
+    /// `createIdentifier` prefers this over TS1003 whenever the token standing
+    /// where an identifier was required is a reserved word (`import q = null`,
+    /// `enum { case }`, `var { while: w }`). Measured, the two spellings differ
+    /// in CLASS and only in class: `import q = null` next to a sibling
+    /// `const bad: string = 1` reports the TS1359 and SUPPRESSES the TS2322,
+    /// while `class C { static { let await = 1 } }` next to the same sibling
+    /// reports both — so this one lives in `parseDiagnostics` and
+    /// `reserved_word_here` does not. Being syntactic also puts it in the
+    /// one-per-position rule, which is what drops the "';' expected" the
+    /// recovery would otherwise add on the very same token.
+    reserved_word_identifier,
 
     // --- class static blocks (tsc's `checkGrammar*`, so all four are semantic)
     /// TS18037: `await x` inside a static block. The operator parses — a static
@@ -1364,7 +1376,9 @@ pub const Code = enum(u16) {
             .strict_reserved_word => "Identifier expected. '{0}' is a reserved word in strict mode.",
             .strict_reserved_word_in_class => "Identifier expected. '{0}' is a reserved word in strict mode. Class definitions are automatically in strict mode.",
             .strict_reserved_word_in_module => "Identifier expected. '{0}' is a reserved word in strict mode. Modules are automatically in strict mode.",
-            .reserved_word_here => "Identifier expected. '{0}' is a reserved word that cannot be used here.",
+            .reserved_word_here,
+            .reserved_word_identifier,
+            => "Identifier expected. '{0}' is a reserved word that cannot be used here.",
             .await_in_static_block => "'await' expression cannot be used inside a class static block.",
             .for_await_in_static_block => "'for await' loops cannot be used inside a class static block.",
             .return_in_static_block => "A 'return' statement cannot be used inside a class static block.",
@@ -1715,7 +1729,7 @@ pub const Code = enum(u16) {
             .strict_reserved_word => 1212,
             .strict_reserved_word_in_class => 1213,
             .strict_reserved_word_in_module => 1214,
-            .reserved_word_here => 1359,
+            .reserved_word_here, .reserved_word_identifier => 1359,
             .await_in_static_block => 18037,
             .for_await_in_static_block => 18038,
             .return_in_static_block => 18041,

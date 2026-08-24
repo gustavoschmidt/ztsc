@@ -541,9 +541,10 @@ pub const Tag = enum(u8) {
             @intFromEnum(tag) <= @intFromEnum(Tag.keyword_using);
     }
 
-    /// Reserved words that can never be identifiers. (Classification kept for
-    /// symmetry with the other three predicates; only the tests read it.)
-    fn isReservedKeyword(tag: Tag) bool {
+    /// Reserved words that can never be identifiers — tsc's
+    /// `scanner.isReservedWord()`, `FirstReservedWord`..`LastReservedWord`.
+    /// The parser asks it for TS1359's wording (`errAtCur`).
+    pub fn isReservedKeyword(tag: Tag) bool {
         return @intFromEnum(tag) >= @intFromEnum(Tag.keyword_break) and
             @intFromEnum(tag) <= @intFromEnum(Tag.keyword_with);
     }
