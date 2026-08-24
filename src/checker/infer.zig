@@ -749,6 +749,16 @@ pub const InferCtx = struct {
     /// occurs at the top level of this return. `no_type` outside a call-site
     /// inference.
     sig_ret: TypeId = types.no_type,
+    /// The Phase-0 contextual-RETURN seed, one entry per type parameter — tsc's
+    /// `InferencePriority.ReturnType` inferences, which live in the same
+    /// `InferenceInfo` rows as every other candidate and so are visible to
+    /// `nonFixingMapper` from the first argument on. ztsc keeps them out of
+    /// `candidates` so argument evidence still owns the committed answer, which
+    /// leaves one reader that must see them anyway: the contextual-signature
+    /// substitution a generic function argument is instantiated against (see the
+    /// second pairing pass in `unify`'s `.function` arm). Empty outside a
+    /// call-site inference; only valid for `owner`'s own accumulator.
+    ret_seed: []const TypeId = &.{},
     /// The unique type parameters minted for this call's generic function
     /// arguments — tsc's `InferenceContext.inferredTypeParameters`, which
     /// `getSignatureInstantiation` re-attaches to the returned signature.
@@ -900,6 +910,7 @@ pub fn inferTypeArgs(
     if (ret_ctx != types.no_type) {
         try c.fillFromReturnContext(sig, tp_syms, ret_ctx, ret_seed, false, true);
     }
+    c.infer_ctx.ret_seed = ret_seed;
 
     // Empty-array-literal candidates, demoted to a fallback (see below).
     const empty_seed = try c.scratch().alloc(TypeId, tp_syms.len);
@@ -2337,6 +2348,27 @@ fn inferFromClassCtorParams(
 fn anyFunctionArg(c: *const Checker, arg_nodes: []const Node) bool {
     for (arg_nodes) |an| {
         if (an != null_node and isFunctionArg(c, an)) return true;
+    }
+    return false;
+}
+
+/// Does any PARAMETER position of the contextual signature `sig` still name an
+/// inference variable of this call that has no candidate yet? tsc's
+/// `some(inferences, hasInferenceCandidates)` after `applyToParameterTypes`,
+/// read one step earlier: a variable that already has a candidate is
+/// substituted by `nonFixingMapper` before the inference runs, so it can no
+/// longer contribute one. Parameters only — the return types are inferred after
+/// this test in tsc too.
+fn paramsMentionFreeVar(c: *Checker, sig: TypeId, tp_syms: []const u32, candidates: []const TypeId) Error!bool {
+    const free = try c.scratch().alloc(bool, tp_syms.len);
+    defer c.scratch().free(free);
+    for (free) |*x| x.* = false;
+    var i: u32 = 0;
+    while (i < c.ts.fnParamCount(sig)) : (i += 1) {
+        try markMentionedTps(c, c.ts.fnParam(sig, i).ty, tp_syms, free, 0);
+    }
+    for (free, candidates) |m, cand| {
+        if (m and cand == types.no_type) return true;
     }
     return false;
 }
@@ -4128,6 +4160,65 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                         depth + 1,
                     );
                 }
+                // A SECOND pairing pass, against the contextual parameter types
+                // with what this call has already inferred substituted into
+                // them. tsc reads the contextual signature through
+                // `context.nonFixingMapper` — so by the time
+                // `instantiateSignatureInContextOf` infers the argument's own
+                // parameters, every variable of this call that has a candidate
+                // is already a concrete type — and `first: <T>(ts: T[]) => T`
+                // against `(c: C) => D` with `C` already `string[]` therefore
+                // answers `T = string`, not nothing. Read raw, `C` is a bare
+                // variable that `T[]` cannot pair with at all, so `T` was left
+                // FREE in the argument's signature (`all_unbound`, so the
+                // instantiation is skipped entirely) and the call went on to
+                // infer `C := T[]` from it — reported as `string[]` not
+                // assignable to `T[]` on the callback that had just supplied
+                // `C` (`genericFunctionInference1`'s `fn60`/`fn61`).
+                //
+                // Fills only what the raw pass left empty, so every shape the
+                // raw pairing already answers keeps its exact reading; and a
+                // still-free contextual variable substitutes to itself, so the
+                // higher-order mint below is untouched where it belongs.
+                if (std.mem.indexOfScalar(TypeId, own_cands, types.no_type) != null) {
+                    // The Phase-0 return seed counts as inferred here, exactly
+                    // as it does in tsc: `InferencePriority.ReturnType`
+                    // candidates sit in the same `InferenceInfo` rows every
+                    // other candidate does, so `nonFixingMapper` substitutes
+                    // them from the first argument on. Without it
+                    // `const f13: <T>(x: Box<T[]>) => T = compose(unbox,
+                    // unlist)` reads `A` as still free, mints for `unbox`, and
+                    // the whole chain answers in minted parameters instead of
+                    // the annotation's `T`.
+                    const seed: []const TypeId = if (c.infer_ctx.owner == candidates.ptr and
+                        c.infer_ctx.ret_seed.len == tp_syms.len) c.infer_ctx.ret_seed else candidates;
+                    // Nothing inferred yet is the common case — the FIRST
+                    // argument of every call reaches here — and then the
+                    // substitution is the identity. Skipping it keeps the
+                    // instantiation off that path entirely.
+                    var any_known = false;
+                    for (candidates, seed) |cand, sd| {
+                        if (cand != types.no_type or sd != types.no_type) any_known = true;
+                    }
+                    for (0..if (any_known) np else 0) |i| {
+                        const src = paramTypeAt(c, param, pat_rest_tuple, @intCast(i));
+                        const subst = try c.instantiateKnownParams(src, tp_syms, candidates, seed);
+                        if (subst == src) continue;
+                        const retry = try c.scratch().alloc(TypeId, own_syms.len);
+                        defer c.scratch().free(retry);
+                        for (retry) |*v| v.* = types.no_type;
+                        try c.unify(
+                            paramTypeAt(c, ra, own_rest_tuple, @intCast(i)),
+                            subst,
+                            own_syms,
+                            retry,
+                            depth + 1,
+                        );
+                        for (own_cands, retry) |*slot, r| {
+                            if (slot.* == types.no_type) slot.* = r;
+                        }
+                    }
+                }
                 var map_list: std.ArrayList(TpMap) = .empty;
                 defer map_list.deinit(c.scratch());
                 var all_unbound = true;
@@ -4320,8 +4411,30 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                     // No slot to release from the fix set here: the minted
                     // parameter is the one thing the walk below legitimately
                     // teaches this call.
+                    //
+                    // …but only while the contextual signature still HAS a free
+                    // variable to carry it. tsc reads the contextual type
+                    // through `context.nonFixingMapper`, so every variable this
+                    // call has already inferred is substituted before the mint
+                    // is even considered, and the mint then happens only when
+                    // inferring from the instantiated source's parameters to
+                    // those (substituted) contextual parameters yields a
+                    // candidate — `some(inferences, hasInferenceCandidates)` in
+                    // `instantiateTypeWithSingleGenericCallSignature`. Against a
+                    // fully-determined contextual signature nothing is left to
+                    // infer, so tsc falls through to
+                    // `instantiateSignatureInContextOf` instead.
+                    //
+                    // `pipe(getArray, x => x, first)` is the shape (`first:
+                    // <T>(ts: T[]) => T` against `(c: C) => D`, with `C` already
+                    // `string[]`): minting `T'` bound `C := T'[]` contravariantly
+                    // on top of the `string[]` the callback had just supplied,
+                    // and the callback's `x` was then reported as `string[]` not
+                    // assignable to `T[]`. `param` is walked unsubstituted here,
+                    // so the substitution is read off `candidates` directly.
                     if (cand0 == types.no_type and c.infer_ctx.sig_ctx == 0 and
-                        c.infer_ctx.ho_result_fn and s.fnTypeParamCount(param) == 0)
+                        c.infer_ctx.ho_result_fn and s.fnTypeParamCount(param) == 0 and
+                        try paramsMentionFreeVar(c, param, tp_syms, candidates))
                     {
                         if (c.infer_ctx.ho_minted) |list| {
                             const ft = try s.makeTypeParam(try uniqueTypeParam(c, sym, list));
