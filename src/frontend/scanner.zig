@@ -1147,6 +1147,32 @@ pub const Scanner = struct {
                 },
                 else => {},
             }
+            // A LEGACY OCTAL literal ends with its digits. tsc's `scanNumber`
+            // scans the whole digit run after the `0` and, when every digit of
+            // it is octal, `return`s right there — before the fraction, the
+            // exponent and the BigInt suffix are ever looked at. So `01.0` is
+            // `01` then `.0`, and `01e2` is `01` then `e2`, which is the "','
+            // expected" tsgo reports at the `.`/`e` and ztsc used to swallow
+            // into one number.
+            //
+            // The test is on the WHOLE run, exactly as tsc's `scanDigits` is:
+            // one digit out of range makes the literal a leading-zero DECIMAL
+            // (`018.5`, `019` — TS1489's shape) which does keep its fraction
+            // and exponent. A numeric separator ends the digit run without
+            // ending the literal, so a `_` after it hands the whole token back
+            // to the ordinary path rather than guessing.
+            if (isDigit(s.at(s.index + 1))) {
+                var i = s.index + 1;
+                var all_octal = true;
+                while (isDigit(s.at(i))) : (i += 1) {
+                    if (s.src[i] > '7') all_octal = false;
+                }
+                if (s.at(i) == '_') all_octal = false;
+                if (all_octal) {
+                    s.index = i;
+                    return .numeric_literal;
+                }
+            }
         }
         var integer = true;
         s.skipDigits(.dec); // no-op when starting at '.'
@@ -1711,6 +1737,14 @@ test "golden: numeric literals" {
     try expectTokens("1e[x]", &.{ .numeric_literal, .l_bracket, .identifier, .r_bracket, .eof });
     // `1..toString` is numeric `1.` then `.` then identifier.
     try expectTokens("1..toString", &.{ .numeric_literal, .dot, .identifier, .eof });
+    // A LEGACY OCTAL literal ends with its digits — no fraction, no exponent,
+    // no BigInt suffix (tsc's `scanNumber` returns from the octal branch).
+    try expectTokens("01.0", &.{ .numeric_literal, .numeric_literal, .eof });
+    try expectTokens("01e2", &.{ .numeric_literal, .identifier, .eof });
+    try expectTokens("01n", &.{ .numeric_literal, .identifier, .eof });
+    // One digit out of range makes it a leading-zero DECIMAL, which keeps both.
+    try expectTokens("018.5", &.{ .numeric_literal, .eof });
+    try expectTokens("019e2", &.{ .numeric_literal, .eof });
 }
 
 test "golden: strings and escapes" {

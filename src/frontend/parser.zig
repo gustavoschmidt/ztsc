@@ -3448,6 +3448,25 @@ const Parser = struct {
             const before = p.curIdx();
             const diags_before = p.diags.items.len;
             const last_syn_before = p.last_syntactic_start;
+            // A `:` where a parameter belongs is the one `startsNoParameter`
+            // token `parseParam` does NOT stall on: it reads the `:` as this
+            // parameter's TYPE ANNOTATION and complains about the name it did
+            // not find (TS1003), so the retraction below — which only fires
+            // when the element parse consumed nothing — never sees it. tsc
+            // asks `isStartOfParameter` FIRST, gets no, and files the list's
+            // TS1138; the skip then leaves the type name to be read as the
+            // next parameter, which is why `function a(<nl>: T) { }` is that
+            // one diagnostic and nothing about `T` (parserSkippedTokens16).
+            //
+            // Held to `:` alone. The other `startsNoParameter` tokens already
+            // stall `parseParam` and reach the same TS1138 through the
+            // retraction, and a token that stalls it is the only one whose
+            // skip is known to leave the list where tsc leaves it.
+            if (p.spec == 0 and p.curTag() == .colon) {
+                try p.fail(.expected_parameter_declaration);
+                _ = try p.bump();
+                continue;
+            }
             const param = try p.parseParam();
             if (p.curIdx() == before) {
                 // tsc's `abortParsingListOrMoveToNextToken`: a token that starts
@@ -6515,6 +6534,24 @@ const Parser = struct {
         // (`parserErrorRecovery_ArgumentList2`).
         while (p.curTag() != .r_paren and p.curTag() != .semicolon and p.curTag() != .eof) {
             const before = p.curIdx();
+            // The LIST's own answer, not the element parse's. tsc never enters
+            // `parseArgumentExpression` for a token `isListElement(
+            // ArgumentExpressions)` refuses — `parseDelimitedList` files
+            // `parsingContextErrors(ArgumentExpressions)`, "Argument expression
+            // expected." (TS1135), and `abortParsingListOrMoveToNextToken`
+            // then hands the token back to whatever enclosing context is
+            // waiting for it. Both of these tokens always have one (a `}`
+            // closes a block, a reserved statement word opens a statement), so
+            // the list ends here; the `)` that `expect` goes on to want lands
+            // on the position this diagnostic just took and is dropped by the
+            // one-per-position rule, exactly as the old TS1109 arrangement's
+            // was. Measured against tsgo: `foo(<nl>}`, `bar(<nl>return x;` and
+            // `bar(a,<nl>return;` are each ONE TS1135, where ztsc answered one
+            // TS1109 at the same position.
+            if (startsNoArgument(p.curTag())) {
+                try p.errAtCur(.expected_argument_expression);
+                break;
+            }
             if (p.curTag() == .dot_dot_dot) {
                 const dots = try p.bump();
                 const expr = try p.parseAssignExpr(.{});
@@ -6568,6 +6605,50 @@ const Parser = struct {
     /// as noise.
     fn startsArgument(tag: TokTag) bool {
         return tag == .dot_dot_dot or canStartExpression(tag);
+    }
+
+    /// The other side of `startsArgument`, and deliberately NOT its negation: a
+    /// list of tokens `isStartOfExpression` refuses for CERTAIN.
+    ///
+    /// tsc's predicate ends in `isBinaryOperator() || isIdentifier()`, so `*`,
+    /// `in`, `&&` and every contextual keyword DO start an expression there —
+    /// `canStartExpression` says no to some of them, and reading its `false` as
+    /// "tsc would refuse" would put the list's TS1135 where tsc keeps the
+    /// expression parse's own TS1109. What is certain is a closing bracket and
+    /// a RESERVED word that begins no expression: neither is an identifier,
+    /// neither is a binary operator, and neither appears in
+    /// `isStartOfLeftHandSideExpression`. `let`, `yield`, `await`, `async` and
+    /// the other contextual words are identifiers and stay off this list;
+    /// `in`/`instanceof` are binary operators and stay off it too.
+    fn startsNoArgument(tag: TokTag) bool {
+        return switch (tag) {
+            .r_brace,
+            .r_bracket,
+            .keyword_var,
+            .keyword_const,
+            .keyword_if,
+            .keyword_else,
+            .keyword_do,
+            .keyword_while,
+            .keyword_for,
+            .keyword_continue,
+            .keyword_break,
+            .keyword_return,
+            .keyword_with,
+            .keyword_switch,
+            .keyword_case,
+            .keyword_default,
+            .keyword_throw,
+            .keyword_try,
+            .keyword_catch,
+            .keyword_finally,
+            .keyword_debugger,
+            .keyword_enum,
+            .keyword_export,
+            .keyword_extends,
+            => true,
+            else => false,
+        };
     }
 
     /// Standing in for tsc's `isInSomeParsingContext`: is the token something

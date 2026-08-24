@@ -104,6 +104,11 @@ pub const Code = enum(u16) {
     /// same family: the list has its own answer, and it replaces whatever the
     /// element parse would have said about the token.
     expected_parameter_declaration,
+    /// TS1135: `parsingContextErrors(ArgumentExpressions)` — a token that
+    /// starts no EXPRESSION, in an argument list (`bar(<newline> return x;`).
+    /// The same family again: the LIST answers, not the element parse, so this
+    /// stands where the generic "Expression expected." would otherwise be.
+    expected_argument_expression,
     expected_binding,
     /// TS1389: the OTHER half of `parsingContextErrors(VariableDeclarations)`.
     /// The same refusal as `expected_binding`, worded for a KEYWORD — `var
@@ -1337,6 +1342,7 @@ pub const Code = enum(u16) {
             .expected_binding_pattern_property => "Property destructuring pattern expected.",
             .expected_binding_pattern_element => "Array element destructuring pattern expected.",
             .expected_parameter_declaration => "Parameter declaration expected.",
+            .expected_argument_expression => "Argument expression expected.",
             .expected_binding => "Variable declaration expected.",
             .reserved_var_decl_name => "'{0}' is not allowed as a variable declaration name.",
             .empty_var_decl_list => "Variable declaration list cannot be empty.",
@@ -1690,6 +1696,7 @@ pub const Code = enum(u16) {
             .expected_binding_pattern_property => 1180,
             .expected_binding_pattern_element => 1181,
             .expected_parameter_declaration => 1138,
+            .expected_argument_expression => 1135,
             .expected_binding => 1134,
             .reserved_var_decl_name => 1389,
             .empty_var_decl_list => 1123,
