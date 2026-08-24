@@ -1462,6 +1462,29 @@ pub const Store = struct {
             }
             return s.makeUnion(s.alloc, arms.items);
         }
+        // tsc's `createNormalizedTupleType` element loop, first case: a
+        // VARIADIC element whose type is `any` is a REST element over `any`,
+        // not a hole waiting for an array to be spliced into it —
+        // `if (type.flags & TypeFlags.Any) addElement(type, ElementFlags.Rest)`.
+        // So `[...any, K]` IS `[...any[], K]`, and `[...any]` is `any[]`
+        // (through the lone-rest collapse below).
+        //
+        // Left as a variadic element the tuple has a position nothing can fill:
+        // a variadic target position demands a variadic source position, so
+        // NOTHING was assignable to `[...any, K]` — not `[...unknown[], K]`, not
+        // a `[...C, K]` over a deferred conditional. bluesky's storage API is
+        // exactly that shape: `get<Key>(scopes: [...Scopes, Key])` on a
+        // `Storage<Scopes extends unknown[], Schema>` read through a
+        // `Store extends Storage<any, any>` gives the parameter `[...any, Key]`,
+        // and every `useStorage` call site was TS2345.
+        for (elems, 0..) |e, ai| {
+            if ((e.flags & elem_flag_rest) == 0 or s.kind(e.ty) != .any) continue;
+            var buf = try s.alloc.alloc(TupleElem, elems.len);
+            defer s.alloc.free(buf);
+            @memcpy(buf, elems);
+            buf[ai] = .{ .ty = try s.makeArray(e.ty), .flags = e.flags };
+            return s.makeTupleFlags(buf, flags);
+        }
         // tsc's `createNormalizedTupleType`: a REST element whose type is
         // itself a TUPLE contributes that tuple's elements positionally, so
         // `[...[A, B], C]` IS `[A, B, C]` — and, the case that reaches this
