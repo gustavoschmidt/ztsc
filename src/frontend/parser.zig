@@ -3791,6 +3791,26 @@ const Parser = struct {
                 try p.pushScratch(try p.parseDecorator());
                 continue;
             }
+            // tsc's `isListElement(ClassMembers)` = `lookAhead(isClassMemberStart)`.
+            // A token that starts no member never reaches `parseClassElement`:
+            // `parseList` files TS1068 and `abortParsingListOrMoveToNextToken`
+            // either ENDS the member list (leaving the token to whatever
+            // enclosing list would take it — `isInSomeParsingContext`,
+            // approximated here by the statement list, which is the only
+            // enclosing context a class body has) or skips exactly that token.
+            //
+            // Measured against tsgo, ending the list is what makes `class C {
+            // var x = 1; }` answer TS1068 on the `var` and then TS1128 on the
+            // now-unmatched `}` — the class closes at the `var`, the
+            // declaration becomes a statement, and the `}` is left over. The
+            // `}` this loop then fails to find lands on the very token TS1068
+            // holds, so the one-per-position rule drops it.
+            if (!p.atStartOfClassMember()) {
+                try p.fail(.expected_class_member);
+                if (p.atStartOfStatement()) break;
+                _ = try p.bump();
+                continue;
+            }
             try p.pushScratch(try p.parseClassMember(deco_at, top));
             deco_at = null;
             try p.dropDecoratorsOnStaticBlock(top);
@@ -3915,6 +3935,91 @@ const Parser = struct {
             .keyword_get => ast.Flags.get,
             .keyword_set => ast.Flags.set,
             else => 0,
+        };
+    }
+
+    /// tsc's `isModifierKind` — the tags its `parseModifiers` loop (and the
+    /// modifier walk inside `isClassMemberStart`) will step over. Wider than
+    /// `classMemberModifierBit`, which answers what a modifier MEANS on a class
+    /// member: `default`, `export`, `in` and `out` are modifiers to the walk
+    /// even though no class member carries them.
+    fn isModifierKind(tag: TokTag) bool {
+        return switch (tag) {
+            .keyword_default, .keyword_export, .keyword_in, .keyword_out, .keyword_const => true,
+            .keyword_get, .keyword_set => false,
+            else => classMemberModifierBit(tag) != 0,
+        };
+    }
+
+    /// tsc's `isClassMemberModifier` — the modifiers that can ONLY introduce a
+    /// class member, so seeing one settles `isClassMemberStart` on the spot.
+    fn isClassMemberModifier(tag: TokTag) bool {
+        return switch (tag) {
+            .keyword_public,
+            .keyword_private,
+            .keyword_protected,
+            .keyword_readonly,
+            .keyword_override,
+            .keyword_static,
+            .keyword_accessor,
+            => true,
+            else => false,
+        };
+    }
+
+    /// tsc's `isLiteralPropertyName`: what may stand as a member NAME without
+    /// brackets — any identifier or keyword, or a string/number/BigInt literal.
+    fn isLiteralPropertyName(tag: TokTag) bool {
+        return isNameLike(tag) or tag == .string_literal or
+            tag == .numeric_literal or tag == .bigint_literal;
+    }
+
+    /// tsc's `isClassMemberStart`, the `isListElement` predicate `parseList`
+    /// asks before every iteration of `parseClassMembers`. A token that answers
+    /// false is never handed to `parseClassElement` at all: the list files one
+    /// TS1068 and `abortParsingListOrMoveToNextToken` then decides between
+    /// LEAVING the token to an enclosing list and skipping just it.
+    ///
+    /// The shape it exists to catch is a keyword that could be a member name
+    /// standing in front of something that proves it is not one — `var x = 1`,
+    /// `class C2 {`, `global x` inside a class body. Without the gate those
+    /// read as a field named `var`/`class`/`global` and answer a TS1005
+    /// cascade where tsc answers TS1068 and hands the text back to the
+    /// statement list.
+    ///
+    /// Conservative where the lookahead window runs out: a modifier run longer
+    /// than the window answers `true`, because a false `true` only keeps
+    /// ztsc's existing recovery while a false `false` manufactures a TS1068
+    /// tsc does not report.
+    fn atStartOfClassMember(p: *Parser) bool {
+        if (p.curTag() == .at) return true;
+        var n: usize = 0;
+        var id_tok: ?TokTag = null;
+        while (isModifierKind(p.peekTag(n))) {
+            id_tok = p.peekTag(n);
+            if (isClassMemberModifier(id_tok.?)) return true;
+            n += 1;
+            if (n + 1 >= max_la) return true;
+        }
+        if (p.peekTag(n) == .asterisk) return true;
+        if (isLiteralPropertyName(p.peekTag(n))) {
+            id_tok = p.peekTag(n);
+            n += 1;
+            if (n + 1 >= max_la) return true;
+        }
+        // An index signature or a computed name is a member whatever preceded.
+        if (p.peekTag(n) == .l_bracket) return true;
+        const idt = id_tok orelse return false;
+        // A plain identifier settles it; so do the two ACCESSOR words, which
+        // are keywords but always introduce a member.
+        if (!idt.isKeyword() or idt == .keyword_get or idt == .keyword_set) return true;
+        return switch (p.peekTag(n)) {
+            // Method, generic method, `!` definite, `:` annotation, `=`
+            // initializer, `?` optional — each proves the keyword was a name.
+            .l_paren, .lt, .lt_lt, .lt_lt_eq, .bang, .colon, .eq, .question => true,
+            // tsc's `canParseSemicolon()`: the keyword stands alone as a field.
+            .semicolon, .r_brace, .eof => true,
+            else => p.peekNewline(n),
         };
     }
 
@@ -4212,6 +4317,20 @@ const Parser = struct {
             else => {
                 if (isNameLike(p.curTag())) {
                     name_tok = try p.bump();
+                } else if (star != null) {
+                    // A generator `*` puts tsc PAST `isClassMemberStart` (which
+                    // returns true on the `*` alone) and inside
+                    // `parsePropertyOrMethodDeclaration`, where the name comes
+                    // from `parsePropertyName` — so a missing one is
+                    // `createIdentifier`'s TS1003, not the list-level TS1068.
+                    // The member then keeps parsing, which is what holds
+                    // `class C { *() {} }` to that single diagnostic: the `(`
+                    // that follows opens the method's parameter list instead of
+                    // being re-offered to the member loop as two more junk
+                    // tokens. Measured against tsgo, `*() {}`, a bare `*`, `* =
+                    // 1;` and `* ;` all answer TS1003 alone.
+                    try p.fail(.expected_identifier);
+                    name_tok = p.lastIdx();
                 } else {
                     // A CLASS member name: tsc's `parseClassElement` answers
                     // TS1068 here, not the object-literal TS1136.
