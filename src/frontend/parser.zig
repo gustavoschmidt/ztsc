@@ -2211,6 +2211,17 @@ const Parser = struct {
                 // ordinary contextual-keyword identifier (`global.foo`, a label).
                 if (p.peekTag(1) == .l_brace) return p.parseGlobalAugmentation();
                 if (p.peekTag(1) == .colon) return p.parseLabeledStatement();
+                // tsc's `isDeclaration` arm for `global` accepts `{`, an
+                // IDENTIFIER, or `export` after the keyword, and
+                // `parseAmbientExternalModuleDeclaration` then names the
+                // declaration after the word `global` itself and — with no `{`
+                // — falls through to `parseSemicolon()`. So `global x` is
+                // "';' expected" ON THE `x` (measured), not the TS1434 an
+                // expression statement `global` earns for a word it cannot
+                // follow.
+                if (isIdentLike(p.peekTag(1)) or p.peekTag(1) == .keyword_export) {
+                    return p.parseBodylessGlobalAugmentation();
+                }
                 return p.parseExpressionStatement();
             },
             .keyword_enum => return p.parseEnumDecl(0),
@@ -3370,6 +3381,22 @@ const Parser = struct {
         return p.scratchToSpan(top);
     }
 
+    /// The tokens tsc's `isStartOfParameter` definitely REFUSES. Deliberately
+    /// narrower than that predicate, which also admits everything
+    /// `isStartOfType` admits — `|`, `&`, `?`, `!`, `*`, `new`, `import`,
+    /// `infer`, and every literal including a TEMPLATE one. Answering `true`
+    /// here only re-labels the list's own diagnostic; answering it where tsc
+    /// would have entered `parseParameter` swaps a right code for a wrong one.
+    /// `function f(`hello`);` is the case that proves the caution is needed: a
+    /// no-substitution template IS a type start, so tsgo answers TS1003 there
+    /// and not TS1138.
+    fn startsNoParameter(tag: TokTag) bool {
+        return switch (tag) {
+            .comma, .semicolon, .colon, .eq, .arrow, .dot => true,
+            else => false,
+        };
+    }
+
     fn parseParams(p: *Parser) PE!ast.SubRange {
         // tsc's `parseParameterList` returns a MISSING list the moment the `(`
         // is not there — it neither reads parameters nor goes on to expect a
@@ -3384,17 +3411,38 @@ const Parser = struct {
         defer p.scratch.shrinkRetainingCapacity(top);
         while (p.curTag() != .r_paren and p.curTag() != .eof) {
             const before = p.curIdx();
+            const diags_before = p.diags.items.len;
+            const last_syn_before = p.last_syntactic_start;
             const param = try p.parseParam();
             if (p.curIdx() == before) {
                 // tsc's `abortParsingListOrMoveToNextToken`: a token that starts
-                // no parameter is reported (already done, inside `parseParam`)
-                // and SKIPPED, and the list keeps going. Ending the list here
-                // instead left the rest of the header to be re-read as
-                // statements, which invented diagnostics tsc never has:
-                // `function* f(a = yield => yield) {}` is one "',' expected"
-                // for tsc, because it skips the `=>` and takes `yield` as a
-                // second parameter, closing the list at the real `)`.
+                // no parameter is reported and SKIPPED, and the list keeps
+                // going. Ending the list here instead left the rest of the
+                // header to be re-read as statements, which invented
+                // diagnostics tsc never has: `function* f(a = yield => yield)
+                // {}` is one "',' expected" for tsc, because it skips the `=>`
+                // and takes `yield` as a second parameter, closing the list at
+                // the real `)`.
+                //
+                // The MESSAGE is the list's, not the element's. tsc never
+                // enters `parseParameter` for such a token at all —
+                // `isListElement(Parameters)` is `isStartOfParameter`, and when
+                // it says no `parseList` files
+                // `parsingContextErrors(Parameters)`, "Parameter declaration
+                // expected." (TS1138). ztsc arrives from the other side —
+                // `parseParam` consuming NOTHING is exactly the shape
+                // `isStartOfParameter` rejects — so whatever it said about the
+                // token is retracted in favour of the list's own answer.
+                // Measured against tsgo: `class X { get x(,) {…} }` is one
+                // TS1138 on the `,`, where ztsc answered TS1003. Only for the
+                // tokens `isStartOfParameter` certainly refuses — see
+                // `startsNoParameter`.
                 if (p.spec > 0) break; // speculating: let the caller decide
+                if (startsNoParameter(p.curTag())) {
+                    p.diags.shrinkRetainingCapacity(diags_before);
+                    p.last_syntactic_start = last_syn_before;
+                    try p.fail(.expected_parameter_declaration);
+                }
                 _ = try p.bump();
                 continue;
             }
@@ -5018,6 +5066,24 @@ const Parser = struct {
     /// the block's top-level declarations become global contributions the
     /// linker merges into the program global table. `name_token` points
     /// at the `global` keyword purely for span/dump purposes.
+    /// `global` standing where tsc reads a global augmentation but with no `{`
+    /// to open a body — `parseAmbientExternalModuleDeclaration`'s
+    /// `else { parseSemicolon(); }` arm. The declaration is real (its NAME is
+    /// the `global` keyword) and simply empty; what matters is that the token
+    /// after it is answered by `parseSemicolon` rather than by the
+    /// expression-statement recovery.
+    fn parseBodylessGlobalAugmentation(p: *Parser) PE!Node {
+        const kw = try p.bump(); // `global`
+        try p.expectSemicolon();
+        const extra = try p.addExtra(ast.NamespaceData{
+            .flags = ast.Flags.declare | ast.Flags.global_aug,
+            .name_token = kw,
+            .body_start = 0,
+            .body_end = 0,
+        });
+        return p.addNode(.{ .tag = .namespace_decl, .main_token = kw, .data = .{ .lhs = extra, .rhs = 0 } });
+    }
+
     fn parseGlobalAugmentation(p: *Parser) PE!Node {
         const kw = try p.bump(); // `global`
         _ = try p.expect(.l_brace, .expected_l_brace);

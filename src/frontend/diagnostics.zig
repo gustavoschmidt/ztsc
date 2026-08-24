@@ -99,6 +99,11 @@ pub const Code = enum(u16) {
     /// `parsingContextErrors(ArrayBindingElements)`, a third wording beside
     /// TS1180's and TS1134's.
     expected_binding_pattern_element,
+    /// TS1138: `parsingContextErrors(Parameters)` — a token that starts no
+    /// PARAMETER, in a parameter list (`get x(,)`). A fourth wording in the
+    /// same family: the list has its own answer, and it replaces whatever the
+    /// element parse would have said about the token.
+    expected_parameter_declaration,
     expected_binding,
     /// TS1389: the OTHER half of `parsingContextErrors(VariableDeclarations)`.
     /// The same refusal as `expected_binding`, worded for a KEYWORD — `var
@@ -1314,6 +1319,7 @@ pub const Code = enum(u16) {
             .expected_property_name => "Property assignment expected.",
             .expected_binding_pattern_property => "Property destructuring pattern expected.",
             .expected_binding_pattern_element => "Array element destructuring pattern expected.",
+            .expected_parameter_declaration => "Parameter declaration expected.",
             .expected_binding => "Variable declaration expected.",
             .reserved_var_decl_name => "'{0}' is not allowed as a variable declaration name.",
             .empty_var_decl_list => "Variable declaration list cannot be empty.",
@@ -1662,6 +1668,7 @@ pub const Code = enum(u16) {
             .expected_property_name => 1136,
             .expected_binding_pattern_property => 1180,
             .expected_binding_pattern_element => 1181,
+            .expected_parameter_declaration => 1138,
             .expected_binding => 1134,
             .reserved_var_decl_name => 1389,
             .empty_var_decl_list => 1123,
