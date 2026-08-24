@@ -70,22 +70,24 @@ pub fn checkNumeric(text: []const u8, start: u32) ?Finding {
             return .{ .code = code, .span = .{ .start = at, .end = at + 1 } };
         }
         // A leading zero followed by a digit. Which of the two rules applies is
-        // decided by the FIRST digit only: tsc scans `0` + octal digits as a
-        // legacy octal literal and stops at the first 8 or 9, and reaches the
-        // leading-zero rule only when the very first digit is already out of
-        // range.
-        switch (text[1]) {
-            '0'...'7' => return .{
-                .code = .octal_literal_not_allowed,
+        // decided by the WHOLE digit run, not its first digit: tsc's
+        // `scanDigits` walks every digit after the `0` and answers "octal" only
+        // when none of them is out of range, so `019` and `018.5` are
+        // leading-zero DECIMALS (TS1489) and only an all-octal run is TS1121.
+        // Reading the first digit alone called `019` an octal literal, which
+        // tsgo does not.
+        if (isDigit(text[1])) {
+            var i: usize = 1;
+            var all_octal = true;
+            while (i < text.len and isDigit(text[i])) : (i += 1) {
+                if (text[i] > '7') all_octal = false;
+            }
+            return .{
+                .code = if (all_octal) .octal_literal_not_allowed else .decimal_with_leading_zero,
                 .span = .{ .start = start, .end = start + @as(u32, @intCast(text.len)) },
-            },
-            '8', '9' => return .{
-                .code = .decimal_with_leading_zero,
-                .span = .{ .start = start, .end = start + @as(u32, @intCast(text.len)) },
-            },
-            // `0e`, `0.5e` — fall through to the exponent rule.
-            else => {},
+            };
         }
+        // `0e`, `0.5e` — fall through to the exponent rule.
     }
     if (danglingExponentAt(text)) |off| {
         const at = start + off;
@@ -561,6 +563,10 @@ test "numeric: legacy octal and leading zeros" {
     try expectNumeric("0777", .octal_literal_not_allowed, 0);
     try expectNumeric("08", .decimal_with_leading_zero, 0);
     try expectNumeric("0900", .decimal_with_leading_zero, 0);
+    // One digit out of range ANYWHERE in the run decides it, not the first
+    // one: tsgo answers TS1489 for both of these.
+    try expectNumeric("019", .decimal_with_leading_zero, 0);
+    try expectNumeric("0178", .decimal_with_leading_zero, 0);
     // Clean forms: a bare zero, a fraction, an exponent, a BigInt, and every
     // prefixed radix with at least one digit.
     try expectNumeric("0", null, 0);

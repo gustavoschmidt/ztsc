@@ -33,13 +33,17 @@
 //!   single tokens (unlike tsc, which scans lone `>` and rescans on demand).
 //!   The parser splits `>>` when closing nested generics — trivial with
 //!   SoA tokens since the pieces are byte-adjacent.
-//! - **Unicode, pragmatically**: ASCII has a fast path; any byte >= 0x80 is
-//!   accepted as an identifier constituent without ID_Start/ID_Continue table
-//!   validation. This over-accepts (e.g. U+00A0 NBSP or U+2028 LS become
-//!   identifier bytes rather than whitespace/line terminators) but never
-//!   mis-tokenizes ASCII-only code and never crashes on invalid UTF-8. `\u`
-//!   escapes in identifiers are consumed (`\uXXXX` and `\u{...}`); escaped
-//!   keywords are always plain identifiers. A UTF-8 BOM is skipped.
+//! - **Unicode**: ASCII has a fast path — every byte below 0x80 is answered by
+//!   a compare, and only a byte >= 0x80 decodes its sequence and consults the
+//!   generated ID_Start / ID_Continue ranges (`unicode_id.zig`). A character
+//!   that is neither an identifier constituent nor trivia starts no token at
+//!   all and scans as `.unknown`, which is tsc's "Invalid character" (TS1127):
+//!   `class C extends A ¬ {}` blames the `¬`, not the brace it displaced.
+//!   `\u` escapes in identifiers are consumed (`\uXXXX` and `\u{...}`) and
+//!   their code point is held to the SAME tables, so `var 1a` (an escaped
+//!   `1`) and a lone surrogate `\uD800` are invalid characters too; escaped
+//!   keywords are always plain identifiers. Malformed UTF-8 never crashes —
+//!   it is binary content. A UTF-8 BOM is skipped.
 //! - **Numeric literals**: decimal (incl. `.5`, `1.`, exponents), hex, octal,
 //!   binary, bigint `n` suffix (only on integer forms: `1.5n` scans as `1.5`
 //!   + identifier `n`; hex-float `0x1p3` is not TS and scans as `0x1` +
@@ -51,6 +55,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const unicode_id = @import("unicode_id.zig");
 
 /// Sources are limited to 2 GiB - 1 so bit 31 of a token start can carry the
 /// preceded-by-newline flag.
@@ -86,7 +91,9 @@ pub fn scanJsxName(src: []const u8, at_index: u32) u32 {
             colon_used = true;
             s.index += 1;
         } else if (c == '\\') {
-            if (!s.consumeIdentifierEscape()) break;
+            // A JSX name's first character may itself be an escape
+            // (`<\u{0061}-b>`), so the position decides which table.
+            if (!s.consumeIdentifierEscape(s.index == at_index)) break;
         } else break;
     }
     return s.index;
@@ -240,7 +247,7 @@ pub fn tokenEnd(src: []const u8, tag: Tag, start: u32) u32 {
             if (start < src.len and src[start] == '\\') {
                 // A `\uXXXX`-introduced identifier: consume the escape exactly
                 // as `next()` does, then fall into the same rest loop.
-                if (!s.consumeIdentifierEscape()) return s.next().end;
+                if (!s.consumeIdentifierEscape(true)) return s.next().end;
             } else if (start < src.len) {
                 s.index +|= charStepLen(src, start);
             } else {
@@ -885,7 +892,7 @@ pub const Scanner = struct {
             'a'...'z', 'A'...'Z', '_', '$' => return s.scanIdentifierOrKeyword(),
             '#' => {
                 const c1 = s.at(s.index + 1);
-                if (isIdentStart(c1) or c1 >= 0x80 or c1 == '\\') {
+                if (isIdentStart(c1) or (c1 >= 0x80 and unicodeIdentStart(s.src, s.index + 1)) or c1 == '\\') {
                     s.index += 1;
                     _ = s.identifierRest();
                     return .private_identifier;
@@ -894,7 +901,7 @@ pub const Scanner = struct {
                 return s.punct(1, .unknown);
             },
             '\\' => {
-                if (s.consumeIdentifierEscape()) {
+                if (s.consumeIdentifierEscape(true)) {
                     _ = s.identifierRest();
                     return .identifier; // escaped text never matches a keyword
                 }
@@ -905,6 +912,14 @@ pub const Scanner = struct {
                     if (isBinaryContent(s.src, s.index)) {
                         s.index = @intCast(s.src.len);
                         return .binary_content;
+                    }
+                    // Well-formed, not trivia (`next`'s loop already took
+                    // those), and not an identifier start: tsc's scanner has
+                    // no production for it and answers TS1127. The token is
+                    // the WHOLE character, so the diagnostic spans it the way
+                    // tsc's does over one decoded UTF-16 unit's worth.
+                    if (!unicodeIdentStart(s.src, s.index)) {
+                        return s.punct(charStepLen(s.src, s.index), .unknown);
                     }
                     return s.scanIdentifierOrKeyword();
                 }
@@ -927,48 +942,70 @@ pub const Scanner = struct {
         return .identifier;
     }
 
-    /// Consume identifier-continue bytes (ASCII fast path; any byte >= 0x80;
-    /// `\u` escapes). Returns whether an escape was consumed.
+    /// Consume identifier-continue characters (ASCII fast path, then the
+    /// ID_Continue tables, then `\u` escapes). Returns whether an escape was
+    /// consumed.
     fn identifierRest(s: *Scanner) bool {
         var has_escape = false;
         while (s.index < s.src.len) {
             const c = s.src[s.index];
             if (c >= 0x80) {
-                // Any well-formed non-ASCII sequence continues the name (ztsc
-                // does not table ID_Continue); binary content ends it, so the
-                // next `next()` reaches the `binary_content` arm and the file
-                // gets tsc's single "appears to be binary" answer. Trivia ends
-                // it too — otherwise `x<NBSP>= 1` is one identifier.
+                // Binary content ends the name, so the next `next()` reaches
+                // the `binary_content` arm and the file gets tsc's single
+                // "appears to be binary" answer rather than a truncated
+                // identifier. Everything else is the ID_Continue question —
+                // which also ends the name at trivia (`x<NBSP>= 1` is not one
+                // identifier) and at a character that starts no token, whose
+                // TS1127 the next `next()` then reports.
                 if (isBinaryContent(s.src, s.index)) break;
-                if (unicodeTrivia(s.src, s.index) != null) break;
+                if (!unicodeIdentCont(s.src, s.index)) break;
                 s.index += utf8SeqLen(s.src, s.index);
             } else if (isIdentCont(c)) {
                 s.index += 1;
             } else if (c == '\\') {
-                if (!s.consumeIdentifierEscape()) break;
+                if (!s.consumeIdentifierEscape(false)) break;
                 has_escape = true;
             } else break;
         }
         return has_escape;
     }
 
-    /// At a `\`: consume a well-formed `\uXXXX` or `\u{H+}` escape and return
-    /// true, or leave the index on the backslash and return false.
-    fn consumeIdentifierEscape(s: *Scanner) bool {
+    /// At a `\`: consume a well-formed `\uXXXX` or `\u{H+}` escape whose code
+    /// point is an identifier character and return true, or leave the index on
+    /// the backslash and return false.
+    ///
+    /// `start` picks which table the code point is held to. tsc's
+    /// `scanIdentifier` runs the same test (`isIdentifierStart` on the first
+    /// character, `isIdentifierPart` after it) and, when it fails, abandons the
+    /// name and lets the caller answer `error(Invalid_character); pos++;
+    /// Unknown` — a ONE-BYTE `.unknown` on the backslash, which is exactly what
+    /// this `false` produces at every call site. `var 1a` (an escaped `1`,
+    /// which is `Nd` and so an identifier PART but not a START) is the shape,
+    /// and a lone surrogate half — `import { x as 𐊧 }`, where tsc
+    /// never pairs two escapes back into one astral code point — is the other.
+    fn consumeIdentifierEscape(s: *Scanner, start: bool) bool {
         if (s.at(s.index + 1) != 'u') return false;
         var i = s.index + 2;
+        var cp: u32 = 0;
         if (s.at(i) == '{') {
             i += 1;
             var digits: u32 = 0;
-            while (isHexDigit(s.at(i))) : (i += 1) digits += 1;
+            while (isHexDigit(s.at(i))) : (i += 1) {
+                digits += 1;
+                cp = (cp << 4) | hexValue(s.at(i));
+                if (cp > 0x10FFFF) return false;
+            }
             if (digits == 0 or s.at(i) != '}') return false;
+            if (!escapedIdentChar(cp, start)) return false;
             s.index = i + 1;
             return true;
         }
         var k: u32 = 0;
         while (k < 4) : (k += 1) {
             if (!isHexDigit(s.at(i + k))) return false;
+            cp = (cp << 4) | hexValue(s.at(i + k));
         }
+        if (!escapedIdentChar(cp, start)) return false;
         s.index = i + 4;
         return true;
     }
@@ -1109,6 +1146,32 @@ pub const Scanner = struct {
                     return s.bigintSuffix();
                 },
                 else => {},
+            }
+            // A LEGACY OCTAL literal ends with its digits. tsc's `scanNumber`
+            // scans the whole digit run after the `0` and, when every digit of
+            // it is octal, `return`s right there — before the fraction, the
+            // exponent and the BigInt suffix are ever looked at. So `01.0` is
+            // `01` then `.0`, and `01e2` is `01` then `e2`, which is the "','
+            // expected" tsgo reports at the `.`/`e` and ztsc used to swallow
+            // into one number.
+            //
+            // The test is on the WHOLE run, exactly as tsc's `scanDigits` is:
+            // one digit out of range makes the literal a leading-zero DECIMAL
+            // (`018.5`, `019` — TS1489's shape) which does keep its fraction
+            // and exponent. A numeric separator ends the digit run without
+            // ending the literal, so a `_` after it hands the whole token back
+            // to the ordinary path rather than guessing.
+            if (isDigit(s.at(s.index + 1))) {
+                var i = s.index + 1;
+                var all_octal = true;
+                while (isDigit(s.at(i))) : (i += 1) {
+                    if (s.src[i] > '7') all_octal = false;
+                }
+                if (s.at(i) == '_') all_octal = false;
+                if (all_octal) {
+                    s.index = i;
+                    return .numeric_literal;
+                }
             }
         }
         var integer = true;
@@ -1320,6 +1383,20 @@ inline fn isHexDigit(c: u8) bool {
     return isDigit(c) or (c | 0x20) >= 'a' and (c | 0x20) <= 'f';
 }
 
+/// Is the code point an escape spelled — `A`, `\u{102A7}` — an identifier
+/// character? ASCII keeps the scanner's own two-line answer; everything above
+/// goes to the generated tables. `$` and `_` are identifier characters at both
+/// positions, which is why the ASCII arm is `isIdentStart`/`isIdentCont` and
+/// not a letter test.
+fn escapedIdentChar(cp: u32, start: bool) bool {
+    if (cp < 0x80) {
+        const c: u8 = @intCast(cp);
+        return if (start) isIdentStart(c) else isIdentCont(c);
+    }
+    const u: u21 = @intCast(cp);
+    return if (start) unicode_id.isStart(u) else unicode_id.isContinue(u);
+}
+
 /// One non-ASCII TRIVIA character: how many bytes it spans, and whether it is a
 /// LINE TERMINATOR (which ends a line comment and arms ASI) rather than
 /// horizontal space.
@@ -1379,6 +1456,33 @@ inline fn isIdentStart(c: u8) bool {
 
 inline fn isIdentCont(c: u8) bool {
     return isIdentStart(c) or isDigit(c);
+}
+
+/// The code point of the UTF-8 sequence at `i`, or null when the bytes there
+/// are not a well-formed one. Only ever called on a byte >= 0x80 (the ASCII
+/// path never decodes), so it shares `utf8SeqLen`'s validation wholesale
+/// rather than repeating the overlong/surrogate/out-of-range rejections.
+fn utf8CodePoint(src: []const u8, i: u32) ?u21 {
+    const n = utf8SeqLen(src, i);
+    if (n == 0) return null;
+    var cp: u21 = switch (n) {
+        2 => src[i] & 0x1F,
+        3 => src[i] & 0x0F,
+        else => src[i] & 0x07,
+    };
+    for (src[i + 1 ..][0 .. n - 1]) |c| cp = (cp << 6) | (c & 0x3F);
+    return cp;
+}
+
+/// Is the non-ASCII character at `i` an ECMAScript IdentifierStart /
+/// IdentifierPart? Malformed bytes are neither — `next` reaches them through
+/// the binary-content arm, which owns that answer.
+fn unicodeIdentStart(src: []const u8, i: u32) bool {
+    return if (utf8CodePoint(src, i)) |cp| unicode_id.isStart(cp) else false;
+}
+
+fn unicodeIdentCont(src: []const u8, i: u32) bool {
+    return if (utf8CodePoint(src, i)) |cp| unicode_id.isContinue(cp) else false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1633,6 +1737,14 @@ test "golden: numeric literals" {
     try expectTokens("1e[x]", &.{ .numeric_literal, .l_bracket, .identifier, .r_bracket, .eof });
     // `1..toString` is numeric `1.` then `.` then identifier.
     try expectTokens("1..toString", &.{ .numeric_literal, .dot, .identifier, .eof });
+    // A LEGACY OCTAL literal ends with its digits — no fraction, no exponent,
+    // no BigInt suffix (tsc's `scanNumber` returns from the octal branch).
+    try expectTokens("01.0", &.{ .numeric_literal, .numeric_literal, .eof });
+    try expectTokens("01e2", &.{ .numeric_literal, .identifier, .eof });
+    try expectTokens("01n", &.{ .numeric_literal, .identifier, .eof });
+    // One digit out of range makes it a leading-zero DECIMAL, which keeps both.
+    try expectTokens("018.5", &.{ .numeric_literal, .eof });
+    try expectTokens("019e2", &.{ .numeric_literal, .eof });
 }
 
 test "golden: strings and escapes" {
@@ -1680,7 +1792,7 @@ test "golden: private identifiers and decorators" {
 }
 
 test "golden: unicode and escaped identifiers" {
-    // Non-ASCII bytes are identifier constituents (pragmatic fast path).
+    // An ID_Continue character continues the name (U+00E9, `Ll`).
     try expectTokens("const caf\xC3\xA9 = 1;", &.{
         .keyword_const, .identifier, .eq, .numeric_literal, .semicolon, .eof,
     });
@@ -1689,6 +1801,41 @@ test "golden: unicode and escaped identifiers" {
     try expectTokens("\\u{74}ype", &.{ .identifier, .eof });
     // Malformed escape: `\` alone is an error token.
     try expectTokens("\\zx", &.{ .unknown, .identifier, .eof });
+}
+
+test "golden: a character that is no identifier constituent starts no token" {
+    // U+00AC NOT SIGN is `Sm` — neither ID_Start nor trivia, so it is one
+    // `.unknown` token (the parser's TS1127) and does not fuse `A` and `{`
+    // into one name. The whole two-byte character is the token.
+    try expectTokens("class C extends A \xC2\xAC {}", &.{
+        .keyword_class, .identifier, .keyword_extends, .identifier,
+        .unknown,       .l_brace,    .r_brace,         .eof,
+    });
+    // Mid-name it ends the name rather than continuing it.
+    try expectTokens("ab\xC2\xACcd", &.{ .identifier, .unknown, .identifier, .eof });
+    // U+0301 COMBINING ACUTE is `Mn`: ID_Continue but not ID_Start.
+    try expectTokens("e\xCC\x81 = 1", &.{ .identifier, .eq, .numeric_literal, .eof });
+    try expectTokens("\xCC\x81e = 1", &.{ .unknown, .identifier, .eq, .numeric_literal, .eof });
+    // An astral letter (U+102A7 CARIAN LETTER A2, `Lo`) is a name on its own.
+    try expectTokens("var \xF0\x90\x8A\xA7 = 1;", &.{
+        .keyword_var, .identifier, .eq, .numeric_literal, .semicolon, .eof,
+    });
+}
+
+test "golden: an escape is held to the same identifier tables" {
+    // `1` is `1` — an identifier PART but not a START, so the name is
+    // abandoned and the BACKSLASH alone is the invalid character (tsc's
+    // `pos++; return Unknown`). What follows rescans as an ordinary name.
+    try expectTokens("var \\u0031a;", &.{ .keyword_var, .unknown, .identifier, .semicolon, .eof });
+    // …and the same escape mid-name is an ordinary continuation.
+    try expectTokens("var a\\u0031;", &.{ .keyword_var, .identifier, .semicolon, .eof });
+    // A lone surrogate half is never paired back into an astral code point:
+    // two invalid characters, not one name.
+    try expectTokens("var \\uD800\\uDEA7;", &.{
+        .keyword_var, .unknown, .identifier, .unknown, .identifier, .semicolon, .eof,
+    });
+    // The astral code point spelled directly is one identifier.
+    try expectTokens("var \\u{102A7};", &.{ .keyword_var, .identifier, .semicolon, .eof });
 }
 
 test "golden: non-ASCII whitespace and line terminators are trivia" {
@@ -1715,11 +1862,14 @@ test "golden: non-ASCII whitespace and line terminators are trivia" {
     try testing.expect(!toks.precededByNewline(3)); // after U+0085
     // A line comment ends at U+2028, so the code after it is scanned.
     try expectTokens("//c\xE2\x80\xA8x", &.{ .identifier, .eof });
-    // A neighbour of NBSP in the same lead byte is NOT trivia: U+00A1 continues
-    // the identifier, so the table is read to the last byte and not guessed from
-    // the lead one. (A truncated `C2` is invalid UTF-8 and keeps its own
-    // pre-existing answer, `binary_content`.)
-    try expectTokens("a\xC2\xA1b", &.{ .identifier, .eof });
+    // A neighbour of NBSP in the same lead byte is NOT trivia, so the table is
+    // read to the last byte and not guessed from the lead one. U+00AA (`Lo`)
+    // continues the identifier; U+00A1 (`Po`) is not trivia EITHER — it is an
+    // invalid character, which is tsgo's answer for `var a¡b` too. (A
+    // truncated `C2` is invalid UTF-8 and keeps its own pre-existing answer,
+    // `binary_content`.)
+    try expectTokens("a\xC2\xAAb", &.{ .identifier, .eof });
+    try expectTokens("a\xC2\xA1b", &.{ .identifier, .unknown, .identifier, .eof });
 }
 
 test "errors: unterminated string" {
