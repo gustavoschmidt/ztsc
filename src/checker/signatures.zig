@@ -2274,7 +2274,7 @@ pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Er
             const init_t = try c.checkExprCached(d.rhs, try destructure.patternContextualType(c, d.lhs));
             if (try inferredUniqueSymbol(c, decl, d.lhs, d.rhs, is_const, init_t)) |u| return u;
             const vt = try c.widenInitializer(init_t, is_const);
-            if (c.nodeTag(d.lhs) == .identifier) return vt;
+            if (c.nodeTag(d.lhs) == .identifier) return evolvingArrayOverride(c, sym, vt);
             return c.bindingElementType(sym, decl, vt);
         },
         .declarator_full => {
@@ -2288,11 +2288,28 @@ pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Er
                 if (try inferredUniqueSymbol(c, decl, d.lhs, e.init, is_const, init_t)) |u| return u;
                 vt = try c.widenInitializer(init_t, is_const);
             }
-            if (c.nodeTag(d.lhs) == .identifier) return vt;
+            if (c.nodeTag(d.lhs) == .identifier) return evolvingArrayOverride(c, sym, vt);
             return c.bindingElementType(sym, decl, vt);
         },
         else => return types.any_type,
     }
+}
+
+/// tsc's `getTypeForVariableLikeDeclaration` head: "use control flow tracked
+/// `any[]` type for non-ambient, non-exported variables with an empty array
+/// literal initializer". tsc reads that off the DECLARATION; ztsc's flow walk
+/// recognizes an evolving array BY ITS TYPE (`flow.flowTypeOfReference` and
+/// `expr.checkEvolvingVarRead` both gate on `any[]`), so the declaration test
+/// has to be turned back into the type here.
+///
+/// The other half is `expr`'s empty-array arm, which now answers `never[]` for
+/// every `[]` exactly as tsc does — `export const x = []`, `class C { f = [] }`,
+/// `f(xs = [])` and `const c = id([])` are all `never[]` there. Only the
+/// evolving variable takes the autoArrayType, and only here.
+fn evolvingArrayOverride(c: *Checker, sym: SymbolId, vt: TypeId) Error!TypeId {
+    if (c.ts.kind(vt) != .array or c.ts.arrayElem(vt) != types.never_type) return vt;
+    if (!c.isEvolvingArrayVar(sym)) return vt;
+    return c.ts.makeArray(types.any_type);
 }
 
 /// tsc's `getESSymbolLikeTypeForNode`: a call to the global `Symbol` /

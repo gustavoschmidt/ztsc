@@ -749,6 +749,16 @@ pub const InferCtx = struct {
     /// occurs at the top level of this return. `no_type` outside a call-site
     /// inference.
     sig_ret: TypeId = types.no_type,
+    /// The Phase-0 contextual-RETURN seed, one entry per type parameter — tsc's
+    /// `InferencePriority.ReturnType` inferences, which live in the same
+    /// `InferenceInfo` rows as every other candidate and so are visible to
+    /// `nonFixingMapper` from the first argument on. ztsc keeps them out of
+    /// `candidates` so argument evidence still owns the committed answer, which
+    /// leaves one reader that must see them anyway: the contextual-signature
+    /// substitution a generic function argument is instantiated against (see the
+    /// second pairing pass in `unify`'s `.function` arm). Empty outside a
+    /// call-site inference; only valid for `owner`'s own accumulator.
+    ret_seed: []const TypeId = &.{},
     /// The unique type parameters minted for this call's generic function
     /// arguments — tsc's `InferenceContext.inferredTypeParameters`, which
     /// `getSignatureInstantiation` re-attaches to the returned signature.
@@ -900,14 +910,49 @@ pub fn inferTypeArgs(
     if (ret_ctx != types.no_type) {
         try c.fillFromReturnContext(sig, tp_syms, ret_ctx, ret_seed, false, true);
     }
+    c.infer_ctx.ret_seed = ret_seed;
 
     // Empty-array-literal candidates, demoted to a fallback (see below).
     const empty_seed = try c.scratch().alloc(TypeId, tp_syms.len);
     for (empty_seed) |*x| x.* = types.no_type;
     const pre_seed = try c.scratch().alloc(TypeId, tp_syms.len);
+    // A GENERIC-function argument written to the RIGHT of a context-sensitive
+    // one is inferred LAST, not first. tsc runs `inferTypeArguments` twice:
+    // round one carries `CheckMode.SkipGenericFunctions` alongside
+    // `SkipContextSensitive`, so *both* kinds of argument answer
+    // `anyFunctionType` and infer nothing (`instantiateTypeWithSingle
+    // GenericCallSignature`'s `skippedGenericFunction` arm); round two then
+    // walks every argument in SOURCE ORDER with both skips off. Splitting the
+    // walk by argument SHAPE — non-functions first, function expressions
+    // second — inverts that order for exactly one pair, and the higher-order
+    // mint below is where the inversion shows:
+    //
+    //     pipe<A extends any[], B, C>(ab: (...args: A) => B, bc: (b: B) => C)
+    //     pipe(x => list(x), box)
+    //
+    // Read box-then-arrow, `B` is still free when `box` arrives, so its `V`
+    // MINTS `V'` and `B := V'`; the arrow is then contextually typed
+    // `(...args: A) => V'`, its `list(x)` answers `any[]`, and `any[]` is not
+    // assignable to `V'` (nine keys of `genericFunctionInference1`, plus the
+    // same shape in `pipe(getString, s => orUndefined(s), identity)`). Read in
+    // source order, the arrow supplies `B := any[]` first, and `box` then takes
+    // the SUBSTITUTING branch — tsc's `instantiateSignatureInContextOf` — for
+    // `(x: any[]) => { value: any[] }`, which is tsgo's answer exactly.
+    //
+    // Only the arguments that can take the mint are moved, and only past a
+    // context-sensitive argument that really precedes them: every other Phase-1
+    // argument keeps its position, so the seeds Phase 2 reads are unchanged.
+    //
+    // Answered LAZILY — the scan walks every argument and asks each function one
+    // for its context sensitivity, and the shape that needs the answer (a
+    // combinator handed a generic function value) is rare enough that paying for
+    // it on every generic call is measurable on drizzle.
+    var cs_first: ?usize = null;
+    var deferred_ho: std.ArrayList(struct { pt: TypeId, at: TypeId }) = .empty;
+    defer deferred_ho.deinit(c.scratch());
     // Phase 1: non-function arguments.
     var ai: u32 = 0;
-    for (arg_nodes) |an| {
+    for (arg_nodes, 0..) |an, ord| {
         if (an == null_node) continue;
         defer ai += 1;
         const tag = c.nodeTag(an);
@@ -1490,6 +1535,22 @@ pub fn inferTypeArgs(
             }
             continue;
         }
+        // The source-order repair described at `cs_first`: hold this argument's
+        // evidence back until Phase 2 has run. The test is tsc's own —
+        // `getSingleSignature(type, Call)` with type parameters, against a
+        // contextual signature that has none — because that pair is exactly
+        // what reaches `instantiateTypeWithSingleGenericCallSignature`, and so
+        // exactly what round one skips.
+        if (ho_result_fn and c.ts.kind(at) == .function and c.ts.fnTypeParamCount(at) > 0) {
+            if (cs_first == null) cs_first = firstContextSensitiveArg(c, arg_nodes);
+            if (ord > cs_first.?) {
+                const rp = try c.resolveStructural(pt);
+                if (c.ts.kind(rp) == .function and c.ts.fnTypeParamCount(rp) == 0) {
+                    try deferred_ho.append(c.scratch(), .{ .pt = pt, .at = at });
+                    continue;
+                }
+            }
+        }
         try c.unify(pt, at, tp_syms, candidates, 0);
     }
     // Phase 1.75: a NON-ARRAY rest parameter takes the trailing arguments as
@@ -1633,6 +1694,10 @@ pub fn inferTypeArgs(
     // excalidraw 15 -> 45, immich 0 -> 1).
     const partial_ctx = try c.scratch().alloc(TpMap, tp_syms.len);
     const param_mentioned = try c.scratch().alloc(bool, tp_syms.len);
+    // Which type parameters a context-sensitive callback could ECHO back — the
+    // ones named by the contextual type of an UN-ANNOTATED parameter position.
+    // See the contravariant-echo guard below.
+    const echoable = try c.scratch().alloc(bool, tp_syms.len);
     ai = 0;
     for (arg_nodes) |an| {
         if (an == null_node) continue;
@@ -1728,10 +1793,25 @@ pub fn inferTypeArgs(
         // is a non-context-sensitive argument — an annotated callback carries
         // real contravariant evidence, which is why tsc rejects
         // `f7(() => sv.get(), sink)` for `sink: (p: string | null) => void`.
+        //
+        // The widened half is per-PARAMETER-POSITION, not per argument. Context
+        // sensitivity is a property of the WHOLE callback — one un-annotated
+        // parameter makes it so — but the echo only exists where the contextual
+        // type was actually adopted, which is exactly the un-annotated
+        // positions. An ANNOTATED parameter's type is what the source says, and
+        // what it yields is evidence whatever else the callback declares:
+        // `els.reduce((acc: Record<string, true>, e) => acc, {})` is
+        // `Record<string, true>` in tsc, where wiping `U`'s contravariant
+        // candidate wholesale left the `{}` the second argument supplies (and
+        // annotating `e`, or dropping the `{}`, already made ztsc agree).
         const ctx_sensitive = c.fnExprIsContextSensitive(fn_node);
+        if (ctx_sensitive) {
+            for (echoable) |*e| e.* = false;
+            try markEchoablePositions(c, fn_node, pt0, tp_syms, echoable);
+        }
         for (contra, 0..) |*cc, i| {
             if (cc.* == before_contra[i]) continue;
-            if (cc.* == fed[i] or (ctx_sensitive and fed[i] != types.any_type))
+            if (cc.* == fed[i] or (ctx_sensitive and echoable[i] and fed[i] != types.any_type))
                 cc.* = before_contra[i];
         }
         // Placeholder echo. A parameter with no candidate yet stands in as
@@ -1765,6 +1845,12 @@ pub fn inferTypeArgs(
         for (partial, 0..) |*p, i| {
             if (!seeded[i] and candidates[i] != types.no_type) p.ty = candidates[i];
         }
+    }
+    // Phase 2.5: the generic-function arguments Phase 1 held back (see
+    // `cs_first`), now read in their written order with the context-sensitive
+    // arguments' inferences already committed — tsc's round two.
+    for (deferred_ho.items) |d| {
+        try c.unify(d.pt, d.at, tp_syms, candidates, 0);
     }
     // Demoted candidates fill what nothing else constrained.
     for (candidates, 0..) |*cd, i| {
@@ -2283,6 +2369,68 @@ fn anyFunctionArg(c: *const Checker, arg_nodes: []const Node) bool {
         if (an != null_node and isFunctionArg(c, an)) return true;
     }
     return false;
+}
+
+/// Does any PARAMETER position of the contextual signature `sig` still name an
+/// inference variable of this call that has no candidate yet? tsc's
+/// `some(inferences, hasInferenceCandidates)` after `applyToParameterTypes`,
+/// read one step earlier: a variable that already has a candidate is
+/// substituted by `nonFixingMapper` before the inference runs, so it can no
+/// longer contribute one. Parameters only — the return types are inferred after
+/// this test in tsc too.
+fn paramsMentionFreeVar(c: *Checker, sig: TypeId, tp_syms: []const u32, candidates: []const TypeId) Error!bool {
+    const free = try c.scratch().alloc(bool, tp_syms.len);
+    defer c.scratch().free(free);
+    for (free) |*x| x.* = false;
+    var i: u32 = 0;
+    while (i < c.ts.fnParamCount(sig)) : (i += 1) {
+        try markMentionedTps(c, c.ts.fnParam(sig, i).ty, tp_syms, free, 0);
+    }
+    for (free, candidates) |m, cand| {
+        if (m and cand == types.no_type) return true;
+    }
+    return false;
+}
+
+/// Mark every type parameter named by the contextual type of an UN-ANNOTATED
+/// parameter of `fn_node` — the positions whose type the callback ADOPTED from
+/// the contextual signature, and so the only ones whose contravariant evidence
+/// can be this call's own guess coming home. `sig` is the (uninstantiated)
+/// contextual signature; a position it does not reach marks nothing.
+fn markEchoablePositions(c: *Checker, fn_node: Node, sig: TypeId, tp_syms: []const u32, out: []bool) Error!void {
+    if (c.ts.kind(sig) != .function) {
+        // No contextual signature to pair positions with: fall back to the
+        // whole-argument reading rather than sparing evidence blindly.
+        for (out) |*e| e.* = true;
+        return;
+    }
+    const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(fn_node).lhs);
+    var pos: u32 = 0;
+    for (c.tree.extraRange(proto.params_start, proto.params_end)) |p| {
+        defer pos += 1;
+        if (p == null_node) continue;
+        const pd = c.tree.nodeData(p);
+        const ann: Node = switch (c.nodeTag(p)) {
+            .param => pd.rhs,
+            .param_full => c.tree.extraData(ast.ParamFull, pd.rhs).type_ann,
+            else => 0,
+        };
+        if (ann != 0) continue; // annotated: its type is the source's, not ours
+        const pt = (try c.paramTypeAt(sig, pos)) orelse continue;
+        try markMentionedTps(c, pt, tp_syms, out, 0);
+    }
+}
+
+/// Index of the first CONTEXT-SENSITIVE function argument, or `maxInt` when the
+/// call has none — the boundary Phase 1's generic-function deferral reads (see
+/// the note at `cs_first`). An index into `arg_nodes`, so it compares directly
+/// against the Phase-1 walk's own position.
+fn firstContextSensitiveArg(c: *Checker, arg_nodes: []const Node) usize {
+    for (arg_nodes, 0..) |an, i| {
+        if (an == null_node or !isFunctionArg(c, an)) continue;
+        if (c.fnExprIsContextSensitive(skipParens(c, an))) return i;
+    }
+    return std.math.maxInt(usize);
 }
 
 /// Is `an` an argument Phase 2 owns — an arrow or function expression, through
@@ -2960,6 +3108,25 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
         try c.unify(s.indexAccessObj(param), s.indexAccessObj(arg), tp_syms, candidates, depth + 1);
         try c.unify(s.indexAccessIndex(param), s.indexAccessIndex(arg), tp_syms, candidates, depth + 1);
         return;
+    }
+    // A PATTERN indexed access over an INTERSECTION, or over a deferred
+    // homomorphic map, is what tsc's `getSimplifiedType` distributes before
+    // inference ever reads it: `(A<V> & E)["k"]` becomes `V & E["k"]`, whose
+    // naked `V` is the thing a candidate can pair with. Left opaque, the whole
+    // access binds nothing — `Pick<Readonly<FormikConfig<Values> & ExtraProps>,
+    // "initialValues">` gave `Values` no candidate at all, so the callback
+    // written for `validate` saw `props: object`
+    // (`complicatedIndexesOfIntersectionsAreInferencable`).
+    //
+    // Asked as a QUERY, never baked into the type's identity: the RELATION
+    // reads the same access structurally and wants it whole, and interning the
+    // simplification also drops `Partial<T>[K]`'s `| undefined` — the map's
+    // value template is where that lives, so substituting the key here keeps
+    // it.
+    if (s.kind(param) == .index_access) {
+        if (try simplifiedIndexPattern(c, param, 0)) |sp| {
+            return c.unify(sp, arg, tp_syms, candidates, depth + 1);
+        }
     }
     const arg_instantiable = switch (s.kind(arg)) {
         .type_param, .index_access, .conditional => true,
@@ -3712,8 +3879,27 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                         try c.unify(pidx, one, tp_syms, candidates, depth + 1);
                     }
                 }
-                if (s.objectNumberIndex(param) != 0 and s.objectNumberIndex(ra) != 0) {
-                    try c.unify(s.objectNumberIndex(param), s.objectNumberIndex(ra), tp_syms, candidates, depth + 1);
+                if (s.objectNumberIndex(param) != 0) {
+                    // tsc pairs the two sides through `getApplicableIndexInfo(
+                    // source, targetInfo.keyType)`, not by matching key kinds:
+                    // a STRING index signature applies to a numeric key as
+                    // well, so `{ [k: string]: Function }` answers a
+                    // `{ [k: number]: T }` target. Requiring a number index on
+                    // both sides left `numberMapToArray(stringMap)` with `T`
+                    // unbound, so the result was `unknown[]` and the repeated
+                    // `var v1: Function[]` was a spurious TS2403
+                    // (`indexSignatureTypeInference`). The converse does NOT
+                    // hold — a number index says nothing about string keys —
+                    // and that asymmetry is the whole point of the case's
+                    // `stringMapToArray(numberMap)` line, which must stay an
+                    // error.
+                    const src_idx = if (s.objectNumberIndex(ra) != 0)
+                        s.objectNumberIndex(ra)
+                    else
+                        s.objectStringIndex(ra);
+                    if (src_idx != 0) {
+                        try c.unify(s.objectNumberIndex(param), src_idx, tp_syms, candidates, depth + 1);
+                    }
                 }
                 // Call / construct signatures on a *callable interface* param
                 // (`FunctionComponent<P>`, whose only `P` lives in its call
@@ -4060,6 +4246,65 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                         depth + 1,
                     );
                 }
+                // A SECOND pairing pass, against the contextual parameter types
+                // with what this call has already inferred substituted into
+                // them. tsc reads the contextual signature through
+                // `context.nonFixingMapper` — so by the time
+                // `instantiateSignatureInContextOf` infers the argument's own
+                // parameters, every variable of this call that has a candidate
+                // is already a concrete type — and `first: <T>(ts: T[]) => T`
+                // against `(c: C) => D` with `C` already `string[]` therefore
+                // answers `T = string`, not nothing. Read raw, `C` is a bare
+                // variable that `T[]` cannot pair with at all, so `T` was left
+                // FREE in the argument's signature (`all_unbound`, so the
+                // instantiation is skipped entirely) and the call went on to
+                // infer `C := T[]` from it — reported as `string[]` not
+                // assignable to `T[]` on the callback that had just supplied
+                // `C` (`genericFunctionInference1`'s `fn60`/`fn61`).
+                //
+                // Fills only what the raw pass left empty, so every shape the
+                // raw pairing already answers keeps its exact reading; and a
+                // still-free contextual variable substitutes to itself, so the
+                // higher-order mint below is untouched where it belongs.
+                if (std.mem.indexOfScalar(TypeId, own_cands, types.no_type) != null) {
+                    // The Phase-0 return seed counts as inferred here, exactly
+                    // as it does in tsc: `InferencePriority.ReturnType`
+                    // candidates sit in the same `InferenceInfo` rows every
+                    // other candidate does, so `nonFixingMapper` substitutes
+                    // them from the first argument on. Without it
+                    // `const f13: <T>(x: Box<T[]>) => T = compose(unbox,
+                    // unlist)` reads `A` as still free, mints for `unbox`, and
+                    // the whole chain answers in minted parameters instead of
+                    // the annotation's `T`.
+                    const seed: []const TypeId = if (c.infer_ctx.owner == candidates.ptr and
+                        c.infer_ctx.ret_seed.len == tp_syms.len) c.infer_ctx.ret_seed else candidates;
+                    // Nothing inferred yet is the common case — the FIRST
+                    // argument of every call reaches here — and then the
+                    // substitution is the identity. Skipping it keeps the
+                    // instantiation off that path entirely.
+                    var any_known = false;
+                    for (candidates, seed) |cand, sd| {
+                        if (cand != types.no_type or sd != types.no_type) any_known = true;
+                    }
+                    for (0..if (any_known) np else 0) |i| {
+                        const src = paramTypeAt(c, param, pat_rest_tuple, @intCast(i));
+                        const subst = try c.instantiateKnownParams(src, tp_syms, candidates, seed);
+                        if (subst == src) continue;
+                        const retry = try c.scratch().alloc(TypeId, own_syms.len);
+                        defer c.scratch().free(retry);
+                        for (retry) |*v| v.* = types.no_type;
+                        try c.unify(
+                            paramTypeAt(c, ra, own_rest_tuple, @intCast(i)),
+                            subst,
+                            own_syms,
+                            retry,
+                            depth + 1,
+                        );
+                        for (own_cands, retry) |*slot, r| {
+                            if (slot.* == types.no_type) slot.* = r;
+                        }
+                    }
+                }
                 var map_list: std.ArrayList(TpMap) = .empty;
                 defer map_list.deinit(c.scratch());
                 var all_unbound = true;
@@ -4252,8 +4497,30 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                     // No slot to release from the fix set here: the minted
                     // parameter is the one thing the walk below legitimately
                     // teaches this call.
+                    //
+                    // …but only while the contextual signature still HAS a free
+                    // variable to carry it. tsc reads the contextual type
+                    // through `context.nonFixingMapper`, so every variable this
+                    // call has already inferred is substituted before the mint
+                    // is even considered, and the mint then happens only when
+                    // inferring from the instantiated source's parameters to
+                    // those (substituted) contextual parameters yields a
+                    // candidate — `some(inferences, hasInferenceCandidates)` in
+                    // `instantiateTypeWithSingleGenericCallSignature`. Against a
+                    // fully-determined contextual signature nothing is left to
+                    // infer, so tsc falls through to
+                    // `instantiateSignatureInContextOf` instead.
+                    //
+                    // `pipe(getArray, x => x, first)` is the shape (`first:
+                    // <T>(ts: T[]) => T` against `(c: C) => D`, with `C` already
+                    // `string[]`): minting `T'` bound `C := T'[]` contravariantly
+                    // on top of the `string[]` the callback had just supplied,
+                    // and the callback's `x` was then reported as `string[]` not
+                    // assignable to `T[]`. `param` is walked unsubstituted here,
+                    // so the substitution is read off `candidates` directly.
                     if (cand0 == types.no_type and c.infer_ctx.sig_ctx == 0 and
-                        c.infer_ctx.ho_result_fn and s.fnTypeParamCount(param) == 0)
+                        c.infer_ctx.ho_result_fn and s.fnTypeParamCount(param) == 0 and
+                        try paramsMentionFreeVar(c, param, tp_syms, candidates))
                     {
                         if (c.infer_ctx.ho_minted) |list| {
                             const ft = try s.makeTypeParam(try uniqueTypeParam(c, sym, list));
@@ -4926,6 +5193,96 @@ pub fn constituentRelatesTo(c: *Checker, param: TypeId, m: TypeId) Error!bool {
     return false;
 }
 
+/// tsc's `getSimplifiedIndexedAccessType`, asked as a QUERY over an inference
+/// PATTERN rather than interned (see the call site for why the type's identity
+/// must keep the access whole):
+///
+///   * a deferred homomorphic map on the object side substitutes the key into
+///     the map's value template — `Readonly<X>[K]` -> `X[K]`, `Partial<X>[K]`
+///     -> `X[K] | undefined` — and the result is simplified again, because that
+///     is how the intersection underneath a `Readonly<A & E>` surfaces;
+///   * an INTERSECTION on the object side distributes — `(A & E)[K]` ->
+///     `A[K] & E[K]`.
+///
+/// Null when neither applies or the simplification is the access itself.
+fn simplifiedIndexPattern(c: *Checker, acc: TypeId, depth: u32) Error!?TypeId {
+    if (depth > 4) return null;
+    const s = &c.ts;
+    if (s.kind(acc) != .index_access) return null;
+    const idx = s.indexAccessIndex(acc);
+    const obj = try c.resolveStructural(s.indexAccessObj(acc));
+    if (s.kind(obj) == .mapped and s.mappedAs(obj) == 0) {
+        const val = try c.substMappedKey(s.mappedValue(obj), s.mappedParamId(s.mappedKeyParam(obj)), idx);
+        if (val == acc) return null;
+        return (try simplifiedIndexPattern(c, val, depth + 1)) orelse val;
+    }
+    if (s.kind(obj) != .intersection) return null;
+    var parts: std.ArrayList(TypeId) = .empty;
+    defer parts.deinit(c.scratch());
+    const ms = try c.scratch().dupe(TypeId, try c.memberList(obj));
+    defer c.scratch().free(ms);
+    for (ms) |mm| try parts.append(c.scratch(), try c.reduceIndexedAccess(mm, idx));
+    const out = try s.makeIntersection(c.scratch(), parts.items);
+    return if (out == acc) null else out;
+}
+
+/// One element of a reverse-mapped rebuild: match `src_ty` against the value
+/// template with `S[K]` replaced by the element variable `fp_sym`, and read the
+/// variable back.
+///
+/// The inferred element is `S[k]`, which can never legitimately BE `S` itself. A
+/// bare `S` in the candidate is a contextual-feedback artifact — the object
+/// literal was contextually typed with a partially-resolved `S`, injecting it
+/// into the reducer's `state:` parameter — so it is stripped, leaving the
+/// reducer's own state rather than a self-referential union.
+fn reverseMappedElem(c: *Checker, template: TypeId, src_ty: TypeId, fp_sym: u32, src_sym: u32, depth: u32) Error!TypeId {
+    const local_syms = [_]u32{fp_sym};
+    var elem = [_]TypeId{types.no_type};
+    try c.unify(template, src_ty, &local_syms, &elem, depth + 1);
+    return c.stripSourceParam(if (elem[0] != types.no_type) elem[0] else types.unknown_type, src_sym);
+}
+
+/// tsc's `createReverseMappedType` precondition: a string index signature, or
+/// at least one property AND `isPartiallyInferableType`. A source built entirely
+/// out of `anyFunctionType` placeholders is not evidence about anything.
+fn reverseMappable(c: *Checker, t: TypeId, depth: u32) Error!bool {
+    const s = &c.ts;
+    if (s.kind(t) == .object and s.objectStringIndex(t) != 0) return true;
+    if (s.kind(t) == .object and s.objectPropCount(t) == 0) return false;
+    return partiallyInferable(c, t, depth);
+}
+
+/// tsc's `isPartiallyInferableType`:
+///
+///     !(getObjectFlags(type) & ObjectFlags.NonInferrableType) ||
+///     isObjectLiteralType(type) && some(getPropertiesOfType(type), p => isPartiallyInferableType(getTypeOfSymbol(p))) ||
+///     isTupleType(type) && some(getElementTypes(type), isPartiallyInferableType)
+///
+/// `containsAnyFunctionType` is ztsc's recomputed `NonInferrableType` flag; it
+/// is only ever consulted while `Checker.aft_seen` says a placeholder was minted
+/// at all, so the ordinary inference path answers `true` on the first line.
+fn partiallyInferable(c: *Checker, t: TypeId, depth: u32) Error!bool {
+    if (!c.aft_seen) return true;
+    if (depth > 4) return true;
+    if (!try containsAnyFunctionType(c, t, 0)) return true;
+    const s = &c.ts;
+    switch (s.kind(t)) {
+        .object => {
+            for (0..s.objectPropCount(t)) |i| {
+                if (try partiallyInferable(c, s.objectProp(t, @intCast(i)).ty, depth + 1)) return true;
+            }
+            return false;
+        },
+        .tuple => {
+            for (0..s.tupleLen(t)) |i| {
+                if (try partiallyInferable(c, s.tupleElem(t, @intCast(i)).ty, depth + 1)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
 /// Reverse-mapped-type inference (tsc's `inferReverseMappedType`): infer the
 /// source `S` of a HOMOMORPHIC mapped target `{ [K in keyof S]: F<S[K]> }`
 /// from an object-literal argument. For each source property `k`, infer the
@@ -4976,10 +5333,64 @@ pub fn inferReverseMapped(c: *Checker, m: TypeId, arg: TypeId, tp_syms: []const 
         }
     }
     if (s.mappedAs(m) != 0) return; // no key remap
+    if (s.mappedHomomorphic(m)) {
+        return inferReverseMappedFrom(c, m, s.mappedSource(m), arg, tp_syms, candidates, depth);
+    }
+    // A COMPOSITE key set. tsc's `inferToMappedType` walks a union or
+    // intersection constraint constituent by constituent
+    // (`result ||= inferToMappedType(source, target, type)`) and takes the
+    // homomorphic path for any `keyof T` it finds, so
+    // `{ [K in keyof T & keyof CompilerOptions]: … }` still infers `T`. The walk
+    // has to descend BOTH connectives to any depth: ztsc's intersection
+    // normalizer distributes over a union, storing that very constraint as
+    // `("allowUnreachableCode" & keyof T) | ("allowUnusedLabels" & keyof T) | …`.
+    if (try homomorphicOperand(c, s.mappedConstraint(m), tp_syms, 0)) |op| {
+        return inferReverseMappedFrom(c, m, op, arg, tp_syms, candidates, depth);
+    }
     // `{ [P in K]: … }` with `K` itself an inference target (`Pick<S, K>`):
-    // the key set is what the argument tells us. Handled separately below.
-    if (!s.mappedHomomorphic(m)) return c.inferMappedKeySet(m, arg, tp_syms, candidates);
-    const src = s.mappedSource(m);
+    // the key set is what the argument tells us.
+    return c.inferMappedKeySet(m, arg, tp_syms, candidates);
+}
+
+/// The `keyof T` operand buried in a composite mapped-type constraint, where
+/// `T` is one of the type parameters this call is solving — the constituent
+/// tsc's `inferToMappedType` walk takes the homomorphic path for. Null when the
+/// constraint names no such source.
+fn homomorphicOperand(c: *Checker, con: TypeId, tp_syms: []const u32, depth: u32) Error!?TypeId {
+    if (con == 0 or depth > 4) return null;
+    const s = &c.ts;
+    switch (s.kind(con)) {
+        .keyof_op => {
+            const operand = s.keyofOperand(con);
+            if (s.kind(operand) != .type_param) return null;
+            if (tpIndex(tp_syms, s.typeParamSymbol(operand)) == null) return null;
+            return operand;
+        },
+        .union_type, .intersection => {
+            const ms = try c.scratch().dupe(TypeId, try c.memberList(con));
+            defer c.scratch().free(ms);
+            for (ms) |mm| {
+                if (try homomorphicOperand(c, mm, tp_syms, depth + 1)) |op| return op;
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
+/// The homomorphic half of `inferReverseMapped`, with the SOURCE named
+/// explicitly so a composite constraint can hand it the `keyof T` operand it
+/// found rather than the mapped type's own (absent) source.
+fn inferReverseMappedFrom(
+    c: *Checker,
+    m: TypeId,
+    src: TypeId,
+    arg: TypeId,
+    tp_syms: []const u32,
+    candidates: []TypeId,
+    depth: u32,
+) Error!void {
+    const s = &c.ts;
     if (s.kind(src) != .type_param) return; // source must be a bare param
     const src_sym = s.typeParamSymbol(src);
     const idx = tpIndex(tp_syms, src_sym) orelse return; // …that we're inferring
@@ -4994,43 +5405,39 @@ pub fn inferReverseMapped(c: *Checker, m: TypeId, arg: TypeId, tp_syms: []const 
     if (s.kind(ra) == .mapped and s.mappedAs(ra) == 0 and s.mappedHomomorphic(ra)) {
         return c.unify(src, s.mappedSource(ra), tp_syms, candidates, depth + 1);
     }
-    // HANDOFF (wave 31 B, built and measured, REVERTED on the app gate). Three
-    // changes turn this into tsc's `inferToMappedType` + `createReverseMappedType`
-    // and are worth +3 exact on the corpus (`reverseMappedTupleContext`,
-    // `objectFromEntries`, `reverseMappedTypeLimitedConstraint`), zero corpus
-    // regressions — but EACH of them, alone or together, moves social-app:
+    // HANDOFF — the ARRAY/TUPLE rebuild, tsc's "for arrays and tuples we infer
+    // new arrays and tuples where the reverse mapping has been applied to the
+    // element type(s)". Built and measured (wave 32 A): widening the switch to
+    // `.object, .array, .tuple` and running the element loop below over
+    // `arrayElem` / `tupleElem` — with a map that ADDS `?` clearing
+    // `elem_flag_optional`, the tuple twin of `keep_mask` — is worth
+    // `reverseMappedTupleContext` and `objectFromEntries` on the corpus, but
+    // takes social-app from 87 to 93: a react-query `QueryBehavior<{…}>` vs
+    // `QueryBehavior<unknown>` variance failure in Composer.tsx plus five
+    // `Property … does not exist on type '{}'` around it. The other three
+    // pieces of the wave-31 handoff are landed and clean at 87 (the
+    // `isPartiallyInferableType` guard below is what made the composite key set
+    // safe); this one is not, and its witness is Composer.tsx's
+    // `useInfiniteQuery`, not the corpus.
+    switch (s.kind(ra)) {
+        .object => {},
+        else => return,
+    }
+    // tsc's `createReverseMappedType` head, the gate the rebuild below never
+    // had:
     //
-    //   1. a COMPOSITE key set. tsc walks a union/intersection constraint
-    //      constituent by constituent (`result ||= inferToMappedType(source,
-    //      target, type)`) and takes the homomorphic path for any `keyof T` it
-    //      finds, so `{ [K in keyof T & keyof CompilerOptions]: … }` infers `T`.
-    //      The walk must descend BOTH connectives to any depth — ztsc's
-    //      intersection normalizer distributes over a union, storing that
-    //      constraint as `("allowUnreachableCode" & keyof T) | …`. Split this
-    //      function so the source is a parameter and call it with the operand.
-    //   2. `substElemAccess` needs a `.mapped` arm (rebuild constraint / value /
-    //      `as` / source), or a mapped type NESTED in the template keeps its
-    //      `S[K]` and the element variable never enters the template at all.
-    //   3. the rebuild must cover ARRAY and TUPLE sources, not just `.object`
-    //      ("for arrays and tuples we infer new arrays and tuples where the
-    //      reverse mapping has been applied to the element type(s)") — which is
-    //      what a nested map resolves to once (2) puts the element variable in
-    //      its source.
+    //     if (!(getIndexInfoOfType(source, stringType) ||
+    //           getPropertiesOfType(source).length !== 0 && isPartiallyInferableType(source))) {
+    //         return undefined;
+    //     }
     //
-    // MEASURED on social-app at the committed baseline (87 check errors):
-    //   * 1+2+3 -> 93: six fresh FPs in Composer.tsx (a react-query
-    //     `QueryBehavior<{…}>` vs `QueryBehavior<unknown>` variance failure plus
-    //     five `Property … does not exist on type '{}'`).
-    //   * 1 alone -> 98: eleven fresh FPs in ageAssurance/data.tsx instead.
-    //   * 2+3 without 1 -> 193. (2) is destructive without (3) to complete the
-    //     inversion; they are one change, not two.
-    // So (3) does not merely add — it also MASKS what (1) breaks. tsc's guard
-    // that ztsc does not have is `isPartiallyInferableType` /
-    // `getIndexInfoOfType(source, stringType)` at the head of
-    // `createReverseMappedType`; the next attempt should start there, and
-    // should treat social-app's `useInfiniteQuery` options object as the
-    // witness rather than the corpus.
-    if (s.kind(ra) != .object) return;
+    // A source every one of whose properties is `anyFunctionType` — the object
+    // literal of a call whose round one skipped every context-sensitive
+    // property — carries no evidence at all, and reverse-mapping it manufactures
+    // a shape out of the placeholders. tsc refuses outright and leaves the
+    // parameter for round two, which is what react-query's
+    // `useInfiniteQuery({queryFn, getNextPageParam})` needs.
+    if (!try reverseMappable(c, ra, 0)) return;
     const key_param = s.mappedKeyParam(m);
     const key_id = s.mappedParamId(key_param);
     const value = s.mappedValue(m);
@@ -5058,19 +5465,13 @@ pub fn inferReverseMapped(c: *Checker, m: TypeId, arg: TypeId, tp_syms: []const 
     if (mflags & types.mapped_flag_readonly_add != 0) keep_mask &= ~types.prop_flag_readonly;
     var props: std.ArrayList(types.Prop) = .empty;
     defer props.deinit(c.scratch());
-    const local_syms = [_]u32{fp_sym};
     for (0..s.objectPropCount(ra)) |i| {
         const p = s.objectProp(ra, @intCast(i));
-        var elem = [_]TypeId{types.no_type};
-        try c.unify(template, p.ty, &local_syms, &elem, depth + 1);
-        // The inferred element is `S[k]`, which can never legitimately BE
-        // `S` itself. A bare `S` appearing in the candidate is a
-        // contextual-feedback artifact (the object literal was
-        // contextually typed with a partially-resolved `S`, injecting it
-        // into the reducer's `state:` parameter); strip it so the inferred
-        // state is the reducer's own state, not a self-referential union.
-        const et = try c.stripSourceParam(if (elem[0] != types.no_type) elem[0] else types.unknown_type, src_sym);
-        try props.append(c.scratch(), .{ .name = p.name, .ty = et, .flags = p.flags & keep_mask });
+        try props.append(c.scratch(), .{
+            .name = p.name,
+            .ty = try reverseMappedElem(c, template, p.ty, fp_sym, src_sym, depth),
+            .flags = p.flags & keep_mask,
+        });
     }
     if (props.items.len == 0) return;
     const obj = try c.objectFromProps(props.items, 0, 0);
@@ -5455,6 +5856,30 @@ pub fn substElemAccess(c: *Checker, t: TypeId, src_sym: u32, key_id: u32, fp: Ty
             const tru = try c.substElemAccess(s.condTrue(t), src_sym, key_id, fp, depth + 1);
             const fls = try c.substElemAccess(s.condFalse(t), src_sym, key_id, fp, depth + 1);
             return s.makeConditional(chk, ext, tru, fls, s.condDistributive(t));
+        },
+        // A mapped type NESTED in the value template — `{ [K in keyof S]:
+        // { [P in keyof S[K]]: … } }`, and every `Record`/`Partial` written over
+        // `S[K]`. Without this arm the nested map keeps its `S[K]` verbatim, the
+        // element variable never enters the template at all, and the inversion
+        // reads back nothing for that property.
+        .mapped => {
+            const con = if (s.mappedConstraint(t) != 0)
+                try c.substElemAccess(s.mappedConstraint(t), src_sym, key_id, fp, depth + 1)
+            else
+                0;
+            const val = if (s.mappedValue(t) != 0)
+                try c.substElemAccess(s.mappedValue(t), src_sym, key_id, fp, depth + 1)
+            else
+                0;
+            const as_c = if (s.mappedAs(t) != 0)
+                try c.substElemAccess(s.mappedAs(t), src_sym, key_id, fp, depth + 1)
+            else
+                0;
+            const msrc = if (s.mappedSource(t) != 0)
+                try c.substElemAccess(s.mappedSource(t), src_sym, key_id, fp, depth + 1)
+            else
+                0;
+            return s.makeMapped(s.mappedKeyParam(t), con, val, as_c, msrc, s.mappedFlags(t));
         },
         else => return t,
     }
