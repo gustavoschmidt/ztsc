@@ -1115,3 +1115,101 @@ test "determinism: cross-file base cycles report identically for N = 1, 2, 4, 8"
         try std.testing.expectEqualStrings(ref, got);
     }
 }
+
+// The alias-cycle counterpart of the base-cycle test above, and the unit-scale
+// form of what `bench/order_sweep.sh`'s whole-grid pass caught on social-app.
+//
+// A reference taken to an alias whose body is still materializing gets a lazy
+// `.ref`; one taken afterwards gets a separately interned structural
+// materialization. Both denote the same type and both are legal, but they are
+// distinct `TypeId`s with distinct PRINTED forms, so which one a diagnostic
+// names depends on where the walk entered the cycle — the root order, and
+// through the partition the checker count. `aliasInstance`'s one-spelling rule
+// exists to collapse that, and it used to be keyed on a set (`alias_recursive`)
+// that only ever recorded the member entered FIRST: in a mutual pair exactly
+// one end kept the ref and the other expanded, and swapping the roots swapped
+// which. `markCycle` now records the whole `alias_stack` suffix, which is a
+// property of the alias graph rather than of the entry point.
+//
+// Eight independent `X<i>` / `Y<i>` pairs, each naming the other, each consumed
+// from BOTH ends so the two entries compete. Measured against the pre-fix
+// binary this program printed eight of its sixteen types expanded, and `source`
+// and `reverse` disagreed on which eight.
+test "determinism: a mutual ALIAS cycle keeps ONE spelling for every member" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+
+    const pairs = 8;
+    var name_buf: [64]u8 = undefined;
+    var body_buf: [512]u8 = undefined;
+    for (0..pairs) |i| {
+        // An INTERSECTION body: the shape whose two spellings are
+        // interchangeable to the relation but not to the printer.
+        var name = try std.fmt.bufPrint(&name_buf, "x{d}.ts", .{i});
+        var body = try std.fmt.bufPrint(&body_buf,
+            \\import {{ Y{d} }} from "./y{d}";
+            \\export type X{d} = {{ k: "x"; p: Y{d}; xf: number }} & {{ xg: string }};
+        , .{ i, i, i, i });
+        try d.writeFile(io, .{ .sub_path = name, .data = body });
+        name = try std.fmt.bufPrint(&name_buf, "y{d}.ts", .{i});
+        body = try std.fmt.bufPrint(&body_buf,
+            \\import {{ X{d} }} from "./x{d}";
+            \\export type Y{d} = {{ k: "y"; p: X{d}; yf: number }} & {{ yg: string }};
+        , .{ i, i, i, i });
+        try d.writeFile(io, .{ .sub_path = name, .data = body });
+        // One consumer per END, each forcing the alias into a message.
+        name = try std.fmt.bufPrint(&name_buf, "ux{d}.ts", .{i});
+        body = try std.fmt.bufPrint(&body_buf,
+            \\import {{ X{d} }} from "./x{d}";
+            \\declare const v: X{d};
+            \\export const badx{d}: number = v;
+        , .{ i, i, i, i });
+        try d.writeFile(io, .{ .sub_path = name, .data = body });
+        name = try std.fmt.bufPrint(&name_buf, "uy{d}.ts", .{i});
+        body = try std.fmt.bufPrint(&body_buf,
+            \\import {{ Y{d} }} from "./y{d}";
+            \\declare const w: Y{d};
+            \\export const bady{d}: number = w;
+        , .{ i, i, i, i });
+        try d.writeFile(io, .{ .sub_path = name, .data = body });
+    }
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var interner = Interner.init();
+    defer interner.deinit(gpa);
+    const alloc = arena.allocator();
+
+    var fwd: [2 * pairs][]const u8 = undefined;
+    var rev: [2 * pairs][]const u8 = undefined;
+    for (0..pairs) |i| {
+        const ux = try std.fmt.allocPrint(alloc, "ux{d}.ts", .{i});
+        const uy = try std.fmt.allocPrint(alloc, "uy{d}.ts", .{i});
+        fwd[2 * i] = ux;
+        fwd[2 * i + 1] = uy;
+        rev[2 * pairs - 1 - 2 * i] = ux;
+        rev[2 * pairs - 2 - 2 * i] = uy;
+    }
+
+    const br_fwd = try modules.buildProgram(alloc, io, gpa, &interner, d, &fwd, .none, .{}, .{}, null);
+    const br_rev = try modules.buildProgram(alloc, io, gpa, &interner, d, &rev, .none, .{}, .{}, null);
+
+    const ref = try sortedLines(alloc, try renderProgramDiags(alloc, io, gpa, &interner, &br_fwd.program, 1));
+    // One TS2322 per consumer, and every one of them names the ALIAS. The
+    // expanded spelling starts `{ k: "`, which is what the old keying printed
+    // for whichever end of each pair it reached second.
+    try std.testing.expectEqual(@as(usize, 2 * pairs), std.mem.count(u8, ref, "TS2322"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ref, "{ k: \""));
+
+    // Same answer under the reversed root list, and under every partition.
+    const rev_lines = try sortedLines(alloc, try renderProgramDiags(alloc, io, gpa, &interner, &br_rev.program, 1));
+    try std.testing.expectEqualStrings(ref, rev_lines);
+    for ([_]usize{ 2, 4, 8 }) |n| {
+        const got = try sortedLines(alloc, try renderProgramDiags(alloc, io, gpa, &interner, &br_fwd.program, n));
+        try std.testing.expectEqualStrings(ref, got);
+    }
+}
