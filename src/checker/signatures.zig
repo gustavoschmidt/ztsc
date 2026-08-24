@@ -1706,9 +1706,11 @@ fn expandoMemberType(c: *Checker, sym: SymbolId) Error!TypeId {
         if (rhs == ast.null_node) continue;
         // `F.m = function () { this }`: this pass types the right-hand side
         // before the assignment walk reaches it, and the node-type memo makes
-        // that the walk the body's `this` sees — so the "has a receiver" mark
-        // has to be recorded here too, or the `this` is a false TS2683.
-        try expr_zig.markAssignedMethodFn(c, c.tree.nodeData(decl).lhs, rhs);
+        // that the walk the body's `this` sees — so the receiver has to be
+        // lent here too, or the `this` is a false TS2683 with no type.
+        const saved_this = c.this_type;
+        defer c.this_type = saved_this;
+        if (try expr_zig.assignedMethodThisType(c, c.tree.nodeData(decl).lhs, rhs)) |recv| c.this_type = recv;
         const ctx = try annotatedTargetPropType(c, c.tree.nodeData(decl).lhs, sym);
         const raw = try c.checkExprCached(rhs, ctx);
         // tsc's `checkExpressionForMutableLocation`: a fresh literal the

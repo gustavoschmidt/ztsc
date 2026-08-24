@@ -5952,27 +5952,39 @@ fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
 /// arrow has no `this` of its own. Parentheses around the value are walked
 /// through, as tsc's `walkUpParenthesizedExpressions` does.
 ///
-/// The `this_bound_fns` marking is why this is `pub`: it has to run wherever
-/// the right-hand side is TYPED, not only where the assignment is checked. The
-/// EXPANDO member pass walks the same function on its own
-/// (`signatures.expandoMemberType`), and the node-type memo means whichever
-/// route gets there first is the one the body's `this` saw.
+/// Returns the receiver's TYPE, which the caller installs as `c.this_type`
+/// around its own walk of the value — tsc's arm is literally
+/// `checkExpressionCached(target.expression)`. Null when the shape does not
+/// match, and null when the receiver came back `any` or an error type, which is
+/// ztsc giving up rather than a receiver worth lending.
 ///
-/// Only the "has a receiver" fact is recorded, not the receiver's TYPE: asking
-/// for it is what tsc does, but `F.m = function () { return this }` would then
-/// resolve `this` through the very symbol whose expando type is being built,
-/// and the cycle answers `never`. `this` stays `any` — an under-report on the
-/// type, never a diagnostic.
-pub fn markAssignedMethodFn(c: *Checker, target: Node, value0: Node) Error!void {
+/// This is `pub` because it has to run wherever the right-hand side is TYPED,
+/// not only where the assignment is checked. The EXPANDO member pass walks the
+/// same function on its own (`signatures.expandoMemberType`), and the node-type
+/// memo means whichever route gets there first is the one the body's `this`
+/// saw — so both routes ask, and both install.
+///
+/// An EXPANDO receiver is the one shape that still comes back with nothing to
+/// lend: `F.m = function () { this }` asks for `F` while `F`'s own type is
+/// being built out of this very assignment, and `typeOfSymbol`'s in-progress
+/// guard answers `any`. `this` stays untyped there, exactly as before — an
+/// under-report, never a false positive. (Documented gap: tsc gets the full
+/// type because an expando function's members resolve lazily, where ztsc folds
+/// them eagerly.)
+pub fn assignedMethodThisType(c: *Checker, target: Node, value0: Node) Error!?TypeId {
     var value = value0;
     while (value != null_node and c.nodeTag(value) == .paren_expr) value = c.tree.nodeData(value).lhs;
-    if (value == null_node or c.nodeTag(value) != .function_expr) return;
+    if (value == null_node or c.nodeTag(value) != .function_expr) return null;
     switch (c.nodeTag(target)) {
         .member_expr, .index_expr => {},
-        else => return,
+        else => return null,
     }
-    if (c.tree.nodeData(target).lhs == null_node) return;
+    const obj = c.tree.nodeData(target).lhs;
+    if (obj == null_node) return null;
     try markThisBound(c, value);
+    const t = try c.checkExprCached(obj, types.no_type);
+    if (t == types.error_type or t == types.any_type or t == types.no_type) return null;
+    return t;
 }
 
 /// A compound assignment's left operand as tsc's `checkExpression(left)` sees
@@ -6056,7 +6068,9 @@ fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
     // () {…}` (any assignment operator) the function has a receiver — `obj` —
     // so a `this` in its body is not TS2683. A contextual signature with a
     // `this` parameter of its own already won inside `checkFunctionLikeExpr`.
-    try markAssignedMethodFn(c, d.lhs, d.rhs);
+    const saved_assign_this = c.this_type;
+    defer c.this_type = saved_assign_this;
+    if (try assignedMethodThisType(c, d.lhs, d.rhs)) |recv| c.this_type = recv;
     const rt = try c.checkExprCached(d.rhs, rhs_ctx);
     switch (op) {
         .eq => {

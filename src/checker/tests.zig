@@ -814,6 +814,22 @@ test "TS2403: two different class/namespace values are not identical" {
     try expectClean("class B {} var b: typeof B; var b = B;");
 }
 
+test "an assigned function expression takes `this` from the assignment target" {
+    // tsc's `getContextualThisParameterType`, last arm: in `obj.m = function
+    // () {…}` the contextual `this` is `obj`.
+    try expectCodes(
+        "declare const o: { m: () => void; n: number }; o.m = function () { const p: string = this; };",
+        &.{2322},
+    );
+    try expectClean("declare const o: { m: () => void; n: number }; o.m = function () { const p: number = this.n; };");
+    // An ARROW keeps the enclosing `this` and never takes the target's — at a
+    // script's top level that is the global object, which the arrow captures.
+    try expectCodes(
+        "declare const o: { m: () => void }; o.m = () => { this; };",
+        &.{7041},
+    );
+}
+
 test "const assignment / readonly (2588 / 2540)" {
     try expectCodes("const x = 1; x = 2;", &.{2588});
     try expectCodes("interface P { readonly a: number; } declare const p: P; p.a = 2;", &.{2540});
