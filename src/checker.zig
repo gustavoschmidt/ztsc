@@ -883,7 +883,7 @@ pub const map_containers = [_][]const u8{
     "sym_key_cache",            "trunc_expansions",       "inst_map_bytes",
     "tp_mentions",              "smk_cache",              "rel_maybe",
     "spec_sym_types",           "spec_tainted",           "last_assign_pos",
-    "definitely_assigned_syms",
+    "definitely_assigned_syms", "alias_stack",            "alias_self_recursive",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -1424,12 +1424,29 @@ pub const Checker = struct {
     enum_relation_cache: IntMap(u64, bool) = .empty,
     alias_generic: IntMap(SymbolId, TypeId) = .empty,
     alias_state: IntMap(SymbolId, u8) = .empty,
-    /// Alias symbols found to be (transitively) self-recursive while their
-    /// generic body was materialized — marked when `aliasInstance` re-enters an
-    /// in-progress alias (state == 1). Used to scope the recursion-accumulator
-    /// default substitution in `fixTypeArgs` (RHF `PathInternal<T, Tr = T>`)
-    /// away from non-recursive library defaults (redux `Reducer<S, A, P = S>`).
+    /// Alias symbols that lie ON a materialization cycle: every member of the
+    /// suffix `markCycle` cuts, not just the one this checker instance happened
+    /// to enter first. See `markCycle` (instantiate.zig) for why the whole
+    /// suffix is the only order-independent answer, and `alias_stack` for the
+    /// frame stack it reads.
+    ///
+    /// Two consumers: the ONE-SPELLING rule in `aliasInstance` (a marked alias
+    /// answers with a lazy `.ref` instead of a fresh structural
+    /// materialization) and the default-substitution scoping in `fixTypeArgs`.
     alias_recursive: IntMap(SymbolId, void) = .empty,
+    /// The subset of `alias_recursive` whose cycle is length ONE: the alias's
+    /// own body names it back directly (`type Foo3<T> = { y: Foo3<…> }`), as
+    /// opposed to reaching itself through other aliases. Also a property of the
+    /// alias graph rather than of the entry point — a body that names itself
+    /// does so from every entry — so it is order-independent for the same
+    /// reason `alias_recursive` is.
+    alias_self_recursive: IntMap(SymbolId, void) = .empty,
+    /// `aliasGeneric` frames currently materializing, outermost first. Pushed
+    /// on entry and popped on exit, so when `aliasInstance` cuts a cycle at an
+    /// in-progress alias the suffix from that alias's own frame to the top IS
+    /// the cycle the reference just closed. A cycle-detection stack, which the
+    /// module rules allow as mutable state; it is bounded by `max_alias_depth`.
+    alias_stack: std.ArrayListUnmanaged(SymbolId) = .empty,
     /// Narrowed-type cache per `(flow, reference, declared)` query, split by
     /// outcome so the overwhelmingly common one costs no value slot. See
     /// `FlowQ` for the packed key and why the split is behaviour-preserving.
