@@ -1869,6 +1869,20 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             if (try c.mentionsActiveInferVar(ctx_elem)) return c.ts.makeArray(types.never_type);
             return c.ts.makeArray(ctx_elem);
         }
+        // tsc's `checkArrayLiteral` empty arm is `createArrayType(
+        // strictNullChecks ? implicitNeverType : undefinedWideningType)` — a
+        // context-free `[]` is `never[]` there, and ztsc's `any[]` is an
+        // under-report (`[].splice(0, 3, 4, 5)` never judges its arguments
+        // against `never`). Measured as a whole-suite change and REVERTED:
+        // 3 cases gained, 2 lost, and both losses need a file this pass does
+        // not own. `var x = []; var x = new Array(1)` is one — tsc's evolving
+        // array covers a MULTI-declaration `var` (tsgo-verified) while
+        // `flow.isEvolvingArrayVar` requires `decls.len == 1`, so the two
+        // declarations came out `never[]` vs `any[]` and collided at TS2403.
+        // `[] as HomomorphicMappedType<T>` is the other: the assertion's
+        // comparability check passes trivially for `any[]` and fails for
+        // `never[]` against a deferred mapped type, which is a relation gap
+        // the `any[]` was hiding. Both have to land with this.
         return c.ts.makeArray(types.any_type); // evolving arrays out of scope
     }
     return c.ts.makeArray(try arrayLiteralElemType(c, raw_types.items, elem_types.items, rctx == types.no_type));
