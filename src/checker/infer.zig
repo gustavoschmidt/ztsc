@@ -2003,11 +2003,19 @@ pub fn inferTypeArgs(
     // Only the minted parameters that SURVIVED the folds above are worth
     // generalizing over: a slot the constraint clamp or the widening replaced
     // no longer names one.
+    //
+    // "Names one" is a MENTION, not an identity. A rest-tuple combinator answers
+    // `A := [T']`, `B := T'[]` — the minted parameter is buried one constructor
+    // deep in every slot — and an identity test read that as "did not survive",
+    // dropped the whole list, and left `pipe(list)` printing the non-generic
+    // `(...args: [T]) => T[]` where tsc answers `<T>(x: T) => T[]`. The probe is
+    // the same occurs check `generalizeCallResult` runs on the result.
     var kept: std.ArrayList(u32) = .empty;
     defer kept.deinit(c.scratch());
     for (ho_minted.items) |m| {
+        const probe = [1]TpMap{.{ .sym = m, .ty = types.unknown_type }};
         for (out) |o| {
-            if (c.ts.kind(o) == .type_param and c.ts.typeParamSymbol(o) == m) {
+            if ((try c.instantiate(o, &probe)) != o) {
                 try kept.append(c.scratch(), m);
                 break;
             }
@@ -4094,35 +4102,53 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                     // a minted parameter, and `map([1, 2, 3], identity)` — whose
                     // `T` is already `number` by the time `identity` is read —
                     // takes the first branch, not the mint.
-                    // NOT for a REST-tuple contextual signature. tsc pairs
-                    // positions through `getTypeAtPosition`, which reads a rest
-                    // parameter's ELEMENT; this arm pairs `fnParam(param, i).ty`
-                    // raw, so `pipe<A extends any[], B>(ab: (...args: A) => B)`
-                    // hands `list`'s `T` the whole TUPLE variable `A` as its
-                    // candidate. Adopting that binds a rest-tuple parameter to a
-                    // scalar and every `pipe` overload stops resolving; the
-                    // erasure below is the right answer there.
+                    //
+                    // A REST-TUPLE contextual parameter mints but does NOT
+                    // adopt. tsc pairs positions through `getTypeAtPosition`,
+                    // which reads a rest parameter's ELEMENT; this arm pairs
+                    // `fnParam(param, i).ty` raw, so `pipe<A extends any[], B>(
+                    // ab: (...args: A) => B)` hands `list`'s `T` the whole
+                    // TUPLE variable `A` as its candidate. Recording `A := T'`
+                    // would bind a rest-tuple parameter to a scalar and every
+                    // `pipe` overload would stop resolving.
+                    //
+                    // The MINT is still right, and it is the whole of what tsc
+                    // does here: `getUniqueTypeParameters` renames `list`'s `T`
+                    // to `T'` unconditionally, and the ensuing walk infers the
+                    // call's own variables from the INSTANTIATED signature
+                    // `(a: T') => T'[]`. That walk already reads a rest pattern
+                    // through `getRestTypeAtPosition` (the `pat_has_rest` block
+                    // below), so it answers `A := [T']`, `B := T'[]` — where
+                    // erasing `T` to its `unknown` fallback answered `A :=
+                    // [unknown]` and `pipe(list)` printed `(...args: [unknown])
+                    // => unknown[]` instead of `<T>(x: T) => T[]`.
+                    //
+                    // Nothing of THIS call's own inference was substituted into
+                    // `ra`, so there is no fix set to arm either: a minted
+                    // parameter is not our guess coming home.
                     const pcount0 = s.fnParamCount(param);
                     const param_rest = pcount0 != 0 and s.fnParam(param, pcount0 - 1).rest();
                     if (self_ref and c.infer_ctx.sig_ctx == 0 and
                         c.ts.kind(cand0) == .type_param and
-                        s.fnTypeParamCount(param) == 0 and !param_rest)
+                        s.fnTypeParamCount(param) == 0)
                     {
                         if (tpIndex(tp_syms, c.ts.typeParamSymbol(cand0))) |oi| {
-                            if (candidates[oi] != types.no_type and c.infer_ctx.ho_result_fn) {
+                            if (!param_rest and candidates[oi] != types.no_type and c.infer_ctx.ho_result_fn) {
                                 try ho_fix.arm(c, param, tp_syms, candidates);
                                 all_unbound = false;
                                 try map_list.append(c.scratch(), .{ .sym = sym, .ty = candidates[oi] });
                                 continue;
                             }
                             if (c.infer_ctx.ho_result_fn) if (c.infer_ctx.ho_minted) |list| {
-                                try ho_fix.arm(c, param, tp_syms, candidates);
+                                if (!param_rest) try ho_fix.arm(c, param, tp_syms, candidates);
                                 const ft = try s.makeTypeParam(try uniqueTypeParam(c, sym, list));
-                                candidates[oi] = ft;
-                                // The slot this instantiation DETERMINED is not
-                                // fixed — it is the answer, and restoring it
-                                // would undo the adoption.
-                                ho_fix.release(oi);
+                                if (!param_rest) {
+                                    candidates[oi] = ft;
+                                    // The slot this instantiation DETERMINED is
+                                    // not fixed — it is the answer, and
+                                    // restoring it would undo the adoption.
+                                    ho_fix.release(oi);
+                                }
                                 all_unbound = false;
                                 try map_list.append(c.scratch(), .{ .sym = sym, .ty = ft });
                                 continue;
@@ -4145,7 +4171,7 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                     // parameter is the one thing the walk below legitimately
                     // teaches this call.
                     if (cand0 == types.no_type and c.infer_ctx.sig_ctx == 0 and
-                        c.infer_ctx.ho_result_fn and s.fnTypeParamCount(param) == 0 and !param_rest)
+                        c.infer_ctx.ho_result_fn and s.fnTypeParamCount(param) == 0)
                     {
                         if (c.infer_ctx.ho_minted) |list| {
                             const ft = try s.makeTypeParam(try uniqueTypeParam(c, sym, list));
