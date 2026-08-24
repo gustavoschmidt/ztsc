@@ -2099,6 +2099,22 @@ const Binder = struct {
     }
 
     fn addFlow(b: *Binder, tag: FlowTag, antecedent: FlowId, node: Node) Error!FlowId {
+        // tsc's `checkUnreachable`: inside a region nothing reaches,
+        // `bindChildren` walks the subtree WITHOUT the flow machinery, so no
+        // assignment, condition, mutation or call edge is minted there at all.
+        // Collapsing the edge onto the shared unreachable node has the same
+        // effect on every consumer — a node built on an unreachable antecedent
+        // is itself unreachable — and it is what lets `pendAdd` DROP the dead
+        // branch: `let y: string|number = 1; if (false) { y = "a"; }` must not
+        // deliver `"a"` to the join after the `if`.
+        //
+        // The three LABEL tags are exempt because their `antecedent` argument
+        // is a pending id, not a flow id, and `.start` because a function body
+        // begins a fresh flow whatever encloses it.
+        switch (tag) {
+            .branch_label, .loop_label, .reduce_label, .start => {},
+            else => if (antecedent == unreachable_flow) return unreachable_flow,
+        }
         const id: FlowId = @intCast(b.flow_tags.items.len);
         try b.addFlowRaw(tag, antecedent, node);
         return id;
@@ -4925,15 +4941,31 @@ const Binder = struct {
     /// checker can narrow each operand
     /// (truthiness/nullishness/typeof/equality/discriminant).
     fn bindCondition(b: *Binder, node: Node) Error!CondFlows {
+        return b.bindConditionAt(node, .direct);
+    }
+
+    /// Whether the node reaching `bindConditionAt`'s tail is the one tsc would
+    /// hand to `createFlowCondition` — which decides whether the
+    /// constant-condition rule applies to it. tsc reaches a paren's or a `!`'s
+    /// OPERAND through `doWithConditionalBranches(bind, …)`, which binds it as
+    /// an ordinary expression and creates no condition edge for it, so only the
+    /// enclosing `(true)` / `!true` node is ever tested — and neither is a
+    /// boolean keyword. The `&&`/`||`/`??` operands are different: tsc calls
+    /// `bindCondition` on each, so each IS tested. Measured against tsgo:
+    /// `if ((true))` and `if (!false)` both keep their dead branch alive, while
+    /// `if (true && true)` prunes.
+    const CondSite = enum { direct, unwrapped };
+
+    fn bindConditionAt(b: *Binder, node: Node, site: CondSite) Error!CondFlows {
         if (node == null_node) {
             return .{ .t = b.cur_flow, .f = unreachable_flow };
         }
         const d = b.tree.nodeData(node);
         switch (b.nodeTag(node)) {
-            .paren_expr => return b.bindCondition(d.lhs),
+            .paren_expr => return b.bindConditionAt(d.lhs, .unwrapped),
             .prefix_unary => {
                 if (b.tree.tokens.tag(b.tree.nodeMainToken(node)) == .bang) {
-                    const inner = try b.bindCondition(d.lhs);
+                    const inner = try b.bindConditionAt(d.lhs, .unwrapped);
                     return .{ .t = inner.f, .f = inner.t };
                 }
             },
@@ -4989,9 +5021,52 @@ const Binder = struct {
             else => {},
         }
         try b.bindExpr(node);
+        // tsc's `createFlowCondition`, the constant-condition rule: a literal
+        // `true` has no FALSE outcome and a literal `false` has no TRUE one —
+        // that edge is `unreachableFlow`, so nothing assigned inside the dead
+        // branch reaches the join after the `if`. Without it
+        //
+        //     let z: string | number = 1;
+        //     if (true) { z = "a"; }
+        //     const w: string = z;
+        //
+        // is a TS2322 false positive: the join still carries the else branch's
+        // `1`. The rule is the BINDER's in tsc as well, which is what makes it
+        // apply uniformly to `if`, `while`, `for`, `?:` and `&&`/`||`.
+        //
+        // tsc's two written exclusions — the expression being an optional
+        // chain's ROOT, or the left operand of `??` — are structural here
+        // rather than conditional: a chain builds its own edges in
+        // `bindOptionalChainCondition` and `??` routes its left operand through
+        // `bindNullishTest`, so neither reaches this tail. In both the keyword
+        // is tested for NULLISHNESS, and `true` is not nullish, so neither
+        // branch would be dead.
+        //
+        // The `site` guard carries tsc's THIRD, unwritten exclusion — see
+        // `CondSite`.
+        if (site == .direct) {
+            if (constantConditionValue(b, node)) |v| {
+                return if (v)
+                    .{ .t = b.cur_flow, .f = unreachable_flow }
+                else
+                    .{ .t = unreachable_flow, .f = b.cur_flow };
+            }
+        }
         return .{
             .t = try b.addFlow(.cond_true, b.cur_flow, node),
             .f = try b.addFlow(.cond_false, b.cur_flow, node),
+        };
+    }
+
+    /// tsc's `isBooleanLiteral` as `createFlowCondition` asks it: the `true`
+    /// and `false` KEYWORDS, nothing else — not `1`, not `(true)`, not
+    /// `!false`, not a `const` bound to one. Measured: `if (1)`, `if ((true))`
+    /// and `if (!false)` all keep both branches in tsgo.
+    fn constantConditionValue(b: *const Binder, node: Node) ?bool {
+        return switch (b.nodeTag(node)) {
+            .true_literal => true,
+            .false_literal => false,
+            else => null,
         };
     }
 

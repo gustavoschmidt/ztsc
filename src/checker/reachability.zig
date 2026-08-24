@@ -76,9 +76,24 @@ pub fn stmtTerminal(c: *Checker, node: Node) bool {
             defer c.cur_scope = saved;
             return c.stmtListTerminal(c.tree.nodeRange(node));
         },
+        // The binder prunes the dead branch of a CONSTANT condition (tsc's
+        // `createFlowCondition`), so `if (true) { … }` has no fall-through edge
+        // at all and `if (false) … else …` is decided by its else branch alone.
+        // tsc reaches the same answer through the flow graph —
+        // `functionHasImplicitReturn` reads `isReachableFlowNode(endFlowNode)`
+        // — but this walk is syntactic, so the rule has to be spelled here too
+        // or `function g(): number { if (true) return 1; }` is a TS2366 false
+        // positive. Only the bare keyword counts, exactly as in the binder:
+        // measured, tsgo still reports TS2366 for `if ((true))` and
+        // `if (!false)`.
+        .if_stmt => return c.nodeTag(d.lhs) == .true_literal and c.stmtTerminal(d.rhs),
         .if_else_stmt => {
             const e = c.tree.extraData(ast.IfElse, d.rhs);
-            return c.stmtTerminal(e.then_stmt) and c.stmtTerminal(e.else_stmt);
+            return switch (c.nodeTag(d.lhs)) {
+                .true_literal => c.stmtTerminal(e.then_stmt),
+                .false_literal => c.stmtTerminal(e.else_stmt),
+                else => c.stmtTerminal(e.then_stmt) and c.stmtTerminal(e.else_stmt),
+            };
         },
         .labeled_stmt => return c.stmtTerminal(d.lhs),
         .try_stmt => {
