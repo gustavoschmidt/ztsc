@@ -557,6 +557,14 @@ pub const Code = enum(u16) {
     /// over `duplicate_identifier` on the EXISTING symbol's flags only, and a
     /// `class` is not a `BlockScopedVariable` there — see `dupCode`.
     block_scoped_redeclare,
+    /// TS2481: a `var` that HOISTED PAST a block-scoped declaration of the
+    /// same name. tsc's `checkVarDeclaredNamesNotShadowed` reports this in
+    /// place of the plain redeclaration message whenever the two names do NOT
+    /// share a scope — i.e. whenever the block-scoped one sits in a scope the
+    /// `var` had to travel out of (a for/for-of head, a bare block, a
+    /// `switch` body) rather than in the function body / module block /
+    /// source file the `var` lands in. Interpolates the name TWICE.
+    outer_scope_var_in_block_scope,
     /// TS2567: a failed merge with an `enum` on either side. tsc gives the
     /// enum its own message ahead of both the block-scoped and the plain
     /// duplicate one (`enum E {} var E;`, `var E; enum E {}`,
@@ -1489,6 +1497,7 @@ pub const Code = enum(u16) {
             // private one `'#e'`, exactly as `declarationNameToString` does.
             .duplicate_identifier => "Duplicate identifier '{0}'.",
             .block_scoped_redeclare => "Cannot redeclare block-scoped variable '{0}'.",
+            .outer_scope_var_in_block_scope => "Cannot initialize outer scoped variable '{0}' in the same scope as block scoped declaration '{0}'.",
             .enum_merge_conflict => "Enum declarations can only merge with namespace or other enum declarations.",
             .duplicate_function_implementation => "Duplicate function implementation.",
             .duplicate_constructor_implementation => "Multiple constructor implementations are not allowed.",
@@ -1702,6 +1711,7 @@ pub const Code = enum(u16) {
 
             .duplicate_identifier => 2300,
             .block_scoped_redeclare => 2451,
+            .outer_scope_var_in_block_scope => 2481,
             .enum_merge_conflict => 2567,
             .duplicate_function_implementation => 2393,
             .duplicate_constructor_implementation => 2392,
@@ -1948,17 +1958,31 @@ pub const Diagnostic = struct {
 /// reserved-word family (TS1212/1213/1214/1359) says `'yield' is a reserved
 /// word…` about the very token its span covers, so the span is the argument
 /// and no call site has to repeat it.
+///
+/// EVERY `{0}` is filled, not just the first: tsc numbers a message's holes by
+/// ARGUMENT, so a template is free to spell the same one twice — TS2481 says
+/// `Cannot initialize outer scoped variable '{0}' in the same scope as block
+/// scoped declaration '{0}'`, and filling only the leading hole left the
+/// literal text `{0}` in the rendered message.
 pub fn renderMessage(arena: Allocator, d: Diagnostic, src: []const u8) Allocator.Error![]const u8 {
     const template = d.code.message();
-    const hole = std.mem.indexOf(u8, template, arg_hole) orelse return template;
+    const holes = std.mem.count(u8, template, arg_hole);
+    if (holes == 0) return template;
     const arg = if (d.arg.end > d.arg.start) d.arg else d.span;
     const start = @min(arg.start, src.len);
     const end = @min(@max(arg.end, start), src.len);
     const text = src[start..end];
-    const out = try arena.alloc(u8, template.len - arg_hole.len + text.len);
-    @memcpy(out[0..hole], template[0..hole]);
-    @memcpy(out[hole..][0..text.len], text);
-    @memcpy(out[hole + text.len ..], template[hole + arg_hole.len ..]);
+    const out = try arena.alloc(u8, template.len - holes * arg_hole.len + holes * text.len);
+    var w: usize = 0;
+    var rest = template;
+    while (std.mem.indexOf(u8, rest, arg_hole)) |hole| {
+        @memcpy(out[w..][0..hole], rest[0..hole]);
+        w += hole;
+        @memcpy(out[w..][0..text.len], text);
+        w += text.len;
+        rest = rest[hole + arg_hole.len ..];
+    }
+    @memcpy(out[w..][0..rest.len], rest);
     return out;
 }
 

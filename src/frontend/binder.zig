@@ -1018,7 +1018,30 @@ const Binder = struct {
                 if (s == scope) break;
                 if (b.members.get(memberKey(s, atom))) |sym| {
                     if (b.sym_flags.items[sym].bits() & mask_let_const_class != 0) {
-                        try b.diag(.block_scoped_redeclare, name_tok);
+                        // TS2481, not TS2451: `s` is a scope this `var` had to
+                        // hoist OUT of, so the two names provably do not share
+                        // one — exactly tsc's `!namesShareScope` in
+                        // `checkVarDeclaredNamesNotShadowed`, which reports
+                        // "cannot initialize outer scoped variable" there and
+                        // keeps the plain redeclaration message for the case
+                        // where the block-scoped name sits in the function
+                        // body / module block / source file the var LANDS in.
+                        // Every scope this loop walks is an intermediate one
+                        // (it stops at the landing scope), so the test needs
+                        // no further condition. Verified against the oracle on
+                        // for/for-of heads, bare blocks, `switch` bodies and
+                        // nested blocks; `function f() { let e; { var e; } }`,
+                        // where the two DO share the body scope, is reported
+                        // by the merge path below and still answers TS2451.
+                        //
+                        // `mask_let_const_class` also admits a CLASS, which
+                        // the oracle excuses entirely (`{ class C {} { var C;
+                        // } }` earns nothing from tsgo) — that arm was a false
+                        // positive before this change and still is, only now
+                        // spelled TS2481. Left alone deliberately: narrowing
+                        // the mask is a separate question from picking the
+                        // code, and nothing in the suite turns on it.
+                        try b.diag(.outer_scope_var_in_block_scope, name_tok);
                     }
                 }
                 try b.var_transits.append(b.scratch, .{ .value = s, .next = atom });
@@ -5909,12 +5932,38 @@ test "dup: var-vs-let picks the code off the EXISTING symbol" {
     // and lands in the same table, so the clash names both spellings.
     try expectBindCodes("let x; { var x; }", &.{ .block_scoped_redeclare, .block_scoped_redeclare });
     // A `let` INSIDE the block the var hoisted out of is the transit check,
-    // which has only the newcomer to name (ztsc reports TS2451 where tsc has
-    // the more specific TS2481 — a pre-existing divergence, not this rule).
+    // which has only the newcomer to name (ztsc reports TS2451 at the LET
+    // where tsc has TS2481 at the VAR — the transit list records no token to
+    // blame, so this direction is still a divergence; the opposite order,
+    // below, is exact).
     try expectBindCodes("{ var x; let x; }", &.{.block_scoped_redeclare});
     // No conflict when the block-scoped name is in a sibling/inner scope.
     try expectBindCodes("var x; { let x; }", &.{});
     try expectBindCodes("function f() { { let x; } var x; }", &.{});
+}
+
+test "dup: a var hoisting PAST a block-scoped name is TS2481, not TS2451" {
+    // tsc's `checkVarDeclaredNamesNotShadowed`: the two names share no scope,
+    // so the message is "cannot initialize outer scoped variable". Every
+    // scope the hoist walk crosses qualifies — a bare block, a `for`/`for-of`
+    // head, a `switch` body — and only ONE diagnostic is filed (the var's own
+    // landing scope holds no clashing name).
+    const outer: []const Code = &.{.outer_scope_var_in_block_scope};
+    try expectBindCodes("{ let x; { var x; } }", outer);
+    try expectBindCodes("{ let x; { { { var x; } } } }", outer);
+    try expectBindCodes("for (let x of []) { var x; }", outer);
+    try expectBindCodes("for (let x of []) { { var x; } }", outer);
+    try expectBindCodes("for (let x = 0;;) { var x; }", outer);
+    try expectBindCodes("for (let x in {}) { var x; }", outer);
+    try expectBindCodes("while (1) { let x; { var x; } }", outer);
+    try expectBindCodes("switch (0) { case 1: let x; { var x; } }", outer);
+    try testing.expectEqual(@as(u16, 2481), Code.outer_scope_var_in_block_scope.tsCode());
+    // The var LANDS in the scope holding the `let` — they share it, so tsc
+    // keeps the plain redeclaration message and names both spellings.
+    try expectBindCodes(
+        "function f() { let x; { var x; } }",
+        &.{ .block_scoped_redeclare, .block_scoped_redeclare },
+    );
 }
 
 test "dup: class/let and class/class" {
