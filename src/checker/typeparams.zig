@@ -298,6 +298,111 @@ pub fn checkFileTypeParamDefaults(c: *Checker) Error!void {
     }
 }
 
+/// TS2313, "Type parameter 'T' has a circular constraint" — tsc's
+/// `getImmediateBaseConstraint`, which reports when resolving a parameter's
+/// base constraint re-enters that same parameter:
+///
+/// ```ts
+/// class C<T extends T> {}                 // T
+/// class D<U extends T, T extends V, V extends T> {}   // T and V, NOT U
+/// ```
+///
+/// The `D` line is the shape that pins the rule down. tsc's
+/// `pushTypeResolution` finds the cycle at `T` and marks the resolution stack
+/// FROM `T` ONWARDS as failed, so only the parameters actually ON the cycle
+/// report; `U`, which merely leads into it, does not. The memo (`t.immediate
+/// BaseConstraint`) then keeps each parameter to one report however many other
+/// parameters walk through it.
+///
+/// Restricted here to the chain a constraint spelled as a BARE reference to a
+/// sibling parameter makes — the only edge shape ztsc can read without
+/// resolving the constraint's type, and the only one either witness needs.
+/// A parameter reached through a type ARGUMENT is not on that chain, which is
+/// tsc's answer too: `function foo<S extends Foo<S>>()` is clean, because
+/// `Foo<S>`'s base constraint is the alias's own body and never asks `S` for
+/// its constraint. Under-reads the type-level rule (`T extends U | V, U
+/// extends T` is circular for tsc and silent here) and cannot over-read it.
+///
+/// Runs off the SYNTAX for the same reason TS2744 does — see
+/// `checkFileTypeParamDefaults`, whose `scope_owners` walk this shares.
+pub fn checkFileCircularConstraints(c: *Checker) Error!void {
+    for (c.prog.files[c.cur_file].bind.scope_owners, 0..) |node, s| {
+        if (s == 0 or node == null_node) continue;
+        const tps = writtenTypeParamRange(c, node) orelse continue;
+        try reportCircularConstraints(c, tps);
+    }
+}
+
+/// One type-parameter list's worth of TS2313. Each parameter has at most ONE
+/// outgoing edge (its constraint names at most one sibling), so the walk is a
+/// chain rather than a search, and the three states are tsc's resolution stack:
+/// unvisited, on the current chain, resolved.
+fn reportCircularConstraints(c: *Checker, tps: []const Node) Error!void {
+    const State = enum(u8) { unvisited, on_chain, done };
+    const mark = c.scratch_arena.mark();
+    defer c.scratch_arena.restore(mark);
+    const state = try c.scratch().alloc(State, tps.len);
+    const circular = try c.scratch().alloc(bool, tps.len);
+    @memset(state, .unvisited);
+    @memset(circular, false);
+    var chain: std.ArrayList(usize) = .empty;
+    for (0..tps.len) |start| {
+        if (state[start] != .unvisited) continue;
+        chain.clearRetainingCapacity();
+        var cur = start;
+        // The parameter the chain CLOSED on, if it closed at all. A chain that
+        // simply runs out of edges, or that joins an already-resolved one, is
+        // not a cycle — and neither is the last parameter on it.
+        var closed_on: ?usize = null;
+        while (true) {
+            state[cur] = .on_chain;
+            try chain.append(c.scratch(), cur);
+            const next = (try constraintNamesSibling(c, tps, cur)) orelse break;
+            if (state[next] == .done) break;
+            if (state[next] == .on_chain) {
+                closed_on = next;
+                break;
+            }
+            cur = next;
+        }
+        // Every parameter from the closing point to the head of the chain is on
+        // the cycle — tsc marks exactly that suffix of its resolution stack as
+        // failed, which is why the parameters that merely LEAD INTO a cycle
+        // stay silent.
+        if (closed_on) |c0| {
+            var k = chain.items.len;
+            while (k > 0) {
+                k -= 1;
+                circular[chain.items[k]] = true;
+                if (chain.items[k] == c0) break;
+            }
+        }
+        for (chain.items) |i| {
+            state[i] = .done;
+            if (!circular[i]) continue;
+            const con = c.tree.nodeData(tps[i]).lhs;
+            try c.diagFmt(2313, c.nodeSpan(con), "Type parameter '{s}' has a circular constraint.", .{
+                c.atomText(try c.atomOfToken(c.tree.nodeMainToken(tps[i]))),
+            });
+        }
+    }
+}
+
+/// The index of the sibling parameter `tps[i]`'s constraint names outright, or
+/// null when it has no constraint or the constraint is anything else.
+fn constraintNamesSibling(c: *Checker, tps: []const Node, i: usize) Error!?usize {
+    if (tps[i] == null_node or c.nodeTag(tps[i]) != .type_param) return null;
+    const con = c.tree.nodeData(tps[i]).lhs;
+    if (con == null_node) return null;
+    // A bare reference IS the identifier — the parser only wraps one in a
+    // `.type_ref` to hang a written type-argument list off it, and `Foo<…>`'s
+    // base constraint is the referent's own, not the argument's. So the
+    // identifier form is exactly the edge shape, and every other node kind
+    // (`.type_ref`, `.qualified_name`, an operator, a literal) ends the chain.
+    if (c.nodeTag(con) != .identifier) return null;
+    return namedTypeParamRef(c, con, tps);
+}
+
 /// Report every reference inside `root` to one of the type parameters in
 /// `window` (the defaulted parameter itself and everything after it).
 ///

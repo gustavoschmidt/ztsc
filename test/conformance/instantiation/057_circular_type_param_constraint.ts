@@ -7,9 +7,9 @@
 // `getBaseConstraintOfType`, which is undefined for a circular constraint.
 //
 // The property reads below are what force the apparent-type walk; the TS2339s
-// are the oracle's own answer for them. ztsc does not implement TS2313
-// ("Type parameter has a circular constraint"), so those lines are recorded
-// in DEFERRED — the point of this case is that the reads terminate.
+// are the oracle's own answer for them, and the TS2313s from the declaration
+// check over the type-parameter list (`checkFileCircularConstraints`). What
+// this case gates is that the reads terminate.
 
 // Direct self-reference.
 function direct<T extends T>(p: T) {
