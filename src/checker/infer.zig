@@ -1694,6 +1694,10 @@ pub fn inferTypeArgs(
     // excalidraw 15 -> 45, immich 0 -> 1).
     const partial_ctx = try c.scratch().alloc(TpMap, tp_syms.len);
     const param_mentioned = try c.scratch().alloc(bool, tp_syms.len);
+    // Which type parameters a context-sensitive callback could ECHO back — the
+    // ones named by the contextual type of an UN-ANNOTATED parameter position.
+    // See the contravariant-echo guard below.
+    const echoable = try c.scratch().alloc(bool, tp_syms.len);
     ai = 0;
     for (arg_nodes) |an| {
         if (an == null_node) continue;
@@ -1789,10 +1793,25 @@ pub fn inferTypeArgs(
         // is a non-context-sensitive argument — an annotated callback carries
         // real contravariant evidence, which is why tsc rejects
         // `f7(() => sv.get(), sink)` for `sink: (p: string | null) => void`.
+        //
+        // The widened half is per-PARAMETER-POSITION, not per argument. Context
+        // sensitivity is a property of the WHOLE callback — one un-annotated
+        // parameter makes it so — but the echo only exists where the contextual
+        // type was actually adopted, which is exactly the un-annotated
+        // positions. An ANNOTATED parameter's type is what the source says, and
+        // what it yields is evidence whatever else the callback declares:
+        // `els.reduce((acc: Record<string, true>, e) => acc, {})` is
+        // `Record<string, true>` in tsc, where wiping `U`'s contravariant
+        // candidate wholesale left the `{}` the second argument supplies (and
+        // annotating `e`, or dropping the `{}`, already made ztsc agree).
         const ctx_sensitive = c.fnExprIsContextSensitive(fn_node);
+        if (ctx_sensitive) {
+            for (echoable) |*e| e.* = false;
+            try markEchoablePositions(c, fn_node, pt0, tp_syms, echoable);
+        }
         for (contra, 0..) |*cc, i| {
             if (cc.* == before_contra[i]) continue;
-            if (cc.* == fed[i] or (ctx_sensitive and fed[i] != types.any_type))
+            if (cc.* == fed[i] or (ctx_sensitive and echoable[i] and fed[i] != types.any_type))
                 cc.* = before_contra[i];
         }
         // Placeholder echo. A parameter with no candidate yet stands in as
@@ -2371,6 +2390,35 @@ fn paramsMentionFreeVar(c: *Checker, sig: TypeId, tp_syms: []const u32, candidat
         if (m and cand == types.no_type) return true;
     }
     return false;
+}
+
+/// Mark every type parameter named by the contextual type of an UN-ANNOTATED
+/// parameter of `fn_node` — the positions whose type the callback ADOPTED from
+/// the contextual signature, and so the only ones whose contravariant evidence
+/// can be this call's own guess coming home. `sig` is the (uninstantiated)
+/// contextual signature; a position it does not reach marks nothing.
+fn markEchoablePositions(c: *Checker, fn_node: Node, sig: TypeId, tp_syms: []const u32, out: []bool) Error!void {
+    if (c.ts.kind(sig) != .function) {
+        // No contextual signature to pair positions with: fall back to the
+        // whole-argument reading rather than sparing evidence blindly.
+        for (out) |*e| e.* = true;
+        return;
+    }
+    const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(fn_node).lhs);
+    var pos: u32 = 0;
+    for (c.tree.extraRange(proto.params_start, proto.params_end)) |p| {
+        defer pos += 1;
+        if (p == null_node) continue;
+        const pd = c.tree.nodeData(p);
+        const ann: Node = switch (c.nodeTag(p)) {
+            .param => pd.rhs,
+            .param_full => c.tree.extraData(ast.ParamFull, pd.rhs).type_ann,
+            else => 0,
+        };
+        if (ann != 0) continue; // annotated: its type is the source's, not ours
+        const pt = (try c.paramTypeAt(sig, pos)) orelse continue;
+        try markMentionedTps(c, pt, tp_syms, out, 0);
+    }
 }
 
 /// Index of the first CONTEXT-SENSITIVE function argument, or `maxInt` when the
