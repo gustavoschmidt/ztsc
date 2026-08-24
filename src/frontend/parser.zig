@@ -5954,12 +5954,58 @@ const Parser = struct {
             }
             if (try p.eat(.comma) == null and p.curTag() != .r_paren) {
                 try p.fail(.expected_comma);
+                // tsc's `parseDelimitedList` does not give up on the list
+                // here. It re-asks `isListElement` at the top of the next
+                // iteration, and only a token that starts NO argument reaches
+                // `abortParsingListOrMoveToNextToken` — which force-advances
+                // past it so the loop can go on to the element after. So
+                // `f(name:string)` stays ONE argument list whose single
+                // complaint is the "',' expected" just filed. (tsc's own
+                // "argument expression expected" for the skipped token lands
+                // on the position that complaint already used and is dropped
+                // by the one-per-position rule, which `errAtCur` applies too
+                // — so force-advancing adds no diagnostic.)
+                //
+                // Abandoning the list instead left `:string)` to be re-parsed
+                // as statements: a spurious TS1434 at `string` and TS1128 at
+                // `)`, in `staticsInAFunction` and
+                // `overloadingStaticFunctionsInFunctions`.
+                //
+                // A token that DOES start an argument must not be skipped —
+                // the loop below parses it as the next element, which is what
+                // makes `foo(public blaz() {})` two "',' expected" and nothing
+                // more. Swallowing the `blaz` there cost four extra keys in
+                // `errorRecoveryInClassDeclaration`.
+                if (!startsArgument(p.curTag()) and !canAbandonArgList(p.curTag()) and !p.nlBefore()) {
+                    _ = try p.bump();
+                    continue;
+                }
                 if (p.curIdx() == before) break;
             }
             if (p.curIdx() == before) break;
         }
         _ = try p.expect(.r_paren, .expected_r_paren);
         return p.scratchToSpan(top);
+    }
+
+    /// tsc's `isListElement(ParsingContext.ArgumentExpressions)`: `token() ===
+    /// DotDotDotToken || isStartOfExpression()`. A token that answers yes is
+    /// the next ARGUMENT and must be left for the loop to parse, never skipped
+    /// as noise.
+    fn startsArgument(tag: TokTag) bool {
+        return tag == .dot_dot_dot or canStartExpression(tag);
+    }
+
+    /// Standing in for tsc's `isInSomeParsingContext`: is the token something
+    /// an ENCLOSING construct is waiting for, so that an unterminated argument
+    /// list must hand it back rather than skip it? A closing bracket or a
+    /// statement separator belongs to whatever opened it; skipping one would
+    /// let a single unclosed `(` eat the rest of the file.
+    fn canAbandonArgList(tag: TokTag) bool {
+        return switch (tag) {
+            .r_brace, .r_bracket, .r_paren, .semicolon, .eof => true,
+            else => false,
+        };
     }
 
     fn parseNewExpr(p: *Parser, ctx: ExprCtx) PE!Node {
