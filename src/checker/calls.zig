@@ -764,6 +764,22 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
             }
         }
     }
+    // …unless the `err` is only ztsc's in-progress marker for a class whose
+    // member table is being built further down this stack. Nothing has been
+    // reported there, and the DECLARATIONS still settle this particular
+    // question: a class body has no call-signature syntax, so unless an
+    // `interface` half supplies one the instance is not callable
+    // (`classes.inProgressCallSigless`). Without it `class D { m() { return
+    // this(); } }` said nothing while the annotated `m(): void` form reported
+    // TS2349 — the same call, and the difference was only whether the return
+    // type was inferred, which is what held the table open.
+    if (rk == .err and !is_new and !super_call and try classes.inProgressCallSigless(c, callee_t)) {
+        try c.diagFmt(2349, c.nodeSpan(shape.callee), "This expression is not callable.", .{});
+        for (shape.arg_nodes) |an| {
+            if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+        }
+        return .{ .ty = types.error_type, .chained = chained };
+    }
     if (rk == .any or rk == .err or isect_any) {
         // The `any` route into `resolveUntypedCall` (see there): an `err`
         // callee has already been reported on, and a super CALL's written
@@ -3099,7 +3115,7 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
             const before = c.diags.items.len;
             if (synthetic) {
                 try c.reportNotAssignable(2345, at, pt, argErrorSpan(c, an));
-            } else if (!try c.elaborateCallbackError(an, at, pt) and
+            } else if (!(callbackElaborates(c, an) and try c.elaborateCallbackError(an, at, pt)) and
                 !try c.elaborateLiteralError(an, at, pt) and
                 // A fresh object-literal argument with an unknown property is
                 // tsc's TS2353/TS2561 on that property, not a TS2345 on the
@@ -3147,6 +3163,46 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
             noteArgBlame(c, anchor_out, before, span, span);
         }
     }
+}
+
+/// Does tsc's `elaborateError` descend into this argument's RETURN, moving the
+/// blame off the whole argument and onto the returned expression?
+///
+/// Only for the shape its switch dispatches to `elaborateArrowFunction`, and
+/// only past that function's own two opening guards:
+///
+/// ```ts
+/// case SyntaxKind.ArrowFunction: return elaborateArrowFunction(…);
+/// …
+/// function elaborateArrowFunction(node, …) {
+///     // Don't elaborate blocks
+///     if (isBlock(node.body)) return false;
+///     // Or functions with annotated parameter types
+///     if (some(node.parameters, hasType)) return false;
+/// ```
+///
+/// So a CONCISE-bodied arrow with no annotated parameter reports on its body
+/// (`foo3(n => 'a')` is TS2322 at `'a'`), and a block-bodied arrow, an arrow
+/// with an annotated parameter, and a `function` expression are all the plain
+/// whole-argument TS2345 — all four tsgo-verified. ztsc offered the
+/// elaboration for every function-shaped argument, which turned each of the
+/// other three into a TS2322 at a span tsc does not report at all.
+fn callbackElaborates(c: *Checker, arg_node: Node) bool {
+    if (c.nodeTag(arg_node) != .arrow_fn) return false;
+    const d = c.tree.nodeData(arg_node);
+    if (d.rhs == 0 or c.nodeTag(d.rhs) == .block) return false;
+    const proto = c.tree.extraData(ast.FnProto, d.lhs);
+    for (c.tree.extraRange(proto.params_start, proto.params_end)) |p| {
+        if (p == null_node) continue;
+        const pd = c.tree.nodeData(p);
+        const ann: Node = switch (c.nodeTag(p)) {
+            .param => pd.rhs,
+            .param_full => c.tree.extraData(ast.ParamFull, pd.rhs).type_ann,
+            else => 0,
+        };
+        if (ann != 0) return false;
+    }
+    return true;
 }
 
 /// Record where an argument report landed, for `resolveSignatureCall`'s TS2769.

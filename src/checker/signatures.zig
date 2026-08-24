@@ -1092,7 +1092,17 @@ fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) Erro
         // the method unassignable to its own base (`void` ⊄ `never`) — 26
         // phantom TS2322s on outline's editor-node registry once the heritage
         // fast path stopped hiding the pair.
-        if (c.stmtListTerminal(c.tree.nodeRange(body)) and mayReturnNever(c, fn_node)) {
+        //
+        // …and a BARE `return;` takes the arm out entirely, however terminal
+        // the body is. tsc's `checkAndAggregateReturnExpressionTypes` gates
+        // the whole `never` answer on `!hasReturnWithNoExpression`, and a
+        // `return;` sets that flag as surely as a reachable endpoint does:
+        // `() => { return; }` produces `undefined` at runtime, so its type is
+        // `void`. Typed `never` it was assignable to every callback target —
+        // `foo((n: number) => number)` called with `(n) => { return; }` lost
+        // its TS2345, and `[1, 2].map(n => { return; })` came out `never[]`
+        // where tsc says `void[]`.
+        if (!rets.bare and c.stmtListTerminal(c.tree.nodeRange(body)) and mayReturnNever(c, fn_node)) {
             return types.never_type;
         }
         // TS 5.1's `getReturnTypeFromBody`, the `types.length === 0` arm:

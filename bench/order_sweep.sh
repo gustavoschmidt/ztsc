@@ -241,12 +241,21 @@ done
 # message text on purpose (ztsc's wording diverges from tsgo's), so a printed
 # type that changes spelling with the partition passes it.
 #
-# That is not hypothetical — it is the defect wave 29 measured and wave 30
-# fixed. `alias_recursive` was written for whichever member of a mutually
-# recursive alias cluster a checker instance materialized FIRST, so social-app's
-# Navigation.tsx:778 printed `NativeStackNavigationProp<{…}>` under one
-# partition and the expanded 40-member object under another. Same keys, same
-# orders, different text, and every standing gate silent.
+# That is not hypothetical — it is the defect wave 29 measured and wave 31
+# closed, and this pass is the gate that found it. `alias_recursive` was written
+# for whichever member of a mutually recursive alias cluster a checker instance
+# materialized FIRST, so social-app's Navigation.tsx:778 printed
+# `NativeStackNavigationProp<{…}>` under one partition and the expanded
+# 40-member object under another. Same keys, same orders, different text, and
+# every standing gate silent.
+#
+# It is fixed (`markCycle` keys on the whole alias cycle, which is a property of
+# the alias graph rather than of the entry point) and both apps now pass the
+# whole grid: excalidraw 20/20 and social-app 20/20 cells byte-identical over
+# CHECKERS="1 2 4 8" × five orders. The unit-scale regression test is
+# `determinism: a mutual ALIAS cycle keeps ONE spelling for every member` in
+# test/run_conformance.zig. Keep running this pass anyway — it is the only gate
+# that crosses the two axes, and the class it catches has no other detector.
 #
 # So the last pass compares every cell of the checkers × orders grid — text and
 # all — against ONE reference. `src/checker.zig:15` promises byte-identical
