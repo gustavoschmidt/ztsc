@@ -460,10 +460,22 @@ pub fn stringEnumCastOverlap(c: *Checker, a: TypeId, b: TypeId) Error!bool {
     return false;
 }
 
-/// The shapes a still-generic mapped type may overlap in the cast test: an
-/// object type is the only thing a mapped type can ever instantiate to.
+/// The shapes a still-generic mapped type may overlap in the cast test: the
+/// object-ish types are the only things a mapped type can ever instantiate to.
+///
+/// An ARRAY or TUPLE counterpart is one of them. A HOMOMORPHIC mapped type
+/// distributes over an array or tuple modifiers type — `{ [P in keyof T]: … }`
+/// with `T extends [number] | [string]` instantiates to a TUPLE, never to a
+/// plain object — so a mapped type and an array-like are exactly as able to
+/// overlap as a mapped type and an object literal, and just as undecidable
+/// here while the key constraint is still generic. Without the two kinds,
+/// `[] as HomomorphicMappedType<T>` was four false TS2352s
+/// (`mappedTypeUnionConstrainTupleTreatedAsArrayLike`), which tsgo accepts —
+/// it reports only the TS2322 on the `readonly`-constrained assignment below
+/// the cast, i.e. the CAST is fine and the assignment is what fails.
 pub fn mappedCastPeer(k: types.Kind) bool {
-    return k == .object or k == .intersection or k == .mapped;
+    return k == .object or k == .intersection or k == .mapped or
+        k == .array or k == .tuple;
 }
 
 /// The kinds `castComparableRec` concedes outright rather than decide on

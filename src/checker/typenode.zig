@@ -1452,7 +1452,47 @@ pub fn gatherSpreadProps(
                         try idx_str.appendSlice(c.scratch(), ms.items);
                         try idx_num.appendSlice(c.scratch(), mn.items);
                     },
-                    .null, .undefined, .void => has_empty = true,
+                    // tsc's `isEmptyObjectTypeOrSpreadsIntoEmptyObject`, the
+                    // predicate `tryMergeUnionOfObjectTypeAndEmptyObject`
+                    // strips a union spread's members by, and the same set
+                    // `getSpreadType` answers `return left` for: nullish, and
+                    // every PRIMITIVE-like constituent. A `boolean && obj`
+                    // guard is the everyday spelling — `{ ...(flag && attrs) }`
+                    // is `false | Attrs` — and bailing out of the whole fold on
+                    // the `false` left the literal with no properties and no
+                    // index signature at all (excalidraw's
+                    // `{ ...(shouldReuseSelection && prevState.selectedElementIds),
+                    // … }` was `{}`, so every later `ids[el.id] = true` was a
+                    // false TS7053; tsgo types it `{ [x: string]: true }`).
+                    // A primitive spreads the empty object, which is exactly
+                    // what `has_empty` already models for the nullish forms.
+                    //
+                    // `symbol` is deliberately NOT in the set: tsc's list is
+                    // `BooleanLike | NumberLike | BigIntLike | StringLike |
+                    // EnumLike | NonPrimitive | Index`, and an ES symbol is
+                    // none of them (`isValidSpreadType` rejects it outright,
+                    // TS2698). Anything else still leaves the whole spread
+                    // unmodelled rather than guessed at.
+                    .null,
+                    .undefined,
+                    .void,
+                    .never,
+                    .boolean,
+                    .bool_true,
+                    .bool_false,
+                    .string,
+                    .string_literal,
+                    .template_literal_type,
+                    .string_mapping,
+                    .number,
+                    .number_literal,
+                    .number_literal_fresh,
+                    .bigint,
+                    .bigint_literal,
+                    .enum_type,
+                    .object_keyword,
+                    .keyof_op,
+                    => has_empty = true,
                     else => return,
                 }
             }
