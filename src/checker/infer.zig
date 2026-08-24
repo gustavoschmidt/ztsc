@@ -4976,6 +4976,42 @@ pub fn inferReverseMapped(c: *Checker, m: TypeId, arg: TypeId, tp_syms: []const 
     if (s.kind(ra) == .mapped and s.mappedAs(ra) == 0 and s.mappedHomomorphic(ra)) {
         return c.unify(src, s.mappedSource(ra), tp_syms, candidates, depth + 1);
     }
+    // HANDOFF (wave 31 B, built and measured, REVERTED on the app gate). Three
+    // changes turn this into tsc's `inferToMappedType` + `createReverseMappedType`
+    // and are worth +3 exact on the corpus (`reverseMappedTupleContext`,
+    // `objectFromEntries`, `reverseMappedTypeLimitedConstraint`), zero corpus
+    // regressions — but EACH of them, alone or together, moves social-app:
+    //
+    //   1. a COMPOSITE key set. tsc walks a union/intersection constraint
+    //      constituent by constituent (`result ||= inferToMappedType(source,
+    //      target, type)`) and takes the homomorphic path for any `keyof T` it
+    //      finds, so `{ [K in keyof T & keyof CompilerOptions]: … }` infers `T`.
+    //      The walk must descend BOTH connectives to any depth — ztsc's
+    //      intersection normalizer distributes over a union, storing that
+    //      constraint as `("allowUnreachableCode" & keyof T) | …`. Split this
+    //      function so the source is a parameter and call it with the operand.
+    //   2. `substElemAccess` needs a `.mapped` arm (rebuild constraint / value /
+    //      `as` / source), or a mapped type NESTED in the template keeps its
+    //      `S[K]` and the element variable never enters the template at all.
+    //   3. the rebuild must cover ARRAY and TUPLE sources, not just `.object`
+    //      ("for arrays and tuples we infer new arrays and tuples where the
+    //      reverse mapping has been applied to the element type(s)") — which is
+    //      what a nested map resolves to once (2) puts the element variable in
+    //      its source.
+    //
+    // MEASURED on social-app at the committed baseline (87 check errors):
+    //   * 1+2+3 -> 93: six fresh FPs in Composer.tsx (a react-query
+    //     `QueryBehavior<{…}>` vs `QueryBehavior<unknown>` variance failure plus
+    //     five `Property … does not exist on type '{}'`).
+    //   * 1 alone -> 98: eleven fresh FPs in ageAssurance/data.tsx instead.
+    //   * 2+3 without 1 -> 193. (2) is destructive without (3) to complete the
+    //     inversion; they are one change, not two.
+    // So (3) does not merely add — it also MASKS what (1) breaks. tsc's guard
+    // that ztsc does not have is `isPartiallyInferableType` /
+    // `getIndexInfoOfType(source, stringType)` at the head of
+    // `createReverseMappedType`; the next attempt should start there, and
+    // should treat social-app's `useInfiniteQuery` options object as the
+    // witness rather than the corpus.
     if (s.kind(ra) != .object) return;
     const key_param = s.mappedKeyParam(m);
     const key_id = s.mappedParamId(key_param);
