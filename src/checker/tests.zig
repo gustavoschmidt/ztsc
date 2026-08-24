@@ -814,6 +814,36 @@ test "TS2403: two different class/namespace values are not identical" {
     try expectClean("class B {} var b: typeof B; var b = B;");
 }
 
+test "an unannotated GET accessor takes its return type from the paired setter" {
+    // tsc's `getReturnTypeFromAnnotation`: with no annotation of its own, a get
+    // accessor's return type is the SET accessor's annotated parameter — so the
+    // body is CHECKED against it rather than inferred.
+    try expectCodes(
+        "class C { get x() { return 0; } set x(v: string) {} }",
+        &.{2322},
+    );
+    try expectClean("class C { get x() { return \"s\"; } set x(v: string) {} }");
+    // An object literal's accessor shorthand pairs the same way.
+    try expectCodes(
+        "const o = { get x() { return 0; }, set x(v: string) {} };",
+        &.{2322},
+    );
+    // The getter's OWN annotation wins, and an unannotated setter parameter
+    // still takes the getter's return (the other direction).
+    try expectClean("class C { get x(): number { return 0; } set x(v: string) {} }");
+    try expectClean("class C { get x() { return 0; } set x(v) { const n: number = v; } }");
+    // A leading `this` parameter is a receiver annotation, not the value.
+    try expectClean(
+        "interface Foo { n: number } interface Bar { w: string }" ++
+            " const o = { n: 13, get x(this: Foo) { return this.n; }, set x(this: Bar, n) { this.w = \"m\"; } };",
+    );
+    // A same-named member that is not the partner accessor is a duplicate
+    // identifier (TS2300, reported by the binder), and tsc pairs through the
+    // SYMBOL — which the clash splits, so the getter infers its own return and
+    // earns no TS2322 on top.
+    try expectClean("class C { x(v: string) {} get x() { return 0; } set x(v: string) {} }");
+}
+
 test "an assigned function expression takes `this` from the assignment target" {
     // tsc's `getContextualThisParameterType`, last arm: in `obj.m = function
     // () {…}` the contextual `this` is `obj`.
