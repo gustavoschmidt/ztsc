@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-24, post wave 31)
+## Standings (2026-08-24, post wave 32)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7433 / 8631 (86.1%)** |
-| excess keys (false positives) | 3541 | 1526 |
-| missing keys (under-reports) | 8617 | 2907 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7479 / 8633 (86.6%)** |
+| excess keys (false positives) | 3541 | 1488 |
+| missing keys (under-reports) | 8617 | 2865 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Thirty-one waves landed (3–31), every one with ZERO match→non-match regressions in
+Thirty-two waves landed (3–32), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -466,7 +466,80 @@ depth guard and the aliasInstance reorder are neutral (52d40ba -0.1%).
 Default config is FASTER (-1.3%), so not a blocker; optimization lead for
 a future wave: memoize the kept-ref resolution per (sym,args).
 
-## Ranked next queue (wave 32) — distilled from wave-31 agent reports
+Wave 32 (+46 exact → 7479/8633 86.6%; social-app baseline 87→77 check —
+ten more tsgo-proven FPs; conformance 1326/1326; all grids stay
+byte-identical): A landed the pipe round-two ordering (17→10 keys), the
+substituted-contextual second pairing pass, the reverse-mapped
+isPartiallyInferableType guard + composite key set, index-over-intersection
+distribution AS A QUERY (tsc never bakes it into the type), the
+contra-wipe fix (an ANNOTATED param's contra evidence is not "our own
+guess coming home"), and flipped C's never[] recipe (+3; excalidraw's
+false TS7053s were an inference gap the any[] was masking). B landed
+identity signature-bound fixes (incl. a latent borrowed-slice-while-
+interning bug in sigIdenticalAt), TS2559 drain-time rollback, the
+number-index optional-property rule, and object-literal methods as
+elaboration elements; its mapped lower-bound attempt produced the
+construction-vs-query lesson A then landed. C landed union-spread
+primitives, function-type interface bases contributing call signatures
+(social-app −10 excess: express ErrorRequestHandler), construct-signature
+defaults for extends clauses, and the unknown-identity screen relaxation.
+D landed TS1127 junk-token routing (one per token, saved with speculation
+state), the isClassMemberStart gate, constant-condition pruning (with
+tsc's unwritten paren/! exclusion via doWithConditionalBranches),
+TS1359's two diagnostic classes (measured: one suppresses siblings, one
+does not), the discriminant-gate veto fix (declared union keeps
+preference, loses the veto), and TS1138/TS1014/TS1013/bare-catch grammar.
+PERF LESSON (B): reading a fresh type param's bound forces the deferred
+substitution mintFreshTpDeferred avoids — +4–6% on drizzle; keep
+typeParamConstraint behind cheap checks. MEASUREMENT LESSON: perf runs
+while other agents sweep read +8% noise — check `ps aux | grep ts_suite`.
+
+## Ranked next queue (wave 33) — distilled from wave-32 agent reports
+
+1. genericFunctionInference1's last 10 keys, two roots: TS2448 FP on an
+   AMBIENT `declare const` used before declaration (ambient decls have no
+   TDZ; 3 corpus cases; names.zig) and f08's self-echo
+   (`pipe(x => list(x), pipe(x => box(x)))` — the inner call echoes its
+   own B into the outer candidate set).
+2. social-app excess, 56 keys by family: TS2353 ×34 (ageAssurance —
+   assign_report's union-target excess check must collect known props from
+   ALL constituents, not one); TS2305 ×9 (expo-image-manipulator re-export
+   chain, src/link); TS2339 ×4 (node:cluster `export { default as default
+   }`, src/link); TS2345 ×4 (variadic tuple with infer, tuple_relate/
+   conditions); TS7053 ×1 (jest it.each tuple inference).
+3. Pick-pattern member materialization when the key set is concrete
+   (inferMappedKeySet returns early on a non-type-param constraint, so
+   A's distribution query never fires; complicatedIndexes… witness).
+4. subtypeReductionUnionConstraints: assumeFalse must compute the
+   true-branch type and SUBTRACT it (tsc: filterType(t =>
+   !isTypeSubsetOf(t, trueType))) — per-constituent false-branching
+   misses a bare type-param constituent; narrow.zig.
+5. `this` inside a function expression assigned to an expando property
+   has NO type at all (blocks jsxComponentTypeErrors' TS2786; a `const
+   probe: string = this` there is silent where tsgo reports TS2322
+   naming typeof FunctionComponent; expr/classes feature).
+6. Scanner ID_Start/ID_Continue tables (5 TS1127-family cases: astral
+   pairs, `¬`, `\u0031` leading).
+7. Per-frame weak rule (weakType.ts:63): rel_intersection_target is
+   checker-global where tsc's IntersectionState resets per property
+   relation; save/zero/restore around structuralAssignable's
+   isAssignable — but the relation memo key must carry the flag.
+8. Alias variance: getAliasVariances + the aliasSymbol shortcut for
+   alias INSTANTIATIONS (variance.zig only fires for .ref pairs;
+   genericIndexedAccessVarianceComparisonResultCorrect).
+9. Reverse-mapped array/tuple rebuild — BLOCKED: worth 2 corpus cases but
+   takes social-app 87→93 (Composer.tsx useInfiniteQuery); the guard does
+   not rescue it; handoff note at the switch in infer.zig.
+10. c1 keying perf lead: memoize the kept-ref resolution per (sym,args)
+    (the +3.2% c1 cost of 25d876f).
+11. Small: reverseMappedPartiallyInferableTypes needs an `unknown`
+    fallback for a refused param (TS18046 vs TS7006);
+    invalidMultipleVariableDeclarations:54 is a class_value screen;
+    narrowingUnionToUnion landed but re-check its family.
+12. Census: TS2322 ~60 one-keys; TS1005/TS1109 residue; substitution
+    types; resolution-mode attributes.
+
+## Superseded queue (wave 32, kept for context)
 
 1. Pipe, the arrow half: contextual type for a context-sensitive arrow
    under a still-free rest tuple (`pipe(x => list(x), box)`), 17 keys in
