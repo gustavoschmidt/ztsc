@@ -3175,10 +3175,11 @@ const Linker = struct {
             }
         }
 
-        try l.starMergeAmbient();
+        try l.mergeAmbientReexports();
     }
 
-    /// `export * from "other"` inside a `declare module "spec" { … }` block.
+    /// The `… from "other"` export forms inside a `declare module "spec" { … }`
+    /// block: `export * from`, `export { a, b } from`, `export * as ns from`.
     ///
     /// The star's source is usually ANOTHER ambient module declared in the same
     /// `.d.ts`: `transformation-matrix`'s typings are one script holding a
@@ -3188,14 +3189,25 @@ const Linker = struct {
     /// reaches names no block of that specifier declares itself. Without this
     /// every such name was TS2305.
     ///
+    /// The NAMED form matters just as much and used to be dropped whole (the
+    /// record kind fell off the end of `buildAmbient`'s switch). social-app's
+    /// `declare module 'expo-image-manipulator' { export { manipulateAsync } from
+    /// 'expo-image-manipulator/build/ImageManipulator'; … }` — an ambient block
+    /// that restates a package's surface — exported only its one directly
+    /// declared `const`, so every other name it names was TS2305 at each import.
+    ///
     /// Runs after `buildAmbient` has placed every block's own members, so a
-    /// star never races the block it names, and iterates so a chain of stars
-    /// settles. Same rules as the file-level star merge: `default` and the
-    /// reserved `export=` key are not re-exported, and the first contributor of
-    /// a name wins (which keeps a block's own declaration ahead of a star's).
-    /// Order-invariant: the fixed point does not depend on visit order, since
-    /// every round only *adds* names no round could have taken differently.
-    fn starMergeAmbient(l: *Linker) Error!void {
+    /// re-export never races the block it names, and iterates so a chain of them
+    /// settles. Same rules as the file-level merges: a star carries neither
+    /// `default` nor the reserved `export=` key, and the first contributor of a
+    /// name wins — which keeps a block's own declaration ahead of any re-export,
+    /// and orders the re-exports among themselves by record (source) order.
+    /// Order-invariant: the fixed point does not depend on file visit order,
+    /// since every round only *adds* names no round could have taken
+    /// differently. A name the source does not (yet) have is simply not put, so
+    /// a later round can still find it and today's TS2305-at-the-import stands
+    /// for a name no round ever resolves.
+    fn mergeAmbientReexports(l: *Linker) Error!void {
         // A specifier whose blocks declare NOTHING of their own — `declare
         // module "node:fs" { export * from "fs"; }`, which is how every
         // `node:` alias in `@types/node` that is not an `import … = require`
@@ -3216,31 +3228,97 @@ const Linker = struct {
                 for (f.bind.ambient_modules) |am| {
                     const dst_idx = l.ambient.getIndex(am.spec) orelse continue;
                     for (f.bind.exports[am.export_start..am.export_end]) |rec| {
-                        if (rec.kind != .reexport_all) continue;
-                        // tsc's precedence: for a non-relative specifier an
-                        // exactly-named ambient module outranks the resolved
-                        // file, which `effectiveModuleFile` already encodes.
-                        if (try l.effectiveModuleFile(f, rec.module)) |mfile| {
-                            const mt = try l.table(mfile);
-                            for (mt.keys(), mt.values()) |name, tgt| {
-                                if (try l.starPut(dst_idx, name, tgt, rec.type_only)) changed = true;
-                            }
-                            continue;
-                        }
-                        const src_key = l.ambientKey(rec.module) orelse continue;
-                        const src_idx = l.ambient.getIndex(src_key).?;
-                        if (src_idx == dst_idx) continue; // self-star
-                        // Snapshot: the put below may grow the destination
-                        // table, and only the source's entries are read.
-                        const src = l.ambient.values()[src_idx];
-                        for (src.keys(), src.values()) |name, tgt| {
-                            if (try l.starPut(dst_idx, name, tgt, rec.type_only)) changed = true;
+                        switch (rec.kind) {
+                            .reexport_all => {
+                                // tsc's precedence: for a non-relative specifier
+                                // an exactly-named ambient module outranks the
+                                // resolved file, which `effectiveModuleFile`
+                                // already encodes.
+                                if (try l.effectiveModuleFile(f, rec.module)) |mfile| {
+                                    const mt = try l.table(mfile);
+                                    for (mt.keys(), mt.values()) |name, tgt| {
+                                        if (try l.starPut(dst_idx, name, tgt, rec.type_only)) changed = true;
+                                    }
+                                    continue;
+                                }
+                                const src_key = l.ambientKey(rec.module) orelse continue;
+                                const src_idx = l.ambient.getIndex(src_key).?;
+                                if (src_idx == dst_idx) continue; // self-star
+                                // Snapshot: the put below may grow the
+                                // destination table, and only the source's
+                                // entries are read.
+                                const src = l.ambient.values()[src_idx];
+                                for (src.keys(), src.values()) |name, tgt| {
+                                    if (try l.starPut(dst_idx, name, tgt, rec.type_only)) changed = true;
+                                }
+                            },
+                            .reexport_named => {
+                                if (l.ambient.values()[dst_idx].contains(rec.exported)) continue;
+                                if (try l.ambientReexportTarget(f, rec, dst_idx)) |tgt| {
+                                    var final = tgt;
+                                    final.type_only = final.type_only or rec.type_only;
+                                    try l.ambient.values()[dst_idx].put(l.scratch, rec.exported, final);
+                                    changed = true;
+                                }
+                            },
+                            .reexport_ns => {
+                                if (l.ambient.values()[dst_idx].contains(rec.exported)) continue;
+                                const tgt = try l.ambientNamespaceTarget(f, rec);
+                                try l.ambient.values()[dst_idx].put(l.scratch, rec.exported, tgt);
+                                changed = true;
+                            },
+                            else => {}, // placed by `buildAmbient`'s first pass
                         }
                     }
                 }
             }
             if (!changed) break;
         }
+    }
+
+    /// One `export { local as exported } from "module"` inside an ambient block:
+    /// the target `exported` should name, or null when the source cannot answer
+    /// it *yet* (a later round may, and a name no round resolves stays absent so
+    /// the import's own TS2305 still lands).
+    ///
+    /// The source arms mirror `table`'s `.reexport_named`: a resolved file is
+    /// read through its export table, with the `export =` namespace-member
+    /// fallback that keeps a CommonJS-shaped or synthetic-`any` module from
+    /// being accused of a missing member; an ambient source is read out of the
+    /// registry, and an ambient source with no ES-style exports at all is
+    /// opaque, so every name off it degrades to `any` exactly as an import of it
+    /// would (`ambientOpaque`). A specifier nothing answers is `any` too — its
+    /// TS2307 is reported at the statement.
+    fn ambientReexportTarget(l: *Linker, f: *const ProgFile, rec: binder.ExportRec, dst_idx: usize) Error!?Target {
+        if (try l.effectiveModuleFile(f, rec.module)) |mfile| {
+            if (try l.lookupExport(mfile, rec.local, 0)) |t| return t;
+            if (try l.lookupExport(mfile, l.atom_export_equals, 0)) |exeq| {
+                return (try l.exportEqualsMeanings(exeq, rec.local)) orelse .{ .kind = .any };
+            }
+            return null;
+        }
+        const src_key = l.ambientKey(rec.module) orelse return .{ .kind = .any };
+        const src_idx = l.ambient.getIndex(src_key).?;
+        if (src_idx == dst_idx) return null; // self-reference
+        const src = l.ambient.values()[src_idx];
+        if (src.get(rec.local)) |t| return t;
+        return if (src.count() == 0) .{ .kind = .any } else null;
+    }
+
+    /// One `export * as ns from "module"` inside an ambient block: the namespace
+    /// object of the module the specifier names, whichever half answers it.
+    fn ambientNamespaceTarget(l: *Linker, f: *const ProgFile, rec: binder.ExportRec) Error!Target {
+        if (try l.effectiveModuleFile(f, rec.module)) |mfile| {
+            return .{ .kind = .namespace, .file = mfile, .type_only = rec.type_only };
+        }
+        if (l.ambientKey(rec.module)) |key| {
+            return .{
+                .kind = .ambient_ns,
+                .payload = @intCast(l.ambient.getIndex(key).?),
+                .type_only = rec.type_only,
+            };
+        }
+        return .{ .kind = .any };
     }
 
     /// Deferred second half of `table`'s pass 2: a FILE's `export * from "spec"`
@@ -3312,7 +3390,7 @@ const Linker = struct {
                 }
             }
             if (!changed) break;
-            try l.starMergeAmbient();
+            try l.mergeAmbientReexports();
         }
     }
 
