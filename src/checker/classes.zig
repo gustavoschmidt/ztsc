@@ -1321,6 +1321,29 @@ pub fn inProgressMemberAbsent(c: *Checker, recv: TypeId, name: Atom) Error!bool 
     return !w.index.contains(name);
 }
 
+/// `inProgressMemberAbsent`'s companion: the names that walk found, for the
+/// SUGGESTION the report it enables wants to make. tsc reaches both from one
+/// `getPropertiesOfType(getApparentType(…))`, so the same window that lets
+/// ztsc say "no such member" has to be able to say "did you mean this one" —
+/// `class Foo { _store = …; bar() { return this.store; } }` is TS2551 in tsc
+/// and was a bare TS2339 here (`propertyOrdering`).
+///
+/// Appends nothing whenever the walk declines, which is the caller's
+/// "suggest nothing" answer.
+pub fn inProgressMemberNames(c: *Checker, recv: TypeId, out: *std.ArrayList(Atom)) Error!void {
+    const t = if (c.ts.kind(recv) == .this_type) c.ts.thisTypeInstance(recv) else recv;
+    if (c.ts.kind(t) != .ref or !refExpansionActive(c, t)) return;
+    const sym = c.ts.refSymbol(t);
+    if (!c.symFlags(sym).class) return;
+    if (c.declared_keys_active) return; // see `Checker.declared_keys_active`
+    c.declared_keys_active = true;
+    defer c.declared_keys_active = false;
+    var w = DeclKeyWalk{};
+    defer w.deinit(c.scratch());
+    if (!try walkDeclaredKeys(c, sym, &w, 0)) return;
+    for (w.keys.items) |k| try out.append(c.scratch(), k.name);
+}
+
 /// The key union of a class or interface symbol, derived from its
 /// declarations. Null when some part of the shape is not derivable.
 pub fn declaredKeyUnion(c: *Checker, sym: SymbolId) Error!?TypeId {
