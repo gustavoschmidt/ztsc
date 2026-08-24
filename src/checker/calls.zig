@@ -443,6 +443,43 @@ fn symWritesTypeAnnotation(c: *Checker, sym: SymbolId) bool {
     return false;
 }
 
+/// tsc's `resolveCallExpression` when the callee carries no CALL signatures:
+///
+///     if (!callSignatures.length) {
+///         if (numConstructSignatures) {
+///             error(node, Diagnostics.Value_of_type_0_is_not_callable_Did_you_mean_to_include_new,
+///                   typeToString(funcType));
+///         }
+///         else { error(node, Diagnostics.This_expression_is_not_callable); }
+///     }
+///
+/// A value that CONSTRUCTS and does not call is a forgotten `new`, and tsc
+/// says so: `C()` on a class, `Tools.NullLogger()` (`forgottenNew`), and
+/// `v2(args)` on a `new (arg: T) => Date` read out of an index signature
+/// (`genericConstructorFunction1`) are all TS2348 where ztsc had the generic
+/// TS2349. The message names the callee's OWN type — tsc prints `funcType`,
+/// not its resolved structure, so `typeof C` and `I1<T>` rather than the
+/// member tables they expand to.
+fn reportNotCallable(c: *Checker, shape: CallShape, callee_t: TypeId, r: TypeId) Error!void {
+    const constructs = switch (c.ts.kind(r)) {
+        .object => c.ts.objectConstructSigCount(r) != 0,
+        // A CLASS value is `numConstructSignatures > 0` by construction — the
+        // declared constructor, or the implicit one every class has. A
+        // NAMESPACE object is a `.class_value` here too (that is how ztsc
+        // models `typeof N`), and it constructs nothing: calling one is the
+        // plain TS2349 (`typeOnlyMerge3`, `valuesMergingAcrossModules`).
+        .class_value => c.symFlags(c.ts.classSymbol(r)).class,
+        else => false,
+    };
+    if (constructs) {
+        try c.diagFmt(2348, c.nodeSpan(shape.callee), "Value of type '{s}' is not callable. Did you mean to include 'new'?", .{
+            try c.typeToString(callee_t),
+        });
+        return;
+    }
+    try c.diagFmt(2349, c.nodeSpan(shape.callee), "This expression is not callable.", .{});
+}
+
 /// tsc's `isUntypedFunctionCall`, minus its two `any` disjuncts:
 ///
 ///     !numCallSignatures && !numConstructSignatures &&
@@ -1023,7 +1060,7 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
                         }
                         return .{ .ty = types.any_type, .chained = chained };
                     }
-                    try c.diagFmt(2349, c.nodeSpan(shape.callee), "This expression is not callable.", .{});
+                    try reportNotCallable(c, shape, callee_t, r);
                     for (shape.arg_nodes) |an| {
                         if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
                     }
@@ -1149,7 +1186,7 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
                     }
                     return .{ .ty = types.any_type, .chained = chained };
                 }
-                try c.diagFmt(2349, c.nodeSpan(shape.callee), "This expression is not callable.", .{});
+                try reportNotCallable(c, shape, callee_t, r);
                 for (shape.arg_nodes) |an| {
                     if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
                 }
