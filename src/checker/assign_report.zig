@@ -386,8 +386,19 @@ pub fn elaborateLiteralError(c: *Checker, expr_node0: Node, src_t: TypeId, targe
                 if (prop == null_node) continue;
                 const pd = c.tree.nodeData(prop);
                 const tag = c.nodeTag(prop);
-                if (tag != .object_property and tag != .object_shorthand) continue;
-                if (tag == .object_property and pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) continue;
+                // A METHOD (and the accessor forms, which share the tag) is one
+                // of tsc's elaboration elements too — `generateObjectLiteral
+                // Elements` yields `MethodDeclaration` / `GetAccessor` /
+                // `SetAccessor` beside `PropertyAssignment` and
+                // `ShorthandPropertyAssignment`, with the property NAME as the
+                // error node. Skipping it lost the one element of
+                // `errorOnUnionVsObjectShouldDeeplyDisambiguate` that is written
+                // as a method — `a() { return [123] }` against
+                // `a?: () => Promise<number[]>` — while every sibling written
+                // `b: () => "hello"` elaborated.
+                if (tag != .object_property and tag != .object_shorthand and tag != .object_method) continue;
+                if ((tag == .object_property or tag == .object_method) and
+                    pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) continue;
                 // A re-check of this same literal must still answer
                 // "elaborated" (see `diagAlreadyFiled`). The anchor is the
                 // property NAME, which is where this arm reports.
@@ -417,8 +428,17 @@ pub fn elaborateLiteralError(c: *Checker, expr_node0: Node, src_t: TypeId, targe
                     try c.makeUnion2(tp.ty, types.undefined_type)
                 else
                     tp.ty;
-                const value_node = if (tag == .object_property) pd.rhs else pd.lhs;
-                const vt = c.nodeType(value_node) orelse continue;
+                const value_node = if (tag == .object_shorthand) pd.lhs else pd.rhs;
+                // A method's value node is its `function_expr`, whose type is
+                // the method's own — but for an ACCESSOR (same tag) that is the
+                // accessor function, where the member's type is what it gets or
+                // sets. tsc reads the source side off the source TYPE for every
+                // element (`getIndexedAccessTypeOrUndefined(source, nameType)`),
+                // so do the same here and keep the node type as the fallback.
+                const vt = if (tag == .object_method)
+                    (if (try c.propOfType(src_t, key)) |sp| sp.ty else c.nodeType(value_node) orelse continue)
+                else
+                    c.nodeType(value_node) orelse continue;
                 if (try c.isAssignable(vt, tp_ty)) continue;
                 if (!try c.elaborateLiteralError(value_node, vt, tp_ty)) {
                     // tsc anchors an object-literal member mismatch at the
