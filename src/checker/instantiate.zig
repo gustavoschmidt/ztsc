@@ -56,8 +56,16 @@ pub fn aliasInstance(c: *Checker, sym: SymbolId, args: []const TypeId, tok: Toke
         const fixed = try c.fixTypeArgs(sym, args, tok) orelse return types.error_type;
         return c.ts.makeRef(sym, fixed);
     }
-    const fixed = try c.fixTypeArgs(sym, args, tok) orelse return types.error_type;
+    // BODY FIRST, THEN THE DEFAULTS. `fixTypeArgs` reads whether `sym` is on a
+    // cycle (`alias_recursive`, below) to decide how far it may thread a
+    // supplied argument into a type parameter's DEFAULT. Reading that from
+    // inside `fixTypeArgs` used to mean forcing `aliasGeneric` from there,
+    // which re-enters `fixTypeArgs` through the body's own references and
+    // overflows the stack on react-navigation. Materializing the body here
+    // instead answers the question before the defaults are filled, off the
+    // recursive path. Measured neutral on excalidraw and social-app.
     const generic = try c.aliasGeneric(sym);
+    const fixed = try c.fixTypeArgs(sym, args, tok) orelse return types.error_type;
     // ONE spelling for a recursive alias whose body is an INTERSECTION.
     //
     // The cycle-cut arm above leaves a lazy `.ref` for every reference taken
