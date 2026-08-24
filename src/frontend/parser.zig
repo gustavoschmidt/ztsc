@@ -1995,7 +1995,14 @@ const Parser = struct {
             .keyword_do => return p.parseDoStatement(),
             .keyword_for => return p.parseForStatement(),
             .keyword_switch => return p.parseSwitchStatement(),
-            .keyword_try => return p.parseTryStatement(),
+            // tsc's `parseStatement` sends a bare `catch` or `finally` to
+            // `parseTryStatement` as well: neither starts a statement, but that
+            // is where the grammar can SAY so and still read the clause the
+            // word opens. `a / finally` is the shape — TS1109 on the `finally`
+            // as a missing operand, then "'{' expected" at end of file for the
+            // finally BLOCK — where leaving the word to the expression-statement
+            // recovery answered the TS1109 alone.
+            .keyword_try, .keyword_catch, .keyword_finally => return p.parseTryStatement(),
             .keyword_throw => return p.parseThrowStatement(),
             .keyword_return => return p.parseReturnStatement(),
             .keyword_break, .keyword_continue => return p.parseBreakContinue(),
@@ -2328,6 +2335,21 @@ const Parser = struct {
     fn parseBlockAs(p: *Parser, role: BlockRole) PE!Node {
         const at_brace = p.curTag() == .l_brace;
         const l_brace = try p.expect(.l_brace, .expected_l_brace);
+        // tsc's `parseBlock` reads the statement list ONLY when the `{` was
+        // really there:
+        //
+        //     if (openBraceParsed || ignoreMissingOpenBrace) { … parseList …; parseExpected(CloseBrace) }
+        //     else { return createBlock(createMissingList()) }
+        //
+        // (`ignoreMissingOpenBrace` is set for a FUNCTION body reached through
+        // `SignatureFlags`, never for a plain block.) Reading a list anyway
+        // makes a brace-less block swallow whatever follows as its own
+        // statements — and for the try-statement arm, which is reached with the
+        // very token that sent it there (a bare `finally` at statement level),
+        // it recursed until the stack ran out.
+        if (!at_brace) {
+            return p.addNode(.{ .tag = .block, .main_token = l_brace, .data = .{ .lhs = 0, .rhs = 0 } });
+        }
         // An ambient body reports once, on the `{`, and suppresses the TS1036
         // its own statements would otherwise each be a candidate for — tsc sets
         // the "already reported" bit on the block, which is the very object the
@@ -3017,7 +3039,12 @@ const Parser = struct {
     }
 
     fn parseTryStatement(p: *Parser) PE!Node {
-        const kw = try p.bump();
+        // `parseExpected(TryKeyword)`, not a `bump`: the statement arm also
+        // sends a bare `catch`/`finally` here, and then the `try` is missing.
+        // On failure nothing is consumed and the `{` the block goes on to
+        // expect lands on the very same token, where the one-per-position rule
+        // drops it — so the shape answers ONE "'try' expected".
+        const kw = try p.expect(.keyword_try, .expected_try);
         const block = try p.parseBlock();
         var catch_clause: Node = null_node;
         var finally_block: Node = null_node;
@@ -3409,6 +3436,14 @@ const Parser = struct {
         _ = try p.bump();
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
+        // TS1014, tsc's `checkGrammarParameterList`: a rest parameter must be
+        // LAST. Blamed on the `...` (`grammarErrorOnNode(parameter.
+        // dotDotDotToken, …)`), and the walk RETURNS at its first hit, so only
+        // the FIRST offending parameter speaks. Judged here rather than in
+        // `parseParam` because "last" is a fact about the whole list.
+        var rest: ?struct { tok: u32, index: usize } = null;
+        var n_params: usize = 0;
+        var trailing_comma: ?u32 = null;
         while (p.curTag() != .r_paren and p.curTag() != .eof) {
             const before = p.curIdx();
             const diags_before = p.diags.items.len;
@@ -3447,12 +3482,49 @@ const Parser = struct {
                 continue;
             }
             try p.pushScratch(param);
-            if (try p.eat(.comma) == null and p.curTag() != .r_paren) {
+            if (rest == null) {
+                if (p.restDotsToken(param)) |d| rest = .{ .tok = d, .index = n_params };
+            }
+            n_params += 1;
+            // Overwritten every iteration, so at loop exit it is non-null
+            // exactly when the last thing consumed was a comma — i.e. when the
+            // list has a TRAILING one (tsc's `NodeArray.hasTrailingComma`).
+            trailing_comma = try p.eat(.comma);
+            if (trailing_comma == null and p.curTag() != .r_paren) {
                 try p.fail(.expected_comma);
+            }
+        }
+        if (rest) |r| {
+            // Reported even while SPECULATING, unlike the modifier walk above:
+            // an arrow function and a function TYPE both read their parameter
+            // list inside a speculative parse that is then COMMITTED, so a
+            // `spec == 0` guard loses `(...x, y) => 0` and `type T = (...x, y)
+            // => void` outright. `restore` truncates `diags`, so a speculation
+            // that backtracks un-reports this exactly as it un-reports the
+            // literal-grammar diagnostics `checkLiteral` files.
+            if (r.index + 1 != n_params) {
+                try p.errAtToken(.rest_param_not_last, r.tok);
+            } else if (trailing_comma) |ct| {
+                // The walk RETURNS on TS1014, so the two never coexist; and it
+                // skips this one in an ambient context
+                // (`!(parameter.flags & NodeFlags.Ambient)`).
+                if (!p.ambient) try p.errAtToken(.rest_param_trailing_comma, ct);
             }
         }
         _ = try p.expect(.r_paren, .expected_r_paren);
         return p.scratchToSpan(top);
+    }
+
+    /// The `...` token of a REST parameter, or null when `param` is not one.
+    /// A parameter's `main_token` is where it started, which for `...x` is the
+    /// `...` itself. (A rest parameter behind a MODIFIER — `constructor(public
+    /// ...x)` — reports on the modifier instead; the shape is already a
+    /// TS1090, so the column is not worth a second token walk.)
+    fn restDotsToken(p: *const Parser, param: Node) ?u32 {
+        if (p.nodeTagAt(param) != .param_full) return null;
+        const flags = p.extraFieldAt(ast.ParamFull, "flags", p.nodeDataAt(param).rhs);
+        if (flags & ast.Flags.rest == 0) return null;
+        return p.nodeMainTokenAt(param);
     }
 
     fn parseParam(p: *Parser) PE!Node {

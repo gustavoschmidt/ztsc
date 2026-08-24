@@ -132,6 +132,11 @@ pub const Code = enum(u16) {
     expected_import_clause,
     expected_export_clause,
     expected_while,
+    /// TS1005 `'try' expected`: tsc's `parseStatement` routes a bare `catch`
+    /// or `finally` to `parseTryStatement`, whose `parseExpected(TryKeyword)`
+    /// answers this and consumes nothing — the clause the word really opens
+    /// then parses as usual.
+    expected_try,
     expected_case_or_default,
     expected_catch_or_finally,
     expected_declaration,
@@ -175,6 +180,16 @@ pub const Code = enum(u16) {
     /// bound NAME, not the `...` (measured against tsgo 7.0.2). Grammar-class,
     /// so the rest of the file is still checked.
     rest_must_be_last,
+    /// TS1014: the PARAMETER-list counterpart of the rule above —
+    /// `checkGrammarParameterList`'s first clause, blamed on the `...` token.
+    /// A grammar diagnostic like its sibling: `function f(...x, y) {}` answers
+    /// it AND the TS7019/TS7006 the same parameters earn (measured).
+    rest_param_not_last,
+    /// TS1013: the same walk's SECOND clause —
+    /// `checkGrammarForDisallowedTrailingComma(parameters, …)`, reached only
+    /// when the last parameter IS a rest one, reported on the trailing comma
+    /// itself, and skipped in an ambient context.
+    rest_param_trailing_comma,
     /// Line break not allowed here (e.g. after `throw`).
     line_break_not_allowed,
     /// Trailing comma or elision where the grammar forbids it.
@@ -1094,6 +1109,8 @@ pub const Code = enum(u16) {
             .multiple_default_clauses,
             .line_break_not_allowed,
             .rest_must_be_last,
+            .rest_param_not_last,
+            .rest_param_trailing_comma,
             .expected_string_literal,
             .statement_not_allowed_in_ambient,
             .implementation_not_allowed_in_ambient,
@@ -1330,6 +1347,7 @@ pub const Code = enum(u16) {
             .expected_import_clause => "expected an import clause",
             .expected_export_clause => "expected an export clause",
             .expected_while => "'while' expected.",
+            .expected_try => "'try' expected.",
             .expected_case_or_default => "'case' or 'default' expected.",
             .expected_catch_or_finally => "'catch' or 'finally' expected.",
             .expected_declaration => "Declaration expected.",
@@ -1346,6 +1364,8 @@ pub const Code = enum(u16) {
             .newline_before_arrow => "Line terminator not permitted before arrow.",
             .multiple_default_clauses => "A 'default' clause cannot appear more than once in a 'switch' statement.",
             .rest_must_be_last => "A rest element must be last in a destructuring pattern.",
+            .rest_param_not_last => "A rest parameter must be last in a parameter list.",
+            .rest_param_trailing_comma => "A rest parameter or binding pattern may not have a trailing comma.",
             .line_break_not_allowed => "Line break not permitted here.",
             .argument_expected => "Argument expression expected.",
             .statement_not_allowed_in_ambient => "Statements are not allowed in ambient contexts.",
@@ -1626,6 +1646,7 @@ pub const Code = enum(u16) {
             .expected_from,
             .expected_as,
             .expected_while,
+            .expected_try,
             .expected_eq,
             .expected_export,
             .regex_expected_r_brace,
@@ -1857,6 +1878,8 @@ pub const Code = enum(u16) {
             .continue_label_not_iteration => 1115,
             .element_access_needs_argument => 1011,
             .rest_must_be_last => 2462,
+            .rest_param_not_last => 1014,
+            .rest_param_trailing_comma => 1013,
             .module_name_needs_quoted_string => 1443,
             .jsx_comma_operator => 18007,
             .rest_element_property_name => 2566,
