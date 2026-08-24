@@ -835,7 +835,7 @@ fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_implicit
         // anything after it — so the `lastOrUndefined` half needs no test.
         if (flags & types.param_flag_rest != 0) {
             ctx_ty = try c.restTupleAtPosition(ctx_sig, index);
-        } else if (try c.paramTypeAt(ctx_sig, index)) |ct| {
+        } else if (try c.paramContextualTypeAt(ctx_sig, index)) |ct| {
             ctx_ty = ct;
         }
     }

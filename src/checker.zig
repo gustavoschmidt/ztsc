@@ -4051,6 +4051,7 @@ pub const Checker = struct {
     pub const eraseParamsOf = assign_zig.eraseParamsOf;
     pub const paramTypeAt = assign_zig.paramTypeAt;
     pub const paramTypeAtInferred = assign_zig.paramTypeAtInferred;
+    pub const paramContextualTypeAt = assign_zig.paramContextualTypeAt;
     pub const paramTotal = assign_zig.paramTotal;
     pub const effParamCount = assign_zig.effParamCount;
     pub const requiredParams = assign_zig.requiredParams;

@@ -6271,7 +6271,9 @@ pub fn paramTypeAt(c: *Checker, sig: TypeId, i: u32) Error!?TypeId {
         // position `?`, or that is too short to reach it, means a call may
         // omit the argument, so the position admits `undefined`
         // (`restUnionOptionalAt`). The element type itself stays the rest's
-        // whole element type — see that helper for what tsc computes.
+        // whole element type — see that helper for what tsc computes, and
+        // `restUnionContextualAt` for the one caller that reads the positions
+        // apart.
         if (i + 1 >= count) {
             if (try c.sigRestUnion(sig)) |u| {
                 const t = try c.elemOfArrayish(u);
@@ -6291,6 +6293,54 @@ pub fn paramTypeAt(c: *Checker, sig: TypeId, i: u32) Error!?TypeId {
         if (last.rest()) return try c.elemOfArrayish(last.ty);
     }
     return null;
+}
+
+/// tsc's `tryGetTypeAtPosition`, whose rest-parameter tail is
+/// `getIndexedAccessType(restType, pos)` — an indexed access, so it
+/// DISTRIBUTES over a rest typed by a UNION of tuples:
+/// `([A, B, "a"] | [A, B, "b"])[2]` is `"a" | "b"`, not the rest's whole
+/// element type. A callback written for such a parameter list gets its
+/// parameters typed from here, and the whole-element answer flattened every
+/// one of them to the join of every arm's every position — social-app's
+/// `handles.test.ts`, whose `e` came out `string` where tsc has `"a" | "b"`,
+/// and whose `IsValidHandle[e]` was a false TS7053 for it.
+///
+/// Kept OUT of `paramTypeAt`, which is also what the argument RELATION reads.
+/// A call with a SPREAD argument is checked position by position rather than
+/// against a whole arm (`checkArgs` drops `sigNonArrayRest` when a spread is
+/// present), and a spread whose own type is a union of tuples contributes that
+/// union's whole element type at EVERY position — so narrowing the parameter
+/// side alone invents rejections there. `navigation.navigate(...args)` is
+/// exactly that shape (social-app's `useNavigationDeduped.ts`): position 0
+/// would go from "anything any arm holds" to "a screen name", which the
+/// spread's whole-element `options` object then fails. Contextual typing has
+/// no such other side, which is why this is the CONTEXTUAL entry point.
+///
+/// An arm too SHORT to reach the position contributes nothing; the `undefined`
+/// such an arm admits is `restUnionOptionalAt`'s answer, which `paramTypeAt`
+/// already folded in.
+pub fn paramContextualTypeAt(c: *Checker, sig: TypeId, i: u32) Error!?TypeId {
+    const plain = (try paramTypeAt(c, sig, i)) orelse return null;
+    const count = c.ts.fnParamCount(sig);
+    if (count == 0 or i + 1 < count) return plain;
+    const u = (try c.sigRestUnion(sig)) orelse return plain;
+    const index = i - (count - 1);
+    // `memberList` hands out a borrowed slice and `tupleElemTypeAt` can
+    // re-enter the checker, which can invalidate it.
+    const ms = try c.scratch().dupe(TypeId, try c.memberList(u));
+    defer c.scratch().free(ms);
+    var parts: std.ArrayList(TypeId) = .empty;
+    defer parts.deinit(c.scratch());
+    for (ms) |m| {
+        const arm = try c.resolveStructural(m);
+        if (c.ts.kind(arm) != .tuple) return plain;
+        const t = (try c.tupleElemTypeAt(arm, index)) orelse continue;
+        try parts.append(c.scratch(), t);
+    }
+    if (parts.items.len == 0) return plain;
+    const t = try c.ts.makeUnion(c.scratch(), parts.items);
+    if (try c.restUnionOptionalAt(u, index)) return try c.makeUnion2(t, types.undefined_type);
+    return t;
 }
 
 /// `paramTypeAt`, retried through what the call has already inferred when
