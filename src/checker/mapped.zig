@@ -382,7 +382,21 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
                     // `O = AudioStreamInfo | null` (immich's
                     // `withAudioStream`, whose `$castTo` nullable row every
                     // `jsonObjectFrom` produces) came back `{} | null`.
+                    // An ARRAY or TUPLE constituent has its own homomorphic
+                    // arm right above (`Mutable<readonly A[]>` is `A[]`), so
+                    // distributing over it is exactly tsc's `mapType` and the
+                    // recursion below already answers correctly. Without it a
+                    // single array constituent sank the whole map to `{}`:
+                    // excalidraw's `Mutable<NonNullable<readonly BoundElement[]
+                    // | readonly { id; type }[] | null>>` — the two spellings a
+                    // recursive alias leaves behind, one lazy `.ref` and one
+                    // materialization — came back `{}`, so `.push` did not
+                    // exist on it and the result was not assignable back to the
+                    // union it was mapped from (restore.ts:404/417,
+                    // newElement.ts:749/756).
                     const ok = s.kind(rm) == .intersection or
+                        s.kind(rm) == .array or
+                        s.kind(rm) == .tuple or
                         isPrimitiveForHomomorphicMap(s.kind(rm)) or
                         (s.kind(rm) == .object and
                             s.objectPropCount(rm) > 0 and
