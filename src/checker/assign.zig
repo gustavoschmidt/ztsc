@@ -460,10 +460,22 @@ pub fn stringEnumCastOverlap(c: *Checker, a: TypeId, b: TypeId) Error!bool {
     return false;
 }
 
-/// The shapes a still-generic mapped type may overlap in the cast test: an
-/// object type is the only thing a mapped type can ever instantiate to.
+/// The shapes a still-generic mapped type may overlap in the cast test: the
+/// object-ish types are the only things a mapped type can ever instantiate to.
+///
+/// An ARRAY or TUPLE counterpart is one of them. A HOMOMORPHIC mapped type
+/// distributes over an array or tuple modifiers type — `{ [P in keyof T]: … }`
+/// with `T extends [number] | [string]` instantiates to a TUPLE, never to a
+/// plain object — so a mapped type and an array-like are exactly as able to
+/// overlap as a mapped type and an object literal, and just as undecidable
+/// here while the key constraint is still generic. Without the two kinds,
+/// `[] as HomomorphicMappedType<T>` was four false TS2352s
+/// (`mappedTypeUnionConstrainTupleTreatedAsArrayLike`), which tsgo accepts —
+/// it reports only the TS2322 on the `readonly`-constrained assignment below
+/// the cast, i.e. the CAST is fine and the assignment is what fails.
 pub fn mappedCastPeer(k: types.Kind) bool {
-    return k == .object or k == .intersection or k == .mapped;
+    return k == .object or k == .intersection or k == .mapped or
+        k == .array or k == .tuple;
 }
 
 /// The kinds `castComparableRec` concedes outright rather than decide on
@@ -4432,7 +4444,24 @@ pub fn structuralAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
                     for (0..c.ts.objectPropCount(s)) |i| {
                         const sp = c.ts.objectProp(s, @intCast(i));
                         if (!isNumericPropName(c.atomText(sp.name))) continue;
-                        if (!try c.isAssignable(sp.ty, nidx)) return false;
+                        // An OPTIONAL property keeps its `| undefined` against a
+                        // NUMBER index signature. tsc's `membersRelatedToIndexInfo`
+                        // strips the `undefined` an optional property carries
+                        // (`getTypeWithFacts(propType, NEUndefined)`) — but not
+                        // when `keyType === numberType`, which is a separate
+                        // clause of the same condition. So `{ [k: string]: string }`
+                        // accepts `{ k1?: string }` and `{ [k: number]: string }`
+                        // refuses `{ 1?: string }`
+                        // (`optionalPropertyAssignableToStringIndexSignature`).
+                        // ztsc keeps the `| undefined` out of the stored property
+                        // type and unions it in at read time, so the string arm
+                        // above already reads as tsc's stripped form and only this
+                        // one has to put it back.
+                        const spt = if (sp.optional())
+                            try c.makeUnion2(sp.ty, types.undefined_type)
+                        else
+                            sp.ty;
+                        if (!try c.isAssignable(spt, nidx)) return false;
                     }
                 } else return false; // interface / class instance, no index sig
             },

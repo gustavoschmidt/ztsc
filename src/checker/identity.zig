@@ -37,10 +37,18 @@ const tuple_relate = @import("tuple_relate.zig");
 
 /// A generic signature pair is compared with the SOURCE's type parameters
 /// mapped onto the target's (tsc's `compareSignaturesIdentical`, which builds
-/// exactly that mapper and instantiates). Six is far past anything a real
-/// declaration nests, and the cap answers "identical" so a runaway pair is an
-/// under-report.
-const max_depth: u32 = 6;
+/// exactly that mapper and instantiates). The cap answers "identical", so a
+/// runaway pair is an under-report.
+///
+/// Ten, not six: a MUTUALLY RECURSIVE interface pair spends four levels per
+/// visible difference (property → signature → parameter → signature → nested
+/// reference), so six ran out mid-signature. `promiseIdentity`'s
+/// `IPromise2<string, number>` beside `Promise2<any, string>` differ in the
+/// callback parameter of the `then` of the `then` — depth 6 exactly — and came
+/// back identical. Only reached by the identity relation's three callers
+/// (TS2403, contextual-signature agreement, discriminant contexts), all of
+/// which are off the hot relation path.
+const max_depth: u32 = 10;
 
 /// tsc's `isTypeIdenticalTo`.
 pub fn identical(c: *Checker, a: TypeId, b: TypeId) Error!bool {
@@ -71,7 +79,17 @@ fn identicalAt(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!bool {
             defer c.scratch().free(args_b);
             var all = true;
             for (args_a, args_b) |x, y| {
-                if (c.ts.kind(x) == .any or c.ts.kind(y) == .any) continue;
+                // …but an `any` beside a free TYPE PARAMETER is a difference the
+                // program wrote. A type parameter is never what a failed
+                // inference leaves behind — that is `any` or `unknown` — so the
+                // two declarations genuinely name two types, and the pair falls
+                // through to the structural comparison below (which separates a
+                // materialized map from a still-deferred one).
+                // `noExcessiveStackDepthError`: `var x: FindConditions<any>;
+                // var x: FindConditions<Entity>;` inside `function foo<Entity>()`.
+                const inference_gave_up = (c.ts.kind(x) == .any or c.ts.kind(y) == .any) and
+                    c.ts.kind(x) != .type_param and c.ts.kind(y) != .type_param;
+                if (inference_gave_up) continue;
                 if (!try identicalAt(c, x, y, depth + 1)) {
                     all = false;
                     break;
@@ -310,15 +328,39 @@ pub fn signatureParamsIdentical(c: *Checker, a: TypeId, b: TypeId) Error!bool {
     return sigIdenticalAt(c, a, b, 0, true);
 }
 
+/// The bound a signature type parameter was DECLARED with, in the vocabulary of
+/// the type being compared.
+///
+/// `typeParamConstraint` answers what the relation ENFORCES, and that is not the
+/// same question. Instantiating a signature whose parameter has a BARE bound
+/// (`<W extends V>`, the bound being another parameter) mints a fresh parameter
+/// with NO enforced constraint on purpose — enforcing the substituted form would
+/// erase a legitimate inference — and parks the substituted bound on
+/// `FreshTp.widen_bound` instead (see `eagerBound`'s `fc`/`wb`).
+///
+/// Identity has to see it. `interface I<V> { then<W extends V>(cb: W): void }`
+/// at `I<number>` and at `I<boolean>` differ in NOTHING else: `V` appears
+/// nowhere in the signature's payload, so both `then`s instantiate to a function
+/// type whose only distinguishing mark is that bound. Reading the enforced
+/// constraint alone saw `no_type` on both sides, skipped the comparison, and
+/// called the two declarations identical (`promiseIdentityWithConstraints`).
+fn declaredBound(c: *Checker, sym: u32) Error!TypeId {
+    // Asked first: for a fresh parameter this is what forces a DEFERRED bound,
+    // so `widen_bound` below is only meaningful afterwards.
+    const con = try c.typeParamConstraint(sym);
+    if (con != types.no_type) return con;
+    if (c.isFreshTp(sym)) return c.freshTp(sym).widen_bound;
+    return types.no_type;
+}
+
 fn sigIdentical(c: *Checker, a: TypeId, b: TypeId, depth: u32) Error!bool {
     return sigIdenticalAt(c, a, b, depth, false);
 }
 
 fn sigIdenticalAt(c: *Checker, a: TypeId, b: TypeId, depth: u32, ignore_return: bool) Error!bool {
     if (a == b) return true;
-    const tpa = c.ts.fnTypeParams(a);
-    const tpb = c.ts.fnTypeParams(b);
-    if (tpa.len != tpb.len) return false;
+    const ntp = c.ts.fnTypeParamCount(a);
+    if (ntp != c.ts.fnTypeParamCount(b)) return false;
     const pa = c.ts.fnParamCount(a);
     if (pa != c.ts.fnParamCount(b)) return false;
     for (0..pa) |i| {
@@ -328,22 +370,31 @@ fn sigIdenticalAt(c: *Checker, a: TypeId, b: TypeId, depth: u32, ignore_return: 
     }
     // Map the source's own type parameters onto the target's, then compare in
     // the target's vocabulary. Building the map costs an allocation, which is
-    // why identity is a separate entry point and not a mode of the relation.
+    // why identity is a separate entry point and not a mode of the relation —
+    // and why the three copies below live under the `ntp > 0` guard: the
+    // overwhelming majority of signature pairs are non-generic and must not pay
+    // an allocator call to find that out.
+    // `fnTypeParams` is BORROWED from the store's `extra` and dies on the next
+    // intern — and everything done with the two lists interns: `makeTypeParam`
+    // mints a type, `typeParamConstraint` materializes a bound from the AST.
+    // Walking the live slices read reallocated memory, so the symbols came back
+    // garbage, `typeParamConstraint` answered `no_type` for both sides, and the
+    // bound comparison was skipped outright — every pair whose ONLY difference
+    // is a signature type parameter's bound came back "identical"
+    // (`promiseIdentityWithConstraints`, where `IPromise<string, number>` and
+    // `Promise<string, boolean>` differ in nothing else).
+    var tpa: []u32 = &.{};
+    defer if (tpa.len > 0) c.scratch().free(tpa);
+    var tpb: []u32 = &.{};
+    defer if (tpb.len > 0) c.scratch().free(tpb);
     var map: []TpMap = &.{};
     defer if (map.len > 0) c.scratch().free(map);
-    if (tpa.len > 0) {
+    if (ntp > 0) {
+        tpa = try c.scratch().dupe(u32, c.ts.fnTypeParams(a));
+        tpb = try c.scratch().dupe(u32, c.ts.fnTypeParams(b));
         map = try c.scratch().alloc(TpMap, tpa.len);
         for (map, tpa, tpb) |*m, sa, sb| {
             m.* = .{ .sym = sa, .ty = try c.ts.makeTypeParam(sb) };
-        }
-        // The constraints must agree in the same vocabulary (tsc compares each
-        // pair before it accepts the mapping).
-        for (tpa, tpb) |sa, sb| {
-            const ca = try c.typeParamConstraint(sa);
-            const cb = try c.typeParamConstraint(sb);
-            if ((ca == types.no_type) != (cb == types.no_type)) return false;
-            if (ca == types.no_type) continue;
-            if (!try identicalAt(c, try c.instantiate(ca, map), cb, depth + 1)) return false;
         }
     }
     for (0..pa) |i| {
@@ -353,7 +404,34 @@ fn sigIdenticalAt(c: *Checker, a: TypeId, b: TypeId, depth: u32, ignore_return: 
             c.ts.fnParam(a, @intCast(i)).ty;
         if (!try identicalAt(c, sp, c.ts.fnParam(b, @intCast(i)).ty, depth + 1)) return false;
     }
-    if (ignore_return) return true;
-    const ra = if (map.len > 0) try c.instantiate(c.ts.fnReturn(a), map) else c.ts.fnReturn(a);
-    return identicalAt(c, ra, c.ts.fnReturn(b), depth + 1);
+    if (!ignore_return) {
+        const ra = if (map.len > 0) try c.instantiate(c.ts.fnReturn(a), map) else c.ts.fnReturn(a);
+        if (!try identicalAt(c, ra, c.ts.fnReturn(b), depth + 1)) return false;
+    }
+    // The bounds must agree in the same vocabulary (tsc compares them before it
+    // accepts the mapping). Asked LAST, which the answer does not depend on —
+    // any difference is decisive whichever check finds it — and the cost does:
+    // reading a fresh parameter's bound FORCES the deferred substitution
+    // `mintFreshTpDeferred` exists to avoid, and on drizzle a bound is a mapped
+    // type over every column of every table in scope. Behind the payload
+    // comparison it runs only for pairs that are identical everywhere else.
+    for (tpa, tpb) |sa, sb| {
+        // Two instantiations of the SAME declared signature: any bound
+        // difference between them comes from the enclosing type arguments
+        // alone, and that is the case tsc decides by VARIANCE rather than
+        // structurally — a parameter witnessed nowhere but in a bound is
+        // `VarianceFlags.Independent`, whose arguments `typeArgumentsRelatedTo`
+        // ignores outright. `interface I<V> { then<W extends V>(cb: W): void }`
+        // is one type at `I<number>` and at `I<boolean>` for exactly that
+        // reason. A parameter the structure DOES witness shows its difference
+        // in the parameter/return comparison above, so skipping the bound here
+        // hides nothing.
+        if (c.tpOrigin(sa) == c.tpOrigin(sb)) continue;
+        const ca = try declaredBound(c, sa);
+        const cb = try declaredBound(c, sb);
+        if ((ca == types.no_type) != (cb == types.no_type)) return false;
+        if (ca == types.no_type) continue;
+        if (!try identicalAt(c, try c.instantiate(ca, map), cb, depth + 1)) return false;
+    }
+    return true;
 }

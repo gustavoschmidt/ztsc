@@ -104,12 +104,34 @@ pub fn typesIdentical(c: *Checker, a: TypeId, b: TypeId) Error!bool {
     // up says nothing about a union on the other side either way.
     if ((isEmptyObject(c, ea) or isEmptyObject(c, eb)) and
         c.ts.kind(ea) == .object and c.ts.kind(eb) == .object) return true;
+    // `unknown` on exactly one side is a DIFFERENCE the program wrote, not an
+    // approximation to forgive. `identity.identical` is deliberately lenient
+    // about it — an `unknown` type argument is treated as ztsc's inference
+    // giving up — and that leniency swallows exactly the report tsc makes
+    // here: `var b = bar({}); var b: {};` for `bar<T>(p: { x?: T }): T` is
+    // TS2403 in tsgo, naming `unknown` and `{}` in the message, and
+    // `var v1: Function[]; var v1 = stringMapToArray(numberMap);` is the same
+    // pair one array deep. Asked ONLY at a redeclaration, where the two sides
+    // are two independently computed declarations rather than two
+    // materializations of one reference.
+    if (isUnknownLike(c, ea) != isUnknownLike(c, eb)) return false;
     // The relation is handed the UNRESOLVED pair: it resolves references
     // itself, and it has a rule that only applies to two materializations of
     // the same generic reference (an `any` type argument is ztsc's inference
     // giving up, not a difference the program wrote). `ea`/`eb` above exist
     // only for the screens that read a materialized shape.
     return identity.identical(c, a, b);
+}
+
+/// `unknown`, or an array of one — the same one-level shape
+/// `identityUndecidable` reads, and for the same reason: `unknown[]` is how a
+/// failed-or-not inference reaches a redeclaration.
+fn isUnknownLike(c: *Checker, t: TypeId) bool {
+    return switch (c.ts.kind(t)) {
+        .unknown => true,
+        .array => isUnknownLike(c, c.ts.arrayElem(t)),
+        else => false,
+    };
 }
 
 fn isEmptyObject(c: *Checker, t: TypeId) bool {
@@ -135,9 +157,8 @@ fn allOptional(c: *Checker, t: TypeId) bool {
 /// Types whose identity this module refuses to judge, because ztsc reaches
 /// them by giving up rather than by reading the program:
 ///
-///   * `unknown` is what a failed inference leaves behind (`xs.map(identity)`
-///     is `number[]` to tsc and `unknown[]` here), `err` what a reported
-///     error leaves, and `void` what an unresolved value declaration leaves.
+///   * `err` is what a reported error leaves, and `void` what an unresolved
+///     value declaration leaves.
 ///   * a `class_value` (`typeof C`, and a namespace object) is NOMINAL here,
 ///     so it is never mutually assignable with the structural type tsc
 ///     considers identical to it.
@@ -145,9 +166,20 @@ fn allOptional(c: *Checker, t: TypeId) bool {
 /// Answering "identical" for these is the same under-report the rest of the
 /// approximation makes, and it is what keeps a divergence that belongs to
 /// inference or to overload resolution from surfacing as a TS2403.
+///
+/// `unknown` was on the list too, on the reading that it is what a FAILED
+/// inference leaves behind (`xs.map(identity)` is `number[]` to tsc and
+/// `unknown[]` here). It no longer is: after wave-32's identity work the
+/// screen costs more than it saves, because ztsc's `unknown` is now usually
+/// the answer tsc gives as well — `var b = bar({})` for `bar<T>(p: { x?: T }):
+/// T` is `unknown` in tsgo too, and the TS2403 against a following
+/// `var b: {}` is a report tsc makes and this screen swallowed. Oracle-probed
+/// on `indexSignatureTypeInference`, `objectLiteralContextualTyping` and
+/// `invalidMultipleVariableDeclarations`, where tsgo names `unknown` in the
+/// message verbatim.
 fn identityUndecidable(c: *Checker, t: TypeId) bool {
     return switch (c.ts.kind(t)) {
-        .unknown, .void, .err, .class_value => true,
+        .void, .err, .class_value => true,
         .array => identityUndecidable(c, c.ts.arrayElem(t)),
         else => false,
     };
@@ -155,11 +187,18 @@ fn identityUndecidable(c: *Checker, t: TypeId) bool {
 
 /// Is `t` the top type — the one thing mutual assignability cannot tell apart
 /// from anything else?
+///
+/// `any` alone. `unknown` used to join it, which put every `unknown`-typed
+/// declaration on the `topTypeIsDeclared` path and so silenced it whenever the
+/// type came from an INITIALIZER rather than from a written annotation — the
+/// exemption that exists because ztsc's `any` doubles as "could not work this
+/// out". `unknown` is not that: it is a type mutual assignability tells apart
+/// perfectly well (`{}` is assignable to `unknown`, `unknown` to nothing but
+/// itself), and tsgo names it in the TS2403 message verbatim —
+/// `var b = bar({}); var b: {};` for `bar<T>(p: { x?: T }): T` reports
+/// "must be of type 'unknown', but here has type '{}'".
 fn isAnyLike(c: *Checker, t: TypeId) bool {
-    return switch (c.ts.kind(t)) {
-        .any, .unknown => true,
-        else => false,
-    };
+    return c.ts.kind(t) == .any;
 }
 
 /// Did the PROGRAM ask for this declaration's `any`, or did ztsc fall back to

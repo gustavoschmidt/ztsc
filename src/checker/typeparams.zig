@@ -578,14 +578,87 @@ pub fn drainTypeArgConstraints(c: *Checker) Error!void {
         }
         c.inst_count = 0;
         c.newBudgetWindow();
+        const before = c.diags.items.len;
         if (p.sig != 0) {
             try checkSigTypeArgConstraints(c, p.sig, args.items, arg_nodes);
         } else {
             try c.checkTypeArgConstraints(p.sym, args.items, arg_nodes);
         }
+        if (p.sig != 0 and c.diags.items.len != before) withdrawArgDiags(c, p.node);
     }
     c.pending_type_args.clearRetainingCapacity();
     c.pending_type_args_pool.clearRetainingCapacity();
+}
+
+/// The diagnostic codes the ARGUMENT relation of a call files. Everything else
+/// an argument expression reports is its own — tsc types every argument
+/// expression whether or not the call resolves — so only these are withdrawn by
+/// `withdrawArgDiags`.
+const arg_relation_codes = [_]u16{ 2322, 2345, 2353, 2559, 2739, 2740, 2741, 2769 };
+
+/// tsc suppresses the whole ARGUMENT check of a call whose EXPLICIT type
+/// arguments failed their constraints: `checkTypeArguments` rejects the
+/// candidate before `getSignatureApplicabilityError` ever runs, the call
+/// resolves through `resolveErrorCall`, and nothing in the argument list is
+/// ever related to a parameter. `incorrectNumberOfTypeArgumentsDuringError
+/// Reporting` is that shape — `fn<MyObjA>({a: {x, y}, b: {}})`, where `MyObjA`
+/// fails `A extends ObjA` (TS2559) and tsc says nothing about the object
+/// literal's `y`, while ztsc added a TS2353.
+///
+/// ztsc cannot honour that at the call site: the constraint verdict is DEFERRED
+/// to the drain on purpose (see `PendingTypeArgs` — forming it eagerly asks a
+/// class member table for a constraint while that table is still materializing),
+/// and by then the argument diagnostics are filed. So the drain withdraws them
+/// instead, which is the same suppression one step later.
+///
+/// `diag_seen` is unwound with the entries, exactly as `rollbackDiags` does:
+/// leaving the key behind would suppress a later, legitimate report at the same
+/// span. `inst_diag_at` holds INDICES into `diags`; any at or after the first
+/// hole is dropped rather than remapped (see `rollbackDiags`, which takes the
+/// same side).
+fn withdrawArgDiags(c: *Checker, node: Node) void {
+    switch (c.nodeTag(node)) {
+        .call_expr_targs, .new_expr_targs, .optional_call => {},
+        else => return,
+    }
+    const info = c.tree.extraData(ast.CallInfo, c.tree.nodeData(node).rhs);
+    const arg_nodes = c.tree.extraRange(info.args_start, info.args_end);
+    var first: Node = null_node;
+    var last: Node = null_node;
+    for (arg_nodes) |an| {
+        if (an == null_node) continue;
+        if (first == null_node) first = an;
+        last = an;
+    }
+    if (first == null_node) return;
+    const lo = c.nodeSpanStart(first);
+    const hi = c.nodeSpan(last).end;
+    var w: usize = 0;
+    var first_hole: ?usize = null;
+    for (c.diags.items, 0..) |d, i| {
+        if (d.file == c.cur_file and d.span.start >= lo and d.span.start < hi and
+            std.mem.indexOfScalar(u16, &arg_relation_codes, d.code) != null)
+        {
+            _ = c.diag_seen.remove((@as(u128, d.file) << 64) | (@as(u128, d.code) << 32) | d.span.start);
+            if (first_hole == null) first_hole = i;
+            continue;
+        }
+        c.diags.items[w] = d;
+        w += 1;
+    }
+    if (first_hole == null) return;
+    c.diags.items.len = w;
+    while (c.inst_diag_at.count() > 0) {
+        var stale: ?u64 = null;
+        var it = c.inst_diag_at.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.* >= first_hole.?) {
+                stale = e.key_ptr.*;
+                break;
+            }
+        }
+        _ = c.inst_diag_at.remove(stale orelse break);
+    }
 }
 
 /// TS2344 — every WRITTEN type argument of a type reference must satisfy its
