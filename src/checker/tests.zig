@@ -802,6 +802,18 @@ test "return checking: 2355 / 2366 / exhaustive switch" {
     try expectClean("function f(): number { while (true) {} }");
 }
 
+test "TS2403: two different class/namespace values are not identical" {
+    // A `class_value` is hash-consed on its symbol, so two different ids are
+    // two different symbols — a difference the program wrote, which the
+    // "undecidable" screen used to forgive.
+    try expectCodes(
+        "namespace M { export class A {} } var m: typeof M; var m = M.A;",
+        &.{2403},
+    );
+    // …while the SAME one stays identical.
+    try expectClean("class B {} var b: typeof B; var b = B;");
+}
+
 test "const assignment / readonly (2588 / 2540)" {
     try expectCodes("const x = 1; x = 2;", &.{2588});
     try expectCodes("interface P { readonly a: number; } declare const p: P; p.a = 2;", &.{2540});
