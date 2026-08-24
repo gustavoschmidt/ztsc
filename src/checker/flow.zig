@@ -1318,7 +1318,22 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
 /// `unknown` is exactly the declared type that says "the value is not
 /// characterised by where it came from".
 fn assignmentRefines(c: *Checker, declared: TypeId) bool {
-    return c.ts.kind(declared) == .union_type;
+    return switch (c.ts.kind(declared)) {
+        .union_type => true,
+        // tsc's rule reads "is a union", and in tsc `boolean` IS the union
+        // `true | false` while a whole enum IS the union of its member
+        // literals — so tsc's own test admits both and reduces them to the
+        // unit that was written. ztsc interns each as ONE atomic nominal
+        // type, so they have to be named here or the reduction never runs:
+        // `let y = true` kept reading `boolean` and `const e: E = E.ONE` kept
+        // reading `E`, for a false TS2322 at every `let t: true = y` and
+        // `const x: E.ONE = e`.
+        .boolean => true,
+        // An enum MEMBER (`E.ONE`) is already a unit and has nothing to
+        // reduce; only the whole enum stands for a union.
+        .enum_type => !c.ts.isEnumMember(declared),
+        else => false,
+    };
 }
 
 /// Does a write with this assignment operator INITIALIZE the property — i.e.
@@ -2830,6 +2845,22 @@ fn assignmentReduced(c: *Checker, declared: TypeId, assigned0: TypeId) Error!Typ
         return declared;
     }
     const assigned = try c.ts.regular(try c.ts.regularLiteral(assigned0));
+    // tsc models `boolean` as the union `true | false` and a whole enum as the
+    // union of its member literals, so `getAssignmentReducedType` reduces both
+    // to the unit that was written: `let y = true` reads `true`, and
+    // `const e: E = E.ONE` reads `E.ONE`. ztsc interns each of them as ONE
+    // atomic nominal type, so the constituent filter below never sees a member
+    // to keep and the declared type survived unreduced — a false TS2322 at
+    // every `let t: true = y` and `const x: E.ONE = e`.
+    //
+    // Only a single unit whose base IS the declared type qualifies. That is
+    // the whole of what the filter would have kept for such an assignment
+    // (a unit matches exactly one constituent), and it keeps the answer a type
+    // ztsc can already print: reconstituting a partial enum union here would
+    // print `E.ONE | E.TWO` where tsc prints `E`.
+    if (dk == .boolean or (dk == .enum_type and !c.ts.isEnumMember(declared))) {
+        if (try c.literalBaseOf(assigned) == declared) return assigned;
+    }
     if (dk != .union_type) return declared;
     if (assigned == declared) return declared;
     var parts: std.ArrayList(TypeId) = .empty;
