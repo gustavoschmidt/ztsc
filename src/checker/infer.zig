@@ -3879,8 +3879,27 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                         try c.unify(pidx, one, tp_syms, candidates, depth + 1);
                     }
                 }
-                if (s.objectNumberIndex(param) != 0 and s.objectNumberIndex(ra) != 0) {
-                    try c.unify(s.objectNumberIndex(param), s.objectNumberIndex(ra), tp_syms, candidates, depth + 1);
+                if (s.objectNumberIndex(param) != 0) {
+                    // tsc pairs the two sides through `getApplicableIndexInfo(
+                    // source, targetInfo.keyType)`, not by matching key kinds:
+                    // a STRING index signature applies to a numeric key as
+                    // well, so `{ [k: string]: Function }` answers a
+                    // `{ [k: number]: T }` target. Requiring a number index on
+                    // both sides left `numberMapToArray(stringMap)` with `T`
+                    // unbound, so the result was `unknown[]` and the repeated
+                    // `var v1: Function[]` was a spurious TS2403
+                    // (`indexSignatureTypeInference`). The converse does NOT
+                    // hold — a number index says nothing about string keys —
+                    // and that asymmetry is the whole point of the case's
+                    // `stringMapToArray(numberMap)` line, which must stay an
+                    // error.
+                    const src_idx = if (s.objectNumberIndex(ra) != 0)
+                        s.objectNumberIndex(ra)
+                    else
+                        s.objectStringIndex(ra);
+                    if (src_idx != 0) {
+                        try c.unify(s.objectNumberIndex(param), src_idx, tp_syms, candidates, depth + 1);
+                    }
                 }
                 // Call / construct signatures on a *callable interface* param
                 // (`FunctionComponent<P>`, whose only `P` lives in its call
