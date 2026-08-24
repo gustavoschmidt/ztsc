@@ -105,6 +105,70 @@ pub fn recombineUnknown(c: *Checker, t: TypeId) TypeId {
     return if (has_empty and has_null and has_undef) types.unknown_type else t;
 }
 
+/// The one piece of tsc's `UnionReduction.Subtype` a flow JOIN cannot do
+/// without: a bare type parameter next to every constituent of its own
+/// constraint is absorbed by them.
+///
+/// tsc unions flow antecedents with `UnionReduction.Subtype`, whose
+/// `removeSubtypes` drops `T` from `Document | T | FooNode | BarNode` when
+/// `T extends FooNode | BarNode` — every value of `T` is already spelled by
+/// the other constituents, so the union is `Document | FooNode | BarNode`.
+/// ztsc joins with the ordinary (literal-absorbing) reduction, so the `T`
+/// survived, and `subtypeReductionUnionConstraints` then reported TS2339 for
+/// a property the constraint's members all have but `T` alone does not:
+///
+///     function visitNodes<T extends Node>(node: Document | Node, p: (n: Node) => n is T) {
+///         isNode(node) && p(node);          // joins Document | T | FooNode | BarNode
+///         if (!isNode(node) || !isBar(node))
+///             const nodes: Node[] = node.children;   // TS2339 on the stray T
+///     }
+///
+/// Scoped to exactly that shape rather than a general subtype reduction: a
+/// full `removeSubtypes` at every join is an O(n²) assignability sweep on the
+/// hottest path in the checker, and a *bare* parameter whose constraint is a
+/// union already sitting beside it is the only case a join manufactures. A
+/// parameter with no constraint, a non-union constraint, or one constituent
+/// missing from the join is left alone — those unions are the ones tsc keeps
+/// too, since a subtype relation against a single constituent is what
+/// `removeSubtypes` would then need and the ordinary reduction already
+/// covers the identical-constituent half of it.
+pub fn reduceConstrainedTypeParams(c: *Checker, t: TypeId) Error!TypeId {
+    if (c.ts.kind(t) != .union_type) return t;
+    const members = c.ts.members(t);
+    var any_tp = false;
+    for (members) |m| {
+        if (c.ts.kind(m) == .type_param) {
+            any_tp = true;
+            break;
+        }
+    }
+    if (!any_tp) return t;
+
+    var kept: std.ArrayList(TypeId) = .empty;
+    defer kept.deinit(c.scratch());
+    for (members) |m| {
+        if (c.ts.kind(m) == .type_param and try absorbedByConstraint(c, m, members)) continue;
+        try kept.append(c.scratch(), m);
+    }
+    if (kept.items.len == members.len) return t;
+    return c.ts.makeUnion(c.scratch(), kept.items);
+}
+
+/// Is every constituent of `tp`'s constraint present in `members`? Only a
+/// UNION constraint qualifies — a single-type constraint that is literally in
+/// the union is already the ordinary reduction's job, and one that is not is
+/// the general subtype question this deliberately does not ask.
+fn absorbedByConstraint(c: *Checker, tp: TypeId, members: []const TypeId) Error!bool {
+    const con = try c.typeParamConstraint(c.ts.typeParamSymbol(tp));
+    if (con == types.no_type) return false;
+    const cr = try c.resolveStructural(con);
+    if (c.ts.kind(cr) != .union_type) return false;
+    for (c.ts.members(cr)) |cm| {
+        if (std.mem.indexOfScalar(TypeId, members, cm) == null) return false;
+    }
+    return true;
+}
+
 /// What a strict `unknown === v` narrows the reference to, or null when `v`
 /// tells us nothing (tsc's `narrowTypeByEquality`, the `TypeFlags.Unknown &&
 /// assumeTrue` arm):

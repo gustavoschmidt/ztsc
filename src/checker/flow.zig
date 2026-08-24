@@ -1278,7 +1278,7 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
             for (parts.items) |*p| p.* = try finalizeEvolvingArray(c, p.*);
             // `recombineUnknown`: a join whose branches between them re-spell
             // `unknown` must hand `unknown` back, not its expansion.
-            const joined = narrow.recombineUnknown(c, try c.ts.makeUnion(c.scratch(), parts.items));
+            const joined = narrow.recombineUnknown(c, try narrow.reduceConstrainedTypeParams(c, try c.ts.makeUnion(c.scratch(), parts.items)));
             // tsc joins the antecedents of an EVOLVING (`auto`-typed)
             // variable with `UnionReduction.Subtype`, so a branch that
             // assigns `{ appState: … }` and one that assigns the
