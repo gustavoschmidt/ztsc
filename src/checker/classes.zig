@@ -1240,6 +1240,13 @@ const DeclKeyWalk = struct {
     str_index: bool = false,
     sym_index: bool = false,
     num_index: bool = false,
+    /// Any contributor declares a CALL or CONSTRUCT signature. Neither keys
+    /// anything, so this is invisible to `declaredKeyUnion` — it is what
+    /// `inProgressCallSigless` needs, and only an `interface` half (a
+    /// declaration-merged `interface C { (): void }`, or an interface reached
+    /// through the heritage walk) can ever set it: a `class` body has no
+    /// syntax for either.
+    call_sig: bool = false,
 
     /// First writer wins, which is the merge direction the table fold uses:
     /// a derived member overrides the inherited one of the same name, and the
@@ -1319,6 +1326,39 @@ pub fn inProgressMemberAbsent(c: *Checker, recv: TypeId, name: Atom) Error!bool 
     // member EXISTS, and the access's own verdict on it is TS2341's, not this
     // one's.
     return !w.index.contains(name);
+}
+
+/// `inProgressMemberAbsent`, asked of the CALL SIGNATURES instead of a name:
+/// is the receiver `recv` — whose class member table is being built further
+/// down this stack — provably NOT callable?
+///
+/// Same window and the same reason. `class D { m() { return this(); } }` has
+/// `m`'s return type INFERRED, so its body is checked while
+/// `classInstanceGeneric` still holds `D`'s table open, `resolveStructural`
+/// answers the error type, and a call on the error type degrades to `any`.
+/// Annotating the return type made the very same call TS2349, so the report
+/// depended on nothing but whether the table happened to be open.
+///
+/// The declarations answer it outright, and more cheaply than they answer a
+/// name: a `class` body has no syntax for a call or construct signature, so an
+/// instance can only acquire one from an `interface` half — a declaration
+/// merge (`class C {} interface C { (): void }`) or an interface reached
+/// through the heritage walk. `walkDeclaredKeys` already visits exactly those,
+/// and declines (`false`) for every shape it cannot derive — a mixin or
+/// expression base, an `extends` naming an alias — which is also the answer
+/// this must give: no verdict, keep the old silence.
+pub fn inProgressCallSigless(c: *Checker, recv: TypeId) Error!bool {
+    const t = if (c.ts.kind(recv) == .this_type) c.ts.thisTypeInstance(recv) else recv;
+    if (c.ts.kind(t) != .ref or !refExpansionActive(c, t)) return false;
+    const sym = c.ts.refSymbol(t);
+    if (!c.symFlags(sym).class) return false;
+    if (c.declared_keys_active) return false; // see `Checker.declared_keys_active`
+    c.declared_keys_active = true;
+    defer c.declared_keys_active = false;
+    var w = DeclKeyWalk{};
+    defer w.deinit(c.scratch());
+    if (!try walkDeclaredKeys(c, sym, &w, 0)) return false;
+    return !w.call_sig;
 }
 
 /// `inProgressMemberAbsent`'s companion: the names that walk found, for the
@@ -1518,7 +1558,11 @@ fn declKeysOfInterfaceBlocks(c: *Checker, sym: SymbolId, w: *DeclKeyWalk) Error!
                         w.str_index = true;
                     }
                 },
-                else => {}, // call / construct signatures key nothing
+                // A call / construct signature keys nothing, but its PRESENCE
+                // is the one thing that can make a class instance callable
+                // (`inProgressCallSigless`).
+                .call_signature, .construct_signature => w.call_sig = true,
+                else => {},
             }
         }
     }
