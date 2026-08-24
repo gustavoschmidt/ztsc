@@ -2456,32 +2456,58 @@ const Parser = struct {
         }
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
-        while (true) {
+        list: while (true) {
             if (pattern_code) |code| {
                 if (p.curTag() == .l_brace or p.curTag() == .l_bracket) try p.errAtCur(code);
             }
             const before = p.curIdx();
             try p.pushScratch(try p.parseDeclarator(no_in));
-            if (try p.eat(.comma) != null) continue;
-            // tsc's `parseDelimitedList` does NOT end the list on a missing
-            // comma: it reports one and keeps reading declarators, so `var y: z
-            // is number` is three of them with two "',' expected" between,
-            // where ztsc used to hand the rest of the line to the statement
-            // list and answer for it there. The list ends only where
-            // `isVariableDeclaratorListTerminator` says it does.
-            if (p.varDeclaratorListDone()) break;
-            try p.fail(.expected_comma);
-            // tsc's own zero-length-element guard: a declarator that consumed
-            // nothing would spin here forever.
-            if (p.curIdx() == before) _ = try p.bump();
-            // `parseDelimitedList` re-asks `isListElement` at the top of every
-            // iteration, and a token that starts no declarator sends it to
-            // `abortParsingListOrMoveToNextToken` — which, for a token the
-            // enclosing STATEMENT list would take, ends the declarator list and
-            // leaves it there. `var a = q~;` is that shape: the `~` is not a
-            // binding name, so the list stops and `~;` becomes its own
-            // statement (whose missing operand is tsc's TS1109).
-            if (!p.atStartOfDeclarator()) break;
+            if (try p.eat(.comma) == null) {
+                // tsc's `parseDelimitedList` does NOT end the list on a missing
+                // comma: it reports one and keeps reading declarators, so `var
+                // y: z is number` is three of them with two "',' expected"
+                // between, where ztsc used to hand the rest of the line to the
+                // statement list and answer for it there. The list ends only
+                // where `isVariableDeclaratorListTerminator` says it does.
+                if (p.varDeclaratorListDone()) break;
+                try p.fail(.expected_comma);
+                // tsc's own zero-length-element guard: a declarator that
+                // consumed nothing would spin here forever.
+                if (p.curIdx() == before) _ = try p.bump();
+            }
+            // Whether or not a comma was there, `parseDelimitedList` re-asks
+            // `isListElement` at the top of the next iteration; a token that
+            // starts no declarator is never handed to `parseVariableDeclaration`
+            // at all. It goes to `isListTerminator` — which ends the list
+            // silently — and then to `abortParsingListOrMoveToNextToken`, which
+            // files `parsingContextErrors(VariableDeclarations)` (TS1134, which
+            // the one-per-position rule drops whenever a "',' expected" just
+            // filed already used this position) and then either ABANDONS the
+            // list, when an enclosing context would take the token, or steps
+            // OVER it and asks again.
+            //
+            // `var a = q~;` is the abandoning shape: the `~` starts a
+            // statement, so the list stops and `~;` becomes its own (whose
+            // missing operand is tsc's TS1109). `var mul = ~[1], "";` is the
+            // same shape one comma later — the `""` is no binding name, so it
+            // earns the TS1134 here and is left to the statement list, where
+            // ztsc used to instead parse it as a declarator with a missing name
+            // and then answer a SECOND TS1134 on the `;` past it
+            // (`bitwiseNotOperatorInvalidOperations`).
+            //
+            // `var x = { ` + "`a`" + `: 321 }` is the advancing shape, and the
+            // reason this is a loop rather than a break: the initializer's
+            // object literal aborts empty at the template (TS1136) and the
+            // template is then taken as a TAGGED TEMPLATE of it, so the
+            // declarator ends on the `:` — which starts neither a declarator
+            // nor a statement. tsc steps over it and lands TS1134 on the `321`
+            // (`templateStringInPropertyName{1,2,ES6_1,ES6_2}`).
+            while (!p.atStartOfDeclarator()) {
+                if (p.varDeclaratorListDone()) break :list;
+                try p.errAtCur(.expected_binding);
+                if (p.abandonsVarDeclList()) break :list;
+                _ = try p.bump();
+            }
         }
         const items = p.scratch.items[top..];
         if (items.len == 1) {
@@ -2558,6 +2584,22 @@ const Parser = struct {
         return switch (p.curTag()) {
             .l_bracket, .l_brace, .private_identifier => true,
             else => |tag| isIdentLike(tag),
+        };
+    }
+
+    /// Standing in for tsc's `isInSomeParsingContext` as
+    /// `abortParsingListOrMoveToNextToken` asks it from a declarator list: is
+    /// this token something an ENCLOSING construct is waiting for, so that the
+    /// list must hand it back rather than skip it? The enclosing statement list
+    /// takes anything `isStartOfStatement` accepts, and a closing bracket
+    /// belongs to whatever opened it, exactly as in `canAbandonArgList` —
+    /// skipping one would let a single unclosed `(` eat the rest of the file.
+    /// The declarator list's own terminators never reach here: the caller
+    /// answers those first, and silently, as `isListTerminator` does.
+    fn abandonsVarDeclList(p: *Parser) bool {
+        return switch (p.curTag()) {
+            .r_paren, .r_bracket => true,
+            else => p.atStartOfStatement(),
         };
     }
 
