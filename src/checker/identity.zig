@@ -359,21 +359,8 @@ fn sigIdentical(c: *Checker, a: TypeId, b: TypeId, depth: u32) Error!bool {
 
 fn sigIdenticalAt(c: *Checker, a: TypeId, b: TypeId, depth: u32, ignore_return: bool) Error!bool {
     if (a == b) return true;
-    // `fnTypeParams` is BORROWED from the store's `extra` and dies on the next
-    // intern — and everything this function does with the two lists interns:
-    // `makeTypeParam` mints a type, `typeParamConstraint` materializes a bound
-    // from the AST. Walking the live slices read reallocated memory, so the
-    // symbols came back garbage, `typeParamConstraint` answered `no_type` for
-    // both sides, and the constraint comparison was skipped outright — every
-    // pair whose ONLY difference is a signature type parameter's bound came
-    // back "identical" (`promiseIdentityWithConstraints`, where `IPromise<string,
-    // number>` and `Promise<string, boolean>` differ in nothing else). Copy
-    // both lists first.
-    if (c.ts.fnTypeParamCount(a) != c.ts.fnTypeParamCount(b)) return false;
-    const tpa = try c.scratch().dupe(u32, c.ts.fnTypeParams(a));
-    defer c.scratch().free(tpa);
-    const tpb = try c.scratch().dupe(u32, c.ts.fnTypeParams(b));
-    defer c.scratch().free(tpb);
+    const ntp = c.ts.fnTypeParamCount(a);
+    if (ntp != c.ts.fnTypeParamCount(b)) return false;
     const pa = c.ts.fnParamCount(a);
     if (pa != c.ts.fnParamCount(b)) return false;
     for (0..pa) |i| {
@@ -383,33 +370,31 @@ fn sigIdenticalAt(c: *Checker, a: TypeId, b: TypeId, depth: u32, ignore_return: 
     }
     // Map the source's own type parameters onto the target's, then compare in
     // the target's vocabulary. Building the map costs an allocation, which is
-    // why identity is a separate entry point and not a mode of the relation.
+    // why identity is a separate entry point and not a mode of the relation —
+    // and why the three copies below live under the `ntp > 0` guard: the
+    // overwhelming majority of signature pairs are non-generic and must not pay
+    // an allocator call to find that out.
+    // `fnTypeParams` is BORROWED from the store's `extra` and dies on the next
+    // intern — and everything done with the two lists interns: `makeTypeParam`
+    // mints a type, `typeParamConstraint` materializes a bound from the AST.
+    // Walking the live slices read reallocated memory, so the symbols came back
+    // garbage, `typeParamConstraint` answered `no_type` for both sides, and the
+    // bound comparison was skipped outright — every pair whose ONLY difference
+    // is a signature type parameter's bound came back "identical"
+    // (`promiseIdentityWithConstraints`, where `IPromise<string, number>` and
+    // `Promise<string, boolean>` differ in nothing else).
+    var tpa: []u32 = &.{};
+    defer if (tpa.len > 0) c.scratch().free(tpa);
+    var tpb: []u32 = &.{};
+    defer if (tpb.len > 0) c.scratch().free(tpb);
     var map: []TpMap = &.{};
     defer if (map.len > 0) c.scratch().free(map);
-    if (tpa.len > 0) {
+    if (ntp > 0) {
+        tpa = try c.scratch().dupe(u32, c.ts.fnTypeParams(a));
+        tpb = try c.scratch().dupe(u32, c.ts.fnTypeParams(b));
         map = try c.scratch().alloc(TpMap, tpa.len);
         for (map, tpa, tpb) |*m, sa, sb| {
             m.* = .{ .sym = sa, .ty = try c.ts.makeTypeParam(sb) };
-        }
-        // The constraints must agree in the same vocabulary (tsc compares each
-        // pair before it accepts the mapping).
-        for (tpa, tpb) |sa, sb| {
-            // Two instantiations of the SAME declared signature: any bound
-            // difference between them comes from the enclosing type arguments
-            // alone, and that is the case tsc decides by VARIANCE rather than
-            // structurally — a parameter witnessed nowhere but in a bound is
-            // `VarianceFlags.Independent`, whose arguments `typeArgumentsRelatedTo`
-            // ignores outright. `interface I<V> { then<W extends V>(cb: W): void }`
-            // is one type at `I<number>` and at `I<boolean>` for exactly that
-            // reason. A parameter the structure DOES witness shows its difference
-            // in the parameter/return comparison below, so skipping the bound here
-            // hides nothing.
-            if (c.tpOrigin(sa) == c.tpOrigin(sb)) continue;
-            const ca = try declaredBound(c, sa);
-            const cb = try declaredBound(c, sb);
-            if ((ca == types.no_type) != (cb == types.no_type)) return false;
-            if (ca == types.no_type) continue;
-            if (!try identicalAt(c, try c.instantiate(ca, map), cb, depth + 1)) return false;
         }
     }
     for (0..pa) |i| {
@@ -419,7 +404,34 @@ fn sigIdenticalAt(c: *Checker, a: TypeId, b: TypeId, depth: u32, ignore_return: 
             c.ts.fnParam(a, @intCast(i)).ty;
         if (!try identicalAt(c, sp, c.ts.fnParam(b, @intCast(i)).ty, depth + 1)) return false;
     }
-    if (ignore_return) return true;
-    const ra = if (map.len > 0) try c.instantiate(c.ts.fnReturn(a), map) else c.ts.fnReturn(a);
-    return identicalAt(c, ra, c.ts.fnReturn(b), depth + 1);
+    if (!ignore_return) {
+        const ra = if (map.len > 0) try c.instantiate(c.ts.fnReturn(a), map) else c.ts.fnReturn(a);
+        if (!try identicalAt(c, ra, c.ts.fnReturn(b), depth + 1)) return false;
+    }
+    // The bounds must agree in the same vocabulary (tsc compares them before it
+    // accepts the mapping). Asked LAST, which the answer does not depend on —
+    // any difference is decisive whichever check finds it — and the cost does:
+    // reading a fresh parameter's bound FORCES the deferred substitution
+    // `mintFreshTpDeferred` exists to avoid, and on drizzle a bound is a mapped
+    // type over every column of every table in scope. Behind the payload
+    // comparison it runs only for pairs that are identical everywhere else.
+    for (tpa, tpb) |sa, sb| {
+        // Two instantiations of the SAME declared signature: any bound
+        // difference between them comes from the enclosing type arguments
+        // alone, and that is the case tsc decides by VARIANCE rather than
+        // structurally — a parameter witnessed nowhere but in a bound is
+        // `VarianceFlags.Independent`, whose arguments `typeArgumentsRelatedTo`
+        // ignores outright. `interface I<V> { then<W extends V>(cb: W): void }`
+        // is one type at `I<number>` and at `I<boolean>` for exactly that
+        // reason. A parameter the structure DOES witness shows its difference
+        // in the parameter/return comparison above, so skipping the bound here
+        // hides nothing.
+        if (c.tpOrigin(sa) == c.tpOrigin(sb)) continue;
+        const ca = try declaredBound(c, sa);
+        const cb = try declaredBound(c, sb);
+        if ((ca == types.no_type) != (cb == types.no_type)) return false;
+        if (ca == types.no_type) continue;
+        if (!try identicalAt(c, try c.instantiate(ca, map), cb, depth + 1)) return false;
+    }
+    return true;
 }
