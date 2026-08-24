@@ -248,8 +248,15 @@ fn entityValueSym(c: *Checker, entity: Node) Error!?SymbolId {
     switch (c.nodeTag(entity)) {
         .identifier => {
             const a = try c.atomOfToken(c.tree.nodeMainToken(entity));
+            // `resolveSpace` already answers with a GLOBAL id (`resolveSpaceInner`
+            // maps every hit through `toGlobal`/`mergedOf` before returning).
+            // Converting again added this file's `sym_base` a second time, so
+            // `import A = N` handed `typeOfSymbol` an unrelated symbol — and in
+            // the first file of a program, where `sym_base` is 0, the bug is
+            // invisible. `import A = N; A.v` silently typed as `any`, which
+            // swallowed the TS2322/TS2339 the alias should carry.
             return switch (c.resolveSpace(a, c.cur_scope, true)) {
-                .sym => |s| c.toGlobal(s),
+                .sym => |s| s,
                 else => null,
             };
         },
