@@ -19,6 +19,8 @@ const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
 const indexOfAtom = @import("generics.zig").indexOfAtom;
+const props_zig = @import("props.zig");
+const classes_zig = @import("classes.zig");
 
 // =====================================================================
 // name resolution (value vs type space)
@@ -412,23 +414,92 @@ pub fn suggestProp(c: *Checker, a: Atom, obj: TypeId) ?Atom {
     if (text.len == 0 or text.len > spell_max_len) return null;
     var best: ?Atom = null;
     var best_d: usize = intern.spellInitialCapTenths(text.len);
-    const t = c.resolveStructural(obj) catch return null;
-    if (c.ts.kind(t) != .object) return null;
-    for (0..c.ts.objectPropCount(t)) |i| {
-        const p = c.ts.objectProp(t, @intCast(i));
-        const cand_text = c.atomText(p.name);
-        const d = spellDistance(text, cand_text, best_d) orelse continue;
-        if (best == null or d < best_d) {
-            best_d = d;
-            best = p.name;
-        } else if (d == best_d and std.mem.order(u8, cand_text, c.atomText(best.?)) == .lt) {
-            // Tie on distance: prefer the lexicographically smaller name so
-            // the suggestion is byte-identical across --workers (props are
-            // iterated in atom order, which is not stable).
-            best = p.name;
+    scanSuggestProps(c, text, obj, &best, &best_d) catch return null;
+    return best;
+}
+
+/// The candidate table tsc scans:
+/// `getPropertiesOfType(getApparentType(containingType))`. A bare member table
+/// was only the FIRST of those two calls, so every receiver whose members come
+/// from somewhere other than its own object type suggested nothing at all:
+///
+///   * a PRIMITIVE lends its wrapper interface's members, so `s.subtr(0)` on a
+///     `string` is "Did you mean 'substr'?" and not a plain TS2339
+///     (`tsxStatelessFunctionComponents2`, `taggedTemplateStringsWith-
+///     OverloadResolution3`);
+///   * a UNION answers for the properties EVERY constituent has, which is what
+///     makes `ab.notInB` on `A | B` suggest `notInC` while `abc.notInB` on
+///     `A | B | C` — where `notInC` is no longer common — stays TS2339
+///     (`unionPropertyExistence` covers both halves);
+///   * a CLASS VALUE / namespace object answers off its static side, so
+///     `A.fng2` suggests the exported `A.fng`
+///     (`ModuleWithExportedAndNonExportedFunctions`).
+///
+/// A receiver with none of those tables suggests nothing, exactly as before.
+fn scanSuggestProps(c: *Checker, text: []const u8, obj: TypeId, best: *?Atom, best_d: *usize) Error!void {
+    // A class whose member table is open further down this stack resolves to
+    // the error type — the WINDOW, not an answer — so the candidates have to
+    // come off the declarations, exactly as the missing-member verdict this
+    // suggestion decorates does (`inProgressMemberAbsent`).
+    {
+        var names: std.ArrayList(Atom) = .empty;
+        defer names.deinit(c.scratch());
+        try classes_zig.inProgressMemberNames(c, obj, &names);
+        if (names.items.len != 0) {
+            for (names.items) |n| noteCandidate(c, text, n, best, best_d);
+            return;
         }
     }
-    return best;
+    const t = try c.resolveStructural(obj);
+    switch (c.ts.kind(t)) {
+        .object => noteObjectProps(c, text, t, best, best_d),
+        .class_value => {
+            const st = try c.resolveStructural(try c.classStaticType(c.ts.classSymbol(t)));
+            if (c.ts.kind(st) == .object) noteObjectProps(c, text, st, best, best_d);
+        },
+        .union_type => {
+            // A union has no member table of its own. Scanning ONE
+            // constituent's and keeping the names the whole union still
+            // answers for is `getPropertiesOfType`'s result exactly — a
+            // property common to every constituent is in particular a property
+            // of this one — and it reuses `propOfType`'s union rule rather
+            // than restating it.
+            const members = try c.memberList(t);
+            if (members.len == 0) return;
+            const first = try c.resolveStructural(members[0]);
+            if (c.ts.kind(first) != .object) return;
+            for (0..c.ts.objectPropCount(first)) |i| {
+                const name = c.ts.objectProp(first, @intCast(i)).name;
+                if ((try c.propOfType(t, name)) == null) continue;
+                noteCandidate(c, text, name, best, best_d);
+            }
+        },
+        else => {
+            const ap = (try props_zig.primitiveApparentObject(c, t)) orelse
+                (try props_zig.arrayApparentObject(c, t)) orelse return;
+            noteObjectProps(c, text, ap, best, best_d);
+        },
+    }
+}
+
+fn noteObjectProps(c: *Checker, text: []const u8, table: TypeId, best: *?Atom, best_d: *usize) void {
+    for (0..c.ts.objectPropCount(table)) |i| {
+        noteCandidate(c, text, c.ts.objectProp(table, @intCast(i)).name, best, best_d);
+    }
+}
+
+fn noteCandidate(c: *Checker, text: []const u8, name: Atom, best: *?Atom, best_d: *usize) void {
+    const cand_text = c.atomText(name);
+    const d = spellDistance(text, cand_text, best_d.*) orelse return;
+    if (best.* == null or d < best_d.*) {
+        best_d.* = d;
+        best.* = name;
+    } else if (d == best_d.* and std.mem.order(u8, cand_text, c.atomText(best.*.?)) == .lt) {
+        // Tie on distance: prefer the lexicographically smaller name so the
+        // suggestion is byte-identical across --workers (props are iterated in
+        // atom order, which is not stable).
+        best.* = name;
+    }
 }
 
 // =====================================================================

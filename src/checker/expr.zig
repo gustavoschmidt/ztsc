@@ -367,7 +367,18 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             try c.diagFmt(2683, c.nodeSpan(node), "'this' implicitly has type 'any' because it does not have a type annotation.", .{});
             return types.any_type;
         },
-        .super_expr => return types.any_type,
+        // A `super` REFERENCE — `super.x`, `super[k]`, or the keyword on its
+        // own. Reached only when no base type was found for it (a
+        // property-access receiver with a base never gets here; see
+        // `superReceiverType`), so this is where tsc's TS2335 lands. A super
+        // CALL is routed past this arm by `calls.zig`, which owns the TS2337
+        // that supersedes it; inside a computed property NAME the answer is
+        // TS2466 instead (`Checker.in_computed_key`), which ztsc does not
+        // implement — silence is the one that is not wrong.
+        .super_expr => {
+            if (!c.in_computed_key) _ = try classes.reportSuperWithoutBase(c, node);
+            return types.any_type;
+        },
         // `new.target`: tsc types it as the enclosing constructor's own
         // type (the class's static side in a constructor, `typeof f` in a
         // plain function). The checker has no enclosing-function *symbol*
@@ -4327,12 +4338,8 @@ fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex, site
                     try parts.append(c.scratch(), types.any_type);
                     continue;
                 }
-                const p = (try c.propOfType(rm, name)) orelse {
-                    try c.diagFmt(2339, c.tokSpan(name_tok), "Property '{s}' does not exist on type '{s}'.", .{
-                        c.atomText(name), try c.typeToString(t),
-                    });
-                    return types.error_type;
-                };
+                const p = (try c.propOfType(rm, name)) orelse
+                    return reportMissingProp(c, t, t, name, name_tok);
                 try found.append(c.scratch(), p);
                 if (p.nonPublic() and non_public_of == types.no_type) non_public_of = m;
                 var pt = try c.substThis(p.ty, m);
@@ -4340,10 +4347,7 @@ fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex, site
                 try parts.append(c.scratch(), pt);
             }
             if (props_zig.unionPropertyDropped(found.items)) {
-                try c.diagFmt(2339, c.tokSpan(name_tok), "Property '{s}' does not exist on type '{s}'.", .{
-                    c.atomText(name), try c.typeToString(t),
-                });
-                return types.error_type;
+                return reportMissingProp(c, t, t, name, name_tok);
             }
             if (non_public_of != types.no_type) {
                 try accessibility.check(c, non_public_of, name, name_tok, site);
@@ -4412,7 +4416,10 @@ fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex, site
                     // polymorphic `this` is the class instance — "does not
                     // exist on type 'Bar'", not "on type 'this'".
                     const shown = if (c.ts.kind(t) == .this_type) c.ts.thisTypeInstance(t) else t;
-                    return reportMissingProp(c, shown, r, name, name_tok);
+                    // `r` is the window's error type and names nothing; the
+                    // RECEIVER is what `suggestProp` can still read the
+                    // declarations off.
+                    return reportMissingProp(c, shown, t, name, name_tok);
                 }
                 return types.any_type;
             }
@@ -4461,10 +4468,13 @@ fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex, site
 /// The not-found verdict of a property access: TS2339, or TS2551 when a
 /// near-miss member suggests itself (tsc's
 /// `getSuggestionForNonexistentProperty`). `t` is the receiver AS WRITTEN —
-/// what the message names — and `r` its resolved structure, which is what the
-/// suggestion searches.
-fn reportMissingProp(c: *Checker, t: TypeId, r: TypeId, name: Atom, name_tok: TokenIndex) Error!TypeId {
-    if (c.suggestProp(name, r)) |sugg| {
+/// what the message names — and `search` is what the suggestion scans, which
+/// is usually `t`'s resolved structure but is the receiver itself wherever
+/// that structure is not the candidate table: a union has none of its own, and
+/// a class whose materialization is still open resolves to the error type
+/// (`suggestProp` handles both).
+fn reportMissingProp(c: *Checker, t: TypeId, search: TypeId, name: Atom, name_tok: TokenIndex) Error!TypeId {
+    if (c.suggestProp(name, search)) |sugg| {
         try c.diagFmt(2551, c.tokSpan(name_tok), "Property '{s}' does not exist on type '{s}'. Did you mean '{s}'?", .{
             c.atomText(name), try c.typeToString(t), c.atomText(sugg),
         });

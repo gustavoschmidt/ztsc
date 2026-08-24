@@ -1321,6 +1321,29 @@ pub fn inProgressMemberAbsent(c: *Checker, recv: TypeId, name: Atom) Error!bool 
     return !w.index.contains(name);
 }
 
+/// `inProgressMemberAbsent`'s companion: the names that walk found, for the
+/// SUGGESTION the report it enables wants to make. tsc reaches both from one
+/// `getPropertiesOfType(getApparentType(…))`, so the same window that lets
+/// ztsc say "no such member" has to be able to say "did you mean this one" —
+/// `class Foo { _store = …; bar() { return this.store; } }` is TS2551 in tsc
+/// and was a bare TS2339 here (`propertyOrdering`).
+///
+/// Appends nothing whenever the walk declines, which is the caller's
+/// "suggest nothing" answer.
+pub fn inProgressMemberNames(c: *Checker, recv: TypeId, out: *std.ArrayList(Atom)) Error!void {
+    const t = if (c.ts.kind(recv) == .this_type) c.ts.thisTypeInstance(recv) else recv;
+    if (c.ts.kind(t) != .ref or !refExpansionActive(c, t)) return;
+    const sym = c.ts.refSymbol(t);
+    if (!c.symFlags(sym).class) return;
+    if (c.declared_keys_active) return; // see `Checker.declared_keys_active`
+    c.declared_keys_active = true;
+    defer c.declared_keys_active = false;
+    var w = DeclKeyWalk{};
+    defer w.deinit(c.scratch());
+    if (!try walkDeclaredKeys(c, sym, &w, 0)) return;
+    for (w.keys.items) |k| try out.append(c.scratch(), k.name);
+}
+
 /// The key union of a class or interface symbol, derived from its
 /// declarations. Null when some part of the shape is not derivable.
 pub fn declaredKeyUnion(c: *Checker, sym: SymbolId) Error!?TypeId {
@@ -1592,6 +1615,55 @@ fn heritageArgCount(c: *Checker, hd: ast.Data) usize {
         if (an != null_node) n += 1;
     }
     return n;
+}
+
+/// tsc's `checkSuperExpression` tail, once the container has been accepted as
+/// a legal one:
+///
+///     const classLikeDeclaration = container.parent as ClassLikeDeclaration;
+///     if (!getClassExtendsHeritageElement(classLikeDeclaration)) {
+///         error(node, Diagnostics.super_can_only_be_referenced_in_a_derived_class);
+///         return errorType;
+///     }
+///
+/// The test is SYNTACTIC — "is there an `extends` clause on this class
+/// declaration" — not "did a base type resolve". That distinction is the whole
+/// of `superCallFromClassThatHasNoBaseTypeButWithSameSymbolInterface`: an
+/// `interface Foo extends Array<number> {}` merged into `class Foo {}` gives
+/// the SYMBOL a base type, but the class declaration still writes no
+/// `extends`, so `super()` in its constructor is TS2335.
+///
+/// The container is read off `c.this_type` rather than walked to from the
+/// `super` node (ztsc has no parent pointers): a class member binds it to the
+/// class's instance ref, a STATIC one to the class value. Anything else — an
+/// object-literal method (tsc types `super` there as `any` and reports
+/// nothing), a `this` parameter naming an interface, a free function — answers
+/// null and reports nothing, which is the conservative half of the rule.
+pub fn reportSuperWithoutBase(c: *Checker, super_node: Node) Error!bool {
+    const sym = superHomeClassSym(c) orelse return false;
+    for (c.declsOf(sym)) |decl| {
+        if (c.nodeTag(decl) != .class_decl) continue;
+        if (c.tree.extraData(ast.ClassData, c.tree.nodeData(decl).lhs).extends != 0) return false;
+        try c.diagFmt(2335, c.nodeSpan(super_node), "'super' can only be referenced in a derived class.", .{});
+        return true;
+    }
+    return false;
+}
+
+/// The class whose body lexically encloses the expression being checked, as
+/// `c.this_type` records it — see `reportSuperWithoutBase`.
+fn superHomeClassSym(c: *Checker) ?SymbolId {
+    if (c.this_type == 0) return null;
+    const inst = if (c.ts.kind(c.this_type) == .this_type)
+        c.ts.thisTypeInstance(c.this_type)
+    else
+        c.this_type;
+    const sym: SymbolId = switch (c.ts.kind(inst)) {
+        .ref => c.ts.refSymbol(inst),
+        .class_value => c.ts.classSymbol(inst),
+        else => return null,
+    };
+    return if (c.symFlags(sym).class) sym else null;
 }
 
 /// The `extends` base of a class as a ref (or null). The base name

@@ -17,6 +17,7 @@ const Node = ast.Node;
 const null_node = ast.null_node;
 const Atom = intern.Atom;
 const Span = source.Span;
+const SymbolId = binder.SymbolId;
 const TypeId = types.TypeId;
 
 const checker_zig = @import("../checker.zig");
@@ -29,6 +30,7 @@ const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const tuple_relate = @import("tuple_relate.zig");
 const accessibility = @import("accessibility.zig");
+const classes = @import("classes.zig");
 const ambientNamespaceType = @import("signatures.zig").ambientNamespaceType;
 const ChainLink = @import("expr.zig").ChainLink;
 const checkExprCached = @import("expr.zig").checkExprCached;
@@ -341,6 +343,143 @@ pub fn checkCallExpr(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Error!T
     return link.ty;
 }
 
+/// TS2347 — the one thing an UNTYPED call may not do. tsc's
+/// `resolveCallExpression` guards every route into `resolveUntypedCall` with
+/// it:
+///
+///     if (node.typeArguments) {
+///         error(node, Diagnostics.Untyped_function_calls_may_not_accept_type_arguments);
+///     }
+///     return resolveUntypedCall(node);
+///
+/// so it fires on all three shapes that reach `resolveUntypedCall` — an `any`
+/// callee, a callee whose type IS the global `Function`, and one that merely
+/// relates to it (`untypedFunctionCall`) — and nowhere else. The error node is
+/// the whole call, which is why `new x<any>(x)` is blamed on `new` and not on
+/// `x` (`anyAsConstructor`).
+///
+/// `declared_any` is tsc's `funcType !== errorType` guard, which only the `any`
+/// route needs: see `anyCalleeIsDeclared`. The two `Function` routes cannot
+/// reach an error type at all — a callee that RELATES to `Function` has a real
+/// type by construction.
+fn reportUntypedTypeArgs(c: *Checker, node: Node, shape: CallShape, declared_any: bool) Error!void {
+    if (shape.targ_nodes.len == 0) return;
+    if (declared_any and !try anyCalleeIsDeclared(c, shape.callee)) return;
+    try c.diagFmt(2347, c.nodeSpan(node), "Untyped function calls may not accept type arguments.", .{});
+}
+
+/// tsc's guard on the diagnostic above: `funcType !== errorType`. tsc reaches
+/// `resolveUntypedCall` for the error type as well as for a real `any`, and
+/// reports TS2347 only for the latter — the error type means something has
+/// already been said about this callee, and a second complaint would be a
+/// cascade.
+///
+/// ztsc has no such split: an unresolved name, an unlinked import binding and
+/// a `const` still being inferred all answer `any`, because `error_type`
+/// suppresses far more of the checker than tsc's does. So the distinction is
+/// re-derived SYNTACTICALLY, from the callee's own declaration:
+///
+///   * a plain name is a declared `any` when its declaration WRITES a type
+///     (`declare var anyVar: any`, `var x: any`). An unresolved name, an
+///     import binding whose module did not link (social-app's `new
+///     Kysely<DbSchema>(…)`, where tsgo also fails to resolve `kysely` and
+///     reports only the TS2307) and an un-annotated `const` mid-inference
+///     (`declarationsWithRecursiveInternalTypesProduceUniqueTypeParams`'s
+///     recursive `reduce<Value<K, U>>(…)`) all write none;
+///   * a property access is a declared `any` when its RECEIVER has a real
+///     member table to have read the property off — `Foo.Bar<T>()` on an
+///     undeclared `Foo` does not (`parserMemberAccessExpression1`), while
+///     `this.foo<string>()` against `private foo: any` does.
+///
+/// Anything else — `super<T>()`, a call result, an element access — answers
+/// false: the shapes that reach here with a genuine declared `any` are these
+/// two, and silence is the side that invents nothing.
+fn anyCalleeIsDeclared(c: *Checker, callee: Node) Error!bool {
+    var n = callee;
+    while (c.nodeTag(n) == .paren_expr or c.nodeTag(n) == .non_null) n = c.tree.nodeData(n).lhs;
+    switch (c.nodeTag(n)) {
+        .identifier => {
+            const a = try c.atomOfToken(c.tree.nodeMainToken(n));
+            // `resolveSpace` already answers with a GLOBAL id (merged where the
+            // name is a cross-file merge constituent) — no `toGlobal` here.
+            const sym = switch (c.resolveSpace(a, c.cur_scope, true)) {
+                .sym => |sy| sy,
+                else => return false,
+            };
+            return symWritesTypeAnnotation(c, sym);
+        },
+        .member_expr, .optional_member_expr => {
+            const d = c.tree.nodeData(n);
+            const recv = try c.resolveStructural(try c.checkExprCached(d.lhs, types.no_type));
+            switch (c.ts.kind(recv)) {
+                .any, .err, .unknown, .never => return false,
+                else => {},
+            }
+            return (try c.propOfType(recv, try c.memberAtom(d.rhs))) != null;
+        },
+        else => return false,
+    }
+}
+
+/// Does any declaration of `sym` WRITE a type? The three shapes that can carry
+/// one and also produce a callable `any`; every other declaration form (an
+/// import specifier, an un-annotated declarator, a binding element) writes
+/// none, which is the answer this needs.
+fn symWritesTypeAnnotation(c: *Checker, sym: SymbolId) bool {
+    const saved = c.enterSymFile(sym);
+    defer c.restoreCtx(saved);
+    for (c.declsOf(sym)) |decl| {
+        switch (c.nodeTag(decl)) {
+            .declarator_full => return true,
+            .class_field => {
+                if (c.tree.extraData(ast.Field, c.tree.nodeData(decl).lhs).type_ann != 0) return true;
+            },
+            .property_signature => {
+                if (c.tree.nodeData(decl).lhs != 0) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// tsc's `resolveCallExpression` when the callee carries no CALL signatures:
+///
+///     if (!callSignatures.length) {
+///         if (numConstructSignatures) {
+///             error(node, Diagnostics.Value_of_type_0_is_not_callable_Did_you_mean_to_include_new,
+///                   typeToString(funcType));
+///         }
+///         else { error(node, Diagnostics.This_expression_is_not_callable); }
+///     }
+///
+/// A value that CONSTRUCTS and does not call is a forgotten `new`, and tsc
+/// says so: `C()` on a class, `Tools.NullLogger()` (`forgottenNew`), and
+/// `v2(args)` on a `new (arg: T) => Date` read out of an index signature
+/// (`genericConstructorFunction1`) are all TS2348 where ztsc had the generic
+/// TS2349. The message names the callee's OWN type — tsc prints `funcType`,
+/// not its resolved structure, so `typeof C` and `I1<T>` rather than the
+/// member tables they expand to.
+fn reportNotCallable(c: *Checker, shape: CallShape, callee_t: TypeId, r: TypeId) Error!void {
+    const constructs = switch (c.ts.kind(r)) {
+        .object => c.ts.objectConstructSigCount(r) != 0,
+        // A CLASS value is `numConstructSignatures > 0` by construction — the
+        // declared constructor, or the implicit one every class has. A
+        // NAMESPACE object is a `.class_value` here too (that is how ztsc
+        // models `typeof N`), and it constructs nothing: calling one is the
+        // plain TS2349 (`typeOnlyMerge3`, `valuesMergingAcrossModules`).
+        .class_value => c.symFlags(c.ts.classSymbol(r)).class,
+        else => false,
+    };
+    if (constructs) {
+        try c.diagFmt(2348, c.nodeSpan(shape.callee), "Value of type '{s}' is not callable. Did you mean to include 'new'?", .{
+            try c.typeToString(callee_t),
+        });
+        return;
+    }
+    try c.diagFmt(2349, c.nodeSpan(shape.callee), "This expression is not callable.", .{});
+}
+
 /// tsc's `isUntypedFunctionCall`, minus its two `any` disjuncts:
 ///
 ///     !numCallSignatures && !numConstructSignatures &&
@@ -452,7 +591,16 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
     if (!is_new and c.nodeTag(shape.callee) == .import_expr) {
         return .{ .ty = try importCallType(c, shape.arg_nodes), .chained = chained };
     }
-    var callee_t = if (c.isOptionalChain(shape.callee)) blk: {
+    // A super CALL's callee is never typed as a value (tsc's
+    // `resolveCallExpression` resolves against the base's construct signatures
+    // instead — see below), and `checkExpr`'s `.super_expr` arm — which would
+    // answer `any` here anyway — carries the TS2335 that a super call's own
+    // TS2337 supersedes. Routing past it keeps the two mutually exclusive, as
+    // `checkSuperExpression`'s early return does.
+    const super_call = !is_new and c.nodeTag(shape.callee) == .super_expr;
+    var callee_t = if (super_call)
+        types.any_type
+    else if (c.isOptionalChain(shape.callee)) blk: {
         const link = try c.chainObjType(shape.callee);
         if (link.chained) chained = true;
         break :blk link.ty;
@@ -525,7 +673,7 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
     // baseTypeNode.typeArguments)`) — see `superCtorSigs`.
     var super_sigs: std.ArrayList(TypeId) = .empty;
     defer super_sigs.deinit(c.scratch());
-    if (!is_new and c.nodeTag(shape.callee) == .super_expr) {
+    if (super_call) {
         // TS2337 — tsc's `checkSuperExpression`: a super CALL is permitted only
         // when its container (`getSuperContainer(node, /*stopOnFunctions*/
         // true)`, so arrows count) is a constructor. A `super()` in a field
@@ -539,14 +687,22 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
         // The arguments are still resolved against the base constructor below,
         // which is where any further diagnostic about them comes from.
         //
-        // A WRITTEN type-argument list takes the call out of this check
+        // A WRITTEN type-argument list takes BOTH of these checks out
         // entirely: `super<T>(0)` is TS2754 ("'super' may not use type
         // arguments") and nothing else, tsgo-verified on
         // `parserSuperExpression2`. ztsc does not implement TS2754, so the
         // choice here is between silence and a different code at a different
         // span — and silence is the one that is not wrong.
-        if (!c.in_ctor_body and !c.in_computed_key and shape.targ_nodes.len == 0) {
-            try c.diagFmt(2337, c.nodeSpan(shape.callee), "Super calls are not permitted outside constructors or in nested functions inside constructors.", .{});
+        if (!c.in_computed_key and shape.targ_nodes.len == 0) {
+            if (!c.in_ctor_body) {
+                try c.diagFmt(2337, c.nodeSpan(shape.callee), "Super calls are not permitted outside constructors or in nested functions inside constructors.", .{});
+            } else {
+                // …and TS2335 once the container IS legal: a class that writes
+                // no `extends` has no `super` to call. tsc's
+                // `checkSuperExpression` returns `errorType` at either one, so
+                // exactly one of the two is ever reported.
+                _ = try classes.reportSuperWithoutBase(c, shape.callee);
+            }
         }
         if (try superCtorSigs(c, &super_sigs)) {
             r = if (super_sigs.items.len == 1)
@@ -609,6 +765,10 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
         }
     }
     if (rk == .any or rk == .err or isect_any) {
+        // The `any` route into `resolveUntypedCall` (see there): an `err`
+        // callee has already been reported on, and a super CALL's written
+        // type-argument list is TS2754's business, not this one.
+        if (rk == .any and !super_call) try reportUntypedTypeArgs(c, node, shape, true);
         for (shape.arg_nodes) |an| {
             if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
         }
@@ -631,6 +791,7 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
     if (!is_new and c.ts.kind(apparent_t) == .ref and
         c.globalSymNamed(c.ts.refSymbol(apparent_t), "Function"))
     {
+        try reportUntypedTypeArgs(c, node, shape, false);
         for (shape.arg_nodes) |an| {
             if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
         }
@@ -893,12 +1054,13 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
             .object => {
                 if (c.ts.objectCallSigCount(r) == 0) {
                     if (try untypedFunctionCall(c, callee_t, r, rk)) {
+                        try reportUntypedTypeArgs(c, node, shape, false);
                         for (shape.arg_nodes) |an| {
                             if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
                         }
                         return .{ .ty = types.any_type, .chained = chained };
                     }
-                    try c.diagFmt(2349, c.nodeSpan(shape.callee), "This expression is not callable.", .{});
+                    try reportNotCallable(c, shape, callee_t, r);
                     for (shape.arg_nodes) |an| {
                         if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
                     }
@@ -1024,7 +1186,7 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
                     }
                     return .{ .ty = types.any_type, .chained = chained };
                 }
-                try c.diagFmt(2349, c.nodeSpan(shape.callee), "This expression is not callable.", .{});
+                try reportNotCallable(c, shape, callee_t, r);
                 for (shape.arg_nodes) |an| {
                     if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
                 }
@@ -1236,9 +1398,19 @@ pub fn resolveSignatureCall(
             try checkCallArguments(c, node, sigs[0], arg_nodes, false);
             return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(sigs[0]);
         }
+        // …and a list whose LENGTH does not fit the type-parameter list is the
+        // same verdict one step up: `hasCorrectTypeArgumentArity` rejects the
+        // candidate, so `map<number>([1, ""], x => x.toString())` is
+        // "Expected 2 type arguments, but got 1" and NOTHING about the
+        // arguments (`mismatchedExplicitTypeParameterAndArgumentType`). The
+        // TS2558 itself is `instantiateSigForCall`'s, which fills the missing
+        // slots and carries on; only the argument verdict is withdrawn here.
+        const targ_count_ok = c.ts.kind(sigs[0]) != .function or
+            explicit_targs.len == 0 or
+            c.sigTargArityOk(sigs[0], explicit_targs.len);
         const inst = try c.instantiateSigForCall(sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
         if (instance_ret == types.no_type) try checkThisArg(c, node, inst);
-        try checkCallArguments(c, node, inst, arg_nodes, true);
+        try checkCallArguments(c, node, inst, arg_nodes, targ_count_ok);
         return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst);
     }
     // Overloads: first signature whose arity fits and whose args check.
@@ -2827,6 +2999,7 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
         si >= required and (total == std.math.maxInt(u32) or si < total)
     else
         true;
+    var arity_failed = false;
     if (report and arity_known) {
         if (spread_at) |si| {
             // An IIFE is exempt: tsc's `isOptionalParameter` makes every
@@ -2848,9 +3021,20 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
             const n = eff.items.len;
             if (n < required or n > total) {
                 try reportArityError(c, node, eff.items, n, required, total, total == std.math.maxInt(u32));
+                arity_failed = true;
             }
         }
     }
+    // An ARITY failure is the whole verdict: tsc's `chooseOverload` rejects a
+    // candidate `hasCorrectArity` refuses BEFORE `getSignatureApplicability-
+    // Error` ever runs, so it joins `candidateForArgumentArityError` and never
+    // `candidatesForArgumentError` — and `reportCallResolutionErrors` reports
+    // out of exactly one pile. `new Derived2(1)` against `(y: string, z:
+    // string)` is TS2554 alone, where ztsc also blamed `1` for not being a
+    // `string` (`derivedClassWithoutExplicitConstructor3`). The arguments are
+    // still TYPED below — that is what contextually types a callback and fills
+    // the node memo — only their verdict is withdrawn.
+    const report_args = report and !arity_failed;
     // tsc reports at most ONE argument error per call. `checkApplicableSignature`
     // walks the arguments in order and returns as soon as one fails, so the
     // arguments after it are never related to their parameters at all — and
@@ -2910,7 +3094,7 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
             try packed_elems.append(c.scratch(), .{ .ty = at });
             continue;
         }
-        if (report and (spread_fits or !synthetic) and !try c.isAssignable(at, pt)) {
+        if (report_args and (spread_fits or !synthetic) and !try c.isAssignable(at, pt)) {
             if (reported_arg) continue;
             const before = c.diags.items.len;
             if (synthetic) {
@@ -2935,7 +3119,7 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
             }
             noteArgBlame(c, anchor_out, before, c.nodeSpan(an), argErrorSpan(c, an));
             reported_arg = true;
-        } else if (report and !synthetic and !reported_arg) {
+        } else if (report_args and !synthetic and !reported_arg) {
             // The excess-property check is part of the same walk tsc stops
             // at the first failure, so a later argument's excess property
             // is not reported either.
@@ -2951,7 +3135,7 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
             if (reported_arg) noteArgBlame(c, anchor_out, before, c.nodeSpan(an), argErrorSpan(c, an));
         }
     }
-    if (report and !reported_arg and whole_rest != null) {
+    if (report_args and !reported_arg and whole_rest != null) {
         const rest_ty = whole_rest.?.ty;
         const packed_ty = try c.ts.makeTuple(packed_elems.items);
         if (!try c.isAssignable(packed_ty, rest_ty)) {
