@@ -117,7 +117,7 @@ const Error = error{OutOfMemory};
 const fbits = bind_result.fbits;
 const effectiveBits = bind_result.effectiveBits;
 const excludesOfFlags = bind_result.excludesOfFlags;
-const mask_let_const_class = bind_result.mask_let_const_class;
+const mask_block_scoped_var = bind_result.mask_block_scoped_var;
 const mask_value = bind_result.mask_value;
 const mask_type = bind_result.mask_type;
 const mask_member = bind_result.mask_member;
@@ -316,6 +316,12 @@ pub fn bind(
 
 const Link = struct { value: u32, next: u32 };
 
+/// One scope a hoisting `var` passed through on its way to the function/module
+/// scope it lands in, remembered with the `var`'s own name token so a later
+/// block-scoped declaration in that scope can blame the `var` (see
+/// `Binder.var_transits`).
+const VarTransit = struct { scope: ScopeId, atom: Atom, name_tok: TokenIndex };
+
 /// The IDENTIFIER an evolving-array operation is rooted at, or `null_node`.
 ///
 /// tsc's `isNarrowableOperand` read in the `getReferenceRoot` direction: a
@@ -445,9 +451,15 @@ const Binder = struct {
     scope_stack: std.ArrayList(ScopeId) = .empty,
     /// One map for the whole file: (scope << 32 | atom) -> symbol.
     members: std.AutoHashMapUnmanaged(u64, SymbolId) = .empty,
-    /// (scope, atom) pairs a `var` hoisted past, for order-independent
-    /// var-vs-let conflict detection.
-    var_transits: std.ArrayList(Link) = .empty, // value=scope, next=atom (reused shape)
+    /// Every scope a `var` hoisted PAST, with the `var`'s own name token, for
+    /// order-independent var-vs-let conflict detection. The token is what makes
+    /// the two orders answer alike: tsc's check is
+    /// `checkVarDeclaredNamesNotShadowed`, which runs once per VARIABLE
+    /// DECLARATION and blames it, so `{ let a; var a; }` and `{ var a; let a; }`
+    /// both land TS2481 on the `var`. Only the second order reaches this list
+    /// (the first finds the `let` already in `members`), and a list that
+    /// recorded no token could only blame the `let`.
+    var_transits: std.ArrayList(VarTransit) = .empty,
     /// class/interface symbol -> members scope (merge reuses it).
     member_scopes: std.AutoHashMapUnmanaged(SymbolId, ScopeId) = .empty,
     static_scopes: std.AutoHashMapUnmanaged(SymbolId, ScopeId) = .empty,
@@ -993,6 +1005,12 @@ const Binder = struct {
         b.sym_reported.items[sym] = i + 1;
     }
 
+    /// Is `atom` already declared in `scope` by a `let`/`const`/`using`?
+    fn hasBlockScopedVar(b: *const Binder, scope: ScopeId, atom: Atom) bool {
+        const sym = b.members.get(memberKey(scope, atom)) orelse return false;
+        return b.sym_flags.items[sym].bits() & mask_block_scoped_var != 0;
+    }
+
     /// Declare `atom` in `scope`. Merges with an existing symbol when the
     /// excludes masks allow it (overloads, interface merge, var+var, value/
     /// type-space sharing); reports a diagnostic at `name_tok` otherwise
@@ -1017,7 +1035,7 @@ const Binder = struct {
                 const s = b.scope_stack.items[i];
                 if (s == scope) break;
                 if (b.members.get(memberKey(s, atom))) |sym| {
-                    if (b.sym_flags.items[sym].bits() & mask_let_const_class != 0) {
+                    if (b.sym_flags.items[sym].bits() & mask_block_scoped_var != 0) {
                         // TS2481, not TS2451: `s` is a scope this `var` had to
                         // hoist OUT of, so the two names provably do not share
                         // one — exactly tsc's `!namesShareScope` in
@@ -1033,27 +1051,27 @@ const Binder = struct {
                         // nested blocks; `function f() { let e; { var e; } }`,
                         // where the two DO share the body scope, is reported
                         // by the merge path below and still answers TS2451.
-                        //
-                        // `mask_let_const_class` also admits a CLASS, which
-                        // the oracle excuses entirely (`{ class C {} { var C;
-                        // } }` earns nothing from tsgo) — that arm was a false
-                        // positive before this change and still is, only now
-                        // spelled TS2481. Left alone deliberately: narrowing
-                        // the mask is a separate question from picking the
-                        // code, and nothing in the suite turns on it.
                         try b.diag(.outer_scope_var_in_block_scope, name_tok);
                     }
                 }
-                try b.var_transits.append(b.scratch, .{ .value = s, .next = atom });
+                try b.var_transits.append(b.scratch, .{ .scope = s, .atom = atom, .name_tok = name_tok });
             }
         }
         // Block-scoped decl: a var declared *inside* this scope's subtree
-        // (already hoisted out) still clashes.
-        if (kind.isBlockScoped()) {
+        // (already hoisted out) still clashes — and tsc blames the VAR, whose
+        // token the transit carries, with the same TS2481 the opposite order
+        // gets from the loop above. One diagnostic per transiting `var`, since
+        // `checkVarDeclaredNamesNotShadowed` visits every declaration; but only
+        // for the FIRST block-scoped declaration of the name here, because the
+        // check resolves the NAME, and a second `let` of it adds no var for the
+        // var-side check to run over (`{ var h; let h; let h; }` is one TS2481
+        // and two TS2451s).
+        if ((kind == .let_decl or kind == .const_decl) and
+            !b.hasBlockScopedVar(scope, atom))
+        {
             for (b.var_transits.items) |t| {
-                if (t.value == scope and t.next == atom) {
-                    try b.diag(.block_scoped_redeclare, name_tok);
-                    break;
+                if (t.scope == scope and t.atom == atom) {
+                    try b.diag(.outer_scope_var_in_block_scope, t.name_tok);
                 }
             }
         }
@@ -5932,11 +5950,20 @@ test "dup: var-vs-let picks the code off the EXISTING symbol" {
     // and lands in the same table, so the clash names both spellings.
     try expectBindCodes("let x; { var x; }", &.{ .block_scoped_redeclare, .block_scoped_redeclare });
     // A `let` INSIDE the block the var hoisted out of is the transit check,
-    // which has only the newcomer to name (ztsc reports TS2451 at the LET
-    // where tsc has TS2481 at the VAR — the transit list records no token to
-    // blame, so this direction is still a divergence; the opposite order,
-    // below, is exact).
-    try expectBindCodes("{ var x; let x; }", &.{.block_scoped_redeclare});
+    // and tsc's check runs off the VARIABLE DECLARATION either way — so this
+    // direction answers TS2481 at the `var`, exactly like the opposite one.
+    try expectBindCodes("{ var x; let x; }", &.{.outer_scope_var_in_block_scope});
+    // Only the FIRST block-scoped declaration re-blames the var; a second
+    // `let` is a plain redeclaration of the first.
+    try expectBindCodes(
+        "{ var x; let x; let x; }",
+        &.{ .outer_scope_var_in_block_scope, .block_scoped_redeclare, .block_scoped_redeclare },
+    );
+    // A CLASS is block-scoped for every other purpose, but it is no
+    // `SymbolFlags.BlockScopedVariable`, so `checkVarDeclaredNamesNotShadowed`
+    // never sees it and the oracle answers nothing at all here.
+    try expectBindCodes("{ class C {} { var C; } }", &.{});
+    try expectBindCodes("{ { var C; } class C {} }", &.{});
     // No conflict when the block-scoped name is in a sibling/inner scope.
     try expectBindCodes("var x; { let x; }", &.{});
     try expectBindCodes("function f() { { let x; } var x; }", &.{});

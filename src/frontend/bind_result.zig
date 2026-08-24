@@ -177,8 +177,13 @@ pub fn fbits(comptime f: SymbolFlags) u32 {
     return @bitCast(f);
 }
 
-pub const mask_let_const_class = fbits(.{ .let_decl = true }) | fbits(.{ .const_decl = true }) |
-    fbits(.{ .class = true });
+/// tsc's `SymbolFlags.BlockScopedVariable` — `let`, `const` and `using`, and
+/// deliberately NOT `class`. It is the meaning `checkVarDeclaredNamesNotShadowed`
+/// tests a hoisting `var`'s name against, so `{ class C {} { var C; } }` earns
+/// nothing at all from the oracle even though a class IS block-scoped for every
+/// other purpose.
+pub const mask_block_scoped_var = fbits(.{ .let_decl = true }) | fbits(.{ .const_decl = true });
+const mask_let_const_class = mask_block_scoped_var | fbits(.{ .class = true });
 pub const mask_value = fbits(.{ .var_decl = true }) | mask_let_const_class |
     fbits(.{ .function = true }) | fbits(.{ .param = true }) |
     fbits(.{ .catch_param = true }) | fbits(.{ .import_binding = true }) |

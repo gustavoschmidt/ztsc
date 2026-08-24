@@ -26,6 +26,7 @@ const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
 const source = @import("../frontend/source.zig");
 const modules = @import("../link/modules.zig");
+const classes = @import("classes.zig");
 
 const Node = ast.Node;
 const null_node = ast.null_node;
@@ -747,6 +748,19 @@ fn sfcBound(c: *Checker) Error!?TypeId {
 /// so reporting on `undefined` was five false positives apiece in
 /// `tsxReactEmit3`/`tsxExternalModuleEmit2`. See `SymbolFlags.ambient_var`.
 fn tagWithoutSignaturesIsError(c: *Checker, tag_ty: TypeId, resolved: TypeId) Error!bool {
+    // `<this/>` inside the very class it names, reached while that class's
+    // member table is still being built: `resolveStructural` answers the CYCLE
+    // — the error type — and the `.err` arm below excuses it, so the tag earned
+    // nothing at all. `classes.inProgressCallSigless` answers the question the
+    // table cannot off the DECLARATIONS instead, and a class BODY has no syntax
+    // for a call signature, so a `true` there is a TS2604 for certain. Asked of
+    // the UNRESOLVED tag type, which is the `this` type the walk needs.
+    //
+    // Only the window matters: with a return-type annotation on the enclosing
+    // method the class is not in flight, `resolved` is the ordinary instance
+    // object, and the `Function` relation below was already giving the right
+    // answer (`tsxDynamicTagName7`, `jsxComponentTypeErrors`).
+    if (try classes.inProgressCallSigless(c, tag_ty)) return true;
     switch (c.ts.kind(resolved)) {
         .any, .err, .string, .string_literal, .type_param, .infer_var => return false,
         // tsc's `!(getReducedType(apparentFuncType).flags & TypeFlags.Never)`
