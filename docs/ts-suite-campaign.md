@@ -459,8 +459,12 @@ blame-the-var (dedicated VarTransit struct), retired mask_let_const_class,
 the jsx this-type half (TS2604 while the table is in flight), ten
 TS1005/TS1109/TS1003 recovery rules (+26), and the evolving-array
 multi-decl relaxation. e2e multi: wall 0.04s vs tsgo 0.09s; A/B flat.
-WATCH ITEM: social-app --checkers=1 wall +3.2% (default config −1.3%,
-FASTER) — bisect queued.
+WATCH ITEM RESOLVED BY BISECT: the social-app --checkers=1 +3.2% wall is
+25d876f (the whole-cycle keying itself — cycle members with .intersection
+bodies keep lazy refs and re-resolve on the single-checker path); the
+depth guard and the aliasInstance reorder are neutral (52d40ba -0.1%).
+Default config is FASTER (-1.3%), so not a blocker; optimization lead for
+a future wave: memoize the kept-ref resolution per (sym,args).
 
 ## Ranked next queue (wave 32) — distilled from wave-31 agent reports
 
@@ -481,9 +485,9 @@ FASTER) — bisect queued.
    social-app's useInfiniteQuery options object.
 4. Mapped target with a MATERIALIZABLE key set → property inference
    (mapped.zig lower-bound key materialization; complicatedIndexes…).
-5. Bisect the social-app --checkers=1 +3.2% wall (96eecaa..wave-31 tip;
-   suspects: A's materialize-before-defaults reorder — measured neutral at
-   default checkers only; B's unconditional fallback).
+5. [BISECTED — done by coordinator] The c1 +3.2% wall is 25d876f's
+   whole-cycle keying (kept lazy refs re-resolve). Optimization lead:
+   memoize the kept-ref resolution per (sym,args) or mark-once per cycle.
 6. Constant-condition pruning: `if (true) { z = "a"; }` leaves the
    unreachable branch in the flow graph → TS2322 FP (no corpus witness;
    blocks nothing but wrong; flow.zig).
