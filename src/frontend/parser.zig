@@ -278,6 +278,14 @@ const Parser = struct {
     /// entry there may be a grammar-class one, which does not participate.
     last_syntactic_start: ?u32 = null,
 
+    /// Start offset of the junk token `errAtCur` last answered with a scanner
+    /// diagnostic (`errAtJunkToken`). tsc's scanner reports that one ONCE, when
+    /// it produces the token; ztsc defers it to the first parser complaint
+    /// about the same token (see `errAtCur`), and the parser can complain about
+    /// one token several times over. Saved/restored with the rest of the
+    /// speculation state, since a backtrack un-reports it.
+    last_junk_start: ?u32 = null,
+
     /// Nesting depth of class bodies, for TS1213 — tsc's `getContainingClass`.
     /// A class body is strict whatever the file is, and tsc says so in its own
     /// wording, so the choice between TS1212 and TS1213 is this counter.
@@ -669,9 +677,35 @@ const Parser = struct {
     }
 
     /// Record a diagnostic at the current token, or Backtrack if speculating.
+    ///
+    /// TS1359, tsc's `createIdentifier`: when the blame for a missing
+    /// identifier falls on a RESERVED word, the message names it — "Identifier
+    /// expected. 'null' is a reserved word that cannot be used here." — instead
+    /// of the bare TS1003. Every `expected_identifier` reported here IS a
+    /// `createIdentifier` site (the two callers that pass a message of their
+    /// own — `parsePrimaryExpression`'s "Expression expected",
+    /// `parseEntityNameOfTypeReference`'s "Type expected" — already spell
+    /// different codes), and the ONE site that is tsc's explicit
+    /// `parseErrorAt(…, Identifier_expected)` goes through
+    /// `failIdentifierLiteral` instead. Measured against tsgo: `import q =
+    /// null` and `import s = this` answer TS1359.
     fn fail(p: *Parser, code: Code) PE!void {
         if (p.spec > 0) return error.Backtrack;
+        if (code == .expected_identifier and p.curTag().isReservedKeyword()) {
+            return p.errAtCur(.reserved_word_identifier);
+        }
         try p.errAtCur(code);
+    }
+
+    /// `fail(.expected_identifier)` WITHOUT the TS1359 substitution — for the
+    /// sites where tsc writes `parseErrorAt(…, Diagnostics.Identifier_expected)`
+    /// itself rather than letting `createIdentifier` choose. ztsc has one: the
+    /// import-specifier keyword check, so `import { default } from "m"` answers
+    /// TS1003 on the `default` even though `default` is a reserved word
+    /// (measured, `es6ImportNamedImportIdentifiersParsing`).
+    fn failIdentifierLiteral(p: *Parser) PE!void {
+        if (p.spec > 0) return error.Backtrack;
+        try p.errAtCur(.expected_identifier);
     }
 
     /// Append a diagnostic, applying tsc's one-per-position rule for the
@@ -732,6 +766,21 @@ const Parser = struct {
 
     fn errAtCur(p: *Parser, code: Code) Error!void {
         const t = p.cur();
+        // tsc's SCANNER owns the no-token-starts-here diagnostics (TS1127,
+        // TS18026, TS1490) and reports one the moment it produces the token —
+        // so the message is already in `parseDiagnostics` before the parser can
+        // say anything about that token, and the one-per-position rule below
+        // then drops whatever the parser would have said at the same character.
+        // ztsc's scanner is a pure tokenizer and the parse is lazy and
+        // speculative, so there is no scan-time moment to report from; the
+        // report is deferred instead to the first parser complaint ABOUT the
+        // junk token, which restores tsc's order (TS1127 first, the parser's
+        // own message suppressed). Measured against tsgo: `var arg\u003`,
+        // `foo(a \`, `class C extends A ¬ {}` and `/re/ \ ;` each answer TS1127
+        // alone, where ztsc used to answer TS1005 alone. Speculation is safe
+        // for the same reason `checkLiteral` is — `restore` truncates `diags`,
+        // and it rewinds `last_junk_start` with them.
+        if (!junkCode(code) and junkTag(t.tag)) try p.errAtJunkToken();
         // tsc's `createMissingNode(reportAtCurrentPosition: token() ===
         // EndOfFileToken)`: when the parse ran out of FILE, a missing name node
         // is blamed on the position where the eof token's trivia began — just
@@ -753,6 +802,24 @@ const Parser = struct {
         });
     }
 
+    /// The token tags that start no token at all — what tsc's scanner answers
+    /// with a diagnostic of its own rather than a grammar production.
+    fn junkTag(tag: TokTag) bool {
+        return switch (tag) {
+            .unknown, .hash_bang, .binary_content => true,
+            else => false,
+        };
+    }
+
+    /// The three codes `errAtJunkToken` itself reports, which must not
+    /// re-enter it.
+    fn junkCode(code: Code) bool {
+        return switch (code) {
+            .unexpected_character, .shebang_not_at_start, .file_appears_binary => true,
+            else => false,
+        };
+    }
+
     /// Report the current no-token-starts-here token. tsc's scanner separates
     /// three answers here, and so does ztsc's:
     ///
@@ -762,7 +829,17 @@ const Parser = struct {
     ///     and its scanner blames the file, then stops — which is why the token
     ///     covers the whole remainder and the next token is `eof`;
     ///   - anything else: TS1127 over the one byte.
+    ///
+    /// Reported ONCE per junk token — tsc's scanner produces each token once,
+    /// while ztsc's parser can reach the same one from several directions (see
+    /// `errAtCur`, which routes every complaint about a junk token through
+    /// here first).
     fn errAtJunkToken(p: *Parser) Error!void {
+        const at = p.cur().start;
+        if (p.last_junk_start) |last| {
+            if (last == at) return;
+        }
+        p.last_junk_start = at;
         switch (p.curTag()) {
             .hash_bang => try p.errAtCur(.shebang_not_at_start),
             .binary_content => try p.addDiag(.file_appears_binary, .{
@@ -1051,6 +1128,7 @@ const Parser = struct {
         n_diags: usize,
         n_computed_keys: usize,
         last_syntactic_start: ?u32,
+        last_junk_start: ?u32,
     };
 
     fn save(p: *Parser) State {
@@ -1065,6 +1143,7 @@ const Parser = struct {
             .n_diags = p.diags.items.len,
             .n_computed_keys = p.computed_keys.items.len,
             .last_syntactic_start = p.last_syntactic_start,
+            .last_junk_start = p.last_junk_start,
         };
     }
 
@@ -1080,6 +1159,7 @@ const Parser = struct {
         p.diags.shrinkRetainingCapacity(s.n_diags);
         p.computed_keys.shrinkRetainingCapacity(s.n_computed_keys);
         p.last_syntactic_start = s.last_syntactic_start;
+        p.last_junk_start = s.last_junk_start;
     }
 
     // --- node construction -------------------------------------------------
@@ -1456,15 +1536,11 @@ const Parser = struct {
 
     /// The diagnostic tsc's `parseList` reports for a token that starts no list
     /// element, for the statement-list contexts. A junk token gets its scanner
-    /// diagnostic FIRST, so that the one-per-position rule in `addDiag` drops
-    /// the TS1128 that would otherwise land on the same character — which is
-    /// exactly what tsc's `parseErrorAtPosition` does.
+    /// diagnostic FIRST (`errAtCur` sees to that), so that the one-per-position
+    /// rule in `addDiag` drops the TS1128 that would otherwise land on the same
+    /// character — which is exactly what tsc's `parseErrorAtPosition` does.
     fn errNotAStatement(p: *Parser, code: Code) PE!void {
         if (p.spec > 0) return error.Backtrack;
-        switch (p.curTag()) {
-            .unknown, .hash_bang, .binary_content => try p.errAtJunkToken(),
-            else => {},
-        }
         try p.errAtCur(code);
     }
 
@@ -1919,7 +1995,14 @@ const Parser = struct {
             .keyword_do => return p.parseDoStatement(),
             .keyword_for => return p.parseForStatement(),
             .keyword_switch => return p.parseSwitchStatement(),
-            .keyword_try => return p.parseTryStatement(),
+            // tsc's `parseStatement` sends a bare `catch` or `finally` to
+            // `parseTryStatement` as well: neither starts a statement, but that
+            // is where the grammar can SAY so and still read the clause the
+            // word opens. `a / finally` is the shape — TS1109 on the `finally`
+            // as a missing operand, then "'{' expected" at end of file for the
+            // finally BLOCK — where leaving the word to the expression-statement
+            // recovery answered the TS1109 alone.
+            .keyword_try, .keyword_catch, .keyword_finally => return p.parseTryStatement(),
             .keyword_throw => return p.parseThrowStatement(),
             .keyword_return => return p.parseReturnStatement(),
             .keyword_break, .keyword_continue => return p.parseBreakContinue(),
@@ -2135,6 +2218,17 @@ const Parser = struct {
                 // ordinary contextual-keyword identifier (`global.foo`, a label).
                 if (p.peekTag(1) == .l_brace) return p.parseGlobalAugmentation();
                 if (p.peekTag(1) == .colon) return p.parseLabeledStatement();
+                // tsc's `isDeclaration` arm for `global` accepts `{`, an
+                // IDENTIFIER, or `export` after the keyword, and
+                // `parseAmbientExternalModuleDeclaration` then names the
+                // declaration after the word `global` itself and — with no `{`
+                // — falls through to `parseSemicolon()`. So `global x` is
+                // "';' expected" ON THE `x` (measured), not the TS1434 an
+                // expression statement `global` earns for a word it cannot
+                // follow.
+                if (isIdentLike(p.peekTag(1)) or p.peekTag(1) == .keyword_export) {
+                    return p.parseBodylessGlobalAugmentation();
+                }
                 return p.parseExpressionStatement();
             },
             .keyword_enum => return p.parseEnumDecl(0),
@@ -2241,6 +2335,21 @@ const Parser = struct {
     fn parseBlockAs(p: *Parser, role: BlockRole) PE!Node {
         const at_brace = p.curTag() == .l_brace;
         const l_brace = try p.expect(.l_brace, .expected_l_brace);
+        // tsc's `parseBlock` reads the statement list ONLY when the `{` was
+        // really there:
+        //
+        //     if (openBraceParsed || ignoreMissingOpenBrace) { … parseList …; parseExpected(CloseBrace) }
+        //     else { return createBlock(createMissingList()) }
+        //
+        // (`ignoreMissingOpenBrace` is set for a FUNCTION body reached through
+        // `SignatureFlags`, never for a plain block.) Reading a list anyway
+        // makes a brace-less block swallow whatever follows as its own
+        // statements — and for the try-statement arm, which is reached with the
+        // very token that sent it there (a bare `finally` at statement level),
+        // it recursed until the stack ran out.
+        if (!at_brace) {
+            return p.addNode(.{ .tag = .block, .main_token = l_brace, .data = .{ .lhs = 0, .rhs = 0 } });
+        }
         // An ambient body reports once, on the `{`, and suppresses the TS1036
         // its own statements would otherwise each be a candidate for — tsc sets
         // the "already reported" bit on the block, which is the very object the
@@ -2930,7 +3039,12 @@ const Parser = struct {
     }
 
     fn parseTryStatement(p: *Parser) PE!Node {
-        const kw = try p.bump();
+        // `parseExpected(TryKeyword)`, not a `bump`: the statement arm also
+        // sends a bare `catch`/`finally` here, and then the `try` is missing.
+        // On failure nothing is consumed and the `{` the block goes on to
+        // expect lands on the very same token, where the one-per-position rule
+        // drops it — so the shape answers ONE "'try' expected".
+        const kw = try p.expect(.keyword_try, .expected_try);
         const block = try p.parseBlock();
         var catch_clause: Node = null_node;
         var finally_block: Node = null_node;
@@ -3294,6 +3408,22 @@ const Parser = struct {
         return p.scratchToSpan(top);
     }
 
+    /// The tokens tsc's `isStartOfParameter` definitely REFUSES. Deliberately
+    /// narrower than that predicate, which also admits everything
+    /// `isStartOfType` admits — `|`, `&`, `?`, `!`, `*`, `new`, `import`,
+    /// `infer`, and every literal including a TEMPLATE one. Answering `true`
+    /// here only re-labels the list's own diagnostic; answering it where tsc
+    /// would have entered `parseParameter` swaps a right code for a wrong one.
+    /// `function f(`hello`);` is the case that proves the caution is needed: a
+    /// no-substitution template IS a type start, so tsgo answers TS1003 there
+    /// and not TS1138.
+    fn startsNoParameter(tag: TokTag) bool {
+        return switch (tag) {
+            .comma, .semicolon, .colon, .eq, .arrow, .dot => true,
+            else => false,
+        };
+    }
+
     fn parseParams(p: *Parser) PE!ast.SubRange {
         // tsc's `parseParameterList` returns a MISSING list the moment the `(`
         // is not there — it neither reads parameters nor goes on to expect a
@@ -3306,29 +3436,95 @@ const Parser = struct {
         _ = try p.bump();
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
+        // TS1014, tsc's `checkGrammarParameterList`: a rest parameter must be
+        // LAST. Blamed on the `...` (`grammarErrorOnNode(parameter.
+        // dotDotDotToken, …)`), and the walk RETURNS at its first hit, so only
+        // the FIRST offending parameter speaks. Judged here rather than in
+        // `parseParam` because "last" is a fact about the whole list.
+        var rest: ?struct { tok: u32, index: usize } = null;
+        var n_params: usize = 0;
+        var trailing_comma: ?u32 = null;
         while (p.curTag() != .r_paren and p.curTag() != .eof) {
             const before = p.curIdx();
+            const diags_before = p.diags.items.len;
+            const last_syn_before = p.last_syntactic_start;
             const param = try p.parseParam();
             if (p.curIdx() == before) {
                 // tsc's `abortParsingListOrMoveToNextToken`: a token that starts
-                // no parameter is reported (already done, inside `parseParam`)
-                // and SKIPPED, and the list keeps going. Ending the list here
-                // instead left the rest of the header to be re-read as
-                // statements, which invented diagnostics tsc never has:
-                // `function* f(a = yield => yield) {}` is one "',' expected"
-                // for tsc, because it skips the `=>` and takes `yield` as a
-                // second parameter, closing the list at the real `)`.
+                // no parameter is reported and SKIPPED, and the list keeps
+                // going. Ending the list here instead left the rest of the
+                // header to be re-read as statements, which invented
+                // diagnostics tsc never has: `function* f(a = yield => yield)
+                // {}` is one "',' expected" for tsc, because it skips the `=>`
+                // and takes `yield` as a second parameter, closing the list at
+                // the real `)`.
+                //
+                // The MESSAGE is the list's, not the element's. tsc never
+                // enters `parseParameter` for such a token at all —
+                // `isListElement(Parameters)` is `isStartOfParameter`, and when
+                // it says no `parseList` files
+                // `parsingContextErrors(Parameters)`, "Parameter declaration
+                // expected." (TS1138). ztsc arrives from the other side —
+                // `parseParam` consuming NOTHING is exactly the shape
+                // `isStartOfParameter` rejects — so whatever it said about the
+                // token is retracted in favour of the list's own answer.
+                // Measured against tsgo: `class X { get x(,) {…} }` is one
+                // TS1138 on the `,`, where ztsc answered TS1003. Only for the
+                // tokens `isStartOfParameter` certainly refuses — see
+                // `startsNoParameter`.
                 if (p.spec > 0) break; // speculating: let the caller decide
+                if (startsNoParameter(p.curTag())) {
+                    p.diags.shrinkRetainingCapacity(diags_before);
+                    p.last_syntactic_start = last_syn_before;
+                    try p.fail(.expected_parameter_declaration);
+                }
                 _ = try p.bump();
                 continue;
             }
             try p.pushScratch(param);
-            if (try p.eat(.comma) == null and p.curTag() != .r_paren) {
+            if (rest == null) {
+                if (p.restDotsToken(param)) |d| rest = .{ .tok = d, .index = n_params };
+            }
+            n_params += 1;
+            // Overwritten every iteration, so at loop exit it is non-null
+            // exactly when the last thing consumed was a comma — i.e. when the
+            // list has a TRAILING one (tsc's `NodeArray.hasTrailingComma`).
+            trailing_comma = try p.eat(.comma);
+            if (trailing_comma == null and p.curTag() != .r_paren) {
                 try p.fail(.expected_comma);
+            }
+        }
+        if (rest) |r| {
+            // Reported even while SPECULATING, unlike the modifier walk above:
+            // an arrow function and a function TYPE both read their parameter
+            // list inside a speculative parse that is then COMMITTED, so a
+            // `spec == 0` guard loses `(...x, y) => 0` and `type T = (...x, y)
+            // => void` outright. `restore` truncates `diags`, so a speculation
+            // that backtracks un-reports this exactly as it un-reports the
+            // literal-grammar diagnostics `checkLiteral` files.
+            if (r.index + 1 != n_params) {
+                try p.errAtToken(.rest_param_not_last, r.tok);
+            } else if (trailing_comma) |ct| {
+                // The walk RETURNS on TS1014, so the two never coexist; and it
+                // skips this one in an ambient context
+                // (`!(parameter.flags & NodeFlags.Ambient)`).
+                if (!p.ambient) try p.errAtToken(.rest_param_trailing_comma, ct);
             }
         }
         _ = try p.expect(.r_paren, .expected_r_paren);
         return p.scratchToSpan(top);
+    }
+
+    /// The `...` token of a REST parameter, or null when `param` is not one.
+    /// A parameter's `main_token` is where it started, which for `...x` is the
+    /// `...` itself. (A rest parameter behind a MODIFIER — `constructor(public
+    /// ...x)` — reports on the modifier instead; the shape is already a
+    /// TS1090, so the column is not worth a second token walk.)
+    fn restDotsToken(p: *const Parser, param: Node) ?u32 {
+        if (p.nodeTagAt(param) != .param_full) return null;
+        const flags = p.extraFieldAt(ast.ParamFull, "flags", p.nodeDataAt(param).rhs);
+        if (flags & ast.Flags.rest == 0) return null;
+        return p.nodeMainTokenAt(param);
     }
 
     fn parseParam(p: *Parser) PE!Node {
@@ -3741,6 +3937,26 @@ const Parser = struct {
                 try p.pushScratch(try p.parseDecorator());
                 continue;
             }
+            // tsc's `isListElement(ClassMembers)` = `lookAhead(isClassMemberStart)`.
+            // A token that starts no member never reaches `parseClassElement`:
+            // `parseList` files TS1068 and `abortParsingListOrMoveToNextToken`
+            // either ENDS the member list (leaving the token to whatever
+            // enclosing list would take it — `isInSomeParsingContext`,
+            // approximated here by the statement list, which is the only
+            // enclosing context a class body has) or skips exactly that token.
+            //
+            // Measured against tsgo, ending the list is what makes `class C {
+            // var x = 1; }` answer TS1068 on the `var` and then TS1128 on the
+            // now-unmatched `}` — the class closes at the `var`, the
+            // declaration becomes a statement, and the `}` is left over. The
+            // `}` this loop then fails to find lands on the very token TS1068
+            // holds, so the one-per-position rule drops it.
+            if (!p.atStartOfClassMember()) {
+                try p.fail(.expected_class_member);
+                if (p.atStartOfStatement()) break;
+                _ = try p.bump();
+                continue;
+            }
             try p.pushScratch(try p.parseClassMember(deco_at, top));
             deco_at = null;
             try p.dropDecoratorsOnStaticBlock(top);
@@ -3865,6 +4081,91 @@ const Parser = struct {
             .keyword_get => ast.Flags.get,
             .keyword_set => ast.Flags.set,
             else => 0,
+        };
+    }
+
+    /// tsc's `isModifierKind` — the tags its `parseModifiers` loop (and the
+    /// modifier walk inside `isClassMemberStart`) will step over. Wider than
+    /// `classMemberModifierBit`, which answers what a modifier MEANS on a class
+    /// member: `default`, `export`, `in` and `out` are modifiers to the walk
+    /// even though no class member carries them.
+    fn isModifierKind(tag: TokTag) bool {
+        return switch (tag) {
+            .keyword_default, .keyword_export, .keyword_in, .keyword_out, .keyword_const => true,
+            .keyword_get, .keyword_set => false,
+            else => classMemberModifierBit(tag) != 0,
+        };
+    }
+
+    /// tsc's `isClassMemberModifier` — the modifiers that can ONLY introduce a
+    /// class member, so seeing one settles `isClassMemberStart` on the spot.
+    fn isClassMemberModifier(tag: TokTag) bool {
+        return switch (tag) {
+            .keyword_public,
+            .keyword_private,
+            .keyword_protected,
+            .keyword_readonly,
+            .keyword_override,
+            .keyword_static,
+            .keyword_accessor,
+            => true,
+            else => false,
+        };
+    }
+
+    /// tsc's `isLiteralPropertyName`: what may stand as a member NAME without
+    /// brackets — any identifier or keyword, or a string/number/BigInt literal.
+    fn isLiteralPropertyName(tag: TokTag) bool {
+        return isNameLike(tag) or tag == .string_literal or
+            tag == .numeric_literal or tag == .bigint_literal;
+    }
+
+    /// tsc's `isClassMemberStart`, the `isListElement` predicate `parseList`
+    /// asks before every iteration of `parseClassMembers`. A token that answers
+    /// false is never handed to `parseClassElement` at all: the list files one
+    /// TS1068 and `abortParsingListOrMoveToNextToken` then decides between
+    /// LEAVING the token to an enclosing list and skipping just it.
+    ///
+    /// The shape it exists to catch is a keyword that could be a member name
+    /// standing in front of something that proves it is not one — `var x = 1`,
+    /// `class C2 {`, `global x` inside a class body. Without the gate those
+    /// read as a field named `var`/`class`/`global` and answer a TS1005
+    /// cascade where tsc answers TS1068 and hands the text back to the
+    /// statement list.
+    ///
+    /// Conservative where the lookahead window runs out: a modifier run longer
+    /// than the window answers `true`, because a false `true` only keeps
+    /// ztsc's existing recovery while a false `false` manufactures a TS1068
+    /// tsc does not report.
+    fn atStartOfClassMember(p: *Parser) bool {
+        if (p.curTag() == .at) return true;
+        var n: usize = 0;
+        var id_tok: ?TokTag = null;
+        while (isModifierKind(p.peekTag(n))) {
+            id_tok = p.peekTag(n);
+            if (isClassMemberModifier(id_tok.?)) return true;
+            n += 1;
+            if (n + 1 >= max_la) return true;
+        }
+        if (p.peekTag(n) == .asterisk) return true;
+        if (isLiteralPropertyName(p.peekTag(n))) {
+            id_tok = p.peekTag(n);
+            n += 1;
+            if (n + 1 >= max_la) return true;
+        }
+        // An index signature or a computed name is a member whatever preceded.
+        if (p.peekTag(n) == .l_bracket) return true;
+        const idt = id_tok orelse return false;
+        // A plain identifier settles it; so do the two ACCESSOR words, which
+        // are keywords but always introduce a member.
+        if (!idt.isKeyword() or idt == .keyword_get or idt == .keyword_set) return true;
+        return switch (p.peekTag(n)) {
+            // Method, generic method, `!` definite, `:` annotation, `=`
+            // initializer, `?` optional — each proves the keyword was a name.
+            .l_paren, .lt, .lt_lt, .lt_lt_eq, .bang, .colon, .eq, .question => true,
+            // tsc's `canParseSemicolon()`: the keyword stands alone as a field.
+            .semicolon, .r_brace, .eof => true,
+            else => p.peekNewline(n),
         };
     }
 
@@ -4162,6 +4463,20 @@ const Parser = struct {
             else => {
                 if (isNameLike(p.curTag())) {
                     name_tok = try p.bump();
+                } else if (star != null) {
+                    // A generator `*` puts tsc PAST `isClassMemberStart` (which
+                    // returns true on the `*` alone) and inside
+                    // `parsePropertyOrMethodDeclaration`, where the name comes
+                    // from `parsePropertyName` — so a missing one is
+                    // `createIdentifier`'s TS1003, not the list-level TS1068.
+                    // The member then keeps parsing, which is what holds
+                    // `class C { *() {} }` to that single diagnostic: the `(`
+                    // that follows opens the method's parameter list instead of
+                    // being re-offered to the member loop as two more junk
+                    // tokens. Measured against tsgo, `*() {}`, a bare `*`, `* =
+                    // 1;` and `* ;` all answer TS1003 alone.
+                    try p.fail(.expected_identifier);
+                    name_tok = p.lastIdx();
                 } else {
                     // A CLASS member name: tsc's `parseClassElement` answers
                     // TS1068 here, not the object-literal TS1136.
@@ -4823,6 +5138,24 @@ const Parser = struct {
     /// the block's top-level declarations become global contributions the
     /// linker merges into the program global table. `name_token` points
     /// at the `global` keyword purely for span/dump purposes.
+    /// `global` standing where tsc reads a global augmentation but with no `{`
+    /// to open a body — `parseAmbientExternalModuleDeclaration`'s
+    /// `else { parseSemicolon(); }` arm. The declaration is real (its NAME is
+    /// the `global` keyword) and simply empty; what matters is that the token
+    /// after it is answered by `parseSemicolon` rather than by the
+    /// expression-statement recovery.
+    fn parseBodylessGlobalAugmentation(p: *Parser) PE!Node {
+        const kw = try p.bump(); // `global`
+        try p.expectSemicolon();
+        const extra = try p.addExtra(ast.NamespaceData{
+            .flags = ast.Flags.declare | ast.Flags.global_aug,
+            .name_token = kw,
+            .body_start = 0,
+            .body_end = 0,
+        });
+        return p.addNode(.{ .tag = .namespace_decl, .main_token = kw, .data = .{ .lhs = extra, .rhs = 0 } });
+    }
+
     fn parseGlobalAugmentation(p: *Parser) PE!Node {
         const kw = try p.bump(); // `global`
         _ = try p.expect(.l_brace, .expected_l_brace);
@@ -5144,11 +5477,26 @@ const Parser = struct {
             // any ModuleExportName — are silent (`es6ImportNamedImport
             // IdentifiersParsing`, `arbitraryModuleNamespaceIdentifiers_syntax`).
             if (!isIdentLike(p.curTag()) and p.peekTag(1) != .keyword_as) {
-                try p.fail(.expected_identifier);
+                try p.failIdentifierLiteral();
             }
             const name = try p.bump();
             var alias: u32 = 0;
-            if (try p.eat(.keyword_as) != null) alias = try p.expectIdentLike();
+            // The ALIAS is the name an IMPORT specifier BINDS, so it goes
+            // through the same explicit check as the bare form above — tsc's
+            // `parseNameWithKeywordCheck` records the token and the
+            // `checkIdentifierIsKeyword` branch answers TS1003 on it, not the
+            // TS1359 `createIdentifier` would choose. `import { yield as
+            // default }` and `import { default as default }` both land here.
+            if (try p.eat(.keyword_as) != null) {
+                if (isIdentLike(p.curTag())) {
+                    try p.checkStrictReserved();
+                    try p.checkAwaitReservedName();
+                    alias = try p.bump();
+                } else {
+                    try p.failIdentifierLiteral();
+                    alias = p.lastIdx();
+                }
+            }
             try p.pushScratch(try p.addNode(.{ .tag = .import_specifier, .main_token = name, .data = .{ .lhs = alias, .rhs = spec_flags } }));
             if (try p.eat(.comma) == null and p.curTag() != .r_brace) {
                 try p.fail(.expected_comma);
@@ -7067,7 +7415,8 @@ const Parser = struct {
             _ = try p.bump();
             flags |= bit;
         }
-        if (try p.eat(.asterisk) != null) flags |= ast.Flags.generator;
+        const star = try p.eat(.asterisk);
+        if (star != null) flags |= ast.Flags.generator;
 
         // Key. tsc reads `tokenIsIdentifier = isIdentifier()` BEFORE consuming
         // the property name, because only a real identifier can stand alone as
@@ -7108,6 +7457,19 @@ const Parser = struct {
                     if (p.curTag() == .private_identifier) try p.errAtCur(.private_name_outside_class);
                     key_tok = p.curIdx();
                     key = try p.leaf(.identifier);
+                } else if (star != null) {
+                    // tsc's `parseObjectLiteralElement` reads the `*` first and
+                    // then calls `parsePropertyName()` unconditionally, so a
+                    // missing name behind a generator star is
+                    // `createIdentifier`'s TS1003 — not the TS1136 that answers
+                    // "nothing here starts a property at all". The element then
+                    // keeps parsing as a method, which is what holds
+                    // `{ *() {} }` to that single diagnostic. Measured against
+                    // tsgo: `{ *() {} }`, `{ *{ } }`, `{ * }` and
+                    // `{ *<T>() {} }` all answer TS1003 alone.
+                    try p.fail(.expected_identifier);
+                    key_tok = star.?;
+                    key = try p.addNode(.{ .tag = .identifier, .main_token = key_tok, .data = .{ .lhs = 0, .rhs = 0 } });
                 } else {
                     try p.fail(.expected_property_name);
                     return p.errorNode();

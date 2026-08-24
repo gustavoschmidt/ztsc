@@ -99,6 +99,11 @@ pub const Code = enum(u16) {
     /// `parsingContextErrors(ArrayBindingElements)`, a third wording beside
     /// TS1180's and TS1134's.
     expected_binding_pattern_element,
+    /// TS1138: `parsingContextErrors(Parameters)` — a token that starts no
+    /// PARAMETER, in a parameter list (`get x(,)`). A fourth wording in the
+    /// same family: the list has its own answer, and it replaces whatever the
+    /// element parse would have said about the token.
+    expected_parameter_declaration,
     expected_binding,
     /// TS1389: the OTHER half of `parsingContextErrors(VariableDeclarations)`.
     /// The same refusal as `expected_binding`, worded for a KEYWORD — `var
@@ -127,6 +132,11 @@ pub const Code = enum(u16) {
     expected_import_clause,
     expected_export_clause,
     expected_while,
+    /// TS1005 `'try' expected`: tsc's `parseStatement` routes a bare `catch`
+    /// or `finally` to `parseTryStatement`, whose `parseExpected(TryKeyword)`
+    /// answers this and consumes nothing — the clause the word really opens
+    /// then parses as usual.
+    expected_try,
     expected_case_or_default,
     expected_catch_or_finally,
     expected_declaration,
@@ -170,6 +180,16 @@ pub const Code = enum(u16) {
     /// bound NAME, not the `...` (measured against tsgo 7.0.2). Grammar-class,
     /// so the rest of the file is still checked.
     rest_must_be_last,
+    /// TS1014: the PARAMETER-list counterpart of the rule above —
+    /// `checkGrammarParameterList`'s first clause, blamed on the `...` token.
+    /// A grammar diagnostic like its sibling: `function f(...x, y) {}` answers
+    /// it AND the TS7019/TS7006 the same parameters earn (measured).
+    rest_param_not_last,
+    /// TS1013: the same walk's SECOND clause —
+    /// `checkGrammarForDisallowedTrailingComma(parameters, …)`, reached only
+    /// when the last parameter IS a rest one, reported on the trailing comma
+    /// itself, and skipped in an ambient context.
+    rest_param_trailing_comma,
     /// Line break not allowed here (e.g. after `throw`).
     line_break_not_allowed,
     /// Trailing comma or elision where the grammar forbids it.
@@ -842,6 +862,18 @@ pub const Code = enum(u16) {
     /// reads it back off the span; like them, it is a GRAMMAR diagnostic
     /// (measured — see `class`), despite reading as parser code in tsc.
     reserved_word_here,
+    /// TS1359 again, same number and same wording, but from tsc's PARSER:
+    /// `createIdentifier` prefers this over TS1003 whenever the token standing
+    /// where an identifier was required is a reserved word (`import q = null`,
+    /// `enum { case }`, `var { while: w }`). Measured, the two spellings differ
+    /// in CLASS and only in class: `import q = null` next to a sibling
+    /// `const bad: string = 1` reports the TS1359 and SUPPRESSES the TS2322,
+    /// while `class C { static { let await = 1 } }` next to the same sibling
+    /// reports both — so this one lives in `parseDiagnostics` and
+    /// `reserved_word_here` does not. Being syntactic also puts it in the
+    /// one-per-position rule, which is what drops the "';' expected" the
+    /// recovery would otherwise add on the very same token.
+    reserved_word_identifier,
 
     // --- class static blocks (tsc's `checkGrammar*`, so all four are semantic)
     /// TS18037: `await x` inside a static block. The operator parses — a static
@@ -1077,6 +1109,8 @@ pub const Code = enum(u16) {
             .multiple_default_clauses,
             .line_break_not_allowed,
             .rest_must_be_last,
+            .rest_param_not_last,
+            .rest_param_trailing_comma,
             .expected_string_literal,
             .statement_not_allowed_in_ambient,
             .implementation_not_allowed_in_ambient,
@@ -1302,6 +1336,7 @@ pub const Code = enum(u16) {
             .expected_property_name => "Property assignment expected.",
             .expected_binding_pattern_property => "Property destructuring pattern expected.",
             .expected_binding_pattern_element => "Array element destructuring pattern expected.",
+            .expected_parameter_declaration => "Parameter declaration expected.",
             .expected_binding => "Variable declaration expected.",
             .reserved_var_decl_name => "'{0}' is not allowed as a variable declaration name.",
             .empty_var_decl_list => "Variable declaration list cannot be empty.",
@@ -1312,6 +1347,7 @@ pub const Code = enum(u16) {
             .expected_import_clause => "expected an import clause",
             .expected_export_clause => "expected an export clause",
             .expected_while => "'while' expected.",
+            .expected_try => "'try' expected.",
             .expected_case_or_default => "'case' or 'default' expected.",
             .expected_catch_or_finally => "'catch' or 'finally' expected.",
             .expected_declaration => "Declaration expected.",
@@ -1328,6 +1364,8 @@ pub const Code = enum(u16) {
             .newline_before_arrow => "Line terminator not permitted before arrow.",
             .multiple_default_clauses => "A 'default' clause cannot appear more than once in a 'switch' statement.",
             .rest_must_be_last => "A rest element must be last in a destructuring pattern.",
+            .rest_param_not_last => "A rest parameter must be last in a parameter list.",
+            .rest_param_trailing_comma => "A rest parameter or binding pattern may not have a trailing comma.",
             .line_break_not_allowed => "Line break not permitted here.",
             .argument_expected => "Argument expression expected.",
             .statement_not_allowed_in_ambient => "Statements are not allowed in ambient contexts.",
@@ -1364,7 +1402,9 @@ pub const Code = enum(u16) {
             .strict_reserved_word => "Identifier expected. '{0}' is a reserved word in strict mode.",
             .strict_reserved_word_in_class => "Identifier expected. '{0}' is a reserved word in strict mode. Class definitions are automatically in strict mode.",
             .strict_reserved_word_in_module => "Identifier expected. '{0}' is a reserved word in strict mode. Modules are automatically in strict mode.",
-            .reserved_word_here => "Identifier expected. '{0}' is a reserved word that cannot be used here.",
+            .reserved_word_here,
+            .reserved_word_identifier,
+            => "Identifier expected. '{0}' is a reserved word that cannot be used here.",
             .await_in_static_block => "'await' expression cannot be used inside a class static block.",
             .for_await_in_static_block => "'for await' loops cannot be used inside a class static block.",
             .return_in_static_block => "A 'return' statement cannot be used inside a class static block.",
@@ -1606,6 +1646,7 @@ pub const Code = enum(u16) {
             .expected_from,
             .expected_as,
             .expected_while,
+            .expected_try,
             .expected_eq,
             .expected_export,
             .regex_expected_r_brace,
@@ -1648,6 +1689,7 @@ pub const Code = enum(u16) {
             .expected_property_name => 1136,
             .expected_binding_pattern_property => 1180,
             .expected_binding_pattern_element => 1181,
+            .expected_parameter_declaration => 1138,
             .expected_binding => 1134,
             .reserved_var_decl_name => 1389,
             .empty_var_decl_list => 1123,
@@ -1715,7 +1757,7 @@ pub const Code = enum(u16) {
             .strict_reserved_word => 1212,
             .strict_reserved_word_in_class => 1213,
             .strict_reserved_word_in_module => 1214,
-            .reserved_word_here => 1359,
+            .reserved_word_here, .reserved_word_identifier => 1359,
             .await_in_static_block => 18037,
             .for_await_in_static_block => 18038,
             .return_in_static_block => 18041,
@@ -1836,6 +1878,8 @@ pub const Code = enum(u16) {
             .continue_label_not_iteration => 1115,
             .element_access_needs_argument => 1011,
             .rest_must_be_last => 2462,
+            .rest_param_not_last => 1014,
+            .rest_param_trailing_comma => 1013,
             .module_name_needs_quoted_string => 1443,
             .jsx_comma_operator => 18007,
             .rest_element_property_name => 2566,

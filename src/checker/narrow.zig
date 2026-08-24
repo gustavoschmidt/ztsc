@@ -657,6 +657,33 @@ pub fn unionFacet(c: *Checker, t: TypeId) Error!TypeId {
     return if (c.ts.kind(r) == .union_type) r else t;
 }
 
+/// The gate every discriminant narrowing goes through — tsc reaches the
+/// equality, `typeof`, truthiness and `switch` forms only via
+/// `getDiscriminantPropertyAccess`, which asks `isDiscriminantProperty` of
+/// `declaredType.flags & Union ? declaredType : computedType`.
+///
+/// The declared union is preferred, exactly as tsc writes it, but it does NOT
+/// get a VETO: a declared union that cannot discriminate falls back to the
+/// narrowed type. Measured against tsgo, both of
+///
+///     declare const v: Record<string, any> | undefined;   // and { x: number } | undefined
+///     if (isMyDiscriminatedUnion(v)) { if (v.type === 'A') { … } }
+///
+/// land on the `'A'` arm, though the declared union has no unit-typed `type`
+/// on any constituent — `Record<string, any>` answers it only through an index
+/// signature and `{ x: number }` not at all. Reading the declared union alone
+/// made the guard's own result unusable, which is the TS2339 false positive in
+/// `narrowingUnionToUnion` and `subtypeReductionUnionConstraints`.
+///
+/// The two shapes the gate exists to protect are unaffected, because neither
+/// type discriminates: a non-union reference (the `switch (data.encoding)`
+/// exhaustiveness idiom) and a union whose property is uniform and non-unit
+/// (`sel[0].id === …` on a `line | arrow`).
+fn discriminates(c: *Checker, t: TypeId, decl: TypeId, prop: Atom) Error!bool {
+    if (try c.isDiscriminantProp(decl, prop)) return true;
+    return c.isDiscriminantProp(t, prop);
+}
+
 pub fn narrowByDiscriminant(c: *Checker, t0: TypeId, prop: Atom, value: TypeId, sense: bool, decl0: TypeId) Error!TypeId {
     const t = try unionFacet(c, t0);
     const decl = try unionFacet(c, decl0);
@@ -690,8 +717,7 @@ pub fn narrowByDiscriminant(c: *Checker, t0: TypeId, prop: Atom, value: TypeId, 
     // `flowTypeInner` — for a reference already narrowed to one constituent
     // it is still the union, which is exactly the shape the single-member
     // fallback above exists for.
-    const disc_over = if (c.ts.kind(decl) == .union_type) decl else t;
-    if (!try c.isDiscriminantProp(disc_over, prop)) return t;
+    if (!try discriminates(c, t, decl, prop)) return t;
     // tsc's `narrowTypeByEquality` subtracts on the NOT-EQUAL side only when
     // the COMPARAND is a unit type: `if (valueType.flags & TypeFlags.Unit)
     // return filterType(…); return type;`. A comparand that is a whole enum
@@ -764,8 +790,7 @@ pub fn narrowByDiscriminantTypeof(c: *Checker, t0: TypeId, prop: Atom, str: Atom
     const t = try unionFacet(c, t0);
     if (c.ts.kind(t) != .union_type) return t0;
     const decl = try unionFacet(c, decl0);
-    if (!try c.isDiscriminantProp(if (c.ts.kind(decl) == .union_type) decl else t, prop))
-        return t0;
+    if (!try discriminates(c, t, decl, prop)) return t0;
     var parts: std.ArrayList(TypeId) = .empty;
     defer parts.deinit(c.scratch());
     const members = try c.memberList(t);
@@ -795,8 +820,7 @@ pub fn narrowByPropTruthiness(c: *Checker, t0: TypeId, prop: Atom, sense: bool, 
     // uniformly non-optional and never a unit type — dropped every member on
     // the falsy branch and left `never`, so the `||`'s right operand reported
     // TS2339 on the same reference. tsc leaves the union untouched there.
-    if (!try c.isDiscriminantProp(if (c.ts.kind(decl) == .union_type) decl else t, prop))
-        return t0;
+    if (!try discriminates(c, t, decl, prop)) return t0;
     var parts: std.ArrayList(TypeId) = .empty;
     defer parts.deinit(c.scratch());
     const truth_members = try c.memberList(t);
