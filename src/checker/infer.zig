@@ -5107,6 +5107,63 @@ pub fn constituentRelatesTo(c: *Checker, param: TypeId, m: TypeId) Error!bool {
     return false;
 }
 
+/// One element of a reverse-mapped rebuild: match `src_ty` against the value
+/// template with `S[K]` replaced by the element variable `fp_sym`, and read the
+/// variable back.
+///
+/// The inferred element is `S[k]`, which can never legitimately BE `S` itself. A
+/// bare `S` in the candidate is a contextual-feedback artifact — the object
+/// literal was contextually typed with a partially-resolved `S`, injecting it
+/// into the reducer's `state:` parameter — so it is stripped, leaving the
+/// reducer's own state rather than a self-referential union.
+fn reverseMappedElem(c: *Checker, template: TypeId, src_ty: TypeId, fp_sym: u32, src_sym: u32, depth: u32) Error!TypeId {
+    const local_syms = [_]u32{fp_sym};
+    var elem = [_]TypeId{types.no_type};
+    try c.unify(template, src_ty, &local_syms, &elem, depth + 1);
+    return c.stripSourceParam(if (elem[0] != types.no_type) elem[0] else types.unknown_type, src_sym);
+}
+
+/// tsc's `createReverseMappedType` precondition: a string index signature, or
+/// at least one property AND `isPartiallyInferableType`. A source built entirely
+/// out of `anyFunctionType` placeholders is not evidence about anything.
+fn reverseMappable(c: *Checker, t: TypeId, depth: u32) Error!bool {
+    const s = &c.ts;
+    if (s.kind(t) == .object and s.objectStringIndex(t) != 0) return true;
+    if (s.kind(t) == .object and s.objectPropCount(t) == 0) return false;
+    return partiallyInferable(c, t, depth);
+}
+
+/// tsc's `isPartiallyInferableType`:
+///
+///     !(getObjectFlags(type) & ObjectFlags.NonInferrableType) ||
+///     isObjectLiteralType(type) && some(getPropertiesOfType(type), p => isPartiallyInferableType(getTypeOfSymbol(p))) ||
+///     isTupleType(type) && some(getElementTypes(type), isPartiallyInferableType)
+///
+/// `containsAnyFunctionType` is ztsc's recomputed `NonInferrableType` flag; it
+/// is only ever consulted while `Checker.aft_seen` says a placeholder was minted
+/// at all, so the ordinary inference path answers `true` on the first line.
+fn partiallyInferable(c: *Checker, t: TypeId, depth: u32) Error!bool {
+    if (!c.aft_seen) return true;
+    if (depth > 4) return true;
+    if (!try containsAnyFunctionType(c, t, 0)) return true;
+    const s = &c.ts;
+    switch (s.kind(t)) {
+        .object => {
+            for (0..s.objectPropCount(t)) |i| {
+                if (try partiallyInferable(c, s.objectProp(t, @intCast(i)).ty, depth + 1)) return true;
+            }
+            return false;
+        },
+        .tuple => {
+            for (0..s.tupleLen(t)) |i| {
+                if (try partiallyInferable(c, s.tupleElem(t, @intCast(i)).ty, depth + 1)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
 /// Reverse-mapped-type inference (tsc's `inferReverseMappedType`): infer the
 /// source `S` of a HOMOMORPHIC mapped target `{ [K in keyof S]: F<S[K]> }`
 /// from an object-literal argument. For each source property `k`, infer the
@@ -5157,10 +5214,64 @@ pub fn inferReverseMapped(c: *Checker, m: TypeId, arg: TypeId, tp_syms: []const 
         }
     }
     if (s.mappedAs(m) != 0) return; // no key remap
+    if (s.mappedHomomorphic(m)) {
+        return inferReverseMappedFrom(c, m, s.mappedSource(m), arg, tp_syms, candidates, depth);
+    }
+    // A COMPOSITE key set. tsc's `inferToMappedType` walks a union or
+    // intersection constraint constituent by constituent
+    // (`result ||= inferToMappedType(source, target, type)`) and takes the
+    // homomorphic path for any `keyof T` it finds, so
+    // `{ [K in keyof T & keyof CompilerOptions]: … }` still infers `T`. The walk
+    // has to descend BOTH connectives to any depth: ztsc's intersection
+    // normalizer distributes over a union, storing that very constraint as
+    // `("allowUnreachableCode" & keyof T) | ("allowUnusedLabels" & keyof T) | …`.
+    if (try homomorphicOperand(c, s.mappedConstraint(m), tp_syms, 0)) |op| {
+        return inferReverseMappedFrom(c, m, op, arg, tp_syms, candidates, depth);
+    }
     // `{ [P in K]: … }` with `K` itself an inference target (`Pick<S, K>`):
-    // the key set is what the argument tells us. Handled separately below.
-    if (!s.mappedHomomorphic(m)) return c.inferMappedKeySet(m, arg, tp_syms, candidates);
-    const src = s.mappedSource(m);
+    // the key set is what the argument tells us.
+    return c.inferMappedKeySet(m, arg, tp_syms, candidates);
+}
+
+/// The `keyof T` operand buried in a composite mapped-type constraint, where
+/// `T` is one of the type parameters this call is solving — the constituent
+/// tsc's `inferToMappedType` walk takes the homomorphic path for. Null when the
+/// constraint names no such source.
+fn homomorphicOperand(c: *Checker, con: TypeId, tp_syms: []const u32, depth: u32) Error!?TypeId {
+    if (con == 0 or depth > 4) return null;
+    const s = &c.ts;
+    switch (s.kind(con)) {
+        .keyof_op => {
+            const operand = s.keyofOperand(con);
+            if (s.kind(operand) != .type_param) return null;
+            if (tpIndex(tp_syms, s.typeParamSymbol(operand)) == null) return null;
+            return operand;
+        },
+        .union_type, .intersection => {
+            const ms = try c.scratch().dupe(TypeId, try c.memberList(con));
+            defer c.scratch().free(ms);
+            for (ms) |mm| {
+                if (try homomorphicOperand(c, mm, tp_syms, depth + 1)) |op| return op;
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
+/// The homomorphic half of `inferReverseMapped`, with the SOURCE named
+/// explicitly so a composite constraint can hand it the `keyof T` operand it
+/// found rather than the mapped type's own (absent) source.
+fn inferReverseMappedFrom(
+    c: *Checker,
+    m: TypeId,
+    src: TypeId,
+    arg: TypeId,
+    tp_syms: []const u32,
+    candidates: []TypeId,
+    depth: u32,
+) Error!void {
+    const s = &c.ts;
     if (s.kind(src) != .type_param) return; // source must be a bare param
     const src_sym = s.typeParamSymbol(src);
     const idx = tpIndex(tp_syms, src_sym) orelse return; // …that we're inferring
@@ -5175,43 +5286,39 @@ pub fn inferReverseMapped(c: *Checker, m: TypeId, arg: TypeId, tp_syms: []const 
     if (s.kind(ra) == .mapped and s.mappedAs(ra) == 0 and s.mappedHomomorphic(ra)) {
         return c.unify(src, s.mappedSource(ra), tp_syms, candidates, depth + 1);
     }
-    // HANDOFF (wave 31 B, built and measured, REVERTED on the app gate). Three
-    // changes turn this into tsc's `inferToMappedType` + `createReverseMappedType`
-    // and are worth +3 exact on the corpus (`reverseMappedTupleContext`,
-    // `objectFromEntries`, `reverseMappedTypeLimitedConstraint`), zero corpus
-    // regressions — but EACH of them, alone or together, moves social-app:
+    // HANDOFF — the ARRAY/TUPLE rebuild, tsc's "for arrays and tuples we infer
+    // new arrays and tuples where the reverse mapping has been applied to the
+    // element type(s)". Built and measured (wave 32 A): widening the switch to
+    // `.object, .array, .tuple` and running the element loop below over
+    // `arrayElem` / `tupleElem` — with a map that ADDS `?` clearing
+    // `elem_flag_optional`, the tuple twin of `keep_mask` — is worth
+    // `reverseMappedTupleContext` and `objectFromEntries` on the corpus, but
+    // takes social-app from 87 to 93: a react-query `QueryBehavior<{…}>` vs
+    // `QueryBehavior<unknown>` variance failure in Composer.tsx plus five
+    // `Property … does not exist on type '{}'` around it. The other three
+    // pieces of the wave-31 handoff are landed and clean at 87 (the
+    // `isPartiallyInferableType` guard below is what made the composite key set
+    // safe); this one is not, and its witness is Composer.tsx's
+    // `useInfiniteQuery`, not the corpus.
+    switch (s.kind(ra)) {
+        .object => {},
+        else => return,
+    }
+    // tsc's `createReverseMappedType` head, the gate the rebuild below never
+    // had:
     //
-    //   1. a COMPOSITE key set. tsc walks a union/intersection constraint
-    //      constituent by constituent (`result ||= inferToMappedType(source,
-    //      target, type)`) and takes the homomorphic path for any `keyof T` it
-    //      finds, so `{ [K in keyof T & keyof CompilerOptions]: … }` infers `T`.
-    //      The walk must descend BOTH connectives to any depth — ztsc's
-    //      intersection normalizer distributes over a union, storing that
-    //      constraint as `("allowUnreachableCode" & keyof T) | …`. Split this
-    //      function so the source is a parameter and call it with the operand.
-    //   2. `substElemAccess` needs a `.mapped` arm (rebuild constraint / value /
-    //      `as` / source), or a mapped type NESTED in the template keeps its
-    //      `S[K]` and the element variable never enters the template at all.
-    //   3. the rebuild must cover ARRAY and TUPLE sources, not just `.object`
-    //      ("for arrays and tuples we infer new arrays and tuples where the
-    //      reverse mapping has been applied to the element type(s)") — which is
-    //      what a nested map resolves to once (2) puts the element variable in
-    //      its source.
+    //     if (!(getIndexInfoOfType(source, stringType) ||
+    //           getPropertiesOfType(source).length !== 0 && isPartiallyInferableType(source))) {
+    //         return undefined;
+    //     }
     //
-    // MEASURED on social-app at the committed baseline (87 check errors):
-    //   * 1+2+3 -> 93: six fresh FPs in Composer.tsx (a react-query
-    //     `QueryBehavior<{…}>` vs `QueryBehavior<unknown>` variance failure plus
-    //     five `Property … does not exist on type '{}'`).
-    //   * 1 alone -> 98: eleven fresh FPs in ageAssurance/data.tsx instead.
-    //   * 2+3 without 1 -> 193. (2) is destructive without (3) to complete the
-    //     inversion; they are one change, not two.
-    // So (3) does not merely add — it also MASKS what (1) breaks. tsc's guard
-    // that ztsc does not have is `isPartiallyInferableType` /
-    // `getIndexInfoOfType(source, stringType)` at the head of
-    // `createReverseMappedType`; the next attempt should start there, and
-    // should treat social-app's `useInfiniteQuery` options object as the
-    // witness rather than the corpus.
-    if (s.kind(ra) != .object) return;
+    // A source every one of whose properties is `anyFunctionType` — the object
+    // literal of a call whose round one skipped every context-sensitive
+    // property — carries no evidence at all, and reverse-mapping it manufactures
+    // a shape out of the placeholders. tsc refuses outright and leaves the
+    // parameter for round two, which is what react-query's
+    // `useInfiniteQuery({queryFn, getNextPageParam})` needs.
+    if (!try reverseMappable(c, ra, 0)) return;
     const key_param = s.mappedKeyParam(m);
     const key_id = s.mappedParamId(key_param);
     const value = s.mappedValue(m);
@@ -5239,19 +5346,13 @@ pub fn inferReverseMapped(c: *Checker, m: TypeId, arg: TypeId, tp_syms: []const 
     if (mflags & types.mapped_flag_readonly_add != 0) keep_mask &= ~types.prop_flag_readonly;
     var props: std.ArrayList(types.Prop) = .empty;
     defer props.deinit(c.scratch());
-    const local_syms = [_]u32{fp_sym};
     for (0..s.objectPropCount(ra)) |i| {
         const p = s.objectProp(ra, @intCast(i));
-        var elem = [_]TypeId{types.no_type};
-        try c.unify(template, p.ty, &local_syms, &elem, depth + 1);
-        // The inferred element is `S[k]`, which can never legitimately BE
-        // `S` itself. A bare `S` appearing in the candidate is a
-        // contextual-feedback artifact (the object literal was
-        // contextually typed with a partially-resolved `S`, injecting it
-        // into the reducer's `state:` parameter); strip it so the inferred
-        // state is the reducer's own state, not a self-referential union.
-        const et = try c.stripSourceParam(if (elem[0] != types.no_type) elem[0] else types.unknown_type, src_sym);
-        try props.append(c.scratch(), .{ .name = p.name, .ty = et, .flags = p.flags & keep_mask });
+        try props.append(c.scratch(), .{
+            .name = p.name,
+            .ty = try reverseMappedElem(c, template, p.ty, fp_sym, src_sym, depth),
+            .flags = p.flags & keep_mask,
+        });
     }
     if (props.items.len == 0) return;
     const obj = try c.objectFromProps(props.items, 0, 0);
@@ -5636,6 +5737,30 @@ pub fn substElemAccess(c: *Checker, t: TypeId, src_sym: u32, key_id: u32, fp: Ty
             const tru = try c.substElemAccess(s.condTrue(t), src_sym, key_id, fp, depth + 1);
             const fls = try c.substElemAccess(s.condFalse(t), src_sym, key_id, fp, depth + 1);
             return s.makeConditional(chk, ext, tru, fls, s.condDistributive(t));
+        },
+        // A mapped type NESTED in the value template — `{ [K in keyof S]:
+        // { [P in keyof S[K]]: … } }`, and every `Record`/`Partial` written over
+        // `S[K]`. Without this arm the nested map keeps its `S[K]` verbatim, the
+        // element variable never enters the template at all, and the inversion
+        // reads back nothing for that property.
+        .mapped => {
+            const con = if (s.mappedConstraint(t) != 0)
+                try c.substElemAccess(s.mappedConstraint(t), src_sym, key_id, fp, depth + 1)
+            else
+                0;
+            const val = if (s.mappedValue(t) != 0)
+                try c.substElemAccess(s.mappedValue(t), src_sym, key_id, fp, depth + 1)
+            else
+                0;
+            const as_c = if (s.mappedAs(t) != 0)
+                try c.substElemAccess(s.mappedAs(t), src_sym, key_id, fp, depth + 1)
+            else
+                0;
+            const msrc = if (s.mappedSource(t) != 0)
+                try c.substElemAccess(s.mappedSource(t), src_sym, key_id, fp, depth + 1)
+            else
+                0;
+            return s.makeMapped(s.mappedKeyParam(t), con, val, as_c, msrc, s.mappedFlags(t));
         },
         else => return t,
     }
