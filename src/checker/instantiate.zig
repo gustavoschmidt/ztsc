@@ -116,16 +116,52 @@ pub fn aliasInstance(c: *Checker, sym: SymbolId, args: []const TypeId, tok: Toke
     //     it reduces to `{}` and four diagnostics follow (restore.ts:404/417,
     //     newElement.ts:749/756).
     //   * WHOLE cycle fixes exactly that (both members keep the ref, nothing
-    //     mixes) and exposes a different gap one layer down: a property lookup
-    //     through an INTERSECTION that still contains a `.ref` does not
-    //     intersect the ref's members, so `{containerId: string} &
-    //     ExcalidrawTextElement` answers `string | null` for `containerId`
-    //     instead of `string` — five TS2345 in resize.test.tsx.
+    //     mixes) and exposes a different gap one layer down: an INTERSECTION
+    //     that still contains a `.ref` is not judged uninhabited through the
+    //     ref's own constituents, so `{ type: "arrow" } & ExcalidrawLinear
+    //     Element & ExcalidrawTextElement` survives as a union member instead
+    //     of reducing to `never` — five TS2345 in resize.test.tsx.
     //
-    // So the whole-cycle keying plus that intersection-lookup fix is the
-    // landable path, and it is the one to finish.
+    // ===== WAVE 30: BOTH OF THOSE ARE NOW FIXED; THE KEYING IS NOT =====
     //
-    // Two more things the next attempt needs, both measured here:
+    // The two blockers above shipped as standalone fixes and are gone:
+    //
+    //   * `computeIntersectionIsNever` (assign.zig) now lets a constituent
+    //     that resolved to an intersection into its member scan, so the
+    //     resize.test.tsx five are closed.
+    //   * `materializeMapped`'s union arm (mapped.zig) now distributes over an
+    //     ARRAY constituent, so `Mutable<readonly A[] | readonly B[]>` is
+    //     `A[] | B[]` instead of `{}` and the restore/newElement four are
+    //     closed. (Tuples stay off that arm — see the note there.)
+    //
+    // The KEYING itself is not in the tree: the `alias_stack` / `markCycle`
+    // machinery was built, measured, and REVERTED, because it costs the false
+    // positives below. Wave 31 rebuilds it — it is a dozen lines. Push `sym` in
+    // `aliasGeneric` and pop on the way out; when the cut arm fires, mark the
+    // stack suffix from `sym`'s own frame to the innermost one.
+    //
+    // With both landed, excalidraw is byte-identical to its baseline under the
+    // whole-cycle keying AND under the narrower `.intersection`-body-only
+    // variant. social-app is what still blocks, and the two variants fail
+    // differently (measured at `--checkers=1` against the SAME binary's own
+    // `--checkers=1` run — the committed app baseline is a default-checkers
+    // capture, and comparing across the two shows a spurious ±1 that is a
+    // pre-existing partition artifact, not a regression):
+    //
+    //   * whole cycle + `originTaggable` — 3 fresh tsgo-clean FPs, all one
+    //     family: `AnimatedRef<T>`'s `current` comes back `unknown`, because
+    //     `AnimatedRefCurrent<TRef> = ExtractElementRef<TRef extends
+    //     AnimatedComponentType<any, infer Instance> ? Instance : TRef>` no
+    //     longer recovers `Instance` once `AnimatedComponentType` keeps its
+    //     ref (DraggableList/index.tsx:195, ImageItem.ios.tsx:111,
+    //     Composer.tsx:1367). The fix belongs in `infer.zig`'s `.ref`
+    //     PARAMETER arm, which pairs a UNION argument by identity but has no
+    //     such arm for an INTERSECTION argument.
+    //   * whole cycle, ref kept only for an `.intersection` BODY — 1 fresh FP,
+    //     exactly the `shallow_default` case below (FeedPage.tsx:101).
+    //
+    // So the narrower variant is one gap from landing, and that gap is the
+    // next bullet. It is the closer path of the two.
     //
     //   * `fixTypeArgs`' `shallow_default` guard rides on this rule. It asks
     //     whether a type parameter's DEFAULT resolved to a `.ref`, which is
@@ -143,6 +179,19 @@ pub fn aliasInstance(c: *Checker, sym: SymbolId, args: []const TypeId, tok: Toke
     //     branch, which is the re-materialization hazard that branch exists to
     //     avoid. It has to be scoped to the cyclic aliases, not applied to
     //     every named default.
+    //
+    //     WAVE 30 built that scoping and it SEGFAULTS social-app — a stack
+    //     overflow, not a wrong answer. Two scopings were tried and both crash:
+    //     `nodeTag(tp.default) == .type_ref and <sym is on a cycle>`, and the
+    //     same plus `containsTypeParam(def)`. Threading a concrete argument
+    //     through react-navigation's cyclic defaults drives the substitution
+    //     without a bound, so the piece this needs FIRST is a depth guard on
+    //     that branch, not a narrower predicate. (Reading "is on a cycle" must
+    //     not force `aliasGeneric` from inside `fixTypeArgs` either — that
+    //     re-enters `fixTypeArgs` through the body's own references and
+    //     overflows on its own. Materialize the body BEFORE filling the
+    //     defaults in this function instead; that reorder is measured neutral
+    //     on both apps.)
     //   * `compiler/varianceMeasurement.ts` pins this arm's PURPOSE and must
     //     keep passing. tsc never materializes `Foo3<unknown>` at all — it
     //     keeps an object carrying `aliasSymbol`/`aliasTypeArguments` and

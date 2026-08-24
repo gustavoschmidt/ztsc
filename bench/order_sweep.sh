@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# Order sweep: one real application, one checker count, the ROOT FILE LIST
-# permuted. The fourth standing gate, and the one axis none of the other
-# three vary.
+# Order sweep: one real application, the ROOT FILE LIST permuted. The fourth
+# standing gate, and the one axis none of the other three vary.
+#
+# Given more than one checker count it is also the DETERMINISM MATRIX: after
+# the per-count passes it compares every cell of the checkers × orders grid,
+# message text and all, against one reference. See "the whole grid" below for
+# the defect class that pass exists for and why no other gate catches it.
 #
 # Usage: bench/order_sweep.sh [checkout]
 #   APP=~/src/excalidraw bench/order_sweep.sh        # same thing via the environment
 #   CONFIG=tsconfig.check.json bench/order_sweep.sh bench/apps/social-app
-#   CHECKERS="1 4" bench/order_sweep.sh              # sweep more partitions
+#   CHECKERS="1 2 4 8" bench/order_sweep.sh          # the full determinism matrix
 #   ORDERS="source reverse shuffle=1" bench/order_sweep.sh
 #   ORDER_SOFT=1 bench/order_sweep.sh                # report only, always exit 0
 #
@@ -116,6 +120,7 @@ echo "  project: $CONFIG · checkers: $CHECKERS · orders: $ORDERS"
 echo
 
 failures=0
+cells=0
 note_fail() {
     echo "  $1"
     failures=$((failures + 1))
@@ -174,6 +179,7 @@ for n in $CHECKERS; do
     cat "$TMP"/keys.c"$n".* | sort | uniq -c \
         | awk -v k="${#tags[@]}" '$1 == k { print $2 }' | sort -u >"$TMP/core.c$n"
     comm -23 "$TMP/union.c$n" "$TMP/core.c$n" >"$TMP/volatile.c$n"
+    cells=$((cells + ${#tags[@]}))
 
     n_union=$(wc -l <"$TMP/union.c$n" | tr -d ' ')
     n_core=$(wc -l <"$TMP/core.c$n" | tr -d ' ')
@@ -225,6 +231,60 @@ for n in $CHECKERS; do
     fi
     echo
 done
+
+# ---------------------------------------------------------- the whole grid ---
+# Everything above holds the checker count fixed and compares the orders under
+# it. That misses the axis the two gates were built to catch TOGETHER: a result
+# that is stable under every order at --checkers=1 and stable under every order
+# at --checkers=4, but DIFFERENT between the two. bench/convergence.sh varies
+# the partition, but it scores each count against tsgo by key and drops the
+# message text on purpose (ztsc's wording diverges from tsgo's), so a printed
+# type that changes spelling with the partition passes it.
+#
+# That is not hypothetical — it is the defect wave 29 measured and wave 30
+# fixed. `alias_recursive` was written for whichever member of a mutually
+# recursive alias cluster a checker instance materialized FIRST, so social-app's
+# Navigation.tsx:778 printed `NativeStackNavigationProp<{…}>` under one
+# partition and the expanded 40-member object under another. Same keys, same
+# orders, different text, and every standing gate silent.
+#
+# So the last pass compares every cell of the checkers × orders grid — text and
+# all — against ONE reference. `src/checker.zig:15` promises byte-identical
+# merged output for a program; this is the check that the promise covers the
+# partition too. Skipped when a single count was swept (the loop above already
+# is the whole grid) or when a key already moved (every text diff would just be
+# that key again).
+if [ "$failures" -eq 0 ] && [ "$(echo "$CHECKERS" | wc -w)" -gt 1 ]; then
+    echo "-- whole grid: $cells cell(s), checkers × orders, one reference"
+    grid_ref=""
+    grid_moved=0
+    for f in "$TMP"/lines.c*; do
+        if [ -z "$grid_ref" ]; then
+            grid_ref="$f"
+            continue
+        fi
+        cmp -s "$grid_ref" "$f" || grid_moved=$((grid_moved + 1))
+    done
+    if [ "$grid_moved" -ne 0 ]; then
+        note_fail "$grid_moved of $cells cell(s) differ from the reference ACROSS checker counts."
+        echo "    $(basename "$grid_ref") vs the first differing cell (first 4 lines):"
+        for f in "$TMP"/lines.c*; do
+            [ "$f" = "$grid_ref" ] && continue
+            if ! cmp -s "$grid_ref" "$f"; then
+                echo "      ($(basename "$f"))"
+                diff "$grid_ref" "$f" | head -4 | cut -c1-160 | sed 's/^/      /'
+                break
+            fi
+        done
+        echo
+        echo "    A type's spelling depends on WHICH CHECKER materialized it first."
+        echo "    See src/checker/instantiate.zig's \`markCycle\` for the shape this"
+        echo "    check was built on, and why the key must be the whole cycle."
+    else
+        echo "  all $cells cell(s) byte-identical"
+    fi
+    echo
+fi
 
 if [ "$failures" -eq 0 ]; then
     echo "order sweep PASSED"

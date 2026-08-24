@@ -4616,6 +4616,24 @@ pub fn computeIntersectionIsNever(c: *Checker, t: TypeId) Error!bool {
             // exactly what makes `T & B` (the branch type of an `x is B`
             // predicate on a `T extends A`) empty.
             .type_param, .union_type => try mem.append(c.scratch(), rm),
+            // A constituent that was a lazy alias `.ref` when the intersection
+            // was interned is ONE member then and an intersection now, because
+            // `makeIntersection` could only flatten what it could SEE. It is
+            // still a member whose properties count, and reading it through
+            // `propOfTypeEx` below intersects its own constituents' — so it
+            // joins `mem` rather than being skipped, WITHOUT contributing
+            // candidate names (the `kind != .object` guard below) and without
+            // being second-guessed for deferred insides.
+            //
+            // Excalidraw is the measured case: `{ type: "arrow" } &
+            // ExcalidrawLinearElement & ExcalidrawTextElement`, where both
+            // aliases have INTERSECTION bodies (`_ExcalidrawElementBase &
+            // Readonly<{ type: "text"; … }>`). The `"arrow"` / `"text"`
+            // conflict that makes the whole thing uninhabited lived one level
+            // below what this scan looked at, and five TS2345 followed in
+            // `resize.test.tsx` — a `never` source that tsc drops from the
+            // union it appears in.
+            .intersection => try mem.append(c.scratch(), rm),
             // Anything still unresolved could contribute anything; do not
             // judge the intersection empty.
             .mapped, .conditional, .index_access, .err, .any, .unknown => return false,
