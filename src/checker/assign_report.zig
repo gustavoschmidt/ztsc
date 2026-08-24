@@ -1436,6 +1436,41 @@ fn epcReducedUnion(c: *Checker, src_t: TypeId, rt: TypeId) Error!TypeId {
     return c.ts.makeUnion(c.scratch(), keep.items);
 }
 
+/// Does SOME constituent of a union target take this literal whole?
+///
+/// tsc relates a source to a union target with `typeRelatedToSomeType`: each
+/// constituent is tried with errors off, and the first that relates ends the
+/// relation clean. The excess-property check runs INSIDE that relation
+/// (`hasExcessProperties` is `isRelatedTo`'s first act on a fresh literal), so
+/// a constituent that accepts the literal accepts its excess check too — and
+/// nothing is reported, whichever OTHER constituent a reporting heuristic
+/// would have named.
+///
+/// ztsc keeps freshness out of `isAssignable` (the relation is memoized on
+/// type pairs), so the two halves are asked separately: the ordinary relation,
+/// then this scan re-run against that one constituent with reporting off.
+///
+/// The witness is a mapped target with a literal key set — react-native's
+/// `Platform.select<T>(specifics: {[p in PlatformOSType]?: T})`. Inference
+/// answers `T` with the UNION of the per-key array literals (which is what tsc
+/// infers too), and `bestMatchingUnionMember` then measured the `web:` literal
+/// against whichever array constituent came first in the union — `{gap: 4}[]`,
+/// the `native:` one — and reported its every unshared property as excess.
+/// Union member order is TypeId order, i.e. interning order, so the same
+/// program disagreed with itself across checker partitions
+/// (social-app's `StarterPackDialog.tsx` and `AppLanguageDropdown.tsx`).
+fn someUnionMemberAccepts(c: *Checker, node: Node, src_t: TypeId, ut: TypeId) Error!bool {
+    // `memberList` hands out a borrowed slice and the scan below re-enters the
+    // checker, which can invalidate it.
+    const ms = try c.scratch().dupe(TypeId, try c.memberList(ut));
+    defer c.scratch().free(ms);
+    for (ms) |m| {
+        if (!try c.isAssignable(src_t, m)) continue;
+        if (!try excessPropertyScan(c, node, src_t, m, false)) return true;
+    }
+    return false;
+}
+
 /// The excess-property check over an ARRAY literal's elements, against the
 /// element type the target gives each position (`elemTypeAt`, so an array, a
 /// tuple and a numerically-indexed interface all work). A UNION target is
@@ -1447,9 +1482,21 @@ fn epcReducedUnion(c: *Checker, src_t: TypeId, rt: TypeId) Error!TypeId {
 fn arrayElemExcessScan(c: *Checker, node: Node, src_t: TypeId, target: TypeId, report: bool) Error!bool {
     var rt = try c.resolveStructural(target);
     if (c.ts.kind(rt) == .union_type) {
-        const b = (try c.bestMatchingUnionMember(src_t, rt)) orelse return false;
+        const ut = rt;
+        const b = (try c.bestMatchingUnionMember(src_t, ut)) orelse return false;
         rt = try c.resolveStructural(b);
+        // The chosen arm is only ONE reading of a union target. Ask the
+        // expensive question — is there an arm that takes this literal whole?
+        // — only once that arm has actually objected, so the clean case pays
+        // nothing beyond the scan it already ran.
+        if (!try arrayElemScanAgainst(c, node, rt, false)) return false;
+        if (try someUnionMemberAccepts(c, node, src_t, ut)) return false;
     }
+    return arrayElemScanAgainst(c, node, rt, report);
+}
+
+/// The element walk of `arrayElemExcessScan`, against one resolved target.
+fn arrayElemScanAgainst(c: *Checker, node: Node, rt: TypeId, report: bool) Error!bool {
     for (c.tree.nodeRange(node)) |el| {
         if (el != null_node and c.nodeTag(el) == .spread_element) return false;
     }
@@ -1468,18 +1515,40 @@ fn arrayElemExcessScan(c: *Checker, node: Node, src_t: TypeId, target: TypeId, r
 /// The type a nested literal is measured against for the name `key`.
 ///
 /// The plain lookup is `targetPropType`, but a UNION target only answers a name
-/// its EVERY constituent has, and the descent has to happen anyway: tsc's
-/// recursion is the relation's, which has already picked the constituent the
-/// literal is being related to. So a union that cannot answer as a whole is
-/// asked again through the constituent the reporting path uses everywhere else
-/// (`bestMatchingUnionMember`) — the shape being
+/// its EVERY constituent has. tsc's `hasExcessProperties` descends with
+/// `getTypeOfPropertyInTypes(checkTypes, name)` — the UNION of the name's type
+/// over every constituent of the (discriminant-reduced) target — so a union
+/// that cannot answer as a whole is answered constituent by constituent and
+/// the answers unioned. That is what lets a nested literal be measured against
+/// every arm that could have accepted it, e.g.
 /// `StatelessComponent<TestProps | { props2: … }>`, whose `icon` lives in one
-/// arm and whose nested `INVALID_PROP_NAME` went unreported without this.
-fn nestedTargetPropType(c: *Checker, rt: TypeId, src_t: TypeId, key: Atom) Error!?TypeId {
+/// arm and whose nested `INVALID_PROP_NAME` is still reported (no arm knows
+/// it), while react-navigation's `LinkProps<AllNavigatorParams>` — a union of
+/// `{ screen: R; params: ParamList[R] }` over every route — measures a
+/// `params:` literal against the union of every route's params rather than
+/// against one arbitrarily chosen route's.
+///
+/// Choosing ONE arm instead (`bestMatchingUnionMember`) was both wrong and
+/// unstable: its tie-break keeps the LAST overlapping constituent, and union
+/// member order is TypeId order — i.e. interning order — so the same program
+/// disagreed with itself across checker partitions (social-app's
+/// `FeedSourceCard.tsx`, whose `screen` is a two-literal union that selects no
+/// single arm at all).
+fn nestedTargetPropType(c: *Checker, rt: TypeId, key: Atom) Error!?TypeId {
     if (try c.targetPropType(rt, key)) |tp| return tp;
     if (c.ts.kind(rt) != .union_type) return null;
-    const b = (try c.bestMatchingUnionMember(src_t, rt)) orelse return null;
-    return c.targetPropType(try c.resolveStructural(b), key);
+    // `memberList` hands out a borrowed slice and `targetPropType` re-enters
+    // the checker, which can invalidate it.
+    const ms = try c.scratch().dupe(TypeId, try c.memberList(rt));
+    defer c.scratch().free(ms);
+    var parts: std.ArrayList(TypeId) = .empty;
+    defer parts.deinit(c.scratch());
+    for (ms) |m| {
+        const tp = (try c.targetPropType(try c.resolveStructural(m), key)) orelse continue;
+        try parts.append(c.scratch(), tp);
+    }
+    if (parts.items.len == 0) return null;
+    return try c.ts.makeUnion(c.scratch(), parts.items);
 }
 
 /// tsc's `shouldCheckAsExcessProperty`: only a property whose symbol was
@@ -1777,7 +1846,7 @@ pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: T
             const rhs_tag = c.nodeTag(pd.rhs);
             if (rhs_tag == .object_literal or rhs_tag == .array_literal) {
                 if (c.nodeType(pd.rhs)) |nested_t| {
-                    if (try nestedTargetPropType(c, rt, src_t, key)) |tp| {
+                    if (try nestedTargetPropType(c, rt, key)) |tp| {
                         if (try c.excessPropertyScan(pd.rhs, nested_t, tp, report)) return true;
                     }
                 }
