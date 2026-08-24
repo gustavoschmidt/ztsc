@@ -577,6 +577,19 @@ const RelId = struct { sym: SymbolId, ref: TypeId };
 /// Set far above any depth in-subset code or the conformance suite reaches, well
 /// below the worker-stack overflow depth.
 pub const max_alias_depth = 200;
+/// Nesting cap for `fixTypeArgs`' substituting default branch (see the
+/// `tp_default_subst_depth` field). Threading a concrete argument through a
+/// CYCLE of aliases that name each other in their defaults produces a fresh
+/// type argument at every step, so neither `tp_default_stack` (same parameter)
+/// nor `alias_state` (same alias, body in progress) ever repeats and the
+/// recursion is unbounded — react-navigation overflows the worker stack. Past
+/// the cap the default is left UNSUBSTITUTED, which is the same lenient answer
+/// the `.d.ts`-default branch beside it already gives, so tripping it costs
+/// precision rather than correctness. Chosen well above the depth a genuine
+/// default chain reaches: measured by bisecting the cap itself, excalidraw and
+/// social-app are byte-identical to their baselines even at ONE, so nothing
+/// outside a cycle nests this branch at all.
+pub const max_tp_default_subst_depth = 8;
 pub const max_type_string = 160;
 
 const FnCtx = struct {
@@ -1336,6 +1349,18 @@ pub const Checker = struct {
     /// Default)`, TS2716. A parameter already on the stack answers `any`
     /// instead of re-entering.
     tp_default_stack: std.ArrayListUnmanaged(SymbolId) = .empty,
+    /// Nesting of `fixTypeArgs`' SUBSTITUTING default branch — the arm that
+    /// threads already-resolved arguments into a type parameter's default with
+    /// `instantiate(def, pmap)`. Unlike `tp_default_stack`, which catches a
+    /// default that names its OWN parameter, this bounds a default that reaches
+    /// a *different* alias whose own defaults reach back: react-navigation's
+    /// `NavigationProp<ParamList, …, State = NavigationState<ParamList>>` and
+    /// `NavigationState<ParamList>` name each other through their defaults, so
+    /// threading a concrete `ParamList` in drives the substitution one fresh
+    /// argument at a time and never repeats a `tp.sym`. Past
+    /// `max_tp_default_subst_depth` the default is left unsubstituted, which is
+    /// exactly the lenient answer the neighbouring branch already gives.
+    tp_default_subst_depth: u32 = 0,
     /// Entity-name import aliases whose right-hand side `resolveNsContainer` is
     /// presently resolving, innermost last. `import a = a.b` names itself: the
     /// qualifier `a` resolves back to the alias, whose RHS is the very name

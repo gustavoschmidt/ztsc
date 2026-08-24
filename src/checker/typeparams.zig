@@ -1101,10 +1101,23 @@ pub fn fixTypeArgs(c: *Checker, sym: SymbolId, args: []const TypeId, tok: TokenI
                 // deeply-recursive `.d.ts` types (the historic OOM) or unmasks
                 // a still-deferred reduction, so keep prior lenient behavior.
                 out[i] = def;
+            } else if (c.tp_default_subst_depth >= checker_zig.max_tp_default_subst_depth) {
+                // Depth cap (see `max_tp_default_subst_depth`). A CYCLE of
+                // aliases naming each other in their defaults produces a fresh
+                // type argument at every step, so no per-symbol guard above
+                // ever repeats and this branch would recur without a bound.
+                // Falling back to the unsubstituted default is what the
+                // `.d.ts` branch above already answers; it is depth-dependent,
+                // so it must suppress memoization of every enclosing
+                // substitution exactly as `max_alias_depth` does.
+                c.inst_limit_tripped = true;
+                out[i] = def;
             } else {
                 // Substitute the already-resolved params into the default so
                 // an earlier-param reference (`B = A`) sees the supplied `A`
                 // (and `C = B` the defaulted `B`) for user generics.
+                c.tp_default_subst_depth += 1;
+                defer c.tp_default_subst_depth -= 1;
                 const pmap = try c.scratch().alloc(TpMap, i);
                 for (tps.items[0..i], 0..) |ptp, j| pmap[j] = .{ .sym = ptp.sym, .ty = out[j] };
                 out[i] = try c.instantiate(def, pmap);
