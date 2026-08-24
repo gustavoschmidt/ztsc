@@ -1393,6 +1393,18 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
         yield_type = c.generatorYieldType(ann);
         eff_ann = types.no_type;
     }
+    // An unannotated GET accessor beside an ANNOTATED set accessor has a
+    // return-check target all the same: tsc's `getReturnTypeFromAnnotation`
+    // answers the setter's parameter annotation for it, so
+    // `get bar() { return 0 }` beside `set bar(n: string)` is TS2322 on the
+    // return statement (`inferSetterParamType`, `getSetAccessorContextualTyping`,
+    // `divergentAccessorsTypes6`). Applied to `eff_ann` alone, AFTER the
+    // async/generator arms: `ann` is what those read to decide whether a
+    // `Promise<T>` was WRITTEN, and an accessor is neither.
+    if (proto.return_type == 0 and !is_async and !is_generator) {
+        const acc = try signatures.getterReturnFromSetter(c, node, proto);
+        if (acc != types.no_type) eff_ann = acc;
+    }
     // A WRITTEN generator return type has to be something a generator can
     // actually produce — see `checkGeneratorReturnAnnotation`. Only with a
     // body: tsc's `getFunctionFlags` marks a bodyless declaration `Invalid`

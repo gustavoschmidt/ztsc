@@ -70,6 +70,17 @@ const identity = @import("identity.zig");
 /// settles that case before asking (see `checkSubsequentVarDecl`).
 pub fn typesIdentical(c: *Checker, a: TypeId, b: TypeId) Error!bool {
     if (a == b) return true;
+    // Two `class_value`s are the one pair this module can judge WITHOUT the
+    // structural relation, and judge exactly: the store hash-conses a
+    // `class_value` on its symbol alone, so two different ids are two different
+    // symbols — `typeof M` beside `typeof M.A` is a difference the program
+    // wrote, not an approximation to forgive. The screens below (and
+    // `identity.identical`, which refuses the family for the same nominal
+    // reason) would both answer "identical" and swallow the TS2403 tsgo makes
+    // (`invalidMultipleVariableDeclarations`'s `var m: typeof M; var m = M.A`,
+    // oracle-probed). One-sided `class_value` stays undecidable: there the
+    // nominal id genuinely cannot be lined up against a structural shape.
+    if (c.ts.kind(a) == .class_value and c.ts.kind(b) == .class_value) return false;
     if (identityUndecidable(c, a) or identityUndecidable(c, b)) return true;
     // A literal and its own base primitive. tsc widens an initializer before
     // it compares (`getWidenedTypeForVariableLikeDeclaration`), so a pair

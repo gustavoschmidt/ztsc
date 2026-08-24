@@ -643,6 +643,19 @@ test "TDZ and use-before-assigned" {
     try expectCodes("declare const c: boolean; let y: number; if (c) { y = 1; } const z: number = y;", &.{2454});
 }
 
+test "TDZ: an ambient declaration has no dead zone" {
+    // tsc's `checkResolvedBlockScopedVariable` tests
+    // `!(declaration.flags & NodeFlags.Ambient)` BEFORE
+    // `isBlockScopedNameDeclaredBeforeUse`: nothing is emitted for an ambient
+    // declaration, so there is no runtime binding to be in a dead zone.
+    try expectClean("declare const x: string; var y = identity(x); declare const identity: <T>(v: T) => T;");
+    try expectClean("const n: number = a; declare const a: number;");
+    try expectClean("var c = new C(); declare class C {}");
+    // …and the non-ambient forms beside it still report.
+    try expectCodes("x; let x = 1;", &.{ 2448, 2454 });
+    try expectCodes("new C(); class C {}", &.{2449});
+}
+
 test "TS2454: ambient declarations are assigned by definition" {
     // An ambient declaration has no initializer to write, but describes
     // something the runtime already provides: tsc's `assumeInitialized`
@@ -787,6 +800,64 @@ test "return checking: 2355 / 2366 / exhaustive switch" {
     try expectClean("function f(x: \"a\" | \"b\"): number { switch (x) { case \"a\": return 0; case \"b\": return 1; } }");
     try expectCodes("function f(x: string): number { switch (x) { case \"a\": return 0; } }", &.{2366});
     try expectClean("function f(): number { while (true) {} }");
+}
+
+test "TS2403: two different class/namespace values are not identical" {
+    // A `class_value` is hash-consed on its symbol, so two different ids are
+    // two different symbols — a difference the program wrote, which the
+    // "undecidable" screen used to forgive.
+    try expectCodes(
+        "namespace M { export class A {} } var m: typeof M; var m = M.A;",
+        &.{2403},
+    );
+    // …while the SAME one stays identical.
+    try expectClean("class B {} var b: typeof B; var b = B;");
+}
+
+test "an unannotated GET accessor takes its return type from the paired setter" {
+    // tsc's `getReturnTypeFromAnnotation`: with no annotation of its own, a get
+    // accessor's return type is the SET accessor's annotated parameter — so the
+    // body is CHECKED against it rather than inferred.
+    try expectCodes(
+        "class C { get x() { return 0; } set x(v: string) {} }",
+        &.{2322},
+    );
+    try expectClean("class C { get x() { return \"s\"; } set x(v: string) {} }");
+    // An object literal's accessor shorthand pairs the same way.
+    try expectCodes(
+        "const o = { get x() { return 0; }, set x(v: string) {} };",
+        &.{2322},
+    );
+    // The getter's OWN annotation wins, and an unannotated setter parameter
+    // still takes the getter's return (the other direction).
+    try expectClean("class C { get x(): number { return 0; } set x(v: string) {} }");
+    try expectClean("class C { get x() { return 0; } set x(v) { const n: number = v; } }");
+    // A leading `this` parameter is a receiver annotation, not the value.
+    try expectClean(
+        "interface Foo { n: number } interface Bar { w: string }" ++
+            " const o = { n: 13, get x(this: Foo) { return this.n; }, set x(this: Bar, n) { this.w = \"m\"; } };",
+    );
+    // A same-named member that is not the partner accessor is a duplicate
+    // identifier (TS2300, reported by the binder), and tsc pairs through the
+    // SYMBOL — which the clash splits, so the getter infers its own return and
+    // earns no TS2322 on top.
+    try expectClean("class C { x(v: string) {} get x() { return 0; } set x(v: string) {} }");
+}
+
+test "an assigned function expression takes `this` from the assignment target" {
+    // tsc's `getContextualThisParameterType`, last arm: in `obj.m = function
+    // () {…}` the contextual `this` is `obj`.
+    try expectCodes(
+        "declare const o: { m: () => void; n: number }; o.m = function () { const p: string = this; };",
+        &.{2322},
+    );
+    try expectClean("declare const o: { m: () => void; n: number }; o.m = function () { const p: number = this.n; };");
+    // An ARROW keeps the enclosing `this` and never takes the target's — at a
+    // script's top level that is the global object, which the arrow captures.
+    try expectCodes(
+        "declare const o: { m: () => void }; o.m = () => { this; };",
+        &.{7041},
+    );
 }
 
 test "const assignment / readonly (2588 / 2540)" {
