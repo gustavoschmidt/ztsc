@@ -976,6 +976,11 @@ pub fn fixTypeArgs(c: *Checker, sym: SymbolId, args: []const TypeId, tok: TokenI
             // `default_sym`, not `sym`: a merged symbol may take the default
             // from a different block than the parameter list (`typeParamsOf`).
             var def: TypeId = undefined;
+            // The default's SYNTACTIC tag, read while the declaring file is
+            // still current — `tp.default` indexes that file's tree, so asking
+            // after the context is restored is out of bounds. See
+            // `named_default` below for the one consumer.
+            var def_tag: ast.Tag = undefined;
             {
                 const dsym = if (tp.default_sym != 0) tp.default_sym else tp.sym;
                 const saved = c.enterSymFile(dsym);
@@ -983,6 +988,7 @@ pub fn fixTypeArgs(c: *Checker, sym: SymbolId, args: []const TypeId, tok: TokenI
                 c.cur_scope = c.symScope(dsym);
                 try c.tp_default_stack.append(c.cm(), tp.sym);
                 defer _ = c.tp_default_stack.pop();
+                def_tag = c.nodeTag(tp.default);
                 def = try c.typeFromTypeNode(tp.default);
             }
             // A *bare* default reference to an earlier own param (`Tr = T`)
@@ -1090,7 +1096,42 @@ pub fn fixTypeArgs(c: *Checker, sym: SymbolId, args: []const TypeId, tok: TokenI
             // deferred reduction — the two hazards the lenient branch exists
             // for. It is also the shape that most often carries the leak,
             // `State extends NavigationState = NavigationState<ParamList>`.
-            const shallow_default = c.ts.kind(def) == .ref;
+            //
+            // ASK THE RESOLVED SHAPE, NOT JUST THE `.ref`. `kind(def) == .ref`
+            // is only true while a recursive alias still ANSWERS with a ref,
+            // which is a property of what has been materialized SO FAR rather
+            // than of the declaration. The moment a mutual cluster finishes,
+            // `NavigationProp`'s `State extends NavigationState =
+            // NavigationState<ParamList>` comes back a materialized `.object`,
+            // this guard misses, and the default is left UNSUBSTITUTED with the
+            // alias's own `ParamList` free — `getRootNavigation(navigation)` at
+            // social-app's `FeedPage.tsx:101` then has a parameter nothing can
+            // meet (TS2345, oracle-clean). Which of the two shapes came back is
+            // exactly the partition-dependence `markCycle` was built to remove
+            // from the PRINTED type; the same skew reached this guard.
+            //
+            // An already-materialized object earns the arm on the same argument
+            // the `.ref` does, from the other end: a ref expands nothing because
+            // it defers, an object expands nothing because it is already
+            // expanded. Substituting into either rewrites leaves. What must stay
+            // out is a default that REDUCES when a concrete argument reaches it,
+            // and that is what the measurement says too — every one of drizzle's
+            // nine sites is a `.conditional` (`TSelectedFields =
+            // BuildSubquerySelection<TSelection, TNullabilityMap>` on
+            // `PgSelectBase` and its Kind/QueryBuilder neighbours), which is
+            // precisely the deferred reduction this branch exists to leave
+            // alone, and pulling those onto the substituting side is the
+            // measured +12.8% wall on drizzle (3.73 s -> 4.20 s over 9 samples
+            // of 20 runs, RSS flat).
+            //
+            // Kept to a default written as a NAME, which is the shape that
+            // carries the leak and the only one measured to need this. An
+            // inline object-literal default has no recursive alias behind it to
+            // change shape underneath, so it stays on the pre-existing path.
+            const materialized_default = def_tag == .type_ref and
+                c.ts.kind(def) == .object and
+                try c.containsTypeParam(def);
+            const shallow_default = c.ts.kind(def) == .ref or materialized_default;
             if (bare_earlier != null and (swappable_earlier or recursive or !c.symInDeclFile(sym))) {
                 out[i] = out[bare_earlier.?];
             } else if (c.symInDeclFile(sym) and !ground_earlier and !shallow_default) {
