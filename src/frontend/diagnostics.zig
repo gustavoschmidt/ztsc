@@ -100,12 +100,23 @@ pub const Code = enum(u16) {
     /// TS1180's and TS1134's.
     expected_binding_pattern_element,
     expected_binding,
+    /// TS1389: the OTHER half of `parsingContextErrors(VariableDeclarations)`.
+    /// The same refusal as `expected_binding`, worded for a KEYWORD — `var
+    /// export;`, `var class;` — which tsc names in the message rather than
+    /// saying "Variable declaration expected" about.
+    reserved_var_decl_name,
     /// TS1123: a `var`/`let`/`const` whose declarator list parsed ZERO
     /// declarators (`const` at end of file, `var ;`, a `for (var in x)` head).
     /// tsc's `checkGrammarVariableDeclarationList`, so this is a GRAMMAR
     /// diagnostic — `for (var in X)` reports it beside the RHS's TS2304, which
     /// a syntactic answer would suppress.
     empty_var_decl_list,
+    /// TS1009: the same list ended on a COMMA (`var a,`). `parseDelimitedList`
+    /// only records `hasTrailingComma` on the node array; the complaint is
+    /// `checkGrammarForDisallowedTrailingComma`, called from
+    /// `checkGrammarVariableDeclarationList` right beside TS1123 — so it is a
+    /// GRAMMAR diagnostic for the same reason that one is.
+    trailing_comma,
     expected_string_literal,
     expected_from,
     /// TS1005 for the `as` of a namespace import (`import * as ns from "m"`)
@@ -1017,6 +1028,7 @@ pub const Code = enum(u16) {
             .generator_in_ambient_context,
             .overload_signature_generator,
             .empty_var_decl_list,
+            .trailing_comma,
             .for_of_one_declaration,
             .for_in_one_declaration,
             .for_of_declaration_initializer,
@@ -1291,7 +1303,9 @@ pub const Code = enum(u16) {
             .expected_binding_pattern_property => "Property destructuring pattern expected.",
             .expected_binding_pattern_element => "Array element destructuring pattern expected.",
             .expected_binding => "Variable declaration expected.",
+            .reserved_var_decl_name => "'{0}' is not allowed as a variable declaration name.",
             .empty_var_decl_list => "Variable declaration list cannot be empty.",
+            .trailing_comma => "Trailing comma not allowed.",
             .expected_string_literal => "String literal expected.",
             .expected_from => "'from' expected.",
             .expected_as => "'as' expected.",
@@ -1635,7 +1649,9 @@ pub const Code = enum(u16) {
             .expected_binding_pattern_property => 1180,
             .expected_binding_pattern_element => 1181,
             .expected_binding => 1134,
+            .reserved_var_decl_name => 1389,
             .empty_var_decl_list => 1123,
+            .trailing_comma => 1009,
             .expected_declaration => 1146,
             .expected_case_or_default => 1130,
             .expected_catch_or_finally => 1472,

@@ -817,6 +817,14 @@ const Parser = struct {
         return .{ .start = start, .end = scanner.tokenEnd(p.src, p.tok_tags.items[to], to_start) };
     }
 
+    /// The CURRENT token's span. `tokSpan` cannot name it: the token is not yet
+    /// consumed, so `curIdx()` is the index it will be GIVEN, one past the end
+    /// of `tok_starts`.
+    fn curSpan(p: *Parser) Span {
+        const t = p.cur();
+        return .{ .start = t.start, .end = if (t.end > t.start) t.end else t.start + 1 };
+    }
+
     /// A diagnostic spanning a whole consumed token run, `from`..`to`
     /// inclusive — the shape tsc's `parseErrorAt(node.pos, node.end)` gives a
     /// grammar error blamed on an entire expression rather than one token.
@@ -1337,7 +1345,6 @@ const Parser = struct {
             .keyword_finally,
             // The lookahead group (see the doc comment).
             .keyword_const,
-            .keyword_export,
             .keyword_import,
             .keyword_async,
             .keyword_declare,
@@ -1366,12 +1373,59 @@ const Parser = struct {
             .keyword_static,
             .keyword_readonly,
             => p.classMemberModifierStartsStatement(),
+            // `export` is the one word of the lookahead group that a false
+            // `true` demonstrably costs: `var export;` steps OVER the keyword
+            // in tsc (the declarator list's abort asks this question, and the
+            // answer is no), where waving it through handed `export;` to the
+            // statement list and earned a whole-file parse error there
+            // (`parserInvalidIdentifiersInVariableStatements1`).
+            .keyword_export => p.exportStartsDeclaration(),
             // tsc's `isStartOfExpression`, including its error tolerance: the
             // start of a BINARY operator counts, so `* x;` is parsed as an
             // expression statement with a missing left operand (TS1109) rather
             // than skipped.
             else => |tag| canStartExpression(tag) or binaryPrec(tag, false) != 0,
         };
+    }
+
+    /// tsc's `isDeclaration` arm for `export`:
+    ///
+    ///     let currentToken = nextToken();
+    ///     if (currentToken === TypeKeyword) currentToken = lookAhead(nextToken);
+    ///     if (currentToken === EqualsToken || AsteriskToken || OpenBraceToken ||
+    ///         DefaultKeyword || AsKeyword || AtToken) return true;
+    ///     continue;
+    ///
+    /// Those six tokens make the `export` itself the declaration — an export
+    /// assignment, a star or named export, an export-default, `export as
+    /// namespace N`, a decorated one. Anything else means the `export` is a
+    /// MODIFIER, and tsc's walk restarts at the token right after it (which is
+    /// why the `type` peek above is a LOOKAHEAD, undone before the `continue`:
+    /// `export type X = 1` is answered by the `type` arm, not by `X`).
+    ///
+    /// A bare `export;` is neither, and tsc refuses to start a statement with
+    /// it. `export export = x` shows why the `continue` has to be a LOOP: the
+    /// first `export` is a modifier and the second one is the export
+    /// assignment (TS1120).
+    fn exportStartsDeclaration(p: *Parser) bool {
+        var n: u32 = 0;
+        while (n + 2 < max_la) : (n += 1) {
+            if (p.peekTag(n) == .keyword_export) {
+                switch (p.peekTag(if (p.peekTag(n + 1) == .keyword_type) n + 2 else n + 1)) {
+                    .eq, .asterisk, .l_brace, .keyword_default, .keyword_as, .at => return true,
+                    else => continue,
+                }
+            }
+            // The class-member modifiers continue the same walk, with ASI —
+            //     nextToken();
+            //     if (scanner.hasPrecedingLineBreak()) return false;
+            //     continue;
+            // — which is how `export public import a = x.c;` reaches the
+            // `import` that makes it a declaration (`importDeclWithClassModifiers`).
+            if (statementModifierCode(p.peekTag(n)) == null) break;
+            if (p.peekNewline(n + 1)) return false;
+        }
+        return p.startsDeclarationAt(n);
     }
 
     /// tsc's `isStartOfStatement` arm for `public`/`private`/`protected`/
@@ -2425,8 +2479,11 @@ const Parser = struct {
     /// `var`/`let`/`const`/`using` declarator list (shared with for-init).
     fn parseVarDecl(p: *Parser, no_in: bool) PE!Node {
         const kw = try p.bump(); // var/let/const/using
-        if (p.curTag() == .keyword_enum) {
-            // `const enum E { ... }` — main_token stays on `const`.
+        if (p.curTag() == .keyword_enum and p.tokTagAt(kw) == .keyword_const) {
+            // `const enum E { ... }` — main_token stays on `const`. Only after
+            // `const`: `var enum;` is a declarator list that refuses to start
+            // (TS1389) and an `enum` statement of its own, not a var-flavoured
+            // const enum.
             _ = try p.bump(); // `enum`
             return p.parseEnumDeclFrom(kw, ast.Flags.const_enum);
         }
@@ -2456,13 +2513,60 @@ const Parser = struct {
         }
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
+        var trailing_comma: ?u32 = null;
         list: while (true) {
+            // `parseDelimitedList` asks `isListElement` at the top of EVERY
+            // iteration, the first included; a token that starts no declarator
+            // is never handed to `parseVariableDeclaration` at all. It goes to
+            // `isListTerminator` — which ends the list silently — and then to
+            // `abortParsingListOrMoveToNextToken`, which files
+            // `parsingContextErrors(VariableDeclarations)` (TS1134, which the
+            // one-per-position rule drops whenever a "',' expected" just filed
+            // already used this position) and then either ABANDONS the list,
+            // when an enclosing context would take the token, or steps OVER it
+            // and asks again.
+            //
+            // `var a = q~;` is the abandoning shape: the `~` starts a
+            // statement, so the list stops and `~;` becomes its own (whose
+            // missing operand is tsc's TS1109). `var mul = ~[1], "";` is the
+            // same shape one comma later, and `var "";` is it on the first
+            // iteration — that TS1134 is the LIST's, not the binding name's,
+            // which is why `parseBindingName` says "Identifier expected"
+            // instead.
+            //
+            // `var x = { ` + "`a`" + `: 321 }` is the advancing shape, and the
+            // reason this is a loop rather than a break: the initializer's
+            // object literal aborts empty at the template (TS1136) and the
+            // template is then taken as a TAGGED TEMPLATE of it, so the
+            // declarator ends on the `:` — which starts neither a declarator
+            // nor a statement. tsc steps over it and lands TS1134 on the `321`
+            // (`templateStringInPropertyName{1,2,ES6_1,ES6_2}`).
+            while (!p.atStartOfDeclarator()) {
+                if (p.varDeclaratorListDone()) break :list;
+                if (p.spec > 0) return error.Backtrack;
+                // `parsingContextErrors(VariableDeclarations)` has two
+                // wordings: a KEYWORD is named in the message (TS1389, `var
+                // export;`, `var class;`), anything else gets the generic
+                // TS1134.
+                if (p.curTag().isKeyword()) {
+                    const span = p.curSpan();
+                    try p.errAtSpanArg(.reserved_var_decl_name, span, span);
+                } else {
+                    try p.errAtCur(.expected_binding);
+                }
+                if (p.abandonsVarDeclList()) break :list;
+                _ = try p.bump();
+            }
             if (pattern_code) |code| {
                 if (p.curTag() == .l_brace or p.curTag() == .l_bracket) try p.errAtCur(code);
             }
             const before = p.curIdx();
             try p.pushScratch(try p.parseDeclarator(no_in));
-            if (try p.eat(.comma) == null) {
+            // The comma that ended the last element, still unanswered — tsc's
+            // `commaStart`, which `parseDelimitedList` carries out of the loop
+            // as the node array's `hasTrailingComma`.
+            trailing_comma = try p.eat(.comma);
+            if (trailing_comma == null) {
                 // tsc's `parseDelimitedList` does NOT end the list on a missing
                 // comma: it reports one and keeps reading declarators, so `var
                 // y: z is number` is three of them with two "',' expected"
@@ -2475,39 +2579,13 @@ const Parser = struct {
                 // consumed nothing would spin here forever.
                 if (p.curIdx() == before) _ = try p.bump();
             }
-            // Whether or not a comma was there, `parseDelimitedList` re-asks
-            // `isListElement` at the top of the next iteration; a token that
-            // starts no declarator is never handed to `parseVariableDeclaration`
-            // at all. It goes to `isListTerminator` — which ends the list
-            // silently — and then to `abortParsingListOrMoveToNextToken`, which
-            // files `parsingContextErrors(VariableDeclarations)` (TS1134, which
-            // the one-per-position rule drops whenever a "',' expected" just
-            // filed already used this position) and then either ABANDONS the
-            // list, when an enclosing context would take the token, or steps
-            // OVER it and asks again.
-            //
-            // `var a = q~;` is the abandoning shape: the `~` starts a
-            // statement, so the list stops and `~;` becomes its own (whose
-            // missing operand is tsc's TS1109). `var mul = ~[1], "";` is the
-            // same shape one comma later — the `""` is no binding name, so it
-            // earns the TS1134 here and is left to the statement list, where
-            // ztsc used to instead parse it as a declarator with a missing name
-            // and then answer a SECOND TS1134 on the `;` past it
-            // (`bitwiseNotOperatorInvalidOperations`).
-            //
-            // `var x = { ` + "`a`" + `: 321 }` is the advancing shape, and the
-            // reason this is a loop rather than a break: the initializer's
-            // object literal aborts empty at the template (TS1136) and the
-            // template is then taken as a TAGGED TEMPLATE of it, so the
-            // declarator ends on the `:` — which starts neither a declarator
-            // nor a statement. tsc steps over it and lands TS1134 on the `321`
-            // (`templateStringInPropertyName{1,2,ES6_1,ES6_2}`).
-            while (!p.atStartOfDeclarator()) {
-                if (p.varDeclaratorListDone()) break :list;
-                try p.errAtCur(.expected_binding);
-                if (p.abandonsVarDeclList()) break :list;
-                _ = try p.bump();
-            }
+        }
+        // `checkGrammarForDisallowedTrailingComma`, the sibling of the TS1123
+        // above: a list that ended on its comma (`var a,`, `var a,;`, `var a,`
+        // + `return;`) is TS1009, blamed on the comma.
+        if (trailing_comma) |c| {
+            if (p.spec > 0) return error.Backtrack;
+            try p.errAtToken(.trailing_comma, c);
         }
         const items = p.scratch.items[top..];
         if (items.len == 1) {
@@ -3415,7 +3493,17 @@ const Parser = struct {
                     try p.checkEvalOrArguments(tok);
                     return p.addNode(.{ .tag = .identifier, .main_token = tok, .data = .{ .lhs = 0, .rhs = 0 } });
                 }
-                try p.fail(.expected_binding);
+                // tsc's `parseBindingIdentifier` is `createIdentifier(
+                // isBindingIdentifier(), privateIdentifierDiagnosticMessage)`,
+                // whose default message is "Identifier expected" — TS1003, in
+                // EVERY context that wants a binding name: a parameter
+                // (`function t1(...) {}`, `function f(` + "`hello`" + `)`), a
+                // `catch (1)`, an object pattern's renamed property
+                // (`const { x: "" } = …`). "Variable declaration expected" is
+                // not this diagnostic at all: TS1134 is what a declarator LIST
+                // says about a token it refuses to start an element with, and
+                // `parseVarDecl` files it there.
+                try p.fail(.expected_identifier);
                 return p.errorNode();
             },
         }
@@ -3513,9 +3601,23 @@ const Parser = struct {
                 // TS1539: tsc answers only the semantic TS2538 for `{ 0n: f } =
                 // arr` (measured — the grammar check is on the three positions
                 // that DECLARE a member, not on this one).
+                //
+                // tsc's `parseObjectBindingElement` reads `tokenIsIdentifier =
+                // isBindingIdentifier()` before the name and then
+                //
+                //     if (tokenIsIdentifier && token() !== ColonToken) { name = propertyName; }
+                //     else { parseExpected(ColonToken); name = parseIdentifierOrPattern(); }
+                //
+                // so a name that could never BIND — a string, a number, a
+                // reserved word — has no shorthand form and the `:` is
+                // mandatory. `var { while } = { while: 1 }` and `var { "while" }
+                // = …` are the two shapes ztsc used to accept silently
+                // (`objectBindingPatternKeywordIdentifiers01`/`03`).
+                const key_is_binding_name = isIdentLike(p.curTag());
                 const key = try p.bump();
                 var value: Node = null_node;
-                if (try p.eat(.colon) != null) {
+                if (!key_is_binding_name or p.curTag() == .colon) {
+                    _ = try p.expect(.colon, .expected_colon);
                     value = try p.parseBindingName(.private_name_outside_class);
                 } else {
                     // Shorthand: the key IS the bound name, so `{ await }` in an
@@ -3595,6 +3697,21 @@ const Parser = struct {
             impl = try p.scratchToSpan(top);
         }
 
+        // tsc's `parseClassDeclarationOrExpression` parses the member list and
+        // its closing `}` only when the `{` was actually THERE:
+        //
+        //     if (parseExpected(OpenBraceToken)) {
+        //         members = parseClassMembers();
+        //         parseExpected(CloseBraceToken);
+        //     } else {
+        //         members = createNodeArray([], getNodePos());
+        //     }
+        //
+        // A headless `class;` therefore ends at the missing brace. Reading a
+        // body anyway made it swallow the rest of the file: the `var class;` of
+        // `parserInvalidIdentifiersInVariableStatements1` took four statements
+        // as members and answered five invented TS1005s for them.
+        const has_body = p.curTag() == .l_brace;
         _ = try p.expect(.l_brace, .expected_l_brace);
         // Inside the body every strict-reserved word is TS1213 rather than
         // TS1212 (tsc's `getContainingClass`), including in nested functions and
@@ -3615,7 +3732,7 @@ const Parser = struct {
         // suppresses the TS116x its computed name would otherwise earn, exactly
         // as tsc's `checkGrammarModifiers` short-circuits `checkGrammarProperty`.
         var deco_at: ?u32 = null;
-        while (p.curTag() != .r_brace and p.curTag() != .eof) {
+        while (has_body and p.curTag() != .r_brace and p.curTag() != .eof) {
             const before = p.curIdx();
             const diags_before = p.diags.items.len;
             if (try p.eat(.semicolon) != null) continue;
@@ -3636,7 +3753,7 @@ const Parser = struct {
                 _ = try p.bump();
             }
         }
-        _ = try p.expect(.r_brace, .expected_r_brace);
+        if (has_body) _ = try p.expect(.r_brace, .expected_r_brace);
         const members = try p.scratchToSpan(top);
 
         const extra = try p.addExtra(ast.ClassData{
@@ -5012,6 +5129,23 @@ const Parser = struct {
                 if (p.curIdx() == before) break;
                 continue;
             }
+            // tsc's `parseImportOrExportSpecifier` runs two checks that fire
+            // only for an IMPORT specifier, and only on the name it BINDS —
+            // which is the one after `as` when there is one, and this one
+            // otherwise:
+            //
+            //     if (checkIdentifierIsKeyword) parseErrorAt(…, Identifier_expected);
+            //     if (kind === ImportSpecifier && name.kind !== Identifier) {
+            //         parseErrorAt(…, Identifier_expected); … }
+            //
+            // So `import { default }`, `import { while }` and `import {
+            // "invalid 1" }` are each TS1003 on the name, while the very same
+            // spellings in an `export { … }` — which binds nothing and takes
+            // any ModuleExportName — are silent (`es6ImportNamedImport
+            // IdentifiersParsing`, `arbitraryModuleNamespaceIdentifiers_syntax`).
+            if (!isIdentLike(p.curTag()) and p.peekTag(1) != .keyword_as) {
+                try p.fail(.expected_identifier);
+            }
             const name = try p.bump();
             var alias: u32 = 0;
             if (try p.eat(.keyword_as) != null) alias = try p.expectIdentLike();
@@ -5886,10 +6020,50 @@ const Parser = struct {
         }
     }
 
+    /// tsc's `parseRightSideOfDot` — the name after a `.`, a `?.`, a qualified
+    /// type name or a JSX tag's dot, all of which route through it.
+    ///
+    /// A keyword is a perfectly good identifier NAME here, so `a.var` parses;
+    /// tsc makes exactly one exception, and it is error recovery rather than
+    /// grammar:
+    ///
+    ///     if (scanner.hasPrecedingLineBreak() && tokenIsIdentifierOrKeyword(token())) {
+    ///         if (lookAhead(nextTokenIsIdentifierOrKeywordOnSameLine)) {
+    ///             return createMissingNode(Identifier, /*reportAtCurrentPosition*/ true,
+    ///                                      Diagnostics.Identifier_expected);
+    ///         }
+    ///     }
+    ///
+    /// `var x = a.` on one line and `var y = 1;` on the next is a DANGLING dot,
+    /// not the access `a.var` with `y` left over, so tsc blames the position
+    /// right after the dot (TS1003) and hands the next line back to the
+    /// statement list. Both halves of the lookahead matter: the name must be on
+    /// a NEW line (`a.var` on one line is the access), and the token after it
+    /// must be on the SAME line as it (ASI already separates `a.b` from a `c`
+    /// below). ztsc used to take the keyword as the property and then complain
+    /// about the leftover name — a "',' expected" one line down, in
+    /// `enumMemberResolution`, `enumConflictsWithGlobalIdentifier` and
+    /// `errorRecoveryWithDotFollowedByNamespaceKeyword`.
     fn expectMemberName(p: *Parser) PE!u32 {
+        if (p.atDanglingDot()) {
+            if (p.spec > 0) return error.Backtrack;
+            try p.errAtFullStart(.expected_identifier);
+            return p.lastIdx();
+        }
         if (isNameLike(p.curTag())) return p.bump();
         try p.fail(.expected_identifier);
         return p.lastIdx();
+    }
+
+    /// The lookahead of `expectMemberName`'s recovery arm: a name on a new line
+    /// with another name after it on that same line. Private identifiers are
+    /// deliberately absent — tsc asks `tokenIsIdentifierOrKeyword`.
+    fn atDanglingDot(p: *Parser) bool {
+        if (!p.nlBefore()) return false;
+        const t = p.curTag();
+        if (t != .identifier and !t.isKeyword()) return false;
+        const next = p.peekTag(1);
+        return (next == .identifier or next.isKeyword()) and !p.peekNewline(1);
     }
 
     /// Type args + parenthesized args → extra→CallInfo (targs may be empty).
@@ -5981,7 +6155,17 @@ const Parser = struct {
         _ = try p.expect(.l_paren, .expected_l_paren);
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
-        while (p.curTag() != .r_paren and p.curTag() != .eof) {
+        // A `;` ENDS the argument list, exactly as `)` does — tsc's
+        // `isListTerminator(ArgumentExpressions)` is
+        //
+        //     // Tokens other than ')' are here for better error recovery
+        //     return token() === CloseParenToken || token() === SemicolonToken;
+        //
+        // so `bar(;` answers the one "')' expected" the missing paren earns and
+        // leaves the `;` to the statement list, where reading it as an argument
+        // instead invented an "Expression expected" for it
+        // (`parserErrorRecovery_ArgumentList2`).
+        while (p.curTag() != .r_paren and p.curTag() != .semicolon and p.curTag() != .eof) {
             const before = p.curIdx();
             if (p.curTag() == .dot_dot_dot) {
                 const dots = try p.bump();
@@ -6885,7 +7069,10 @@ const Parser = struct {
         }
         if (try p.eat(.asterisk) != null) flags |= ast.Flags.generator;
 
-        // Key.
+        // Key. tsc reads `tokenIsIdentifier = isIdentifier()` BEFORE consuming
+        // the property name, because only a real identifier can stand alone as
+        // a SHORTHAND — see the `:` decision below.
+        const key_is_ident = isIdentLike(p.curTag());
         var key: Node = null_node;
         var key_tok: u32 = 0;
         switch (p.curTag()) {
@@ -6951,14 +7138,37 @@ const Parser = struct {
                 const func = try p.addNode(.{ .tag = .function_expr, .main_token = key_tok, .data = .{ .lhs = proto, .rhs = body } });
                 return p.addNode(.{ .tag = .object_method, .main_token = key_tok, .data = .{ .lhs = key, .rhs = func } });
             },
-            .eq => {
+            // tsc's `isShorthandPropertyAssignment = tokenIsIdentifier &&
+            // token() !== ColonToken`. A property name that is NOT an
+            // identifier — a string, a number, a reserved word, a computed name
+            // — has no shorthand form at all, so the `:` is not optional for it
+            // and the element still wants a value:
+            //
+            //     parseExpected(ColonToken);
+            //     const initializer = parseAssignmentExpressionOrHigher();
+            //
+            // `var v = { "" }` and `var { while } = …` are the shapes; ztsc
+            // used to build a shorthand out of them and answer nothing
+            // (`parserShorthandPropertyAssignment3`/`4`,
+            // `objectBindingPatternKeywordIdentifiers01`/`03`). The
+            // "Expression expected" that follows the missing colon lands on the
+            // position the TS1005 just used and is dropped.
+            .eq => if (key_is_ident) {
                 // `{ a = 1 }` — cover grammar for destructuring defaults.
                 _ = try p.bump();
                 const init = try p.parseAssignExpr(.{});
                 return p.addNode(.{ .tag = .object_shorthand, .main_token = key_tok, .data = .{ .lhs = key, .rhs = init } });
+            } else {
+                try p.fail(.expected_colon);
+                const value = try p.parseAssignExpr(.{});
+                return p.addNode(.{ .tag = .object_property, .main_token = key_tok, .data = .{ .lhs = key, .rhs = value } });
             },
-            else => {
+            else => if (key_is_ident) {
                 return p.addNode(.{ .tag = .object_shorthand, .main_token = key_tok, .data = .{ .lhs = key, .rhs = 0 } });
+            } else {
+                try p.fail(.expected_colon);
+                const value = try p.parseAssignExpr(.{});
+                return p.addNode(.{ .tag = .object_property, .main_token = key_tok, .data = .{ .lhs = key, .rhs = value } });
             },
         }
     }
