@@ -278,6 +278,14 @@ const Parser = struct {
     /// entry there may be a grammar-class one, which does not participate.
     last_syntactic_start: ?u32 = null,
 
+    /// Start offset of the junk token `errAtCur` last answered with a scanner
+    /// diagnostic (`errAtJunkToken`). tsc's scanner reports that one ONCE, when
+    /// it produces the token; ztsc defers it to the first parser complaint
+    /// about the same token (see `errAtCur`), and the parser can complain about
+    /// one token several times over. Saved/restored with the rest of the
+    /// speculation state, since a backtrack un-reports it.
+    last_junk_start: ?u32 = null,
+
     /// Nesting depth of class bodies, for TS1213 — tsc's `getContainingClass`.
     /// A class body is strict whatever the file is, and tsc says so in its own
     /// wording, so the choice between TS1212 and TS1213 is this counter.
@@ -732,6 +740,21 @@ const Parser = struct {
 
     fn errAtCur(p: *Parser, code: Code) Error!void {
         const t = p.cur();
+        // tsc's SCANNER owns the no-token-starts-here diagnostics (TS1127,
+        // TS18026, TS1490) and reports one the moment it produces the token —
+        // so the message is already in `parseDiagnostics` before the parser can
+        // say anything about that token, and the one-per-position rule below
+        // then drops whatever the parser would have said at the same character.
+        // ztsc's scanner is a pure tokenizer and the parse is lazy and
+        // speculative, so there is no scan-time moment to report from; the
+        // report is deferred instead to the first parser complaint ABOUT the
+        // junk token, which restores tsc's order (TS1127 first, the parser's
+        // own message suppressed). Measured against tsgo: `var arg\u003`,
+        // `foo(a \`, `class C extends A ¬ {}` and `/re/ \ ;` each answer TS1127
+        // alone, where ztsc used to answer TS1005 alone. Speculation is safe
+        // for the same reason `checkLiteral` is — `restore` truncates `diags`,
+        // and it rewinds `last_junk_start` with them.
+        if (!junkCode(code) and junkTag(t.tag)) try p.errAtJunkToken();
         // tsc's `createMissingNode(reportAtCurrentPosition: token() ===
         // EndOfFileToken)`: when the parse ran out of FILE, a missing name node
         // is blamed on the position where the eof token's trivia began — just
@@ -753,6 +776,24 @@ const Parser = struct {
         });
     }
 
+    /// The token tags that start no token at all — what tsc's scanner answers
+    /// with a diagnostic of its own rather than a grammar production.
+    fn junkTag(tag: TokTag) bool {
+        return switch (tag) {
+            .unknown, .hash_bang, .binary_content => true,
+            else => false,
+        };
+    }
+
+    /// The three codes `errAtJunkToken` itself reports, which must not
+    /// re-enter it.
+    fn junkCode(code: Code) bool {
+        return switch (code) {
+            .unexpected_character, .shebang_not_at_start, .file_appears_binary => true,
+            else => false,
+        };
+    }
+
     /// Report the current no-token-starts-here token. tsc's scanner separates
     /// three answers here, and so does ztsc's:
     ///
@@ -762,7 +803,17 @@ const Parser = struct {
     ///     and its scanner blames the file, then stops — which is why the token
     ///     covers the whole remainder and the next token is `eof`;
     ///   - anything else: TS1127 over the one byte.
+    ///
+    /// Reported ONCE per junk token — tsc's scanner produces each token once,
+    /// while ztsc's parser can reach the same one from several directions (see
+    /// `errAtCur`, which routes every complaint about a junk token through
+    /// here first).
     fn errAtJunkToken(p: *Parser) Error!void {
+        const at = p.cur().start;
+        if (p.last_junk_start) |last| {
+            if (last == at) return;
+        }
+        p.last_junk_start = at;
         switch (p.curTag()) {
             .hash_bang => try p.errAtCur(.shebang_not_at_start),
             .binary_content => try p.addDiag(.file_appears_binary, .{
@@ -1051,6 +1102,7 @@ const Parser = struct {
         n_diags: usize,
         n_computed_keys: usize,
         last_syntactic_start: ?u32,
+        last_junk_start: ?u32,
     };
 
     fn save(p: *Parser) State {
@@ -1065,6 +1117,7 @@ const Parser = struct {
             .n_diags = p.diags.items.len,
             .n_computed_keys = p.computed_keys.items.len,
             .last_syntactic_start = p.last_syntactic_start,
+            .last_junk_start = p.last_junk_start,
         };
     }
 
@@ -1080,6 +1133,7 @@ const Parser = struct {
         p.diags.shrinkRetainingCapacity(s.n_diags);
         p.computed_keys.shrinkRetainingCapacity(s.n_computed_keys);
         p.last_syntactic_start = s.last_syntactic_start;
+        p.last_junk_start = s.last_junk_start;
     }
 
     // --- node construction -------------------------------------------------
@@ -1456,15 +1510,11 @@ const Parser = struct {
 
     /// The diagnostic tsc's `parseList` reports for a token that starts no list
     /// element, for the statement-list contexts. A junk token gets its scanner
-    /// diagnostic FIRST, so that the one-per-position rule in `addDiag` drops
-    /// the TS1128 that would otherwise land on the same character — which is
-    /// exactly what tsc's `parseErrorAtPosition` does.
+    /// diagnostic FIRST (`errAtCur` sees to that), so that the one-per-position
+    /// rule in `addDiag` drops the TS1128 that would otherwise land on the same
+    /// character — which is exactly what tsc's `parseErrorAtPosition` does.
     fn errNotAStatement(p: *Parser, code: Code) PE!void {
         if (p.spec > 0) return error.Backtrack;
-        switch (p.curTag()) {
-            .unknown, .hash_bang, .binary_content => try p.errAtJunkToken(),
-            else => {},
-        }
         try p.errAtCur(code);
     }
 
