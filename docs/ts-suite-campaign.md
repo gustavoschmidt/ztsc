@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-24, post wave 30)
+## Standings (2026-08-24, post wave 31)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7389 / 8631 (85.6%)** |
-| excess keys (false positives) | 3541 | 1592 |
-| missing keys (under-reports) | 8617 | 2979 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7433 / 8631 (86.1%)** |
+| excess keys (false positives) | 3541 | 1526 |
+| missing keys (under-reports) | 8617 | 2907 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Thirty waves landed (3–30), every one with ZERO match→non-match regressions in
+Thirty-one waves landed (3–31), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -432,7 +432,79 @@ TS1434 parseArguments (+11).
 MEASUREMENT LESSON: never diff a --checkers=1 run against the default-
 checkers baseline — compare same binary at same checker count.
 
-## Ranked next queue (wave 31) — distilled from wave-30 agent reports
+Wave 31 (+81 exact → 7433/8631 86.1%; bucketed 9→8; conformance
+1326/1326; DETERMINISM DEFECT CLOSED): A landed the alias keying —
+materialize-before-defaults in aliasInstance, a depth guard
+(max_tp_default_subst_depth=8) on fixTypeArgs' substituting branch (the
+cyclic-defaults recursion mints fresh type args each step, so no stack
+repeats — that's what overflowed wave 30's attempts), alias_stack+markCycle
+marking the whole cycle suffix, with the one-spelling rule split into its
+two real purposes (self-recursive originTaggable for variance; any cycle
+member with an .intersection body for mixing), and shallow_default keyed on
+the RESOLVED KIND (defkind=object fires; defkind=conditional is exactly the
+deferred reduction the branch protects — the source of the rejected
++12.8%). Social-app AND excalidraw now 20/20 grid cells byte-identical
+(checkers 1/2/4/8 × orders, message text included); the surviving 778
+spelling is the alias-named one, which is what tsc prints. B landed 3 of
+the pipe bugs (rest-tuple mint exclusion, generalizeCallResult identity
+test, getTypeAtPosition semantics; 27→17 keys — the arrow-argument half
+remains), the unconditional instantiateSignatureInContextOf fallback +
+fixedInference, and C's const-context handoff (the any-placeholder at the
+return-only block + contextAdmitsLiteral/isConstTypeVar descending
+.index_access). C fixed the modvalue double-toGlobal (only site, audit of
+all 18 resolveSpace consumers), bare `return;` infers void not never,
+callback-elaboration dispatch, and the this-type instance half
+(inProgressCallSigless). D landed the TS1134 abort-loop recipe, TS2481
+blame-the-var (dedicated VarTransit struct), retired mask_let_const_class,
+the jsx this-type half (TS2604 while the table is in flight), ten
+TS1005/TS1109/TS1003 recovery rules (+26), and the evolving-array
+multi-decl relaxation. e2e multi: wall 0.04s vs tsgo 0.09s; A/B flat.
+WATCH ITEM: social-app --checkers=1 wall +3.2% (default config −1.3%,
+FASTER) — bisect queued.
+
+## Ranked next queue (wave 32) — distilled from wave-31 agent reports
+
+1. Pipe, the arrow half: contextual type for a context-sensitive arrow
+   under a still-free rest tuple (`pipe(x => list(x), box)`), 17 keys in
+   genericFunctionInference1.
+2. The never[] trio (C31's measured recipe, net +3 expected): context-free
+   `[]` is never[] (tsc implicitNeverType) in expr.zig's empty arm; the
+   assign.zig comparability gap it exposes (`[] as HomomorphicMappedType<T>`
+   must pass against a deferred mapped type, 4 FPs); flow multi-decl
+   evolving-array half ALREADY LANDED (D31). Empirical widening rule
+   pinned: only the evolving variable becomes any[].
+3. Reverse-mapped composite key set (B31's near-miss, recipe recorded at
+   infer.zig inferReverseMapped): inferToMappedType composite keys +
+   substElemAccess .mapped arm + createReverseMappedType array/tuple
+   rebuild is +3 corpus but breaks social-app THREE ways without tsc's
+   isPartiallyInferableType guard — build the guard first; witness is
+   social-app's useInfiniteQuery options object.
+4. Mapped target with a MATERIALIZABLE key set → property inference
+   (mapped.zig lower-bound key materialization; complicatedIndexes…).
+5. Bisect the social-app --checkers=1 +3.2% wall (96eecaa..wave-31 tip;
+   suspects: A's materialize-before-defaults reorder — measured neutral at
+   default checkers only; B's unconditional fallback).
+6. Constant-condition pruning: `if (true) { z = "a"; }` leaves the
+   unreachable branch in the flow graph → TS2322 FP (no corpus witness;
+   blocks nothing but wrong; flow.zig).
+7. jsxComponentTypeErrors last key: TS2786 from checkJsxTagBound on
+   `<this type="foo"/>` inside a function EXPRESSION assigned to an
+   expando property.
+8. TS2559 deferred-constraint suppression via drain-time rollback
+   (typeparams.zig owns the verdict; 2 cases).
+9. Identity relation: -TS2403 ×6 (identity.zig); -TS2339 ×7 (intersection
+   never-reduction + narrowing).
+10. social-app's own excess: 66 excess / 1 under vs tsgo remain, incl. the
+    Navigation.tsx:778 TS2322 FP itself (now one deterministic spelling).
+11. Census: 366 one-key cases (TS2322 62, TS1005 20, TS2345 16, TS2339 15);
+    inference one-key FPs: contravariantOnlyInferenceFromAnnotatedFunction,
+    deeplyNestedConstraints, subtypeReductionUnionConstraints,
+    arrayLiterals3, nonInferrableTypePropagation2,
+    contextualTypeBasedOnIntersectionWithAnyInTheMix1.
+12. Substitution types (owner spanning generics+instantiate+subst+memo+
+    print); resolution-mode attributes; per-frame weak rule.
+
+## Superseded queue (wave 31, kept for context)
 
 1. Alias keying, the finish (recipe committed in instantiate.zig): rebuild
    markCycle via the aliasGeneric stack; keep the ref ONLY for an
