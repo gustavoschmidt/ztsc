@@ -1871,42 +1871,21 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         }
         // tsc's `checkArrayLiteral` empty arm is `createArrayType(
         // strictNullChecks ? implicitNeverType : undefinedWideningType)` — a
-        // context-free `[]` is `never[]` there, and an `any[]` in its place is
-        // an under-report (`[].splice(0, 3, 4, 5)` never judges its arguments
-        // against `never`). The widening rule is empirical and narrow: ONLY
-        // the evolving variable (`var x = []; x.push(1)`) becomes `any[]` —
+        // context-free `[]` is `never[]`, and the `any[]` that stood here was an
+        // under-report (`[].splice(0, 3, 4, 5)` never judged its arguments
+        // against `never`). The widening rule is empirical and narrow: ONLY the
+        // evolving variable (`var x = []; x.push(1)`) becomes `any[]` —
         // `export const x = []`, `class C { f = [] }`, `f(xs = [])` and
         // `const c = id([])` are all `never[]` in tsc.
         //
-        // The evolving half has to move with this line, because the flow walk
+        // The evolving half moves with this line, because ztsc's flow walk
         // recognizes an evolving array BY ITS TYPE (`flow.flowTypeOfReference`
-        // and `expr.checkEvolvingVarRead` both gate on `any[]`). tsc keys it
-        // off the DECLARATION instead — `getTypeForVariableLikeDeclaration`'s
-        // "use control flow tracked `any[]` type for non-ambient, non-exported
-        // variables with an empty array literal initializer" — so the arm that
-        // restores the 19 evolving-array cases this line would otherwise cost
-        // belongs in `signatures.declaratorType`: when
-        // `flow.isEvolvingArrayVar(sym)` holds and the declarator's own
-        // initializer typed as `never[]`, hand back `any[]` (the autoArrayType)
-        // instead. Measured together, that pair is +4 exact on the suite with
-        // ZERO regressions.
-        //
-        // MEASURED AND HELD BACK (wave 32): +4 exact on the suite with ZERO
-        // regressions and social-app byte-identical, but excalidraw's
-        // `App.tsx` gains two false TS7053. The `never[]` is CORRECT there —
-        // `this.state.selectionElement ? getElementsWithinSelection(…) : []`
-        // subtype-reduces to `NonDeletedExcalidrawElement[]`, exactly as tsc
-        // types it — and the `any[]` was hiding an INFERENCE gap one step
-        // later: `els.reduce((acc: Record<string, true>, e) => acc, {})` is
-        // `{}` in ztsc and `Record<string, true>` in tsgo, because a
-        // context-sensitive callback's CONTRAVARIANT candidate is discarded
-        // whenever the type parameter was already fed a candidate
-        // (`infer.zig`'s `ctx_sensitive and fed[i] != any` wipe), so the `{}`
-        // from the initial-value argument stands. Annotating the callback's
-        // second parameter, or dropping the `{}` argument, makes ztsc agree.
-        // Flip this line the moment that wipe stops covering an ANNOTATED
-        // parameter position.
-        return c.ts.makeArray(types.any_type);
+        // and `expr.checkEvolvingVarRead` both gate on `any[]`) where tsc keys
+        // it off the DECLARATION — `getTypeForVariableLikeDeclaration`'s "use
+        // control flow tracked `any[]` type for non-ambient, non-exported
+        // variables with an empty array literal initializer". That arm is
+        // `signatures.evolvingArrayOverride`, and the two are one change.
+        return c.ts.makeArray(types.never_type);
     }
     return c.ts.makeArray(try arrayLiteralElemType(c, raw_types.items, elem_types.items, rctx == types.no_type));
 }
