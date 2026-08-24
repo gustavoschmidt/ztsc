@@ -1660,6 +1660,24 @@ pub fn inferTypeArgs(
             partial_ctx[i] = p;
             if (!ret_only or param_mentioned[i]) continue;
             if (seeded[i] or p.ty != types.any_type) continue;
+            // A `const` type parameter is left FREE, not replaced by anything.
+            // tsc's `nonFixingMapper` leaves an un-inferred variable standing,
+            // and `isConstContext` is then `isValidConstAssertionArgument(node)
+            // && isConstTypeVariable(getContextualType(node))` — the contextual
+            // type has to still BE the parameter for that test to see the
+            // `const`. Substituting the `any` placeholder erases exactly the
+            // thing `const` exists to preserve: `test1<const T>(create: () => T)`
+            // handed `() => 'a'` typed the arrow's return against `any`, the
+            // fresh `'a'` widened on the way out, and `T` came back `string`
+            // (the whole `typeParameterConstModifiersReturnsAndYields` family —
+            // literals, template literals, array and object literals, `async`
+            // and generator bodies alike). An unconstrained `const T` also has
+            // no constraint for the substitution below to reach for, so this is
+            // the only reading available.
+            if (c.isConstTypeParamSym(tp_syms[i])) {
+                partial_ctx[i] = .{ .sym = tp_syms[i], .ty = try c.ts.makeTypeParam(tp_syms[i]) };
+                continue;
+            }
             const con = try c.typeParamConstraint(tp_syms[i]);
             if (con == types.no_type) continue;
             const ci = try c.instantiate(con, partial);

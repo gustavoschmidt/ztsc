@@ -521,6 +521,7 @@ fn noteCandidate(c: *Checker, text: []const u8, name: Atom, best: *?Atom, best_d
 pub fn isConstTypeVar(c: *Checker, t: TypeId) bool {
     switch (c.ts.kind(t)) {
         .type_param => return c.isConstTypeParamSym(c.ts.typeParamSymbol(t)),
+        .index_access => return isConstTypeVar(c, c.ts.indexAccessObj(t)),
         .union_type => {
             for (0..c.ts.memberCount(t)) |i| {
                 const m = c.ts.memberAt(t, @intCast(i));
