@@ -1108,6 +1108,14 @@ fn checkTdz(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex) Error!void 
     if (c.symFile(sym) != c.cur_file) return; // cross-file: no TDZ
     const decls = c.declsOf(sym);
     if (decls.len == 0) return;
+    // An AMBIENT declaration has no temporal dead zone: nothing is emitted for
+    // it, so there is no runtime binding whose initialization the use could
+    // race. tsc's `checkResolvedBlockScopedVariable` closes on
+    // `!(declaration.flags & NodeFlags.Ambient) && !isBlockScopedNameDeclaredBeforeUse(…)`
+    // — the ambient test comes FIRST and short-circuits the position check
+    // entirely, so `var y = identity(x); declare const identity: <T>(v: T) => T`
+    // is clean (`genericFunctionInference1`).
+    if (isAmbientDecl(c, decls[0])) return;
     const decl_start = c.nodeSpanStart(decls[0]);
     const use_start = c.tree.tokens.start(tok);
     if (use_start >= decl_start) return;
@@ -1182,11 +1190,16 @@ fn valueDeclarator(c: *Checker, decls: []const Node) ?Node {
 }
 
 /// Was `decl` written in an ambient context? The parser records tsc's
-/// `NodeFlags.Ambient` on the declarator itself (see `parseDeclarator`).
-fn isAmbientDeclarator(c: *Checker, decl: Node) bool {
-    if (c.nodeTag(decl) != .declarator_full) return false;
-    const e = c.tree.extraData(ast.DeclaratorFull, c.tree.nodeData(decl).rhs);
-    return e.flags & ast.Flags.declare != 0;
+/// `NodeFlags.Ambient` on the declaration itself (see `parseDeclarator`) — for
+/// a `declare` modifier, and for every declaration inside a `.d.ts`, a
+/// `declare namespace` body or a `declare global` block.
+fn isAmbientDecl(c: *Checker, decl: Node) bool {
+    return switch (c.nodeTag(decl)) {
+        .declarator_full => c.tree.extraData(ast.DeclaratorFull, c.tree.nodeData(decl).rhs).flags & ast.Flags.declare != 0,
+        .class_decl => c.tree.extraData(ast.ClassData, c.tree.nodeData(decl).lhs).flags & ast.Flags.declare != 0,
+        .enum_decl => c.tree.extraData(ast.EnumData, c.tree.nodeData(decl).lhs).flags & ast.Flags.declare != 0,
+        else => false,
+    };
 }
 
 /// tsc's auto-type arm of `checkIdentifier`:
@@ -1238,7 +1251,7 @@ fn checkEvolvingVarRead(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex,
     if (f.exported) return;
     const decls = c.declsOf(sym);
     if (decls.len == 0) return;
-    if (c.ambient_ctx or isAmbientDeclarator(c, decls[0])) return;
+    if (c.ambient_ctx or isAmbientDecl(c, decls[0])) return;
     // A `for..in`/`for..of` HEAD declarator takes its type from the iterable, not
     // from the control flow — tsc's auto-type branch is reached only for a
     // declarator whose type has no other source. Recognized on the token after
@@ -1325,7 +1338,7 @@ fn useBeforeAssignedVerdict(c: *Checker, sym: SymbolId, node: Node, declared: Ty
     // any flow analysis and regardless of where the use sits, so a use even
     // ahead of the declaration is exempt too.
     if (valueDeclarator(c, decls)) |vd| {
-        if (isAmbientDeclarator(c, vd)) return false;
+        if (isAmbientDecl(c, vd)) return false;
     }
     // tsc's `isOuterVariable`, class-field half: `getControlFlowContainer`
     // stops at a PropertyDeclaration, so a field initializer is its own flow

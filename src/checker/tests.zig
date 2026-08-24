@@ -643,6 +643,19 @@ test "TDZ and use-before-assigned" {
     try expectCodes("declare const c: boolean; let y: number; if (c) { y = 1; } const z: number = y;", &.{2454});
 }
 
+test "TDZ: an ambient declaration has no dead zone" {
+    // tsc's `checkResolvedBlockScopedVariable` tests
+    // `!(declaration.flags & NodeFlags.Ambient)` BEFORE
+    // `isBlockScopedNameDeclaredBeforeUse`: nothing is emitted for an ambient
+    // declaration, so there is no runtime binding to be in a dead zone.
+    try expectClean("declare const x: string; var y = identity(x); declare const identity: <T>(v: T) => T;");
+    try expectClean("const n: number = a; declare const a: number;");
+    try expectClean("var c = new C(); declare class C {}");
+    // …and the non-ambient forms beside it still report.
+    try expectCodes("x; let x = 1;", &.{ 2448, 2454 });
+    try expectCodes("new C(); class C {}", &.{2449});
+}
+
 test "TS2454: ambient declarations are assigned by definition" {
     // An ambient declaration has no initializer to write, but describes
     // something the runtime already provides: tsc's `assumeInitialized`
