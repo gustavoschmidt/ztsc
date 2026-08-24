@@ -766,9 +766,16 @@ pub fn classInstanceGeneric(c: *Checker, sym0: SymbolId) Error!TypeId {
         // Overloads of one constructor all return the same instance, so this
         // is a no-op for the single-base case.
         for (0..c.ts.objectConstructSigCount(base_ctor)) |i| {
-            const ret = c.ts.fnReturn(c.ts.objectConstructSig(base_ctor, @intCast(i)));
+            const ret = try instantiatedCtorReturn(c, sym, c.ts.objectConstructSig(base_ctor, @intCast(i)));
             const rstruct = try c.resolveStructural(ret);
-            result = try c.mergeBaseObject(result, rstruct, false);
+            // Through `mergeBaseResolved`, not `mergeBaseObject`: a construct
+            // signature that returns an INTERSECTION is the normal shape for
+            // this arm — `new <T = A>(a: T): Base & T` is how a mixin
+            // constructor is written, and `resolveBaseTypesOfClass` reads the
+            // whole return type as the base — and the object-only guard
+            // dropped every such base whole (`genericDefaults`:468, where
+            // `Base02 & A` lost BOTH halves).
+            result = try mergeBaseResolved(c, result, rstruct);
             if (c.ts.kind(rstruct) == .err and (c.baseRefProvisional(ret) or c.baseRefCut(ret))) provisional = true;
         }
     }
@@ -1162,7 +1169,7 @@ fn lazyRefPropRec(c: *Checker, ref: TypeId, name: Atom, depth: u32) Error!?types
             // return this.x } }` is the shape: the ANNOTATED return type takes
             // the lazy path, and `this.x` was TS2339.
             for (0..c.ts.objectConstructSigCount(base_ctor)) |i| {
-                const ret = c.ts.fnReturn(c.ts.objectConstructSig(base_ctor, @intCast(i)));
+                const ret = try instantiatedCtorReturn(c, sym, c.ts.objectConstructSig(base_ctor, @intCast(i)));
                 if (try c.propOfTypeEx(try c.resolveStructural(ret), name, false)) |p| {
                     found = p;
                     break;
@@ -2066,6 +2073,75 @@ pub fn baseExprConstructType(c: *Checker, sym: SymbolId) Error!?TypeId {
         return null;
     }
     return null;
+}
+
+/// tsc's `getInstantiatedConstructorsForTypeArguments`, which
+/// `resolveBaseTypesOfClass` runs before it reads a base instance off a
+/// construct signature's RETURN type: a base value's construct signature may
+/// be GENERIC —
+///
+///     interface Base02Constructor { new <T = A>(a: T): Base02 & T }
+///     declare const Base02: Base02Constructor;
+///     declare class Derived03 extends Base02 {}
+///
+/// — and the signature is instantiated first, with the type arguments written
+/// on the `extends` clause and, for every parameter past them,
+/// `fillMissingTypeArguments`' DEFAULT. Reading the return type raw instead
+/// leaves the signature's own parameters standing in the base instance, so
+/// `Derived03` lost the `& A` half of `Base02 & A` and every member `A`
+/// contributes was a TS2339 (`genericDefaults`:468).
+///
+/// A parameter with neither a written argument nor a default falls back to
+/// `any` — the same seed `calls.zig` uses when a call supplies no evidence —
+/// and each resolved default is visible to the next, which is tsc's
+/// `createTypeMapper(typeParameters, result)` reading the array it fills.
+///
+/// The `extends` clause is re-walked only when the signature actually
+/// declares type parameters, which is the rare case; a non-generic signature
+/// hands its return type straight back.
+fn instantiatedCtorReturn(c: *Checker, sym: SymbolId, sig: TypeId) Error!TypeId {
+    const tps = c.ts.fnTypeParams(sig);
+    const ret = c.ts.fnReturn(sig);
+    if (tps.len == 0) return ret;
+    var targs: std.ArrayList(TypeId) = .empty;
+    defer targs.deinit(c.scratch());
+    try baseExprTypeArgs(c, sym, &targs);
+    const pmap = try c.scratch().alloc(TpMap, tps.len);
+    for (tps, 0..) |tp, i| {
+        pmap[i] = .{ .sym = tp, .ty = if (i < targs.items.len) targs.items[i] else types.error_type };
+    }
+    for (tps, 0..) |tp, i| {
+        if (i < targs.items.len) continue;
+        pmap[i].ty = if (c.typeParamHasDefault(tp))
+            try c.instantiate(try c.typeParamDefault(tp), pmap)
+        else
+            types.any_type;
+    }
+    return c.instantiate(ret, pmap);
+}
+
+/// The type arguments written on `sym`'s `extends` clause
+/// (`class D extends Base<X> {}`), converted in the symbol's own file context.
+/// Empty when the clause writes none — which is every case but the one
+/// `instantiatedCtorReturn` needs them for.
+fn baseExprTypeArgs(c: *Checker, sym: SymbolId, out: *std.ArrayList(TypeId)) Error!void {
+    const saved_ctx = c.enterSymFile(sym);
+    defer c.restoreCtx(saved_ctx);
+    for (c.declsOf(sym)) |decl| {
+        if (c.nodeTag(decl) != .class_decl) continue;
+        const data = c.tree.extraData(ast.ClassData, c.tree.nodeData(decl).lhs);
+        if (data.extends == 0) return;
+        const hd = c.tree.nodeData(data.extends);
+        if (hd.rhs == 0) return;
+        const saved = c.cur_scope;
+        defer c.cur_scope = saved;
+        if (try c.scopeOf(decl)) |s| c.cur_scope = s;
+        const r = c.tree.extraData(ast.SubRange, hd.rhs);
+        for (c.tree.extraRange(r.start, r.end)) |an| {
+            if (an != null_node) try out.append(c.scratch(), try c.typeFromTypeNode(an));
+        }
+        return;
+    }
 }
 
 /// The base expression's type as ONE structural constructor object.
