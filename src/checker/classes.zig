@@ -388,6 +388,33 @@ pub fn mergeBaseResolved(c: *Checker, derived: TypeId, base: TypeId) Error!TypeI
     if (c.ts.kind(base) == .class_value) {
         return c.mergeBaseObject(derived, try c.classConstructType(c.ts.classSymbol(base)), false);
     }
+    // `interface I extends F` where `F` names a FUNCTION type — a `type` alias
+    // whose body is a signature. tsc accepts it (an interface may extend "an
+    // object type with statically known members", and a call signature is
+    // one) and `resolveObjectTypeMembers` folds the base's call signatures in.
+    // ztsc models a signature with its own `.function` kind rather than as an
+    // object carrying one, so the object-only guard dropped the base whole and
+    // the interface came out with NO call signature at all.
+    //
+    // `@types/express` writes exactly this shape:
+    //
+    //     interface ErrorRequestHandler<…> extends core.ErrorRequestHandler<…> {}
+    //     type core.ErrorRequestHandler<…> = (err, req, res, next) => unknown
+    //
+    // so `const h: ErrorRequestHandler = (err, _req, res, next) => …` had no
+    // contextual signature and every parameter was a false TS7006 — eight of
+    // them across social-app's two `routes/util.ts`, tsgo-silent on all eight.
+    //
+    // An OVERLOADS base (`type F = { (a: A): X; (b: B): Y }` written as a
+    // call-signature list, which ztsc interns as `.overloads`) contributes
+    // each signature in order, which is what `makeObjectSigs` wants anyway.
+    if (c.ts.kind(base) == .function or c.ts.kind(base) == .overloads) {
+        const sigs: []const TypeId = if (c.ts.kind(base) == .overloads)
+            try c.memberList(base)
+        else
+            &.{base};
+        return c.mergeBaseObject(derived, try c.ts.makeObjectSigs(&.{}, 0, 0, 0, sigs, &.{}), false);
+    }
     return c.mergeBaseObject(derived, base, false);
 }
 
