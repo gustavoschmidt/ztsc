@@ -302,9 +302,27 @@ fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
         .constructor_type => {
             // `new (…) => R` / `abstract new (…) => R`: an object
             // type with a single construct signature and no call signature.
-            // (Abstract-ness is not yet modelled — under-reports TS2511 on
-            // `new (abstractCtor)()`, never a false positive.)
-            const sig = try c.signatureOfProto(node, d.lhs, false, true);
+            // WAVE36-A (abstract construct signature): the parser already
+            // records the modifier in `rhs`; carry it on the SIGNATURE (tsc's
+            // `SignatureFlags.Abstract`) so the two spellings intern apart and
+            // the relation's abstract screen has a bit to read — see
+            // `assign.sourceSatisfiesSigs`.
+            //
+            // Interning them apart is not free where a program writes BOTH,
+            // and drizzle-orm's `DrizzleEntityClass<T>` is exactly that:
+            // `((abstract new (...a: any[]) => T) | (new (...a: any[]) => T))
+            // & DrizzleEntity`. The two operands used to hash-cons together,
+            // so the union collapsed to one member and the intersection
+            // distributed once; now the union has the two members tsc gives
+            // it and the distribution runs twice. That is +2.6% wall on
+            // drizzle (measured, single-threaded, 12 checks per sample) and
+            // nothing measurable on excalidraw, social-app or typebox — the
+            // price of the type actually having two operands.
+            const sig0 = try c.signatureOfProto(node, d.lhs, false, true);
+            const sig = if (d.rhs != 0)
+                try c.ts.withFnFlags(sig0, types.fn_flag_abstract)
+            else
+                sig0;
             return c.ts.makeObjectSigs(&.{}, 0, 0, types.obj_flag_not_inferable, &.{}, &.{sig});
         },
         .keyof_type => return c.keyofType(try c.typeFromTypeNode(d.lhs)),
@@ -1179,6 +1197,13 @@ pub fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, obj_flags:
     defer getter_keys.deinit(c.scratch());
     var setter_keys: std.AutoHashMapUnmanaged(Atom, void) = .empty;
     defer setter_keys.deinit(c.scratch());
+    // WAVE36-A (write type): the setter's PARAMETER type per accessor key, so
+    // a divergent pair (`get n(): number; set n(v: string)`) can be stamped on
+    // the property as `types.Prop.write_ty` in the post-pass below. Recorded
+    // in a map rather than on the prop directly because the getter may be
+    // declared either side of the setter.
+    var setter_params: std.AutoHashMapUnmanaged(Atom, TypeId) = .empty;
+    defer setter_params.deinit(c.scratch());
 
     for (member_nodes) |m| {
         if (m == null_node) continue;
@@ -1223,11 +1248,14 @@ pub fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, obj_flags:
                         try upsertProp(c.scratch(), &props, &prop_index, .{ .name = name, .ty = gt, .flags = 0 });
                     } else {
                         try setter_keys.put(c.scratch(), name, {});
+                        const st = if (c.ts.kind(sig) == .function and c.ts.fnParamCount(sig) > 0)
+                            c.ts.fnParam(sig, 0).ty
+                        else
+                            types.any_type;
+                        // WAVE36-A: kept for the write-type post-pass whether
+                        // or not a getter claimed the property type.
+                        try setter_params.put(c.scratch(), name, st);
                         if (!getter_keys.contains(name)) {
-                            const st = if (c.ts.kind(sig) == .function and c.ts.fnParamCount(sig) > 0)
-                                c.ts.fnParam(sig, 0).ty
-                            else
-                                types.any_type;
                             try upsertProp(c.scratch(), &props, &prop_index, .{ .name = name, .ty = st, .flags = 0 });
                         }
                     }
@@ -1283,6 +1311,30 @@ pub fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, obj_flags:
     while (git.next()) |k| {
         if (setter_keys.contains(k.*)) continue;
         if (prop_index.get(k.*)) |idx| props.items[idx].flags |= types.prop_flag_readonly;
+    }
+    // WAVE36-A (write type): a get/set pair whose two annotations DIFFER gets
+    // the setter's parameter as `Prop.write_ty` (tsc's `getWriteTypeOfSymbol`),
+    // so an assignment target reads it instead of the getter's return. Same
+    // type on both sides stores nothing — `makeObjectSigs` derives
+    // `obj_flag_write_types` from the props, so the common object's shape is
+    // byte-for-byte what it was.
+    //
+    // TYPE LITERALS ONLY. An INTERFACE (the other caller, which passes
+    // `obj_flag_not_inferable`) stays a `.ref`, so `expr.setterWriteType`
+    // reaches its `set` declarations directly and the stored copy would be
+    // redundant — and not free: the DOM lib declares ~29 divergent pairs on
+    // `Node`, `Element` and friends, every derived interface's member table
+    // inherits them, and storing them there cost +3.4 MB peak RSS on
+    // excalidraw (+3.3%, measured) for an answer the declaration walk already
+    // had. A materialized type literal is the one shape with no declaration
+    // to walk back to, and it is the only one that stores.
+    if (obj_flags & types.obj_flag_not_inferable == 0) {
+        var sit = setter_params.iterator();
+        while (sit.next()) |e| {
+            const idx = prop_index.get(e.key_ptr.*) orelse continue;
+            if (props.items[idx].ty == e.value_ptr.*) continue;
+            props.items[idx].write_ty = e.value_ptr.*;
+        }
     }
     var flags = if (sym_index and !str_index and nindex == 0)
         obj_flags | types.obj_flag_symbol_index

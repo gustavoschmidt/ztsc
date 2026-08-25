@@ -6924,53 +6924,74 @@ fn setterWriteType(c: *Checker, t0: TypeId, name: Atom, depth: u32) Error!?TypeI
     if (depth > 8) return null;
     const t = if (c.ts.kind(t0) == .this_type) c.ts.thisTypeInstance(t0) else t0;
     switch (c.ts.kind(t)) {
-        // A composite's property is a SYNTHESIZED symbol, and tsc's
-        // `getWriteTypeOfSymbol` for one combines the constituents' write
-        // types the same way `getTypeOfSymbol` combines their read types: a
-        // union unions, an intersection intersects. A constituent with no
-        // setter contributes its READ type, because that is what its own
-        // `getWriteTypeOfSymbol` falls back to.
+        // WAVE36-A (write type): the synthesized property of a union or
+        // intersection carries its own WRITE type — tsc's
+        // `createUnionOrIntersectionProperty` collects one write type per
+        // constituent (a constituent that declares no setter contributes its
+        // READ type, which is what `getWriteTypeOfSymbol` answers there) and
+        // combines them the way it combines the read types: a UNION for a
+        // union source, an INTERSECTION for an intersection source.
         //
-        // First-arm-wins was wrong in both directions, and the corpus names
-        // both:
-        //
-        //   * `One & Two`, `One.prop2: number` beside
-        //     `Two: set prop2(s: string | 42)`, writes at
-        //     `number & (string | 42)` — i.e. `42` — so `i.prop2 = "hello"`
-        //     is a TS2322 that answering `string | 42` let through
-        //     (`divergentAccessorsTypes4`, `…Types5`).
-        //   * `One | Two` writes at the UNION, so `u1.prop3 = 42` is legal as
-        //     long as SOME constituent accepts it; answering only the first
-        //     constituent's made it a false positive
-        //     (`divergentAccessorsTypes3`).
-        //
-        // Only reached when some constituent really declares a setter: with
-        // none, the caller's `orelse p.ty` — the property off the RESOLVED
-        // composite — is both the same answer and the cheaper one.
+        // Answering with the first divergent constituent, as this walk used
+        // to, picked a parameter type by member ORDER: `(One | Two).prop3`
+        // took `Two`'s `string | boolean` and rejected `= 42` even though
+        // `One.prop3` is a `number` field, and `(One & Two).prop2` took
+        // `Two`'s `string | 42` and accepted `= "hello"` even though
+        // `One.prop2` is `number` (so the write type is `42`).
         .union_type, .intersection => {
-            const is_union = c.ts.kind(t) == .union_type;
-            var parts: std.ArrayList(TypeId) = .empty;
-            defer parts.deinit(c.scratch());
-            var any_setter = false;
-            for (c.ts.members(t)) |m| {
+            // `members` dangles as soon as the recursion interns anything.
+            const ms = try c.scratch().dupe(TypeId, c.ts.members(t));
+            defer c.scratch().free(ms);
+            // Pass one is byte for byte the walk this used to be, and it is
+            // the one that runs on every write through a union receiver:
+            // unless SOME constituent declares a divergent setter there is
+            // nothing to combine. Reading the other constituents' property
+            // types unconditionally (the obvious single pass) cost +2.4% wall
+            // on drizzle, whose builder types are deep unions.
+            var first: usize = ms.len;
+            var first_wt: TypeId = types.no_type;
+            for (ms, 0..) |m, i| {
                 if (try setterWriteType(c, m, name, depth + 1)) |wt| {
-                    any_setter = true;
-                    try parts.append(c.scratch(), wt);
-                } else if (try c.propOfType(try c.resolveStructural(m), name)) |p| {
-                    try parts.append(c.scratch(), p.ty);
-                } else if (is_union) {
-                    // A union arm that lacks the property has no write type to
-                    // contribute and no way to stand in for one; the access
-                    // itself is the error. Keep the caller's fallback.
-                    return null;
+                    first = i;
+                    first_wt = wt;
+                    break;
                 }
             }
-            if (!any_setter) return null;
-            if (parts.items.len == 1) return parts.items[0];
-            return if (is_union)
+            if (first == ms.len) return null;
+            var parts: std.ArrayList(TypeId) = .empty;
+            defer parts.deinit(c.scratch());
+            try parts.ensureTotalCapacityPrecise(c.scratch(), ms.len);
+            for (ms, 0..) |m, i| {
+                // Same split tsc's `createUnionOrIntersectionProperty` makes:
+                // it seeds `writeTypes` from the read types collected SO FAR
+                // at the first divergence, so a constituent before it
+                // contributes its read type and one after it contributes
+                // `getWriteTypeOfSymbol` — the setter's parameter when it has
+                // one, the read type when it does not.
+                const part: TypeId = blk: {
+                    if (i == first) break :blk first_wt;
+                    if (i > first) {
+                        if (try setterWriteType(c, m, name, depth + 1)) |wt| break :blk wt;
+                    }
+                    // A constituent that does not have the property at all:
+                    // the ACCESS is the error. Keep the read type.
+                    const p = (try c.propOfType(m, name)) orelse return null;
+                    break :blk p.ty;
+                };
+                parts.appendAssumeCapacity(part);
+            }
+            return if (c.ts.kind(t) == .union_type)
                 try c.ts.makeUnion(c.scratch(), parts.items)
             else
                 try c.ts.makeIntersection(c.scratch(), parts.items);
+        },
+        // WAVE36-A (write type): a MATERIALIZED object — a type literal, a
+        // non-generic alias naming one, an instantiation of either — has no
+        // declaration to walk back to, so it carries the divergent accessor's
+        // parameter type on the property itself. See `types.Prop.write_ty`.
+        .object => {
+            const p = c.ts.objectPropByName(t, name) orelse return null;
+            return if (p.write_ty != types.no_type) p.write_ty else null;
         },
         .ref => {
             const sym = c.ts.refSymbol(t);

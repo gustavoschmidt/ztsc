@@ -139,7 +139,9 @@ pub const Kind = enum(u8) {
     ///  (iff flags has obj_flag_has_sigs) call_count, construct_count,
     ///  then per property (sorted by name atom): name, type, prop_flags,
     ///  (iff obj_flag_has_sigs) then call-sig TypeIds, then construct-sig
-    ///  TypeIds — each an interned `.function` type, in declaration order].
+    ///  TypeIds — each an interned `.function` type, in declaration order,
+    ///  (iff obj_flag_write_types) then write_count, then that many
+    ///  [property_index, write_type] pairs in ascending index order].
     /// Object flags: 1 = fresh (object literal, excess-prop checked);
     /// 2 = not-inferable-index (interface / class-instance shape — has no
     /// *implied* string index for the index-signature relation, unlike
@@ -385,6 +387,20 @@ pub const obj_flag_readonly_string_index: u32 = 512;
 /// shared `enumNumberIndexInfo` is built `isReadonly: true`, which is what makes
 /// `E[0] = "x"` TS2542. `numberIndexIsReadonly` folds the two together.
 pub const obj_flag_readonly_number_index: u32 = 1024;
+/// At least one property carries a WRITE type that differs from its read type
+/// — a TS 4.3 divergent accessor pair (`get n(): number; set n(v: string)`).
+/// When set, the shape ends in a `[write_count, (property_index, write_type)*]`
+/// block; see the `.object` layout note and `Prop.write_ty`.
+///
+/// A block rather than a fourth word per property record: a divergent pair is
+/// rare and every object in a real program would otherwise pay 33% more shape
+/// words. The bit is derived from the props in `makeObjectSigs` and never
+/// taken from a caller's `flags` argument, so it cannot go out of sync with
+/// the block — every object rebuilder that drops `write_ty` (a spread, a
+/// mapped type, a class-member merge) simply produces the plain shape, which
+/// is the pre-existing behaviour and a DIFFERENT `TypeId` from the one that
+/// carries write types. No aliasing is possible.
+pub const obj_flag_write_types: u32 = 2048;
 pub const prop_flag_optional: u32 = 1;
 pub const prop_flag_readonly: u32 = 2;
 /// A `private`/`protected` class member (tsc's `ModifierFlags.NonPublic`).
@@ -452,6 +468,19 @@ pub const fn_flag_predicate: u32 = 2;
 /// list, so it never counts toward arity; it is used for the call-site
 /// receiver check (TS2684) and for typing `this` inside the body.
 pub const fn_flag_this: u32 = 4;
+/// tsc's `SignatureFlags.Abstract`: this CONSTRUCT signature cannot be `new`ed
+/// — it is what `abstract new (…) => R` writes, and what the static side of an
+/// `abstract class` carries. `signaturesRelatedTo` screens on it before it
+/// compares anything: an abstract source signature against a non-abstract
+/// target is rejected outright, because letting `typeof A` through a
+/// `new () => A` target would hand the caller a `new` on a class with
+/// unimplemented members. The reverse stays legal.
+///
+/// It lives on the SIGNATURE and not on the class declaration precisely so
+/// that `new () => A` and `abstract new () => A` are two types: both build the
+/// same lone-construct-signature object, and without the bit in the interned
+/// shape they hash-cons together and the screen has nothing to read.
+pub const fn_flag_abstract: u32 = 8;
 pub const param_flag_optional: u32 = 1;
 pub const param_flag_rest: u32 = 2;
 pub const param_flag_initializer: u32 = 4;
@@ -475,6 +504,25 @@ pub const Prop = struct {
     name: Atom,
     ty: TypeId,
     flags: u32 = 0,
+    /// tsc's `getWriteTypeOfSymbol`: since TS 4.3 a get/set pair may declare
+    /// DIFFERENT types (`get n(): number; set n(v: string)`), so a property
+    /// has a READ type (`ty`, the getter's — every existing consumer wants
+    /// this one) and a WRITE type, which only an assignment target reads.
+    ///
+    /// `no_type` — the default, so every existing `Prop` literal is unchanged
+    /// — means "the write type IS the read type", which is what
+    /// `getWriteTypeOfSymbol` answers for a plain field, a method, and a
+    /// get/set pair whose two annotations agree. A non-zero value is stored
+    /// out-of-line in the object's `obj_flag_write_types` block and is part
+    /// of the interned shape, so two type literals that differ ONLY in their
+    /// setter parameter are two types.
+    write_ty: TypeId = no_type,
+
+    /// The type an assignment to this property is checked against: the write
+    /// type when the accessors diverge, the read type otherwise.
+    pub fn writeType(p: Prop) TypeId {
+        return if (p.write_ty != no_type) p.write_ty else p.ty;
+    }
 
     pub fn optional(p: Prop) bool {
         return p.flags & prop_flag_optional != 0;
@@ -853,19 +901,50 @@ pub const Store = struct {
     pub fn objectPropCount(s: *const Store, id: TypeId) u32 {
         return s.dataB(id);
     }
-    /// Property records start at `dataA + objectHeaderLen`: 3 header words
-    /// (flags, string index, number index), plus 2 more (call/construct
-    /// counts) when the object carries signatures.
-    fn objectHeaderLen(s: *const Store, id: TypeId) u32 {
-        return if (s.objectFlags(id) & obj_flag_has_sigs != 0) 5 else 3;
+    /// Shape words BEFORE the optional write-type block: header, property
+    /// records, call/construct signature ids. `a` is the object's `extra`
+    /// offset into `extra`, `n` its property count.
+    fn objectBodyLen(extra: []const u32, a: u32, n: u32) u32 {
+        if (extra[a] & obj_flag_has_sigs != 0)
+            return 5 + 3 * n + extra[a + 3] + extra[a + 4];
+        return 3 + 3 * n;
     }
+    /// The whole interned shape, write-type block included.
+    fn objectShapeLen(extra: []const u32, a: u32, n: u32) u32 {
+        const body = objectBodyLen(extra, a, n);
+        if (extra[a] & obj_flag_write_types == 0) return body;
+        return body + 1 + 2 * extra[a + body];
+    }
+    /// The stored WRITE type of property `i`, or `no_type`. Linear over the
+    /// write block, which exists only for an object built from a divergent
+    /// get/set pair and holds one pair per such property.
+    fn objectWriteAt(s: *const Store, a: u32, n: u32, i: u32) TypeId {
+        const w = a + objectBodyLen(s.extra.items, a, n);
+        const cnt = s.extra.items[w];
+        var k: u32 = 0;
+        while (k < cnt) : (k += 1) {
+            if (s.extra.items[w + 1 + 2 * k] == i) return s.extra.items[w + 2 + 2 * k];
+        }
+        return no_type;
+    }
+    /// Property records start at `dataA` plus the header: 3 words (flags,
+    /// string index, number index), plus 2 more (call/construct counts) when
+    /// the object carries signatures.
     pub fn objectProp(s: *const Store, id: TypeId, i: u32) Prop {
         if (id < s.base_len) return s.base.?.objectProp(id, i);
-        const base = s.dataA(id) + s.objectHeaderLen(id) + 3 * i;
+        const a = s.dataA(id);
+        const f = s.extra.items[a];
+        const base = a + (if (f & obj_flag_has_sigs != 0) @as(u32, 5) else 3) + 3 * i;
         return .{
             .name = s.extra.items[base],
             .ty = s.extra.items[base + 1],
             .flags = s.extra.items[base + 2],
+            // The flags word is already in hand; the branch is taken only for
+            // an object that carries a divergent accessor pair.
+            .write_ty = if (f & obj_flag_write_types != 0)
+                s.objectWriteAt(a, s.dataB(id), i)
+            else
+                no_type,
         };
     }
     /// Number of call signatures on a callable object (0 for a plain object).
@@ -955,6 +1034,10 @@ pub const Store = struct {
 
     pub fn fnHasPredicate(s: *const Store, id: TypeId) bool {
         return s.kind(id) == .function and s.fnFlags(id) & fn_flag_predicate != 0;
+    }
+    /// Is this construct signature `abstract`? See `fn_flag_abstract`.
+    pub fn fnIsAbstract(s: *const Store, id: TypeId) bool {
+        return s.kind(id) == .function and s.fnFlags(id) & fn_flag_abstract != 0;
     }
     pub fn fnPredicate(s: *const Store, id: TypeId) Predicate {
         if (id < s.base_len) return s.base.?.fnPredicate(id);
@@ -1199,16 +1282,11 @@ pub const Store = struct {
             .union_type, .intersection, .overloads => return s.extra.items[a..b],
             // 2 words per element plus the trailing tuple-level flags word.
             .tuple => return s.extra.items[a .. a + 2 * b + 1],
-            .object => {
-                // A callable object has 2 extra header words plus one
-                // TypeId per call/construct signature after the property
-                // records; all part of the identity shape.
-                if (s.extra.items[a] & obj_flag_has_sigs != 0) {
-                    const sig_words = s.extra.items[a + 3] + s.extra.items[a + 4];
-                    return s.extra.items[a .. a + 5 + 3 * b + sig_words];
-                }
-                return s.extra.items[a .. a + 3 + 3 * b];
-            },
+            // A callable object has 2 extra header words plus one TypeId per
+            // call/construct signature after the property records, and an
+            // object with a divergent accessor pair a trailing write-type
+            // block; all part of the identity shape.
+            .object => return s.extra.items[a .. a + objectShapeLen(s.extra.items, a, b)],
             .function => {
                 const tpc = s.extra.items[a + 2];
                 // A predicate function (`x is T` / `asserts x`) stores 3 extra
@@ -1636,7 +1714,14 @@ pub const Store = struct {
         construct_sigs: []const TypeId,
     ) Error!TypeId {
         const has_sigs = call_sigs.len != 0 or construct_sigs.len != 0;
-        const flags = if (has_sigs) flags0 | obj_flag_has_sigs else flags0 & ~obj_flag_has_sigs;
+        // Both bits are DERIVED, never taken from `flags0`: every caller that
+        // passes another object's flags through (instantiation, the class
+        // merge, `clearObjFlags`) would otherwise claim a block it did not
+        // build. See `obj_flag_write_types`. The write bit is OR'd in below,
+        // once the property loop has counted — this loop is the hot path for
+        // every object the program builds, so it stays a single pass.
+        const flags = (if (has_sigs) flags0 | obj_flag_has_sigs else flags0 & ~obj_flag_has_sigs) &
+            ~obj_flag_write_types;
         const start = s.pending.items.len;
         defer s.pending.items.len = start;
         try s.pending.append(s.alloc, flags);
@@ -1647,7 +1732,9 @@ pub const Store = struct {
             try s.pending.append(s.alloc, @intCast(construct_sigs.len));
         }
         const pstart = s.pending.items.len;
+        var nwrites: u32 = 0;
         for (props) |p| {
+            if (p.write_ty != no_type and p.write_ty != p.ty) nwrites += 1;
             try s.pending.append(s.alloc, p.name);
             try s.pending.append(s.alloc, p.ty);
             try s.pending.append(s.alloc, p.flags);
@@ -1657,6 +1744,24 @@ pub const Store = struct {
         // Signatures trail the properties in declaration order.
         try s.pending.appendSlice(s.alloc, call_sigs);
         try s.pending.appendSlice(s.alloc, construct_sigs);
+        if (nwrites != 0) {
+            s.pending.items[start] |= obj_flag_write_types;
+            try s.pending.append(s.alloc, nwrites);
+            // Indices are into the SORTED records, so the block is keyed the
+            // same way `objectProp` reads it and two spellings of the same
+            // literal produce byte-identical shapes. Names are unique within
+            // an object, so the name→input lookup is unambiguous.
+            var i: u32 = 0;
+            while (i < props.len) : (i += 1) {
+                const nm = s.pending.items[pstart + 3 * i];
+                for (props) |p| {
+                    if (p.name != nm or p.write_ty == no_type or p.write_ty == p.ty) continue;
+                    try s.pending.append(s.alloc, i);
+                    try s.pending.append(s.alloc, p.write_ty);
+                    break;
+                }
+            }
+        }
         return s.internType(.object, s.pending.items[start..], @intCast(props.len));
     }
 
@@ -1689,14 +1794,37 @@ pub const Store = struct {
         const own = if (id < s.base_len) s.base.? else s;
         const start = s.pending.items.len;
         defer s.pending.items.len = start;
-        // Copy the whole shape (header + props + any call/construct sigs).
-        const len: u32 = if (own.extra.items[a] & obj_flag_has_sigs != 0)
-            5 + 3 * n + own.extra.items[a + 3] + own.extra.items[a + 4]
-        else
-            3 + 3 * n;
+        // Copy the whole shape (header + props + any call/construct sigs +
+        // any write-type block); only the flags word changes.
+        const len = objectShapeLen(own.extra.items, a, n);
         try s.pending.appendSlice(s.alloc, own.extra.items[a .. a + len]);
         s.pending.items[start] &= ~mask;
         return s.internType(.object, s.pending.items[start..], n);
+    }
+
+    /// The same signature with `mask` added to its flags word. Used for
+    /// `fn_flag_abstract`, which the type-node path only learns AFTER the
+    /// proto has been converted; every other flag is known at build time and
+    /// goes straight into `makeFunction*`. The flags word is part of the
+    /// interned shape, so this mints a distinct type — which is the point.
+    pub fn withFnFlags(s: *Store, id: TypeId, mask: u32) Error!TypeId {
+        if (s.kind(id) != .function) return id;
+        const a = s.dataA(id);
+        const b = s.dataB(id);
+        // The signature may live in the frozen base; read its shape words from
+        // the owning store (base ids carry base-relative extra offsets).
+        const own = if (id < s.base_len) s.base.? else s;
+        const f = own.extra.items[a];
+        if (f & mask == mask) return id;
+        const tpc = own.extra.items[a + 2];
+        const pred: u32 = if (f & fn_flag_predicate != 0) 3 else 0;
+        const thisw: u32 = if (f & fn_flag_this != 0) 1 else 0;
+        const len: u32 = 3 + tpc + 3 * b + pred + thisw;
+        const start = s.pending.items.len;
+        defer s.pending.items.len = start;
+        try s.pending.appendSlice(s.alloc, own.extra.items[a .. a + len]);
+        s.pending.items[start] |= mask;
+        return s.internType(.function, s.pending.items[start..], b);
     }
 
     pub fn makeFunction(
@@ -2612,6 +2740,57 @@ test "union canonicalization: order, dups, flatten, never, true|false" {
     try testing.expectEqual(boolean_type, try s.makeUnion(sc, &.{ true_type, boolean_type }));
 }
 
+test "a property's WRITE type is part of the object's interned shape" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var s = try Store.init(arena.allocator());
+
+    // `{ get n(): number; set n(v: string) }` vs `{ … set n(v: boolean) }`:
+    // the READ shape is identical, so without the write type in the shape the
+    // two hash-cons together and the write site cannot tell them apart.
+    const read_only_shape = try s.makeObject(&.{.{ .name = 7, .ty = number_type }}, 0, 0, 0);
+    const w_string = try s.makeObject(&.{.{ .name = 7, .ty = number_type, .write_ty = string_type }}, 0, 0, 0);
+    const w_bool = try s.makeObject(&.{.{ .name = 7, .ty = number_type, .write_ty = boolean_type }}, 0, 0, 0);
+    try testing.expect(read_only_shape != w_string);
+    try testing.expect(w_string != w_bool);
+    try testing.expectEqual(w_string, try s.makeObject(&.{.{ .name = 7, .ty = number_type, .write_ty = string_type }}, 0, 0, 0));
+    try testing.expectEqual(string_type, s.objectProp(w_string, 0).write_ty);
+    try testing.expectEqual(string_type, s.objectPropByName(w_string, 7).?.writeType());
+    // `no_type`, and a write type EQUAL to the read type, both mean "no
+    // divergence" and produce the pristine shape — no object in a program
+    // without split accessors grows a word.
+    try testing.expectEqual(read_only_shape, try s.makeObject(&.{.{ .name = 7, .ty = number_type, .write_ty = number_type }}, 0, 0, 0));
+    try testing.expectEqual(no_type, s.objectProp(read_only_shape, 0).write_ty);
+    try testing.expectEqual(number_type, s.objectProp(read_only_shape, 0).writeType());
+
+    // The block is keyed by SORTED property index, so the same members
+    // written in either order are one type and each write type still lands on
+    // its own property.
+    const a = Prop{ .name = 3, .ty = string_type, .write_ty = number_type };
+    const b = Prop{ .name = 9, .ty = number_type, .write_ty = boolean_type };
+    const ab = try s.makeObject(&.{ a, b }, 0, 0, 0);
+    const ba = try s.makeObject(&.{ b, a }, 0, 0, 0);
+    try testing.expectEqual(ab, ba);
+    try testing.expectEqual(number_type, s.objectPropByName(ab, 3).?.write_ty);
+    try testing.expectEqual(boolean_type, s.objectPropByName(ab, 9).?.write_ty);
+
+    // The block trails the call/construct signatures, so a callable object
+    // reads both correctly and the two features are independent.
+    const sig = try s.makeFunction(&.{}, void_type, &.{}, 0);
+    const callable = try s.makeObjectSigs(&.{ a, b }, 0, 0, 0, &.{sig}, &.{});
+    try testing.expectEqual(@as(u32, 1), s.objectCallSigCount(callable));
+    try testing.expectEqual(sig, s.objectCallSig(callable, 0));
+    try testing.expectEqual(number_type, s.objectPropByName(callable, 3).?.write_ty);
+    try testing.expectEqual(boolean_type, s.objectPropByName(callable, 9).?.write_ty);
+    try testing.expect(callable != try s.makeObjectSigs(&.{ .{ .name = 3, .ty = string_type }, .{ .name = 9, .ty = number_type } }, 0, 0, 0, &.{sig}, &.{}));
+
+    // `regular`/`widenedObject` copy the whole shape, block included.
+    const fresh = try s.makeObject(&.{ a, b }, 0, 0, obj_flag_fresh);
+    try testing.expect(fresh != ab);
+    try testing.expectEqual(ab, try s.regular(fresh));
+    try testing.expectEqual(number_type, s.objectPropByName(fresh, 3).?.write_ty);
+}
+
 test "intersection canonicalization" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2725,6 +2904,38 @@ test "function and tuple interning" {
     try testing.expectEqual(t1, t2);
     try testing.expectEqual(@as(u32, 2), s.tupleLen(t1));
     try testing.expect(s.tupleElem(t1, 1).optional());
+}
+
+test "an abstract construct signature is a distinct interned type" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var s = try Store.init(arena.allocator());
+
+    // `new () => number` and `abstract new () => number` must not hash-cons
+    // together, or the relation's abstract screen has nothing to read.
+    const plain = try s.makeFunction(&.{}, number_type, &.{}, 0);
+    const abst = try s.withFnFlags(plain, fn_flag_abstract);
+    try testing.expect(plain != abst);
+    try testing.expect(!s.fnIsAbstract(plain));
+    try testing.expect(s.fnIsAbstract(abst));
+    // Everything else about the signature survives the rebuild…
+    try testing.expectEqual(s.fnReturn(plain), s.fnReturn(abst));
+    try testing.expectEqual(s.fnParamCount(plain), s.fnParamCount(abst));
+    // …and the rebuild is idempotent and hash-consed.
+    try testing.expectEqual(abst, try s.withFnFlags(abst, fn_flag_abstract));
+    try testing.expectEqual(abst, try s.withFnFlags(try s.makeFunction(&.{}, number_type, &.{}, 0), fn_flag_abstract));
+
+    // The trailing payload words (predicate, `this`) are copied, not dropped:
+    // both are read off offsets past the params.
+    const params = [_]Param{.{ .name = 1, .ty = number_type }};
+    const pred = try s.makeFunctionThis(&params, boolean_type, &.{}, 0, .{ .param = 0, .ty = string_type, .asserts = false }, number_type);
+    const pred_a = try s.withFnFlags(pred, fn_flag_abstract);
+    try testing.expect(pred != pred_a);
+    try testing.expect(s.fnHasPredicate(pred_a));
+    try testing.expectEqual(s.fnPredicate(pred).ty, s.fnPredicate(pred_a).ty);
+    try testing.expectEqual(number_type, s.fnThisType(pred_a));
+    // A non-function id is returned unchanged.
+    try testing.expectEqual(number_type, try s.withFnFlags(number_type, fn_flag_abstract));
 }
 
 test "refs and type params intern by symbol + args" {

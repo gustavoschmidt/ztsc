@@ -885,7 +885,19 @@ pub const baseClassSym = classes.baseClassSym;
 pub const classBaseEntitySym = classes.classBaseEntitySym;
 pub const baseExprConstructType = classes.baseExprConstructType;
 pub const importedContainerSym = classes.importedContainerSym;
-pub const classIsAbstract = classes.classIsAbstract;
+/// `classes.classIsAbstract`, memoized per class symbol. The answer is one
+/// modifier bit on one declaration, but reading it brackets the walk in
+/// `enterSymFile`/`restoreCtx`, and the relation's abstract-constructor screen
+/// (`assign.sourceSatisfiesSigs`) asks it on EVERY `class_value` source
+/// related to a construct signature. See `Checker.class_abstract_cache` for
+/// the measurement. A pure function of the program, so the memo cannot make an
+/// answer depend on which checker asked first.
+pub fn classIsAbstract(c: *Checker, sym: SymbolId) Error!bool {
+    if (c.class_abstract_cache.get(sym)) |v| return v;
+    const v = try classes.classIsAbstract(c, sym);
+    try c.class_abstract_cache.put(c.cm(), sym, v);
+    return v;
+}
 pub const abstractSatisfiedElsewhere = classes.abstractSatisfiedElsewhere;
 pub const classChainMemberIsAbstract = classes.classChainMemberIsAbstract;
 pub const classChainMemberType = classes.classChainMemberType;
