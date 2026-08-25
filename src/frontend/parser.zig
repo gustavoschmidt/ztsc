@@ -370,6 +370,9 @@ const Parser = struct {
     /// parsed, so the diagnostics are recorded as TS1212 and rewritten in
     /// `sealInto`.
     saw_module_syntax: bool = false,
+    /// How many `with` bodies enclose the statement being parsed. A cheap
+    /// stand-in for tsc's "the checker never descends here" — see `addDiag`.
+    with_body_depth: u32 = 0,
 
     /// Copy the parsed lists into `out` at exact size. `out` is an arena, so
     /// each `dupe`/`setCapacity` is a single tight allocation with no slack
@@ -725,6 +728,12 @@ const Parser = struct {
     /// only, because the grammar-class ones do not live in tsc's
     /// `parseDiagnostics` and so neither suppress nor are suppressed by these.
     fn addDiag(p: *Parser, code: Code, span: ast.Diagnostic) Error!void {
+        // Inside a `with` body tsc's CHECKER never runs (`checkWithStatement`
+        // stops after the object expression), so every grammar-class code that
+        // belongs to the checker's grammar pass is dropped there. Its binder
+        // still walks the body, so the `checkStrictMode*` codes stay — see
+        // `Code.strictModeBinder`.
+        if (p.with_body_depth > 0 and code.class() == .grammar and !code.strictModeBinder()) return;
         if (code.class() == .syntactic) {
             if (p.last_syntactic_start) |last| {
                 if (last == span.span.start) return;
@@ -1702,6 +1711,7 @@ const Parser = struct {
             .if_else_stmt,
             .while_stmt,
             .do_stmt,
+            .with_stmt,
             .for_stmt,
             .for_in_stmt,
             .for_of_stmt,
@@ -1884,6 +1894,14 @@ const Parser = struct {
     /// ModuleBlock — so a module element there is out of context whatever list
     /// encloses the whole thing (`if (x) namespace N {}` is TS1235 even at the
     /// top level of a file). See `Parser.element_home`.
+    /// TS1040 for an `async` keyword at token `kw`, when the declaration it
+    /// modifies sits in an ambient context (`checkGrammarModifiers`' `flags &
+    /// ModifierFlags.Ambient || node.parent.flags & NodeFlags.Ambient`). A
+    /// no-op outside one, so the callers need no guard of their own.
+    fn asyncInAmbient(p: *Parser, kw: TokenIndex) Error!void {
+        if (p.ambient and p.spec == 0) try p.errAtToken(.async_modifier_in_ambient, kw);
+    }
+
     fn parseSubstatement(p: *Parser) PE!Node {
         const was_home = p.element_home;
         p.element_home = .other;
@@ -2024,6 +2042,7 @@ const Parser = struct {
             },
             .keyword_if => return p.parseIfStatement(),
             .keyword_while => return p.parseWhileStatement(),
+            .keyword_with => return p.parseWithStatement(),
             .keyword_do => return p.parseDoStatement(),
             .keyword_for => return p.parseForStatement(),
             .keyword_switch => return p.parseSwitchStatement(),
@@ -2069,7 +2088,13 @@ const Parser = struct {
             },
             .keyword_async => {
                 if (p.peekTag(1) == .keyword_function and !p.peekNewline(1)) {
-                    _ = try p.bump();
+                    const kw = try p.bump();
+                    // TS1040, tsc's `checkGrammarModifiers`: an ambient
+                    // declaration has no body to await in. The context is
+                    // inherited — a `.d.ts`, a `declare namespace` body, a
+                    // `declare module` block — where the `declare async
+                    // function` spelling reaches its own arm below.
+                    try p.asyncInAmbient(kw);
                     return p.parseFunctionDecl(ast.Flags.async, false);
                 }
                 // Any OTHER declaration behind `async` is tsc's TS1042: its
@@ -2147,10 +2172,11 @@ const Parser = struct {
                     },
                     .keyword_async => {
                         _ = try p.bump();
-                        _ = try p.bump();
+                        const kw = try p.bump();
                         const was_ambient = p.ambient;
                         p.ambient = true;
                         defer p.ambient = was_ambient;
+                        try p.asyncInAmbient(kw);
                         return p.parseFunctionDecl(ast.Flags.declare | ast.Flags.async, false);
                     },
                     .keyword_class => {
@@ -2933,6 +2959,38 @@ const Parser = struct {
         _ = try p.expect(.r_paren, .expected_r_paren);
         const body = try p.parseLoopBody();
         return p.addNode(.{ .tag = .while_stmt, .main_token = kw, .data = .{ .lhs = cond, .rhs = body } });
+    }
+
+    /// `with (o) s`. Both of the statement's own diagnostics are raised here,
+    /// because both are grammar-class in ztsc's sense (semantic despite the
+    /// TS1101 number, hidden by `@ts-ignore`, suppressed by a syntactic error):
+    ///
+    ///   - TS1101 from tsc's BINDER (`checkStrictModeWithStatement`), on the
+    ///     `with` token alone. ztsc has no non-strict mode, so it is
+    ///     unconditional.
+    ///   - TS2410 from tsc's CHECKER (`checkWithStatement`), over
+    ///     `[getSpanOfTokenAtPosition(node.pos).start, node.statement.pos)` —
+    ///     the head `with (o)` with its trailing trivia, which is exactly the
+    ///     `)`-to-body gap `curFullStart` names once the `)` is consumed.
+    ///
+    /// The BODY is parsed and bound but never checked; `checkWithStatement`
+    /// checks the object expression and returns. Nothing inside a `with` block
+    /// is diagnosed, which is why `with (o) { bing = true }` earns no TS2304.
+    fn parseWithStatement(p: *Parser) PE!Node {
+        const kw = try p.bump();
+        const head_start = p.tok_starts.items[kw] & scanner.Tokens.start_mask;
+        try p.errAtToken(.with_in_strict, kw);
+        _ = try p.expect(.l_paren, .expected_l_paren);
+        const obj = try p.parseExpression(.{});
+        _ = try p.expect(.r_paren, .expected_r_paren);
+        try p.addDiag(.with_statement_not_supported, .{
+            .code = .with_statement_not_supported,
+            .span = .{ .start = head_start, .end = p.curFullStart() },
+        });
+        p.with_body_depth += 1;
+        defer p.with_body_depth -= 1;
+        const body = try p.parseSubstatement();
+        return p.addNode(.{ .tag = .with_stmt, .main_token = kw, .data = .{ .lhs = obj, .rhs = body } });
     }
 
     fn parseDoStatement(p: *Parser) PE!Node {
@@ -3830,6 +3888,19 @@ const Parser = struct {
         // replaces whatever the walk above found.
         if (p.curTag() == .keyword_this) {
             if (first_mod) |m| problem = .{ .code = .decorator_on_this_param, .tok = m };
+        } else if (problem == null and p.curTag() == .dot_dot_dot and
+            flags & param_modifiers.property_mask != 0)
+        {
+            // TS1317: a parameter PROPERTY may not also be a rest parameter.
+            // Later in `checkGrammarModifiers` than the per-modifier walk, so
+            // it only speaks when that walk had nothing to say —
+            // `constructor(static ...a: string[])` is TS1090 alone. It does NOT
+            // depend on the owner being a constructor: measured against tsgo
+            // 7.0.2, a method, a plain function and an overload signature each
+            // answer it (alongside the TS2369 the parameter property itself
+            // earns there). Blamed on the parameter node, whose first token is
+            // the modifier run's first.
+            if (first_mod) |m| problem = .{ .code = .param_property_rest, .tok = m };
         }
         if (p.spec == 0) {
             if (problem) |it| try p.errAtToken(it.code, it.tok);
@@ -5832,14 +5903,27 @@ const Parser = struct {
     /// `assert { ... }` — on an `import`, `export * from` or `export { } from`
     /// declaration. Consumed, not modeled: the module resolver ztsc has does
     /// not vary by attribute, and a construct the parser rejects costs a false
-    /// syntax error (which suppresses the file's whole semantic pass). Must be
-    /// on the same line as the module specifier, as in tsc's
-    /// `tryParseImportAttributes`.
+    /// syntax error (which suppresses the file's whole semantic pass).
+    ///
+    /// The same-line rule is the DEPRECATED `assert` spelling's alone — tsc
+    /// writes `token() === WithKeyword || token() === AssertKeyword &&
+    /// !scanner.hasPrecedingLineBreak()`, and `importAttributes11.ts` puts the
+    /// `with { type: "json" }` on its own line for exactly that reason.
+    /// Requiring it of `with` too left the clause to statement position, where
+    /// it now parses as a `with` STATEMENT and costs three syntax errors tsgo
+    /// does not report.
     fn skipImportAttributes(p: *Parser) Error!void {
         const tag = p.curTag();
-        if (tag != .keyword_with and tag != .keyword_assert) return;
-        if (p.nlBefore() or p.peekTag(1) != .l_brace) return;
+        if (tag != .keyword_with and !(tag == .keyword_assert and !p.nlBefore())) return;
         _ = try p.bump();
+        // tsc's `parseImportAttributes` opens with `parseExpected(
+        // OpenBraceToken)`, so a keyword with no clause behind it is one "'{'
+        // expected" on the token that is there — `import * as f from "./first"
+        // with<eof>` is tsgo's single TS1005 at the end of the file.
+        // Refusing the clause instead left the keyword to statement position,
+        // which answered "';' expected" at the `with` and then a second error
+        // for the statement it is not.
+        if (p.curTag() != .l_brace) return p.errAtCur(.expected_l_brace);
         p.skipBalancedBraces();
     }
 
@@ -8833,21 +8917,109 @@ const Parser = struct {
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
         while (p.curTag() != .r_brace and p.curTag() != .eof) {
+            // tsc's `parseList` gate: the member is only PARSED when
+            // `isTypeMemberStart` says one begins here. Judging by whether the
+            // parse consumed anything instead read `interface C { var x }` as a
+            // property named `var` with a missing separator.
+            if (!p.atTypeMemberStart()) {
+                if (p.spec > 0) return error.Backtrack;
+                try p.errAtCur(.expected_type_member);
+                if (p.typeMemberListAborts()) break;
+                _ = try p.bump();
+                continue;
+            }
             const before = p.curIdx();
             const diags_before = p.diags.items.len;
-            try p.pushScratch(try p.parseTypeMember());
+            const member = try p.parseTypeMember();
             if (p.curIdx() == before) {
-                // `parseTypeMember` already reported TS1131 at this token when
-                // it failed on the member name; one diagnostic per token is
-                // what tsc emits, so do not double it.
+                // The gate said a member starts here and the parse disagreed:
+                // force progress. `parseTypeMember` has already reported at
+                // this token in that case, and one diagnostic per token is what
+                // tsc emits, so do not double it.
                 if (p.diags.items.len == diags_before) try p.errAtCur(.expected_type_member);
                 _ = try p.bump();
                 continue;
             }
+            try p.pushScratch(member);
             try p.typeMemberSemicolon();
         }
         _ = try p.expect(.r_brace, .expected_r_brace);
         return p.scratchToSpan(top);
+    }
+
+    /// tsc's `isTypeMemberStart`, the gate its TypeMembers list runs BEFORE it
+    /// will call `parseTypeMember` at all:
+    ///
+    ///     if (token() is `(`, `<`, `get` or `set`) return true;
+    ///     let idToken = false;
+    ///     while (isModifierKind(token())) { idToken = true; nextToken(); }
+    ///     if (token() === `[`) return true;              // index sig / computed
+    ///     if (isLiteralPropertyName()) { idToken = true; nextToken(); }
+    ///     if (idToken) return token() is `(` `<` `?` `:` `,` || canParseSemicolon();
+    ///     return false;
+    ///
+    /// `var` is a keyword, so it IS a literal property name — but `x` behind it
+    /// is neither a member's punctuation nor a semicolon it could ASI, so the
+    /// whole member is refused and `interface C { var x: number; }` earns
+    /// TS1131 plus the list abort. Judging by whether `parseTypeMember`
+    /// consumed anything instead read that as a property NAMED `var` and
+    /// answered a "';' expected" on the `x`.
+    ///
+    /// Peeked, not backtracked. The lookahead window bounds the modifier run,
+    /// and a run that overflows it answers `true` — a false `true` only keeps
+    /// ztsc's older behaviour for that shape, where a false `false` would
+    /// manufacture a TS1131 tsc does not report.
+    fn atTypeMemberStart(p: *Parser) bool {
+        switch (p.curTag()) {
+            .l_paren, .lt, .lt_lt, .lt_lt_eq, .keyword_get, .keyword_set => return true,
+            else => {},
+        }
+        var i: usize = 0;
+        var id_token = false;
+        while (i + 1 < max_la and isModifierKind(p.peekTag(i))) : (i += 1) id_token = true;
+        if (i + 1 >= max_la) return true;
+        if (p.peekTag(i) == .l_bracket) return true;
+        if (isLiteralPropertyName(p.peekTag(i))) {
+            id_token = true;
+            i += 1;
+        }
+        if (!id_token) return false;
+        if (i + 1 >= max_la) return true;
+        return switch (p.peekTag(i)) {
+            .l_paren, .lt, .lt_lt, .lt_lt_eq, .question, .colon, .comma => true,
+            // tsc's `canParseSemicolon`: a real `;`, or a position ASI would
+            // put one at.
+            .semicolon, .r_brace, .eof => true,
+            else => p.peekNewline(i),
+        };
+    }
+
+    /// tsc's `abortParsingListOrMoveToNextToken` for the TypeMembers list: a
+    /// token that starts no member is SKIPPED only when NO enclosing list would
+    /// take it (`isInSomeParsingContext`). When one would, the member list ENDS
+    /// where it is — and the `}` it never found falls to whatever encloses it,
+    /// which is how `interface C { var x: number; }` earns a TS1128 on its
+    /// trailing brace. (The `'}' expected` the aborted list still asks for lands
+    /// on the same token as the TS1131 and is dropped by `addDiag`'s
+    /// one-per-position rule, exactly as in tsc.)
+    ///
+    /// A type-member list is, in practice, nested inside a statement list, so
+    /// the question is tsc's `isListElement(SourceElements, inErrorRecovery:
+    /// true)` — does this token start a STATEMENT — with `;` excluded, because
+    /// tsc refuses to read a stray semicolon as an empty statement while
+    /// recovering ("';' can show up in far too many contexts, and if we see one
+    /// and assume it's a statement, then we may bail out inappropriately").
+    /// `isStartOfStatement` ends in `isStartOfExpression`, which is why an
+    /// operator aborts where a comma does not.
+    ///
+    /// Measured against tsgo 7.0.2: `interface A { a: string;; }` and
+    /// `interface B { , }` each answer TS1131 and keep going, while
+    /// `interface C { var x: number; }` and
+    /// `type D = { a: string, + , b: number }` abort and earn a TS1128 on the
+    /// trailing `}`.
+    fn typeMemberListAborts(p: *Parser) bool {
+        if (p.curTag() == .semicolon) return false;
+        return p.atStartOfStatement() or canStartExpression(p.curTag());
     }
 
     /// tsc's `parseTypeMemberSemicolon`, the separator rule for every member of

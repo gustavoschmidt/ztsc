@@ -2305,6 +2305,15 @@ const Binder = struct {
                 b.cur_flow = try b.finishPending(pid);
             },
             .while_stmt => try b.bindWhile(node, d.lhs, d.rhs),
+            // tsc's binder has no control-flow arm for `with`, so it falls to
+            // `bindEachChild`: the object expression and then the body, with
+            // the flow running straight through. The body's DECLARATIONS are
+            // real (a `var` inside a `with` block still hoists) even though the
+            // checker never looks at the statements around them.
+            .with_stmt => {
+                try b.bindExpr(d.lhs);
+                try b.bindStatement(d.rhs);
+            },
             .do_stmt => try b.bindDoWhile(node, d.lhs, d.rhs),
             .for_stmt => try b.bindFor(node),
             .for_in_stmt, .for_of_stmt => try b.bindForInOf(node),
