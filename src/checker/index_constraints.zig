@@ -53,6 +53,7 @@ const intern = @import("../intern.zig");
 const member_names = @import("../frontend/member_names.zig");
 const modules = @import("../link/modules.zig");
 const numeric_lit = @import("../numeric_lit.zig");
+const scanner = @import("../frontend/scanner.zig");
 const source = @import("../frontend/source.zig");
 const types = @import("../types.zig");
 
@@ -182,6 +183,10 @@ pub fn checkClassIndexConstraints(
     instance: TypeId,
     statics: TypeId,
 ) Error!void {
+    // Ahead of the index-info screen below: an index signature whose KEY TYPE
+    // is illegal never becomes an index info at all, so the screen is exactly
+    // where the signatures this rule exists for disappear. See `checkKeyType`.
+    try checkIndexGrammar(c, classMembers(c, node));
     for ([2]bool{ false, true }) |is_static| {
         const t = try c.resolveStructural(if (is_static) statics else instance);
         if (c.ts.kind(t) != .object) continue;
@@ -209,6 +214,21 @@ pub fn checkInterfaceIndexConstraints(
 ) Error!void {
     if (name_token == 0) return;
     if (!isFirstInterfaceDecl(c, sym, node)) return;
+    // Ahead of the index-info screen, for the reason `checkClassIndexConstraints`
+    // gives: `interface Test { [index: TypeNotFound]: any }` declares no index
+    // info to screen ON, which is precisely what makes it a TS1268.
+    {
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        for (c.declsOf(sym)) |decl| {
+            if (c.nodeTag(decl) != .interface_decl) continue;
+            const saved_scope = c.cur_scope;
+            defer c.cur_scope = saved_scope;
+            if (try c.scopeOf(decl)) |s| c.cur_scope = s;
+            const d = c.tree.extraData(ast.InterfaceData, c.tree.nodeData(decl).lhs);
+            try checkIndexGrammar(c, c.tree.extraRange(d.members_start, d.members_end));
+        }
+    }
     const self = try c.interfaceGeneric(sym);
     if (self == types.error_type) return;
     const t = try c.resolveStructural(self);
@@ -536,6 +556,171 @@ fn addIndex(c: *Checker, out: *Own, node: Node, extra: ast.ExtraIndex) Error!voi
         return;
     };
     out.setIdx(slot, site);
+}
+
+/// The member list of a class body, as a node range.
+fn classMembers(c: *Checker, node: Node) []const Node {
+    const data = c.tree.extraData(ast.ClassData, c.tree.nodeData(node).lhs);
+    return c.tree.extraRange(data.members_start, data.members_end);
+}
+
+/// Run `checkKeyType` over every index signature in one member list.
+///
+/// Separate from the `gather*` walks because it must run BEFORE their callers'
+/// index-info screen, and because it is indifferent to `static`: a grammar rule
+/// about a signature's own syntax does not care which half of the type the
+/// signature lands in. Costs one tag read per member on a class or interface
+/// with no index signature at all, which is the overwhelming majority.
+fn checkIndexGrammar(c: *Checker, members: []const Node) Error!void {
+    for (members) |m| {
+        if (m == null_node or c.nodeTag(m) != .index_signature) continue;
+        const e = c.tree.extraData(ast.IndexSig, c.tree.nodeData(m).lhs);
+        if (e.key_type == null_node) continue;
+        try checkKeyType(c, m, e, try c.typeFromTypeNode(e.key_type));
+    }
+}
+
+/// tsc's `checkGrammarIndexSignature`, the two arms of it that need the key
+/// type RESOLVED:
+///
+/// ```ts
+/// if (someType(type, t => !!(t.flags & TypeFlags.StringOrNumberLiteralOrUnique)) || isGenericType(type)) {
+///     return grammarErrorOnNode(parameter.name, …literal_type_or_generic_type…);      // TS1337
+/// }
+/// if (!everyType(type, isValidIndexKeyType)) {
+///     return grammarErrorOnNode(parameter.name, …must_be_string_number_symbol…);      // TS1268
+/// }
+/// ```
+///
+/// The rest of the chain is the parser's (`frontend/index_signature.check`),
+/// which runs on the parsed SHAPE and therefore cannot see through a name:
+/// `[b: AliasedBoolean]`, `[u: "foo" | 42]` and `[index: TypeNotFound]` are all
+/// spellings it has to decline. It does answer for a one-token KEYWORD
+/// annotation, whose verdict needs no resolution at all — so those are exactly
+/// what this skips, or the two halves would both report on `[a: boolean]`.
+/// (The cost of drawing the line at "one keyword token" rather than at the
+/// parser's keyword LIST is `[k: true]`, whose TS1337 stays the under-report
+/// the parser's own comment already records it as. A list copied to a second
+/// file would drift; this cannot.)
+///
+/// Both arms are POSITIVE tests — a constituent must be recognizably a literal
+/// or generic for TS1337, recognizably not a key domain for TS1268 — so a shape
+/// ztsc models differently than tsc (an enum key, a deferred `keyof T`) stays
+/// silent instead of manufacturing a grammar error on a legal signature.
+/// Reported on the parameter NAME: `interface R { [index: RegExp]: number }`
+/// answers at column 16, the `index`, not at the `[`.
+fn checkKeyType(c: *Checker, node: Node, e: ast.IndexSig, key: TypeId) Error!void {
+    if (e.name_token == 0 or e.key_type == null_node) return;
+    if (!isPlainOneParamSignature(c, node, e)) return;
+    if (isOneKeywordToken(c, e.key_type)) return;
+    const span = c.tokSpan(e.name_token);
+    const resolved = try c.resolveStructural(key);
+    const members: []const TypeId = if (c.ts.kind(resolved) == .union_type)
+        c.ts.members(resolved)
+    else
+        &.{resolved};
+    for (members) |m| {
+        if (isLiteralOrGenericKey(c, m)) {
+            try c.diagFmt(1337, span, "An index signature parameter type cannot be a literal type " ++
+                "or generic type. Consider using a mapped object type instead.", .{});
+            return;
+        }
+    }
+    for (members) |m| {
+        if (isInvalidKeyType(c, m)) {
+            try c.diagFmt(1268, span, "An index signature parameter type must be 'string', " ++
+                "'number', 'symbol', or a template literal type.", .{});
+            return;
+        }
+    }
+    // The chain's last arm, TS1021 ("must have a type annotation"), belongs
+    // here too — the parser has to decline it for a key it cannot vouch for,
+    // since answering it for `[key: Key]` would have been wrong had `Key`
+    // turned out to be `boolean` — but it stays an under-report
+    // (`indexerConstraints2` line 80): a missing value type reaches the
+    // checker as an ERROR NODE, not as `null_node`, so nothing distinguishes
+    // it here from one that was written and did not resolve.
+}
+
+/// Is this signature spelled `[name: T]` exactly — one parameter, no `...`, no
+/// modifier, no `?`, no initializer, nothing after the annotation but the `]`?
+///
+/// tsc's grammar chain `return`s at the first thing it finds wrong, and every
+/// one of those arms sits AHEAD of the key-type arms this file implements — so
+/// `[...p3: any[]]` answers TS1017 and is never asked what `any[]` is. The
+/// parser answered all of them already (`frontend/index_signature.check`); what
+/// this reproduces is not its rules but the single fact that it HAD something
+/// to say, which the AST does not record. Three token comparisons and a walk to
+/// the `]` do it, and a spelling they do not recognize goes silent, which is
+/// the direction a grammar rule may be wrong in.
+fn isPlainOneParamSignature(c: *Checker, node: Node, e: ast.IndexSig) bool {
+    const tags = c.tree.tokens.tags;
+    // `[` then the name: anything between them is a `...` or a modifier.
+    if (e.name_token != c.tree.nodeMainToken(node) + 1) return false;
+    // …then the `:`, not a `?`.
+    if (e.name_token + 1 >= tags.len or tags[e.name_token + 1] != .colon) return false;
+    // …then the annotation, then the `]`: a `,` (second parameter) or an `=`
+    // (initializer) here is another arm's answer.
+    const end = c.nodeSpan(e.key_type).end;
+    var i: TokenIndex = e.name_token + 2;
+    while (i < tags.len and c.tokSpan(i).start < end) i += 1;
+    return i < tags.len and tags[i] == .r_bracket;
+}
+
+/// Is `n` an annotation the PARSER's half of the chain already judged — one
+/// token, and that token a keyword? See `checkKeyType`.
+fn isOneKeywordToken(c: *Checker, n: Node) bool {
+    const tok = c.tree.nodeMainToken(n);
+    const tok_span = c.tokSpan(tok);
+    const node_span = c.nodeSpan(n);
+    if (tok_span.start != node_span.start or tok_span.end != node_span.end) return false;
+    return scanner.Tag.isKeyword(c.tree.tokens.tags[tok]);
+}
+
+/// tsc's `t.flags & TypeFlags.StringOrNumberLiteralOrUnique`, plus the
+/// `isGenericType(type)` disjunct folded in per constituent — a bare type
+/// PARAMETER is the generic spelling that reaches an index signature
+/// (`type Wat<T extends string> = { [x: T]: string }`).
+fn isLiteralOrGenericKey(c: *const Checker, t: TypeId) bool {
+    return switch (c.ts.kind(t)) {
+        .string_literal, .number_literal, .unique_symbol, .type_param => true,
+        else => false,
+    };
+}
+
+/// The complement of tsc's `isValidIndexKeyType`, stated positively: a
+/// constituent this recognizes as NOT a key domain. `string`, `number`,
+/// `symbol` and a pattern template literal are the domains; an intersection is
+/// one when some constituent is (tsc's own recursion). Everything this does not
+/// recognize either way answers `false` and reports nothing.
+fn isInvalidKeyType(c: *const Checker, t: TypeId) bool {
+    if (t == types.string_type or t == types.number_type or t == types.symbol_type) return false;
+    return switch (c.ts.kind(t)) {
+        .template_literal_type => false,
+        .intersection => for (c.ts.members(t)) |m| {
+            if (!isInvalidKeyType(c, m)) break false;
+        } else true,
+        .boolean,
+        .bool_true,
+        .bool_false,
+        .any,
+        .err,
+        .unknown,
+        .never,
+        .void,
+        .undefined,
+        .null,
+        .bigint,
+        .object,
+        .object_keyword,
+        .array,
+        .tuple,
+        .function,
+        .overloads,
+        .class_value,
+        => true,
+        else => false,
+    };
 }
 
 /// The site of an index-signature declaration, modifiers included.
