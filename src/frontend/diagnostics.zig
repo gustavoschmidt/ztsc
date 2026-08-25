@@ -1061,6 +1061,12 @@ pub const Code = enum(u16) {
     /// TS1197: `catch (e = 1) {}`. tsc's `checkGrammarVariableDeclaration`,
     /// at the initializer expression.
     catch_variable_initializer,
+    /// TS1092: `class C { constructor<T>() {} }`. tsc's
+    /// `checkGrammarConstructorTypeParameters` blames the LIST — its span
+    /// starts at `typeParameters.pos`, i.e. the token after the `<`, which for
+    /// an empty list is the `>` itself. So `constructor<>()` earns this beside
+    /// the TS1098 the empty list earns at the `<`, one column apart.
+    ctor_type_parameters,
 
     /// How tsc surfaces the condition — which decides both what a diagnostic
     /// suppresses and what suppresses it. Established empirically against tsgo
@@ -1378,6 +1384,8 @@ pub const Code = enum(u16) {
             .type_literal_property_initializer,
             .empty_type_param_list,
             .catch_variable_initializer,
+
+            .ctor_type_parameters,
             => .grammar,
 
             else => .syntactic,
@@ -1732,6 +1740,8 @@ pub const Code = enum(u16) {
             .type_literal_property_initializer => "A type literal property cannot have an initializer.",
             .empty_type_param_list => "Type parameter list cannot be empty.",
             .catch_variable_initializer => "Catch clause variable cannot have an initializer.",
+
+            .ctor_type_parameters => "Type parameters cannot appear on a constructor declaration.",
         };
     }
 
@@ -2068,6 +2078,8 @@ pub const Code = enum(u16) {
             .type_literal_property_initializer => 1247,
             .empty_type_param_list => 1098,
             .catch_variable_initializer => 1197,
+
+            .ctor_type_parameters => 1092,
             else => 0,
         };
     }

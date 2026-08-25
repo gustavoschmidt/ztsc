@@ -4750,6 +4750,11 @@ const Parser = struct {
             p.jump = .{ .labels_base = p.labels.items.len, .in_function = true };
             p.fn_ctx = if (flags & ast.Flags.async != 0) .async_fn else .sync;
             p.yield_ctx = star != null;
+            // The `<` of a type-parameter list, if there is one. Captured
+            // BEFORE the prototype is read (afterwards the token is consumed
+            // and the index is stable) so TS1092 can blame the list, which is
+            // the only thing that remembers where it started.
+            const targs_lt: ?TokenIndex = if (p.atLt()) p.curIdx() else null;
             const proto = try p.parseFnProtoRest(flags, name_tok);
             var body: Node = null_node;
             if (p.curTag() == .l_brace) {
@@ -4771,6 +4776,23 @@ const Parser = struct {
             const is_accessor = flags & (ast.Flags.get | ast.Flags.set) != 0;
             const is_ctor = !is_accessor and computed == null and
                 p.tokTagAt(name_tok) == .keyword_constructor;
+            // TS1092, tsc's `checkGrammarConstructorTypeParameters`:
+            //
+            //     const pos = range.pos === range.end ? range.pos
+            //                                         : skipTrivia(text, range.pos);
+            //     grammarErrorAtPos(node, pos, range.end - pos, …)
+            //
+            // A NodeArray's `pos` is the offset just past the `<`. An EMPTY list
+            // skips the trivia skip, so `constructor< >()` blames the SPACE and
+            // `constructor<>()` the `>`; a non-empty one blames the first type
+            // parameter's own token. Both spellings are in
+            // parserConstructorDeclaration12, one per line.
+            if (is_ctor) if (targs_lt) |lt| {
+                if (lt + 1 < p.tok_tags.items.len and !isGtFamily(p.tok_tags.items[lt + 1]))
+                    try p.errAtToken(.ctor_type_parameters, lt + 1)
+                else if (lt < p.tok_tags.items.len)
+                    try p.errAtTokenEnd(.ctor_type_parameters, lt);
+            };
             const mod_member: modifier_order.Member = if (is_accessor)
                 .accessor
             else if (is_ctor)
