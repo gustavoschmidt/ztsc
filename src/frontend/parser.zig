@@ -9380,7 +9380,16 @@ const Parser = struct {
                 _ = try p.parseFunctionBody();
             }
             const member = try p.addNode(.{ .tag = .method_signature, .main_token = name_tok, .data = .{ .lhs = proto, .rhs = flags } });
-            if (computed) |cn| try p.finishComputedName(cn, member, p.typeMemberHome(), .method_signature, false);
+            if (computed) |cn| {
+                // A `get`/`set` signature is a GetAccessor/SetAccessor node in
+                // tsc, and `checkGrammarForInvalidDynamicName` is reached only
+                // from `checkGrammarProperty` and `checkGrammarMethod` — so its
+                // computed name earns nothing, in a type literal exactly as in
+                // a class body (`noMappedGetSet`).
+                const kind: computed_member.MemberKind =
+                    if (flags & (ast.Flags.get | ast.Flags.set) != 0) .accessor else .method_signature;
+                try p.finishComputedName(cn, member, p.typeMemberHome(), kind, false);
+            }
             return member;
         }
         var type_ann: Node = null_node;

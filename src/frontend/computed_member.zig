@@ -28,10 +28,14 @@
 //!     type turns out to be;
 //!   * everything else earns the code `grammarCode` picks.
 //!
-//! The five wordings are tsc's, and they come from three call sites —
-//! `checkGrammarProperty` for a property, `checkGrammarMethod` for a method,
-//! and neither for an accessor, which is why a class accessor with a computed
-//! name is silent. All of it measured (probes `t/k3.ts`–`t/k5.ts`).
+//! The five wordings are tsc's, and they come from exactly TWO call sites —
+//! `checkGrammarProperty` for a property and `checkGrammarMethod` for a
+//! method. An ACCESSOR is a `GetAccessorDeclaration`/`SetAccessorDeclaration`
+//! and reaches neither, so a computed accessor name is silent EVERYWHERE, not
+//! only in a class body: `type T = { get [foo()](): string }` and `interface I
+//! { get [foo()](): string }` are both silent for tsgo, where ztsc answered
+//! TS1170/TS1169 (`noMappedGetSet`). All of it measured (probes `t/k3.ts`–
+//! `t/k5.ts`, and `get`/`set` in each of the three homes).
 
 const Code = @import("diagnostics.zig").Code;
 
@@ -78,10 +82,12 @@ pub fn grammarCode(home: Home, kind: MemberKind, ambient: bool) ?Code {
                 .computed_name_in_method_overload,
         },
         .interface_body => switch (kind) {
-            .accessor, .property, .method_impl, .method_signature => .computed_name_in_interface,
+            .accessor => null,
+            .property, .method_impl, .method_signature => .computed_name_in_interface,
         },
         .type_literal => switch (kind) {
-            .accessor, .property, .method_impl, .method_signature => .computed_name_in_type_literal,
+            .accessor => null,
+            .property, .method_impl, .method_signature => .computed_name_in_type_literal,
         },
     };
 }
@@ -107,14 +113,9 @@ test "a class property keeps its own wording in an ambient context" {
     );
 }
 
-test "an accessor is judged only outside a class body" {
-    try std.testing.expectEqual(@as(?Code, null), grammarCode(.class_body, .accessor, false));
-    try std.testing.expectEqual(
-        @as(?Code, .computed_name_in_interface),
-        grammarCode(.interface_body, .accessor, false),
-    );
-    try std.testing.expectEqual(
-        @as(?Code, .computed_name_in_type_literal),
-        grammarCode(.type_literal, .accessor, false),
-    );
+test "an accessor is judged in no home at all" {
+    for ([_]Home{ .class_body, .interface_body, .type_literal }) |home| {
+        try std.testing.expectEqual(@as(?Code, null), grammarCode(home, .accessor, false));
+        try std.testing.expectEqual(@as(?Code, null), grammarCode(home, .accessor, true));
+    }
 }
