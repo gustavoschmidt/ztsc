@@ -246,6 +246,68 @@ fn thisBoundKey(c: *const Checker, fn_node: Node) u64 {
     return (@as(u64, c.cur_file) << 32) | fn_node;
 }
 
+/// tsc's `getSuperContainer(node, /*stopOnFunctions*/ true)` for a `super`
+/// PROPERTY reference, reduced to the one question `checkSuperExpression` then
+/// asks of the container:
+///
+///     isClassLike(container.parent) || container.parent.kind === ObjectLiteralExpression
+///
+/// "no" is TS2660 — `super` was written somewhere no `super` binding reaches at
+/// all, rather than in a member of a class that happens to have no base
+/// (TS2335) or in a static/nested position a `super()` CALL cannot use
+/// (TS2337).
+///
+/// The same scope walk `thisFrame` runs, because tsc's two container queries
+/// agree everywhere it matters: arrows are stepped out of (tsc's `while
+/// (container && isArrowFunction(container))` loop), a non-arrow function stops
+/// the walk, and a class body — a field initializer, a static block — is a
+/// container in its own right. Where they differ is the verdict: a plain
+/// `function` has a `this` of its own (an implicitly-`any` one, TS2683) but is
+/// never a `super` container, and an object literal's `m() {}` shorthand is
+/// one where the `p: function () {}` spelling beside it is not.
+fn superContainerIsMember(c: *const Checker) bool {
+    var cur = c.cur_scope;
+    while (cur != binder.file_scope) {
+        switch (c.bind.scope_kinds[cur]) {
+            .function => {
+                const owner = c.bind.scope_owners[cur];
+                switch (c.nodeTag(owner)) {
+                    // An arrow contributes no container; the search continues.
+                    .arrow_fn => {},
+                    // A class member — method, accessor, constructor — or a
+                    // `static { … }` block, whose scope the binder owns by its
+                    // `.block` node.
+                    .class_method, .block => return true,
+                    else => return isObjectLiteralMethod(c, owner),
+                }
+            },
+            // A field initializer or a computed member name: the container is
+            // the member itself, whose parent is the class.
+            .class, .class_members, .class_statics => return true,
+            .namespace, .enum_body => return false,
+            else => {},
+        }
+        cur = c.bind.scope_parents[cur];
+    }
+    return false;
+}
+
+/// Is this `function_expr` an object literal's METHOD (or accessor) shorthand
+/// — `{ m() {} }`, `{ get p() {} }` — rather than a `function` expression?
+///
+/// The parser builds both as `.function_expr`, and the distinction matters
+/// twice over for `super`: the shorthand's container is the object literal, so
+/// `super.m()` there is legal, while `{ p: function () { super.m() } }` is
+/// TS2660. It is decided from the node alone — the shorthand's proto takes the
+/// property NAME as its name token, which is also the node's `main_token`,
+/// whereas a `function` expression's `main_token` is the keyword and its name
+/// token is a later one (or none).
+fn isObjectLiteralMethod(c: *const Checker, fn_node: Node) bool {
+    if (c.nodeTag(fn_node) != .function_expr) return false;
+    const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(fn_node).lhs);
+    return proto.name_token == c.tree.nodeMainToken(fn_node);
+}
+
 /// Record that `fn_node` has a receiver of its own — see
 /// `Checker.this_bound_fns`. `src` is the node whose type IS that receiver,
 /// when the answer was not available at the time (`null_node` otherwise).
@@ -419,7 +481,17 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         // TS2466 instead (`Checker.in_computed_key`), which ztsc does not
         // implement — silence is the one that is not wrong.
         .super_expr => {
-            if (!c.in_computed_key) _ = try classes.reportSuperWithoutBase(c, node);
+            // tsc's `checkSuperExpression` decides the CONTAINER first and
+            // returns after one diagnostic: a `super` no container can bind is
+            // TS2660, and only once the container is legal does the "this
+            // class writes no `extends`" question (TS2335) come up.
+            if (!c.in_computed_key) {
+                if (superContainerIsMember(c)) {
+                    _ = try classes.reportSuperWithoutBase(c, node);
+                } else {
+                    try c.diagFmt(2660, c.nodeSpan(node), "'super' can only be referenced in members of derived classes or object literal expressions.", .{});
+                }
+            }
             return types.any_type;
         },
         // `new.target`: tsc types it as the enclosing constructor's own
@@ -4269,6 +4341,13 @@ fn enterConstraintPos(c: *Checker, ref: Node, index_expr: Node) narrowable.Const
 /// which ztsc does not model — `c.this_type` is a `.class_value`, not a `.ref`.
 fn superReceiverType(c: *Checker, recv: Node) Error!?TypeId {
     if (c.nodeTag(recv) != .super_expr) return null;
+    // A `super` no container can bind (TS2660) has no receiver type either —
+    // tsc returns `errorType` from `checkSuperExpression` before it ever asks
+    // for the base. `c.this_type` alone does not say so: a plain `function`
+    // nested in a method INHERITS the method's `this`, which would hand
+    // `class D extends B { m() { function f() { super.p } } }` the base's
+    // instance type and silence the diagnostic (`emitThisInSuperMethodCall`).
+    if (!superContainerIsMember(c)) return null;
     const t = c.this_type;
     if (t == 0) return null;
     // Inside a method the receiver is the POLYMORPHIC `this` (see
