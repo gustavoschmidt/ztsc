@@ -1060,6 +1060,25 @@ fn ctxReturnAdmitsUndefined(c: *Checker, ret_ctx: TypeId) Error!bool {
 
 fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) Error!TypeId {
     if (body == 0) return types.any_type;
+    // A member of an object literal that has no contextual type takes `this`
+    // from the literal's OWN finished type (`expr.objectLiteralMemberOf`), and
+    // the literal is still being built right here — this probe is what its
+    // member list is waiting on. So `this` reads as `any` for the duration,
+    // and the ordinary probe would MEMOIZE that reading: `{ n: 101, m(x) {
+    // return x + this.n.length } }` published `this.n` as `any`, the deferred
+    // body walk read it straight back out of `node_types`, and the TS2339 the
+    // finished receiver earns was never asked for.
+    //
+    // Probed SPECULATIVELY instead — `side_query_depth` withholds both the
+    // memo and the diagnostics — leaving the drained body as the one
+    // authoritative walk of these expressions. Nothing is lost by the silence:
+    // the probe only ever visits the body's RETURN expressions, and the body
+    // walk visits those and everything else besides.
+    const speculative = expr_zig.deferredThisSource(c, fn_node) != null_node;
+    if (speculative) c.side_query_depth += 1;
+    defer if (speculative) {
+        c.side_query_depth -= 1;
+    };
     // Establish *this* function's async/generator context while checking
     // its body: `await`/`yield` legality (TS1308/TS1163…) must be judged
     // against the function being inferred, not the enclosing one. Without
@@ -1842,6 +1861,15 @@ fn expandoMemberType(c: *Checker, sym: SymbolId) Error!TypeId {
     const saved = c.enterSymFile(sym);
     defer c.restoreCtx(saved);
     c.cur_scope = c.symScope(sym);
+    // The right-hand sides are being typed to BUILD this member's type, so any
+    // function body inside one must not be walked yet — `declaratorType`'s
+    // rule, and here it buys something extra: the EXPANDO function that owns
+    // this member is itself in progress, so a `this` in such a body resolves
+    // against `typeOfSymbol`'s cycle-break `any`. Queued, the body runs from
+    // `drainDeferredBodies` with the owner sealed, and picks the receiver back
+    // up through `expr.deferredThisType`.
+    c.defer_bodies += 1;
+    defer c.defer_bodies -= 1;
     var parts: std.ArrayList(TypeId) = .empty;
     defer parts.deinit(c.scratch());
     for (c.declsOf(sym)) |decl| {

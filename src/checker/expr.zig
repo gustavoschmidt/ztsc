@@ -247,9 +247,52 @@ fn thisBoundKey(c: *const Checker, fn_node: Node) u64 {
 }
 
 /// Record that `fn_node` has a receiver of its own — see
+/// `Checker.this_bound_fns`. `src` is the node whose type IS that receiver,
+/// when the answer was not available at the time (`null_node` otherwise).
+///
+/// A recorded source is never downgraded back to `null_node`: the same
+/// function is reached twice for an expando member — once from
+/// `expandoMemberType`, while the owner is still in progress, and once from
+/// the assignment walk, by when it is sealed — and it is the FIRST visit that
+/// queues the body, so the second must not erase what the drain needs.
+fn markThisBound(c: *Checker, fn_node: Node, src: Node) Error!void {
+    const gop = try c.this_bound_fns.getOrPut(c.cm(), thisBoundKey(c, fn_node));
+    if (!gop.found_existing or src != null_node) gop.value_ptr.* = src;
+}
+
+/// The node whose type is `fn_node`'s deferred `this` — `null_node` when
+/// nothing is pending, i.e. `fn_node` is not one of the two shapes below or
+/// its receiver was already installed eagerly (a contextual type, a
+/// `ThisType<T>` marker, an explicit `this` parameter). See
 /// `Checker.this_bound_fns`.
-fn markThisBound(c: *Checker, fn_node: Node) Error!void {
-    try c.this_bound_fns.put(c.cm(), thisBoundKey(c, fn_node), {});
+pub fn deferredThisSource(c: *const Checker, fn_node: Node) Node {
+    return c.this_bound_fns.get(thisBoundKey(c, fn_node)) orelse null_node;
+}
+
+/// …and the type it turns out to have, read at drain time. Two shapes, told
+/// apart by the source node's own tag:
+///
+///   * an OBJECT LITERAL with no contextual type — tsc's
+///     `getContextualThisParameterType` falling through to
+///     `getWidenedType(checkExpressionCached(containingLiteral))`. The
+///     literal's finished type is already in `node_types`.
+///
+///   * an EXPANDO receiver, `F.m = function () { this }`. `F`'s type is built
+///     out of this very assignment, so the walk that queued the body saw
+///     `typeOfSymbol`'s in-progress `any`. That reading was published, so the
+///     memo entry is dropped and the receiver re-asked — by now `F` is sealed
+///     and answers the whole `{ (): R; m: …; … }` shape tsc resolves lazily.
+///
+/// Either way this only works because the body WAITED (see
+/// `objLitDeferBodies` and `expandoMemberType`): mid-walk neither type exists.
+pub fn deferredThisType(c: *Checker, fn_node: Node) Error!?TypeId {
+    const src = deferredThisSource(c, fn_node);
+    if (src == null_node) return null;
+    if (c.nodeTag(src) == .object_literal) return c.nodeType(src);
+    _ = c.node_types.remove(c.nodeKey(src));
+    const t = try c.checkExprCached(src, types.no_type);
+    if (t == types.error_type or t == types.any_type or t == types.no_type) return null;
+    return t;
 }
 
 /// `this`, narrowed the way tsc's `checkThisExpression` narrows it: both arms
@@ -3324,6 +3367,24 @@ fn objectLiteralThis(c: *Checker, rctx: TypeId, marker: TypeId) Error!TypeId {
     return c.nonNullable(rctx);
 }
 
+/// May an object-literal member's BODY be postponed to the deferred-body
+/// queue right now — tsc's `checkNodeDeferred`, which
+/// `checkFunctionExpressionOrObjectLiteralMethod` calls for every function-like
+/// written as a literal member so the literal's own type is COMPLETE before any
+/// of its bodies runs.
+///
+/// Refused inside a walk whose diagnostics are being suppressed. A queued body
+/// is walked from `drainDeferredBodies`, where the suppression counters are all
+/// back at zero, so deferring one out of an overload probe
+/// (`no_publish_depth`), a side query (`side_query_depth`) or a
+/// context-insensitive pass (`skip_ctx_sensitive`) would PUBLISH diagnostics
+/// the caller had asked to be thrown away — a rejected overload candidate's
+/// argument body reported as if it had been the chosen one. Those walks keep
+/// the inline behaviour they have always had.
+fn objLitDeferBodies(c: *const Checker) bool {
+    return c.no_publish_depth == 0 and c.side_query_depth == 0 and !c.skip_ctx_sensitive;
+}
+
 /// tsc's `getThisTypeFromContextualType`: the argument of a `ThisType<T>`
 /// reference anywhere in the contextual type, unions mapped and intersections
 /// searched member-wise. Null when the type names no marker.
@@ -3352,6 +3413,16 @@ fn thisTypeMarker(c: *Checker, t: TypeId) Error!?TypeId {
 /// call whose argument happens to be a literal, an array, a function — is
 /// checked with the marker cleared (see `Checker.ctx_this_marker`).
 fn checkPropValue(c: *Checker, value: Node, pctx: TypeId, marker: TypeId) Error!TypeId {
+    // A `function () {}` written DIRECTLY as a property value is one of the two
+    // shapes tsc's `getContainingObjectLiteral` recognises (the other is the
+    // `m() {}` shorthand, handled in the `.object_method` arm), so its body is
+    // deferred the same way. The value's TYPE — the signature, return type
+    // included — is still built here and now; only the body walk moves.
+    const defer_body = value != null_node and c.nodeTag(value) == .function_expr and objLitDeferBodies(c);
+    if (defer_body) c.defer_bodies += 1;
+    defer if (defer_body) {
+        c.defer_bodies -= 1;
+    };
     if (marker == types.no_type or value == null_node or c.nodeTag(value) != .object_literal) {
         return c.checkExprCached(value, pctx);
     }
@@ -3474,6 +3545,20 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
         inherited_marker
     else
         (try thisTypeMarker(c, rctx)) orelse inherited_marker;
+    // tsc's `getContextualThisParameterType` ends at
+    // `getWidenedType(contextualType ? getNonNullableType(contextualType) :
+    // checkExpressionCached(containingLiteral))`: with NO contextual type at
+    // all, a member's `this` is the literal's own finished type. That is the
+    // arm `objectLiteralThis` could not answer, and the only one that needs
+    // the literal to be complete — hence the deferral. Recorded per member
+    // node so the drained body can read it back (`this_bound_fns`).
+    //
+    // Deliberately NOT extended to the two cases `objectLiteralThis` refuses
+    // with a free type variable in hand: tsc answers those with the marker /
+    // contextual type instantiated through the enclosing call's inference
+    // context, and substituting the literal's own type there would be a
+    // different (wrong) receiver rather than the under-report they are today.
+    const this_fallback: Node = if (rctx == types.no_type and this_marker == types.no_type) node else null_node;
     var props: std.ArrayList(types.Prop) = .empty;
     defer props.deinit(c.scratch());
     var prop_index: std.AutoHashMapUnmanaged(Atom, u32) = .empty;
@@ -3529,9 +3614,9 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
         // function expression's PARENT is the property assignment, which
         // `{ a: (function () {}) }` fails.
         switch (c.nodeTag(prop)) {
-            .object_method => try markThisBound(c, pd.rhs),
+            .object_method => try markThisBound(c, pd.rhs, this_fallback),
             .object_property => {
-                if (pd.rhs != null_node and c.nodeTag(pd.rhs) == .function_expr) try markThisBound(c, pd.rhs);
+                if (pd.rhs != null_node and c.nodeTag(pd.rhs) == .function_expr) try markThisBound(c, pd.rhs, this_fallback);
             },
             else => {},
         }
@@ -3639,6 +3724,16 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                 const saved_this = c.this_type;
                 defer c.this_type = saved_this;
                 c.this_type = try objectLiteralThis(c, rctx, this_marker);
+                // The body waits (tsc's `checkNodeDeferred` — see
+                // `objLitDeferBodies`). Everything below still runs eagerly:
+                // the signature, the accessor's return/parameter type, the
+                // computed key. Only the statement walk is queued, and it
+                // carries the `this` just installed.
+                const defer_body = objLitDeferBodies(c);
+                if (defer_body) c.defer_bodies += 1;
+                defer if (defer_body) {
+                    c.defer_bodies -= 1;
+                };
                 // A SYMBOL-keyed method or accessor shorthand
                 // (`{ [Symbol.toStringTag]() {…} }`,
                 // `{ set [Symbol.toPrimitive](p) {…} }`) declares a real,
@@ -6040,9 +6135,17 @@ pub fn assignedMethodThisType(c: *Checker, target: Node, value0: Node) Error!?Ty
     }
     const obj = c.tree.nodeData(target).lhs;
     if (obj == null_node) return null;
-    try markThisBound(c, value);
     const t = try c.checkExprCached(obj, types.no_type);
-    if (t == types.error_type or t == types.any_type or t == types.no_type) return null;
+    if (t == types.error_type or t == types.any_type or t == types.no_type) {
+        // The EXPANDO case: `F` is being built out of this very assignment, so
+        // `typeOfSymbol`'s in-progress guard answered `any`. The receiver NODE
+        // is recorded instead, and the body — queued by `expandoMemberType` —
+        // re-asks it from `drainDeferredBodies` with `F` sealed. `this` is
+        // still untyped for the eager walk right here, exactly as before.
+        try markThisBound(c, value, obj);
+        return null;
+    }
+    try markThisBound(c, value, null_node);
     return t;
 }
 
@@ -6523,6 +6626,24 @@ fn reportReadonlyIndexWrite(c: *Checker, obj: TypeId, node: Node, numeric: bool)
     });
 }
 
+/// Does `recv[idx_node]` name a position past the end of a fixed tuple — the
+/// shape `indexChainInner`'s `.number_literal` arm reports TS2493 for and
+/// answers `error_type`? Asked only where that answer has already come back,
+/// so it re-runs the same two questions the arm asked: the receiver's
+/// indexable constituent is a tuple, and `numericIndexHit` (which is
+/// `tupleElemTypeAt` for a tuple, rest element included) has no element there.
+///
+/// `checkExprCached` on the index is a memo hit: the write path has already
+/// checked it through `readonlyIndexWriteAt`.
+fn outOfRangeTupleIndex(c: *Checker, recv: TypeId, idx_node: Node) Error!bool {
+    const rk = c.ts.kind(recv);
+    const rt = if (rk == .intersection) (try c.indexableConstituent(recv)) orelse recv else recv;
+    if (c.ts.kind(rt) != .tuple) return false;
+    const idx_t = try c.ts.regularLiteral(try c.checkExprCached(idx_node, types.no_type));
+    if (c.ts.kind(idx_t) != .number_literal) return false;
+    return (try numericIndexHit(c, recv, rk, c.ts.numberValue(idx_t))) == null;
+}
+
 /// A write through `obj[idx]` — an assignment target or a `delete` operand.
 /// Reports TS2540 on a readonly list's fixed element and TS2542 on a readonly
 /// index signature (a readonly list's, or a declared `readonly [k: …]`), and
@@ -6717,16 +6838,47 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
             const d = c.tree.nodeData(node);
             const obj_t = try c.checkExprCached(d.lhs, types.no_type);
             // `o["p"] = v` writes at the setter's parameter type when `p` is
-            // a TS 4.3 split accessor, exactly as `o.p = v` does. Keyed off
-            // the *syntactic* string literal so no extra expression is
-            // checked on the ordinary element-write path.
-            if (c.nodeTag(d.rhs) == .string_literal) {
-                const key = try c.memberAtom(c.tree.nodeMainToken(d.rhs));
-                if (try setterWriteType(c, obj_t, key, 0)) |wt| return wt;
+            // a TS 4.3 split accessor, exactly as `o.p = v` does — and so does
+            // every other spelling of the SAME member name. A LATE-BOUND key
+            // (`o[sym]`, `o[Enum.M]`, a `const s = "p"`) is one:
+            // `atoms.memberKey` resolves a computed `set [k](v)` to the very
+            // `__@u<id>` atom `lateBoundName` mints here, so the declaration
+            // the setter lookup walks to is the one this write names.
+            //
+            // Without it `foo[k] = ['foo']` against
+            // `get [k](): Set<string>; set [k](v: Iterable<string>)` checked
+            // the right-hand side against the GETTER's type and reported a
+            // TS2740 tsc does not (`computedPropertiesWithSetterAssignment`).
+            //
+            // The index expression is checked here rather than only inside
+            // `readonlyIndexWriteAt` below; that call re-asks it through
+            // `checkExprCached`, so the ordinary path pays nothing extra.
+            const key: ?Atom = if (c.nodeTag(d.rhs) == .string_literal)
+                try c.memberAtom(c.tree.nodeMainToken(d.rhs))
+            else
+                try computed_key.lateBoundName(c, d.rhs, try c.checkExprCached(d.rhs, types.no_type));
+            if (key) |name| {
+                if (try setterWriteType(c, obj_t, name, 0)) |wt| return wt;
             }
             const r = try c.resolveStructural(obj_t);
             if (try readonlyIndexWriteAt(c, r, node, d.rhs)) return types.error_type;
-            return checkIndexExpr(c, node, false, types.no_type);
+            const t = try checkIndexExpr(c, node, false, types.no_type);
+            // An out-of-range FIXED tuple index writes at `undefined`. tsc's
+            // `getIndexedAccessTypeOrUndefined` reports the TS2493 (which the
+            // read path just emitted) and then answers `undefinedType`, so
+            // `t[3] = { a: "" }` on a `[string, number]` is ALSO a TS2322
+            // against `undefined`. ztsc answered `error_type` there, which is
+            // exactly the "suppress the cascade" marker, so the second half of
+            // tsc's verdict never arrived (`genericCallWithTupleType`).
+            //
+            // Only the WRITE side moves. The read `var e = t[3]` keeps
+            // `error_type`: `undefined` there would put a "possibly undefined"
+            // (and a TS2339 on any member of it) on every use of a value the
+            // program has already been told is out of range.
+            if (t == types.error_type and try outOfRangeTupleIndex(c, r, d.rhs)) {
+                return types.undefined_type;
+            }
+            return t;
         },
         .array_literal, .object_literal, .array_pattern, .object_pattern => {
             // Destructuring-assignment pattern in the expression cover
@@ -6772,11 +6924,53 @@ fn setterWriteType(c: *Checker, t0: TypeId, name: Atom, depth: u32) Error!?TypeI
     if (depth > 8) return null;
     const t = if (c.ts.kind(t0) == .this_type) c.ts.thisTypeInstance(t0) else t0;
     switch (c.ts.kind(t)) {
+        // A composite's property is a SYNTHESIZED symbol, and tsc's
+        // `getWriteTypeOfSymbol` for one combines the constituents' write
+        // types the same way `getTypeOfSymbol` combines their read types: a
+        // union unions, an intersection intersects. A constituent with no
+        // setter contributes its READ type, because that is what its own
+        // `getWriteTypeOfSymbol` falls back to.
+        //
+        // First-arm-wins was wrong in both directions, and the corpus names
+        // both:
+        //
+        //   * `One & Two`, `One.prop2: number` beside
+        //     `Two: set prop2(s: string | 42)`, writes at
+        //     `number & (string | 42)` — i.e. `42` — so `i.prop2 = "hello"`
+        //     is a TS2322 that answering `string | 42` let through
+        //     (`divergentAccessorsTypes4`, `…Types5`).
+        //   * `One | Two` writes at the UNION, so `u1.prop3 = 42` is legal as
+        //     long as SOME constituent accepts it; answering only the first
+        //     constituent's made it a false positive
+        //     (`divergentAccessorsTypes3`).
+        //
+        // Only reached when some constituent really declares a setter: with
+        // none, the caller's `orelse p.ty` — the property off the RESOLVED
+        // composite — is both the same answer and the cheaper one.
         .union_type, .intersection => {
+            const is_union = c.ts.kind(t) == .union_type;
+            var parts: std.ArrayList(TypeId) = .empty;
+            defer parts.deinit(c.scratch());
+            var any_setter = false;
             for (c.ts.members(t)) |m| {
-                if (try setterWriteType(c, m, name, depth + 1)) |wt| return wt;
+                if (try setterWriteType(c, m, name, depth + 1)) |wt| {
+                    any_setter = true;
+                    try parts.append(c.scratch(), wt);
+                } else if (try c.propOfType(try c.resolveStructural(m), name)) |p| {
+                    try parts.append(c.scratch(), p.ty);
+                } else if (is_union) {
+                    // A union arm that lacks the property has no write type to
+                    // contribute and no way to stand in for one; the access
+                    // itself is the error. Keep the caller's fallback.
+                    return null;
+                }
             }
-            return null;
+            if (!any_setter) return null;
+            if (parts.items.len == 1) return parts.items[0];
+            return if (is_union)
+                try c.ts.makeUnion(c.scratch(), parts.items)
+            else
+                try c.ts.makeIntersection(c.scratch(), parts.items);
         },
         .ref => {
             const sym = c.ts.refSymbol(t);
@@ -7542,7 +7736,7 @@ fn checkFunctionLikeExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             c.this_type = ctx_this;
             // Recorded so a `this` in the body knows the receiver is THIS
             // function's and not an outer frame's — see `thisFrameOwnsThis`.
-            try markThisBound(c, node);
+            try markThisBound(c, node, null_node);
         }
     }
     const sig = try c.signatureOfProtoCtx(node, d.lhs, false, ctx_sig == types.no_type, ctx_sig);

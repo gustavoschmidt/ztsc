@@ -2010,7 +2010,16 @@ pub const Checker = struct {
     /// (`DeferredBody`) and runs long after the object literal that owns it has
     /// been left. Being an object-literal member is a property of the NODE, so
     /// recording it once is both correct and cheaper than threading it.
-    this_bound_fns: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    ///
+    /// The VALUE is the containing object literal when that literal has NO
+    /// contextual type of its own, and `null_node` otherwise (including for a
+    /// function that took its `this` from a contextual signature). It is the
+    /// last arm of tsc's `getContextualThisParameterType`,
+    /// `getWidenedType(checkExpressionCached(containingLiteral))` — the
+    /// literal's own type, which is only knowable once the literal is finished,
+    /// so the deferred body reads it back through `node_types` at drain time.
+    /// See `expr.objectLiteralThisFallback`.
+    this_bound_fns: std.AutoHashMapUnmanaged(u64, Node) = .empty,
     /// The class symbol whose constructor body is currently being checked
     /// (`no_symbol` = not in a constructor). A `readonly` property may be
     /// assigned via `this.x` inside the constructor of the class that OWNS the
@@ -3082,6 +3091,12 @@ pub const Checker = struct {
             // TS2313 is the same kind of rule about the same lists, and runs
             // off the same `scope_owners` walk.
             try typenode_zig.checkFileCircularConstraints(c);
+            // The three once-per-file passes above materialize types, and
+            // materializing one can reach an object literal whose member
+            // bodies then queue (see `DeferredBody`). Nothing drains after
+            // them otherwise, so those bodies would go unchecked — an
+            // under-report the per-statement drain above never has.
+            try c.drainDeferredBodies();
         }
         // Every class instance type is now complete, so the written type
         // arguments collected along the way can be judged against their
