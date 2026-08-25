@@ -24,6 +24,7 @@ const instantiate = @import("enums.zig").instantiate;
 const iteration = @import("iteration.zig");
 const nullability = @import("nullability.zig");
 const resolveStructural = @import("instantiate.zig").resolveStructural;
+const typeparams = @import("typeparams.zig");
 
 // =====================================================================
 // properties & type parts
@@ -932,7 +933,10 @@ fn typeParamConstraintUncached(c: *Checker, sym: SymbolId) Error!TypeId {
     for (decls) |decl| {
         if (c.nodeTag(decl) != .type_param) continue;
         const d = c.tree.nodeData(decl);
-        if (d.lhs == 0) return types.no_type;
+        // A merged interface's blocks share ONE type-parameter symbol in tsc,
+        // so a block that writes a bare `T` still sees a sibling block's
+        // clause. See `typeparams.mergedTypeParamConstraint`.
+        if (d.lhs == 0) return typeparams.mergedTypeParamConstraint(c, sym, decl);
         c.cur_scope = c.symScope(sym);
         return c.typeFromTypeNode(d.lhs);
     }
