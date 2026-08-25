@@ -7253,10 +7253,11 @@ pub fn checkDestructuringPattern(c: *Checker, node: Node, src: TypeId) Error!voi
         },
         else => {
             const iterated = try arrayPatternIteratedType(c, node, src);
+            const els = c.tree.nodeRange(node);
             var index: u32 = 0;
-            for (c.tree.nodeRange(node)) |el| {
+            for (els, 0..) |el, i| {
                 defer index += 1;
-                try checkArrayDestructuringElement(c, el, src, iterated, index);
+                try checkArrayDestructuringElement(c, el, src, iterated, index, i + 1 == els.len);
             }
         },
     }
@@ -7421,13 +7422,38 @@ fn checkObjectDestructuringProperty(c: *Checker, prop: Node, src: TypeId, rest_s
 }
 
 /// One element of an array destructuring pattern, at position `index`.
-fn checkArrayDestructuringElement(c: *Checker, el: Node, src: TypeId, iterated: TypeId, index: u32) Error!void {
+/// `is_last` selects tsc's rest arm: a LAST spread is the rest position, and
+/// only there does `checkArrayLiteralDestructuringElementAssignment` look for
+/// the initializer TS1186 refuses.
+fn checkArrayDestructuringElement(c: *Checker, el: Node, src: TypeId, iterated: TypeId, index: u32, is_last: bool) Error!void {
     if (el == null_node) return;
     switch (c.nodeTag(el)) {
         .omitted, .error_node, .unsupported => {},
         // `[a, ...rest] = src`: the rest is the remaining elements, not the
         // element at `index`.
-        .spread_element, .rest_element => try checkDestructuringTarget(c, c.tree.nodeData(el).lhs, try arrayRestSourceType(c, src, iterated, index), .assignment),
+        .spread_element, .rest_element => {
+            const target = c.tree.nodeData(el).lhs;
+            // TS1186: `[...x = a] = a`. The cover grammar parses the rest's
+            // operand as an ordinary assignment, and tsc's
+            // `checkArrayLiteralDestructuringElementAssignment` rejects it
+            // outright — reported at the `=` OPERATOR, and with nothing
+            // checked behind it (the `else` branch is where the assignment
+            // walk lives, so the whole rest position is skipped).
+            //
+            // The BINDING form (`function f(...[a] = []) {}`) is the parser's
+            // TS1186; only the assignment form reaches a checker at all.
+            if (is_last and target != null_node and c.nodeTag(target) == .assign and
+                c.tree.tokens.tag(c.tree.nodeMainToken(target)) == .eq)
+            {
+                return c.diagFmt(
+                    1186,
+                    c.tokSpan(c.tree.nodeMainToken(target)),
+                    "A rest element cannot have an initializer.",
+                    .{},
+                );
+            }
+            try checkDestructuringTarget(c, target, try arrayRestSourceType(c, src, iterated, index), .assignment);
+        },
         else => try checkDestructuringTarget(c, el, try destructuringElementType(c, src, iterated, index), .assignment),
     }
 }
