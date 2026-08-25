@@ -295,7 +295,10 @@ fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
             // `(file, node)` and reports against the file the node lives in, so
             // this is once per literal wherever the materialization starts.
             // (wave-10 A: one flagged call into `computed_key.zig`.)
-            try computed_key.checkMemberNames(c, c.tree.nodeRange(node), .type_space);
+            // No type parameters: a type literal never earns TS2467, not even
+            // as a generic type alias's body (measured — see
+            // `computed_key.reportTypeParamRefs`).
+            try computed_key.checkMemberNames(c, c.tree.nodeRange(node), .type_space, &.{});
             return c.objectTypeFromMembers(c.tree.nodeRange(node), 0);
         },
         .function_type => return c.signatureOfProto(node, d.lhs, false, true),

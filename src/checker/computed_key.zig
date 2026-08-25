@@ -174,6 +174,95 @@ fn reportIllegalRefs(c: *Checker, node: Node, want: IllegalRefs, depth: u16) Err
 /// Far above any hand-written key expression; the cap only ever under-reports.
 const max_name_depth: u16 = 200;
 
+/// TS2467: a member's computed NAME cannot reference a type parameter of the
+/// class or interface that declares it. The name is evaluated once, when the
+/// declaration is elaborated, so the type arguments a use site supplies do not
+/// exist yet — `class C<T> { [foo<T>()]() {} }` has no `T` to call `foo` with.
+///
+/// The boundary was measured against tsgo 7.0.2 over twenty shapes, and it is
+/// narrower than "any type parameter in scope":
+///
+///   * only the IMMEDIATELY containing class or interface counts. An enclosing
+///     function's parameter is fine, and so is an OUTER class's seen from a
+///     class nested in one of its methods.
+///   * a TYPE LITERAL never reports, even as the body of a generic type alias
+///     (`type D<T> = { [foo<T>()]: number }` is TS1170 alone) — which is why
+///     `typenode`'s call passes no type parameters.
+///   * the reference has to be in a TYPE position. `class C<T> { [T]() {} }`
+///     is TS2304, not this: the value space has no `T` and the type space is
+///     never asked.
+///   * a STATIC member reports too, and so does a class EXPRESSION's member;
+///     every reference reports, so `[foo<[A, B]>()]` is two diagnostics.
+///
+/// Matched by NAME against the declaration's type-parameter list rather than by
+/// resolving the reference: an interface's computed names are checked in the
+/// ENCLOSING scope (that is where a computed key is evaluated), so its own type
+/// parameters are not in scope to resolve against at all.
+fn reportTypeParamRefs(c: *Checker, node: Node, tps: []const Node, depth: u16) Error!void {
+    if (node == null_node or depth > max_name_depth) return;
+    const d = c.tree.nodeData(node);
+    switch (c.nodeTag(node)) {
+        // The three ways a TYPE can be written inside an expression. Each
+        // hands its type slots to the type-position walk; everything else
+        // under this node stays an expression.
+        .call_expr_targs, .optional_call, .new_expr_targs => {
+            const info = c.tree.extraData(ast.CallInfo, d.rhs);
+            for (c.tree.extraRange(info.targs_start, info.targs_end)) |t| {
+                try reportTypeParamRefsInType(c, t, tps, depth + 1);
+            }
+        },
+        .instantiation_expr => {
+            const r = c.tree.extraData(ast.SubRange, d.rhs);
+            for (c.tree.extraRange(r.start, r.end)) |t| {
+                try reportTypeParamRefsInType(c, t, tps, depth + 1);
+            }
+        },
+        .as_expr, .satisfies_expr => try reportTypeParamRefsInType(c, d.rhs, tps, depth + 1),
+        // A nested declaration of its own is a different containing type — the
+        // same boundary `reportIllegalRefs` stops at, and for the same reason.
+        .function_expr,
+        .function_decl,
+        .class_decl,
+        .class_method,
+        .object_method,
+        .class_field,
+        => return,
+        else => {},
+    }
+    var it = c.tree.childIterator(node);
+    while (it.next()) |child| try reportTypeParamRefs(c, child, tps, depth + 1);
+}
+
+/// The type-position half of `reportTypeParamRefs`: every `identifier` under
+/// here names a TYPE, so one matching a containing type parameter is the
+/// reference TS2467 refuses. Nesting is walked whole — `T[]`, `{ a: T }`,
+/// `Foo<T>` and `[A, B]` all report, once per reference.
+fn reportTypeParamRefsInType(c: *Checker, node: Node, tps: []const Node, depth: u16) Error!void {
+    if (node == null_node or depth > max_name_depth) return;
+    switch (c.nodeTag(node)) {
+        .identifier => {
+            const text = c.tokenText(c.tree.nodeMainToken(node));
+            for (tps) |tp| {
+                if (tp == null_node) continue;
+                if (!std.mem.eql(u8, text, c.tokenText(c.tree.nodeMainToken(tp)))) continue;
+                return c.diagFmt(
+                    2467,
+                    c.nodeSpan(node),
+                    "A computed property name cannot reference a type parameter from its containing type.",
+                    .{},
+                );
+            }
+            return;
+        },
+        // `typeof x` names a VALUE, and a type parameter is not one — the
+        // reference there is a TS2304, not this.
+        .typeof_type => return,
+        else => {},
+    }
+    var it = c.tree.childIterator(node);
+    while (it.next()) |child| try reportTypeParamRefsInType(c, child, tps, depth + 1);
+}
+
 /// The computed NAMES of a class body's or an interface's members — tsc's
 /// `checkComputedPropertyName`, reached from the declaration walk so it runs in
 /// the file that owns the declaration and for an unreferenced container too.
@@ -191,7 +280,11 @@ const max_name_depth: u16 = 200;
 ///
 /// `home` says whether the member name is EMITTED code — see
 /// `Checker.in_type_space_name` for the one diagnostic that turns on.
-pub fn checkMemberNames(c: *Checker, members: []const Node, home: Home) Error!void {
+///
+/// `type_params` are the CONTAINING class's or interface's own type-parameter
+/// nodes, which a name may not reference (TS2467, see `reportTypeParamRefs`).
+/// A type literal has none of its own and passes an empty slice.
+pub fn checkMemberNames(c: *Checker, members: []const Node, home: Home, type_params: []const Node) Error!void {
     // Almost every file has no computed member name at all.
     if (c.tree.computed_keys.len == 0) return;
     const saved = c.in_type_space_name;
@@ -210,6 +303,9 @@ pub fn checkMemberNames(c: *Checker, members: []const Node, home: Home) Error!vo
         if (c.node_types.contains(c.nodeKey(c.tree.nodeData(key).lhs))) continue;
         // Only a non-ambient class FIELD's name is a use that can be too early.
         c.defer_computed_key_tdz = home != .class_body or c.nodeTag(m) != .class_field;
+        if (type_params.len > 0) {
+            try reportTypeParamRefs(c, c.tree.nodeData(key).lhs, type_params, 0);
+        }
         _ = try checkComputedName(c, key, home != .type_space);
     }
 }

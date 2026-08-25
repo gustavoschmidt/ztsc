@@ -2705,7 +2705,7 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
     try computed_key.checkMemberNames(c, members, if (c.ambient_ctx or data.flags & ast.Flags.declare != 0)
         .ambient_class_body
     else
-        .class_body);
+        .class_body, c.tree.extraRange(data.tp_start, data.tp_end));
     // The same pairing, for the other question the two halves answer together:
     // whose annotation supplies the property's type (TS7032/TS7033).
     try implicit_any.reportAccessorImplicitAny(c, members);
@@ -2897,7 +2897,12 @@ fn checkInterfaceDecl(c: *Checker, node: Node) Error!void {
     // computed key is evaluated) and before the name guard, because a nameless
     // interface's members are still written down.
     // (wave-10 A: one flagged call into `computed_key.zig`.)
-    try computed_key.checkMemberNames(c, c.tree.extraRange(data.members_start, data.members_end), .type_space);
+    try computed_key.checkMemberNames(
+        c,
+        c.tree.extraRange(data.members_start, data.members_end),
+        .type_space,
+        c.tree.extraRange(data.tp_start, data.tp_end),
+    );
     if (data.name_token == 0) return;
     const a = try c.atomOfToken(data.name_token);
     const saved = c.cur_scope;
