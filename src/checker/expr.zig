@@ -1689,6 +1689,18 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     {
         ctx_tuple_ty = rctx;
     }
+    // tsc's `isTupleLikeType` SECOND disjunct: `!!getPropertyOfType(type,
+    // "0")`. An interface written with NUMERIC MEMBER NAMES — `interface tup
+    // { 0: number[] | string[]; 1: number[] | string[] }` — is tuple-like
+    // without being a tuple and without an index signature, so `var c0: tup =
+    // [...temp2]` reads each position off the interface and the literal is a
+    // TUPLE. Reading it as an array folded both positions into one element
+    // union, which `tup` accepts at neither (`arrayLiterals3`).
+    if (ctx_tuple_ty == types.no_type and rctx != types.no_type and
+        try tupleLikeByZeroProp(c, rctx))
+    {
+        ctx_tuple_ty = rctx;
+    }
     const ctx_tuple = ctx_tuple_ty != types.no_type;
     // Contextual element type for a plain (non-tuple) array literal. A
     // direct array context yields its element; a union context contributes
@@ -2131,10 +2143,16 @@ fn contextualElemTypeAt(c: *Checker, rctx: TypeId, i: u32, length: ?u32) Error!T
             if (elems.items.len == 0) return types.no_type;
             return c.ts.makeUnion(c.scratch(), elems.items);
         },
-        // An `extends Array<T>` interface has no per-POSITION type, but its
-        // numeric index signature types every position — the same arm
-        // `contextualArrayElemType` grows above, for the tuple-context route.
+        // tsc reads the position by NAME (`getTypeOfPropertyOfContextualType(t,
+        // "" + i)`), so an interface written with numeric member names —
+        // `interface tup { 0: T; 1: U }` — answers each position exactly, and
+        // an `extends Array<T>` interface, which has no per-POSITION type,
+        // answers from its numeric index signature instead (the same arm
+        // `contextualArrayElemType` grows above, for the tuple-context route).
         .object => {
+            var buf: [24]u8 = undefined;
+            const name = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
+            if (try c.propOfType(rctx, try c.internText(name))) |p| return p.ty;
             const idx = c.ts.objectNumberIndex(rctx);
             return if (idx != 0) idx else types.no_type;
         },
@@ -2178,6 +2196,45 @@ fn tupleLikeByLength(c: *Checker, r: TypeId) Error!bool {
     if (!array_like) return false;
     const len = (try c.propOfType(r, c.atom_length)) orelse return false;
     return allNumberLiterals(c, try c.resolveStructural(len.ty));
+}
+
+/// tsc's `isTupleLikeType` second disjunct, `someType`'d over a union: does
+/// any constituent answer for the name `"0"`?
+///
+/// A `.tuple` never reaches here (the direct arm already claimed it) and an
+/// `.array` has no `"0"` member, so the lookup only ever runs on an
+/// object/intersection contextual type — where it is the one thing that
+/// distinguishes `interface tup { 0: T; 1: T }` from an ordinary bag of
+/// properties.
+///
+/// The lookup is `propOfType`, which lets a STRING INDEX SIGNATURE stand in
+/// for the name, where tsc's `getPropertyOfType` would not. That is
+/// deliberate, and it is about what this predicate GATES rather than about
+/// the predicate itself: tsc reads an array-literal element's contextual type
+/// with `getTypeOfPropertyOfContextualType(t, "" + index)` — which DOES fall
+/// back to an index signature — for every array literal, tuple context or
+/// not, and ztsc reaches that per-position read only from here. So the
+/// question this really answers is "does a positional read have an answer",
+/// and an index signature is one.
+///
+/// `Record<string, (a: string) => void> | Array<(a: number) => void>` is the
+/// case that turns on it: position 0 draws `(a: string) => void` from the
+/// record's index and `(a: number) => void` from the array's, and a
+/// contextual union of two DISAGREEING signatures types no callback at all —
+/// tsc's TS7006 on the arrow's parameter, which the whole-array element read
+/// (which sees only the array constituent) never reported
+/// (`contextualSignatureInArrayElementLibEs2015`, the #53280 repro).
+fn tupleLikeByZeroProp(c: *Checker, r: TypeId) Error!bool {
+    switch (c.ts.kind(r)) {
+        .union_type => {
+            for (try c.memberList(r)) |m| {
+                if (try tupleLikeByZeroProp(c, try c.resolveStructural(m))) return true;
+            }
+            return false;
+        },
+        .object, .intersection => return (try c.propOfType(r, try c.atom("0"))) != null,
+        else => return false,
+    }
 }
 
 /// tsc's `everyType(lengthType, t => !!(t.flags & TypeFlags.NumberLiteral))`.
