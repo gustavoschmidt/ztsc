@@ -162,9 +162,9 @@ fn receiverOf(c: *Checker, s: Scan, recv: Node, allow_this: bool) Receiver {
 }
 
 /// Is `name` a member of this class that has no value yet at the point
-/// `s.member` runs? Members that are not plain fields are exempt: a method or
-/// an accessor is on the prototype (or the constructor) before any initializer
-/// runs.
+/// `s.member` runs? Only a plain field or a constructor's parameter property
+/// can be one: a method or an accessor is on the prototype (or on the
+/// constructor) before any initializer runs, so neither is ever unassigned.
 fn isUnassigned(c: *Checker, s: Scan, name: []const u8, via_this: bool) bool {
     const want_static = s.side == .static;
     const here = c.nodeSpanStart(s.member);
