@@ -3166,6 +3166,15 @@ fn reportNonIterableSpreads(c: *Checker, arg_nodes: []const Node) Error!void {
             else => {},
         }
         if (try c.iterationElementType(st) != null) continue;
+        // A DEFERRED type is not a shape the protocol can be read off, and
+        // tsc's `getIteratedTypeOrElementType` asks its base constraint
+        // instead: `T extends (...args: any[]) => any` makes `Parameters<T>`
+        // an `any[]`, so `cb(...args)` on one is fine (social-app's
+        // `useRequireEmailVerification`). An unconstrained type parameter
+        // still reports — its constraint is `unknown`, which is not iterable
+        // either, and tsgo agrees.
+        const con = try c.baseConstraintOf(st);
+        if (con != st and try c.iterationElementType(try c.resolveStructural(con)) != null) continue;
         try c.diagFmt(2488, c.nodeSpan(operand), "Type '{s}' must have a '[Symbol.iterator]()' method that returns an iterator.", .{
             try c.typeToString(st),
         });
