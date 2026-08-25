@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-25, post wave 34)
+## Standings (2026-08-25, post wave 35)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7565 / 8633 (87.6%)** |
-| excess keys (false positives) | 3541 | 1342 |
-| missing keys (under-reports) | 8617 | 2594 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7594 / 8633 (87.9%)** |
+| excess keys (false positives) | 3541 | 1329 |
+| missing keys (under-reports) | 8617 | 2527 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Thirty-four waves landed (3–34), every one with ZERO match→non-match regressions in
+Thirty-five waves landed (3–35), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -546,7 +546,76 @@ origin in modules.zig — C's oracle recipe), the accessor grammar family
 TS2323/TS2664. relationComplexityError does NOT flap: stable ~8.5s at
 85% of the 10s cutoff; real fix is tsc's relation step budget → TS2859.
 
-## Ranked next queue (wave 35) — distilled from wave-34 agent reports
+Wave 35 (+29 exact → 7594/8633 87.9%; bucketed 8→5; ztsc timeouts now 0
+— the complexity flake is dead; conformance 1326/1326): A ran the
+alias-ref policy to a DEFINITIVE NO — oracle-exact on probes, but a kept
+.ref reaching materialized-kind consumers blows up the apps (17→76,
+68→319) and breaks grid message-text determinism; regressions live in
+infer/mapped/indexed-access consumers, not the spelling. Landed
+flags-off bisect legs + the finding that measuredVariances lacks tsc's
+Unreliable/Unmeasurable (AllowsStructuralFallback) — the prerequisite
+for ANY negative variance verdict. Also: the c1 keying cost is SEMANTIC
+(more kept refs), not markCycle's inserts — item dropped. B killed
+relationComplexityError: intersection-source identity hoisted above
+target-union decomposition (33.6M steps/4.4s → 8.2k/0.06s) + tsc's
+per-query 4M-step budget → TS2859 (never fires today; message must take
+the declared type node, not ref spelling). Also <T extends T> has no
+constraint (the in-progress mark answered YES → assignable to
+everything), TS1268/TS1337 index keys. C corrected wave-34's framing —
+members were left FRESH, not stored widened (checkExpressionForMutable
+Location ends every branch with getRegularTypeOfLiteralType) — fixing
+objectFreezeLiteralsDontWiden; destructured params take the PATTERN
+type (+4); empty [] is never[] unconditionally; TS7051; and REFUTED
+D's &&=-arm hypothesis by oracle probe. D landed the augmentation-only
+fix (registry seeds from SCRIPT files only), TS1326 + import
+statement-start spelling, TS1092/TS1176/TS1246/TS1247, type-member
+separators (+15, bucketed→5). PERF METHODOLOGY (adopt): under load use
+single-threaded user-CPU interleaved A/B; script at
+scratchpad/capC35/perfcpu.sh.
+
+## Ranked next queue (wave 36) — distilled from wave-35 agent reports
+
+1. Object-literal BODY DEFERRAL (tsc checkNodeDeferred): ztsc walks
+   method bodies inline so getContextualThisParameterType's
+   checkExpressionCached(containingLiteral) fallback is impossible; one
+   mechanism unblocks expando `this`, jsxComponentTypeErrors TS2786,
+   objectLiteralThisWidenedOnUse, looseThisTypeInFunctions:29. One
+   agent, one wave, C's files. Cheap approximations invent TS2339s.
+2. makeIntersection ORIGIN (types.zig): ztsc distributes T1 & T2 into
+   the union at construction keeping no origin; TS2859-silence requires
+   "target is literally an operand of the source intersection" (7-case
+   oracle battery in B35's report).
+3. measuredVariances: add Unreliable/Unmeasurable
+   (AllowsStructuralFallback) — prerequisite for
+   measured_variance_decides and any negative variance verdict.
+4. Divergent accessor WRITE type: types.Prop needs a write type; wire
+   expr.setterWriteType for anonymous type literals too. Cluster:
+   divergentAccessorsTypes4, getAndSetNotIdenticalType2,
+   divergentAccessors1.
+5. Mapped `as` clause: mappedAssignable bails on mappedAs(t)!=0; tsc's
+   keysRemapped branch relates the AS-CLAUSE TYPE to keyof source
+   (mappedTypeAsClauseRelationships, 2 FPs).
+6. restTuplesFromContextualTypes:58:7 — the relation refuses
+   `(...x: [number, ...T]) => void` vs `(x: number, ...args: T) => void`
+   (assign/tuple_relate).
+7. genericCallWithTupleType: out-of-range tuple index in WRITE position
+   is `undefined` (expr.zig element-access assignment target).
+8. `with` statement family (~10 cases): parse it; TS1101 (binder
+   strict-mode) + TS2410 at [with-start, stmt.pos); tsc NEVER checks
+   the body — decide drop-the-node vs skip flag (stmts.zig is C's).
+9. isTypeMemberStart abort semantics (TS1131 + list abort → TS1128 on
+   trailing brace).
+10. abstract on the CONSTRUCT SIGNATURE, not the class decl (types.zig
+    + typenode.zig).
+11. computedPropertiesWithSetterAssignment: computed accessor pair makes
+    the symbol .method; memberTypeOf's method arm wins over accessors.
+12. Small: TS2345 message widens the argument literal ('number' vs
+    '100'); TS1268/TS1337 in TYPE LITERALS; TS2313's companion codes
+    (TS2365/TS2456); import defer type * recovery.
+13. Census: 304 one-key cases (TS2322 32 under / 15 excess; capB35 has
+    the full list); substitution types; resolution-mode attributes.
+
+## Superseded queue (wave 35, kept for context)
 
 1. TS2859 relation step budget (tsc's relationCount): ztsc has no code
    for "Excessive complexity comparing types" at all; relationComplexity
