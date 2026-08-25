@@ -12,6 +12,7 @@ const ast = @import("../frontend/ast.zig");
 const implicit_any = @import("implicit_any.zig");
 const intern = @import("../intern.zig");
 const binder = @import("../frontend/binder.zig");
+const literals = @import("../frontend/literals.zig");
 const source = @import("../frontend/source.zig");
 const types = @import("../types.zig");
 
@@ -2003,7 +2004,7 @@ fn checkStaticSideExtends(c: *Checker, class_sym: SymbolId, name_token: ast.Toke
 /// and a name the flow graph can key. Collected while the members are checked
 /// (the annotation is typed exactly once, by the member walk) and judged after,
 /// so the constructor's body has been checked before its flow is queried.
-const InitCand = struct { member: Node, ty: TypeId };
+const InitCand = struct { member: Node, ty: TypeId, flags: u32 };
 
 /// tsc's `isPropertyWithoutInitializer` plus the surrounding filters in
 /// `checkPropertyInitialization`, applied to one `class_field`:
@@ -2020,19 +2021,30 @@ const InitCand = struct { member: Node, ty: TypeId };
 ///     isComputedPropertyName(propName)` — so a QUOTED or numeric member name
 ///     (`"quoted": string`) is silently skipped, verified against the oracle.
 ///
-/// A COMPUTED name passes this filter (tsc's `isComputedPropertyName` arm) but
-/// is routed to `checkComputedPropertyInit` instead of the flow query: ztsc
-/// keys such a member by a placeholder atom (`memberNameKey`) that a
-/// `this[k] = v` write does not produce, so the flow graph cannot answer for it
-/// and only the syntactic question is safe to ask.
+/// A COMPUTED name passes this filter (tsc's `isComputedPropertyName` arm), and
+/// which question gets asked of it depends on whether ztsc can key it:
+///
+///   * a LITERAL computed name (`["a"]: string`) is keyed by the literal's text
+///     exactly as tsc's late binding keys it, so the ordinary flow query
+///     answers — and it has to, because `this.a = v`, `this["a"] = v` and
+///     `this[1] = v` all count as the assignment (measured against tsgo). The
+///     `.string_literal`/`.numeric_literal` skip above must therefore NOT catch
+///     it: that arm is for a QUOTED member name, whose name node is a literal
+///     rather than a `ComputedPropertyName`;
+///   * every other computed spelling is routed to `checkComputedPropertyInit`
+///     instead: ztsc keys those by a placeholder atom (`memberNameKey`) that a
+///     `this[k] = v` write does not produce, so the flow graph cannot answer
+///     for them and only the syntactic question is safe to ask.
 fn initCandidate(c: *Checker, member: Node, e: ast.Field, ann: TypeId) bool {
     if (e.init != 0) return false;
     const exempt = ast.Flags.definite | ast.Flags.abstract | ast.Flags.declare |
         ast.Flags.static | ast.Flags.optional;
     if (e.flags & exempt != 0) return false;
-    switch (c.tree.tokens.tag(c.tree.nodeMainToken(member))) {
-        .string_literal, .numeric_literal => return false,
-        else => {},
+    if (e.flags & ast.Flags.computed_lit == 0) {
+        switch (c.tree.tokens.tag(c.tree.nodeMainToken(member))) {
+            .string_literal, .numeric_literal => return false,
+            else => {},
+        }
     }
     if (ann == types.no_type or ann == types.error_type) return false;
     switch (c.ts.kind(ann)) {
@@ -2267,15 +2279,42 @@ fn writesThisProp(c: *Checker, target: Node, name: intern.Atom) bool {
 /// out of the constructor wrote `this.<name>` — `thisPropUnassigned` at the
 /// constructor's return join, tsc's `isPropertyInitializedInConstructor` over
 /// `constructor.returnFlowNode`. Reported at the property NAME (tsc's
-/// `member.name`), which is the field node's main token, so a modifier list
-/// (`private readonly x: T`) does not move the column.
+/// `member.name`), which `memberNameSpan` answers for every spelling — a
+/// modifier list (`private readonly x: T`) does not move the column, and a
+/// LITERAL computed name is blamed and rendered as the whole `["a"]`, which is
+/// what `declarationNameToString` prints for a `ComputedPropertyName`.
 fn checkPropertyInit(c: *Checker, ctor: Node, widened: bool, cands: []const InitCand) Error!void {
     for (cands) |cand| {
         const tok = c.tree.nodeMainToken(cand.member);
         const name = try c.memberAtom(tok);
         if (try propAssignedInCtor(c, ctor, widened, name, cand.ty)) continue;
-        try c.diagFmt(2564, c.tokSpan(tok), "Property '{s}' has no initializer and is not definitely assigned in the constructor.", .{c.tokenText(tok)});
+        if (try numericKeyAssignedInCtor(c, ctor, cand, name)) continue;
+        const span = memberNameSpan(c, cand.member, cand.flags);
+        try c.diagFmt(2564, span, "Property '{s}' has no initializer and is not definitely assigned in the constructor.", .{c.src[span.start..span.end]});
     }
+}
+
+/// Does the constructor write `this[<n>] = …` for a NUMERICALLY named member?
+///
+/// tsc's `getAccessedPropertyName` renders a numeric-literal element access as
+/// the property NAME (`isNumericLiteralName`), so `this[1] = v` initializes the
+/// member declared `[1]: string`. ztsc's reference keys deliberately do not:
+/// `constIndexOf` turns a constant numeric index into an INDEX path link, which
+/// is what makes tuple-element narrowing work, and that link never matches the
+/// member-name link the definite-assignment query is spelled with.
+///
+/// Rather than blur that distinction for every reference, the one check that
+/// needs the other reading asks the syntactic question directly, on the rare
+/// path where the flow graph already answered "unassigned" for a numerically
+/// named member. `writeHiddenFromFlow` with `hidden` set from the top is that
+/// scan: it accepts any definite `this[<n>] = …` write anywhere in the body
+/// (`writesThisProp` does the numeric-name rendering), which under-reports
+/// exactly where a conditional write leaves a path uninitialized.
+fn numericKeyAssignedInCtor(c: *Checker, ctor: Node, cand: InitCand, name: intern.Atom) Error!bool {
+    if (ctor == null_node) return false;
+    if (cand.flags & ast.Flags.computed_lit == 0) return false;
+    if (!literals.isNumericName(c.atomText(name))) return false;
+    return writeHiddenFromFlow(c, c.tree.nodeData(ctor).rhs, name, true);
 }
 
 /// TS2564 for a COMPUTED-name property (`[Symbol.unscopables]: number`).
@@ -2612,11 +2651,22 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
         }
     }
 
-    // implements clauses: instance assignable to each interface. Skipped
-    // entirely when the class inherits from a base ztsc could not resolve —
-    // the instance type is then missing whatever that base contributed, and
-    // the verdict would be about ztsc's gap, not the code.
-    if (class_sym != binder.no_symbol and !try c.hasUnresolvedBase(class_sym)) {
+    // implements clauses: instance assignable to each interface.
+    //
+    // Every clause is RESOLVED, whatever became of the others. tsc walks the
+    // heritage elements independently (`checkClassLikeDeclaration` checks each
+    // `ExpressionWithTypeArguments` in turn), so `class C extends A implements
+    // B {}` with neither name declared is TWO TS2304s — ztsc reported only the
+    // `extends` one (`parserClassDeclaration3`/`4`/`5`,
+    // `ExtendsOrImplementsClause5`).
+    //
+    // Only the assignability VERDICT is skipped when the class inherits from a
+    // base ztsc could not resolve: the instance type is then missing whatever
+    // that base contributed, so the answer would be about ztsc's gap and not
+    // about the code. An anonymous class expression has no symbol to ask, and
+    // is skipped for the same reason it always was.
+    const impl_verdict = class_sym != binder.no_symbol and !try c.hasUnresolvedBase(class_sym);
+    {
         for (c.tree.extraRange(data.impl_start, data.impl_end)) |h| {
             if (h == null_node or c.nodeTag(h) != .heritage) continue;
             const hd = c.tree.nodeData(h);
@@ -2629,7 +2679,7 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
                 }
             }
             const iface = try c.typeFromTypeName(hd.lhs, targs.items);
-            if (iface != types.error_type and iface != types.any_type) {
+            if (impl_verdict and iface != types.error_type and iface != types.any_type) {
                 if (!try c.isAssignable(this_t, iface)) {
                     // Same shape as the `extends` side: the per-member pass
                     // blames the offending member (TS2416), and the broad
@@ -2740,7 +2790,7 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
                     if (e.flags & ast.Flags.computed != 0)
                         try computed_init_cands.append(c.scratch(), member)
                     else
-                        try init_cands.append(c.scratch(), .{ .member = member, .ty = ann });
+                        try init_cands.append(c.scratch(), .{ .member = member, .ty = ann, .flags = e.flags });
                 }
                 // A `unique symbol` static-readonly field, like a const,
                 // takes only a fresh `Symbol()` initializer without TS2322.
@@ -2898,20 +2948,29 @@ fn checkInterfaceDecl(c: *Checker, node: Node) Error!void {
     // method signatures) fire even for unused interfaces.
     const d = c.tree.nodeData(node);
     const data = c.tree.extraData(ast.InterfaceData, d.lhs);
-    // The members' computed NAMES, in the enclosing scope (which is where a
-    // computed key is evaluated) and before the name guard, because a nameless
+    const saved = c.cur_scope;
+    defer c.cur_scope = saved;
+    // The members' computed NAMES, before the name guard, because a nameless
     // interface's members are still written down.
     // (wave-10 A: one flagged call into `computed_key.zig`.)
+    //
+    // Checked in the interface's OWN scope — the block's type-parameter scope,
+    // which is where the binder bound the key expressions. tsc resolves a
+    // computed key in its ordinary lexical scope, and an interface's type
+    // parameters are part of it: `interface I<T> { [foo<T>()](): void }` finds
+    // `T` and reports only that finding it there is illegal (TS2467). Running
+    // in the ENCLOSING scope instead left `T` unresolved and added a TS2304 the
+    // oracle does not have (`computedPropertyNames35_ES5`/`_ES6`).
+    if (try c.scopeOf(node)) |s| c.cur_scope = s;
     try computed_key.checkMemberNames(
         c,
         c.tree.extraRange(data.members_start, data.members_end),
         .type_space,
         c.tree.extraRange(data.tp_start, data.tp_end),
     );
+    c.cur_scope = saved;
     if (data.name_token == 0) return;
     const a = try c.atomOfToken(data.name_token);
-    const saved = c.cur_scope;
-    defer c.cur_scope = saved;
     if (c.bind.lookupInScope(c.cur_scope, a)) |sym| {
         if (c.bind.symbol_flags[sym].interface) {
             _ = try c.interfaceGeneric(c.toGlobal(sym));

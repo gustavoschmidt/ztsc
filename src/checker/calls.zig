@@ -508,6 +508,19 @@ fn untypedFunctionCall(c: *Checker, callee_t: TypeId, apparent: TypeId, ak: type
     return c.isAssignable(callee_t, try c.ts.makeRef(sym, &.{}));
 }
 
+/// Does a `new` target that carries no CONSTRUCT signature carry a CALL one?
+/// tsc's `resolveNewExpression` falls back to those, which turns TS2351 into
+/// TS7009 — see the arm in the `new` dispatch, its only caller. An INTERSECTION
+/// is deliberately absent: its call signatures are gathered separately
+/// (`isect_sigs`) and the construct arm above already consumed the shape.
+fn newTargetIsCallable(c: *const Checker, apparent: TypeId) bool {
+    return switch (c.ts.kind(apparent)) {
+        .function, .overloads => true,
+        .object => c.ts.objectCallSigCount(apparent) > 0,
+        else => false,
+    };
+}
+
 /// Is the callee a NAME whose declared type is `never`, as opposed to a name
 /// the flow narrowed to `never`? See the `.never` arm of the call dispatch,
 /// which is the only caller.
@@ -1037,6 +1050,28 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
                     return .{ .ty = types.error_type, .chained = chained };
                 },
             }
+        } else if (newTargetIsCallable(c, r)) {
+            // No construct signature, but CALL signatures: tsc's
+            // `resolveNewExpression` falls back to them
+            // ("the expression is processed as a function call"), and
+            // `checkNewExpression` then sees that the resolved declaration is
+            // not a constructor and answers `any` — reporting TS7009 on the
+            // whole `new` expression rather than TS2351 on the callee.
+            // `new Test()` on a plain `function Test() {}` is the shape, and
+            // `new Symbol` on `SymbolConstructor` (call signature, no
+            // construct signature) is the other. TS2351 is left to a target
+            // with neither kind of signature.
+            //
+            // The fallback call is NOT resolved: its only remaining product
+            // would be an arity or argument diagnostic, and inventing one on a
+            // path that already reports is the wrong direction to be wrong in.
+            if (c.prog.no_implicit_any) {
+                try c.diagFmt(7009, c.nodeSpan(node), "'new' expression, whose target lacks a construct signature, implicitly has an 'any' type.", .{});
+            }
+            for (shape.arg_nodes) |an| {
+                if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+            }
+            return .{ .ty = types.any_type, .chained = chained };
         } else {
             try c.diagFmt(2351, c.nodeSpan(shape.callee), "This expression is not constructable.", .{});
             for (shape.arg_nodes) |an| {

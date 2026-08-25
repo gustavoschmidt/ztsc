@@ -51,6 +51,7 @@ const narrowable = @import("narrowable.zig");
 const hasTypeMeaning = @import("names.zig").hasTypeMeaning;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
 const identity = @import("identity.zig");
+const keyof = @import("keyof.zig");
 const indexableConstituent = @import("typenode.zig").indexableConstituent;
 const negatedBigIntLiteral = @import("typenode.zig").negatedBigIntLiteral;
 const init = Checker.init;
@@ -1213,6 +1214,11 @@ fn checkIdentifier(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
                 // diagnostic instead of a type (TS2815 in a class static block).
                 if (try c.implicitArgumentsType(c.nodeSpan(node))) |t| return t;
             }
+            // A name an enclosing CLASS declares as a member is the prefix
+            // suggestion (TS2662/TS2663), which tsc puts FIRST in
+            // `resolveNameHelper`'s chain — ahead of TS2693 and of the spelling
+            // suggestion below.
+            if (try names_zig.reportMissingPrefix(c, a, tok)) return types.error_type;
             // A primitive TYPE name in a value position is TS2693, ahead of
             // both the suggestion and the not-found message (tsc's
             // `checkAndReportErrorForUsingTypeAsValue`).
@@ -4420,6 +4426,25 @@ fn memberChainInner(c: *Checker, node: Node, ctx: TypeId) Error!ChainLink {
     if (c.nodeTag(d.lhs) == .super_expr and site.dir != .none) {
         if (try accessibility.checkSuperField(c, name, name_tok)) site.dir = .none;
     }
+    // A `#name` on an ANY-like receiver does NOT get the free pass every other
+    // name gets there. tsc's `checkPropertyAccessExpressionOrQualifiedName`
+    // resolves the spelling LEXICALLY first and, on an any-like left type,
+    // returns the apparent type only when some enclosing class declares it; a
+    // spelling no enclosing class declares falls through to the ordinary
+    // lookup, which `any` answers with nothing — so `x.#unknown` with `x: any`
+    // is the same TS2339 a typed receiver would give
+    // (`privateNameNestedMethodAccess`). A `#name` written outside every class
+    // body is tsc's grammar error TS18016, which `checkPrivateName` deliberately
+    // does not transcribe, so `outside_class` is left alone here too.
+    if (c.tree.tokens.tag(name_tok) == .private_identifier and
+        c.ts.kind(try c.resolveStructural(obj_t)) == .any and
+        names_zig.resolvePrivateName(c, name, c.cur_scope) == .no_such_member)
+    {
+        try c.diagFmt(2339, c.tokSpan(name_tok), "Property '{s}' does not exist on type '{s}'.", .{
+            c.atomText(name), try c.typeToString(obj_t),
+        });
+        return .{ .ty = types.error_type, .chained = chained };
+    }
     var pt = try propertyTypeOf(c, obj_t, name, name_tok, site);
     // A `#name` is resolved lexically before it is looked up, so an access
     // from outside the declaring class is TS18013 even though the member
@@ -4602,6 +4627,41 @@ fn entityNameOf(c: *Checker, node: Node) ?[]const u8 {
     }
 }
 
+/// Does `cls`, or a class it extends, declare `name` as a STATIC member?
+/// tsc's `typeHasStaticProperty`, whose two halves both matter for TS2576:
+///
+///   * it asks the class's STATIC SIDE, which INHERITS — `class C2 extends A {}`
+///     with `static bar` on `A` makes `c2.bar()` this diagnostic rather than a
+///     plain TS2339 (`classSideInheritance1`, `classImplementsClass6`);
+///   * it then filters on `prop.valueDeclaration && isStatic(valueDeclaration)`,
+///     which drops everything on the static side that is not a `static` member
+///     — most importantly the exports a merged NAMESPACE contributes.
+///     `class C { static foo } namespace C { export var bar }` reads `c.foo` as
+///     TS2576 and `c.bar` as a plain TS2339 (`staticPropertyNotInClassType`,
+///     `staticMemberExportAccess`, `mergedClassNamespaceRecordCast`).
+///
+/// Walking the binder's per-class statics SCOPES gives both at once: a scope
+/// holds exactly the members the class body declared `static`, and a namespace
+/// block's exports live in a scope of its own. The walk is bounded by
+/// `max_static_base_hops`, so a base cycle the heritage checker has already
+/// reported cannot spin here.
+fn declaresStatic(c: *Checker, cls0: SymbolId, name: Atom) Error!bool {
+    var cls = cls0;
+    var hops: u8 = 0;
+    while (hops < max_static_base_hops) : (hops += 1) {
+        if (!c.symFlags(cls).class) return false;
+        const cb = c.symBind(cls);
+        if (cb.staticsScopeOf(c.localOf(cls))) |ss| {
+            if (cb.lookupInScope(ss, name) != null) return true;
+        }
+        cls = (try c.baseClassSym(cls)) orelse return false;
+    }
+    return false;
+}
+
+/// Deeper than any real class hierarchy; the cap only ever under-reports.
+const max_static_base_hops: u8 = 64;
+
 /// Property `name` on `t`, with TS2339/TS2551 on failure.
 ///
 /// `dir` is the access direction the ACCESSIBILITY check reads its modifiers
@@ -4749,16 +4809,11 @@ fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex, site
             // Instance access to a static member (TS2576).
             if (k == .ref) {
                 const cls = c.ts.refSymbol(t);
-                const cls_bind = c.symBind(cls);
-                if (c.symFlags(cls).class) {
-                    if (cls_bind.staticsScopeOf(c.localOf(cls))) |ss| {
-                        if (cls_bind.lookupInScope(ss, name) != null) {
-                            try c.diagFmt(2576, c.tokSpan(name_tok), "Property '{s}' does not exist on type '{s}'. Did you mean to access the static member '{s}.{s}' instead?", .{
-                                c.atomText(name), try c.typeToString(t), c.symbolName(cls), c.atomText(name),
-                            });
-                            return types.error_type;
-                        }
-                    }
+                if (try declaresStatic(c, cls, name)) {
+                    try c.diagFmt(2576, c.tokSpan(name_tok), "Property '{s}' does not exist on type '{s}'. Did you mean to access the static member '{s}.{s}' instead?", .{
+                        c.atomText(name), try c.typeToString(t), c.symbolName(cls), c.atomText(name),
+                    });
+                    return types.error_type;
                 }
             }
             // An unknown member of the global scope object is, for tsc, an
@@ -5229,6 +5284,10 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
                     });
                     result = types.error_type;
                 }
+            } else if (c.ts.kind(rt) == .union_type and
+                try unionTupleIndexMiss(c, rt, obj_t, c.ts.numberValue(rl), d.rhs))
+            {
+                result = types.error_type;
             } else if (try c.numericKeyProp(r, rl)) |p| {
                 // tsc's `getPropertyNameFromIndex`: a NUMERIC-literal key
                 // names a property exactly as a string-literal one does —
@@ -7352,6 +7411,24 @@ pub fn checkDestructuringPattern(c: *Checker, node: Node, src: TypeId) Error!voi
     }
 }
 
+/// `o[n]` with a numeric-literal key and a receiver whose every constituent is
+/// a TUPLE, past the end of all of them — the element-access spelling of the
+/// rule `keyof.zig` runs on a written `T[2]`. A single tuple is handled by the
+/// arm above (which has the arity in hand); this is the UNION case, where tsc's
+/// `getPropertyOfUnionOrIntersectionType` finds no property at all and reports
+/// the generic TS2339 rather than the tuple-arity TS2493.
+///
+/// The 4096 bound is `refkey.constIndexOf`'s: past it no tuple has the
+/// position anyway, and the report would be about a receiver ztsc does not
+/// model — silence is the safe answer.
+fn unionTupleIndexMiss(c: *Checker, rt: TypeId, obj: TypeId, v: f64, at: Node) Error!bool {
+    if (v < 0 or v != @floor(v) or v >= 4096) return false;
+    const n: u32 = @intFromFloat(v);
+    if (try keyof.tupleIndexVerdict(c, rt, n) != .out_of_range) return false;
+    try keyof.reportTupleIndexOutOfRange(c, rt, obj, n, at);
+    return true;
+}
+
 /// The element type an ARRAY destructuring-assignment pattern reads its
 /// positions through when the source carries no numeric domain of its own —
 /// tsc's `checkArrayLiteralAssignment` computes it once for the whole pattern
@@ -7443,11 +7520,26 @@ fn destructuringHasDefault(c: *Checker, el0: Node) bool {
 /// by indexed access only where `isArrayLikeType(source)` holds and otherwise
 /// hands every element that one iterated type, so a source with no numeric
 /// domain (a `Set`, a `Generator`) still types its positions.
-fn destructuringElementType(c: *Checker, src: TypeId, iterated: TypeId, index: u32) Error!TypeId {
+///
+/// A position past the end of every TUPLE constituent is that indexed access's
+/// own diagnostic, not the write's: tsc reaches the position through
+/// `getIndexedAccessTypeOrUndefined(source, <index>, ExpressionPosition |
+/// (hasDefaultValue ? AllowMissing : 0), <synthetic node at the element>)`, and
+/// the access reports TS2493 (one tuple) / TS2339 (a union of them) at the
+/// element and answers `errorType`. Reporting it here is what keeps
+/// `[a, b, c] = someTwoTuple` from being the TS2322 the widened iterated type
+/// would otherwise produce at the third target.
+fn destructuringElementType(c: *Checker, el: Node, src: TypeId, iterated: TypeId, index: u32) Error!TypeId {
     if (src == types.no_type) return types.no_type;
     const r = try c.resolveStructural(src);
     const rk = c.ts.kind(r);
     if (rk == .any or rk == .err) return types.any_type;
+    if (!destructuringHasDefault(c, el) and
+        try keyof.tupleIndexVerdict(c, r, index) == .out_of_range)
+    {
+        try keyof.reportTupleIndexOutOfRange(c, r, src, index, el);
+        return types.error_type;
+    }
     if (try numericIndexHit(c, r, rk, @floatFromInt(index))) |t| return t;
     return iterated;
 }
@@ -7543,7 +7635,7 @@ fn checkArrayDestructuringElement(c: *Checker, el: Node, src: TypeId, iterated: 
             }
             try checkDestructuringTarget(c, target, try arrayRestSourceType(c, src, iterated, index), .assignment);
         },
-        else => try checkDestructuringTarget(c, el, try destructuringElementType(c, src, iterated, index), .assignment),
+        else => try checkDestructuringTarget(c, el, try destructuringElementType(c, el, src, iterated, index), .assignment),
     }
 }
 

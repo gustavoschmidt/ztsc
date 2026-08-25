@@ -26,6 +26,7 @@ const accessibility = @import("accessibility.zig");
 const PathElem = @import("flow.zig").PathElem;
 const RefKey = @import("flow.zig").RefKey;
 const containsAtom = @import("expr.zig").containsAtom;
+const keyof = @import("keyof.zig");
 const markSpeculativePin = @import("signatures.zig").markSpeculativePin;
 const max_deep_ref_depth = @import("flow.zig").max_deep_ref_depth;
 const subst = @import("subst.zig");
@@ -1064,7 +1065,18 @@ fn checkArrayPatternProps(c: *Checker, pat: Node, whole: TypeId) Error!void {
         // (`destructuringVariableDeclaration2`) — a literal initializer is a
         // tuple here precisely because the pattern contextually types it
         // (`patternContextualType`).
-        if (c.ts.kind(r) != .tuple) continue;
+        if (c.ts.kind(r) != .tuple) {
+            // A UNION of tuples has no single element type to descend with,
+            // but the out-of-range question still has one answer for the whole
+            // union — tsc's indexed access reports on the union receiver, with
+            // the generic TS2339 rather than any one constituent's arity.
+            if (c.ts.kind(r) == .union_type and c.nodeTag(el) != .binding_default and
+                try keyof.tupleIndexVerdict(c, r, i) == .out_of_range)
+            {
+                try keyof.reportTupleIndexOutOfRange(c, r, whole, i, el);
+            }
+            continue;
+        }
         if (i >= c.ts.tupleLen(r)) {
             // Past the end, with no rest element to absorb it: the same
             // out-of-range indexed access `tupleBindingElemType` answers

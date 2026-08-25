@@ -1168,33 +1168,58 @@ fn numericKeyAtom(c: *Checker, v: f64) Error!?types.Atom {
 ///
 /// True when this arm CONSUMED the key (reported or not), so the caller stops.
 fn tupleIndexMiss(c: *Checker, r: TypeId, obj: TypeId, name: types.Atom, at: Node) Error!bool {
-    const s = &c.ts;
     const txt = c.atomText(name);
     const signed = integralName(txt) orelse return false;
     if (signed < 0 or signed > std.math.maxInt(u32)) return false;
     const n: u32 = @intCast(signed);
+    switch (try tupleIndexVerdict(c, r, n)) {
+        .not_tuples => return false,
+        .in_range => return true,
+        .out_of_range => {
+            try reportTupleIndexOutOfRange(c, r, obj, n, at);
+            return true;
+        },
+    }
+}
 
+/// Where a non-negative integral key falls relative to a receiver whose every
+/// constituent is a tuple — the predicate half of `tupleIndexMiss`, shared with
+/// the EXPRESSION-side element access and array destructuring, which reach the
+/// same rule through an index they already have as a number.
+///
+/// `not_tuples` means the rule does not apply (some constituent is not a
+/// tuple), and the caller keeps whatever it was going to do.
+pub const TupleIndexVerdict = enum { not_tuples, in_range, out_of_range };
+
+pub fn tupleIndexVerdict(c: *Checker, r: TypeId, n: u32) Error!TupleIndexVerdict {
+    const s = &c.ts;
     const ms: []const TypeId = if (s.kind(r) == .union_type) try c.memberList(r) else &.{r};
     for (ms) |m| {
         const rm = try c.resolveStructural(m);
-        if (s.kind(rm) != .tuple) return false;
+        if (s.kind(rm) != .tuple) return .not_tuples;
         // In range on ANY constituent, or reachable through a rest element:
         // the access answers and this arm is done.
-        if (n < s.tupleLen(rm)) return true;
+        if (n < s.tupleLen(rm)) return .in_range;
         for (0..s.tupleLen(rm)) |i| {
-            if (s.tupleElem(rm, @intCast(i)).rest()) return true;
+            if (s.tupleElem(rm, @intCast(i)).rest()) return .in_range;
         }
     }
-    if (ms.len == 1 and s.kind(r) == .tuple) {
-        try c.diagFmt(2493, c.nodeSpan(at), "Tuple type '{s}' of length '{d}' has no element at index '{s}'.", .{
-            try c.typeToString(r), s.tupleLen(r), txt,
-        });
-    } else {
-        try c.diagFmt(2339, c.nodeSpan(at), "Property '{s}' does not exist on type '{s}'.", .{
-            txt, try c.typeToString(obj),
+    return .out_of_range;
+}
+
+/// The report half: TS2493 naming the tuple's arity for a SINGLE tuple, plain
+/// TS2339 for a union of them (tsc's `getPropertyOfUnionOrIntersectionType`
+/// finds no property at all there, so the message is the generic one). `r` is
+/// the resolved receiver the arity is read from, `obj` the one printed.
+pub fn reportTupleIndexOutOfRange(c: *Checker, r: TypeId, obj: TypeId, n: u32, at: Node) Error!void {
+    if (c.ts.kind(r) == .tuple) {
+        return c.diagFmt(2493, c.nodeSpan(at), "Tuple type '{s}' of length '{d}' has no element at index '{d}'.", .{
+            try c.typeToString(r), c.ts.tupleLen(r), n,
         });
     }
-    return true;
+    return c.diagFmt(2339, c.nodeSpan(at), "Property '{d}' does not exist on type '{s}'.", .{
+        n, try c.typeToString(obj),
+    });
 }
 
 /// tsc's `isTypeAssignableToKind(indexType, StringLike | NumberLike |
