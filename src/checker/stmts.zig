@@ -1420,6 +1420,14 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
         const acc = try signatures.getterReturnFromSetter(c, node, proto);
         if (acc != types.no_type) eff_ann = acc;
     }
+    // A SET accessor returns `void` whatever it was annotated with. tsc's
+    // `checkAccessorDeclaration` never runs the function-like return checks on
+    // one at all — it checks the body and the get/set agreement rules and
+    // stops — so the annotation is TS1095's business alone (a `return v` in
+    // the body is TS2408, a report of its own). Reading it as an ordinary
+    // return target instead put a TS2355 on `set Goo(v: string): string {}`
+    // and a TS2534 on a `never` one (`gettersAndSettersErrors`).
+    if (proto.flags & ast.Flags.set != 0) eff_ann = types.no_type;
     // A WRITTEN generator return type has to be something a generator can
     // actually produce — see `checkGeneratorReturnAnnotation`. Only with a
     // body: tsc's `getFunctionFlags` marks a bodyless declaration `Invalid`
