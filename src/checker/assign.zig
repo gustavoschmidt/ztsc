@@ -6152,8 +6152,52 @@ fn applyToParameterTypes(c: *Checker, s: TypeId, t: TypeId, tp_syms: []const u32
         const sp = (try c.paramTypeAt(s, i)) orelse break;
         const tp = (try c.paramTypeAt(t, i)) orelse break;
         try c.unify(sp, tp, tp_syms, cand, 0);
+        try pairTemplateHoles(c, sp, tp, tp_syms, cand);
     }
     if (s_rest) |sr| try c.unify(sr, try c.restTupleAtPosition(t, pair_count), tp_syms, cand, 0);
+}
+
+/// tsc's `inferTypesFromTemplateLiteralType` short-circuit, for the one
+/// position `instantiateSigInContextOf` needs it:
+///
+/// ```ts
+/// arraysEqual(source.texts, target.texts) ? map(source.types, getStringLikeTypeForType) : …
+/// ```
+///
+/// Two patterns whose fixed text is identical have their placeholders paired
+/// one-to-one, and each pair is inferred straight through — no text scan, no
+/// template wrapper around the match. So `` `${T2}` `` against `` `${T0}` ``
+/// binds `T0 := T2` (oracle-verified: `inf(x: `${T0}`): [T0]` called with a
+/// `` `${T2}` `` argument answers `[T2]`, not ``[`${T2}`]``).
+///
+/// `unify` itself binds NOTHING from a template-literal pattern, and here that
+/// silence is not merely a missed inference — it hands the decision to the
+/// RETURN position, which is a strictly worse answer. tsc's return-position
+/// inferences run at `InferencePriority.ReturnType` and are DISCARDED wherever
+/// a parameter already bound the variable; ztsc's `instantiateSigInContextOf`
+/// applies the same precedence, so an empty parameter candidate let
+/// `TypeMap[T0]` against ``TypeMap[`${T2}`]`` bind `` T0 := `${T2}` `` from the
+/// return, making the instantiated return IDENTICAL to the target's and
+/// accepting a pair tsc rejects (`templateLiteralTypes5`, where `T2` is not
+/// assignable to `` `${T2}` ``).
+///
+/// Parameters only. The general arm belongs in `infer.unify`, where it would
+/// serve calls and return positions too; this is the signature relation's own
+/// half, added where the precedence rule makes it decisive.
+fn pairTemplateHoles(c: *Checker, sp: TypeId, tp: TypeId, tp_syms: []const u32, cand: []TypeId) Error!void {
+    if (c.ts.kind(sp) != .template_literal_type or c.ts.kind(tp) != .template_literal_type) return;
+    if (!template_zig.sameTemplateTexts(c, sp, tp)) return;
+    for (0..c.ts.templateHoleCount(sp)) |h| {
+        const hs = c.ts.templateHole(sp, @intCast(h));
+        const ht = c.ts.templateHole(tp, @intCast(h));
+        // `map(source.types, getStringLikeTypeForType)`: a placeholder that is
+        // NOT already string-like is wrapped in its own `` `${t}` `` before it
+        // becomes the match, so `` `${number}` `` binds `` `${number}` `` and
+        // not `number`. Those holes are left to the rest of the inference
+        // rather than paired wrongly.
+        if (!template_zig.templateHolePairsDirectly(c, ht)) continue;
+        try c.unify(hs, ht, tp_syms, cand, 0);
+    }
 }
 
 /// tsc's `getEffectiveRestType`: what a signature's rest parameter types the
