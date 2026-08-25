@@ -194,7 +194,14 @@ fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!voi
             if (sidx != 0) {
                 if (!first) try w.writeAll(" ");
                 first = false;
-                try w.writeAll("[x: string]: ");
+                // A `[k: symbol]` signature is stored in the STRING slot with
+                // `obj_flag_symbol_index` marking the key domain (see
+                // `index_constraints.indexKindOf`), so the printed key type
+                // comes off the flag, not the slot.
+                try w.writeAll(if (s.objectFlags(t) & types.obj_flag_symbol_index != 0)
+                    "[x: symbol]: "
+                else
+                    "[x: string]: ");
                 try printType(c, w, sidx, depth + 1);
                 try w.writeAll(";");
             }
