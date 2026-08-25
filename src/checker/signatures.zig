@@ -1861,6 +1861,15 @@ fn expandoMemberType(c: *Checker, sym: SymbolId) Error!TypeId {
     const saved = c.enterSymFile(sym);
     defer c.restoreCtx(saved);
     c.cur_scope = c.symScope(sym);
+    // The right-hand sides are being typed to BUILD this member's type, so any
+    // function body inside one must not be walked yet — `declaratorType`'s
+    // rule, and here it buys something extra: the EXPANDO function that owns
+    // this member is itself in progress, so a `this` in such a body resolves
+    // against `typeOfSymbol`'s cycle-break `any`. Queued, the body runs from
+    // `drainDeferredBodies` with the owner sealed, and picks the receiver back
+    // up through `expr.deferredThisType`.
+    c.defer_bodies += 1;
+    defer c.defer_bodies -= 1;
     var parts: std.ArrayList(TypeId) = .empty;
     defer parts.deinit(c.scratch());
     for (c.declsOf(sym)) |decl| {

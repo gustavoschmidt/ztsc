@@ -247,35 +247,52 @@ fn thisBoundKey(c: *const Checker, fn_node: Node) u64 {
 }
 
 /// Record that `fn_node` has a receiver of its own — see
-/// `Checker.this_bound_fns`. `lit` is the containing object literal whose OWN
-/// type is this function's `this` (`null_node` when the receiver comes from
-/// somewhere else, which is every case but an uncontextualized literal).
-fn markThisBound(c: *Checker, fn_node: Node, lit: Node) Error!void {
-    try c.this_bound_fns.put(c.cm(), thisBoundKey(c, fn_node), lit);
+/// `Checker.this_bound_fns`. `src` is the node whose type IS that receiver,
+/// when the answer was not available at the time (`null_node` otherwise).
+///
+/// A recorded source is never downgraded back to `null_node`: the same
+/// function is reached twice for an expando member — once from
+/// `expandoMemberType`, while the owner is still in progress, and once from
+/// the assignment walk, by when it is sealed — and it is the FIRST visit that
+/// queues the body, so the second must not erase what the drain needs.
+fn markThisBound(c: *Checker, fn_node: Node, src: Node) Error!void {
+    const gop = try c.this_bound_fns.getOrPut(c.cm(), thisBoundKey(c, fn_node));
+    if (!gop.found_existing or src != null_node) gop.value_ptr.* = src;
 }
 
-/// The object literal whose OWN type is `fn_node`'s `this` — `null_node` when
-/// `fn_node` is not an object-literal member, or when its receiver comes from
-/// somewhere that already knows the answer (a contextual type, a `ThisType<T>`
-/// marker, an explicit `this` parameter). See `Checker.this_bound_fns`.
+/// The node whose type is `fn_node`'s deferred `this` — `null_node` when
+/// nothing is pending, i.e. `fn_node` is not one of the two shapes below or
+/// its receiver was already installed eagerly (a contextual type, a
+/// `ThisType<T>` marker, an explicit `this` parameter). See
+/// `Checker.this_bound_fns`.
 pub fn deferredThisSource(c: *const Checker, fn_node: Node) Node {
     return c.this_bound_fns.get(thisBoundKey(c, fn_node)) orelse null_node;
 }
 
-/// The type that literal ended up with — tsc's
-/// `getContextualThisParameterType` falling through to
-/// `getWidenedType(checkExpressionCached(containingLiteral))`.
+/// …and the type it turns out to have, read at drain time. Two shapes, told
+/// apart by the source node's own tag:
 ///
-/// Answered from the FINISHED literal's recorded type, which is why the body
-/// asking has to have been deferred (see `objLitDeferBodies`): mid-walk the
-/// literal has no type yet, and tsc's whole reason for `checkNodeDeferred` on
-/// an object-literal member is to make this answer available. `null` when
-/// `fn_node` is not such a member, or when the literal's type never made it
-/// into `node_types`.
+///   * an OBJECT LITERAL with no contextual type — tsc's
+///     `getContextualThisParameterType` falling through to
+///     `getWidenedType(checkExpressionCached(containingLiteral))`. The
+///     literal's finished type is already in `node_types`.
+///
+///   * an EXPANDO receiver, `F.m = function () { this }`. `F`'s type is built
+///     out of this very assignment, so the walk that queued the body saw
+///     `typeOfSymbol`'s in-progress `any`. That reading was published, so the
+///     memo entry is dropped and the receiver re-asked — by now `F` is sealed
+///     and answers the whole `{ (): R; m: …; … }` shape tsc resolves lazily.
+///
+/// Either way this only works because the body WAITED (see
+/// `objLitDeferBodies` and `expandoMemberType`): mid-walk neither type exists.
 pub fn deferredThisType(c: *Checker, fn_node: Node) Error!?TypeId {
-    const lit = deferredThisSource(c, fn_node);
-    if (lit == null_node) return null;
-    return c.nodeType(lit);
+    const src = deferredThisSource(c, fn_node);
+    if (src == null_node) return null;
+    if (c.nodeTag(src) == .object_literal) return c.nodeType(src);
+    _ = c.node_types.remove(c.nodeKey(src));
+    const t = try c.checkExprCached(src, types.no_type);
+    if (t == types.error_type or t == types.any_type or t == types.no_type) return null;
+    return t;
 }
 
 /// `this`, narrowed the way tsc's `checkThisExpression` narrows it: both arms
@@ -6118,9 +6135,17 @@ pub fn assignedMethodThisType(c: *Checker, target: Node, value0: Node) Error!?Ty
     }
     const obj = c.tree.nodeData(target).lhs;
     if (obj == null_node) return null;
-    try markThisBound(c, value, null_node);
     const t = try c.checkExprCached(obj, types.no_type);
-    if (t == types.error_type or t == types.any_type or t == types.no_type) return null;
+    if (t == types.error_type or t == types.any_type or t == types.no_type) {
+        // The EXPANDO case: `F` is being built out of this very assignment, so
+        // `typeOfSymbol`'s in-progress guard answered `any`. The receiver NODE
+        // is recorded instead, and the body — queued by `expandoMemberType` —
+        // re-asks it from `drainDeferredBodies` with `F` sealed. `this` is
+        // still untyped for the eager walk right here, exactly as before.
+        try markThisBound(c, value, obj);
+        return null;
+    }
+    try markThisBound(c, value, null_node);
     return t;
 }
 
