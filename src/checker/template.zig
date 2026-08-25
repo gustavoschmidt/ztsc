@@ -740,6 +740,60 @@ pub fn definitelyUnrelated(c: *Checker, s: TypeId, t: TypeId) bool {
     return !std.mem.eql(u8, s_end[s_end.len - end_len ..], t_end[t_end.len - end_len ..]);
 }
 
+/// tsc's `isTypeMatchedByTemplateLiteralType` for the one pattern↔pattern shape
+/// it decides without an inference pass: `inferTypesFromTemplateLiteralType`
+/// short-circuits on `arraysEqual(source.texts, target.texts)` and hands back
+/// the SOURCE's own placeholders, which `isValidTypeForTemplateLiteralPlaceholder`
+/// then checks one by one against the target's.
+///
+/// So `` `a${string}` `` is NOT a `` `a${number}` `` (TS2322 — the fixed text
+/// lines up and `string` is not a `number`), while `` `a${number}` `` IS an
+/// `` `a${string}` ``. `definitelyUnrelated` cannot see either: the texts agree.
+///
+/// `null` means "no verdict" — the texts differ, so tsc would run the real
+/// inference (`` `ab${string}` `` still matches `` `a${string}` ``) and ztsc's
+/// caller keeps its lenient answer. A placeholder ztsc cannot decide on its own
+/// terms (a literal, a nested pattern, a type variable) is likewise read as
+/// "could match", so this only ever converts a certain mismatch into `false`.
+pub fn sameTextPatternRelated(c: *Checker, s: TypeId, t: TypeId) Error!?bool {
+    const store = &c.ts;
+    const n = store.templateHoleCount(s);
+    if (n != store.templateHoleCount(t)) return null;
+    if (store.templateHead(s) != store.templateHead(t)) return null;
+    for (0..n) |i| {
+        if (store.templateChunk(s, @intCast(i)) != store.templateChunk(t, @intCast(i))) return null;
+    }
+    for (0..n) |i| {
+        if (!try placeholderValid(c, store.templateHole(s, @intCast(i)), store.templateHole(t, @intCast(i)))) return false;
+    }
+    return true;
+}
+
+/// tsc's `isValidTypeForTemplateLiteralPlaceholder`, restricted to the
+/// placeholder pairs ztsc can answer outright: identical types are valid by
+/// that function's own first line, and a plain primitive on both sides is its
+/// trailing `isTypeAssignableTo`. Everything else keeps the lenient answer —
+/// see `sameTextPatternRelated`.
+///
+/// The whitelist on the TARGET side is not just caution. tsc's `addSpans`
+/// INLINES a template-typed placeholder, so `Uppercase<`${number}`>` spliced
+/// into a bigger pattern collapses back to a bare `number` span; ztsc keeps the
+/// nested template, and the two spellings of one type have to go on relating
+/// (`stringMappingOverPatternLiterals`, whose `NonStringPat` and
+/// `EquivalentNonStringPat` are that pair). A nested pattern, a string
+/// transform, `any` and `string` therefore all mean "could match".
+fn placeholderValid(c: *Checker, s: TypeId, t: TypeId) Error!bool {
+    if (s == t) return true;
+    switch (c.ts.kind(t)) {
+        .number, .bigint, .boolean, .symbol => {},
+        else => return true,
+    }
+    return switch (c.ts.kind(s)) {
+        .string, .number, .bigint, .boolean, .symbol => c.isAssignable(s, t),
+        else => true,
+    };
+}
+
 pub fn matchTplHole(c: *Checker, rest: []const u8, tpl: TypeId, i: u32) Error!bool {
     const s = &c.ts;
     const n = s.templateHoleCount(tpl);
