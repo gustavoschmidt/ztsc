@@ -58,6 +58,7 @@ const accessor_grammar = @import("accessor_grammar.zig");
 const ast = @import("ast.zig");
 const diagnostics = @import("diagnostics.zig");
 const directives = @import("directives.zig");
+const reference_pragma = @import("reference_pragma.zig");
 const literals = @import("literals.zig");
 const modifier_order = @import("modifier_order.zig");
 const param_modifiers = @import("param_modifiers.zig");
@@ -192,7 +193,24 @@ const JumpCtx = struct {
 
 /// The three kinds of `node.parent` a statement can have, as far as tsc's
 /// grammar checks care: `SourceFile`, `ModuleBlock`, and everything else.
-const ElementHome = enum { source_file, module_block, other };
+const ElementHome = enum {
+    source_file,
+    /// The body of a `namespace N { … }` / `module N { … }` — tsc's
+    /// ModuleBlock whose ModuleDeclaration has an IDENTIFIER name.
+    namespace_block,
+    /// The body of `declare module "spec" { … }` or `declare global { … }` —
+    /// tsc's `isAmbientModule`, which one rule (TS1319) has to tell apart from
+    /// the namespace kind: a default export is legal in an ambient module
+    /// declaration and not in a namespace.
+    ambient_module_block,
+    other,
+
+    /// Both module kinds — tsc's "parent is a ModuleBlock", which is what the
+    /// modifier rules ask.
+    fn moduleBlock(h: ElementHome) bool {
+        return h == .namespace_block or h == .ambient_module_block;
+    }
+};
 
 const Parser = struct {
     /// Transient arena: all growable lists live here during the parse.
@@ -238,6 +256,21 @@ const Parser = struct {
     /// enclosing list's answer rather than getting its own — tsc would say
     /// TS1184 there; no corpus case writes it.
     element_home: ElementHome = .source_file,
+
+    /// tsc's `allowLetAndConstDeclarations(node.parent) == false`: the statement
+    /// now being parsed is the single SUBSTATEMENT of an `if`/`else`/`do`/
+    /// `while`/`with`/`for`, so a `let`, `const`, `type` or `interface`
+    /// declaration standing here is TS1156 — it would have no block to live in.
+    ///
+    /// Deliberately NOT a fifth `element_home`, even though both answer a
+    /// question about `node.parent`, because a LABEL sits on opposite sides of
+    /// the two: `allowLetAndConstDeclarations` recurses THROUGH a
+    /// LabeledStatement to its parent (so `{ l: let x = 1 }` is fine and
+    /// `if (c) l: let x = 1;` is not), while
+    /// `checkGrammarModuleElementContext` stops AT it (`l: namespace N {}` is
+    /// TS1235 wherever it stands). Folding them into one field would have to
+    /// pick one behaviour for labels and be wrong about the other rule.
+    substatement: bool = false,
 
     /// Lookahead queue of scanned-but-not-consumed tokens; la[0] is current.
     la: [max_la]Token = undefined,
@@ -891,6 +924,18 @@ const Parser = struct {
         const start = p.tok_starts.items[tok] & scanner.Tokens.start_mask;
         const at = scanner.tokenEnd(p.src, p.tok_tags.items[tok], start);
         try p.addDiag(code, .{ .code = code, .span = .{ .start = at, .end = at } });
+    }
+
+    /// `errAtToken` whose `{0}` comes from ANOTHER consumed token — TS1156 on a
+    /// `type`/`interface` declaration is reported on the NAME while naming the
+    /// keyword.
+    fn errAtTokenArg(p: *Parser, code: Code, tok: u32, arg_tok: u32) Error!void {
+        try p.errAtSpanArg(code, p.tokenSpan(tok), p.tokenSpan(arg_tok));
+    }
+
+    fn tokenSpan(p: *Parser, tok: u32) Span {
+        const start = p.tok_starts.items[tok] & scanner.Tokens.start_mask;
+        return .{ .start = start, .end = scanner.tokenEnd(p.src, p.tok_tags.items[tok], start) };
     }
 
     fn errAtToken(p: *Parser, code: Code, tok: u32) Error!void {
@@ -1601,6 +1646,7 @@ const Parser = struct {
         // Node 0 is the root; extra_data[0] is the reserved none-sentinel.
         _ = try p.addNode(.{ .tag = .root, .main_token = 0, .data = .{ .lhs = 0, .rhs = 0 } });
         try p.extra.append(p.gpa, 0);
+        try p.reportInvalidReferencePragmas();
 
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
@@ -1616,10 +1662,33 @@ const Parser = struct {
         try p.flushConflictMarkers();
     }
 
+    /// TS1084, tsc's `processPragmasIntoFields`: a `/// <reference … />` that
+    /// names none of the arguments the pragma knows. Read from the raw bytes,
+    /// for the same reason `directives.scan` is — the scanner discards trivia —
+    /// and reported over the WHOLE comment, which is the pragma's range.
+    ///
+    /// Runs before the first statement so the diagnostics come out in source
+    /// order, and costs one character comparison for a file that opens with
+    /// code rather than a comment.
+    fn reportInvalidReferencePragmas(p: *Parser) PE!void {
+        var it = reference_pragma.leading(p.src);
+        while (it.next()) |c| {
+            if (reference_pragma.read(c.body) != .invalid) continue;
+            try p.errAtBytes(.invalid_reference_directive, c.start, c.end);
+        }
+    }
+
     /// Parse statements until `terminator` (or eof), pushing them on
     /// scratch. Guarantees progress on every iteration.
     fn parseStatementList(p: *Parser, top: usize, terminator: TokTag, ambient_reported: bool) PE!void {
         _ = top;
+        // A real statement LIST — a block, a module body, a source file, a
+        // `case` clause — is where `let`/`const`/`type`/`interface` are allowed
+        // (`substatement`). One assignment here covers every list, however it
+        // was reached.
+        const was_sub = p.substatement;
+        p.substatement = false;
+        defer p.substatement = was_sub;
         // TS1036, tsc's `checkGrammarStatementInAmbientContext`: an ambient
         // context declares, it does not execute. tsc reports it ONCE per
         // containing block ("we only want to really report an error once to
@@ -1911,6 +1980,17 @@ const Parser = struct {
     }
 
     fn parseSubstatement(p: *Parser) PE!Node {
+        const was_sub = p.substatement;
+        p.substatement = true;
+        defer p.substatement = was_sub;
+        return p.parseLabeledBody();
+    }
+
+    /// The body a LABEL carries. Out of module-element context like any other
+    /// substatement, but TRANSPARENT to `Parser.substatement` — tsc's
+    /// `allowLetAndConstDeclarations` recurses through a LabeledStatement, so
+    /// `l: let x = 1` inherits the answer of wherever the label itself stands.
+    fn parseLabeledBody(p: *Parser) PE!Node {
         const was_home = p.element_home;
         p.element_home = .other;
         defer p.element_home = was_home;
@@ -2145,7 +2225,7 @@ const Parser = struct {
                 // (`declare = 1`) would be a key on a program that has no
                 // modifier in it at all.
                 if (!p.peekNewline(1) and declareIsModifier(p.peekTag(1)) and
-                    p.ambient and p.element_home == .module_block and p.spec == 0)
+                    p.ambient and p.element_home.moduleBlock() and p.spec == 0)
                 {
                     try p.errAtCur(.declare_in_ambient_context);
                 }
@@ -2351,7 +2431,7 @@ const Parser = struct {
         // outside — a function nested in it starts its own slice of the stack.
         try p.labels.append(p.gpa, label | (if (p.labelTargetsIteration()) label_on_iteration else 0));
         defer p.labels.shrinkRetainingCapacity(p.labels.items.len - 1);
-        const body = try p.parseSubstatement();
+        const body = try p.parseLabeledBody();
         if (isDeclarationTag(p.nodes.items(.tag)[body])) {
             try p.errAtToken(.label_not_allowed, label);
         }
@@ -2605,6 +2685,30 @@ const Parser = struct {
     }
 
     fn parseVarStatement(p: *Parser) PE!Node {
+        // TS1156 for `if (c) let x = 1;`, reported on the keyword — which is
+        // also the text `{0}` interpolates, so `errAtCur` needs no argument
+        // span. Only the STATEMENT form: a `for (let i = 0; …)` head reaches
+        // `parseVarDecl` directly, and its `let` is a head binding rather than
+        // a substatement. `var` is exempt (it hoists out of the position
+        // anyway) and so is `const enum`, a declaration of another kind
+        // entirely; `using` is NOT (measured — tsgo reports it, worded for the
+        // `using`). An `await using` reaches here on its `await` and is left
+        // alone: tsc words that one "'await using' declarations", which no
+        // single token spells.
+        //
+        // A MODIFIER run in front of the statement takes the report away, and
+        // only here: `checkVariableStatement` chains
+        // `!checkGrammarModifiers(node) && !checkGrammarVariableDeclarationList(…)`
+        // before reaching `checkGrammarForDisallowedBlockScopedVariableStatement`,
+        // so `if (c) export const x;` is the TS1184 alone — while
+        // `checkTypeAliasDeclaration` and `checkInterfaceDeclaration` run their
+        // grammar check unconditionally and answer BOTH (all three measured).
+        if (p.substatement and p.spec == 0 and
+            !isStatementModifier(p.tokTagAt(p.lastIdx()))) switch (p.curTag()) {
+            .keyword_let, .keyword_using => try p.errAtCur(.decl_only_in_block),
+            .keyword_const => if (p.peekTag(1) != .keyword_enum) try p.errAtCur(.decl_only_in_block),
+            else => {},
+        };
         const node = try p.parseVarDecl(false);
         try p.checkDestructuringInitializers(node);
         try p.expectSemicolon();
@@ -4309,6 +4413,38 @@ const Parser = struct {
     /// member by member (`decorator_target.zig`).
     const ClassForm = enum { declaration, expression };
 
+    /// The first token of the declaration `kw` heads — tsc's
+    /// `grammarErrorOnFirstToken(node)`, which starts at the node's `pos` and so
+    /// covers the MODIFIER LIST. Null when the run holds `default`, whose
+    /// presence is what the one caller (TS1211) is asking about.
+    ///
+    /// A backward scan rather than a threaded parameter: the modifiers of a
+    /// class declaration are consumed by three different callers (`parseStatement`
+    /// for `abstract`, its `declare` arm, and `parseExportStatement` for the
+    /// `export` that wraps either), and each of them would have to carry the
+    /// token down through `parseStatementUnchecked` to hand it over. The tokens
+    /// are adjacent in the stream — a modifier list admits no trivia that is not
+    /// trivia — so reading them back costs one bounded loop on an error path.
+    fn declModifiersStart(p: *const Parser, kw: u32) ?u32 {
+        var t = kw;
+        while (t > 0) {
+            if (p.tok_tags.items[t - 1] == .keyword_default) return null;
+            if (!isStatementModifier(p.tok_tags.items[t - 1])) break;
+            t -= 1;
+        }
+        return t;
+    }
+
+    /// A modifier a STATEMENT-position declaration can carry — the run
+    /// `declModifiersStart` walks back over, and the one whose presence a
+    /// variable statement's TS1156 defers to.
+    fn isStatementModifier(tag: TokTag) bool {
+        return switch (tag) {
+            .keyword_export, .keyword_declare, .keyword_abstract, .keyword_default => true,
+            else => false,
+        };
+    }
+
     fn parseClassDecl(p: *Parser, flags_in: u32, form: ClassForm) PE!Node {
         const kw = try p.bump(); // `class`
         // From here to the closing `}` everything is INSIDE the class node, and
@@ -4330,6 +4466,11 @@ const Parser = struct {
             try p.checkAwaitReservedName();
             try p.checkStrictReserved();
             name_tok = try p.bump();
+        }
+        // TS1211, tsc's `checkClassDeclaration`: a class DECLARATION with no
+        // name needs the `default` modifier to stand for one.
+        if (form == .declaration and name_tok == 0) {
+            if (declModifiersStart(p, kw)) |first| try p.errAtToken(.class_decl_needs_name, first);
         }
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
         if (p.atLt()) tp = try p.parseTypeParams(.class);
@@ -4685,7 +4826,7 @@ const Parser = struct {
             return .{
                 .l_bracket = lb,
                 .name_tok = p.nodeMainTokenAt(expr),
-                .flags = 0,
+                .flags = ast.Flags.computed_lit,
                 .key = null_node,
                 .non_bindable = false,
             };
@@ -5208,6 +5349,9 @@ const Parser = struct {
     fn parseInterfaceDecl(p: *Parser, flags: u32) PE!Node {
         const kw = try p.bump(); // `interface`
         const name_tok = try p.expectIdentLike();
+        // TS1156 for `if (c) interface I { … }` — on the NAME, as the type
+        // alias arm is.
+        if (p.substatement and p.spec == 0) try p.errAtTokenArg(.decl_only_in_block, name_tok, kw);
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
         if (p.atLt()) tp = try p.parseTypeParams(.type_decl);
         var ext: ast.SubRange = .{ .start = 0, .end = 0 };
@@ -5412,6 +5556,9 @@ const Parser = struct {
         // (`typeAliasDeclareKeywordNewlines` still declares `T1`).
         if (p.nlBefore()) try p.fail(.line_break_before_alias_name);
         const name_tok = try p.expectIdentLike();
+        // TS1156 for `if (c) type T = X;`. tsc anchors this arm on the NAME
+        // (measured), unlike the `let`/`const` one, which takes the keyword.
+        if (p.substatement and p.spec == 0) try p.errAtTokenArg(.decl_only_in_block, name_tok, kw);
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
         if (p.atLt()) tp = try p.parseTypeParams(.type_decl);
         _ = try p.expect(.eq, .expected_eq);
@@ -5558,7 +5705,7 @@ const Parser = struct {
         defer p.ambient = was_ambient;
         // A namespace block IS a module body however deeply it is nested.
         const was_home = p.element_home;
-        p.element_home = .module_block;
+        p.element_home = .namespace_block;
         defer p.element_home = was_home;
         return p.parseNamespaceName(kw, flags, false);
     }
@@ -5643,8 +5790,10 @@ const Parser = struct {
         const was_ambient = p.ambient;
         p.ambient = was_ambient or declared;
         defer p.ambient = was_ambient;
+        // Modeled as a global augmentation (see the doc comment), which is one
+        // of the two shapes `isAmbientModule` answers true for.
         const was_home = p.element_home;
-        p.element_home = .module_block;
+        p.element_home = .ambient_module_block;
         defer p.element_home = was_home;
         try p.parseStatementList(top, .r_brace, false);
         _ = try p.expect(.r_brace, .expected_r_brace);
@@ -5691,7 +5840,7 @@ const Parser = struct {
         defer p.ambient = was_ambient;
         // A module block IS a module body however deeply it is nested.
         const was_home = p.element_home;
-        p.element_home = .module_block;
+        p.element_home = .ambient_module_block;
         defer p.element_home = was_home;
         try p.parseStatementList(top, .r_brace, false);
         _ = try p.expect(.r_brace, .expected_r_brace);
@@ -5770,7 +5919,7 @@ const Parser = struct {
         defer p.ambient = was_ambient;
         // A module block IS a module body however deeply it is nested.
         const was_home = p.element_home;
-        p.element_home = .module_block;
+        p.element_home = .ambient_module_block;
         defer p.element_home = was_home;
         try p.parseStatementList(top, .r_brace, false);
         _ = try p.expect(.r_brace, .expected_r_brace);
@@ -6202,7 +6351,24 @@ const Parser = struct {
         try p.eatStatementModifiers();
         switch (p.curTag()) {
             .keyword_default => {
-                _ = try p.bump();
+                const default_tok = try p.bump();
+                // TS1319: a default export inside a NAMESPACE body. tsc splits
+                // the report between two passes and they anchor differently —
+                // `checkGrammarModifiers` blames the `default` MODIFIER of a
+                // declaration, while `checkExportAssignment` blames the whole
+                // `export default <expr>;` statement, which starts at `export`.
+                // An ambient module declaration (`declare module "m"`,
+                // `declare global`) is exempt: `isAmbientModule`.
+                const home_is_namespace = p.element_home == .namespace_block;
+                const decl_form = switch (p.curTag()) {
+                    .keyword_function, .keyword_class, .keyword_interface => true,
+                    .keyword_async => p.peekTag(1) == .keyword_function and !p.peekNewline(1),
+                    .keyword_abstract => p.peekTag(1) == .keyword_class,
+                    else => false,
+                };
+                if (home_is_namespace) {
+                    try p.errAtToken(.default_export_needs_esm, if (decl_form) default_tok else kw);
+                }
                 const inner = switch (p.curTag()) {
                     // `export default function (…) {…}` may be anonymous.
                     .keyword_function => try p.parseFunctionDeclNamed(0, false, true),
@@ -7310,7 +7476,15 @@ const Parser = struct {
             } else {
                 try p.pushScratch(try p.parseAssignExpr(.{}));
             }
-            if (try p.eat(.comma) == null and p.curTag() != .r_paren) {
+            // `;` terminates the list here for the same reason it does at the
+            // top of the loop — `isListTerminator(ArgumentExpressions)` answers
+            // it — so `foo(1;` is the one "')' expected" the missing paren
+            // earns, not a "',' expected" standing in front of it. (Same
+            // position and same TS1005 either way, so the suite's keys do not
+            // move; the MESSAGE was wrong.)
+            if (try p.eat(.comma) == null and
+                p.curTag() != .r_paren and p.curTag() != .semicolon)
+            {
                 try p.fail(.expected_comma);
                 // tsc's `parseDelimitedList` does not give up on the list
                 // here. It re-asks `isListElement` at the top of the next

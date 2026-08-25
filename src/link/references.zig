@@ -15,6 +15,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const resolve = @import("resolve.zig");
 const paths = @import("paths.zig");
+const reference_pragma = @import("../frontend/reference_pragma.zig");
 
 const Error = Allocator.Error;
 const dirnamePart = paths.dirnamePart;
@@ -24,7 +25,7 @@ const Fs = resolve.Fs;
 /// A `/// <reference path=… />` / `<reference types=… />` directive; `spec`
 /// slices into the source. `lib=` references are ignored (built-in libs).
 pub const RefDirective = struct {
-    pub const Kind = enum { path, types };
+    pub const Kind = reference_pragma.Kind;
 
     kind: Kind,
     spec: []const u8,
@@ -36,72 +37,31 @@ pub const RefDirective = struct {
 };
 
 /// Scan the leading `///`-comment block of `src` for reference directives.
-/// tsc only honors them before the first token, so scanning stops at the
-/// first non-trivia character. Slices into `src` (no allocation of text).
+/// tsc only honors them before the first token, so scanning stops at the first
+/// non-trivia character (`reference_pragma.leading`). Slices into `src` (no
+/// allocation of text).
+///
+/// The directives that name NOTHING resolvable are the parser's business, not
+/// this one's: `reference_pragma.Verdict.invalid` is TS1084, a syntactic
+/// diagnostic, and it is filed where the file is parsed.
 pub fn scanReferences(alloc: Allocator, src: []const u8) Error![]RefDirective {
     var out: std.ArrayList(RefDirective) = .empty;
-    var i: usize = 0;
-    while (i < src.len) {
-        while (i < src.len and (src[i] == ' ' or src[i] == '\t' or src[i] == '\r' or src[i] == '\n')) i += 1;
-        if (i + 1 < src.len and src[i] == '/' and src[i + 1] == '/') {
-            const start = i;
-            while (i < src.len and src[i] != '\n') i += 1;
-            const line = src[start..i];
-            // Triple-slash only.
-            if (line.len >= 3 and line[2] == '/') {
-                if (parseReference(line[3..])) |d| {
-                    // `spec` is always a subslice of `src` (the scanner never
-                    // copies), so its byte offset is a pointer difference —
-                    // the anchor a directive diagnostic (TS2688) reports at.
-                    var with_pos = d;
-                    with_pos.pos = @intCast(@intFromPtr(d.spec.ptr) - @intFromPtr(src.ptr));
-                    try out.append(alloc, with_pos);
-                }
-            }
-            continue;
-        }
-        if (i + 1 < src.len and src[i] == '/' and src[i + 1] == '*') {
-            i += 2;
-            while (i + 1 < src.len and !(src[i] == '*' and src[i + 1] == '/')) i += 1;
-            i = if (i + 1 < src.len) i + 2 else src.len;
-            continue;
-        }
-        break; // first real token — directives must precede it
+    var it = reference_pragma.leading(src);
+    while (it.next()) |c| {
+        const d = switch (reference_pragma.read(c.body)) {
+            .directive => |d| d,
+            else => continue,
+        };
+        // `spec` is always a subslice of `src` (the scan never copies), so its
+        // byte offset is a pointer difference — the anchor a directive
+        // diagnostic (TS2688) reports at.
+        try out.append(alloc, .{
+            .kind = d.kind,
+            .spec = d.spec,
+            .pos = @intCast(@intFromPtr(d.spec.ptr) - @intFromPtr(src.ptr)),
+        });
     }
     return out.toOwnedSlice(alloc);
-}
-
-/// Parse the body of a `///` comment (text after the three slashes) into a
-/// reference directive, or null if it is not `<reference path|types=…/>`.
-fn parseReference(body: []const u8) ?RefDirective {
-    var s = body;
-    while (s.len > 0 and (s[0] == ' ' or s[0] == '\t')) s = s[1..];
-    if (!std.mem.startsWith(u8, s, "<reference")) return null;
-    if (attrValue(s, "path")) |v| return .{ .kind = .path, .spec = v };
-    if (attrValue(s, "types")) |v| return .{ .kind = .types, .spec = v };
-    return null;
-}
-
-/// Value of a `key="…"` / `key='…'` attribute in `s`, or null.
-fn attrValue(s: []const u8, key: []const u8) ?[]const u8 {
-    var from: usize = 0;
-    while (std.mem.indexOfPos(u8, s, from, key)) |at| {
-        var k = at + key.len;
-        while (k < s.len and (s[k] == ' ' or s[k] == '\t')) k += 1;
-        if (k < s.len and s[k] == '=') {
-            k += 1;
-            while (k < s.len and (s[k] == ' ' or s[k] == '\t')) k += 1;
-            if (k < s.len and (s[k] == '"' or s[k] == '\'')) {
-                const q = s[k];
-                k += 1;
-                const vstart = k;
-                while (k < s.len and s[k] != q) k += 1;
-                if (k < s.len) return s[vstart..k];
-            }
-        }
-        from = at + key.len;
-    }
-    return null;
 }
 
 /// Resolve a reference directive to a file path (owned by `alloc`), or null.

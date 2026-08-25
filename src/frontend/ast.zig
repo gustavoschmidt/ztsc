@@ -80,6 +80,15 @@ pub const Flags = struct {
     pub const computed_sym: u32 = 1 << 22; // `[k]` computed key naming a const `unique symbol` (main_token = the key identifier)
     pub const computed_sym_qual: u32 = 1 << 23; // qualified `[a.b]` computed key (with computed_sym; main_token = the member identifier, object identifier at main_token - 2)
     pub const computed_expr: u32 = 1 << 24; // `[expr]` computed key that names NOTHING (main_token = the `[`; the key expression is in `Ast.computedKey`)
+    /// `["foo"]` / `[1]`: a computed key whose expression is a string or
+    /// numeric literal. tsc's `getDeclarationName` hands such a member the
+    /// literal's text, so it declares an ORDINARY member and none of the
+    /// computed-name machinery applies to it — which is why the bit sits
+    /// outside every `computed | computed_sym` test. What it still records is
+    /// that the member's NAME NODE is a `ComputedPropertyName` starting at the
+    /// `[`, and tsc positions a declaration-name diagnostic on that node
+    /// (`dupDiagTok`).
+    pub const computed_lit: u32 = 1 << 25;
 };
 
 /// A member's retained computed key: `member` is the class/type member node,
