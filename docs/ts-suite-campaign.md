@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-26, post wave 39)
+## Standings (2026-08-26, post wave 40)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7727 / 8641 (89.5%)** |
-| excess keys (false positives) | 3541 | 1237 |
-| missing keys (under-reports) | 8617 | 2283 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7776 / 8641 (90.0%)** |
+| excess keys (false positives) | 3541 | 1179 |
+| missing keys (under-reports) | 8617 | 2191 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Thirty-nine waves landed (3–39), every one with ZERO match→non-match regressions in
+Forty waves landed (3–40), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -680,7 +680,83 @@ NOTE: D's branch claimed bucketed 0 but the combined sweep shows 5 —
 reconcile. .gitignore now covers the tsgo node_modules SYMLINK (three
 recurrences of committing it).
 
-## Ranked next queue (wave 40) — distilled from wave-39 agent reports
+Wave 40 (+49 exact → 7776/8641 — 90.0% CROSSED; BUCKETED NOW 0 — every
+corpus case scored): D landed the heritage-clause family — parse EVERY
+extends/implements clause as a list, keep what tsc's checker keeps,
+refuse duplicates by grammar (TS1172-75, TS1097; 12 of 24 TS1434 cases
+died), plus export-type-star cancellation (type_only_from_star cleared
+by a later plain star) and new.<name>/clause-less-import parses; the 5
+bucketed cases resolved (4 exact). A measured the late-binding pass at
+~2 cases and DESCOPED it (mechanism recorded: hasNonBindableDynamicName
+skips declareSymbol entirely — needs binder diagnostic deferral;
+overloadSiblingDiag needs key-TYPE identity and can only land with the
+deferral), then took census wins instead: "did you mean" trio (+9),
+TS7009 (+4), element-access tuple-index forms shared with keyof (+3),
+TS2662/2663/2576/TS2564 halves; landed D's implements-after-failed-
+extends handoff. B fixed merged-interface type-param constraints (tsc
+binds ONE symbol across blocks; first extends clause wins), admitted
+bare free type args behind the cond_true screen (79 FPs without it, 0
+with), .array/.tuple constraint sets, null/undefined overlap, and the
+FPs the gate exposed (mapped numeric keys re-minted as string literals;
+void-target arm ahead of the type-variable arm); found and fixed its
+own +3.6% drizzle blocker with a tp_list_cache memo (byte-identical
+sweep). C fixed generator contextual typing (widenToContext for Y,
+inferredNextType for N), aligned the same-alias pairing to
+unconditional with variance direction (the .object-arm version cost
+5.3% drizzle — measuredVariances is a measurement, not a lookup),
+iterator-arity protocol filter. MEASUREMENT: macOS /usr/bin/time
+reports only the last reaped child — sum individually-timed runs.
+
+## Ranked next queue (wave 41) — distilled from wave-40 agent reports
+
+1. Per-position CONTRAVARIANT parameter candidates (B's full diagnosis,
+   assignmentCompatWithGenericCallSignatures2): instantiateSigInContext
+   Of unions a source param's candidates across positions; tsc infers
+   param positions contravariantly and closes with getCommonSubtype
+   (reduceLeft, first unless later is subtype). Faithful fix:
+   per-position candidate slots in applyToParameterTypes reduced by
+   common-subtype. Reduced witness in B40's report. High-risk, own
+   sweep (infer.zig mechanics + assign.zig caller).
+2. templateLiteralTypes5:14:7: TypeMap[T2] → TypeMap[`${T2}`] must
+   REJECT because T2 is not assignable to `${T2}` (index types must
+   relate; template.zig placeholder-over-constrained-param equivalence
+   is wrong).
+3. mappedTypeInferenceFromApparentType:14:1: mapped-vs-mapped template
+   relation must reduce Obj[K] vs U[K] → Obj vs U and reject ("U could
+   be instantiated with an arbitrary type").
+4. indexedAccessRelation:17:25: an intersection-object indexed access
+   drops non-key-holding constituents — must keep S["a"] & (T |
+   undefined).
+5. asyncImportedPromise_es5/es6 (one root): async method with a
+   Promise-SUBCLASS return annotation (Task<T>) + bare `return;`
+   (signatures/stmts).
+6. mergedDeclarations7: `export =` + named import of a property
+   (link/modules).
+7. intersectionsAndOptionalProperties:28:7 FP: `number[] &
+   [number, ...number[]]` source → `[number, ...number[]]` target must
+   succeed on the identical constituent.
+8. reservedWords2 (now the only ex-bucketed non-match): excess 13:19
+   TS1138 + 7:16 TS1109 — cheap parser rules.
+9. iteratorExtraParameters last key: TS2488 on g(...iter) —
+   calls.zig spreadArgTypes files an opaque error_type; wants
+   forOfElementType with the operand as blame, but measure the
+   cascade first (the silence may be deliberate).
+10. Small codes: TS1257 + TS2574 (flips restTupleElements1); TS2449;
+    TS2708 ×2; const-enum element access branch (TS2339 at index vs
+    TS7053); TS2449.
+11. Blocked/architecture (recorded, do not re-derive): TS7023 needs a
+    return-type-demand re-entry hook (value-based cache has none);
+    late-binding pass ~2 cases (deprioritized); coAndContraVariant
+    Inferences5/6 (internal union ordering); destructuringFromUnion
+    Spread (distribute spread-of-union, app-risky);
+    genericIndexedAccessVariance…:26:1 (alias-variance RELATION rule —
+    needs alias identity at the relation, B's file, still blocked on
+    ref policy).
+12. Census: TS2322 one-keys (20 under / 12 excess); TS7006 excess
+    pool (58); TS2304 48/69; TS7053 19/33; substitution types;
+    resolution-mode attributes.
+
+## Superseded queue (wave 40, kept for context)
 
 1. CHECKER-SIDE LATE BINDING for computed names (A's + D's handoffs
    converge): tsc's binder gives every dynamic name an anonymous
