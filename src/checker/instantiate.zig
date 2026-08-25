@@ -174,14 +174,29 @@ pub fn aliasInstance(c: *Checker, sym: SymbolId, args: []const TypeId, tok: Toke
     // and it is enough, because neither app needs more.
     // =======================================================================
     if ((c.alias_self_recursive.contains(sym) and originTaggable(c.ts.kind(generic))) or
-        (c.alias_recursive.contains(sym) and c.ts.kind(generic) == .intersection))
+        (c.alias_recursive.contains(sym) and c.ts.kind(generic) == .intersection) or
+        (c.opts.alias_refs and fixed.len > 0 and aliasIdentityKeepable(c, generic)))
     {
         return c.ts.makeRef(sym, fixed);
     }
     var tps: std.ArrayList(TypeParamInfo) = .empty;
     defer tps.deinit(c.scratch());
     try c.typeParamsOf(sym, &tps);
-    if (tps.items.len == 0) return generic;
+    if (tps.items.len == 0) {
+        // A NON-generic alias over a kept alias ref (`type C = T<A>`) takes the
+        // inner alias's IDENTITY when it keeps the inner spelling, and that is
+        // the wrong identity: tsc gives `C` its own `aliasSymbol` with NO
+        // `aliasTypeArguments`, and the variance shortcut is guarded on
+        // `source.aliasTypeArguments` being present — so `c = d` over
+        // `type C = T<A>` / `type D = T<B>` is compared STRUCTURALLY while
+        // `b = a` over `T<A>` / `T<B>` is not (oracle: tsgo 7.0.2 reports only
+        // the latter). ztsc cannot spell "identity C, no arguments" — a
+        // zero-argument ref would just defer the same wrong comparison one hop
+        // down — so drop to the structure, which is what this arm answered
+        // before the alias-ref policy existed.
+        if (c.opts.alias_refs and keptAliasRef(c, generic)) return resolveStructural(c, generic);
+        return generic;
+    }
     var map = try c.scratch().alloc(TpMap, tps.items.len);
     for (tps.items, 0..) |tp, i| map[i] = .{ .sym = tp.sym, .ty = fixed[i] };
     const result = try c.instantiate(generic, map);
@@ -197,6 +212,34 @@ pub fn aliasInstance(c: *Checker, sym: SymbolId, args: []const TypeId, tok: Toke
     // it against a two-step re-instantiation of the same alias object.
     if (originTaggable(c.ts.kind(reduced))) try c.origin.put(c.cm(), reduced, orig);
     return reduced;
+}
+
+/// Is `generic` an alias body whose instantiation can carry the alias's own
+/// identity as `ref(alias, args)` — the `--alias-refs` policy's admission test?
+///
+/// `originTaggable` is the set the `origin` machinery already treats as "a ref
+/// and its materialization are interchangeable" (object / function /
+/// intersection / mapped). A UNION body is deliberately not in it: a `.ref`
+/// standing in for a union is NOT interchangeable, because discriminant
+/// narrowing and the union-source relation arms switch on `.union_type`
+/// directly. Nor is a CONDITIONAL: deferring a conditional body behind a ref is
+/// the shape wave 30 measured at +12.8% on drizzle.
+///
+/// The one addition is a body that is ITSELF a kept alias ref — `type T<X> =
+/// Pick<X, 'x'>`, whose body materializes to `ref(Pick, [X, 'x'])` under this
+/// same policy. Without it the chain breaks at the first wrapper: `T<A>` would
+/// instantiate to `ref(Pick, [A, 'x'])` and compare against `ref(Pick, [B,
+/// 'x'])` under `Pick`'s variance, which reports the same failure one alias too
+/// low — and would then also fire on `type C = T<A>` / `type D = T<B>`, where
+/// the oracle reports nothing.
+fn aliasIdentityKeepable(c: *Checker, generic: TypeId) bool {
+    return originTaggable(c.ts.kind(generic)) or keptAliasRef(c, generic);
+}
+
+/// Is `t` a `ref` to a type ALIAS — i.e. a spelling only the alias-ref policy
+/// (or the cycle arms) can have produced?
+fn keptAliasRef(c: *Checker, t: TypeId) bool {
+    return c.ts.kind(t) == .ref and c.symFlags(c.ts.refSymbol(t)).type_alias;
 }
 
 pub fn aliasGeneric(c: *Checker, sym: SymbolId) Error!TypeId {

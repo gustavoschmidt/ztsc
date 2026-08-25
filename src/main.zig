@@ -104,6 +104,12 @@ const usage =
     \\  --eager-members        materialize every interface/class member table
     \\                         whole, instead of member-by-member on demand
     \\                         (bisect leg / oracle)
+    \\  --alias-refs           keep ref(alias, args) as the spelling for every
+    \\                         generic alias instantiation, so alias identity
+    \\                         survives structural interning (bisect leg)
+    \\  --variance-decides     believe a complete measured-variance comparison
+    \\                         in both directions, with no structural fallback
+    \\                         (bisect leg)
     \\  -h, --help             print this help and exit
     \\  --version              print version and exit
     \\
@@ -167,6 +173,17 @@ const Cli = struct {
     /// movement the route causes is visible as a key-set diff against this
     /// flag in the same binary.
     eager_members: bool = false,
+    /// `--alias-refs`: keep `ref(alias, args)` as the spelling for every
+    /// generic alias instantiation whose body is `originTaggable`, so alias
+    /// identity survives structural interning (see
+    /// `checker.Options.alias_refs`). A bisect leg.
+    alias_refs: bool = false,
+    /// `--variance-decides`: believe a complete measured-variance comparison in
+    /// both directions (see `checker.Options.variance_decides`). A bisect leg.
+    variance_decides: bool = false,
+    /// `--alias-variance-decides`: the same, restricted to type ALIAS pairs
+    /// (see `checker.Options.alias_variance_decides`). A bisect leg.
+    alias_variance_decides: bool = false,
     /// `--lazy-stats`: dump the lazy relation route.s hit/bail tally to stderr
     /// at seal. A diagnostic instrument; pair with `--checkers=1`.
     lazy_stats: bool = false,
@@ -410,6 +427,9 @@ pub fn main(init: std.process.Init) !void {
         .decl_prof = cli.decl_profile or cli.dup_profile,
         .dup_prof = cli.dup_profile,
         .lazy_members = !cli.eager_members,
+        .alias_refs = cli.alias_refs,
+        .variance_decides = cli.variance_decides,
+        .alias_variance_decides = cli.alias_variance_decides,
         .lazy_stats = cli.lazy_stats,
         .mem_prof = cli.mem_profile,
         .inst_memo_bits = cli.inst_memo_bits,
@@ -1241,6 +1261,12 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8) error{OutOfMe
             cli.inst_profile = true;
         } else if (std.mem.eql(u8, arg, "--eager-members")) {
             cli.eager_members = true;
+        } else if (std.mem.eql(u8, arg, "--alias-refs")) {
+            cli.alias_refs = true;
+        } else if (std.mem.eql(u8, arg, "--variance-decides")) {
+            cli.variance_decides = true;
+        } else if (std.mem.eql(u8, arg, "--alias-variance-decides")) {
+            cli.alias_variance_decides = true;
         } else if (std.mem.eql(u8, arg, "--decl-profile")) {
             cli.decl_profile = true;
         } else if (std.mem.eql(u8, arg, "--mem-profile")) {

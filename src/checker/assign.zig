@@ -1684,7 +1684,22 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!RelAnswer {
                     if (!c.marker_refs.contains(sref) and !c.marker_refs.contains(tref)) {
                         switch (try c.measuredVarianceVerdict(sref, tref)) {
                             .related => break :blk .yes,
-                            .unrelated => if (measured_variance_decides) break :blk .no,
+                            // ALIAS-REF BISECT LEG (see
+                            // `checker.Options.alias_variance_decides`): tsc runs
+                            // the decisive comparison over an alias pair from a
+                            // DIFFERENT site than over a type-reference pair — the
+                            // `source.aliasSymbol === target.aliasSymbol` shortcut
+                            // at the top of `structuredTypeRelatedTo`, ahead of
+                            // every structural arm — and ztsc's own measurement is
+                            // trustworthy on the alias population in a way
+                            // 60f4287 measured it is not on the interface/class
+                            // one (zod v4's `ZodType` family). So the two are
+                            // separately switchable.
+                            .unrelated => if (measured_variance_decides or c.opts.variance_decides or
+                                (c.opts.alias_variance_decides and c.symFlags(c.ts.refSymbol(sref)).type_alias))
+                            {
+                                break :blk .no;
+                            },
                             .undecided => {},
                         }
                     }
