@@ -3765,7 +3765,15 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                 try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = mt });
             },
             .spread_element => {
-                const raw = try c.checkExprCached(pd.lhs, types.no_type);
+                // tsc's `getContextualType` steps STRAIGHT THROUGH a spread
+                // assignment (`case SyntaxKind.SpreadAssignment: return
+                // getContextualType(parent.parent, contextFlags)`), so the
+                // operand is contextually typed by the CONTAINING literal's
+                // own context. Without it `i = { ...{ a: "a" } }` typed the
+                // inner literal with nothing, widened `a` to `string`, and
+                // reported a TS2322 against `interface I { a: "a" }`
+                // (`contextualTypeObjectSpreadExpression`).
+                const raw = try c.checkExprCached(pd.lhs, ctx);
                 var src = raw;
                 for (dist) |d| {
                     if (d.node == prop) {
