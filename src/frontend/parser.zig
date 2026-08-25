@@ -410,6 +410,15 @@ const Parser = struct {
     /// `externalModuleIndicator`, for TS1214. Only known once the whole file is
     /// parsed, so the diagnostics are recorded as TS1212 and rewritten in
     /// `sealInto`.
+    ///
+    /// TOP-LEVEL is the whole content of the word: tsc's
+    /// `isFileProbablyExternalModule` is `forEach(sourceFile.statements,
+    /// isAnExternalModuleIndicatorNode)` — the file's OWN statement list, not a
+    /// walk. So `namespace M { export function f() {…} }` is a script, and
+    /// `var arguments = []` inside it answers TS1100 ("in strict mode") rather
+    /// than TS1215 ("Modules are automatically in strict mode") — measured,
+    /// `alwaysStrictModule`/`alwaysStrictModule2`. Hence the `element_home`
+    /// guard on both writers.
     saw_module_syntax: bool = false,
     /// How many `with` bodies enclose the statement being parsed. A cheap
     /// stand-in for tsc's "the checker never descends here" — see `addDiag`.
@@ -6099,7 +6108,7 @@ const Parser = struct {
             return p.parseExpressionStatement();
         }
         const kw = try p.bump(); // `import`
-        p.saw_module_syntax = true;
+        if (p.element_home == .source_file) p.saw_module_syntax = true;
         // `Flags.exported` deliberately NOT set on the ES6 form: the binder reads
         // only `type_only` out of `ImportData.flags`, and whether tsc's
         // `export import { a } from "m"` really re-exports `a` (the family's
@@ -6243,7 +6252,7 @@ const Parser = struct {
         if (bare_specifier) {
             _ = try p.parseExpression(.{});
         } else if (try p.eat(.keyword_from) != null) {
-            mod = try p.expect(.string_literal, .expected_string_literal);
+            mod = try p.parseModuleSpecifier();
         } else if (default_name != 0 or ns_name != 0 or specs.start != specs.end) {
             try p.fail(.expected_from);
             // tsc's `parseModuleSpecifier` runs whether or not `parseExpected`
@@ -6316,7 +6325,7 @@ const Parser = struct {
         if (isIdentLike(p.curTag()) and std.mem.eql(u8, p.laText(0), "require") and p.peekTag(1) == .l_paren) {
             _ = try p.bump(); // require
             _ = try p.expect(.l_paren, .expected_l_paren);
-            module_token = try p.expect(.string_literal, .expected_string_literal);
+            module_token = try p.parseModuleSpecifier();
             _ = try p.expect(.r_paren, .expected_r_paren);
         } else if (isIdentLike(p.curTag())) {
             entity = try p.parseEntityName();
@@ -6341,11 +6350,61 @@ const Parser = struct {
         return p.addNode(.{ .tag = .import_equals, .main_token = anchor_kw, .data = .{ .lhs = extra, .rhs = 0 } });
     }
 
+    /// The one token `isListElement(ImportOrExportSpecifiers)` refuses even
+    /// though it is a perfectly good specifier name:
+    ///
+    ///     // bail out if the next token is [FromKeyword StringLiteral].
+    ///     // That means we're in something like `import { from "mod"`. Stop
+    ///     // here to give better error message.
+    ///     if (token() === FromKeyword && lookAhead(nextTokenIsStringLiteral))
+    ///         return false;
+    ///
+    /// The clause is over, so the `}` that never came is the whole complaint —
+    /// tsc even special-cases the list's own message for it
+    /// (`parsingContextErrors`: a `from` there answers "'}' expected" rather
+    /// than TS1003), and the `parseExpected(CloseBraceToken)` behind it repeats
+    /// that at the same position and is dropped. Reading `from` as a specifier
+    /// instead left the module specifier to be re-read as a statement, which is
+    /// two extra TS1005s per file (unclosedExportClause01/02). No line-break
+    /// condition: `lookAhead` does not have one.
+    fn unclosedSpecifierList(p: *Parser) bool {
+        return p.curTag() == .keyword_from and p.peekTag(1) == .string_literal;
+    }
+
+    /// tsc's `parseModuleSpecifier`. A string literal when there is one, and
+    /// otherwise:
+    ///
+    ///     // We allow arbitrary expressions here, even though the grammar only
+    ///     // allows string literals. We check to ensure that it is only a
+    ///     // string literal later in the grammar check pass.
+    ///     return parseExpression();
+    ///
+    /// So a non-literal specifier is ONE grammar diagnostic (TS1141, the
+    /// checker's) and the statement still ends where it should — where refusing
+    /// to consume the expression leaves it to be re-read as a fresh statement
+    /// and adds a "';' expected" tsc never has (`namespace N { export * from
+    /// Aaa; }`, exportDeclarationInInternalModule).
+    ///
+    /// Returns 0 — the callers' "no module specifier" — when there was no
+    /// literal, which is the same answer they already give for a missing
+    /// `from`. Handing back the last consumed token instead (what `expect`
+    /// does) makes the LINKER read a `from` or a `(` as a module name and
+    /// invent a TS2307 for it; that was invisible only because the TS1005 this
+    /// replaces suppressed the whole semantic pass. The expression itself is
+    /// dropped: a specifier that is not a literal names no module.
+    fn parseModuleSpecifier(p: *Parser) PE!u32 {
+        if (p.curTag() == .string_literal) return p.bump();
+        try p.fail(.expected_string_literal);
+        if (canStartExpression(p.curTag()) and !p.nlBefore()) _ = try p.parseExpression(.{});
+        return 0;
+    }
+
     fn parseImportSpecifiers(p: *Parser) PE!ast.SubRange {
         _ = try p.expect(.l_brace, .expected_l_brace);
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
         while (p.curTag() != .r_brace and p.curTag() != .eof) {
+            if (unclosedSpecifierList(p)) break;
             const before = p.curIdx();
             var spec_flags: u32 = 0;
             // `type name` / `type name as alias` (but `type as x` and plain
@@ -6468,7 +6527,7 @@ const Parser = struct {
 
     fn parseExportStatement(p: *Parser) PE!Node {
         const kw = try p.bump(); // `export`
-        p.saw_module_syntax = true;
+        if (p.element_home == .source_file) p.saw_module_syntax = true;
         // An export assignment behind modifiers is TS1120, blamed on the
         // statement. A `declare` among them also makes it AMBIENT, which is
         // what drops the TS1203 an `export =` otherwise earns — tsc's ESM check
@@ -6571,7 +6630,7 @@ const Parser = struct {
                 var ns_name: u32 = 0;
                 if (try p.eat(.keyword_as) != null) ns_name = try p.expectModuleExportName();
                 _ = try p.expect(.keyword_from, .expected_from);
-                const mod = try p.expect(.string_literal, .expected_string_literal);
+                const mod = try p.parseModuleSpecifier();
                 try p.skipImportAttributes();
                 try p.expectSemicolon();
                 const extra = try p.addExtra(ast.ExportAll{ .flags = 0, .name_token = ns_name });
@@ -6603,7 +6662,7 @@ const Parser = struct {
                     var ns_name: u32 = 0;
                     if (try p.eat(.keyword_as) != null) ns_name = try p.expectModuleExportName();
                     _ = try p.expect(.keyword_from, .expected_from);
-                    const mod = try p.expect(.string_literal, .expected_string_literal);
+                    const mod = try p.parseModuleSpecifier();
                     try p.skipImportAttributes();
                     try p.expectSemicolon();
                     const extra = try p.addExtra(ast.ExportAll{ .flags = ast.Flags.type_only, .name_token = ns_name });
@@ -6657,6 +6716,7 @@ const Parser = struct {
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
         while (p.curTag() != .r_brace and p.curTag() != .eof) {
+            if (unclosedSpecifierList(p)) break;
             const before = p.curIdx();
             var spec_flags: u32 = 0;
             if (p.curTag() == .keyword_type) {
@@ -6695,7 +6755,7 @@ const Parser = struct {
 
         var mod: u32 = 0;
         if (try p.eat(.keyword_from) != null) {
-            mod = try p.expect(.string_literal, .expected_string_literal);
+            mod = try p.parseModuleSpecifier();
         }
         try p.skipImportAttributes();
         try p.expectSemicolon();
@@ -8606,6 +8666,31 @@ const Parser = struct {
         }
 
         var flags: u32 = 0;
+        // tsc's `parseObjectLiteralElement` opens with `parseModifiers`, so a
+        // modifier keyword in front of a property name is CONSUMED and the
+        // member behind it parses normally; `checkGrammarObjectLiteral
+        // Expression` then reports TS1042 on each one:
+        //
+        //     if (canHaveModifiers(prop) && prop.modifiers) for (const mod of …)
+        //         if (isModifier(mod) && (mod.kind !== AsyncKeyword ||
+        //             prop.kind !== MethodDeclaration))
+        //             grammarErrorOnNode(mod, _0_modifier_cannot_be_used_here, …);
+        //
+        // Refusing the word instead read it as the member's own NAME and blamed
+        // the real name behind it with "',' expected" (modifiersInObjectLiterals,
+        // objectLiteralMemberWithModifiers1). `async` is excluded here because it
+        // is the one legal spelling (on a method) and the loop below owns it —
+        // `{ async foo: 1 }` therefore under-reports its TS1042, which is where
+        // ztsc already was.
+        var first_mod: ?TokenIndex = null;
+        while (p.curTag() != .keyword_async and
+            param_modifiers.isModifierKind(p.curTag()) and
+            canFollowModifier(p.peekTag(1)))
+        {
+            const m = try p.bump();
+            if (first_mod == null) first_mod = m;
+            try p.errAtToken(.modifier_not_usable_here, m);
+        }
         // get/set/async modifiers (only when a property name follows).
         while (true) {
             const bit: u32 = switch (p.curTag()) {
@@ -8684,6 +8769,20 @@ const Parser = struct {
             },
         }
 
+        // tsc's `parseObjectLiteralElement` reads a `?` here unconditionally —
+        //
+        //     // Disallowing of optional property assignments and definite
+        //     // assignment assertion happens in the grammar checker.
+        //     const questionToken = parseOptionalToken(QuestionToken);
+        //
+        // — so `{ x?: 1 }` and `{ foo?() {} }` are ordinary members carrying one
+        // grammar error (TS1162, blamed on the `?`), not a parse derailment.
+        // ztsc stopped at the `?` instead and answered a TS1005/TS1109/TS1128
+        // cascade tsc never has (objectTypeWithOptionalProperty1,
+        // objectLiteralMemberWithQuestionMark1,
+        // spaceBeforeQuestionMarkInPropertyAssignment).
+        if (try p.eat(.question)) |q| try p.errAtToken(.object_member_optional, q);
+
         switch (p.curTag()) {
             .colon => {
                 _ = try p.bump();
@@ -8691,6 +8790,13 @@ const Parser = struct {
                 return p.addNode(.{ .tag = .object_property, .main_token = key_tok, .data = .{ .lhs = key, .rhs = value } });
             },
             .l_paren, .lt, .lt_lt => {
+                // A METHOD in an object literal reaches `checkGrammarMethod` ->
+                // `checkGrammarModifiers` as well, which blames the POSITION
+                // rather than the word and stops at its first hit — so
+                // `{ public foo() {} }` is TS1042 *and* TS1184 on the `public`,
+                // where `{ public foo: 1 }` (a property assignment, which that
+                // pass never visits) is TS1042 alone. Measured against tsgo.
+                if (first_mod) |m| try p.errAtToken(.modifiers_not_allowed_here, m);
                 // Method shorthand: value is a function_expr.
                 const saved_fn_ctx = p.fn_ctx;
                 const saved_yield_ctx = p.yield_ctx;
@@ -9440,12 +9546,54 @@ const Parser = struct {
         return p.scratchToSpan(top);
     }
 
+    /// tsc's `getArrayElementTypeNode(node) !== undefined` — the SYNTACTIC test
+    /// that separates a tuple's REST element (`...string[]`, whose length is
+    /// open) from a VARIADIC one (`...T`, whose length is whatever `T` turns out
+    /// to be). Looks through parentheses and through a one-element tuple whose
+    /// single element is itself a rest, exactly as tsc's does.
+    fn isArrayShapedTypeNode(p: *const Parser, node: Node) bool {
+        var n = node;
+        while (true) switch (p.nodeTagAt(n)) {
+            .array_type => return true,
+            .paren_type => n = p.nodeDataAt(n).lhs,
+            .tuple_type => {
+                const d = p.nodeDataAt(n);
+                if (d.rhs - d.lhs != 1) return false;
+                const only: Node = p.extra.items[d.lhs];
+                if (p.nodeTagAt(only) != .rest_type) return false;
+                n = p.nodeDataAt(only).lhs;
+            },
+            else => return false,
+        };
+    }
+
+    /// Where one tuple element stands in tsc's `checkTupleType` walk.
+    const TupleElementKind = enum { required, optional, rest, variadic };
+
     fn parseTupleType(p: *Parser) PE!Node {
         const lb = try p.bump();
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
+        // tsc's `checkTupleType` element-order walk (TS1265/TS1266/TS1257). Its
+        // three grammar rules are decided by the element FLAGS alone, and those
+        // are syntax: `...T[]` is a Rest, `...T` a Variadic, `T?` an Optional.
+        // The walk RETURNS at its first hit, so at most one is reported, and it
+        // blames the ELEMENT node — its first token, which is where each branch
+        // below starts.
+        //
+        // A VARIADIC element STOPS the walk here, because from there tsc's state
+        // is no longer syntactic: it resolves the element's type and either
+        // reports TS2574 and breaks (`!isArrayLikeType`) or sets
+        // `seenRestElement` only for an array / rest-bearing tuple. Both answers
+        // are unavailable to a parser, so the rules go quiet rather than guess —
+        // an under-report (`[...Array<string>, ...number[]]` keeps its missing
+        // TS1265), never a false positive.
+        var seen_optional = false;
+        var seen_rest = false;
+        var walk_done = false;
         while (p.curTag() != .r_bracket and p.curTag() != .eof) {
             const before = p.curIdx();
+            var elem: Node = null_node;
             if (p.curTag() == .dot_dot_dot) {
                 const dots = try p.bump();
                 // Named rest element `...name: T[]`: the label is
@@ -9455,7 +9603,7 @@ const Parser = struct {
                     _ = try p.bump(); // ':'
                 }
                 const ty = try p.parseType();
-                try p.pushScratch(try p.addNode(.{ .tag = .rest_type, .main_token = dots, .data = .{ .lhs = ty, .rhs = 0 } }));
+                elem = try p.addNode(.{ .tag = .rest_type, .main_token = dots, .data = .{ .lhs = ty, .rhs = 0 } });
             } else if (isIdentLike(p.curTag()) and
                 (p.peekTag(1) == .colon or (p.peekTag(1) == .question and p.peekTag(2) == .colon)))
             {
@@ -9468,14 +9616,37 @@ const Parser = struct {
                 _ = try p.bump(); // ':'
                 var ty = try p.parseType();
                 if (q_tok) |q| ty = try p.addNode(.{ .tag = .optional_type, .main_token = q, .data = .{ .lhs = ty, .rhs = 0 } });
-                try p.pushScratch(ty);
+                elem = ty;
             } else {
                 var ty = try p.parseTypeIn(.tuple_optional);
                 if (p.curTag() == .question) {
                     const q = try p.bump();
                     ty = try p.addNode(.{ .tag = .optional_type, .main_token = q, .data = .{ .lhs = ty, .rhs = 0 } });
                 }
-                try p.pushScratch(ty);
+                elem = ty;
+            }
+            try p.pushScratch(elem);
+            if (!walk_done) {
+                const kind: TupleElementKind = switch (p.nodeTagAt(elem)) {
+                    .rest_type => if (p.isArrayShapedTypeNode(p.nodeDataAt(elem).lhs)) .rest else .variadic,
+                    .optional_type => .optional,
+                    else => .required,
+                };
+                const code: ?Code = switch (kind) {
+                    .variadic => null,
+                    .rest => if (seen_rest) .rest_element_after_rest else null,
+                    .optional => if (seen_rest) .optional_element_after_rest else null,
+                    .required => if (seen_optional) .required_element_after_optional else null,
+                };
+                if (code) |c| {
+                    try p.errAtToken(c, before);
+                    walk_done = true;
+                } else switch (kind) {
+                    .variadic => walk_done = true,
+                    .rest => seen_rest = true,
+                    .optional => seen_optional = true,
+                    .required => {},
+                }
             }
             if (try p.eat(.comma) == null and p.curTag() != .r_bracket) {
                 try p.fail(.expected_comma);

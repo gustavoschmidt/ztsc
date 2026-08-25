@@ -306,6 +306,14 @@ pub const Code = enum(u16) {
     /// a declaration follows) and `checkGrammarModifiers` rejects it there, so
     /// the declaration itself still parses and binds normally.
     async_modifier_not_allowed_here,
+    /// TS1042 again, for the position that names whichever modifier it found:
+    /// an OBJECT LITERAL member (`var v = { public foo: 1 }`). tsc's
+    /// `parseObjectLiteralElement` opens with `parseModifiers`, so the word is
+    /// consumed and the member parses; `checkGrammarObjectLiteralExpression`
+    /// then reports on EVERY modifier it carries (`async` on a method
+    /// excepted, which is the one legal spelling). Fills `{0}` from its own
+    /// span — the modifier token it is reported on.
+    modifier_not_usable_here,
     /// TS1184: the same modifiers, but on a declaration whose statement list is
     /// NOT a module body (a function body, a plain block, a method body) — tsc
     /// stops naming the modifier there and blames the position instead.
@@ -913,6 +921,24 @@ pub const Code = enum(u16) {
     /// and a class member — and NOT in a binding pattern, where `{ 0n: f }`
     /// parses and earns the semantic TS2538 instead (measured against tsgo).
     bigint_property_name,
+    /// TS1265/TS1266/TS1257, tsc's `checkTupleType` element-order walk. Three
+    /// facts about a tuple type's element FLAGS, which are syntax: `...T[]` is a
+    /// Rest, `T?` an Optional, anything else Required. The walk returns at its
+    /// first hit, so at most one of the three ever speaks about one tuple, and
+    /// each is blamed on the offending ELEMENT. `checkTupleType` is the
+    /// checker's, so a syntax error anywhere suppresses these — measured, the
+    /// TS1257 in `optionalTupleElements1` sits beside that file's TS2322s.
+    rest_element_after_rest,
+    optional_element_after_rest,
+    required_element_after_optional,
+    /// TS1162: `var v = { x?: 1 }` — a `?` on an OBJECT LITERAL member. tsc's
+    /// parser CONSUMES the token (`parseObjectLiteralElement` keeps a
+    /// `questionToken` field on the element precisely so it can be complained
+    /// about later) and `checkGrammarObjectLiteralExpression` reports on it, so
+    /// the member itself still parses and the file keeps its semantic pass.
+    /// Reported on the `?`, and only when the member carries no modifier — tsc
+    /// writes the two as `if (modifiers) … else if (questionToken) …`.
+    object_member_optional,
     /// TS18016: `#x` as an OBJECT-LITERAL property name (`{ #x: 1 }`) or a TYPE
     /// member name (`interface I { #x: string }`) — the two property positions
     /// that are never inside a class body. tsc's `checkGrammarObjectLiteral…`
@@ -1318,6 +1344,7 @@ pub const Code = enum(u16) {
             .static_not_on_module_element,
             .readonly_not_on_property,
             .async_modifier_not_allowed_here,
+            .modifier_not_usable_here,
             .modifiers_not_allowed_here,
             // Same funnel as TS1184: `{ import "m"; }` next to a sibling file's
             // TS2322 lets the TS2322 through, and `moduleElementsInWrongContext.ts`
@@ -1383,6 +1410,13 @@ pub const Code = enum(u16) {
             // `{ 1n: 123 }` reports TS1539 next to the TS2464/TS2538 its
             // siblings earn in the same file — tsc's checker.
             .bigint_property_name,
+            // `checkTupleType`, likewise the checker's grammar pass.
+            .rest_element_after_rest,
+            .optional_element_after_rest,
+            .required_element_after_optional,
+            // `checkGrammarObjectLiteralExpression`, the same pass: measured,
+            // `var v = { x?: 1 }` beside a sibling file's TS2322 reports both.
+            .object_member_optional,
             .private_name_outside_class,
             // `using {a} = null` reports TS1492 and the TS2339 its pattern
             // earns in the same run — tsc's checker, not its parser.
@@ -1724,6 +1758,10 @@ pub const Code = enum(u16) {
             .computed_name_in_interface => "A computed property name in an interface must refer to an expression whose type is a literal type or a 'unique symbol' type.",
             .computed_name_in_type_literal => "A computed property name in a type literal must refer to an expression whose type is a literal type or a 'unique symbol' type.",
             .bigint_property_name => "A 'bigint' literal cannot be used as a property name.",
+            .object_member_optional => "An object member cannot be declared optional.",
+            .rest_element_after_rest => "A rest element cannot follow another rest element.",
+            .optional_element_after_rest => "An optional element cannot follow a rest element.",
+            .required_element_after_optional => "A required element cannot follow an optional element.",
             .private_name_outside_class => "Private identifiers are not allowed outside class bodies.",
             .private_name_in_var_decl => "Private identifiers are not allowed in variable declarations.",
             .private_name_as_param => "Private identifiers cannot be used as parameters.",
@@ -1769,6 +1807,9 @@ pub const Code = enum(u16) {
             .static_not_on_module_element => moduleElementModifierMessage("static"),
             .readonly_not_on_property => "'readonly' modifier can only appear on a property declaration or index signature.",
             .async_modifier_not_allowed_here => "'async' modifier cannot be used here.",
+            // `{0}` from its own span — the modifier token, as the
+            // reserved-word family does.
+            .modifier_not_usable_here => "'{0}' modifier cannot be used here.",
             .modifiers_not_allowed_here => "Modifiers cannot appear here.",
             .import_not_at_top_level => "An import declaration can only be used at the top level of a namespace or module.",
             .export_not_at_top_level => "An export declaration can only be used at the top level of a namespace or module.",
@@ -2127,6 +2168,10 @@ pub const Code = enum(u16) {
             .computed_name_in_interface => 1169,
             .computed_name_in_type_literal => 1170,
             .bigint_property_name => 1539,
+            .object_member_optional => 1162,
+            .rest_element_after_rest => 1265,
+            .optional_element_after_rest => 1266,
+            .required_element_after_optional => 1257,
             .private_name_outside_class => 18016,
             .private_name_in_var_decl => 18029,
             .private_name_as_param => 18009,
@@ -2202,7 +2247,7 @@ pub const Code = enum(u16) {
             .static_not_on_module_element,
             => 1044,
             .readonly_not_on_property => 1024,
-            .async_modifier_not_allowed_here => 1042,
+            .async_modifier_not_allowed_here, .modifier_not_usable_here => 1042,
             .modifiers_not_allowed_here => 1184,
             .import_not_at_top_level => 1232,
             .export_not_at_top_level => 1233,
