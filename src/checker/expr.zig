@@ -6772,11 +6772,44 @@ fn setterWriteType(c: *Checker, t0: TypeId, name: Atom, depth: u32) Error!?TypeI
     if (depth > 8) return null;
     const t = if (c.ts.kind(t0) == .this_type) c.ts.thisTypeInstance(t0) else t0;
     switch (c.ts.kind(t)) {
+        // WAVE36-A (write type): the synthesized property of a union or
+        // intersection carries its own WRITE type — tsc's
+        // `createUnionOrIntersectionProperty` collects one write type per
+        // constituent (a constituent that declares no setter contributes its
+        // READ type, which is what `getWriteTypeOfSymbol` answers there) and
+        // combines them the way it combines the read types: a UNION for a
+        // union source, an INTERSECTION for an intersection source.
+        //
+        // Answering with the first divergent constituent, as this walk used
+        // to, picked a parameter type by member ORDER: `(One | Two).prop3`
+        // took `Two`'s `string | boolean` and rejected `= 42` even though
+        // `One.prop3` is a `number` field, and `(One & Two).prop2` took
+        // `Two`'s `string | 42` and accepted `= "hello"` even though
+        // `One.prop2` is `number` (so the write type is `42`).
         .union_type, .intersection => {
-            for (c.ts.members(t)) |m| {
-                if (try setterWriteType(c, m, name, depth + 1)) |wt| return wt;
+            // `members` dangles as soon as the recursion interns anything.
+            const ms = try c.scratch().dupe(TypeId, c.ts.members(t));
+            defer c.scratch().free(ms);
+            var parts: std.ArrayList(TypeId) = .empty;
+            defer parts.deinit(c.scratch());
+            var diverged = false;
+            for (ms) |m| {
+                if (try setterWriteType(c, m, name, depth + 1)) |wt| {
+                    diverged = true;
+                    try parts.append(c.scratch(), wt);
+                } else if (try c.propOfType(m, name)) |p| {
+                    try parts.append(c.scratch(), p.ty);
+                } else {
+                    // A constituent that does not have the property at all:
+                    // the ACCESS is the error. Keep the read type.
+                    return null;
+                }
             }
-            return null;
+            if (!diverged) return null;
+            return if (c.ts.kind(t) == .union_type)
+                try c.ts.makeUnion(c.scratch(), parts.items)
+            else
+                try c.ts.makeIntersection(c.scratch(), parts.items);
         },
         .ref => {
             const sym = c.ts.refSymbol(t);
