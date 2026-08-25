@@ -5672,10 +5672,7 @@ pub fn instantiateSigInContextOf(c: *Checker, s: TypeId, t: TypeId) Error!?TypeI
         if (cand[k] == types.no_type) continue; // already the constraint
         const con = try c.typeParamConstraint(tp);
         if (con == types.no_type) continue;
-        switch (try infer_zig.clampSigInference(c, map[k].ty, try c.instantiate(con, map), pos[k], bound)) {
-            .use => |ty| map[k].ty = ty,
-            .decline => return null,
-        }
+        map[k].ty = try infer_zig.clampSigInference(c, map[k].ty, try c.instantiate(con, map), pos[k], bound) orelse return null;
     }
     const inst = try c.instantiate(s, map);
     // A full map over the source's own params yields a non-generic sig; if

@@ -2621,6 +2621,17 @@ pub const SigInferPos = enum { parameter, ret };
 /// that same partially-satisfying union candidate in a PARAMETER position and
 /// does take the whole constraint, so the position is the axis, not the shape.
 ///
+/// …and the clamp is nonetheless taken only for a bound that instantiates to a
+/// BARE TYPE PARAMETER. That is the shape ztsc's missing clone creates and the
+/// one the corpus pays for (`assignmentStricterConstraints`: `S extends T`
+/// against a target whose `S2` and `T2` are unrelated). The general clamp costs
+/// **+4% wall on zod** — measured, interleaved, medians and mins agreeing, and
+/// bisected to this line: every pair whose candidate violates a CONCRETE bound
+/// stops falling to the cheap erase path and runs a full structural relation on
+/// the clamped instantiation instead. No corpus case pays for that, so the
+/// wider rows above stay documented-but-declined; a `null` answer puts the pair
+/// back on the erase path, exactly where it was before this clamp existed.
+///
 /// `bound` is every type parameter the instantiated constraint may legitimately
 /// still name — the source signature's own and the target's, which stay free.
 /// Anything ELSE in it is a parameter of the type that DECLARED this signature,
@@ -2631,30 +2642,30 @@ pub const SigInferPos = enum { parameter, ret };
 /// off a `GrowthBook<Record<string, any>>` has parameter types with no
 /// `AppFeatures` left in them but a bound that still says `AppFeatures[K]`,
 /// where tsc's clone says `Record<string, any>[K]` — i.e. `any`, which every
-/// candidate satisfies. Clamping to the stale bound invented a `.bind`-shaped
-/// TS2345 on the social-app; declining keeps the pair on the erase path, which
-/// is where it was before this clamp existed.
+/// candidate satisfies. Such a bound is unenforceable rather than violated, so
+/// the CANDIDATE stands: clamping to the stale bound invented a `.bind`-shaped
+/// TS2345 on the social-app, and dropping the whole instantiation instead broke
+/// `nonInferrableTypePropagation2`'s `filter(exists(…))`, whose returned
+/// `<B extends A>` carries a bound over a minted parameter this pair does not
+/// bind. It is the same policy `inferTypeArgs` applies at the call seam
+/// (`bare_outer`): a constraint we cannot resolve does not get to erase an
+/// inference we can.
+/// `null` declines the whole instantiation.
 pub fn clampSigInference(
     c: *Checker,
     cand: TypeId,
     constraint: TypeId,
     pos: SigInferPos,
     bound: []const u32,
-) Error!SigClamp {
-    if (try c.isAssignable(cand, constraint)) return .{ .use = cand };
-    if (try c.containsFreeTypeParam(constraint, bound)) return .decline;
-    return .{ .use = switch (pos) {
+) Error!?TypeId {
+    if (try c.isAssignable(cand, constraint)) return cand;
+    if (try c.containsFreeTypeParam(constraint, bound)) return cand;
+    if (c.ts.kind(constraint) != .type_param) return null;
+    return switch (pos) {
         .parameter => constraint,
         .ret => (try c.clampToConstraint(cand, constraint)).ty,
-    } };
+    };
 }
-
-/// What `clampSigInference` answered for one type parameter: the type to
-/// substitute, or "no trustworthy answer", which drops the whole instantiation.
-pub const SigClamp = union(enum) {
-    use: TypeId,
-    decline,
-};
 
 /// Is this candidate one of the *literal* shapes tsc's
 /// `unionObjectAndArrayLiteralCandidates` pulls out of the covariant set —
