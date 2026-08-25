@@ -2387,16 +2387,47 @@ pub fn relIdDeeplyNested(c: *const Checker, src: bool) bool {
 /// `set(shape: T["type"] extends keyof Shapes ? Shapes[T["type"]] : D)`
 /// could not be passed on (TS2345/TS2322).
 ///
-/// Cover the shape that needs it — the branch IS the indexed access
-/// `O[check]` — by indexing with the extends type instead. Sound for a
-/// SOURCE position, which is the only caller: every instantiation has
-/// `K <: extends`, and `O[A | B]` is `O[A] | O[B]`, so `O[K] <: O[extends]`.
+/// Two shapes are covered, both sound for a SOURCE position — which is what
+/// both callers are (the relation's source arm, and the APPARENT-TYPE read in
+/// `props.zig`; tsc's substitution type reads as its intersection and writes as
+/// its base type, so a read is exactly where the widening is legal).
+///
+///   * the branch IS the indexed access `O[check]` — index with the extends
+///     type instead. Every instantiation has `K <: extends`, and `O[A | B]` is
+///     `O[A] | O[B]`, so `O[K] <: O[extends]`.
+///   * the branch IS the check type — `Extract<X, U>` (`X extends U ? X :
+///     never`) and everything shaped like it — so the substituted branch is
+///     just `X & U`. That is what gives a deferred `Extract` the members of the
+///     type it extracts TO: `deeplyNestedConstraints`' `Extract<M[K],
+///     ArrayLike<any>>` reads `array.length` off the `ArrayLike` half, where
+///     the bare `M[K]` (apparent type `number | boolean | string | number[]`,
+///     through `TypeMap<E>`'s template) has no `length` and was a TS2339.
+///     The intersection is the whole answer — no exploration of the five
+///     constraint levels the test's own comment mentions is needed for the
+///     member lookup, because the extends type already names what survives.
+///
+/// `condTrueSubstituted` is the general form of the same reading and delegates
+/// this case here, so the two cannot drift.
 pub fn condTrueUnderExtends(c: *Checker, cond: TypeId) Error!TypeId {
     const s = &c.ts;
     const tru = s.condTrue(cond);
+    const chk = s.condCheck(cond);
+    const ext = s.condExtends(cond);
+    // The same two declines `condTrueSubstituted` opens with: a check that IS
+    // the extends type, and an `any`/`unknown` bound, both intersect to
+    // nothing new.
+    if (ext != chk and tru == chk) {
+        switch (s.kind(ext)) {
+            .any, .unknown => {},
+            else => {
+                const sub = try s.makeIntersection(c.scratch(), &.{ chk, ext });
+                if (sub != chk) return sub;
+            },
+        }
+    }
     if (s.kind(tru) != .index_access) return tru;
-    if (s.indexAccessIndex(tru) != s.condCheck(cond)) return tru;
-    return c.reduceIndexedAccess(s.indexAccessObj(tru), s.condExtends(cond));
+    if (s.indexAccessIndex(tru) != chk) return tru;
+    return c.reduceIndexedAccess(s.indexAccessObj(tru), ext);
 }
 
 /// The same reading of a true branch as `condTrueUnderExtends`, for the other
@@ -2559,13 +2590,11 @@ fn condTrueSubstituted(c: *Checker, cond: TypeId) Error!TypeId {
     // shape with a concrete check: its true branch reads as `any[] & T`,
     // which IS assignable to `T`, while the bare `any[]` is not.
     //
-    // Answered here rather than in the type-variable path below because it
-    // needs no rewrite at all — the branch is the check type, so the
-    // substituted branch is the intersection itself.
-    if (tru == chk) {
-        const sub = try s.makeIntersection(c.scratch(), &.{ chk, ext });
-        return if (sub == chk) tru else sub;
-    }
+    // Answered by `condTrueUnderExtends` rather than in the type-variable path
+    // below because it needs no rewrite at all — the branch is the check type,
+    // so the substituted branch is the intersection itself, and that is the
+    // one case the two readings share.
+    if (tru == chk) return condTrueUnderExtends(c, cond);
     if (chk_kind != .type_param and chk_kind != .infer_var) return tru;
     if (!try substitutableBranch(c, tru, 0)) return tru;
     const sub = try s.makeIntersection(c.scratch(), &.{ chk, ext });
