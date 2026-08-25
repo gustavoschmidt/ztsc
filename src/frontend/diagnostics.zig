@@ -222,8 +222,15 @@ pub const Code = enum(u16) {
     /// when the last parameter IS a rest one, reported on the trailing comma
     /// itself, and skipped in an ambient context.
     rest_param_trailing_comma,
-    /// Line break not allowed here (e.g. after `throw`).
+    /// TS1142 after `throw` — tsc's `grammarErrorAfterFirstToken`, in the
+    /// CHECKER, so it is grammar-class and a parse error suppresses it.
     line_break_not_allowed,
+    /// TS1142 between `type` and the alias NAME. Same number and wording, but
+    /// tsc writes this one in `parseTypeAliasDeclaration` — a PARSE diagnostic,
+    /// so it suppresses the semantic pass instead of being suppressed by it
+    /// (measured: `declare type<nl>T1 = null` next to a sibling file's TS2322
+    /// reports the TS1142 alone, where `throw<nl>a` reports both).
+    line_break_before_alias_name,
     /// Trailing comma or elision where the grammar forbids it.
     argument_expected,
     /// TS1011: `a[]` — an element access with nothing between the brackets.
@@ -1098,6 +1105,27 @@ pub const Code = enum(u16) {
     /// TS18059: the same refusal for NAMED imports, `import defer { a } from
     /// "m"`, likewise on the `defer`.
     defer_import_named_bindings,
+    /// TS1186: `var [...x = a] = a` — a rest element in a BINDING pattern with
+    /// a default. tsc's `checkGrammarBindingElement`, blamed on the `=` itself
+    /// (`grammarErrorAtPos(node, node.initializer.pos - 1, 1, …)`).
+    rest_element_initializer,
+    /// TS1196: `catch (e: Error)` — a catch variable's annotation must be
+    /// `any` or `unknown`. tsc's `checkCatchClause`, so grammar-class, and
+    /// blamed on the annotation's first token.
+    catch_clause_type_annotation,
+    /// TS1477: `List<number>.makeChild()` — a `<…>` that parsed as an
+    /// INSTANTIATION expression cannot be the object of a property access. A
+    /// parse diagnostic (measured), anchored at the `<`, which is the
+    /// instantiation node's own token.
+    instantiation_property_access,
+    /// TS17012: `import.foo` — the only meta-property `import` has is `meta`.
+    /// tsc's `checkGrammarMetaProperty`, blamed on (and interpolating) the
+    /// NAME, so this one carries `Diagnostic.arg`.
+    import_meta_property,
+    /// TS18061: the same rule where the meta-property is the CALLEE of a call,
+    /// `import.foo()` — there `defer` is spelled too (a deferred dynamic
+    /// import), so tsc offers both words and numbers the message differently.
+    import_meta_property_in_call,
 
     /// How tsc surfaces the condition — which decides both what a diagnostic
     /// suppresses and what suppresses it. Established empirically against tsgo
@@ -1435,6 +1463,17 @@ pub const Code = enum(u16) {
             // why `import defer type * as ns from "m"` shows only its TS1005s).
             .defer_import_default_binding,
             .defer_import_named_bindings,
+            // `checkCatchClause` and `checkGrammarBindingElement` are checker
+            // code too — measured, `catch (e: Error)` and `var [...x = a] = a`
+            // each report next to a sibling file's TS2322 and each vanish once
+            // any file in the program has a parse error.
+            .catch_clause_type_annotation,
+            .rest_element_initializer,
+            // `checkGrammarMetaProperty` is checker code as well: measured,
+            // `import.foo;` reports its TS17012 next to a sibling file's
+            // TS2322 and both vanish behind any parse error in the program.
+            .import_meta_property,
+            .import_meta_property_in_call,
             => .grammar,
 
             else => .syntactic,
@@ -1564,7 +1603,7 @@ pub const Code = enum(u16) {
             .rest_must_be_last => "A rest element must be last in a destructuring pattern.",
             .rest_param_not_last => "A rest parameter must be last in a parameter list.",
             .rest_param_trailing_comma => "A rest parameter or binding pattern may not have a trailing comma.",
-            .line_break_not_allowed => "Line break not permitted here.",
+            .line_break_not_allowed, .line_break_before_alias_name => "Line break not permitted here.",
             .argument_expected => "Argument expression expected.",
             .statement_not_allowed_in_ambient => "Statements are not allowed in ambient contexts.",
             .implementation_not_allowed_in_ambient => "An implementation cannot be declared in ambient contexts.",
@@ -1830,6 +1869,11 @@ pub const Code = enum(u16) {
             .ctor_type_parameters => "Type parameters cannot appear on a constructor declaration.",
             .defer_import_default_binding => "Default imports are not allowed in a deferred import.",
             .defer_import_named_bindings => "Named imports are not allowed in a deferred import.",
+            .rest_element_initializer => "A rest element cannot have an initializer.",
+            .catch_clause_type_annotation => "Catch clause variable type annotation must be 'any' or 'unknown' if specified.",
+            .instantiation_property_access => "An instantiation expression cannot be followed by a property access.",
+            .import_meta_property => "'{0}' is not a valid meta-property for keyword 'import'. Did you mean 'meta'?",
+            .import_meta_property_in_call => "'{0}' is not a valid meta-property for keyword 'import'. Did you mean 'meta' or 'defer'?",
         };
     }
 
@@ -1951,7 +1995,7 @@ pub const Code = enum(u16) {
             .tagged_template_in_optional_chain => 1358,
             .newline_before_arrow => 1200,
             .multiple_default_clauses => 1113,
-            .line_break_not_allowed => 1142,
+            .line_break_not_allowed, .line_break_before_alias_name => 1142,
             .statement_not_allowed_in_ambient => 1036,
             .implementation_not_allowed_in_ambient => 1183,
             .accessibility_modifier_already_seen => 1028,
@@ -2174,6 +2218,11 @@ pub const Code = enum(u16) {
             .ctor_type_parameters => 1092,
             .defer_import_default_binding => 18058,
             .defer_import_named_bindings => 18059,
+            .rest_element_initializer => 1186,
+            .catch_clause_type_annotation => 1196,
+            .instantiation_property_access => 1477,
+            .import_meta_property => 17012,
+            .import_meta_property_in_call => 18061,
             else => 0,
         };
     }

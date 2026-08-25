@@ -2901,6 +2901,21 @@ const Parser = struct {
     /// no first-token index to blame.
     const DeclaratorHome = enum { var_stmt, catch_clause };
 
+    /// May a `catch (e: T)` annotation stand? tsc asks the CHECKER — the type
+    /// must carry `TypeFlags.AnyOrUnknown` — so an alias to either (`type any1 =
+    /// any`) passes there and fails here. This is the syntactic approximation:
+    /// the annotation is the bare `any` or `unknown` keyword and nothing else.
+    /// The alias spelling appears once in the corpus, in a case the harness
+    /// skips for `useUnknownInCatchVariables: false`, and never in either app —
+    /// every real annotation is spelled with the keyword.
+    fn catchClauseTypeAllowed(p: *Parser, ann_tok: u32) bool {
+        if (p.lastIdx() != ann_tok) return false; // more than one token
+        return switch (p.tok_tags.items[ann_tok]) {
+            .keyword_any, .keyword_unknown => true,
+            else => false,
+        };
+    }
+
     fn parseDeclarator(p: *Parser, no_in: bool, home: DeclaratorHome) PE!Node {
         const name_tok = p.curIdx();
         const name = try p.parseBindingName(.private_name_in_var_decl);
@@ -2910,7 +2925,14 @@ const Parser = struct {
             flags |= ast.Flags.definite;
         }
         var type_ann: Node = null_node;
-        if (try p.eat(.colon) != null) type_ann = try p.parseType();
+        if (try p.eat(.colon) != null) {
+            const ann_tok = p.curIdx();
+            type_ann = try p.parseType();
+            // TS1196 at the annotation's FIRST token, tsc's `checkCatchClause`
+            // (`grammarErrorOnFirstToken(typeNode, …)`).
+            if (home == .catch_clause and !p.catchClauseTypeAllowed(ann_tok))
+                try p.errAtToken(.catch_clause_type_annotation, ann_tok);
+        }
         var init: Node = null_node;
         if (try p.eat(.eq)) |eq_tok| {
             init = try p.parseAssignExpr(.{ .no_in = no_in });
@@ -3237,8 +3259,14 @@ const Parser = struct {
         const kw = try p.bump();
         var expr: Node = null_node;
         if (p.nlBefore()) {
-            // Restricted production: `throw\nexpr` is a syntax error.
-            try p.fail(.line_break_not_allowed);
+            // Restricted production: `throw\nexpr` is a syntax error. Blamed at
+            // the END of the `throw` keyword, not on the token that follows it
+            // — tsc's `checkGrammarStatementInAmbientContext` sibling here is
+            // `grammarErrorAfterFirstToken`, whose span is
+            // `getSpanOfTokenAtPosition(node)`'s END (measured: `throw<nl>a;`
+            // is 2:6, one past the keyword, where ztsc said 3:1).
+            if (p.spec > 0) return error.Backtrack;
+            try p.errAtTokenEnd(.line_break_not_allowed, kw);
             expr = try p.errorNode();
         } else {
             expr = try p.parseExpression(.{});
@@ -4101,9 +4129,29 @@ const Parser = struct {
             if (p.curTag() == .dot_dot_dot) {
                 const dots = try p.bump();
                 const target = try p.parseBindingName(.private_name_outside_class);
+                // tsc's `parseArrayBindingElement` PARSES a rest element's
+                // initializer like any other binding element's and leaves the
+                // refusal to `checkGrammarBindingElement`. Refusing it in the
+                // grammar instead spent the position on a TS1005 (`var [...x =
+                // a]`, restElementWithInitializer1). The initializer expression
+                // is parsed and dropped: nothing downstream reads a rest
+                // element's default, and tsc never types one either.
+                var eq_tok: ?u32 = null;
+                if (p.curTag() == .eq) {
+                    eq_tok = try p.bump();
+                    _ = try p.parseAssignExpr(.{});
+                }
                 try p.pushScratch(try p.addNode(.{ .tag = .rest_element, .main_token = dots, .data = .{ .lhs = target, .rhs = 0 } }));
-                // TS2462 is blamed on the bound NAME, not on the `...`.
-                if (p.curTag() == .comma) try p.errAtToken(.rest_must_be_last, p.nodes.items(.main_token)[target]);
+                // `checkGrammarBindingElement` stops at the FIRST complaint, so
+                // a rest element that is not last earns TS2462 and nothing else.
+                // TS2462 is blamed on the bound NAME, not on the `...`; TS1186
+                // on the `=` ("Error on equals token which immediately precedes
+                // initializer").
+                if (p.curTag() == .comma) {
+                    try p.errAtToken(.rest_must_be_last, p.nodes.items(.main_token)[target]);
+                } else if (eq_tok) |eq| {
+                    try p.errAtToken(.rest_element_initializer, eq);
+                }
             } else if (p.atStartOfDeclarator()) {
                 try p.pushScratch(try p.parseBindingElement());
             } else {
@@ -5357,6 +5405,12 @@ const Parser = struct {
 
     fn parseTypeAlias(p: *Parser, flags: u32) PE!Node {
         const kw = try p.bump(); // `type`
+        // tsc's `parseTypeAliasDeclaration` refuses a line break between the
+        // `type` keyword and the alias NAME — the one place in the grammar
+        // where ASI would otherwise turn a declaration into two statements.
+        // Reported at the name, and the declaration is parsed anyway
+        // (`typeAliasDeclareKeywordNewlines` still declares `T1`).
+        if (p.nlBefore()) try p.fail(.line_break_before_alias_name);
         const name_tok = try p.expectIdentLike();
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
         if (p.atLt()) tp = try p.parseTypeParams(.type_decl);
@@ -6917,8 +6971,17 @@ const Parser = struct {
         while (true) {
             switch (p.curTag()) {
                 .dot => {
+                    // `List<number>.makeChild()` — tsc's parser refuses a
+                    // property access on an instantiation expression and blames
+                    // the `<`, which is this node's `main_token`.
+                    if (p.nodes.items(.tag)[lhs] == .instantiation_expr) {
+                        if (p.spec > 0) return error.Backtrack;
+                        try p.errAtToken(.instantiation_property_access, p.nodes.items(.main_token)[lhs]);
+                    }
                     const dot = try p.bump();
                     const name = try p.expectMemberName();
+                    if (try p.importDeferCallee(lhs, name)) continue;
+                    if (p.nodes.items(.tag)[lhs] == .import_expr) try p.checkImportMetaProperty(name);
                     lhs = try p.addNode(.{ .tag = .member_expr, .main_token = dot, .data = .{ .lhs = lhs, .rhs = name } });
                 },
                 .question_dot => {
@@ -7048,6 +7111,51 @@ const Parser = struct {
     /// about the leftover name — a "',' expected" one line down, in
     /// `enumMemberResolution`, `enumConflictsWithGlobalIdentifier` and
     /// `errorRecoveryWithDotFollowedByNamespaceKeyword`.
+    /// `import.defer(…)` — a DEFERRED dynamic import, not a meta-property.
+    /// tsc reads the `.defer` as part of the import-keyword expression and then
+    /// REQUIRES the argument list, so a `.defer` with no `(` after it is
+    /// "'(' expected" on whatever token stands there
+    /// (`dynamicImportDeferInvalidStandalone`: `import.defer;`,
+    /// `(import.defer)("a")`, `Function(import.defer)` and a bare `import.defer`
+    /// at end of file are four of them).
+    ///
+    /// Answers true when the `.defer` was ABSORBED — the caller leaves `lhs` as
+    /// the bare `.import_expr` and the `(` that follows makes the ordinary
+    /// dynamic-import call, so `import.defer("./a")` types exactly as
+    /// `import("./a")` does. Without the `(` the node stays a member expression:
+    /// the diagnostic is already filed, and a bare `.import_expr` is a shape the
+    /// checker has no reading for.
+    fn importDeferCallee(p: *Parser, lhs: Node, name: u32) PE!bool {
+        if (p.nodes.items(.tag)[lhs] != .import_expr) return false;
+        if (!std.mem.eql(u8, p.tokenTextAt(name), "defer")) return false;
+        if (p.curTag() == .l_paren) return true;
+        if (p.spec > 0) return error.Backtrack;
+        // At the FULL start of the offending token — the byte just past the
+        // `defer`, trivia included. tsc's own report survives end of file that
+        // way: a file ending in `import.defer` blames column 13 of that line,
+        // not column 1 of the empty line after it.
+        try p.errAtFullStart(.expected_l_paren);
+        return false;
+    }
+
+    /// tsc's `checkGrammarMetaProperty` for the `import` keyword: `meta` is the
+    /// only meta-property it has. In a CALL position `defer` is spelled as well
+    /// — that shape never reaches here, `importDeferCallee` took it — so the
+    /// two message wordings are two codes, and which one applies is decided by
+    /// the `(` that would make this member expression a callee.
+    ///
+    /// A grammar-class diagnostic: tsc's CHECKER files it, so a parse error
+    /// anywhere in the program suppresses it.
+    fn checkImportMetaProperty(p: *Parser, name: u32) Error!void {
+        if (std.mem.eql(u8, p.tokenTextAt(name), "meta")) return;
+        const span = p.tokSpan(name, name);
+        const code: Code = if (p.curTag() == .l_paren)
+            .import_meta_property_in_call
+        else
+            .import_meta_property;
+        try p.errAtSpanArg(code, span, span);
+    }
+
     fn expectMemberName(p: *Parser) PE!u32 {
         if (p.atDanglingDot()) {
             if (p.spec > 0) return error.Backtrack;
@@ -7962,8 +8070,18 @@ const Parser = struct {
             },
             .unknown, .hash_bang, .binary_content => {
                 if (p.spec > 0) return error.Backtrack;
+                // NOT consumed — tsc reaches this token through
+                // `parseIdentifier(Diagnostics.Expression_expected)`, whose
+                // `createMissingNode` files a diagnostic and advances NOTHING.
+                // The junk token is left for the enclosing list, which skips it
+                // in `abortParsingListOrMoveToNextToken`; swallowing it here
+                // instead pushed every following `expected` diagnostic one token
+                // late (`Foo<A,B,\ C>(4, 5, 6)` earned a TS1005 on the `C` that
+                // tsgo does not report). The `Expression expected` tsc files
+                // lands on the character the scanner already blamed with TS1127,
+                // so the one-per-position rule drops it and `errAtJunkToken`
+                // alone is the whole report.
                 try p.errAtJunkToken();
-                _ = try p.bump();
                 return p.errorNode();
             },
             .unterminated_comment => {
@@ -8743,8 +8861,10 @@ const Parser = struct {
             .keyword_import => return p.parseImportType(),
             .unknown, .hash_bang, .binary_content => {
                 if (p.spec > 0) return error.Backtrack;
+                // NOT consumed, for the same reason as `parsePrimaryExpression`'s
+                // arm: tsc's type path ends in `parseEntityNameOfTypeReference`'s
+                // `createMissingNode`, which reports and advances nothing.
                 try p.errAtJunkToken();
-                _ = try p.bump();
                 return p.errorNode();
             },
             else => {
@@ -8767,7 +8887,14 @@ const Parser = struct {
                     return name;
                 }
                 try p.fail(.expected_type);
-                return p.errorNode();
+                // tsc's `parseEntityNameOfTypeReference` builds a MISSING
+                // identifier and then runs the `.B.C` loop over it, so a
+                // qualifier is consumed even when the head is not there. In
+                // `typeof import.defer("./a")` that swallows the `.defer`, and
+                // the "')' expected" `parseImportType` files next lands on the
+                // `(` — one token later than ztsc used to put it, and one more
+                // diagnostic than it used to file (typeofImportDefer).
+                return p.parseEntityNameFrom(try p.errorNode());
             },
         }
     }
@@ -8821,8 +8948,16 @@ const Parser = struct {
             // rather than wrong.
             try p.fail(.expected_type);
         }
-        // Tolerate `import("m", { with: {...} })` assertions: skip to `)`.
-        while (p.curTag() != .r_paren and p.curTag() != .eof) _ = try p.bump();
+        // Tolerate `import("m", { with: {...} })` assertions: skip to `)`. Only
+        // a COMMA opens that skip — tsc's `parseImportType` reads the
+        // attributes behind `parseOptional(CommaToken)` and then wants its `)`
+        // straight away, so anything else stays where it is and earns the
+        // "')' expected" right there (`typeof import.defer("./a")`, whose
+        // `.defer` the argument parse already took as a qualifier, blames the
+        // `(` — typeofImportDefer).
+        if (p.curTag() == .comma) {
+            while (p.curTag() != .r_paren and p.curTag() != .eof) _ = try p.bump();
+        }
         _ = try p.expect(.r_paren, .expected_r_paren);
         var ty = try p.addNode(.{ .tag = .import_type, .main_token = kw, .data = .{ .lhs = spec_tok, .rhs = 0 } });
         while (p.curTag() == .dot) {
