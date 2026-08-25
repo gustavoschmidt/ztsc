@@ -803,6 +803,34 @@ pub fn patternContextualType(c: *Checker, pat: Node) Error!TypeId {
     };
 }
 
+/// The type a BINDING PATTERN declares for the thing it destructures, when
+/// nothing else does — tsc's `getTypeFromBindingPattern(name,
+/// /*includePatternInType*/ false, /*reportErrors*/ true)`, the last arm of
+/// `getTypeForVariableLikeDeclaration` for a parameter with no annotation, no
+/// contextual signature and no initializer.
+///
+/// A pattern says how many positions the value must have and which names it
+/// must carry; typing such a parameter `any` threw all of that away, so
+/// `function c5([a, b, [[c]]]) {}` accepted a five-element argument where tsc
+/// answers TS2345 against `[any, any, [[any]]]`
+/// (`destructuringParameterDeclaration1ES6`), and `function foo({x: [a, b]})`
+/// accepted an `x` that is an ARRAY rather than a two-tuple
+/// (`argumentExpressionContextualTyping`).
+///
+/// This is the same walk `patternContextualType` runs, minus its
+/// object-pattern gate: that gate exists because handing an all-`any`
+/// CONTEXTUAL type to an initializer is not the same as handing it none, and
+/// a DECLARED type has no such hazard. `no_type` for everything the walk
+/// cannot enumerate — a rest element, a computed key, an empty pattern — where
+/// the caller keeps its `any`.
+pub fn patternDeclaredType(c: *Checker, pat: Node) Error!TypeId {
+    return switch (c.nodeTag(pat)) {
+        .object_pattern => (try patternImpliedType(c, pat, .binding)) orelse types.no_type,
+        .array_pattern => arrayPatternContextualType(c, pat),
+        else => types.no_type,
+    };
+}
+
 /// How one position of an array pattern behaves, over BOTH vocabularies: a
 /// declaration's binding pattern (`.rest_element`, `.binding_default`) and
 /// the expression cover grammar an assignment pattern parses as

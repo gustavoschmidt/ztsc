@@ -938,6 +938,14 @@ fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_implicit
         // REQUIRED and `f({ w: 5 })` reported TS2345.
         ty = try optionalizePatternDefaults(c, ty, name_node);
     }
+    // A DESTRUCTURED parameter with nothing else to go on takes its type from
+    // the PATTERN (tsc's `getTypeFromBindingPattern`), which is also where its
+    // TS7031s come from — so the report runs here whether or not the walk can
+    // enumerate a type. `name == 0` is exactly "the name is not an identifier".
+    if (ty == types.no_type and name == 0 and name_node != 0) {
+        if (report_implicit) try implicit_any.reportPatternImplicitAny(c, name_node);
+        ty = try destructure.patternDeclaredType(c, name_node);
+    }
     if (ty == types.no_type) {
         // `noImplicitAny: false` suppresses TS7006 — the parameter still
         // types as `any` below, only the diagnostic is gone.
@@ -957,10 +965,6 @@ fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_implicit
                 try c.diagFmt(7006, c.nodeSpan(pn), "Parameter '{s}' implicitly has an 'any' type.", .{c.tokenText(tok)});
             }
         }
-        // A DESTRUCTURED parameter has no name to report TS7006 against: tsc
-        // builds its type out of the pattern instead and reports TS7031 at
-        // each leaf the pattern leaves as `any`.
-        if (report_implicit and name == 0) try implicit_any.reportPatternImplicitAny(c, name_node);
         ty = types.any_type;
     }
     // `x?: T` reads as T | undefined.
