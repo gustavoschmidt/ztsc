@@ -4039,7 +4039,19 @@ pub fn unionNestedPropType(c: *Checker, rt: TypeId, key: Atom) Error!?TypeId {
 fn ctxIndexType(c: *Checker, rctx: TypeId, want_number: bool) Error!TypeId {
     switch (c.ts.kind(rctx)) {
         .object => {
-            const idx = if (want_number) c.ts.objectNumberIndex(rctx) else c.ts.objectStringIndex(rctx);
+            // tsc's `getContextualTypeForObjectLiteralElement` ends in
+            // `isNumericName(name) && getIndexTypeOfContextualType(numberType)
+            // || getIndexTypeOfContextualType(stringType)`: a NUMERIC key
+            // prefers the number signature and falls back to the string one,
+            // exactly as `findApplicableIndexInfo` does for a read. Without
+            // the fallback, `var o: I = { [+"foo"](y) { … } }` under an
+            // `I = { [s: string]: (x: string) => number }` gave its parameter
+            // no contextual type at all and every such member was a TS7006
+            // (`computedPropertyNamesContextualType3`).
+            if (want_number and c.ts.objectNumberIndex(rctx) != 0) return c.ts.objectNumberIndex(rctx);
+            // The string slot may really hold a `[k: symbol]` signature, which
+            // no string- or number-domain key reaches.
+            const idx = props_zig.stringIndexForStringKey(c, rctx);
             return if (idx != 0) idx else types.no_type;
         },
         // A constituent with no index signature contributes nothing (tsc's
@@ -5096,8 +5108,8 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
                 result = if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
             } else if (try numericNameIndexHit(c, r, rk, c.atomText(key))) |nt| {
                 result = nt;
-            } else if (rk == .object and c.ts.objectStringIndex(r) != 0) {
-                result = c.ts.objectStringIndex(r);
+            } else if (rk == .object and props_zig.stringIndexForStringKey(c, r) != 0) {
+                result = props_zig.stringIndexForStringKey(c, r);
             } else {
                 // Element access `o['k']` with a string-literal key that is
                 // neither a known property nor covered by a string index is,
@@ -5165,7 +5177,7 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
                 //
                 // Both stay silent — an under-report rather than an invention.
                 const v = c.ts.numberValue(rl);
-                if (rk == .object and c.ts.objectNumberIndex(r) == 0 and c.ts.objectStringIndex(r) == 0 and
+                if (rk == .object and c.ts.objectNumberIndex(r) == 0 and props_zig.stringIndexForStringKey(c, r) == 0 and
                     c.ts.objectFlags(r) & types.obj_flag_global_this == 0 and
                     !c.ts.objectIsLiteralOrigin(r) and
                     v == @floor(v) and @abs(v) < 9007199254740992.0)
@@ -5177,8 +5189,8 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
         },
         .number => result = try c.numberIndexType(r),
         .string => {
-            if (rk == .object and c.ts.objectStringIndex(r) != 0) {
-                result = c.ts.objectStringIndex(r);
+            if (rk == .object and props_zig.stringIndexForStringKey(c, r) != 0) {
+                result = props_zig.stringIndexForStringKey(c, r);
             } else if (rk == .array or rk == .tuple or rk == .string) {
                 result = types.any_type;
             } else if (rk == .object and c.ts.objectIsLiteralOrigin(r)) {
@@ -5238,8 +5250,8 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
             if (ia != types.no_type and ia != types.error_type) {
                 result = ia;
             } else if (try c.typeIsStringLike(ri)) {
-                result = if (rk == .object and c.ts.objectStringIndex(r) != 0)
-                    c.ts.objectStringIndex(r)
+                result = if (rk == .object and props_zig.stringIndexForStringKey(c, r) != 0)
+                    props_zig.stringIndexForStringKey(c, r)
                 else
                     types.any_type;
             } else if (try c.typeIsNumberLike(ri)) {
@@ -7241,10 +7253,11 @@ pub fn checkDestructuringPattern(c: *Checker, node: Node, src: TypeId) Error!voi
         },
         else => {
             const iterated = try arrayPatternIteratedType(c, node, src);
+            const els = c.tree.nodeRange(node);
             var index: u32 = 0;
-            for (c.tree.nodeRange(node)) |el| {
+            for (els, 0..) |el, i| {
                 defer index += 1;
-                try checkArrayDestructuringElement(c, el, src, iterated, index);
+                try checkArrayDestructuringElement(c, el, src, iterated, index, i + 1 == els.len);
             }
         },
     }
@@ -7409,13 +7422,38 @@ fn checkObjectDestructuringProperty(c: *Checker, prop: Node, src: TypeId, rest_s
 }
 
 /// One element of an array destructuring pattern, at position `index`.
-fn checkArrayDestructuringElement(c: *Checker, el: Node, src: TypeId, iterated: TypeId, index: u32) Error!void {
+/// `is_last` selects tsc's rest arm: a LAST spread is the rest position, and
+/// only there does `checkArrayLiteralDestructuringElementAssignment` look for
+/// the initializer TS1186 refuses.
+fn checkArrayDestructuringElement(c: *Checker, el: Node, src: TypeId, iterated: TypeId, index: u32, is_last: bool) Error!void {
     if (el == null_node) return;
     switch (c.nodeTag(el)) {
         .omitted, .error_node, .unsupported => {},
         // `[a, ...rest] = src`: the rest is the remaining elements, not the
         // element at `index`.
-        .spread_element, .rest_element => try checkDestructuringTarget(c, c.tree.nodeData(el).lhs, try arrayRestSourceType(c, src, iterated, index), .assignment),
+        .spread_element, .rest_element => {
+            const target = c.tree.nodeData(el).lhs;
+            // TS1186: `[...x = a] = a`. The cover grammar parses the rest's
+            // operand as an ordinary assignment, and tsc's
+            // `checkArrayLiteralDestructuringElementAssignment` rejects it
+            // outright — reported at the `=` OPERATOR, and with nothing
+            // checked behind it (the `else` branch is where the assignment
+            // walk lives, so the whole rest position is skipped).
+            //
+            // The BINDING form (`function f(...[a] = []) {}`) is the parser's
+            // TS1186; only the assignment form reaches a checker at all.
+            if (is_last and target != null_node and c.nodeTag(target) == .assign and
+                c.tree.tokens.tag(c.tree.nodeMainToken(target)) == .eq)
+            {
+                return c.diagFmt(
+                    1186,
+                    c.tokSpan(c.tree.nodeMainToken(target)),
+                    "A rest element cannot have an initializer.",
+                    .{},
+                );
+            }
+            try checkDestructuringTarget(c, target, try arrayRestSourceType(c, src, iterated, index), .assignment);
+        },
         else => try checkDestructuringTarget(c, el, try destructuringElementType(c, src, iterated, index), .assignment),
     }
 }

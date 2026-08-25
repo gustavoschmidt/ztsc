@@ -379,6 +379,32 @@ pub fn nominalizeComputedKey(c: *Checker, name: Atom, scope: ScopeId) Error!Atom
     return name;
 }
 
+/// The key expression's TYPE behind a computed-key PLACEHOLDER atom, or null
+/// when `name` is not a placeholder (an ordinary member, or a key already
+/// nominalized to `__@u<id>` / a literal name) or when the key identifier
+/// resolves to nothing at all.
+///
+/// A placeholder is precisely the member tsc's `isLateBindableName` refuses:
+/// the key resolved, but to something that is not a string literal, a numeric
+/// literal or a `unique symbol`. Those members declare no property — they
+/// contribute an INDEX SIGNATURE instead (tsc's `getIndexInfosOfIndexSymbol`),
+/// and `computed_key.splitDynamicMembers` needs the key type to say which
+/// domain. Split out here because the resolution it reuses
+/// (`constSymbolKeyType`) is this file's, and it deliberately answers WITHOUT
+/// re-entering the expression walk — a class member's key is resolved while
+/// the class's own table is materializing.
+pub fn placeholderKeyType(c: *Checker, name: Atom, scope: ScopeId) Error!?TypeId {
+    const text = c.atomText(name);
+    if (!std.mem.startsWith(u8, text, computed_sym_prefix)) return null;
+    return constSymbolKeyType(c, text[computed_sym_prefix.len..], scope);
+}
+
+/// Is `name` a computed-key placeholder atom at all? The cheap half of
+/// `placeholderKeyType`, for a pre-scan that wants to skip the resolution.
+pub fn isComputedPlaceholder(c: *Checker, name: Atom) bool {
+    return std.mem.startsWith(u8, c.atomText(name), computed_sym_prefix);
+}
+
 /// If `node` is syntactically `Symbol.<wellKnownName>` (e.g.
 /// `Symbol.iterator`), returns the synthetic member key `__@<name>` used by
 /// the declaration side (`ast.wellKnownSymbolKey`). Matches the identifier

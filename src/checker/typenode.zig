@@ -295,7 +295,10 @@ fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
             // `(file, node)` and reports against the file the node lives in, so
             // this is once per literal wherever the materialization starts.
             // (wave-10 A: one flagged call into `computed_key.zig`.)
-            try computed_key.checkMemberNames(c, c.tree.nodeRange(node), .type_space);
+            // No type parameters: a type literal never earns TS2467, not even
+            // as a generic type alias's body (measured — see
+            // `computed_key.reportTypeParamRefs`).
+            try computed_key.checkMemberNames(c, c.tree.nodeRange(node), .type_space, &.{});
             return c.objectTypeFromMembers(c.tree.nodeRange(node), 0);
         },
         .function_type => return c.signatureOfProto(node, d.lhs, false, true),
@@ -1335,6 +1338,22 @@ pub fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, obj_flags:
             if (props.items[idx].ty == e.value_ptr.*) continue;
             props.items[idx].write_ty = e.value_ptr.*;
         }
+    }
+    // A member whose computed name names no property (`{ [plain](): number }`
+    // with `plain: symbol`) contributes an INDEX SIGNATURE instead — tsc's
+    // `getIndexInfosOfIndexSymbol`. Run after every post-pass above, because
+    // those index `props` through `prop_index` and this one compacts it.
+    // A WRITTEN signature keeps its slot: `resolveDeclaredMembers` reads the
+    // declared infos first and the computed ones only fill what is left.
+    const dyn = try computed_key.splitDynamicMembers(c, &props, c.cur_scope);
+    if (sindex == 0 and dyn.str != 0) {
+        sindex = dyn.str;
+        sindex_ro = dyn.str_readonly;
+        if (dyn.sym_only) sym_index = true else str_index = true;
+    }
+    if (nindex == 0 and dyn.num != 0) {
+        nindex = dyn.num;
+        nindex_ro = dyn.num_readonly;
     }
     var flags = if (sym_index and !str_index and nindex == 0)
         obj_flags | types.obj_flag_symbol_index

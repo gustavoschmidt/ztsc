@@ -1,4 +1,5 @@
-//! TS2464: what a computed property NAME is allowed to be.
+//! What a computed property NAME is allowed to be (TS2464), and — when it
+//! names no property at all — the INDEX SIGNATURE it contributes instead.
 //!
 //! A computed key has to name a property, and the three things that can name
 //! one are a string, a number and a symbol — so tsc's
@@ -20,8 +21,11 @@ const std = @import("std");
 const ast = @import("../frontend/ast.zig");
 const binder = @import("../frontend/binder.zig");
 const intern = @import("../intern.zig");
+const literals = @import("../frontend/literals.zig");
 const numeric_lit = @import("../numeric_lit.zig");
 const types = @import("../types.zig");
+
+const atoms = @import("atoms.zig");
 
 const Atom = intern.Atom;
 const Node = ast.Node;
@@ -170,6 +174,95 @@ fn reportIllegalRefs(c: *Checker, node: Node, want: IllegalRefs, depth: u16) Err
 /// Far above any hand-written key expression; the cap only ever under-reports.
 const max_name_depth: u16 = 200;
 
+/// TS2467: a member's computed NAME cannot reference a type parameter of the
+/// class or interface that declares it. The name is evaluated once, when the
+/// declaration is elaborated, so the type arguments a use site supplies do not
+/// exist yet — `class C<T> { [foo<T>()]() {} }` has no `T` to call `foo` with.
+///
+/// The boundary was measured against tsgo 7.0.2 over twenty shapes, and it is
+/// narrower than "any type parameter in scope":
+///
+///   * only the IMMEDIATELY containing class or interface counts. An enclosing
+///     function's parameter is fine, and so is an OUTER class's seen from a
+///     class nested in one of its methods.
+///   * a TYPE LITERAL never reports, even as the body of a generic type alias
+///     (`type D<T> = { [foo<T>()]: number }` is TS1170 alone) — which is why
+///     `typenode`'s call passes no type parameters.
+///   * the reference has to be in a TYPE position. `class C<T> { [T]() {} }`
+///     is TS2304, not this: the value space has no `T` and the type space is
+///     never asked.
+///   * a STATIC member reports too, and so does a class EXPRESSION's member;
+///     every reference reports, so `[foo<[A, B]>()]` is two diagnostics.
+///
+/// Matched by NAME against the declaration's type-parameter list rather than by
+/// resolving the reference: an interface's computed names are checked in the
+/// ENCLOSING scope (that is where a computed key is evaluated), so its own type
+/// parameters are not in scope to resolve against at all.
+fn reportTypeParamRefs(c: *Checker, node: Node, tps: []const Node, depth: u16) Error!void {
+    if (node == null_node or depth > max_name_depth) return;
+    const d = c.tree.nodeData(node);
+    switch (c.nodeTag(node)) {
+        // The three ways a TYPE can be written inside an expression. Each
+        // hands its type slots to the type-position walk; everything else
+        // under this node stays an expression.
+        .call_expr_targs, .optional_call, .new_expr_targs => {
+            const info = c.tree.extraData(ast.CallInfo, d.rhs);
+            for (c.tree.extraRange(info.targs_start, info.targs_end)) |t| {
+                try reportTypeParamRefsInType(c, t, tps, depth + 1);
+            }
+        },
+        .instantiation_expr => {
+            const r = c.tree.extraData(ast.SubRange, d.rhs);
+            for (c.tree.extraRange(r.start, r.end)) |t| {
+                try reportTypeParamRefsInType(c, t, tps, depth + 1);
+            }
+        },
+        .as_expr, .satisfies_expr => try reportTypeParamRefsInType(c, d.rhs, tps, depth + 1),
+        // A nested declaration of its own is a different containing type — the
+        // same boundary `reportIllegalRefs` stops at, and for the same reason.
+        .function_expr,
+        .function_decl,
+        .class_decl,
+        .class_method,
+        .object_method,
+        .class_field,
+        => return,
+        else => {},
+    }
+    var it = c.tree.childIterator(node);
+    while (it.next()) |child| try reportTypeParamRefs(c, child, tps, depth + 1);
+}
+
+/// The type-position half of `reportTypeParamRefs`: every `identifier` under
+/// here names a TYPE, so one matching a containing type parameter is the
+/// reference TS2467 refuses. Nesting is walked whole — `T[]`, `{ a: T }`,
+/// `Foo<T>` and `[A, B]` all report, once per reference.
+fn reportTypeParamRefsInType(c: *Checker, node: Node, tps: []const Node, depth: u16) Error!void {
+    if (node == null_node or depth > max_name_depth) return;
+    switch (c.nodeTag(node)) {
+        .identifier => {
+            const text = c.tokenText(c.tree.nodeMainToken(node));
+            for (tps) |tp| {
+                if (tp == null_node) continue;
+                if (!std.mem.eql(u8, text, c.tokenText(c.tree.nodeMainToken(tp)))) continue;
+                return c.diagFmt(
+                    2467,
+                    c.nodeSpan(node),
+                    "A computed property name cannot reference a type parameter from its containing type.",
+                    .{},
+                );
+            }
+            return;
+        },
+        // `typeof x` names a VALUE, and a type parameter is not one — the
+        // reference there is a TS2304, not this.
+        .typeof_type => return,
+        else => {},
+    }
+    var it = c.tree.childIterator(node);
+    while (it.next()) |child| try reportTypeParamRefsInType(c, child, tps, depth + 1);
+}
+
 /// The computed NAMES of a class body's or an interface's members — tsc's
 /// `checkComputedPropertyName`, reached from the declaration walk so it runs in
 /// the file that owns the declaration and for an unreferenced container too.
@@ -187,7 +280,11 @@ const max_name_depth: u16 = 200;
 ///
 /// `home` says whether the member name is EMITTED code — see
 /// `Checker.in_type_space_name` for the one diagnostic that turns on.
-pub fn checkMemberNames(c: *Checker, members: []const Node, home: Home) Error!void {
+///
+/// `type_params` are the CONTAINING class's or interface's own type-parameter
+/// nodes, which a name may not reference (TS2467, see `reportTypeParamRefs`).
+/// A type literal has none of its own and passes an empty slice.
+pub fn checkMemberNames(c: *Checker, members: []const Node, home: Home, type_params: []const Node) Error!void {
     // Almost every file has no computed member name at all.
     if (c.tree.computed_keys.len == 0) return;
     const saved = c.in_type_space_name;
@@ -206,6 +303,9 @@ pub fn checkMemberNames(c: *Checker, members: []const Node, home: Home) Error!vo
         if (c.node_types.contains(c.nodeKey(c.tree.nodeData(key).lhs))) continue;
         // Only a non-ambient class FIELD's name is a use that can be too early.
         c.defer_computed_key_tdz = home != .class_body or c.nodeTag(m) != .class_field;
+        if (type_params.len > 0) {
+            try reportTypeParamRefs(c, c.tree.nodeData(key).lhs, type_params, 0);
+        }
         _ = try checkComputedName(c, key, home != .type_space);
     }
 }
@@ -317,4 +417,188 @@ pub fn admissible(c: *Checker, kt: TypeId) Error!bool {
 /// the union constructor interns.
 fn stringNumberSymbol(c: *Checker) Error!TypeId {
     return c.makeUnion2(types.string_type, try c.makeUnion2(types.number_type, types.symbol_type));
+}
+
+/// Which of the three index-signature key domains a member's computed name
+/// falls in, once the name is known to declare no property of its own.
+pub const Domain = enum { string, number, symbol };
+
+/// tsc's `getIndexInfosOfIndexSymbol` domain test, verified against tsgo 7.0.2
+/// over sixteen key types (see `splitDynamicMembers` for the measurements).
+/// It is an if/else CHAIN over the whole key type, not a per-constituent walk:
+/// a `string | symbol` key lands in the string domain alone, and a
+/// `string | number` one in the string domain alone too.
+///
+/// Null when the key names a property after all, or names nothing: an
+/// inadmissible key (`boolean`, `unknown` — TS2464 already reported) declares
+/// neither a member nor a signature.
+fn indexDomain(c: *Checker, kt: TypeId) Error!?Domain {
+    if (kt == types.no_type or kt == types.error_type) return null;
+    if (!try admissible(c, kt)) return null;
+    // `any` and `never` are both assignable to `number`, and tsc's chain
+    // therefore files them under the NUMBER domain — measured, not assumed:
+    // `class C { [k]() {} }` with `k: any` has `keyof C === number`.
+    if (try c.isAssignable(kt, types.number_type)) return .number;
+    if (try c.isAssignable(kt, types.symbol_type)) return .symbol;
+    return .string;
+}
+
+/// The index signatures a table's non-late-bindable computed member names
+/// contribute between them.
+pub const DynamicIndexes = struct {
+    /// Value type for the STRING-keyed signature (or, when `sym_only`, the
+    /// symbol-keyed one — ztsc keeps both in the same slot, see
+    /// `types.obj_flag_symbol_index`). Zero when there is none.
+    str: TypeId = 0,
+    num: TypeId = 0,
+    /// The `str` slot holds a `[k: symbol]` signature.
+    sym_only: bool = false,
+    /// Every member that claimed the slot carried `readonly` — tsc's
+    /// `IndexInfo.isReadonly`, which makes a write TS2542.
+    str_readonly: bool = false,
+    num_readonly: bool = false,
+};
+
+/// Split the members a NON-late-bindable computed name declared out of `props`
+/// and return the index signatures they contribute — tsc's
+/// `getIndexInfosOfIndexSymbol`.
+///
+/// A computed name whose key type is not a string literal, a numeric literal
+/// or a `unique symbol` (`class K { [plain]() {} }` with `plain: symbol`)
+/// declares no property: the binder files every such member under one `__index`
+/// symbol, and `resolveDeclaredMembers` turns that symbol into index
+/// signatures. ztsc's binder keys them by a `__@k$<ident>` PLACEHOLDER atom
+/// instead (see `atoms.placeholderKeyType`), so they arrive here as ordinary
+/// props and are removed from `props` in place once classified.
+///
+/// The shapes below were measured against tsgo 7.0.2 by reading `keyof` and
+/// element-access results back out of classes, interfaces and type literals:
+///
+///   * **domain** — `symbol` → `[x: symbol]`; `string`, `` `data-${string}` ``,
+///     `Uppercase<string>`, `"a" | "b"`, `string | number`, `string | symbol`
+///     → `[x: string]`; `number`, `1 | 2`, a numeric enum, `any`, `never`
+///     → `[x: number]`. `unknown` and `boolean` (TS2464) contribute nothing.
+///   * **value type** — each signature's value is the union of the members
+///     whose key lands in its domain, PLUS the table's ordinary members that a
+///     key of that domain could read. So the string signature takes every
+///     string- and numeric-NAMED sibling and every string- and number-keyed
+///     computed member; the number signature takes only numeric-named siblings
+///     and number-keyed computed members; the symbol signature takes only
+///     symbol-named siblings and symbol-keyed computed members. Verified:
+///     `class A { plainProp = true; [ks]() {…} [kn]() {…} [ky]() {…} }` reads
+///     `a["zz"]` as `boolean | (() => number) | (() => string)`, `a[3]` as
+///     `() => string`, and `a[ky]` as `() => bigint`.
+///   * an OPTIONAL member contributes `T | undefined`
+///     (`declarationEmitComputedNameWithQuestionToken` reads
+///     `(() => string) | undefined`).
+///   * a table with no computed member in a domain gets no signature there —
+///     a symbol key alone leaves `a["zz"]` a TS7053, and a number key alone
+///     leaves `b["zz"]` a TS7015.
+///
+/// **Representation limit.** ztsc stores two index slots and reinterprets the
+/// string one as symbol-keyed via `types.obj_flag_symbol_index`, so a table
+/// that would need a symbol signature ALONGSIDE a string or number one cannot
+/// have all three. The symbol half is dropped there and its members stay
+/// placeholder props, exactly as they were before this pass existed — the rare
+/// case degrades to the old behavior rather than losing the common one.
+///
+/// `scope` must reach the key identifiers' bindings.
+pub fn splitDynamicMembers(
+    c: *Checker,
+    props: *std.ArrayList(types.Prop),
+    scope: binder.ScopeId,
+) Error!DynamicIndexes {
+    // Pre-scan: a table with no placeholder member — every table in the DOM
+    // lib, and all but a handful in any real program — pays one interned-text
+    // prefix test per prop and allocates nothing.
+    var any_placeholder = false;
+    for (props.items) |p| {
+        if (atoms.isComputedPlaceholder(c, p.name)) {
+            any_placeholder = true;
+            break;
+        }
+    }
+    if (!any_placeholder) return .{};
+
+    // Parallel to `props`: the domain each member was classified into, or null
+    // for a member that stays a property. Scratch-allocated on the rare path
+    // only (guarded above).
+    const doms = try c.scratch().alloc(?Domain, props.items.len);
+    defer c.scratch().free(doms);
+    var have: [3]bool = .{ false, false, false };
+    var ro: [3]bool = .{ true, true, true };
+    for (props.items, 0..) |p, i| {
+        doms[i] = null;
+        const kt = (try atoms.placeholderKeyType(c, p.name, scope)) orelse continue;
+        const d = (try indexDomain(c, kt)) orelse continue;
+        doms[i] = d;
+        have[@intFromEnum(d)] = true;
+        if (p.flags & types.prop_flag_readonly == 0) ro[@intFromEnum(d)] = false;
+    }
+    const has_str = have[@intFromEnum(Domain.string)];
+    const has_num = have[@intFromEnum(Domain.number)];
+    // See the representation limit above: a symbol signature is only storable
+    // when nothing else claims a slot.
+    const has_sym = have[@intFromEnum(Domain.symbol)] and !has_str and !has_num;
+    if (!has_str and !has_num and !has_sym) return .{};
+    if (!has_sym) {
+        for (doms) |*d| {
+            if (d.* == .symbol) d.* = null;
+        }
+    }
+
+    var str_vals: std.ArrayList(TypeId) = .empty;
+    defer str_vals.deinit(c.scratch());
+    var num_vals: std.ArrayList(TypeId) = .empty;
+    defer num_vals.deinit(c.scratch());
+    var sym_vals: std.ArrayList(TypeId) = .empty;
+    defer sym_vals.deinit(c.scratch());
+    for (props.items, 0..) |p, i| {
+        const vt = if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
+        if (doms[i]) |d| switch (d) {
+            // A number-keyed member is readable through the string signature
+            // too — a numeric key IS a string key — so it joins both.
+            .number => {
+                try num_vals.append(c.scratch(), vt);
+                if (has_str) try str_vals.append(c.scratch(), vt);
+            },
+            .string => try str_vals.append(c.scratch(), vt),
+            .symbol => try sym_vals.append(c.scratch(), vt),
+        } else {
+            // An ordinary sibling, folded into whichever signature a key of
+            // its own name domain would reach.
+            const text = c.atomText(p.name);
+            if (std.mem.startsWith(u8, text, "__@")) {
+                if (has_sym) try sym_vals.append(c.scratch(), vt);
+            } else {
+                if (has_str) try str_vals.append(c.scratch(), vt);
+                if (has_num and literals.isNumericName(text)) try num_vals.append(c.scratch(), vt);
+            }
+        }
+    }
+
+    var out: DynamicIndexes = .{};
+    if (has_str) {
+        out.str = try c.ts.makeUnion(c.scratch(), str_vals.items);
+        out.str_readonly = ro[@intFromEnum(Domain.string)];
+    } else if (has_sym) {
+        out.str = try c.ts.makeUnion(c.scratch(), sym_vals.items);
+        out.str_readonly = ro[@intFromEnum(Domain.symbol)];
+        out.sym_only = true;
+    }
+    if (has_num) {
+        out.num = try c.ts.makeUnion(c.scratch(), num_vals.items);
+        out.num_readonly = ro[@intFromEnum(Domain.number)];
+    }
+
+    // Drop the classified members: they name no property (tsc keys them under
+    // `__index`, which is not in the member table at all).
+    var w: usize = 0;
+    for (props.items, 0..) |p, i| {
+        if (doms[i] != null) continue;
+        props.items[w] = p;
+        w += 1;
+    }
+    props.shrinkRetainingCapacity(w);
+    return out;
 }

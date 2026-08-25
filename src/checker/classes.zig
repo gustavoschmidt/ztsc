@@ -46,6 +46,7 @@ const Error = checker_zig.Error;
 const prof_zig = checker_zig.prof_zig;
 
 const accessibility = @import("accessibility.zig");
+const computed_key = @import("computed_key.zig");
 const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 
@@ -473,6 +474,27 @@ pub const ClassIndexInfos = struct {
     str_readonly: bool = false,
     num_readonly: bool = false,
 
+    /// Fold in the signatures this half's non-late-bindable computed member
+    /// NAMES contribute (`computed_key.splitDynamicMembers`). A WRITTEN
+    /// signature keeps its slot: tsc's `resolveDeclaredMembers` reads the
+    /// declared index infos first, and the computed ones only fill what is
+    /// left. A number index in either source takes the key domain back from a
+    /// symbol one, which is what `obj_flag_symbol_index` means.
+    fn withDynamic(i: ClassIndexInfos, dyn: computed_key.DynamicIndexes) ClassIndexInfos {
+        var out = i;
+        if (out.str == 0 and dyn.str != 0) {
+            out.str = dyn.str;
+            out.str_readonly = dyn.str_readonly;
+            out.sym_only = dyn.sym_only;
+        }
+        if (out.num == 0 and dyn.num != 0) {
+            out.num = dyn.num;
+            out.num_readonly = dyn.num_readonly;
+        }
+        if (out.num != 0) out.sym_only = false;
+        return out;
+    }
+
     /// `base` plus the symbol-index and readonly-index flags this half earned.
     pub fn objFlags(i: ClassIndexInfos, base: u32) u32 {
         var f = base;
@@ -729,7 +751,13 @@ pub fn classInstanceGeneric(c: *Checker, sym0: SymbolId) Error!TypeId {
                 .flags = flags,
             });
         }
-        result = try c.ts.makeObject(props.items, own_index.str, own_index.num, own_index.objFlags(types.obj_flag_not_inferable));
+        // A member whose computed name names no property (`class K {
+        // [plain]() {} }` with `plain: symbol`) contributes an INDEX SIGNATURE
+        // instead of a member — tsc's `getIndexInfosOfIndexSymbol`. The split
+        // both removes those props and reads the survivors, so it runs once
+        // the table is complete.
+        const idx = own_index.withDynamic(try computed_key.splitDynamicMembers(c, &props, kscope));
+        result = try c.ts.makeObject(props.items, idx.str, idx.num, idx.objFlags(types.obj_flag_not_inferable));
     }
     // Same-file class+interface declaration merge. tsc binds the pair to ONE
     // symbol whose declarations share a single member table, and whose base
