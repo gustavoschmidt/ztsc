@@ -328,7 +328,16 @@ fn tupleSlice(c: *Checker, r: TypeId, from: u32) Error!TypeId {
 /// statically here; under-excluding it would invent an assignability error at
 /// the rest target, so the whole shape falls back to `whole`.
 pub fn objectRestType(c: *Checker, whole: TypeId, pat: Node) Error!TypeId {
-    const r = try c.resolveStructural(whole);
+    const r0 = try c.resolveStructural(whole);
+    // tsc's `getRestType` walks `getPropertiesOfType(source)`, which answers
+    // for a CLASS VALUE (`const { ...rest } = C`) out of its static side.
+    // Leaving `typeof C` untouched instead handed the rest binding every
+    // static the class has, including the `#private` ones a spread drops
+    // (`privateNameAndObjectRestSpread`).
+    const r = if (c.ts.kind(r0) == .class_value)
+        try c.classStaticType(c.ts.classSymbol(r0))
+    else
+        r0;
     const kind = c.ts.kind(r);
     if (kind != .object and kind != .intersection) return whole;
 
