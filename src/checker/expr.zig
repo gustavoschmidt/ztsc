@@ -4039,7 +4039,19 @@ pub fn unionNestedPropType(c: *Checker, rt: TypeId, key: Atom) Error!?TypeId {
 fn ctxIndexType(c: *Checker, rctx: TypeId, want_number: bool) Error!TypeId {
     switch (c.ts.kind(rctx)) {
         .object => {
-            const idx = if (want_number) c.ts.objectNumberIndex(rctx) else c.ts.objectStringIndex(rctx);
+            // tsc's `getContextualTypeForObjectLiteralElement` ends in
+            // `isNumericName(name) && getIndexTypeOfContextualType(numberType)
+            // || getIndexTypeOfContextualType(stringType)`: a NUMERIC key
+            // prefers the number signature and falls back to the string one,
+            // exactly as `findApplicableIndexInfo` does for a read. Without
+            // the fallback, `var o: I = { [+"foo"](y) { … } }` under an
+            // `I = { [s: string]: (x: string) => number }` gave its parameter
+            // no contextual type at all and every such member was a TS7006
+            // (`computedPropertyNamesContextualType3`).
+            if (want_number and c.ts.objectNumberIndex(rctx) != 0) return c.ts.objectNumberIndex(rctx);
+            // The string slot may really hold a `[k: symbol]` signature, which
+            // no string- or number-domain key reaches.
+            const idx = props_zig.stringIndexForStringKey(c, rctx);
             return if (idx != 0) idx else types.no_type;
         },
         // A constituent with no index signature contributes nothing (tsc's
