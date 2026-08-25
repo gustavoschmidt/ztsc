@@ -642,13 +642,22 @@ pub fn lenientOverlap(c: *Checker, s0: TypeId, t0: TypeId, depth: u32) Error!boo
     if (tk == .object) {
         for (0..c.ts.objectPropCount(t)) |i| {
             const tp = c.ts.objectProp(t, @intCast(i));
-            // `propOfType` (unlike `objectPropByName`) reaches through a
-            // source intersection / ref / string index signature, so the
-            // winning direction — where the intersection being cast to is
-            // the relation *source* — resolves each target member. Optional
-            // target props may be absent (the optional→required leniency);
-            // present props need only be comparable (either direction).
-            const sp = (try c.propOfType(s, tp.name)) orelse {
+            // `relationSrcProp` (unlike `objectPropByName`) reaches through a
+            // source intersection / ref, so the winning direction — where the
+            // intersection being cast to is the relation *source* — resolves
+            // each target member. Optional target props may be absent (the
+            // optional→required leniency); present props need only be
+            // comparable (either direction).
+            //
+            // It is the RELATION's lookup and not the member-access one for
+            // the reason it exists: a string INDEX SIGNATURE does not answer a
+            // named property. `{ [k: string]: number } as { foo: string }` is
+            // TS2352 in tsgo, and the plain lookup handed this walk a synthetic
+            // `foo: number` — comparable to `string` neither way, so that one
+            // still failed, but `{ [k: string]: unknown }` handed it `unknown`,
+            // which overlaps everything. That is the same distinction
+            // `structuralAssignable` already draws one relation over.
+            const sp = (try relationSrcProp(c, s, tp.name)) orelse {
                 if (tp.optional()) continue;
                 return false; // required target member absent from source
             };
@@ -682,9 +691,66 @@ pub fn lenientOverlap(c: *Checker, s0: TypeId, t0: TypeId, depth: u32) Error!boo
         // signature the source cannot supply does not overlap.
         if (!try c.sigListOverlap(s, t, false, depth)) return false;
         if (!try c.sigListOverlap(s, t, true, depth)) return false;
-        return true;
+        return indexInfoOverlap(c, s, t, depth);
     }
     return false; // non-object shapes: the isComparable probes already ruled
+}
+
+/// tsc's `typeRelatedToIndexInfo` under the COMPARABLE relation — the target's
+/// STRING index signature, which this walk used to ignore entirely, so
+/// `Record<string, unknown>` (no named members at all) was overlapped by every
+/// object in the language.
+///
+/// ```ts
+/// function typeRelatedToIndexInfo(source, targetInfo, …) {
+///     const sourceInfo = getApplicableIndexInfo(source, targetInfo.keyType);
+///     if (sourceInfo) return indexInfoRelatedTo(sourceInfo, targetInfo, …);
+///     if (… isObjectTypeWithInferableIndex(source)) {
+///         return membersRelatedToIndexInfo(source, targetInfo, …);
+///     }
+///     return Ternary.False;
+/// }
+/// ```
+///
+/// `isObjectTypeWithInferableIndex` is the load-bearing half: an object or type
+/// literal, an enum or a value module has its members read as an implicit index
+/// signature; a CLASS INSTANCE or an INTERFACE does not, and a class merged
+/// with a namespace still does not (`!(type.symbol.flags & SymbolFlags.Class)`
+/// is a separate conjunct from the ValueModule test). ztsc already carries that
+/// bit as `obj_flag_not_inferable`, and the assignable walk already consults it
+/// — this is the same rule on the comparable side, and it is the whole of
+/// `mergedClassNamespaceRecordCast`: `new C1() as Record<string, unknown>` and
+/// `new C2() as Record<string, unknown>` are TS2352 while `C3 as Record<string,
+/// unknown>` (a bare namespace) is not.
+///
+/// The `any`-valued exemption is the one from `indexSignaturesRelatedTo` and is
+/// what keeps `x as Record<string, any>` the escape hatch it is in practice; it
+/// is spelled the same way it is on the assignable side, and `unknown` does not
+/// get it.
+///
+/// NUMBER index signatures are deliberately not asked about. The assignable
+/// walk needs them because a target may be spelled `{ [x: number]: T }` alone;
+/// the shapes this walk exists for reach it through a cast, and no corpus or
+/// app case needs the numeric half — adding it on speculation would only widen
+/// the surface of a rule whose whole risk is false REJECTION.
+fn indexInfoOverlap(c: *Checker, s: TypeId, t: TypeId, depth: u32) Error!bool {
+    const sidx = c.ts.objectStringIndex(t);
+    if (sidx == 0) return true;
+    if (isNonPrimitiveKind(c.ts.kind(s)) and
+        c.ts.kind(try c.resolveStructural(sidx)) == .any) return true;
+    // Only an object side can be judged on members; everything else keeps the
+    // walk's standing concession (see `lenientOverlap`'s doc comment: a shape
+    // with no verdict must not answer "no overlap").
+    if (c.ts.kind(s) != .object) return true;
+    if (c.ts.objectStringIndex(s) != 0) {
+        return c.lenientComparable(c.ts.objectStringIndex(s), sidx, depth + 1);
+    }
+    if (!c.ts.objectHasImpliedIndex(s)) return false; // interface / class instance
+    for (0..c.ts.objectPropCount(s)) |i| {
+        const sp = c.ts.objectProp(s, @intCast(i));
+        if (!try c.lenientComparable(sp.ty, sidx, depth + 1)) return false;
+    }
+    return true;
 }
 
 /// How many call (or construct) signatures a type offers the overlap walk.
