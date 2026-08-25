@@ -376,7 +376,7 @@ fn iterationOutcome(c: *Checker, rt: TypeId) Error!IterationOutcome {
         // `anyIterationTypes` the moment the method (or its return) is `any`,
         // and never look for `next` (`for-of25`, `for-of27`).
         if (isAnyLike(c, try c.resolveStructural(p.ty))) return .{ .element = types.any_type };
-        const ret = try c.callableReturn(p.ty);
+        const ret = try zeroArgCallableReturn(c, p.ty);
         if (ret != 0) {
             if (isAnyLike(c, try c.resolveStructural(ret))) return .{ .element = types.any_type };
             // Lib iterables return `IterableIterator<E>`/`Iterator<E>`.
@@ -417,7 +417,7 @@ pub fn asyncIterationElementType(c: *Checker, rt: TypeId) Error!?TypeId {
         else => {},
     }
     if (try c.propOfType(r, c.atom_sym_asyncIterator)) |p| {
-        const ret = try c.callableReturn(p.ty);
+        const ret = try zeroArgCallableReturn(c, p.ty);
         if (ret != 0) {
             const y = c.asyncGeneratorYieldType(ret);
             if (y != 0) return y;
@@ -440,6 +440,47 @@ pub fn callableReturn(c: *Checker, ty: TypeId) Error!TypeId {
         },
         else => return 0,
     }
+}
+
+/// Return type of the signature the ITERATION PROTOCOL would actually reach:
+/// the first one callable with NO arguments. 0 when `ty` is not callable, or
+/// when every signature it has demands an argument.
+///
+/// The protocol invokes `[Symbol.iterator]()` / `[Symbol.asyncIterator]()`
+/// with nothing, so a signature with a REQUIRED parameter is not the protocol
+/// — tsc filters the call signatures by `getMinArgumentCount(sig) === 0`
+/// (microsoft/TypeScript#57130) and reports TS2488 when none survive. An
+/// optional or rest parameter still has a zero minimum and still qualifies
+/// (`iteratorExtraParameters`, verified against the oracle both ways).
+///
+/// `next` deliberately does NOT go through this: the protocol DOES hand
+/// `next` a value, so `next(v: T)` is a legal iterator — a `T` that
+/// `undefined` cannot satisfy is tsc's separate TS2763, not a missing
+/// protocol.
+fn zeroArgCallableReturn(c: *Checker, ty: TypeId) Error!TypeId {
+    switch (c.ts.kind(ty)) {
+        .function => return if (minArgCount(c, ty) == 0) c.ts.fnReturn(ty) else 0,
+        .overloads => {
+            for (try c.memberList(ty)) |sig| {
+                if (minArgCount(c, sig) == 0) return c.ts.fnReturn(sig);
+            }
+            return 0;
+        },
+        else => return 0,
+    }
+}
+
+/// tsc's `getMinArgumentCount`: how many arguments a signature demands.
+/// Optional and rest parameters demand none, and neither does anything after
+/// the first of them.
+fn minArgCount(c: *const Checker, sig: TypeId) u32 {
+    const n = c.ts.fnParamCount(sig);
+    var i: u32 = n;
+    while (i > 0) : (i -= 1) {
+        const p = c.ts.fnParam(sig, i - 1);
+        if (!p.optional() and !p.rest()) return i;
+    }
+    return 0;
 }
 
 /// The `value` type of an iterator's `next()` result, i.e. the yield type
