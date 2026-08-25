@@ -556,14 +556,20 @@ fn legacyDescriptorType(c: *Checker, t: TypeId) TypeId {
 /// signature of that shape) and on argument assignability second, and the
 /// argument failure outranks the arity one in the report.
 ///
-/// Deliberately narrower than tsc in three places, each an under-report and
+/// Deliberately narrower than tsc in two places, each an under-report and
 /// never a false positive: an OVERLOADED decorator is left alone (tsc's
-/// report there is a nested "No overload matches this call" chain), a
+/// report there is a nested "No overload matches this call" chain) and a
 /// GENERIC signature is left alone (its parameters are only judgeable after
-/// inference), and a non-callable decorator is left alone (tsc's "This
-/// expression is not callable"). The decorator's RETURN type — tsc also
-/// requires `void`/`any` for a property decorator and a descriptor for a
-/// method one, under the same TS12xx codes — is not checked here either.
+/// inference). The decorator's RETURN type — tsc also requires `void`/`any`
+/// for a property decorator and a descriptor for a method one, under the same
+/// TS12xx codes — is not checked here either.
+///
+/// A CLASS used as a decorator is the one non-callable shape that is answered:
+/// `@CtorDtor class C {}` cannot resolve, whatever `CtorDtor` declares,
+/// because a class constructor is never callable as a function
+/// (`constructableDecoratorOnClass01`). Every other non-callable type stays an
+/// under-report — an `any`, an unresolved import or a shape ztsc modelled
+/// incompletely must not turn into an invented diagnostic.
 fn checkLegacyDecoratorSig(c: *Checker, deco: Node, dt: TypeId, pos: DecoPos, args: LegacyDecoArgs) Error!void {
     const r = try c.resolveStructural(dt);
     const sig = switch (c.ts.kind(r)) {
@@ -571,6 +577,16 @@ fn checkLegacyDecoratorSig(c: *Checker, deco: Node, dt: TypeId, pos: DecoPos, ar
         // A callable object with exactly one signature resolves like a plain
         // function; more than one is an overload set (skipped, above).
         .object => if (c.ts.objectCallSigCount(r) == 1) c.ts.objectCallSig(r, 0) else return,
+        // tsc's `resolveCall` finds no call signature at all and reports the
+        // decorator head with `getInvocationErrorDetails` chained beneath —
+        // the two-level "not callable / no call signatures" chain, verified
+        // byte-for-byte against tsgo 7.0.2.
+        .class_value => return c.diagFmt(
+            decoCode(pos),
+            decoExprSpan(c, deco),
+            "Unable to resolve signature of {s} decorator when called as an expression.\n  This expression is not callable.\n    Type '{s}' has no call signatures.",
+            .{ decoPosWord(pos), try c.typeToString(dt) },
+        ),
         else => return,
     };
     if (c.ts.fnTypeParams(sig).len > 0) return;
