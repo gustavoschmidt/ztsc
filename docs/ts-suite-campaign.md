@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-25, post wave 36)
+## Standings (2026-08-25, post wave 37)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7630 / 8633 (88.4%)** |
-| excess keys (false positives) | 3541 | 1298 |
-| missing keys (under-reports) | 8617 | 2473 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7656 / 8633 (88.7%)** |
+| excess keys (false positives) | 3541 | 1280 |
+| missing keys (under-reports) | 8617 | 2451 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Thirty-six waves landed (3–36), every one with ZERO match→non-match regressions in
+Thirty-seven waves landed (3–37), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -601,7 +601,77 @@ makeIntersection ORIGIN closed as redesign-sized. PERF BASELINE
 WARNING (A): never use main's prebuilt zig-out binary as a baseline —
 rebuild from the merge-base in the same worktree (~2.6% drift).
 
-## Ranked next queue (wave 37) — distilled from wave-36 agent reports
+Wave 37 (+26 exact → 7656/8633 88.7%): A landed the getInferredType
+constraint clamp — POSITION-DEPENDENT in a signature relation (parameter
+candidates take the whole constraint, return candidates the satisfying
+subset; oracle battery in clampSigInference's doc comment), restricted
+to bare-type-param bounds because the general clamp cost +4% zod
+(bisected: pairs stop falling to the cheap erase path); `new C()` on a
+ctor-less class answers C<unknown>; a method's bare bound is enforced
+once the receiver substitutes it (closed wrappedAndRecursiveConstraints4
+as a free rider). At a CALL seam tsgo takes the FULL constraint —
+built, swept, zero delta, reverted and recorded. B landed
+AccessFlags.Writing for index-access targets (intersection over a union
+key, per-constituent missing screen), the abstractCtorTail bit, and
+TS2741 stand-in names via heritage.declaresHeritage (a base-less ref
+can't be base-swapped). C landed the union-key write intersection,
+objlit/spread write_ty (the flagged getRestType premise was INVERTED —
+tsc keeps it there; addSpreadProp was the dropper), field-beats-method
+ordering, setter-return exemption, class-value rest, prototype
+not-readonly. D landed binding-pattern list recovery (the decisive
+detail: tsc's inErrorRecovery refuses `;` as an empty statement INSIDE
+a parameter list but lets it terminate a declarator list), the whole
+import-defer family (one predicate: tsc reads at most ONE of
+type/defer), and the three forwarded one-liners (TS1113 latch, TS2492
+BlockScopedVariable — measured: class is silent too, print single
+construct sig). 149 cases now diverge ONLY in TS1xxx codes.
+
+## Ranked next queue (wave 38) — distilled from wave-37 agent reports
+
+1. Non-late-bindable computed member names contribute an INDEX
+   SIGNATURE (tsc getIndexInfosOfIndexSymbol): object literals do this,
+   classes/type-literals/interfaces don't. `class K { [plain]() {} }`
+   with plain: symbol → `[x: symbol]: () => number`; a
+   `data-${string}` pattern key gives a STRING-keyed index (verified).
+   Wins symbolProperty61, declarationEmitComputedNameWithQuestionToken.
+   Changes class shapes — own gate cycle (expr/classes/statics/
+   typenode: agent C + flags).
+2. Junk-token-as-operand: ztsc CONSUMES a junk/unterminated token as an
+   expression operand where tsc's createMissingNode consumes nothing,
+   landing 'expected' diagnostics one token late (TypeArgumentList1,
+   parserX_TypeArgumentList1, parserRegularExpressionDivideAmbiguity4)
+   — highest-yield parser lead.
+3. import.defer EXPRESSION form (TS18061/TS17012 + parsing; 4 cases).
+4. Missing TS1xxx codes, one each: TS1211, TS1084, TS1196, TS1186,
+   TS1142 ×2, TS1477, TS1340, TS1355, TS1453; TS1238/TS1239 decorator
+   signature resolution ×6 (checker side, agent C).
+5. divergentAccessorsTypes2 message text (keys match): the assignment
+   RHS isn't widened in the message ('42' should print 'number' when
+   the contextual type is non-literal) AND the message names the READ
+   type where the check used the write type (expr.zig).
+6. coAndContraVariantInferences5 NEW LEAD: tsc re-checks arguments
+   against the CLAMPED parameter types; ztsc doesn't (infer/calls).
+7. contravariantOnlyInferenceFromAnnotatedFunction: empirical rule
+   oracle-confirmed (extend reverseMappedElem's local_syms to the
+   call's tp_syms when the template property mentions K or B).
+8. unionPropertyOfProtectedAndIntersectionProperty: tsc's
+   createUnionOrIntersectionProperty returns undefined on
+   private/protected multi-symbol unions EXCEPT via the
+   shared-declaration test — needs oracle pinning (props.zig).
+9. String-literal property names need real escape cooking (atoms.zig
+   memberAtom stripQuotes; also changes literal-type printing —
+   dedicated slot).
+10. TS2344 non-inference residue: Parameters<typeof C>,
+    import('./f').Foo<T>, instantiation expressions, two
+    recursive-constraint cases (typeparams/typenode).
+11. deeplyNestedConstraints (>5 constraint levels through a mapped
+    TypeMap<E> — sizeable); destructuringFromUnionSpread (union-spread
+    distribution rewrite); alias variance (types.zig, still blocked —
+    consistentAliasVsNonAliasRecordBehavior).
+12. Census: TS2322 one-key pool (~26 under / ~12 excess, capB37/t4.tsv);
+    substitution types; resolution-mode attributes.
+
+## Superseded queue (wave 37, kept for context)
 
 1. indexAccessTargetConstraint needs tsc's AccessFlags.Writing: the
    constraint of Obj[K] as a TARGET is the INTERSECTION over a
