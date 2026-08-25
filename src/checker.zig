@@ -1129,6 +1129,13 @@ pub const Checker = struct {
     /// file (right-sizing), so a checker only maps scopes for files it
     /// actually traverses — not every file of the program, per instance.
     node_scopes: IntMap(u64, ScopeId) = .empty,
+    /// (file << 32 | function-like node) -> `fnExprIsContextSensitive`.
+    /// A pure function of the SYNTAX (parameter annotations, and the shape of
+    /// the returned expressions), so one answer per node is the only answer —
+    /// tsc caches it the same way, on `getNodeLinks`. Memoized because the
+    /// inference loops in `infer.zig` ask it once per candidate signature per
+    /// round while the answer costs a walk of the whole body.
+    ctx_sensitive_memo: IntMap(u64, bool) = .empty,
     /// Per-file flag: has this file's scope-owner map been faulted into
     /// `node_scopes` yet?
     scopes_faulted: []bool = &.{},
