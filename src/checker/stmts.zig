@@ -1119,6 +1119,14 @@ pub fn drainDeferredBodies(c: *Checker) Error!void {
         const d = c.deferred_bodies.items[i];
         if (d.file != c.cur_file) c.setFile(d.file);
         c.this_type = d.this_type;
+        // Nothing lent this body a receiver on the way in, and it is a member
+        // of an object literal with no contextual type: `this` is the
+        // literal's own type, which exists now and did not when the body was
+        // queued (tsc's `getContextualThisParameterType` last arm — see
+        // `Checker.this_bound_fns`).
+        if (c.this_type == 0) {
+            if (try expr_zig.deferredThisType(c, d.node)) |t| c.this_type = t;
+        }
         try c.checkFunctionBody(d.node, d.proto_idx, d.body, d.sig, d.ret_ctx);
     }
     c.deferred_bodies.clearRetainingCapacity();

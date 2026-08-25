@@ -247,9 +247,35 @@ fn thisBoundKey(c: *const Checker, fn_node: Node) u64 {
 }
 
 /// Record that `fn_node` has a receiver of its own — see
-/// `Checker.this_bound_fns`.
-fn markThisBound(c: *Checker, fn_node: Node) Error!void {
-    try c.this_bound_fns.put(c.cm(), thisBoundKey(c, fn_node), {});
+/// `Checker.this_bound_fns`. `lit` is the containing object literal whose OWN
+/// type is this function's `this` (`null_node` when the receiver comes from
+/// somewhere else, which is every case but an uncontextualized literal).
+fn markThisBound(c: *Checker, fn_node: Node, lit: Node) Error!void {
+    try c.this_bound_fns.put(c.cm(), thisBoundKey(c, fn_node), lit);
+}
+
+/// The object literal whose OWN type is `fn_node`'s `this` — `null_node` when
+/// `fn_node` is not an object-literal member, or when its receiver comes from
+/// somewhere that already knows the answer (a contextual type, a `ThisType<T>`
+/// marker, an explicit `this` parameter). See `Checker.this_bound_fns`.
+pub fn deferredThisSource(c: *const Checker, fn_node: Node) Node {
+    return c.this_bound_fns.get(thisBoundKey(c, fn_node)) orelse null_node;
+}
+
+/// The type that literal ended up with — tsc's
+/// `getContextualThisParameterType` falling through to
+/// `getWidenedType(checkExpressionCached(containingLiteral))`.
+///
+/// Answered from the FINISHED literal's recorded type, which is why the body
+/// asking has to have been deferred (see `objLitDeferBodies`): mid-walk the
+/// literal has no type yet, and tsc's whole reason for `checkNodeDeferred` on
+/// an object-literal member is to make this answer available. `null` when
+/// `fn_node` is not such a member, or when the literal's type never made it
+/// into `node_types`.
+pub fn deferredThisType(c: *Checker, fn_node: Node) Error!?TypeId {
+    const lit = deferredThisSource(c, fn_node);
+    if (lit == null_node) return null;
+    return c.nodeType(lit);
 }
 
 /// `this`, narrowed the way tsc's `checkThisExpression` narrows it: both arms
@@ -3502,6 +3528,20 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
         inherited_marker
     else
         (try thisTypeMarker(c, rctx)) orelse inherited_marker;
+    // tsc's `getContextualThisParameterType` ends at
+    // `getWidenedType(contextualType ? getNonNullableType(contextualType) :
+    // checkExpressionCached(containingLiteral))`: with NO contextual type at
+    // all, a member's `this` is the literal's own finished type. That is the
+    // arm `objectLiteralThis` could not answer, and the only one that needs
+    // the literal to be complete — hence the deferral. Recorded per member
+    // node so the drained body can read it back (`this_bound_fns`).
+    //
+    // Deliberately NOT extended to the two cases `objectLiteralThis` refuses
+    // with a free type variable in hand: tsc answers those with the marker /
+    // contextual type instantiated through the enclosing call's inference
+    // context, and substituting the literal's own type there would be a
+    // different (wrong) receiver rather than the under-report they are today.
+    const this_fallback: Node = if (rctx == types.no_type and this_marker == types.no_type) node else null_node;
     var props: std.ArrayList(types.Prop) = .empty;
     defer props.deinit(c.scratch());
     var prop_index: std.AutoHashMapUnmanaged(Atom, u32) = .empty;
@@ -3557,9 +3597,9 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
         // function expression's PARENT is the property assignment, which
         // `{ a: (function () {}) }` fails.
         switch (c.nodeTag(prop)) {
-            .object_method => try markThisBound(c, pd.rhs),
+            .object_method => try markThisBound(c, pd.rhs, this_fallback),
             .object_property => {
-                if (pd.rhs != null_node and c.nodeTag(pd.rhs) == .function_expr) try markThisBound(c, pd.rhs);
+                if (pd.rhs != null_node and c.nodeTag(pd.rhs) == .function_expr) try markThisBound(c, pd.rhs, this_fallback);
             },
             else => {},
         }
@@ -6078,7 +6118,7 @@ pub fn assignedMethodThisType(c: *Checker, target: Node, value0: Node) Error!?Ty
     }
     const obj = c.tree.nodeData(target).lhs;
     if (obj == null_node) return null;
-    try markThisBound(c, value);
+    try markThisBound(c, value, null_node);
     const t = try c.checkExprCached(obj, types.no_type);
     if (t == types.error_type or t == types.any_type or t == types.no_type) return null;
     return t;
@@ -7580,7 +7620,7 @@ fn checkFunctionLikeExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             c.this_type = ctx_this;
             // Recorded so a `this` in the body knows the receiver is THIS
             // function's and not an outer frame's — see `thisFrameOwnsThis`.
-            try markThisBound(c, node);
+            try markThisBound(c, node, null_node);
         }
     }
     const sig = try c.signatureOfProtoCtx(node, d.lhs, false, ctx_sig == types.no_type, ctx_sig);

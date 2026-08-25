@@ -1994,7 +1994,16 @@ pub const Checker = struct {
     /// (`DeferredBody`) and runs long after the object literal that owns it has
     /// been left. Being an object-literal member is a property of the NODE, so
     /// recording it once is both correct and cheaper than threading it.
-    this_bound_fns: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    ///
+    /// The VALUE is the containing object literal when that literal has NO
+    /// contextual type of its own, and `null_node` otherwise (including for a
+    /// function that took its `this` from a contextual signature). It is the
+    /// last arm of tsc's `getContextualThisParameterType`,
+    /// `getWidenedType(checkExpressionCached(containingLiteral))` — the
+    /// literal's own type, which is only knowable once the literal is finished,
+    /// so the deferred body reads it back through `node_types` at drain time.
+    /// See `expr.objectLiteralThisFallback`.
+    this_bound_fns: std.AutoHashMapUnmanaged(u64, Node) = .empty,
     /// The class symbol whose constructor body is currently being checked
     /// (`no_symbol` = not in a constructor). A `readonly` property may be
     /// assigned via `this.x` inside the constructor of the class that OWNS the
