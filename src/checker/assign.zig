@@ -3609,6 +3609,22 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
 /// re-compared, not a full second relation. A nested failure is still reported
 /// by the ordinary walk whenever the shortcut does not fire, so this is the
 /// under-reporting direction.
+///
+/// And COMPARABLE, not assignable — a deliberate weakening of tsc's rule,
+/// bounded by a witness. tsc's version is a full relation re-run, so it sees
+/// the property pair in the same state the ordinary walk would; this one asks
+/// the relation cold, and re-deciding a pair the shortcut had already stepped
+/// around turns any residual imprecision in the relation into a NEW false
+/// positive rather than a missing one. social-app's
+/// `queryClient.fetchQuery(queryOptions({…}))` is that witness: the source is
+/// `Opts & { queryKey: DataTag<…> }`, the second constituent alone satisfies
+/// `FetchQueryOptions` (every other member is optional), and asking cold about
+/// `persister` — a `QueryPersister` whose callback context differs only in
+/// `direction?: unknown` vs `direction: "backward" | "forward"` — fails one way
+/// and succeeds the other, where tsgo accepts. Requiring the pair to be
+/// unrelated in BOTH directions keeps every case this check is for (`null` vs
+/// `number | undefined`, `boolean` vs `string | undefined` — primitives that
+/// are unrelated either way) and drops that one.
 fn intersectionOptionalsRelated(c: *Checker, s: TypeId, t: TypeId) Error!bool {
     const rt = try c.resolveStructural(t);
     if (c.ts.kind(rt) != .object) return true;
@@ -3617,10 +3633,20 @@ fn intersectionOptionalsRelated(c: *Checker, s: TypeId, t: TypeId) Error!bool {
     for (0..n) |i| {
         const tp = c.ts.objectProp(rt, @intCast(i));
         if (!tp.optional()) continue;
-        const sp = (try propOfType(c, s, tp.name)) orelse continue;
+        // `relationSrcProp`, not `propOfType`: the relation's own source
+        // lookup, which refuses to answer a NAMED property out of a string
+        // index signature. `propOfType` does answer from one, and ztsc uses an
+        // `any`-valued index as its stand-in for a constituent it could not
+        // reduce — so the plain lookup handed this check a synthetic member
+        // that the structural walk would never have compared (social-app's
+        // `queryClient.fetchQuery(queryOptions({…}))`, whose source is
+        // `Opts & { queryKey: DataTag<…> }`, was a false TS2345 on `persister`).
+        const sp = (try relationSrcProp(c, s, tp.name)) orelse continue;
         const want = try c.makeUnion2(tp.ty, types.undefined_type);
         const have = if (sp.optional()) try c.makeUnion2(sp.ty, types.undefined_type) else sp.ty;
-        if (!try c.isAssignable(have, want)) return false;
+        // BOTH directions, not just the assignable one — see the doc comment's
+        // last paragraph.
+        if (!try c.isComparable(have, want)) return false;
     }
     return true;
 }
