@@ -1248,7 +1248,38 @@ fn checkTdz(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex) Error!void 
     // — the ambient test comes FIRST and short-circuits the position check
     // entirely, so `var y = identity(x); declare const identity: <T>(v: T) => T`
     // is clean (`genericFunctionInference1`).
-    if (isAmbientDecl(c, decls[0])) return;
+    // …and neither does anything written in a DECLARATION FILE: tsc gates the
+    // whole check on `!(declaration.flags & NodeFlags.Ambient)`, and every node
+    // of a `.d.ts` carries that flag whether or not a `declare` modifier was
+    // spelled. A declaration file states an order-free API, so
+    // `export class C { static readonly p: unique symbol; [C.p](): void }` in
+    // one is clean (`declarationTypecheckNoUseBeforeReferenceCheck`).
+    if (isAmbientDecl(c, decls[0]) or c.symInDeclFile(sym)) return;
+    // A CLASS named inside a computed member name of its OWN body is in a
+    // temporal dead zone however the positions read: the name is evaluated
+    // while the binding is still being initialized. tsc closes the
+    // "declaration is before usage" arm of `isBlockScopedNameDeclaredBeforeUse`
+    // with exactly this exception —
+    //
+    //     else if (isClassDeclaration(declaration)) {
+    //         return !findAncestor(usage, n => isComputedPropertyName(n) &&
+    //             n.parent.parent === declaration);
+    //     }
+    //
+    // — so `class A { static p = 1; [A.p]() {} }` is TS2449 at `A`, for every
+    // member spelling (field, method, accessor, static or not) and for a class
+    // EXPRESSION just the same (`classDeclarationShouldBeOutOfScopeInComputed
+    // Names`, `computedPropertyNamesWithStaticProperty`). It runs ahead of the
+    // position, deferral and container tests below because it overrules all
+    // three: the declaration IS earlier, the name IS a deferred one for a
+    // method, and the containers differ.
+    if (c.symFlags(sym).class and c.computed_key_owner != 0) {
+        for (decls) |d| {
+            if (d != c.computed_key_owner) continue;
+            try c.diagFmt(2449, c.tokSpan(tok), "Class '{s}' used before its declaration.", .{c.tokenText(tok)});
+            return;
+        }
+    }
     const decl_start = c.nodeSpanStart(decls[0]);
     const use_start = c.tree.tokens.start(tok);
     if (use_start >= decl_start) return;
@@ -6658,8 +6689,36 @@ fn baseOfLiteralType(c: *Checker, t: TypeId) Error!TypeId {
 /// generic TS7053. Both are gated on `noImplicitAny`; the access types as
 /// `any` either way.
 pub fn reportIndexImplicitAny(c: *Checker, node: Node, recv: Node, idx_t: TypeId, obj_t: TypeId) Error!void {
-    if (!c.prog.no_implicit_any) return;
     const r = try c.resolveStructural(obj_t);
+    // tsc wraps its ENTIRE implicit-any block in
+    // `if (accessExpression && !isConstEnumObjectType(objectType))`, so the
+    // value side of a `const enum` never earns a TS7052/TS7053 at all: the walk
+    // falls through to `getPropertyTypeForIndexType`'s last report instead —
+    // `Property '0' does not exist on type '1'`, blamed on the INDEX expression
+    // (`getIndexNodeForAccessExpression`) rather than on the access, and NOT
+    // gated on `noImplicitAny`. `const enum E { A }; E["B"]` is that case
+    // (`constEnumBadPropertyNames`, `constEnumErrors`).
+    if (isConstEnumObjectType(c, r)) {
+        const lit = try c.ts.regularLiteral(idx_t);
+        // The key, unquoted — `typeToString` of a string literal carries quotes
+        // this message must not (same rule as the object-literal arm below).
+        const name: ?[]const u8 = switch (c.ts.kind(lit)) {
+            .string_literal => c.atomText(c.ts.literalAtom(lit)),
+            .number_literal => try c.typeToString(lit),
+            else => null,
+        };
+        if (name) |n| {
+            const idx_node = switch (c.nodeTag(node)) {
+                .index_expr, .optional_index_expr => c.tree.nodeData(node).rhs,
+                else => node,
+            };
+            try c.diagFmt(2339, c.nodeSpan(idx_node), "Property '{s}' does not exist on type '{s}'.", .{
+                n, try c.typeToString(obj_t),
+            });
+        }
+        return;
+    }
+    if (!c.prog.no_implicit_any) return;
     // tsc picks `set` for an assignment target and `get` otherwise. ztsc has
     // no write context at this site, so it asks for `get` only: an object
     // carrying BOTH (the map-like shape this diagnostic exists for) reports
@@ -6712,6 +6771,31 @@ pub fn reportIndexImplicitAny(c: *Checker, node: Node, recv: Node, idx_t: TypeId
     try c.diagFmt(7053, c.nodeSpan(node), "Element implicitly has an 'any' type because expression of type '{s}' can't be used to index type '{s}'.", .{
         try c.typeToString(idx_t), try c.typeToString(obj_t),
     });
+}
+
+/// tsc's `isConstEnumObjectType`: the VALUE side (`typeof E`) of a `const
+/// enum`, which its indexed-access walk exempts from every implicit-any
+/// report.
+///
+/// tsc reads `objectType.symbol`; ztsc's enum value object
+/// (`enums.enumValueType`) is an anonymous `makeObject` that carries no symbol,
+/// so the enum is recovered from its MEMBERS — every property of that object is
+/// an `.enum_type` member of one enum symbol, a shape nothing else builds. An
+/// enum with NO members has no property to read and stays a gap (an under-
+/// report there: `const enum Empty {}; Empty["x"]` keeps its TS7053).
+fn isConstEnumObjectType(c: *Checker, t: TypeId) bool {
+    if (c.ts.kind(t) != .object) return false;
+    const n = c.ts.objectPropCount(t);
+    if (n == 0) return false;
+    var sym: u32 = 0;
+    for (0..n) |i| {
+        const p = c.ts.objectProp(t, @intCast(i));
+        if (!c.ts.isEnumMember(p.ty)) return false;
+        const s = c.ts.enumSymbol(p.ty);
+        if (sym != 0 and s != sym) return false;
+        sym = s;
+    }
+    return constEnumOnly(c, c.declsOf(sym));
 }
 
 /// The expression inside any number of parentheses. tsc's `skipParentheses`:
