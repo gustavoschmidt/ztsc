@@ -714,6 +714,29 @@ pub const Code = enum(u16) {
     /// Reported on the name token, and NOT gated on `static` (`static get
     /// constructor` reports too — verified against tsgo 7.0.2).
     ctor_may_not_be_accessor,
+    // --- `checkGrammarAccessor` (src/frontend/accessor_grammar.zig) --------
+    // One walk with one `return`, so at most one of these fires per accessor.
+    // All GRAMMAR-class: tsc keeps them in the checker, and a sibling file's
+    // TS2322 survives beside them (measured).
+    /// TS1094: `get x<T>()` — an accessor cannot be generic. At the name.
+    accessor_type_parameters,
+    /// TS1054: `get x(a: number)` — a getter takes no parameters (a `this`
+    /// parameter is not one). At the name.
+    get_accessor_parameters,
+    /// TS1049: `set x()` / `set x(a, b)` — a setter takes exactly one. At the
+    /// name.
+    set_accessor_one_parameter,
+    /// TS1095: `set x(v: number): void` — a setter has nothing to return. At
+    /// the name.
+    set_accessor_return_type,
+    /// TS1053: `set x(...v: number[])`. At the `...`.
+    set_accessor_rest_parameter,
+    /// TS1051: `set x(v?: number)`. At the `?`.
+    set_accessor_optional_parameter,
+    /// TS1052: `set x(v: number = 1)`. At the NAME — tsc's own source blames
+    /// the initializer, tsgo 7.0.2 blames the name, and the oracle is what
+    /// this follows.
+    set_accessor_parameter_initializer,
     /// TS2528: two `export default`s that cannot share the slot. Not every pair
     /// collides — function overloads merge, and a function and an interface are
     /// legal side by side — so the rule is tsc's `declareSymbol` includes/
@@ -1257,6 +1280,13 @@ pub const Code = enum(u16) {
             .abstract_method_outside_abstract_class,
             .abstract_property_outside_abstract_class,
             .ctor_may_not_be_accessor,
+            .accessor_type_parameters,
+            .get_accessor_parameters,
+            .set_accessor_one_parameter,
+            .set_accessor_return_type,
+            .set_accessor_rest_parameter,
+            .set_accessor_optional_parameter,
+            .set_accessor_parameter_initializer,
             // The regex family: tsc's `checkGrammarRegularExpressionLiteral`
             // reaches the scanner's `scanRegularExpressionWorker`, so these are
             // semantic despite their TS1xxx codes — measured, `let x = /a/gg`
@@ -1591,6 +1621,13 @@ pub const Code = enum(u16) {
             .param_initializer_outside_impl => "A parameter initializer is only allowed in a function or constructor implementation.",
             .ctor_as_param_property_name => "'constructor' cannot be used as a parameter property name.",
             .ctor_may_not_be_accessor => "Class constructor may not be an accessor.",
+            .accessor_type_parameters => "An accessor cannot have type parameters.",
+            .get_accessor_parameters => "A 'get' accessor cannot have parameters.",
+            .set_accessor_one_parameter => "A 'set' accessor must have exactly one parameter.",
+            .set_accessor_return_type => "A 'set' accessor cannot have a return type annotation.",
+            .set_accessor_rest_parameter => "A 'set' accessor cannot have rest parameter.",
+            .set_accessor_optional_parameter => "A 'set' accessor cannot have an optional parameter.",
+            .set_accessor_parameter_initializer => "A 'set' accessor parameter cannot have an initializer.",
             .multiple_default_exports => "A module cannot have multiple default exports.",
             .super_before_this => "'super' must be called before accessing 'this' in the constructor of a derived class.",
             .super_before_super_property => "'super' must be called before accessing a property of 'super' in the constructor of a derived class.",
@@ -1811,6 +1848,13 @@ pub const Code = enum(u16) {
             .param_initializer_outside_impl => 2371,
             .ctor_as_param_property_name => 2398,
             .ctor_may_not_be_accessor => 1341,
+            .accessor_type_parameters => 1094,
+            .get_accessor_parameters => 1054,
+            .set_accessor_one_parameter => 1049,
+            .set_accessor_return_type => 1095,
+            .set_accessor_rest_parameter => 1053,
+            .set_accessor_optional_parameter => 1051,
+            .set_accessor_parameter_initializer => 1052,
             .multiple_default_exports => 2528,
             .super_before_this => 17009,
             .super_before_super_property => 17011,

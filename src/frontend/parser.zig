@@ -54,6 +54,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const scanner = @import("scanner.zig");
+const accessor_grammar = @import("accessor_grammar.zig");
 const ast = @import("ast.zig");
 const diagnostics = @import("diagnostics.zig");
 const directives = @import("directives.zig");
@@ -3278,6 +3279,12 @@ const Parser = struct {
         const params = try p.parseParams();
         var ret: Node = null_node;
         if (try p.eat(.colon) != null) ret = try p.parseReturnType();
+        // Every accessor in the language funnels through here — class member,
+        // object-literal property, interface/type-literal member — so tsc's
+        // `checkGrammarAccessor` is asked once, in one place.
+        if (flags & (ast.Flags.get | ast.Flags.set) != 0) {
+            try p.reportAccessorGrammar(flags, name_tok, tp, params, ret);
+        }
         return p.addExtra(ast.FnProto{
             .flags = flags,
             .name_token = name_tok,
@@ -3396,6 +3403,11 @@ const Parser = struct {
                 if (p.curIdx() == before) break;
                 continue;
             }
+            // A type parameter's name is a DECLARATION name, not a property
+            // name, so tsc's `checkStrictModeIdentifier` reaches it (its
+            // `isIdentifierName` exemption lists only the member/property
+            // positions): `class D<public, private> {}` is two TS1213.
+            try p.checkStrictReserved();
             const name = try p.bump();
             var constraint: Node = null_node;
             var default: Node = null_node;
@@ -3544,6 +3556,87 @@ const Parser = struct {
         const flags = p.extraFieldAt(ast.ParamFull, "flags", p.nodeDataAt(param).rhs);
         if (flags & ast.Flags.rest == 0) return null;
         return p.nodeMainTokenAt(param);
+    }
+
+    /// One parameter's flag word (`.param` carries none).
+    fn paramFlags(p: *const Parser, param: Node) u32 {
+        if (p.nodeTagAt(param) != .param_full) return 0;
+        return p.extraFieldAt(ast.ParamFull, "flags", p.nodeDataAt(param).rhs);
+    }
+
+    /// The `?` token of an OPTIONAL parameter — tsc's `parameter.questionToken`,
+    /// where `checkGrammarAccessor` anchors TS1051. The AST records the flag but
+    /// not the token, so it is recovered from the token stream: the `?` sits
+    /// immediately after the parameter's binding NAME, and a binding name is
+    /// either one identifier token or a bracketed pattern, so "immediately
+    /// after" is one token past the name or one token past the pattern's
+    /// matching bracket.
+    fn optionalQuestionToken(p: *Parser, param: Node) ?u32 {
+        if (p.paramFlags(param) & ast.Flags.optional == 0) return null;
+        const name = p.nodeDataAt(param).lhs;
+        if (name == null_node) return null;
+        var i = p.nodeMainTokenAt(name);
+        switch (p.tokTagAt(i)) {
+            .l_bracket, .l_brace => {
+                var depth: u32 = 0;
+                while (i < p.tok_tags.items.len) : (i += 1) {
+                    switch (p.tokTagAt(i)) {
+                        .l_bracket, .l_brace => depth += 1,
+                        .r_bracket, .r_brace => {
+                            depth -= 1;
+                            if (depth == 0) break;
+                        },
+                        else => {},
+                    }
+                }
+            },
+            else => {},
+        }
+        i += 1;
+        if (i >= p.tok_tags.items.len or p.tokTagAt(i) != .question) return null;
+        return i;
+    }
+
+    /// tsc's `checkGrammarAccessor`, over the signature `parseFnProtoRest` has
+    /// just read. A `this` parameter is not a value parameter and is excluded
+    /// from the count on both sides (`getAccessorThisParameter`); what it earns
+    /// instead is the checker's TS2784.
+    ///
+    /// Not reported while SPECULATING: a discarded parse must leave no
+    /// diagnostic behind, and `restore` would drop it anyway — but an accessor
+    /// is never speculated in practice, so the guard is only for symmetry with
+    /// the rest of the grammar reports here.
+    fn reportAccessorGrammar(
+        p: *Parser,
+        flags: u32,
+        name_tok: u32,
+        tp: ast.SubRange,
+        params: ast.SubRange,
+        ret: Node,
+    ) Error!void {
+        if (p.spec != 0 or name_tok == 0) return;
+        const nodes = p.extra.items[params.start..params.end];
+        var first: Node = null_node;
+        var n: u32 = 0;
+        for (nodes) |param| {
+            // A `this` parameter's name node is `.this_expr` (see `parseParam`).
+            const name = p.nodeDataAt(param).lhs;
+            if (name != null_node and p.nodeTagAt(name) == .this_expr) continue;
+            if (n == 0) first = param;
+            n += 1;
+        }
+        const report = accessor_grammar.check(.{
+            .kind = if (flags & ast.Flags.get != 0) .get else .set,
+            .name_token = name_tok,
+            .value_params = n,
+            .type_params = tp.start != tp.end,
+            .return_type = ret != null_node,
+            .rest = if (first == null_node) null else p.restDotsToken(first),
+            .question = if (first == null_node) null else p.optionalQuestionToken(first),
+            .initializer = first != null_node and p.nodeTagAt(first) == .param_full and
+                p.extraFieldAt(ast.ParamFull, "init", p.nodeDataAt(first).rhs) != null_node,
+        }) orelse return;
+        try p.errAtToken(report.code, report.token);
     }
 
     fn parseParam(p: *Parser) PE!Node {
@@ -3837,8 +3930,13 @@ const Parser = struct {
                 } else {
                     // Shorthand: the key IS the bound name, so `{ await }` in an
                     // await context is TS1359 — while `{ await: other }` names a
-                    // property and is fine (measured).
+                    // property and is fine (measured). The strict-reserved rule
+                    // splits the same way, and for tsc's own reason: its
+                    // `checkStrictModeIdentifier` skips an `isIdentifierName`
+                    // node, which the KEY half of `{ public: a }` is and the
+                    // shorthand `{ public }` is not.
                     try p.checkAwaitReservedNameAt(key);
+                    try p.checkStrictReservedAt(key);
                 }
                 var init: Node = null_node;
                 if (try p.eat(.eq) != null) init = try p.parseAssignExpr(.{});
@@ -3886,12 +3984,24 @@ const Parser = struct {
 
     fn parseClassDecl(p: *Parser, flags_in: u32, form: ClassForm) PE!Node {
         const kw = try p.bump(); // `class`
+        // From here to the closing `}` everything is INSIDE the class node, and
+        // tsc's `getStrictModeIdentifierMessage` asks `getContainingClass(node)`
+        // — an ancestor walk from the identifier's PARENT — so the class's own
+        // NAME is in it (`var c = class package extends public {}` is two
+        // TS1213), and so are its TYPE PARAMETERS (`class D<public, private>
+        // {}`) and its HERITAGE clauses (`class E implements yield {}`). All
+        // four were TS1212, or silent, while the counter covered only the body.
+        // A depth counter rather than a flag, because nested functions and
+        // nested classes are inside it too.
+        p.class_depth += 1;
+        defer p.class_depth -= 1;
         var name_tok: u32 = 0;
         if (isIdentLike(p.curTag()) and p.curTag() != .keyword_implements) {
             // A class name is parsed in the ENCLOSING context (tsc's
             // `parseNameOfClassDeclarationOrExpression` inherits it), so
             // `class await {}` inside a static block is TS1359.
             try p.checkAwaitReservedName();
+            try p.checkStrictReserved();
             name_tok = try p.bump();
         }
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
@@ -3928,11 +4038,6 @@ const Parser = struct {
         // as members and answered five invented TS1005s for them.
         const has_body = p.curTag() == .l_brace;
         _ = try p.expect(.l_brace, .expected_l_brace);
-        // Inside the body every strict-reserved word is TS1213 rather than
-        // TS1212 (tsc's `getContainingClass`), including in nested functions and
-        // nested classes — hence a depth counter rather than a flag.
-        p.class_depth += 1;
-        defer p.class_depth -= 1;
         const was_abstract_class = p.abstract_class;
         p.abstract_class = flags_in & ast.Flags.abstract != 0;
         defer p.abstract_class = was_abstract_class;
@@ -4825,15 +4930,34 @@ const Parser = struct {
     /// file describes an interface that may well have been written in sloppy
     /// mode, so the reserved-word rule has nothing to say about it.
     ///
-    /// Skipped while speculating: a construct that only ever gets parsed inside a
-    /// lookahead is not committed source, and the real parse reports it.
+    /// Reported even while SPECULATING, for the same reason `parseParams`
+    /// reports TS1014 there: an ARROW function and a function TYPE both read
+    /// their parameter list inside a speculative parse that is then COMMITTED,
+    /// so a `spec` guard loses `((private, public) => {})` and `(cb: (private,
+    /// public) => void)` outright — there is no "real parse" behind those to
+    /// report them. `restore` truncates `diags`, so a speculation that
+    /// BACKTRACKS un-reports this exactly as it un-reports the literal-grammar
+    /// diagnostics `checkLiteral` files, and the tokens it re-reads as an
+    /// expression are identifier REFERENCES, which this rule never sees.
     fn checkStrictReserved(p: *Parser) Error!void {
-        if (p.spec > 0 or p.ambient) return;
+        if (p.ambient) return;
         if (!p.curTag().isStrictReservedKeyword()) return;
         try p.errAtCur(if (p.class_depth > 0)
             .strict_reserved_word_in_class
         else
             .strict_reserved_word);
+    }
+
+    /// `checkStrictReserved` for a token that has already been consumed — the
+    /// two name positions that bump theirs directly, exactly as
+    /// `checkAwaitReservedNameAt` serves them.
+    fn checkStrictReservedAt(p: *Parser, tok: u32) Error!void {
+        if (p.spec > 0 or p.ambient) return;
+        if (!p.tokTagAt(tok).isStrictReservedKeyword()) return;
+        try p.errAtToken(if (p.class_depth > 0)
+            .strict_reserved_word_in_class
+        else
+            .strict_reserved_word, tok);
     }
 
     /// TS1359, tsc's `createIdentifier`: inside an await context — an `async`
@@ -5356,6 +5480,12 @@ const Parser = struct {
 
         if (isIdentLike(p.curTag())) {
             // `import d ...` — but `import x = require(...)` is out of subset.
+            // The name is a BINDING, so the strict-reserved rule applies to it
+            // (`import public from "m"`, `import public = require("m")`); a
+            // module is automatically strict, which is what turns it into
+            // TS1214 at seal. The namespace and named-specifier bindings reach
+            // the rule through their own funnels already.
+            try p.checkStrictReserved();
             default_name = try p.bump();
             // The ImportEqualsDeclaration arm — `export` belongs here, and it
             // anchors the node: a declaration's span starts at its first
