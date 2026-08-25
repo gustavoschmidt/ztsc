@@ -1384,19 +1384,6 @@ const Parser = struct {
         };
     }
 
-    /// tsc's `isStartOfStatement`, the gate on its statement-list loops: a
-    /// token that answers false is NOT handed to `parseStatement` at all —
-    /// `parseList` reports one "Declaration or statement expected." (TS1128)
-    /// and skips exactly that token. Without the gate a recovering parser
-    /// instead tries to read an expression statement out of a `}` or a `,` and
-    /// answers with a cascade of "Expression expected"/"';' expected" that tsc
-    /// never produces.
-    ///
-    /// Deliberately CONSERVATIVE where tsc looks ahead: `const`, `export`,
-    /// `import` and the modifier words go through tsc's `isStartOfDeclaration`
-    /// lookahead, and are answered `true` here unconditionally. A false `true`
-    /// only keeps ztsc's existing recovery for that token; a false `false`
-    /// would manufacture a TS1128 tsc does not report.
     /// tsc's `isDeclaration()` arm for `import`: the keyword commits to an
     /// import DECLARATION only on a specifier, a `*`, a `{` or a name.
     ///
@@ -1415,6 +1402,20 @@ const Parser = struct {
         return after == .l_paren or after == .lt or after == .dot;
     }
 
+    /// tsc's `isStartOfStatement`, the gate on its statement-list loops: a
+    /// token that answers false is NOT handed to `parseStatement` at all —
+    /// `parseList` reports one "Declaration or statement expected." (TS1128)
+    /// and skips exactly that token. Without the gate a recovering parser
+    /// instead tries to read an expression statement out of a `}` or a `,` and
+    /// answers with a cascade of "Expression expected"/"';' expected" that tsc
+    /// never produces.
+    ///
+    /// Deliberately CONSERVATIVE where tsc looks ahead: `const`, `export` and
+    /// the modifier words go through tsc's `isStartOfDeclaration` lookahead,
+    /// and are answered `true` here unconditionally. A false `true` only keeps
+    /// ztsc's existing recovery for that token; a false `false` would
+    /// manufacture a TS1128 tsc does not report. `import` is the exception —
+    /// see its arm.
     fn atStartOfStatement(p: *Parser) bool {
         return switch (p.curTag()) {
             .at,
