@@ -1173,6 +1173,22 @@ pub const Code = enum(u16) {
     /// `import.foo()` — there `defer` is spelled too (a deferred dynamic
     /// import), so tsc offers both words and numbers the message differently.
     import_meta_property_in_call,
+    /// TS1172: `class C extends A extends B {}`. tsc's `parseHeritageClauses`
+    /// is a LIST — every `extends`/`implements` clause in a row is parsed —
+    /// and `checkGrammarClassLikeDeclaration` refuses the duplicate afterwards,
+    /// on the clause's own keyword. It RETURNS at its first complaint, so this
+    /// code and the three below are mutually exclusive within one class.
+    extends_clause_already_seen,
+    /// TS1173: `class C implements A extends B {}` — the same walk, reached
+    /// when an `extends` clause follows an `implements` one.
+    extends_must_precede_implements,
+    /// TS1174: `class C extends A, B {}` — an `extends` clause may list only
+    /// one type for a CLASS. Blamed on the SECOND entry
+    /// (`grammarErrorOnFirstNode(heritageClause.types[1], …)`).
+    class_extends_single_class,
+    /// TS1175: `class C implements A implements B {}`, the `implements` twin of
+    /// TS1172.
+    implements_clause_already_seen,
 
     /// How tsc surfaces the condition — which decides both what a diagnostic
     /// suppresses and what suppresses it. Established empirically against tsgo
@@ -1511,6 +1527,12 @@ pub const Code = enum(u16) {
             // all checker passes, so all four let a sibling TS2322 through.
             .import_call_type_args,
             .interface_implements_clause,
+            // `checkGrammarClassLikeDeclaration`'s heritage walk, the same
+            // checker pass that already owns TS1098 below.
+            .extends_clause_already_seen,
+            .extends_must_precede_implements,
+            .class_extends_single_class,
+            .implements_clause_already_seen,
             .interface_property_initializer,
             .type_literal_property_initializer,
             .empty_type_param_list,
@@ -1928,6 +1950,10 @@ pub const Code = enum(u16) {
 
             .import_call_type_args => "This use of 'import' is invalid. 'import()' calls can be written, but they must have parentheses and cannot have type arguments.",
             .interface_implements_clause => "Interface declaration cannot have 'implements' clause.",
+            .extends_clause_already_seen => "'extends' clause already seen.",
+            .extends_must_precede_implements => "'extends' clause must precede 'implements' clause.",
+            .class_extends_single_class => "Classes can only extend a single class.",
+            .implements_clause_already_seen => "'implements' clause already seen.",
             .interface_property_initializer => "An interface property cannot have an initializer.",
             .type_literal_property_initializer => "A type literal property cannot have an initializer.",
             .empty_type_param_list => "Type parameter list cannot be empty.",
@@ -2283,6 +2309,10 @@ pub const Code = enum(u16) {
             .ctor_type_in_intersection => 1388,
             .import_call_type_args => 1326,
             .interface_implements_clause => 1176,
+            .extends_clause_already_seen => 1172,
+            .extends_must_precede_implements => 1173,
+            .class_extends_single_class => 1174,
+            .implements_clause_already_seen => 1175,
             .interface_property_initializer => 1246,
             .type_literal_property_initializer => 1247,
             .empty_type_param_list => 1098,

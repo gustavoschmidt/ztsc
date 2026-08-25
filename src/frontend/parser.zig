@@ -4476,18 +4476,62 @@ const Parser = struct {
         if (p.atLt()) tp = try p.parseTypeParams(.class);
 
         var extends: Node = null_node;
-        if (try p.eat(.keyword_extends) != null) {
-            extends = try p.parseHeritage();
-        }
         var impl: ast.SubRange = .{ .start = 0, .end = 0 };
-        if (try p.eat(.keyword_implements) != null) {
-            const top = p.scratchTop();
-            defer p.scratch.shrinkRetainingCapacity(top);
-            while (true) {
-                try p.pushScratch(try p.parseHeritage());
-                if (try p.eat(.comma) == null) break;
+        {
+            // tsc's `parseHeritageClauses` is a LIST: it takes EVERY
+            // `extends`/`implements` clause in a row, each one a
+            // comma-delimited list of entries, and leaves the duplicates and
+            // the over-long `extends` to `checkGrammarClassLikeDeclaration`.
+            // Taking at most one clause of each kind, and no comma list after
+            // `extends`, turned `class C extends A extends B {}` and `class C
+            // extends A, B {}` into a TS1005/TS1434 cascade where tsgo reports
+            // a single TS1172/TS1174 (11 cases, measured).
+            var seen_extends = false;
+            var seen_implements = false;
+            // The grammar walk `return`s at its first complaint, so at most one
+            // of the four codes is ever reported for one class.
+            var grammar_reported = false;
+            while (p.curTag() == .keyword_extends or p.curTag() == .keyword_implements) {
+                const is_extends = p.curTag() == .keyword_extends;
+                const kw_tok = try p.bump();
+                const clause_top = p.scratchTop();
+                defer p.scratch.shrinkRetainingCapacity(clause_top);
+                while (true) {
+                    try p.pushScratch(try p.parseHeritage());
+                    if (try p.eat(.comma) == null) break;
+                }
+                const entries = p.scratch.items[clause_top..];
+                if (is_extends) {
+                    if (!grammar_reported) {
+                        if (seen_extends) {
+                            try p.errAtToken(.extends_clause_already_seen, kw_tok);
+                            grammar_reported = true;
+                        } else if (seen_implements) {
+                            try p.errAtToken(.extends_must_precede_implements, kw_tok);
+                            grammar_reported = true;
+                        } else if (entries.len > 1) {
+                            const second = p.nodes.items(.main_token)[entries[1]];
+                            try p.errAtToken(.class_extends_single_class, second);
+                            grammar_reported = true;
+                        }
+                    }
+                    // `getEffectiveBaseTypeNode` is the FIRST `extends`
+                    // clause's FIRST entry and nothing else, so every other
+                    // entry is parsed and dropped: tsgo never resolves the `B`
+                    // of `class C extends A, B {}` (no TS2304 for it).
+                    if (!seen_extends) extends = entries[0];
+                    seen_extends = true;
+                } else {
+                    if (!grammar_reported and seen_implements) {
+                        try p.errAtToken(.implements_clause_already_seen, kw_tok);
+                        grammar_reported = true;
+                    }
+                    // `getEffectiveImplementsTypeNodes` likewise reads the
+                    // first `implements` clause only — but all of its entries.
+                    if (!seen_implements) impl = try p.scratchToSpan(clause_top);
+                    seen_implements = true;
+                }
             }
-            impl = try p.scratchToSpan(top);
         }
 
         // tsc's `parseClassDeclarationOrExpression` parses the member list and
