@@ -1872,40 +1872,29 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     }
     if (ctx_tuple) return c.ts.makeTuple(tuple_elems.items);
     if (elem_types.items.len == 0) {
-        if (ctx_elem != types.no_type) {
-            // Empty array literal under a union context with MULTIPLE
-            // array-like branches of differing element types
-            // (leaflet `polyline([], …)`: `LatLngExpression[] |
-            // LatLngExpression[][]`): folding their elements into a union
-            // element (`(E | E[])[]`) is assignable to NEITHER branch — a
-            // false TS2345. An empty literal has no elements to
-            // disambiguate, and `never[]` is assignable to every
-            // array/tuple branch (tsc's empty-array typing). A single
-            // array branch keeps its element type (display/inference).
-            if (rctx != types.no_type and c.ts.kind(rctx) == .union_type and
-                try multiArrayLikeBranches(c, rctx))
-                return c.ts.makeArray(types.never_type);
-            // The contextual element is a FREE inference variable of a call
-            // in flight (`mk<T>(xs: T[])` called as `mk([])`): echoing it
-            // back makes the argument its own evidence, so `T` infers `T` and
-            // leaks a naked type parameter into the result (immich's
-            // `asSet(v, [])` produced `Set<T>`, then `T | ImmichWorker`).
-            // tsc never reads the contextual element type for an EMPTY
-            // literal at all — `checkArrayLiteral` hands back
-            // `implicitNeverType` regardless — and `never` is the right
-            // evidence: it is what an array holding nothing contributes, and
-            // it is assignable to every array target.
-            if (try c.mentionsActiveInferVar(ctx_elem)) return c.ts.makeArray(types.never_type);
-            return c.ts.makeArray(ctx_elem);
-        }
         // tsc's `checkArrayLiteral` empty arm is `createArrayType(
-        // strictNullChecks ? implicitNeverType : undefinedWideningType)` — a
-        // context-free `[]` is `never[]`, and the `any[]` that stood here was an
-        // under-report (`[].splice(0, 3, 4, 5)` never judged its arguments
-        // against `never`). The widening rule is empirical and narrow: ONLY the
-        // evolving variable (`var x = []; x.push(1)`) becomes `any[]` —
+        // strictNullChecks ? implicitNeverType : undefinedWideningType)` — an
+        // empty `[]` is `never[]`, and the CONTEXTUAL element type is not
+        // consulted at all: `elementTypes.length ? getUnionType(…) :
+        // implicitNeverType` reads the literal's own elements, of which there
+        // are none. (The `any[]` that stood here before wave 32 was an
+        // under-report — `[].splice(0, 3, 4, 5)` never judged its arguments
+        // against `never`.) The widening rule is empirical and narrow: ONLY
+        // the evolving variable (`var x = []; x.push(1)`) becomes `any[]` —
         // `export const x = []`, `class C { f = [] }`, `f(xs = [])` and
         // `const c = id([])` are all `never[]` in tsc.
+        //
+        // Echoing the contextual element back instead is wrong in both
+        // directions. It makes an argument its OWN evidence when the context
+        // is a free inference variable (`mk<T>(xs: T[])` called as `mk([])`
+        // inferred `T = T`), it picks one branch of a union context that an
+        // empty literal cannot disambiguate (leaflet's `polyline([], …)`
+        // against `LatLngExpression[] | LatLngExpression[][]`), and it hides
+        // the `never` a later operation is judged against:
+        // `(results &&= (results1 &&= [])).push(100)` is TS2345 "'100' is not
+        // assignable to parameter of type 'never'" in tsc, because the inner
+        // `[]` is `never[]` however `results1` is declared
+        // (`logicalAssignment6`/`7`, wave-35 D's oracle probe).
         //
         // The evolving half moves with this line, because ztsc's flow walk
         // recognizes an evolving array BY ITS TYPE (`flow.flowTypeOfReference`
@@ -2287,22 +2276,6 @@ fn elemCtxKeepsLiteral(c: *Checker, rctx: TypeId, i: u32, length: ?u32, cand: Ty
         return false;
     }
     return keepLiteral(c, cand, try contextualElemTypeAt(c, rctx, i, length));
-}
-
-/// True when a (structurally resolved) union contextual type has two or
-/// more array-like constituents (`E[] | E[][]`, `A[] | B[]`). Used to
-/// detect the ambiguous empty-array-literal case where folding every
-/// branch's element type would produce an array assignable to no branch.
-fn multiArrayLikeBranches(c: *Checker, rctx: TypeId) Error!bool {
-    if (c.ts.kind(rctx) != .union_type) return false;
-    var n: usize = 0;
-    for (try c.memberList(rctx)) |m| {
-        if (c.ts.kind(try c.resolveStructural(m)) == .array) {
-            n += 1;
-            if (n >= 2) return true;
-        }
-    }
-    return false;
 }
 
 /// `[...] as const` -> a readonly tuple. Elements keep their literal
