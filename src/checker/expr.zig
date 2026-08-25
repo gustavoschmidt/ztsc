@@ -6626,6 +6626,24 @@ fn reportReadonlyIndexWrite(c: *Checker, obj: TypeId, node: Node, numeric: bool)
     });
 }
 
+/// Does `recv[idx_node]` name a position past the end of a fixed tuple — the
+/// shape `indexChainInner`'s `.number_literal` arm reports TS2493 for and
+/// answers `error_type`? Asked only where that answer has already come back,
+/// so it re-runs the same two questions the arm asked: the receiver's
+/// indexable constituent is a tuple, and `numericIndexHit` (which is
+/// `tupleElemTypeAt` for a tuple, rest element included) has no element there.
+///
+/// `checkExprCached` on the index is a memo hit: the write path has already
+/// checked it through `readonlyIndexWriteAt`.
+fn outOfRangeTupleIndex(c: *Checker, recv: TypeId, idx_node: Node) Error!bool {
+    const rk = c.ts.kind(recv);
+    const rt = if (rk == .intersection) (try c.indexableConstituent(recv)) orelse recv else recv;
+    if (c.ts.kind(rt) != .tuple) return false;
+    const idx_t = try c.ts.regularLiteral(try c.checkExprCached(idx_node, types.no_type));
+    if (c.ts.kind(idx_t) != .number_literal) return false;
+    return (try numericIndexHit(c, recv, rk, c.ts.numberValue(idx_t))) == null;
+}
+
 /// A write through `obj[idx]` — an assignment target or a `delete` operand.
 /// Reports TS2540 on a readonly list's fixed element and TS2542 on a readonly
 /// index signature (a readonly list's, or a declared `readonly [k: …]`), and
@@ -6820,16 +6838,47 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
             const d = c.tree.nodeData(node);
             const obj_t = try c.checkExprCached(d.lhs, types.no_type);
             // `o["p"] = v` writes at the setter's parameter type when `p` is
-            // a TS 4.3 split accessor, exactly as `o.p = v` does. Keyed off
-            // the *syntactic* string literal so no extra expression is
-            // checked on the ordinary element-write path.
-            if (c.nodeTag(d.rhs) == .string_literal) {
-                const key = try c.memberAtom(c.tree.nodeMainToken(d.rhs));
-                if (try setterWriteType(c, obj_t, key, 0)) |wt| return wt;
+            // a TS 4.3 split accessor, exactly as `o.p = v` does — and so does
+            // every other spelling of the SAME member name. A LATE-BOUND key
+            // (`o[sym]`, `o[Enum.M]`, a `const s = "p"`) is one:
+            // `atoms.memberKey` resolves a computed `set [k](v)` to the very
+            // `__@u<id>` atom `lateBoundName` mints here, so the declaration
+            // the setter lookup walks to is the one this write names.
+            //
+            // Without it `foo[k] = ['foo']` against
+            // `get [k](): Set<string>; set [k](v: Iterable<string>)` checked
+            // the right-hand side against the GETTER's type and reported a
+            // TS2740 tsc does not (`computedPropertiesWithSetterAssignment`).
+            //
+            // The index expression is checked here rather than only inside
+            // `readonlyIndexWriteAt` below; that call re-asks it through
+            // `checkExprCached`, so the ordinary path pays nothing extra.
+            const key: ?Atom = if (c.nodeTag(d.rhs) == .string_literal)
+                try c.memberAtom(c.tree.nodeMainToken(d.rhs))
+            else
+                try computed_key.lateBoundName(c, d.rhs, try c.checkExprCached(d.rhs, types.no_type));
+            if (key) |name| {
+                if (try setterWriteType(c, obj_t, name, 0)) |wt| return wt;
             }
             const r = try c.resolveStructural(obj_t);
             if (try readonlyIndexWriteAt(c, r, node, d.rhs)) return types.error_type;
-            return checkIndexExpr(c, node, false, types.no_type);
+            const t = try checkIndexExpr(c, node, false, types.no_type);
+            // An out-of-range FIXED tuple index writes at `undefined`. tsc's
+            // `getIndexedAccessTypeOrUndefined` reports the TS2493 (which the
+            // read path just emitted) and then answers `undefinedType`, so
+            // `t[3] = { a: "" }` on a `[string, number]` is ALSO a TS2322
+            // against `undefined`. ztsc answered `error_type` there, which is
+            // exactly the "suppress the cascade" marker, so the second half of
+            // tsc's verdict never arrived (`genericCallWithTupleType`).
+            //
+            // Only the WRITE side moves. The read `var e = t[3]` keeps
+            // `error_type`: `undefined` there would put a "possibly undefined"
+            // (and a TS2339 on any member of it) on every use of a value the
+            // program has already been told is out of range.
+            if (t == types.error_type and try outOfRangeTupleIndex(c, r, d.rhs)) {
+                return types.undefined_type;
+            }
+            return t;
         },
         .array_literal, .object_literal, .array_pattern, .object_pattern => {
             // Destructuring-assignment pattern in the expression cover
@@ -6875,11 +6924,53 @@ fn setterWriteType(c: *Checker, t0: TypeId, name: Atom, depth: u32) Error!?TypeI
     if (depth > 8) return null;
     const t = if (c.ts.kind(t0) == .this_type) c.ts.thisTypeInstance(t0) else t0;
     switch (c.ts.kind(t)) {
+        // A composite's property is a SYNTHESIZED symbol, and tsc's
+        // `getWriteTypeOfSymbol` for one combines the constituents' write
+        // types the same way `getTypeOfSymbol` combines their read types: a
+        // union unions, an intersection intersects. A constituent with no
+        // setter contributes its READ type, because that is what its own
+        // `getWriteTypeOfSymbol` falls back to.
+        //
+        // First-arm-wins was wrong in both directions, and the corpus names
+        // both:
+        //
+        //   * `One & Two`, `One.prop2: number` beside
+        //     `Two: set prop2(s: string | 42)`, writes at
+        //     `number & (string | 42)` — i.e. `42` — so `i.prop2 = "hello"`
+        //     is a TS2322 that answering `string | 42` let through
+        //     (`divergentAccessorsTypes4`, `…Types5`).
+        //   * `One | Two` writes at the UNION, so `u1.prop3 = 42` is legal as
+        //     long as SOME constituent accepts it; answering only the first
+        //     constituent's made it a false positive
+        //     (`divergentAccessorsTypes3`).
+        //
+        // Only reached when some constituent really declares a setter: with
+        // none, the caller's `orelse p.ty` — the property off the RESOLVED
+        // composite — is both the same answer and the cheaper one.
         .union_type, .intersection => {
+            const is_union = c.ts.kind(t) == .union_type;
+            var parts: std.ArrayList(TypeId) = .empty;
+            defer parts.deinit(c.scratch());
+            var any_setter = false;
             for (c.ts.members(t)) |m| {
-                if (try setterWriteType(c, m, name, depth + 1)) |wt| return wt;
+                if (try setterWriteType(c, m, name, depth + 1)) |wt| {
+                    any_setter = true;
+                    try parts.append(c.scratch(), wt);
+                } else if (try c.propOfType(try c.resolveStructural(m), name)) |p| {
+                    try parts.append(c.scratch(), p.ty);
+                } else if (is_union) {
+                    // A union arm that lacks the property has no write type to
+                    // contribute and no way to stand in for one; the access
+                    // itself is the error. Keep the caller's fallback.
+                    return null;
+                }
             }
-            return null;
+            if (!any_setter) return null;
+            if (parts.items.len == 1) return parts.items[0];
+            return if (is_union)
+                try c.ts.makeUnion(c.scratch(), parts.items)
+            else
+                try c.ts.makeIntersection(c.scratch(), parts.items);
         },
         .ref => {
             const sym = c.ts.refSymbol(t);
