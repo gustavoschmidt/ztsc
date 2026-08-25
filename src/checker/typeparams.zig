@@ -150,6 +150,18 @@ pub fn mergedTypeParamConstraint(c: *Checker, sym: SymbolId, tp_decl: Node) Erro
         const saved = c.enterSymFile(csym);
         defer c.restoreCtx(saved);
         for (c.declsOf(csym)) |decl| {
+            // ONLY the declaration forms whose type parameters tsc routes into
+            // the symbol's member table. A function declaration merged with the
+            // interface (`interface Tag<Id, Value>` beside `declare function
+            // Tag<const Id extends string>(…)`, which
+            // contextualParamTypeVsNestedReturnTypeInference2-4 write) keeps its
+            // parameters in its own `locals` and donates nothing — reading its
+            // `Id extends string` onto the interface's `Id` was six false
+            // TS2344s.
+            switch (c.nodeTag(decl)) {
+                .interface_decl, .class_decl => {},
+                else => continue,
+            }
             const tps = writtenTypeParamRange(c, decl) orelse continue;
             for (tps) |tp| {
                 if (tp == null_node or c.nodeTag(tp) != .type_param) continue;
@@ -739,7 +751,7 @@ fn queuePendingTypeArgs(c: *Checker, node: Node, sym: SymbolId, sig: TypeId, arg
         for (args[0..@min(args.len, arg_nodes.len)], 0..) |a, i| {
             if (arg_nodes[i] == null_node) continue;
             if (a == types.any_type or a == types.unknown_type) continue;
-            if (try c.undecidableType(a)) continue;
+            if (try undecidableTypeArg(c, a)) continue;
             any_decidable = true;
             break;
         }
@@ -755,7 +767,33 @@ fn queuePendingTypeArgs(c: *Checker, node: Node, sym: SymbolId, sig: TypeId, arg
         .this_type = c.this_type,
         .args_start = args_start,
         .args_len = @intCast(args.len),
+        .cond_true = c.cond_true_depth > 0,
     });
+}
+
+/// `undecidableType` for a WRITTEN type argument, which can afford one
+/// exclusion the general predicate cannot: a BARE free type parameter.
+///
+/// `undecidableType` refuses every type variable, and for a NESTED one that is
+/// right — `Foo<T["k"]>`, `Foo<{ a: T }>` are questions about ztsc's own
+/// deferral machinery. But `Foo<T>` written whole is the shape tsc decides
+/// directly, by relating `T`'s constraint to the parameter's
+/// (`checkTypeArgumentConstraints` → `isTypeAssignableTo(getTypeWithThisArgument
+/// (typeArgument), constraint)`), and that is a relation ztsc runs correctly:
+/// `assign.zig` walks a source type parameter's constraint chain. So an
+/// unconstrained `T` handed to `ReturnType<T>` is a real TS2344, and the whole
+/// `Parameters<typeof C>` / `unmetTypeConstraintInImportCall` family turns on it.
+///
+/// The one place it must NOT apply is a conditional type's TRUE branch. There
+/// tsc replaces every occurrence of the check type with a SUBSTITUTION type
+/// constrained by the `extends` clause, so `T extends (...a: any) => any ?
+/// ReturnType<T> : never` sees a `T` that already satisfies the bound; ztsc
+/// models no substitution types, reads `T`'s declared constraint instead, and
+/// invents a false positive for every guarded use. Measured: 79 excess keys
+/// without this screen, 0 with it.
+fn undecidableTypeArg(c: *Checker, t: TypeId) Error!bool {
+    if (c.ts.kind(t) == .type_param and c.cond_true_depth == 0) return false;
+    return c.undecidableType(t);
 }
 
 /// The WRITTEN type-argument nodes of one of the four nodes that can carry a
@@ -788,10 +826,12 @@ pub fn drainTypeArgConstraints(c: *Checker) Error!void {
     const saved_file = c.cur_file;
     const saved_scope = c.cur_scope;
     const saved_this = c.this_type;
+    const saved_cond_true = c.cond_true_depth;
     defer {
         c.setFile(saved_file);
         c.cur_scope = saved_scope;
         c.this_type = saved_this;
+        c.cond_true_depth = saved_cond_true;
     }
     // Index-walked, and the entry's arguments are copied out before the check
     // runs: a check can convert a type node that queues a further reference,
@@ -806,6 +846,9 @@ pub fn drainTypeArgConstraints(c: *Checker) Error!void {
         c.setFile(p.file);
         c.cur_scope = binder.file_scope;
         c.this_type = p.this_type;
+        // Replayed, not inherited: `undecidableTypeArg` reads it, and the
+        // reference's own true-branch nesting is not the drain's.
+        c.cond_true_depth = @intFromBool(p.cond_true);
         const arg_nodes = writtenTypeArgNodes(c, p.node);
         args.clearRetainingCapacity();
         try args.appendSlice(c.scratch(), c.pending_type_args_pool.items[p.args_start..][0..p.args_len]);
@@ -1023,7 +1066,7 @@ pub fn checkSigTypeArgConstraints(c: *Checker, sig: TypeId, args: []const TypeId
 fn checkOneTypeArgConstraint(c: *Checker, arg: TypeId, con0: TypeId, map: []const TpMap, an: Node) Error!void {
     if (an == null_node) return;
     if (arg == types.any_type or arg == types.unknown_type) return;
-    if (try c.undecidableType(arg)) return;
+    if (try undecidableTypeArg(c, arg)) return;
     // A class whose `extends` chain reaches a base ztsc could not resolve has
     // an INCOMPLETE member set by construction, so "does not satisfy" against
     // it is a verdict about the missing base, not about the code — the same
@@ -1185,6 +1228,17 @@ pub fn decidableConstraintSet(c: *Checker, con: TypeId) Error!bool {
             => {},
             .union_type, .intersection => {
                 for (0..s.memberCount(cur)) |i| try stack.append(c.scratch(), s.memberAt(cur, i));
+            },
+            // An ARRAY or TUPLE constraint is structural in the same sense a
+            // `.object` is — `S extends T` with `T = [number, ...number[]]` is
+            // decided element by element by the relation, including arity and
+            // the rest element — so it is decidable exactly when its elements
+            // are. `restTupleElements1` writes eight of them
+            // (`assign<[number, ...number[]], [number]>()`), every one of which
+            // this arm's absence dropped on the floor.
+            .array => try stack.append(c.scratch(), s.arrayElem(cur)),
+            .tuple => for (0..s.tupleLen(cur)) |i| {
+                try stack.append(c.scratch(), s.tupleElem(cur, @intCast(i)).ty);
             },
             else => return false,
         }

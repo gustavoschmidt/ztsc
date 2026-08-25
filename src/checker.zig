@@ -770,6 +770,12 @@ pub const PendingTypeArgs = struct {
     /// positionally paired with the non-hole entries of the node list.
     args_start: u32,
     args_len: u32,
+    /// Whether the reference was written inside a conditional type's TRUE
+    /// branch (`cond_true_depth` non-zero). Replayed at the drain, where the
+    /// gate needs it to keep a free type parameter out of the verdict: the
+    /// branch narrows the check type and ztsc models none of that narrowing.
+    /// See `typeparams.undecidableTypeArg`.
+    cond_true: bool = false,
 };
 
 /// A memoized expression type together with the contextual type it was
