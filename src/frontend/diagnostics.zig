@@ -1189,6 +1189,13 @@ pub const Code = enum(u16) {
     /// TS1175: `class C implements A implements B {}`, the `implements` twin of
     /// TS1172.
     implements_clause_already_seen,
+    /// TS1097: `class C extends {}` / `interface I extends { }` — a heritage
+    /// clause whose entry list came out EMPTY, because the `{` opens the BODY
+    /// (tsc's `isValidHeritageClauseObjectLiteral`) or because the next
+    /// clause's keyword followed immediately. `checkGrammarHeritageClause`
+    /// blames `types.pos` zero-width — the end of the clause keyword — and
+    /// interpolates that keyword, so this one carries `Diagnostic.arg`.
+    heritage_list_empty,
 
     /// How tsc surfaces the condition — which decides both what a diagnostic
     /// suppresses and what suppresses it. Established empirically against tsgo
@@ -1533,6 +1540,7 @@ pub const Code = enum(u16) {
             .extends_must_precede_implements,
             .class_extends_single_class,
             .implements_clause_already_seen,
+            .heritage_list_empty,
             .interface_property_initializer,
             .type_literal_property_initializer,
             .empty_type_param_list,
@@ -1954,6 +1962,7 @@ pub const Code = enum(u16) {
             .extends_must_precede_implements => "'extends' clause must precede 'implements' clause.",
             .class_extends_single_class => "Classes can only extend a single class.",
             .implements_clause_already_seen => "'implements' clause already seen.",
+            .heritage_list_empty => "'{0}' list cannot be empty.",
             .interface_property_initializer => "An interface property cannot have an initializer.",
             .type_literal_property_initializer => "A type literal property cannot have an initializer.",
             .empty_type_param_list => "Type parameter list cannot be empty.",
@@ -2313,6 +2322,7 @@ pub const Code = enum(u16) {
             .extends_must_precede_implements => 1173,
             .class_extends_single_class => 1174,
             .implements_clause_already_seen => 1175,
+            .heritage_list_empty => 1097,
             .interface_property_initializer => 1246,
             .type_literal_property_initializer => 1247,
             .empty_type_param_list => 1098,

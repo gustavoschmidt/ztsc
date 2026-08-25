@@ -926,6 +926,18 @@ const Parser = struct {
         try p.addDiag(code, .{ .code = code, .span = .{ .start = at, .end = at } });
     }
 
+    /// `errAtTokenEnd` whose `{0}` is that same token's TEXT — TS1097 blames
+    /// the empty list that starts where its clause keyword ended, and names
+    /// the keyword.
+    fn errAtTokenEndNamed(p: *Parser, code: Code, tok: u32) Error!void {
+        const span = p.tokenSpan(tok);
+        try p.addDiag(code, .{
+            .code = code,
+            .span = .{ .start = span.end, .end = span.end },
+            .arg = span,
+        });
+    }
+
     /// `errAtToken` whose `{0}` comes from ANOTHER consumed token — TS1156 on a
     /// `type`/`interface` declaration is reported on the NAME while naming the
     /// keyword.
@@ -4496,10 +4508,7 @@ const Parser = struct {
                 const kw_tok = try p.bump();
                 const clause_top = p.scratchTop();
                 defer p.scratch.shrinkRetainingCapacity(clause_top);
-                while (true) {
-                    try p.pushScratch(try p.parseHeritage());
-                    if (try p.eat(.comma) == null) break;
-                }
+                try p.parseHeritageEntries(kw_tok, clause_top);
                 const entries = p.scratch.items[clause_top..];
                 if (is_extends) {
                     if (!grammar_reported) {
@@ -4519,7 +4528,7 @@ const Parser = struct {
                     // clause's FIRST entry and nothing else, so every other
                     // entry is parsed and dropped: tsgo never resolves the `B`
                     // of `class C extends A, B {}` (no TS2304 for it).
-                    if (!seen_extends) extends = entries[0];
+                    if (!seen_extends and entries.len > 0) extends = entries[0];
                     seen_extends = true;
                 } else {
                     if (!grammar_reported and seen_implements) {
@@ -4620,6 +4629,58 @@ const Parser = struct {
             .members_end = members.end,
         });
         return p.addNode(.{ .tag = .class_decl, .main_token = kw, .data = .{ .lhs = extra, .rhs = 0 } });
+    }
+
+    /// ONE `extends`/`implements` clause's comma-separated entries, pushed on
+    /// the scratch stack from `top`. tsc's
+    /// `parseDelimitedList(HeritageClauseElement, …)` consults `isListElement`
+    /// before every entry, so a clause can come out EMPTY or end on a comma —
+    /// and `checkGrammarHeritageClause` then reports TS1097 or TS1009 for it.
+    /// Parsing an entry unconditionally instead made `class C extends {}` eat
+    /// the class BODY as its base type and answer a TS1005 cascade.
+    ///
+    /// `kw_tok` is the clause keyword: TS1097 is anchored just past it and
+    /// interpolates it.
+    fn parseHeritageEntries(p: *Parser, kw_tok: u32, top: usize) PE!void {
+        while (p.atHeritageEntry()) {
+            try p.pushScratch(try p.parseHeritage());
+            const comma = try p.eat(.comma) orelse break;
+            if (!p.atHeritageEntry()) {
+                // `checkGrammarForDisallowedTrailingComma` blames `list.end -
+                // 1`, and a delimited list ends at the FULL start of the token
+                // after it — so the byte before that is the comma itself.
+                try p.errAtToken(.trailing_comma, comma);
+                return;
+            }
+        }
+        if (p.scratchTop() == top) try p.errAtTokenEndNamed(.heritage_list_empty, kw_tok);
+    }
+
+    /// `isListElement(HeritageClauseElement)`, narrowed to the three tokens
+    /// that end a clause in practice: the next clause's keyword
+    /// (`isHeritageClauseExtendsOrImplementsKeyword`), a `{` that opens the
+    /// BODY rather than an object literal, and end of file. Everything else is
+    /// handed to `parseHeritage`, which is what ztsc did for every token
+    /// before — so this only ever SHORTENS a list that used to swallow the
+    /// body.
+    fn atHeritageEntry(p: *Parser) bool {
+        return switch (p.curTag()) {
+            .keyword_extends, .keyword_implements, .eof => false,
+            .l_brace => p.atHeritageObjectLiteral(),
+            else => true,
+        };
+    }
+
+    /// tsc's `isValidHeritageClauseObjectLiteral`: `extends {}` is the class
+    /// BODY, not a base expression — unless the `{}` is followed by a token
+    /// that cannot open a body (`,`, `{`, `extends`, `implements`). A NON-empty
+    /// `{…}` is always the base expression.
+    fn atHeritageObjectLiteral(p: *Parser) bool {
+        if (p.peekTag(1) != .r_brace) return true;
+        return switch (p.peekTag(2)) {
+            .comma, .l_brace, .keyword_extends, .keyword_implements => true,
+            else => false,
+        };
     }
 
     /// `extends`/`implements` entry: LHS expression + optional type args.
@@ -5399,13 +5460,10 @@ const Parser = struct {
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
         if (p.atLt()) tp = try p.parseTypeParams(.type_decl);
         var ext: ast.SubRange = .{ .start = 0, .end = 0 };
-        if (try p.eat(.keyword_extends) != null) {
+        if (try p.eat(.keyword_extends)) |kw_tok| {
             const top = p.scratchTop();
             defer p.scratch.shrinkRetainingCapacity(top);
-            while (true) {
-                try p.pushScratch(try p.parseHeritage());
-                if (try p.eat(.comma) == null) break;
-            }
+            try p.parseHeritageEntries(kw_tok, top);
             ext = try p.scratchToSpan(top);
         }
         // `interface I implements J {}`: tsc's `parseHeritageClauses` takes
