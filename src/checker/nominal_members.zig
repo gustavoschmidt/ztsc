@@ -90,6 +90,7 @@
 //! property walk on the NAME put a lock on the hot path — interleaved A/B on
 //! drizzle, 4.28s -> 4.63s median (+7-8%) against a 2% bar.
 
+const ast = @import("../frontend/ast.zig");
 const binder = @import("../frontend/binder.zig");
 const intern = @import("../intern.zig");
 const types = @import("../types.zig");
@@ -109,6 +110,46 @@ const statics_zig = @import("statics.zig");
 const classes = @import("classes.zig");
 const max_heritage_nodes = classes.max_heritage_nodes;
 const derivesFrom = classes.derivesFrom;
+
+/// The CONSTRUCTOR's half of the same nominal screen — tsc's
+/// `constructorVisibilitiesAreCompatible`, run out of `signaturesRelatedTo`
+/// when a class value is related to another class value:
+///
+/// ```ts
+/// if (targetAccessibility === Private) return true;                          // anything -> private
+/// if (targetAccessibility === Protected && source !== Private) return true;  // public/protected -> protected
+/// if (targetAccessibility !== Protected && !sourceAccessibility) return true; // public -> public
+/// return false;   // Cannot_assign_a_0_constructor_type_to_a_1_constructor_type
+/// ```
+///
+/// In one line: the target constructor must be AT LEAST as hidden as the
+/// source's. `let a = Foo; a = Baz` with a protected `Baz` constructor is the
+/// error; `let b = Baz; b = Foo` is not.
+///
+/// Like every rule in this file it is a fact about DECLARATIONS that the
+/// resolved type has thrown away — a materialized static object carries no
+/// accessibility bit on its construct signatures, exactly as a resolved `Prop`
+/// carries no declaring class. The modifier is therefore read off the
+/// declaring class: the first one up the `extends` chain that writes a
+/// `constructor` (`statics.declaringCtor`, the same walk
+/// `isConstructorAccessible` uses for TS2673/2674), so a derived class with no
+/// constructor of its own inherits its base's visibility. No declaration at
+/// all is the implicit constructor, which is public.
+pub fn ctorVisibilityCompatible(c: *Checker, src_cls: SymbolId, tgt_cls: SymbolId) Error!bool {
+    const tgt = try ctorAccessOf(c, tgt_cls);
+    if (tgt == .private) return true;
+    return @intFromEnum(try ctorAccessOf(c, src_cls)) <= @intFromEnum(tgt);
+}
+
+/// The accessibility of the constructor a `new <cls>()` would resolve against.
+/// `Access` is ordered public < protected < private, which is what makes
+/// "at least as hidden" a single comparison.
+pub fn ctorAccessOf(c: *Checker, cls: SymbolId) Error!Access {
+    const found = (try statics_zig.declaringCtor(c, cls)) orelse return .public;
+    if (found.flags & ast.Flags.private != 0) return .private;
+    if (found.flags & ast.Flags.protected != 0) return .protected;
+    return .public;
+}
 
 /// The screen for the one pair the property walk can never see: two distinct
 /// REFERENCES whose member tables materialize to the very same type id.

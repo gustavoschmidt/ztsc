@@ -146,7 +146,17 @@ const Tail = union(enum) {
     /// returns as soon as the abstract bit decides the pair, so nothing below
     /// it is ever compared.
     abstract_ctor,
+    /// tsc's `Cannot_assign_a_0_constructor_type_to_a_1_constructor_type`, out
+    /// of `constructorVisibilitiesAreCompatible` (see
+    /// `nominal_members.ctorVisibilityCompatible`). Terminal for the same
+    /// reason `abstract_ctor` is, and checked right after it — the two rules
+    /// are consecutive returns in tsc's construct-signature half. Carries the
+    /// two rendered modifier words.
+    ctor_visibility: CtorVisibility,
 };
+
+/// The two modifier words `Tail.ctor_visibility` interpolates, in tsc's order.
+const CtorVisibility = struct { src: []const u8, tgt: []const u8 };
 
 const Found = union(enum) { step: Level, tail: Tail };
 
@@ -318,6 +328,7 @@ fn findStep(c: *Checker, s0: TypeId, t0: TypeId, missing_ok: bool) Error!?Found 
     const s = try c.resolveStructural(s0);
     const t = try c.resolveStructural(t0);
     if (try abstractCtorTail(c, s0, t0, t)) return .{ .tail = .abstract_ctor };
+    if (try ctorVisibilityTail(c, s0, t0)) |v| return .{ .tail = .{ .ctor_visibility = v } };
     switch (store.kind(s)) {
         .err, .none, .any, .never => return null,
         else => {},
@@ -471,6 +482,31 @@ fn abstractCtorTail(c: *Checker, s0: TypeId, t0: TypeId, t: TypeId) Error!bool {
     return store.kind(t) == .object and
         store.objectConstructSigCount(t) > 0 and
         !store.fnIsAbstract(store.objectConstructSig(t, 0));
+}
+
+/// The constructor-VISIBILITY tail, on the same terms as `abstractCtorTail`:
+/// the pair is two class VALUES and the rule in
+/// `nominal_members.ctorVisibilityCompatible` is what rejected it, so nothing
+/// below it was ever compared. Null when the rule is not what decided the pair.
+fn ctorVisibilityTail(c: *Checker, s0: TypeId, t0: TypeId) Error!?CtorVisibility {
+    const store = &c.ts;
+    if (store.kind(s0) != .class_value or store.kind(t0) != .class_value) return null;
+    const src = store.classSymbol(s0);
+    const tgt = store.classSymbol(t0);
+    if (try nominal_members.ctorVisibilityCompatible(c, src, tgt)) return null;
+    return .{
+        .src = accessWord(try nominal_members.ctorAccessOf(c, src)),
+        .tgt = accessWord(try nominal_members.ctorAccessOf(c, tgt)),
+    };
+}
+
+/// The modifier word tsc interpolates into the constructor-visibility message.
+fn accessWord(a: accessibility.Access) []const u8 {
+    return switch (a) {
+        .public => "public",
+        .protected => "protected",
+        .private => "private",
+    };
 }
 
 /// A missing required property (the chain's tail) or the first incompatible
@@ -710,6 +746,9 @@ fn render(c: *Checker, levels: []const Level, tail: Tail) Error![]const u8 {
     }
     if (tail == .nominal) try line(&out.writer, &indent, "{s}", .{tail.nominal});
     if (tail == .abstract_ctor) try line(&out.writer, &indent, "Cannot assign an abstract constructor type to a non-abstract constructor type.", .{});
+    if (tail == .ctor_visibility) try line(&out.writer, &indent, "Cannot assign a '{s}' constructor type to a '{s}' constructor type.", .{
+        tail.ctor_visibility.src, tail.ctor_visibility.tgt,
+    });
     return out.written();
 }
 
