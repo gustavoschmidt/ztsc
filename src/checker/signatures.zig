@@ -37,9 +37,10 @@ const finalizeInferredReturn = @import("names.zig").finalizeInferredReturn;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
 const hasOwnValueMeaning = @import("names.zig").hasOwnValueMeaning;
 const implicit_any = @import("implicit_any.zig");
+const iteration = @import("iteration.zig");
 const modvalue = @import("modvalue.zig");
 const narrowByCondition = @import("flow.zig").narrowByCondition;
-const contextualIteration = @import("stmts.zig").contextualIteration;
+const contextualIteration = iteration.contextualIteration;
 const widenLiteral = @import("names.zig").widenLiteral;
 const widenReturnMember = @import("names.zig").widenReturnMember;
 const widenToContext = @import("names.zig").widenToContext;
@@ -1326,11 +1327,12 @@ fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) Erro
 }
 
 /// Inferred return type of an unannotated `function*`: tsc's
-/// `Generator<Y, R, N>`, where `Y` unions every yielded value (widened —
-/// `yield "a"` gives `string`, a bare `yield` gives `undefined`, no yields
-/// at all give `never`), `R` is the ordinary inferred return type of the
-/// body, and `N` is `unknown` — the value a caller hands to `.next()`,
-/// which nothing in the body can pin down.
+/// `Generator<Y, R, N>`, where `Y` unions every yielded value (widened
+/// against the contextual yield type — `yield "a"` gives `string`, a bare
+/// `yield` gives `undefined`, no yields at all give `never`), `R` is the
+/// ordinary inferred return type of the body, and `N` is the CONTEXTUAL next
+/// type falling back to `unknown` — the value a caller hands to `.next()`,
+/// which nothing in the body can pin down (`iteration.inferredNextType`).
 ///
 /// A `yield*` delegation contributes what its operand ITERATES, which is
 /// the same `checkIteratedTypeOrElementType` reading the body check relates
@@ -1386,13 +1388,20 @@ fn inferGeneratorReturn(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId)
             const operand_ctx: TypeId = if (y.delegate) ret_ctx else yield_ctx;
             const vt = try c.checkExprCached(y.expr, operand_ctx);
             const contributed = if (y.delegate) try c.forOfElementType(vt, null_node, false) else vt;
-            try parts.append(c.scratch(), try c.widenLiteral(contributed));
+            // Widened AGAINST THE YIELD CONTEXT, not unconditionally: a fresh
+            // literal whose contextual yield type admits it stays literal,
+            // exactly as a contextually-typed `return` expression does
+            // (tsc's `isLiteralOfContextualType`, reached here through
+            // `getContextualIterationType`). `f1<0, 0, 1>(function* () { yield
+            // 0; … })` must contribute `0`, not `number`
+            // (`generatorYieldContextualType`).
+            try parts.append(c.scratch(), try c.widenToContext(contributed, if (yield_ctx == 0) types.no_type else yield_ctx));
         }
         if (yields.bare) try parts.append(c.scratch(), types.undefined_type);
         yield_ty = try c.ts.makeUnion(c.scratch(), parts.items);
     }
     const ret_ty = try inferReturnType(c, fn_node, body, if (iter_ctx) |it| it.ret else types.no_type);
-    return c.ts.makeRef(gen_sym, &.{ yield_ty, ret_ty, types.unknown_type });
+    return c.ts.makeRef(gen_sym, &.{ yield_ty, ret_ty, iteration.inferredNextType(iter_ctx) });
 }
 
 /// One `yield` operand of a generator body: the expression, the scope it

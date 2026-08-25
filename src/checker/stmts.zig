@@ -852,6 +852,8 @@ pub const forOfElementType = iteration.forOfElementType;
 pub const iterationElementType = iteration.iterationElementType;
 pub const contextualIterationElementType = iteration.contextualIterationElementType;
 pub const iteratorNextValue = iteration.iteratorNextValue;
+pub const IterationCtx = iteration.IterationCtx;
+pub const contextualIteration = iteration.contextualIteration;
 
 fn checkSwitch(c: *Checker, node: Node) Error!void {
     const d = c.tree.nodeData(node);
@@ -1139,51 +1141,6 @@ pub fn drainDeferredBodies(c: *Checker) Error!void {
         try c.checkFunctionBody(d.node, d.proto_idx, d.body, d.sig, d.ret_ctx);
     }
     c.deferred_bodies.clearRetainingCapacity();
-}
-
-/// The yield element type and the return type a generator's return type
-/// carries — `Generator<Y, R, N>`'s first two arguments.
-pub const IterationCtx = struct { yield: TypeId, ret: TypeId };
-
-/// The yield and return contexts a generator takes from a CONTEXTUAL return
-/// type — tsc's `getContextualIterationType`, which reads
-/// `getIterationTypeOfGeneratorFunctionReturnType` off the contextual
-/// signature's return type. Null when that type names no generator.
-///
-/// The contextual type is routinely a UNION with the generator as one arm
-/// (`() => number | Generator<(arg: number) => void, any, void>` —
-/// `contextualTypeOnYield1`), so the first arm that names one wins; tsc reaches
-/// the same place through `getIterationTypesOfType` over the union.
-///
-/// Purely contextual: both halves only TYPE the operands, and nothing is
-/// reported against either — see `FnCtx.yield_ctx`.
-pub fn contextualIteration(c: *Checker, ctx: TypeId, is_async: bool) Error!?IterationCtx {
-    if (ctx == 0 or ctx == types.no_type) return null;
-    if (c.ts.kind(ctx) == .union_type) {
-        for (try c.memberList(ctx)) |m| {
-            if (try contextualIteration(c, m, is_async)) |it| return it;
-        }
-        return null;
-    }
-    const y = if (is_async) c.asyncGeneratorYieldType(ctx) else c.generatorYieldType(ctx);
-    if (y == 0) {
-        // `Iterable<T, TReturn>` / `AsyncIterable<…>` are legal generator
-        // return types too, and `iteration.generatorYieldType` — whose job is
-        // the CHECK target — leaves them out because a written `Iterable`
-        // annotation is not what tsc relates a `yield` to. As a CONTEXT it is:
-        // `function* (): Iterator<Iterable<(x: string) => number>>` types the
-        // inner generator of `yield (function*(){…})()` through it.
-        if (c.ts.kind(ctx) != .ref) return null;
-        const sym = c.ts.refSymbol(ctx);
-        const name = try c.atom(if (is_async) "AsyncIterable" else "Iterable");
-        const g = c.prog.globals.lookup(name) orelse return null;
-        if (sym != g) return null;
-        const iargs = c.ts.refArgs(ctx);
-        if (iargs.len == 0) return null;
-        return .{ .yield = iargs[0], .ret = if (iargs.len >= 2) iargs[1] else types.no_type };
-    }
-    const args = c.ts.refArgs(ctx);
-    return .{ .yield = y, .ret = if (args.len >= 2) args[1] else types.no_type };
 }
 
 /// The `<T, TReturn, TNext>` arguments of a type written with one of the

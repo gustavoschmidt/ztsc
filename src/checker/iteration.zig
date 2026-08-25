@@ -147,6 +147,76 @@ pub fn asyncGeneratorYieldType(c: *Checker, t: TypeId) TypeId {
     return 0;
 }
 
+/// The yield, return and next types a generator's return type carries —
+/// `Generator<Y, R, N>`'s three arguments. `ret`/`next` are `types.no_type`
+/// when the spelling left them off.
+pub const IterationCtx = struct { yield: TypeId, ret: TypeId, next: TypeId };
+
+/// The yield, return and next contexts a generator takes from a CONTEXTUAL
+/// return type — tsc's `getContextualIterationType`, which reads
+/// `getIterationTypeOfGeneratorFunctionReturnType` off the contextual
+/// signature's return type. Null when that type names no generator.
+///
+/// The contextual type is routinely a UNION with the generator as one arm
+/// (`() => number | Generator<(arg: number) => void, any, void>` —
+/// `contextualTypeOnYield1`), so the first arm that names one wins; tsc reaches
+/// the same place through `getIterationTypesOfType` over the union.
+///
+/// Purely contextual: every half only TYPES the operands (or, for `next`,
+/// spells the third argument of the INFERRED `Generator<…>`), and nothing is
+/// reported against any of them — see `FnCtx.yield_ctx`.
+pub fn contextualIteration(c: *Checker, ctx: TypeId, is_async: bool) Error!?IterationCtx {
+    if (ctx == 0 or ctx == types.no_type) return null;
+    if (c.ts.kind(ctx) == .union_type) {
+        for (try c.memberList(ctx)) |m| {
+            if (try contextualIteration(c, m, is_async)) |it| return it;
+        }
+        return null;
+    }
+    const y = if (is_async) c.asyncGeneratorYieldType(ctx) else c.generatorYieldType(ctx);
+    if (y == 0) {
+        // `Iterable<T, TReturn, TNext>` / `AsyncIterable<…>` are legal
+        // generator return types too, and `generatorYieldType` — whose job is
+        // the CHECK target — leaves them out because a written `Iterable`
+        // annotation is not what tsc relates a `yield` to. As a CONTEXT it is:
+        // `function* (): Iterator<Iterable<(x: string) => number>>` types the
+        // inner generator of `yield (function*(){…})()` through it.
+        if (c.ts.kind(ctx) != .ref) return null;
+        const sym = c.ts.refSymbol(ctx);
+        const name = try c.atom(if (is_async) "AsyncIterable" else "Iterable");
+        const g = c.prog.globals.lookup(name) orelse return null;
+        if (sym != g) return null;
+        return iterationCtxOf(c.ts.refArgs(ctx));
+    }
+    return iterationCtxOf(c.ts.refArgs(ctx));
+}
+
+/// `Generator<Y, R, N>`'s argument list read positionally; null when it has
+/// no yield argument at all (`Iterable` written bare).
+fn iterationCtxOf(args: []const TypeId) ?IterationCtx {
+    if (args.len == 0) return null;
+    return .{
+        .yield = args[0],
+        .ret = if (args.len >= 2) args[1] else types.no_type,
+        .next = if (args.len >= 3) args[2] else types.no_type,
+    };
+}
+
+/// The NEXT type of the `Generator<Y, R, N>` inferred for an unannotated
+/// generator body: the CONTEXTUAL one when the contextual return type named a
+/// generator that spells it, else `unknown`.
+///
+/// tsc's `getReturnTypeFromBody` builds the generator type from
+/// `getIterationTypesOfGeneratorFunctionReturnType(contextualReturnType)`, so
+/// `f1<0, 0, 1>(function* () { … })` infers `Generator<0, 0, 1>` — the `1` can
+/// only come from the context, since nothing a body does pins down what a
+/// caller hands to `.next()`. Hardcoding `unknown` made that argument diverge
+/// and the call fail (`generatorYieldContextualType`).
+pub fn inferredNextType(it: ?IterationCtx) TypeId {
+    const n = (it orelse return types.unknown_type).next;
+    return if (n == types.no_type) types.unknown_type else n;
+}
+
 /// Union of a tuple's element types (the element type used when a tuple
 /// borrows `Array<T>` members).
 pub fn tupleElementUnion(c: *Checker, t: TypeId) Error!TypeId {
@@ -306,7 +376,7 @@ fn iterationOutcome(c: *Checker, rt: TypeId) Error!IterationOutcome {
         // `anyIterationTypes` the moment the method (or its return) is `any`,
         // and never look for `next` (`for-of25`, `for-of27`).
         if (isAnyLike(c, try c.resolveStructural(p.ty))) return .{ .element = types.any_type };
-        const ret = try c.callableReturn(p.ty);
+        const ret = try zeroArgCallableReturn(c, p.ty);
         if (ret != 0) {
             if (isAnyLike(c, try c.resolveStructural(ret))) return .{ .element = types.any_type };
             // Lib iterables return `IterableIterator<E>`/`Iterator<E>`.
@@ -347,7 +417,7 @@ pub fn asyncIterationElementType(c: *Checker, rt: TypeId) Error!?TypeId {
         else => {},
     }
     if (try c.propOfType(r, c.atom_sym_asyncIterator)) |p| {
-        const ret = try c.callableReturn(p.ty);
+        const ret = try zeroArgCallableReturn(c, p.ty);
         if (ret != 0) {
             const y = c.asyncGeneratorYieldType(ret);
             if (y != 0) return y;
@@ -370,6 +440,47 @@ pub fn callableReturn(c: *Checker, ty: TypeId) Error!TypeId {
         },
         else => return 0,
     }
+}
+
+/// Return type of the signature the ITERATION PROTOCOL would actually reach:
+/// the first one callable with NO arguments. 0 when `ty` is not callable, or
+/// when every signature it has demands an argument.
+///
+/// The protocol invokes `[Symbol.iterator]()` / `[Symbol.asyncIterator]()`
+/// with nothing, so a signature with a REQUIRED parameter is not the protocol
+/// — tsc filters the call signatures by `getMinArgumentCount(sig) === 0`
+/// (microsoft/TypeScript#57130) and reports TS2488 when none survive. An
+/// optional or rest parameter still has a zero minimum and still qualifies
+/// (`iteratorExtraParameters`, verified against the oracle both ways).
+///
+/// `next` deliberately does NOT go through this: the protocol DOES hand
+/// `next` a value, so `next(v: T)` is a legal iterator — a `T` that
+/// `undefined` cannot satisfy is tsc's separate TS2763, not a missing
+/// protocol.
+fn zeroArgCallableReturn(c: *Checker, ty: TypeId) Error!TypeId {
+    switch (c.ts.kind(ty)) {
+        .function => return if (minArgCount(c, ty) == 0) c.ts.fnReturn(ty) else 0,
+        .overloads => {
+            for (try c.memberList(ty)) |sig| {
+                if (minArgCount(c, sig) == 0) return c.ts.fnReturn(sig);
+            }
+            return 0;
+        },
+        else => return 0,
+    }
+}
+
+/// tsc's `getMinArgumentCount`: how many arguments a signature demands.
+/// Optional and rest parameters demand none, and neither does anything after
+/// the first of them.
+fn minArgCount(c: *const Checker, sig: TypeId) u32 {
+    const n = c.ts.fnParamCount(sig);
+    var i: u32 = n;
+    while (i > 0) : (i -= 1) {
+        const p = c.ts.fnParam(sig, i - 1);
+        if (!p.optional() and !p.rest()) return i;
+    }
+    return 0;
 }
 
 /// The `value` type of an iterator's `next()` result, i.e. the yield type
