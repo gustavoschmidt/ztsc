@@ -4398,6 +4398,85 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
         },
         .function => {
             var ra = try c.resolveStructural(arg);
+            // Same generic ALIAS on both sides, before either signature is
+            // paired — tsc's `inferFromTypes`: "source and target are types
+            // originating in the same generic type alias declaration … simply
+            // infer from source type arguments to target type arguments"
+            // (`source.aliasSymbol === target.aliasSymbol` →
+            // `inferFromTypeArguments`). The `.object` and `.intersection` arms
+            // already carry this rule; a FUNCTION-bodied alias had none, so the
+            // walk descended into the signature and inferred out of whatever
+            // the parameter types happened to reduce to.
+            //
+            // react-query's `QueryFunction<T, K, P> = (c: QueryFunctionContext
+            // <K, P>) => T` is the measured case, and the context is a
+            // conditional on `P`: with the alias spelling on both sides, `P`
+            // pairs positionally and takes the written `never`; without this
+            // rule the walk reached `QueryFunctionContext<K, P>` (still
+            // deferred, `P` free) against the argument's already-REDUCED true
+            // branch and bound `P` to that branch's `pageParam?: unknown`. That
+            // is the social-app `fetchQuery` witness root-caused above
+            // `assign.intersectionOptionalsRelated`: `TPageParam` came back
+            // `unknown` where tsgo has `never`, which put the two persister
+            // types on opposite branches of the same conditional.
+            //
+            // Identity-only, exactly as the `.object` arm is: it fires solely
+            // when both origins are refs to the SAME alias symbol, and an
+            // argument written STRUCTURALLY (no alias) carries no origin tag at
+            // all — which is precisely the distinction tsc draws here, and the
+            // one the oracle confirms (the same call with the context spelled
+            // out inline does infer `unknown`).
+            //
+            // NARROWER THAN TSC, deliberately. tsc pairs the arguments
+            // unconditionally, DIRECTED BY `getAliasVariances`; ztsc's pairing
+            // is covariant, and for a contravariant alias parameter that is the
+            // wrong direction — `Func1<T> = (x: T) => void` given `Func1<string>`
+            // and `Func1<"a">` for one `T` infers `string` where tsc infers
+            // `"a"` (`compiler/contravariantTypeAliasInference.ts`). So the
+            // shortcut is taken only where the structural walk is provably
+            // pairing different SHAPES and has no right answer to lose: a
+            // parameter position the TARGET still holds as a deferred
+            // conditional while the SOURCE has already reduced past it.
+            // Widening it to tsc's form is a variance-directed pairing away
+            // (`variance.measuredVariances` + a `contra_pos` flip per position).
+            if (s.kind(ra) == .function and try deferredParamShapeMismatch(c, param, ra)) {
+                if (c.origin.get(param)) |po| {
+                    if (c.origin.get(arg) orelse c.origin.get(ra)) |ao| {
+                        if (s.kind(po) == .ref and s.kind(ao) == .ref and
+                            s.refSymbol(po) == s.refSymbol(ao))
+                        {
+                            const pa = try c.scratch().dupe(TypeId, s.refArgs(po));
+                            defer c.scratch().free(pa);
+                            const aa = try c.scratch().dupe(TypeId, s.refArgs(ao));
+                            defer c.scratch().free(aa);
+                            const n = @min(pa.len, aa.len);
+                            // …unless the application is an IDENTITY on one of its
+                            // arguments, where pairing re-enters `unify` with the
+                            // very pair that got here (see the `.object` arm), or
+                            // the ARGUMENT's origin is not GROUND. The second guard
+                            // is what a structural interner needs and tsc's
+                            // `aliasSymbol` does not: an origin ref is recovered by
+                            // substituting through a materialization, and a `.d.ts`
+                            // alias whose trailing parameter carries a bare default
+                            // (`type Red<S, A, P = S>`) leaves one of ITS OWN names
+                            // in that ref. Pairing such a position hands the slot a
+                            // type variable as a candidate and the inference comes
+                            // back as `answer | S` — `instantiation/037` pins it.
+                            // An argument written at concrete arguments, which is
+                            // the whole population this shortcut is for, is ground.
+                            var skip = false;
+                            for (0..n) |i| {
+                                if (pa[i] == param and (aa[i] == arg or aa[i] == ra)) skip = true;
+                                if (try c.containsTypeParam(aa[i])) skip = true;
+                            }
+                            if (!skip) {
+                                for (0..n) |i| try c.unify(pa[i], aa[i], tp_syms, candidates, depth + 1);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
             // tsc's `InferenceInfo.isFixed`, for the one place ztsc needs it —
             // the spec paragraph `contextualSignatureInstantiation.ts` opens
             // with: "any inferences made for type parameters referenced by the
@@ -5528,6 +5607,26 @@ pub fn constituentCarriesInference(c: *Checker, param: TypeId, m: TypeId, tp_sym
 /// screen for `constituentCarriesInference` — the deeper the occurrence, the
 /// less a structural pairing can invert it, and a false negative only leaves
 /// the prior behaviour.
+/// Do two signatures of the SAME generic alias disagree about whether a
+/// parameter position is still deferred — the target holding a conditional the
+/// source has already reduced past?
+///
+/// That disagreement is what makes the structural walk unsound for such a pair:
+/// it pairs a conditional against ONE of its own branches, and every inference
+/// it takes out of that branch is an inference out of a shape the target may
+/// never have. It is also the only case `unify`'s same-alias shortcut is
+/// allowed to pre-empt, because a pair that agrees structurally has a real
+/// answer the covariant pairing could lose (see the caller).
+fn deferredParamShapeMismatch(c: *Checker, param: TypeId, arg: TypeId) Error!bool {
+    const s = &c.ts;
+    const n = @min(s.fnParamCount(param), s.fnParamCount(arg));
+    for (0..n) |i| {
+        if (s.kind(s.fnParam(param, @intCast(i)).ty) != .conditional) continue;
+        if (s.kind(try c.resolveStructural(s.fnParam(arg, @intCast(i)).ty)) != .conditional) return true;
+    }
+    return false;
+}
+
 fn mentionsAnyTypeParam(c: *Checker, t: TypeId, tp_syms: []const u32) Error!bool {
     return mentionsAnyTypeParamAt(c, t, tp_syms, 0);
 }
