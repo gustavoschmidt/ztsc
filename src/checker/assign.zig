@@ -3171,7 +3171,7 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
     }
     if (sk == .intersection) {
         for (try c.memberList(s)) |m| {
-            if (try c.isAssignable(m, t)) return true;
+            if (try c.isAssignable(m, t)) return intersectionOptionalsRelated(c, s, t);
         }
         // Fall through: merged-members structural check for object targets.
         if (tk == .object or tk == .ref) {
@@ -3558,12 +3558,94 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
             if (sk == .class_value and
                 try c.classIsAbstract(c.ts.classSymbol(s)) and
                 !try c.classIsAbstract(c.ts.classSymbol(t))) return false;
+            // …and the constructor-VISIBILITY rule, here for the same reason:
+            // `private` / `protected` live on the constructor DECLARATION,
+            // and materializing both sides into construct signatures loses
+            // them (ztsc's signatures carry no accessibility bit).
+            if (sk == .class_value and
+                !try nominal_members.ctorVisibilityCompatible(c, c.ts.classSymbol(s), c.ts.classSymbol(t))) return false;
             const tgt_static = try c.classConstructType(c.ts.classSymbol(t));
             if (sk != .class_value) return c.structuralAssignable(s, tgt_static);
             return c.structuralAssignable(try c.classConstructType(c.ts.classSymbol(s)), tgt_static);
         },
         else => return false,
     }
+}
+
+/// tsc's INTERSECTION PROPERTY CHECK — the `inPropertyCheck` block of
+/// `isRelatedTo`:
+///
+/// ```ts
+/// if (result && !inPropertyCheck && (
+///     target.flags & TypeFlags.Intersection && … ||
+///     isNonGenericObjectType(target) && !isArrayOrTupleType(target) &&
+///     source.flags & TypeFlags.Intersection && …
+/// )) {
+///     inPropertyCheck = true;
+///     result &= recursiveTypeRelatedTo(source, target, reportErrors, IntersectionState.PropertyCheck, …);
+///     inPropertyCheck = false;
+/// }
+/// ```
+///
+/// `IntersectionState.PropertyCheck` re-runs `propertiesRelatedTo` with
+/// `optionalsOnly`, so it says exactly this: an intersection source that got in
+/// through the "SOME constituent is related to the target" shortcut still owes
+/// the target's OPTIONAL properties a comparison against the intersection's own
+/// synthesized member.
+///
+/// The shortcut is what makes the extra pass necessary. `{ a: null } & { b:
+/// string }` against `{ a?: number, b: string }` passes it on the strength of
+/// `{ b: string }` alone — an object with no `a` at all satisfies an optional
+/// `a?`, and tsgo agrees when that object is written on its own — while the
+/// intersection as a whole plainly has `a: null`. Oracle-pinned: the same pair
+/// with `a: number` is accepted, and `{ z: boolean } & { b: string }` (no `a`
+/// anywhere) is accepted, so it is the SYNTHESIZED property that decides, not
+/// the presence of a second constituent.
+///
+/// The array/tuple exclusion is tsc's and it is load-bearing: `number[] &
+/// [number, ...number[]]` is a legal source for `[number, ...number[]]`.
+///
+/// Shallow where tsc recurses: only the target's own optional properties are
+/// re-compared, not a full second relation. A nested failure is still reported
+/// by the ordinary walk whenever the shortcut does not fire, so this is the
+/// under-reporting direction.
+///
+/// And COMPARABLE, not assignable — a deliberate weakening of tsc's rule,
+/// bounded by a witness. tsc's version is a full relation re-run, so it sees
+/// the property pair in the same state the ordinary walk would; this one asks
+/// the relation cold, and re-deciding a pair the shortcut had already stepped
+/// around turns any residual imprecision in the relation into a NEW false
+/// positive rather than a missing one. social-app's
+/// `queryClient.fetchQuery(queryOptions({…}))` is that witness: the source is
+/// `Opts & { queryKey: DataTag<…> }`, the second constituent alone satisfies
+/// `FetchQueryOptions` (every other member is optional), and asking cold about
+/// `persister` — a `QueryPersister` whose callback context differs only in
+/// `direction?: unknown` vs `direction: "backward" | "forward"` — fails one way
+/// and succeeds the other, where tsgo accepts. Requiring the pair to be
+/// unrelated in BOTH directions keeps every case this check is for (`null` vs
+/// `number | undefined`, `boolean` vs `string | undefined` — primitives that
+/// are unrelated either way) and drops that one.
+fn intersectionOptionalsRelated(c: *Checker, s: TypeId, t: TypeId) Error!bool {
+    // `.object` is also where tsc's array/tuple exclusion lands: neither kind
+    // resolves to one, so both answer "nothing owed" here.
+    const rt = try c.resolveStructural(t);
+    if (c.ts.kind(rt) != .object) return true;
+    for (0..c.ts.objectPropCount(rt)) |i| {
+        const tp = c.ts.objectProp(rt, @intCast(i));
+        if (!tp.optional()) continue;
+        // `relationSrcProp`, not `propOfType`: the relation's own source
+        // lookup, which refuses to answer a NAMED property out of a string
+        // index signature. ztsc uses an `any`-valued index as its stand-in for
+        // a constituent it could not reduce, so the plain lookup hands this
+        // check synthetic members the structural walk would never compare.
+        const sp = (try relationSrcProp(c, s, tp.name)) orelse continue;
+        const want = try c.makeUnion2(tp.ty, types.undefined_type);
+        const have = if (sp.optional()) try c.makeUnion2(sp.ty, types.undefined_type) else sp.ty;
+        // BOTH directions, not just the assignable one — see the doc comment's
+        // last paragraph.
+        if (!try c.isComparable(have, want)) return false;
+    }
+    return true;
 }
 
 /// The key set a mapped type iterates: `keyof <source>` for a homomorphic
@@ -6364,9 +6446,15 @@ pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode
     // non-void, a target type predicate (`x is T`, return boolean)
     // constrains the source per tsc's `compareTypePredicateRelatedTo`:
     //   - the source must also be a type predicate (else TS2322,
-    //     "Signature '…' must be a type predicate") — but only when the
-    //     target guards an *identifier* (`this is T` targets do not force
-    //     the source to be a predicate);
+    //     "Signature '…' must be a type predicate"). tsc's test is
+    //     `isIdentifierTypePredicate(target) || isThisTypePredicate(target)`,
+    //     so a `this is T` target forces it too — this arm was written
+    //     against tsc 5.5.4, which had only the identifier half, and tsgo
+    //     7.0.2 errors on `method(): boolean` overriding `method(): this is
+    //     {a: 1}` (`compiler/typePredicateInherit`, both the `implements`
+    //     and the `extends` witness). The two ASSERTS kinds are not in
+    //     tsc's test and never reach here: an assertion returns `void`, so
+    //     the early-out above already accepted the pair;
     //   - the predicate kinds must match: same asserts-ness and the same
     //     guarded position (`this` vs a parameter index);
     //   - the asserted type is covariant — source type assignable to
@@ -6376,16 +6464,13 @@ pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode
     // target has no predicate, so this block is skipped).
     if (c.ts.fnHasPredicate(te)) {
         const tp = c.ts.fnPredicate(te);
-        if (!c.ts.fnHasPredicate(se)) {
-            if (tp.param != types.Predicate.this_param) return false;
-        } else {
-            const spd = c.ts.fnPredicate(se);
-            if (spd.asserts != tp.asserts) return false;
-            if (spd.param != tp.param) return false;
-            if (tp.ty != types.no_type) {
-                if (spd.ty == types.no_type) return false;
-                if (!try c.isAssignable(spd.ty, tp.ty)) return false;
-            }
+        if (!c.ts.fnHasPredicate(se)) return false;
+        const spd = c.ts.fnPredicate(se);
+        if (spd.asserts != tp.asserts) return false;
+        if (spd.param != tp.param) return false;
+        if (tp.ty != types.no_type) {
+            if (spd.ty == types.no_type) return false;
+            if (!try c.isAssignable(spd.ty, tp.ty)) return false;
         }
     }
     const s_ret = c.ts.fnReturn(se);

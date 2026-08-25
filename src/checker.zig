@@ -3753,6 +3753,7 @@ pub const Checker = struct {
     pub const typeParamSymsOfDecl = typenode_zig.typeParamSymsOfDecl;
     pub const buildInstMap = typenode_zig.buildInstMap;
     pub const fixTypeArgs = typenode_zig.fixTypeArgs;
+    pub const reportNoTypeArguments = typenode_zig.reportNoTypeArguments;
     pub const symHasConstrainedTypeParam = typenode_zig.symHasConstrainedTypeParam;
     pub const queueTypeArgConstraints = typenode_zig.queueTypeArgConstraints;
     pub const queueSigTypeArgConstraints = typenode_zig.queueSigTypeArgConstraints;

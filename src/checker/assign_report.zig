@@ -1147,7 +1147,80 @@ pub fn tryReportMissingProps(c: *Checker, src_t: TypeId, target: TypeId, span: S
     return false;
 }
 
-pub fn reportNotAssignable(c: *Checker, code: u16, src_t: TypeId, target: TypeId, span: Span) Error!void {
+/// tsc's NULL-STRIPPED union target — `isRelatedTo`, before any structural
+/// work:
+///
+/// ```ts
+/// // Try to see if we're relating something like `Foo` -> `Bar | null | undefined`
+/// if (relation !== identityRelation && target.flags & TypeFlags.Union &&
+///     (target as UnionType).types.length <= 3 && maybeTypeOfKind(target, TypeFlags.Nullable)) {
+///     const nullStrippedTarget = extractTypesOfKind(target, ~TypeFlags.Nullable);
+///     if (!(nullStrippedTarget.flags & (TypeFlags.Union | TypeFlags.Never))) {
+///         target = getNormalizedType(nullStrippedTarget, /*writing*/ true);
+///     }
+/// }
+/// ```
+///
+/// So a target of at most three constituents that reduces to ONE non-nullish
+/// type when `null` and `undefined` are dropped IS that type for the whole
+/// relation — head message, elaboration chain and literal generalization
+/// alike. `s.foo = 42` against a `T | undefined` setter is
+/// `Type 'number' is not assignable to type 'string'`, not `Type '42' is not
+/// assignable to type 'string | undefined'`: with the union gone, the target
+/// can no longer hold a singleton, so `generalizedSourceForMessage` widens the
+/// literal too — ONE substitution produces BOTH operand differences
+/// (`divergentAccessorsTypes2`). Four constituents, or a residue that is still
+/// a union, leave the target alone — oracle-pinned on `string | number |
+/// undefined` and `void | string | null | undefined`, which tsgo names in full.
+///
+/// Applied HERE rather than in the relation, which is where tsc has it. The
+/// pair reaching this function has already been rejected, so substituting the
+/// target cannot change a verdict — and the guard that makes tsc's version
+/// sound (a NULLISH source keeps the constituent that would have accepted it)
+/// is kept anyway, so the two agree on which pairs get the substitution.
+fn nullStrippedTarget(c: *Checker, src_t: TypeId, target: TypeId) Error!TypeId {
+    const rt = try c.resolveStructural(target);
+    if (c.ts.kind(rt) != .union_type) return target;
+    const ms = try c.memberList(rt);
+    if (ms.len == 0 or ms.len > 3) return target;
+    var kept: TypeId = types.no_type;
+    var had_nullish = false;
+    for (ms) |m| {
+        switch (c.ts.kind(m)) {
+            .null, .undefined => {
+                had_nullish = true;
+                continue;
+            },
+            else => {},
+        }
+        if (kept != types.no_type) return target;
+        kept = m;
+    }
+    if (!had_nullish or kept == types.no_type) return target;
+    if (mentionsNullish(c, src_t)) return target;
+    return kept;
+}
+
+/// Is `t` `null`/`undefined`, or a union with such a constituent? tsc's
+/// `maybeTypeOfKind(t, TypeFlags.Nullable)` for the source side.
+fn mentionsNullish(c: *Checker, t: TypeId) bool {
+    switch (c.ts.kind(t)) {
+        .null, .undefined => return true,
+        .union_type => {
+            for (0..c.ts.memberCount(t)) |i| {
+                switch (c.ts.kind(c.ts.memberAt(t, @intCast(i)))) {
+                    .null, .undefined => return true,
+                    else => {},
+                }
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
+pub fn reportNotAssignable(c: *Checker, code: u16, src_t: TypeId, target0: TypeId, span: Span) Error!void {
+    const target = try nullStrippedTarget(c, src_t, target0);
     // Readonly-list headline (tsc TS4104). tsc's `tryElaborateArrayLikeErrors`
     // runs before the head message is chosen and REPLACES it — in argument
     // position too, where the diagnostic comes out as 4104 rather than 2345 —

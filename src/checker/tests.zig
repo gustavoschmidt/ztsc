@@ -913,7 +913,13 @@ test "printer goldens via diagnostics" {
     var t3 = try TestCheck.init("const x: [number, string] | null = true;");
     defer t3.deinit();
     try testing.expectEqual(@as(usize, 1), t3.result.diagnostics.len);
-    try testing.expectEqualStrings("Type 'true' is not assignable to type '[number, string] | null'.", t3.result.diagnostics[0].msg);
+    // A target of at most three constituents that reduces to ONE non-nullish
+    // type when `null`/`undefined` are dropped IS that type for the whole
+    // report (tsc's null-stripped union target — `assign_report
+    // .nullStrippedTarget`), and with the union gone the target can no longer
+    // hold a singleton, so the source generalizes too. Oracle: tsgo 7.0.2
+    // prints exactly this for `const x: [number, string] | null = true`.
+    try testing.expectEqualStrings("Type 'boolean' is not assignable to type '[number, string]'.", t3.result.diagnostics[0].msg);
 
     // `&` binds tighter than `|`, so a union *inside* an intersection needs
     // parens — `(B | C) & A`, not `B | C & A`, which reads as `B | (C & A)`.
