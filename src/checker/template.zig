@@ -740,6 +740,45 @@ pub fn definitelyUnrelated(c: *Checker, s: TypeId, t: TypeId) bool {
     return !std.mem.eql(u8, s_end[s_end.len - end_len ..], t_end[t_end.len - end_len ..]);
 }
 
+/// tsc's `arraysEqual(source.texts, target.texts)`: two template-literal types
+/// whose HEAD and every post-hole CHUNK are the same interned text, so their
+/// placeholders line up one-to-one and both the relation
+/// (`sameTextPatternRelated`) and the inference (`assign.pairTemplateHoles`)
+/// can pair them position by position instead of running a text scan. Both
+/// sides must be `.template_literal_type`.
+pub fn sameTemplateTexts(c: *Checker, s: TypeId, t: TypeId) bool {
+    const store = &c.ts;
+    const n = store.templateHoleCount(s);
+    if (n != store.templateHoleCount(t)) return false;
+    if (store.templateHead(s) != store.templateHead(t)) return false;
+    for (0..n) |i| {
+        if (store.templateChunk(s, @intCast(i)) != store.templateChunk(t, @intCast(i))) return false;
+    }
+    return true;
+}
+
+/// Is `t` a template-literal placeholder that tsc's `getStringLikeTypeForType`
+/// hands back UNCHANGED — i.e. one that already denotes a set of strings, or an
+/// instantiable one that stands for such a set? Everything else (`number`,
+/// `bigint`, a boolean literal) tsc first wraps in a fresh `` `${t}` ``, so a
+/// caller that pairs placeholders one-to-one must not treat it as the match.
+///
+/// Oracle-pinned on `declare function inf<T0 extends string>(x: `${T0}`): [T0]`,
+/// whose inferred `T0` tsgo 7.0.2 reports as:
+///
+/// | argument                 | `T0`              |
+/// |--------------------------|-------------------|
+/// | `` `${T2}` ``            | `T2`              |
+/// | `` `${Uppercase<T2>}` `` | `Uppercase<T2>`   |
+/// | `` `${number}` ``        | `` `${number}` `` |
+pub fn templateHolePairsDirectly(c: *Checker, t: TypeId) bool {
+    return switch (c.ts.kind(t)) {
+        .string, .string_literal, .template_literal_type, .string_mapping, .any, .err => true,
+        .type_param, .infer_var, .mapped_param, .index_access, .conditional, .keyof_op => true,
+        else => false,
+    };
+}
+
 /// tsc's `isTypeMatchedByTemplateLiteralType` for the one pattern↔pattern shape
 /// it decides without an inference pass: `inferTypesFromTemplateLiteralType`
 /// short-circuits on `arraysEqual(source.texts, target.texts)` and hands back
@@ -757,12 +796,8 @@ pub fn definitelyUnrelated(c: *Checker, s: TypeId, t: TypeId) bool {
 /// "could match", so this only ever converts a certain mismatch into `false`.
 pub fn sameTextPatternRelated(c: *Checker, s: TypeId, t: TypeId) Error!?bool {
     const store = &c.ts;
+    if (!sameTemplateTexts(c, s, t)) return null;
     const n = store.templateHoleCount(s);
-    if (n != store.templateHoleCount(t)) return null;
-    if (store.templateHead(s) != store.templateHead(t)) return null;
-    for (0..n) |i| {
-        if (store.templateChunk(s, @intCast(i)) != store.templateChunk(t, @intCast(i))) return null;
-    }
     for (0..n) |i| {
         if (!try placeholderValid(c, store.templateHole(s, @intCast(i)), store.templateHole(t, @intCast(i)))) return false;
     }
