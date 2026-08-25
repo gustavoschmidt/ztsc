@@ -2508,6 +2508,26 @@ const Parser = struct {
 
     /// ASI: `;` is consumed; `}`, EOF, or a preceding line break also
     /// terminate the statement; anything else is an error (not consumed).
+    /// The body position of a function DECLARATION, a method or a constructor:
+    /// either a `{ … }` block (the caller's business) or a semicolon (an
+    /// overload signature / ambient declaration). tsc's
+    /// `parseFunctionBlockOrSemicolon(…, Diagnostics.or_expected)` — when
+    /// neither is possible it names BOTH ways out, TS1144, where an ordinary
+    /// statement position names only the semicolon (`function f() => 4;` is
+    /// TS1144 at the `=>`, measured). The recovery is identical either way:
+    /// tsc's `parseBlock` finds no `{`, consumes nothing, and the declaration
+    /// ends with no body.
+    fn expectBodyOrSemicolon(p: *Parser) PE!void {
+        switch (p.curTag()) {
+            .semicolon => _ = try p.bump(),
+            .r_brace, .eof => {},
+            else => {
+                if (p.nlBefore()) return;
+                try p.fail(.expected_brace_or_semi);
+            },
+        }
+    }
+
     fn expectSemicolon(p: *Parser) PE!void {
         switch (p.curTag()) {
             .semicolon => _ = try p.bump(),
@@ -2835,6 +2855,13 @@ const Parser = struct {
         const cond = try p.parseExpression(.{});
         _ = try p.expect(.r_paren, .expected_r_paren);
         const then_stmt = try p.parseSubstatement();
+        // tsc's `checkIfStatement`: an `if` whose body is the EMPTY statement is
+        // almost always a stray `;` in front of the block that was meant to be
+        // the body. Only the THEN branch — an empty `else` is silent — and only
+        // `if`, since `for (;;);` and `while (x);` are legal idioms.
+        if (then_stmt != null_node and p.nodeTagAt(then_stmt) == .empty_stmt and p.spec == 0) {
+            try p.errAtToken(.if_body_empty_statement, p.nodeMainTokenAt(then_stmt));
+        }
         if (try p.eat(.keyword_else) != null) {
             const else_stmt = try p.parseSubstatement();
             const extra = try p.addExtra(ast.IfElse{ .then_stmt = then_stmt, .else_stmt = else_stmt });
@@ -3244,7 +3271,7 @@ const Parser = struct {
             body = try p.parseFunctionBody();
         } else {
             // Overload signature / ambient declaration.
-            try p.expectSemicolon();
+            try p.expectBodyOrSemicolon();
         }
         try p.checkGeneratorStar(star, body != null_node);
         return p.addNode(.{
@@ -3765,6 +3792,17 @@ const Parser = struct {
         }
         var init: Node = null_node;
         if (try p.eat(.eq) != null) init = try p.parseAssignExpr(.{});
+        // TS1015, tsc's `checkGrammarParameterList`: `?` and `= …` say the same
+        // thing twice, and the two disagree about the type. On the parameter's
+        // NAME, and independent of the TS2371 an initializer outside an
+        // implementation earns beside it (`declare function h(a?= 1): void`
+        // answers both). Reported while speculating for the same reason the
+        // rest-parameter rule is — an arrow's parameter list is read inside a
+        // speculation that then COMMITS, and `restore` un-reports the ones that
+        // do not.
+        if (flags & ast.Flags.optional != 0 and init != null_node and name != null_node) {
+            try p.errAtToken(.param_question_and_initializer, p.nodeMainTokenAt(name));
+        }
 
         if (flags == 0 and init == null_node) {
             return p.addNode(.{ .tag = .param, .main_token = start_tok, .data = .{ .lhs = name, .rhs = type_ann } });
@@ -4647,7 +4685,16 @@ const Parser = struct {
             if (p.curTag() == .l_brace) {
                 body = try p.parseFunctionBody();
             } else {
-                try p.expectSemicolon(); // overload signature / abstract
+                // Overload signature / abstract. TS1144 for a method or a
+                // constructor, TS1005 "';' expected" for an ACCESSOR: tsc's
+                // `parseAccessorDeclaration` is the one caller of
+                // `parseFunctionBlockOrSemicolon` that passes no message
+                // (measured — `class G { get p() => 7; }` is "'{' expected").
+                if (flags & (ast.Flags.get | ast.Flags.set) != 0) {
+                    try p.expectSemicolon();
+                } else {
+                    try p.expectBodyOrSemicolon();
+                }
             }
             const member = try p.addNode(.{ .tag = .class_method, .main_token = name_tok, .data = .{ .lhs = proto, .rhs = body } });
             try p.checkGeneratorStar(star, body != null_node);
@@ -8374,11 +8421,30 @@ const Parser = struct {
     fn parseImportType(p: *Parser) PE!Node {
         const kw = try p.bump(); // import
         _ = try p.expect(.l_paren, .expected_l_paren);
+        // tsc's `parseImportType` reads the argument as a full TYPE and leaves
+        // "it has to be a string literal" to the checker
+        // (`getTypeFromImportTypeNode`'s TS1141, reported only when the type is
+        // actually RESOLVED — an unused `type A = import({x: 12})` is silent,
+        // measured). Refusing anything but a string here stalled on the
+        // argument, which cost a false TS1110 on every such node AND wrecked
+        // the recovery of a NESTED one: the `)` of `import(import("./a").X)`
+        // closed the attribute skip below, leaving the outer `)` to be blamed
+        // as a missing `;` (importTypeNested).
+        //
+        // `spec_tok` is the argument's FIRST token whatever it turned out to
+        // be; every reader checks the tag, because only a `.string_literal`
+        // names a module.
         var spec_tok: u32 = 0;
         if (p.curTag() == .string_literal) {
             spec_tok = p.curIdx();
             _ = try p.bump();
+        } else if (p.curTag() != .r_paren) {
+            spec_tok = p.curIdx();
+            _ = try p.parseType();
         } else {
+            // `import()` with nothing in it: tsc's `parseType` answers TS1110
+            // at the `)`, which is the one shape where the argument is missing
+            // rather than wrong.
             try p.fail(.expected_type);
         }
         // Tolerate `import("m", { with: {...} })` assertions: skip to `)`.

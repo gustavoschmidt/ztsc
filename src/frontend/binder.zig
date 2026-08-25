@@ -5199,6 +5199,11 @@ const Binder = struct {
     fn bindImportType(b: *Binder, node: Node) Error!void {
         const spec_tok = b.tree.nodeData(node).lhs;
         if (spec_tok == 0) return; // parse error: no specifier
+        // …and a specifier that is not a STRING names no module: the argument
+        // of an `import()` type is parsed as a type (see `parseImportType`), so
+        // this token can be any type's first one. Its diagnostic is the
+        // checker's TS1141, at the use site.
+        if (b.tree.tokens.tag(spec_tok) != .string_literal) return;
         const module = try b.moduleAtom(spec_tok);
         if (module == 0) return;
         try b.import_recs.append(b.scratch, .{

@@ -555,6 +555,19 @@ pub const NsContainer = union(enum) { ns: SymbolId, module: ModuleRef };
 pub fn resolveImportTypeModule(c: *Checker, import_node: Node, report: bool) Error!?ModuleRef {
     const spec_tok = c.tree.nodeData(import_node).lhs;
     if (spec_tok == 0) return null;
+    // tsc's `getTypeFromImportTypeNode`: `if (!isLiteralImportTypeNode(node))
+    // error(node.argument, String_literal_expected)`. Reported HERE and not in
+    // the parser because it is a resolution-time error — an `import()` type
+    // whose argument is not a string is silent until something asks for the
+    // type (an unused `type A = import({x: 12})` reports nothing, measured).
+    // (wave-34 D: one flagged crossing; the parser half is what makes the
+    // argument reach this point at all.)
+    if (c.tree.tokens.tag(spec_tok) != .string_literal) {
+        if (report) {
+            try c.diagFmt(1141, c.tokSpan(spec_tok), "String literal expected.", .{});
+        }
+        return null;
+    }
     const spec = try c.memberAtom(spec_tok);
     if (c.prog.files.len != 0) {
         if (c.prog.files[c.cur_file].specs.get(spec)) |mfile| return .{ .file = mfile };

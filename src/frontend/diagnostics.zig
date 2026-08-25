@@ -134,6 +134,26 @@ pub const Code = enum(u16) {
     /// `checkGrammarVariableDeclarationList` right beside TS1123 — so it is a
     /// GRAMMAR diagnostic for the same reason that one is.
     trailing_comma,
+    /// TS1144: a function DECLARATION, method or constructor with neither a
+    /// `{` body nor anywhere to put a semicolon. tsc's
+    /// `parseFunctionBlockOrSemicolon(…, Diagnostics.or_expected)` names both
+    /// ways out where the plain statement position names only the semicolon —
+    /// `function f() => 4;` is this, at the `=>`. An ACCESSOR is deliberately
+    /// not in the list: `parseAccessorDeclaration` passes no message and gets
+    /// the bare "'{' expected" (measured).
+    expected_brace_or_semi,
+    /// TS1313: `if (x);` — the `if` body is an empty statement, which is
+    /// almost always a stray semicolon before the block that was meant to be
+    /// the body. tsc's `checkIfStatement`, so a GRAMMAR diagnostic; only the
+    /// THEN branch (an empty `else` is silent), and only `if` — `for (;;);`
+    /// and `while (x);` are legal idioms and say nothing.
+    if_body_empty_statement,
+    /// TS1015: `f(a?= 1)` — a parameter with both a `?` and an initializer,
+    /// which say the same thing twice and disagree about the type. tsc's
+    /// `checkGrammarParameterList`, on the parameter's NAME, and independent of
+    /// the TS2371 an initializer in a non-implementation earns beside it
+    /// (measured on `declare function h(a?= 1): void`, which answers both).
+    param_question_and_initializer,
     expected_string_literal,
     expected_from,
     /// TS1005 for the `as` of a namespace import (`import * as ns from "m"`)
@@ -1097,6 +1117,8 @@ pub const Code = enum(u16) {
             .empty_var_decl_list,
             .empty_type_arg_list,
             .trailing_comma,
+            .if_body_empty_statement,
+            .param_question_and_initializer,
             .for_of_one_declaration,
             .for_in_one_declaration,
             .for_of_declaration_initializer,
@@ -1386,6 +1408,9 @@ pub const Code = enum(u16) {
             .empty_var_decl_list => "Variable declaration list cannot be empty.",
             .empty_type_arg_list => "Type argument list cannot be empty.",
             .trailing_comma => "Trailing comma not allowed.",
+            .expected_brace_or_semi => "'{' or ';' expected.",
+            .if_body_empty_statement => "The body of an 'if' statement cannot be the empty statement.",
+            .param_question_and_initializer => "Parameter cannot have question mark and initializer.",
             .expected_string_literal => "String literal expected.",
             .expected_from => "'from' expected.",
             .expected_as => "'as' expected.",
@@ -1748,6 +1773,9 @@ pub const Code = enum(u16) {
             .empty_var_decl_list => 1123,
             .empty_type_arg_list => 1099,
             .trailing_comma => 1009,
+            .expected_brace_or_semi => 1144,
+            .if_body_empty_statement => 1313,
+            .param_question_and_initializer => 1015,
             .expected_declaration => 1146,
             .expected_case_or_default => 1130,
             .expected_catch_or_finally => 1472,
