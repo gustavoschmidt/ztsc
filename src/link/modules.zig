@@ -2229,6 +2229,12 @@ const Linker = struct {
     /// `declare module "spec" { … }` blocks; imports of `"spec"` resolve
     /// against it (after the on-disk module, so it augments a real module).
     ambient: std.AutoArrayHashMapUnmanaged(Atom, std.AutoArrayHashMapUnmanaged(Atom, Target)) = .empty,
+    /// The subset of `ambient`'s keys that a SCRIPT declared — the blocks that
+    /// bring a module into existence, as opposed to the ones in a module file,
+    /// which tsc reads as AUGMENTATIONS of a module that has to exist already
+    /// (`isExternalModuleAugmentation`). Only these satisfy an augmentation's
+    /// own name lookup; see `reportAugmentationName`.
+    script_ambient: std.AutoHashMapUnmanaged(Atom, void) = .empty,
     /// Augmentation index, grouped by the file being augmented: the blocks
     /// `declare module "spec" { … }` whose `spec` resolves to that file, as
     /// (augmenting file, `bind.ambient_modules` index) pairs in FileId order.
@@ -3085,6 +3091,7 @@ const Linker = struct {
                 if (f.bind.scope_parents[am.scope] != binder.file_scope) continue;
                 const gop = try l.ambient.getOrPut(l.scratch, am.spec);
                 if (!gop.found_existing) gop.value_ptr.* = .empty;
+                if (!f.bind.is_module) try l.script_ambient.put(l.scratch, am.spec, {});
             }
         }
         for (l.files, 0..) |*f, fi| {
@@ -3649,11 +3656,25 @@ const Linker = struct {
     /// forty overlapping patterns (`*?worker` / `*?worker&inline`, `*.css` /
     /// `*.module.css`), so the distinction is not hypothetical.
     fn ambientKey(l: *Linker, spec: Atom) ?Atom {
-        if (l.ambient.contains(spec)) return spec;
+        return l.ambientKeyIn(spec, null);
+    }
+
+    /// `ambientKey`, restricted to the registry keys in `only` (null = all).
+    /// The restriction is what an AUGMENTATION's own name lookup needs: it may
+    /// only find a module a SCRIPT brought into existence, never another
+    /// augmentation.
+    fn ambientKeyIn(l: *Linker, spec: Atom, only: ?*const std.AutoHashMapUnmanaged(Atom, void)) ?Atom {
+        const admits = struct {
+            fn f(set: ?*const std.AutoHashMapUnmanaged(Atom, void), a: Atom) bool {
+                return if (set) |s| s.contains(a) else true;
+            }
+        }.f;
+        if (l.ambient.contains(spec) and admits(only, spec)) return spec;
         const text = l.atomText(spec);
         var best: ?Atom = null;
         var best_prefix: usize = 0;
         for (l.ambient.keys()) |pat_atom| {
+            if (!admits(only, pat_atom)) continue;
             const pat = l.atomText(pat_atom);
             const star = std.mem.indexOfScalar(u8, pat, '*') orelse continue;
             const prefix = pat[0..star];
@@ -3684,7 +3705,7 @@ const Linker = struct {
     /// The same walk carries TS7016 for the module that resolved but has no
     /// declarations behind it — see `untypedJsModule`.
     fn reportUnresolvedModules(l: *Linker, file: FileId) Error!void {
-        try l.reportUnresolvedIn(file, l.files[file].tree.nodeRange(ast.root_node));
+        try l.reportUnresolvedIn(file, l.files[file].tree.nodeRange(ast.root_node), true);
         try l.reportUnresolvedImportCalls(file);
     }
 
@@ -3733,7 +3754,11 @@ const Linker = struct {
     /// The test is on the DIRECT parent, tsc's `node.parent.kind ===
     /// ModuleBlock && isAmbientModule(node.parent.parent)`, so a plain
     /// namespace nested inside an ambient module ends the walk too.
-    fn reportUnresolvedIn(l: *Linker, file: FileId, stmts: []const ast.Node) Error!void {
+    ///
+    /// `top_level` distinguishes the file's own statement list from an ambient
+    /// module BODY, which is the one thing an `declare module "spec"` block
+    /// needs to know about itself before it can be judged an augmentation.
+    fn reportUnresolvedIn(l: *Linker, file: FileId, stmts: []const ast.Node, top_level: bool) Error!void {
         const f = &l.files[file];
         const tree = f.tree;
         for (stmts) |stmt0| {
@@ -3746,7 +3771,8 @@ const Linker = struct {
             if (tag == .namespace_decl) {
                 const e = tree.extraData(ast.NamespaceData, tree.nodeData(stmt).lhs);
                 if (e.flags & ast.Flags.ambient_module != 0) {
-                    try l.reportUnresolvedIn(file, tree.extraRange(e.body_start, e.body_end));
+                    if (top_level) try l.reportAugmentationName(file, f, e.name_token);
+                    try l.reportUnresolvedIn(file, tree.extraRange(e.body_start, e.body_end), false);
                 }
                 continue;
             }
@@ -3820,6 +3846,36 @@ const Linker = struct {
             // its own message down and never consults the node list.
             try l.diag(file, 2591, l.tokSpan(file, mod_tok), "Cannot find name '{s}'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node` and then add 'node' to the types field in your tsconfig.", .{stripped});
         }
+    }
+
+    /// TS2664 for a module AUGMENTATION whose target does not exist —
+    /// tsc's `mergeModuleAugmentation`, whose `resolveExternalModuleNameWorker`
+    /// is handed `Invalid_module_name_in_augmentation_module_0_cannot_be_found`
+    /// as its not-found message.
+    ///
+    /// A top-level `declare module "spec" { … }` is an augmentation exactly
+    /// when its file is a MODULE (tsc's `isExternalModuleAugmentation`); in a
+    /// SCRIPT the same block DECLARES the module and there is nothing to
+    /// resolve — `@types/node`'s `declare module "fs"` is that, and it is the
+    /// reason the name lookup here may only find a script-declared key
+    /// (`script_ambient`) and never another augmentation.
+    ///
+    /// Skipped in a DECLARATION file: tsc's gate is `!(moduleName.parent.parent
+    /// .flags & NodeFlags.Ambient)`, and every node of a `.d.ts` carries
+    /// `Ambient`, so the same block there is silent — measured, with
+    /// `skipLibCheck` off, on a `.d.ts` that augments a module that does not
+    /// exist. Nested blocks are skipped for the same reason (their container IS
+    /// ambient), which is what `top_level` carries.
+    fn reportAugmentationName(l: *Linker, file: FileId, f: *const ProgFile, name_tok: ast.TokenIndex) Error!void {
+        if (!f.bind.is_module or name_tok == 0) return;
+        if (paths.isDeclarationPath(f.path)) return;
+        const text = f.tree.tokenSlice(f.src, name_tok);
+        const stripped = literals.stripQuotes(text);
+        if (stripped.len == 0) return;
+        const atom = l.interner.intern(l.io, l.gpa, stripped) catch return Error.OutOfMemory;
+        if ((try l.effectiveModuleFile(f, atom)) != null) return;
+        if (l.ambientKeyIn(atom, &l.script_ambient) != null) return;
+        try l.diag(file, 2664, l.tokSpan(file, name_tok), "Invalid module name in augmentation, module '{s}' cannot be found.", .{stripped});
     }
 
     /// True when specifier `stripped` resolved (to a file or to a `declare
