@@ -314,13 +314,19 @@ fn tupleSlice(c: *Checker, r: TypeId, from: u32) Error!TypeId {
     return c.ts.makeTupleLike(r, elems.items);
 }
 
-/// Object binding-pattern rest type: `whole` with every key named by a
-/// sibling `binding_property` in `pat` removed (tsc's `{a, ...rest}` →
-/// `rest = Omit<whole, "a">`), and every UNSPREADABLE member dropped as well
-/// (`types.Prop.spreadable`). Objects and intersections of objects are
-/// filtered (index signatures preserved); anything else (unions, generics,
-/// `any`) falls back to `whole` unchanged — lenient, matching how the rest
-/// of the checker treats non-enumerable shapes.
+/// Object rest type: `whole` with every key named by a non-rest sibling of
+/// `pat` removed (tsc's `{a, ...rest}` → `rest = Omit<whole, "a">`), and every
+/// UNSPREADABLE member dropped as well (`types.Prop.spreadable`). Objects and
+/// intersections of objects are filtered (index signatures preserved);
+/// anything else (unions, generics, `any`) falls back to `whole` unchanged —
+/// lenient, matching how the rest of the checker treats non-enumerable shapes.
+///
+/// `pat` is either a binding pattern (siblings are `binding_property`) or the
+/// expression cover grammar an object destructuring ASSIGNMENT parses to
+/// (`object_property` / `object_shorthand`) — tsc runs the one `getRestType`
+/// for both. An assignment sibling with a COMPUTED key cannot be named
+/// statically here; under-excluding it would invent an assignability error at
+/// the rest target, so the whole shape falls back to `whole`.
 pub fn objectRestType(c: *Checker, whole: TypeId, pat: Node) Error!TypeId {
     const r = try c.resolveStructural(whole);
     const kind = c.ts.kind(r);
@@ -330,8 +336,16 @@ pub fn objectRestType(c: *Checker, whole: TypeId, pat: Node) Error!TypeId {
     defer excluded.deinit(c.scratch());
     for (c.tree.nodeRange(pat)) |el| {
         if (el == null_node) continue;
-        if (c.nodeTag(el) == .binding_property) {
-            try excluded.append(c.scratch(), try c.memberAtom(c.tree.nodeMainToken(el)));
+        switch (c.nodeTag(el)) {
+            .binding_property, .object_shorthand => {
+                try excluded.append(c.scratch(), try c.memberAtom(c.tree.nodeMainToken(el)));
+            },
+            .object_property => {
+                const key = c.tree.nodeData(el).lhs;
+                if (key != null_node and c.nodeTag(key) == .computed_name) return whole;
+                try excluded.append(c.scratch(), try c.memberAtom(c.tree.nodeMainToken(el)));
+            },
+            else => {},
         }
     }
 
@@ -785,6 +799,34 @@ pub fn patternContextualType(c: *Checker, pat: Node) Error!TypeId {
     return switch (c.nodeTag(pat)) {
         .object_pattern => objectPatternContextualType(c, pat),
         .array_pattern, .array_literal => arrayPatternContextualType(c, pat),
+        else => types.no_type,
+    };
+}
+
+/// The type a BINDING PATTERN declares for the thing it destructures, when
+/// nothing else does — tsc's `getTypeFromBindingPattern(name,
+/// /*includePatternInType*/ false, /*reportErrors*/ true)`, the last arm of
+/// `getTypeForVariableLikeDeclaration` for a parameter with no annotation, no
+/// contextual signature and no initializer.
+///
+/// A pattern says how many positions the value must have and which names it
+/// must carry; typing such a parameter `any` threw all of that away, so
+/// `function c5([a, b, [[c]]]) {}` accepted a five-element argument where tsc
+/// answers TS2345 against `[any, any, [[any]]]`
+/// (`destructuringParameterDeclaration1ES6`), and `function foo({x: [a, b]})`
+/// accepted an `x` that is an ARRAY rather than a two-tuple
+/// (`argumentExpressionContextualTyping`).
+///
+/// This is the same walk `patternContextualType` runs, minus its
+/// object-pattern gate: that gate exists because handing an all-`any`
+/// CONTEXTUAL type to an initializer is not the same as handing it none, and
+/// a DECLARED type has no such hazard. `no_type` for everything the walk
+/// cannot enumerate — a rest element, a computed key, an empty pattern — where
+/// the caller keeps its `any`.
+pub fn patternDeclaredType(c: *Checker, pat: Node) Error!TypeId {
+    return switch (c.nodeTag(pat)) {
+        .object_pattern => (try patternImpliedType(c, pat, .binding)) orelse types.no_type,
+        .array_pattern => arrayPatternContextualType(c, pat),
         else => types.no_type,
     };
 }

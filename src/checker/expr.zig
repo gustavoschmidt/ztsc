@@ -1872,40 +1872,29 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     }
     if (ctx_tuple) return c.ts.makeTuple(tuple_elems.items);
     if (elem_types.items.len == 0) {
-        if (ctx_elem != types.no_type) {
-            // Empty array literal under a union context with MULTIPLE
-            // array-like branches of differing element types
-            // (leaflet `polyline([], …)`: `LatLngExpression[] |
-            // LatLngExpression[][]`): folding their elements into a union
-            // element (`(E | E[])[]`) is assignable to NEITHER branch — a
-            // false TS2345. An empty literal has no elements to
-            // disambiguate, and `never[]` is assignable to every
-            // array/tuple branch (tsc's empty-array typing). A single
-            // array branch keeps its element type (display/inference).
-            if (rctx != types.no_type and c.ts.kind(rctx) == .union_type and
-                try multiArrayLikeBranches(c, rctx))
-                return c.ts.makeArray(types.never_type);
-            // The contextual element is a FREE inference variable of a call
-            // in flight (`mk<T>(xs: T[])` called as `mk([])`): echoing it
-            // back makes the argument its own evidence, so `T` infers `T` and
-            // leaks a naked type parameter into the result (immich's
-            // `asSet(v, [])` produced `Set<T>`, then `T | ImmichWorker`).
-            // tsc never reads the contextual element type for an EMPTY
-            // literal at all — `checkArrayLiteral` hands back
-            // `implicitNeverType` regardless — and `never` is the right
-            // evidence: it is what an array holding nothing contributes, and
-            // it is assignable to every array target.
-            if (try c.mentionsActiveInferVar(ctx_elem)) return c.ts.makeArray(types.never_type);
-            return c.ts.makeArray(ctx_elem);
-        }
         // tsc's `checkArrayLiteral` empty arm is `createArrayType(
-        // strictNullChecks ? implicitNeverType : undefinedWideningType)` — a
-        // context-free `[]` is `never[]`, and the `any[]` that stood here was an
-        // under-report (`[].splice(0, 3, 4, 5)` never judged its arguments
-        // against `never`). The widening rule is empirical and narrow: ONLY the
-        // evolving variable (`var x = []; x.push(1)`) becomes `any[]` —
+        // strictNullChecks ? implicitNeverType : undefinedWideningType)` — an
+        // empty `[]` is `never[]`, and the CONTEXTUAL element type is not
+        // consulted at all: `elementTypes.length ? getUnionType(…) :
+        // implicitNeverType` reads the literal's own elements, of which there
+        // are none. (The `any[]` that stood here before wave 32 was an
+        // under-report — `[].splice(0, 3, 4, 5)` never judged its arguments
+        // against `never`.) The widening rule is empirical and narrow: ONLY
+        // the evolving variable (`var x = []; x.push(1)`) becomes `any[]` —
         // `export const x = []`, `class C { f = [] }`, `f(xs = [])` and
         // `const c = id([])` are all `never[]` in tsc.
+        //
+        // Echoing the contextual element back instead is wrong in both
+        // directions. It makes an argument its OWN evidence when the context
+        // is a free inference variable (`mk<T>(xs: T[])` called as `mk([])`
+        // inferred `T = T`), it picks one branch of a union context that an
+        // empty literal cannot disambiguate (leaflet's `polyline([], …)`
+        // against `LatLngExpression[] | LatLngExpression[][]`), and it hides
+        // the `never` a later operation is judged against:
+        // `(results &&= (results1 &&= [])).push(100)` is TS2345 "'100' is not
+        // assignable to parameter of type 'never'" in tsc, because the inner
+        // `[]` is `never[]` however `results1` is declared
+        // (`logicalAssignment6`/`7`, wave-35 D's oracle probe).
         //
         // The evolving half moves with this line, because ztsc's flow walk
         // recognizes an evolving array BY ITS TYPE (`flow.flowTypeOfReference`
@@ -2287,22 +2276,6 @@ fn elemCtxKeepsLiteral(c: *Checker, rctx: TypeId, i: u32, length: ?u32, cand: Ty
         return false;
     }
     return keepLiteral(c, cand, try contextualElemTypeAt(c, rctx, i, length));
-}
-
-/// True when a (structurally resolved) union contextual type has two or
-/// more array-like constituents (`E[] | E[][]`, `A[] | B[]`). Used to
-/// detect the ambiguous empty-array-literal case where folding every
-/// branch's element type would produce an array assignable to no branch.
-fn multiArrayLikeBranches(c: *Checker, rctx: TypeId) Error!bool {
-    if (c.ts.kind(rctx) != .union_type) return false;
-    var n: usize = 0;
-    for (try c.memberList(rctx)) |m| {
-        if (c.ts.kind(try c.resolveStructural(m)) == .array) {
-            n += 1;
-            if (n >= 2) return true;
-        }
-    }
-    return false;
 }
 
 /// `[...] as const` -> a readonly tuple. Elements keep their literal
@@ -3261,6 +3234,15 @@ fn collectSpreadParts(c: *Checker, t: TypeId, depth: u8, out: *std.ArrayList(Typ
             return;
         }
         r = try c.resolveStructural(con);
+    } else if (c.ts.kind(r) == .index_access or c.ts.kind(r) == .conditional) {
+        // `getBaseConstraintOrType` is not limited to a bare type PARAMETER:
+        // every instantiable type contributes its base constraint. `T["b"]`
+        // for `T extends { b: string }` is `string`, and no more spreadable
+        // than a bare `string` — `{ ...i }` over `var i!: T["b"]` is TS2698
+        // (`spreadInvalidArgumentType`). An index access whose constraint
+        // does not reduce maps to ITSELF and stays a valid type variable.
+        const base = try c.baseConstraintOf(r);
+        if (base != r) r = try c.resolveStructural(base);
     }
     if (c.ts.kind(r) == .union_type) {
         for (try c.memberList(r)) |m| try collectSpreadParts(c, m, depth + 1, out);
@@ -3581,7 +3563,9 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                         var vt = try checkPropValue(c, pd.rhs, pctx, this_marker);
                         if (c.const_ctx) {
                             vt = try c.ts.regularLiteral(vt);
-                        } else if (!try propCtxKeepsLiteral(c, rctx, ctx, key, vt)) vt = try c.widenPropValue(vt);
+                        } else if (!try propCtxKeepsLiteral(c, rctx, ctx, key, vt)) {
+                            vt = try c.widenPropValue(vt);
+                        } else vt = try names_zig.regularOfLiteral(c, vt);
                         try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
                         continue;
                     }
@@ -3599,7 +3583,9 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                     var vt = try checkPropValue(c, pd.rhs, pctx, this_marker);
                     if (c.const_ctx) {
                         vt = try c.ts.regularLiteral(vt);
-                    } else if (!try keepLiteral(c, vt, pctx)) vt = try c.widenPropValue(vt);
+                    } else if (!try keepLiteral(c, vt, pctx)) {
+                        vt = try c.widenPropValue(vt);
+                    } else vt = try names_zig.regularOfLiteral(c, vt);
                     switch (key_kind) {
                         .string, .template_literal_type, .string_mapping => try str_index_vals.append(c.scratch(), vt),
                         .number, .number_literal, .number_literal_fresh => try num_index_vals.append(c.scratch(), vt),
@@ -3612,7 +3598,9 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                 var vt = try checkPropValue(c, pd.rhs, pctx, this_marker);
                 if (c.const_ctx) {
                     vt = try c.ts.regularLiteral(vt);
-                } else if (!try propCtxKeepsLiteral(c, rctx, ctx, key, vt)) vt = try c.widenPropValue(vt);
+                } else if (!try propCtxKeepsLiteral(c, rctx, ctx, key, vt)) {
+                    vt = try c.widenPropValue(vt);
+                } else vt = try names_zig.regularOfLiteral(c, vt);
                 try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
             },
             .object_shorthand => {
@@ -3620,7 +3608,9 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                 var vt = try c.checkExprCached(pd.lhs, types.no_type);
                 if (c.const_ctx) {
                     vt = try c.ts.regularLiteral(vt);
-                } else if (!try propCtxKeepsLiteral(c, rctx, ctx, key, vt)) vt = try c.widenPropValue(vt);
+                } else if (!try propCtxKeepsLiteral(c, rctx, ctx, key, vt)) {
+                    vt = try c.widenPropValue(vt);
+                } else vt = try names_zig.regularOfLiteral(c, vt);
                 if (pd.rhs != 0) _ = try c.checkExprCached(pd.rhs, types.no_type);
                 try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
             },
@@ -3757,7 +3747,15 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                 try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = mt });
             },
             .spread_element => {
-                const raw = try c.checkExprCached(pd.lhs, types.no_type);
+                // tsc's `getContextualType` steps STRAIGHT THROUGH a spread
+                // assignment (`case SyntaxKind.SpreadAssignment: return
+                // getContextualType(parent.parent, contextFlags)`), so the
+                // operand is contextually typed by the CONTAINING literal's
+                // own context. Without it `i = { ...{ a: "a" } }` typed the
+                // inner literal with nothing, widened `a` to `string`, and
+                // reported a TS2322 against `interface I { a: "a" }`
+                // (`contextualTypeObjectSpreadExpression`).
+                const raw = try c.checkExprCached(pd.lhs, ctx);
                 var src = raw;
                 for (dist) |d| {
                     if (d.node == prop) {
@@ -6932,7 +6930,19 @@ fn setterParamOfProto(c: *Checker, decl: Node, proto_idx: u32) Error!?TypeId {
 pub fn checkDestructuringPattern(c: *Checker, node: Node, src: TypeId) Error!void {
     switch (c.nodeTag(node)) {
         .object_literal, .object_pattern => {
-            for (c.tree.nodeRange(node)) |el| try checkObjectDestructuringProperty(c, el, src);
+            const els = c.tree.nodeRange(node);
+            for (els, 0..) |el, i| {
+                // tsc's `checkObjectLiteralDestructuringPropertyAssignment`
+                // computes the rest type only for a spread in LAST position;
+                // anywhere else it is TS2462 and no assignment is checked.
+                const is_last_spread = i + 1 == els.len and el != null_node and
+                    (c.nodeTag(el) == .spread_element or c.nodeTag(el) == .rest_element);
+                const rest_src: TypeId = if (is_last_spread and src != types.no_type)
+                    try c.objectRestType(src, node)
+                else
+                    types.no_type;
+                try checkObjectDestructuringProperty(c, el, src, rest_src);
+            }
         },
         else => {
             const iterated = try arrayPatternIteratedType(c, node, src);
@@ -7048,7 +7058,11 @@ fn destructuringElementType(c: *Checker, src: TypeId, iterated: TypeId, index: u
 /// One property of an object destructuring pattern. A property KEY is a
 /// name, not a reference — without this peel the generic expression walker
 /// checked it as one (TS2304 on `({ width: dx } = …)`).
-fn checkObjectDestructuringProperty(c: *Checker, prop: Node, src: TypeId) Error!void {
+///
+/// `rest_src` is the type a REST element in this position reads (`no_type`
+/// where the caller could not compute one, or where this element is not a
+/// last-position rest); every other element ignores it.
+fn checkObjectDestructuringProperty(c: *Checker, prop: Node, src: TypeId, rest_src: TypeId) Error!void {
     if (prop == null_node) return;
     const d = c.tree.nodeData(prop);
     switch (c.nodeTag(prop)) {
@@ -7091,9 +7105,9 @@ fn checkObjectDestructuringProperty(c: *Checker, prop: Node, src: TypeId) Error!
             if (d.rhs != null_node) try checkDestructuringTarget(c, d.rhs, types.no_type, .assignment);
         },
         // `{ ...rest } = src`: the rest object is `src` minus the names its
-        // siblings take (tsc's `getRestType`), which is not computed here.
+        // siblings take (tsc's `getRestType`), which the caller computed.
         // An object rest target has its OWN pair of reference diagnostics.
-        .spread_element, .rest_element => try checkDestructuringTarget(c, d.lhs, types.no_type, .object_rest),
+        .spread_element, .rest_element => try checkDestructuringTarget(c, d.lhs, rest_src, .object_rest),
         .omitted, .error_node, .unsupported => {},
         else => _ = try checkAssignmentTarget(c, prop),
     }
@@ -7164,8 +7178,20 @@ fn checkDestructuringTarget(c: *Checker, el0: Node, src: TypeId, site: RefSite) 
                 _ = try c.checkExprCached(el, types.no_type);
             }
         },
+        // tsc's `checkDestructuringAssignment` dispatches on the target node AS
+        // WRITTEN — it never skips parentheses — so a PARENTHESIZED pattern is
+        // not a pattern at all: it falls through to `checkReferenceAssignment`,
+        // where `checkReferenceExpression` refuses it. `({...([])} = {})` is
+        // TS2701 for that reason and carries no diagnostic from inside the
+        // array (`restPropertyWithBindingPattern`), where the unparenthesized
+        // `({...[]} = {})` on the line above IS walked and reports TS2488.
         .array_literal, .object_literal, .array_pattern, .object_pattern => {
-            try checkDestructuringPattern(c, el, src);
+            if (el == el0) {
+                try checkDestructuringPattern(c, el, src);
+            } else {
+                _ = try checkAssignmentTarget(c, el);
+                _ = try checkReferenceExpression(c, el0, site);
+            }
         },
         .omitted, .error_node, .unsupported => {},
         // tsc's `checkReferenceAssignment`: a leaf pattern element is a write,

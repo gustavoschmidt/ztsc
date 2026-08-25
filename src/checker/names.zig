@@ -599,6 +599,33 @@ pub fn widenPropValue(c: *Checker, t: TypeId) Error!TypeId {
     return widenLiteralInner(c, t, false);
 }
 
+/// tsc's `getRegularTypeOfLiteralType`: FRESHNESS dropped, nothing widened.
+/// A union maps member-wise; an object type is returned unchanged (an object
+/// literal's own freshness is a separate flag in tsc, and ztsc drives nested
+/// excess-property checking from the syntax instead).
+///
+/// This is the OTHER half of `checkExpressionForMutableLocation`: when the
+/// contextual type keeps a property's literal type
+/// (`getWidenedLiteralLikeTypeForContextualType` short-circuits its widening
+/// arm), tsc still regularizes the result before storing it on the literal.
+/// Without it a kept member stays fresh, and every LATER widening point —
+/// `let x = o.k`, a covariant inference — widens it a second time where tsc
+/// has nothing left to widen (`objectFreezeLiteralsDontWiden`).
+pub fn regularOfLiteral(c: *Checker, t: TypeId) Error!TypeId {
+    if (c.ts.isFreshLiteral(t)) return c.ts.regularLiteral(t);
+    if (c.ts.kind(t) != .union_type) return t;
+    const members = try c.memberList(t);
+    var any = false;
+    for (members) |m| {
+        if (c.ts.isFreshLiteral(m)) any = true;
+    }
+    if (!any) return t;
+    var list: std.ArrayList(TypeId) = .empty;
+    defer list.deinit(c.scratch());
+    for (members) |m| try list.append(c.scratch(), try c.ts.regularLiteral(m));
+    return c.ts.makeUnion(c.scratch(), list.items);
+}
+
 fn widenLiteralInner(c: *Checker, t: TypeId, widen_objects: bool) Error!TypeId {
     if (c.ts.isFreshLiteral(t)) {
         const base = try c.literalBaseOf(t);

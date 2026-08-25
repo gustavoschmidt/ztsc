@@ -150,7 +150,7 @@ pub fn signatureOfProtoCtx(
                 continue;
             }
         }
-        const p = try paramInfo(c, pn, pi, ctx_sig, report_implicit, setter_ctx);
+        const p = try paramInfo(c, pn, node, pi, ctx_sig, report_implicit, setter_ctx);
         // A parameter with an initializer (`x = 'grey'`) is optional at the
         // call site and accepts `undefined` — passing `undefined` triggers
         // the default (tsc's `getTypeOfParameter` adds the optional type).
@@ -838,7 +838,48 @@ fn reportLoneObjectLiteralSetter(c: *Checker, node: Node, proto: ast.FnProto) Er
     try implicit_any.reportSetAccessorImplicitAny(c, c.tree.nodeMainToken(pair.member));
 }
 
-fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_implicit: bool, setter_ctx: TypeId) Error!types.Param {
+/// tsc's `reportImplicitAny` intercepts one shape before the ordinary
+/// TS7006/TS7019: a parameter of a CALL SIGNATURE, METHOD SIGNATURE or
+/// FUNCTION TYPE whose NAME is a type keyword, or resolves in TYPE space, is
+/// almost certainly a C-style parameter list — someone wrote the TYPE where
+/// the name goes. `declare var b: (string, C) => void` declares two parameters
+/// called `string` and `C`, both implicitly `any`, and tsc says so with TS7051
+/// and the rewrite it means (`noImplicitAnyNamelessParameter`,
+/// `strictModeReservedWord2`'s `foo(package, protected)` — where `package`
+/// names an enum and `protected`, a keyword that is not a TYPE keyword, keeps
+/// the ordinary TS7006).
+///
+/// `owner` is the declaration the parameter list belongs to; `null_node` where
+/// the caller reached a parameter node on its own and reports nothing.
+fn namelessTypeParamName(c: *Checker, owner: Node, name_node: Node) Error!bool {
+    if (owner == null_node or name_node == 0) return false;
+    switch (c.nodeTag(owner)) {
+        .call_signature, .method_signature, .function_type => {},
+        else => return false,
+    }
+    const tok = c.tree.nodeMainToken(name_node);
+    switch (c.tree.tokens.tag(tok)) {
+        .keyword_any,
+        .keyword_unknown,
+        .keyword_never,
+        .keyword_void,
+        .keyword_undefined,
+        .keyword_number,
+        .keyword_string,
+        .keyword_boolean,
+        .keyword_bigint,
+        .keyword_symbol,
+        .keyword_object,
+        => return true,
+        else => {},
+    }
+    return switch (c.resolveSpace(try c.atomOfToken(tok), c.cur_scope, false)) {
+        .sym => true,
+        else => false,
+    };
+}
+
+fn paramInfo(c: *Checker, pn: Node, owner: Node, index: u32, ctx_sig: TypeId, report_implicit: bool, setter_ctx: TypeId) Error!types.Param {
     const d = c.tree.nodeData(pn);
     var name_node: Node = 0;
     var type_ann: Node = 0;
@@ -938,6 +979,14 @@ fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_implicit
         // REQUIRED and `f({ w: 5 })` reported TS2345.
         ty = try optionalizePatternDefaults(c, ty, name_node);
     }
+    // A DESTRUCTURED parameter with nothing else to go on takes its type from
+    // the PATTERN (tsc's `getTypeFromBindingPattern`), which is also where its
+    // TS7031s come from — so the report runs here whether or not the walk can
+    // enumerate a type. `name == 0` is exactly "the name is not an identifier".
+    if (ty == types.no_type and name == 0 and name_node != 0) {
+        if (report_implicit) try implicit_any.reportPatternImplicitAny(c, name_node);
+        ty = try destructure.patternDeclaredType(c, name_node);
+    }
     if (ty == types.no_type) {
         // `noImplicitAny: false` suppresses TS7006 — the parameter still
         // types as `any` below, only the diagnostic is gone.
@@ -951,16 +1000,18 @@ fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_implicit
             // `...` of a rest, or a modifier. `function F(public A) {}` is a
             // TS7006 at `public` (with `A` still the name in the message), and
             // so is `new (public x)` in an interface (ParameterList4/5/6/13).
-            if (flags & types.param_flag_rest != 0) {
+            if (try namelessTypeParamName(c, owner, name_node)) {
+                try c.diagFmt(7051, c.nodeSpan(pn), "Parameter has a name but no type. Did you mean 'arg{d}: {s}{s}'?", .{
+                    index,
+                    c.tokenText(tok),
+                    if (flags & types.param_flag_rest != 0) "[]" else "",
+                });
+            } else if (flags & types.param_flag_rest != 0) {
                 try c.diagFmt(7019, c.nodeSpan(pn), "Rest parameter '{s}' implicitly has an 'any[]' type.", .{c.tokenText(tok)});
             } else {
                 try c.diagFmt(7006, c.nodeSpan(pn), "Parameter '{s}' implicitly has an 'any' type.", .{c.tokenText(tok)});
             }
         }
-        // A DESTRUCTURED parameter has no name to report TS7006 against: tsc
-        // builds its type out of the pattern instead and reports TS7031 at
-        // each leaf the pattern leaves as `any`.
-        if (report_implicit and name == 0) try implicit_any.reportPatternImplicitAny(c, name_node);
         ty = types.any_type;
     }
     // `x?: T` reads as T | undefined.
@@ -1621,7 +1672,7 @@ fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
         for (decls) |decl| {
             switch (c.nodeTag(decl)) {
                 .param, .param_full => {
-                    const p = try paramInfo(c, decl, 0, types.no_type, false, types.no_type);
+                    const p = try paramInfo(c, decl, null_node, 0, types.no_type, false, types.no_type);
                     // Pattern params: paramInfo names only identifiers;
                     // for destructured params fall through to any.
                     if (p.name != 0 and p.name == c.symNameAtom(sym)) return p.ty;
@@ -2848,7 +2899,7 @@ pub fn memberTypeOf(c: *Checker, sym: SymbolId) Error!TypeId {
                 const saved_scope = c.cur_scope;
                 defer c.cur_scope = saved_scope;
                 if (try ctorScopeOfMemberScope(c, c.symScope(sym))) |s| c.cur_scope = s;
-                const p = try paramInfo(c, decl, 0, types.no_type, false, types.no_type);
+                const p = try paramInfo(c, decl, null_node, 0, types.no_type, false, types.no_type);
                 return p.ty;
             },
             else => {},
