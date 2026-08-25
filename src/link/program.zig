@@ -352,8 +352,65 @@ pub const Target = struct {
     /// Property name for `.export_equals_prop`; 0 otherwise.
     name: Atom = 0,
     /// The chain passed through `export type` / `import type` somewhere:
-    /// value use of the binding is an error (TS1362-adjacent).
+    /// value use of the binding is an error (TS1361 / TS1362).
     type_only: bool = false,
+    /// Which side of the boundary the NEAREST such declaration sits on —
+    /// meaningful only when `type_only`. See `TypeOnly`.
+    type_only_from_export: bool = false,
+
+    pub fn typeOnly(t: Target) TypeOnly {
+        return .{ .on = t.type_only, .from_export = t.type_only_from_export };
+    }
+
+    /// Layer a type-only mark from a hop CLOSER to the use site over whatever
+    /// this target already carries (`TypeOnly.under`).
+    pub fn markTypeOnly(t: *Target, near: TypeOnly) void {
+        const v = t.typeOnly().under(near);
+        t.type_only = v.on;
+        t.type_only_from_export = v.from_export;
+    }
+};
+
+/// A type-only mark on an alias chain, and which KIND of declaration put it
+/// there. tsc words the same condition two ways —
+///
+///   TS1361 "… cannot be used as a value because it was imported using
+///           'import type'"   (ImportClause / ImportSpecifier /
+///                             NamespaceImport / ImportEquals)
+///   TS1362 "… exported using 'export type'"          (ExportSpecifier)
+///
+/// — and picks by the declaration NEAREST the use site, not by the first one
+/// the resolver happens to reach. `chained.ts` and `importEquals1.ts` are the
+/// witnesses: a value re-exported plainly out of a module that imported it
+/// with `import type` is TS1361 at the use, while the same value re-exported
+/// with `export type` out of a module that imported it plainly is TS1362 —
+/// and a plain re-export CHAIN over an `export type` stays TS1362, because
+/// the plain hops contribute nothing and the nearest MARK is still the
+/// export specifier.
+pub const TypeOnly = struct {
+    on: bool = false,
+    /// Only meaningful when `on`.
+    from_export: bool = false,
+
+    pub const none: TypeOnly = .{};
+
+    /// A mark contributed by an `export type` specifier.
+    pub fn exported(on: bool) TypeOnly {
+        return .{ .on = on, .from_export = true };
+    }
+
+    /// A mark contributed by an `import type` clause/specifier.
+    pub fn imported(on: bool) TypeOnly {
+        return .{ .on = on, .from_export = false };
+    }
+
+    /// This mark with `near` — a hop CLOSER to the use site — layered over
+    /// it. A closer mark wins outright; a closer hop that is NOT type-only
+    /// leaves the farther answer standing, since a plain re-export of an
+    /// already-stripped binding is still stripped.
+    pub fn under(t: TypeOnly, near: TypeOnly) TypeOnly {
+        return if (near.on) near else t;
+    }
 };
 
 /// The two meanings of one `.dual` binding. `type_tgt` is the member of the

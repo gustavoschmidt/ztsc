@@ -983,6 +983,10 @@ fn checkIdentifier(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
                     try c.diagFmt(1362, c.tokSpan(tok), "'{s}' cannot be used as a value because it was exported using 'export type'.", .{c.tokenText(tok)});
                     return types.error_type;
                 },
+                .import_type => {
+                    try c.diagFmt(1361, c.tokSpan(tok), "'{s}' cannot be used as a value because it was imported using 'import type'.", .{c.tokenText(tok)});
+                    return types.error_type;
+                },
             }
             // tsc's `getNarrowableTypeForReference`: a type variable with a
             // union constraint enters the flow walk AS that constraint where
