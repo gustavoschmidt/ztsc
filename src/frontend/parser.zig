@@ -6249,10 +6249,13 @@ const Parser = struct {
         }
 
         var mod: u32 = 0;
+        var bad_specifier: u32 = 0;
         if (bare_specifier) {
             _ = try p.parseExpression(.{});
         } else if (try p.eat(.keyword_from) != null) {
-            mod = try p.parseModuleSpecifier();
+            const spec = try p.parseModuleSpecifier();
+            mod = spec orelse 0;
+            bad_specifier = badSpecifierFlag(spec);
         } else if (default_name != 0 or ns_name != 0 or specs.start != specs.end) {
             try p.fail(.expected_from);
             // tsc's `parseModuleSpecifier` runs whether or not `parseExpected`
@@ -6283,7 +6286,7 @@ const Parser = struct {
         }
 
         const extra = try p.addExtra(ast.ImportData{
-            .flags = flags,
+            .flags = flags | bad_specifier,
             .default_name_token = default_name,
             .ns_name_token = ns_name,
             .spec_start = specs.start,
@@ -6321,11 +6324,14 @@ const Parser = struct {
         // name, so the `=` itself may well be missing.
         _ = try p.expect(.eq, .expected_eq);
         var module_token: u32 = 0;
+        var bad_specifier: u32 = 0;
         var entity: Node = 0;
         if (isIdentLike(p.curTag()) and std.mem.eql(u8, p.laText(0), "require") and p.peekTag(1) == .l_paren) {
             _ = try p.bump(); // require
             _ = try p.expect(.l_paren, .expected_l_paren);
-            module_token = try p.parseModuleSpecifier();
+            const spec = try p.parseModuleSpecifier();
+            module_token = spec orelse 0;
+            bad_specifier = badSpecifierFlag(spec);
             _ = try p.expect(.r_paren, .expected_r_paren);
         } else if (isIdentLike(p.curTag())) {
             entity = try p.parseEntityName();
@@ -6345,7 +6351,7 @@ const Parser = struct {
             .name_token = name_tok,
             .module_token = module_token,
             .entity = entity,
-            .flags = flags,
+            .flags = flags | bad_specifier,
         });
         return p.addNode(.{ .tag = .import_equals, .main_token = anchor_kw, .data = .{ .lhs = extra, .rhs = 0 } });
     }
@@ -6385,18 +6391,25 @@ const Parser = struct {
     /// and adds a "';' expected" tsc never has (`namespace N { export * from
     /// Aaa; }`, exportDeclarationInInternalModule).
     ///
-    /// Returns 0 — the callers' "no module specifier" — when there was no
-    /// literal, which is the same answer they already give for a missing
-    /// `from`. Handing back the last consumed token instead (what `expect`
-    /// does) makes the LINKER read a `from` or a `(` as a module name and
-    /// invent a TS2307 for it; that was invisible only because the TS1005 this
-    /// replaces suppressed the whole semantic pass. The expression itself is
-    /// dropped: a specifier that is not a literal names no module.
-    fn parseModuleSpecifier(p: *Parser) PE!u32 {
-        if (p.curTag() == .string_literal) return p.bump();
+    /// Returns null — not the last consumed token — when the specifier was not
+    /// a literal. Handing that token back (what `expect` does) makes the LINKER
+    /// read a `from` or a `(` as a module NAME and invent a TS2307 for it; that
+    /// was invisible only because the TS1005 this replaces suppressed the whole
+    /// semantic pass. The expression itself is dropped: a specifier that is not
+    /// a literal names no module. Null is distinct from a token of 0 ("no
+    /// `from` at all") because tsc's `checkExternalImportOrExportDeclaration`
+    /// RETURNS after "String literal expected.", so the placement rules behind
+    /// it (TS1194/TS1147) never run — where a missing `from` still earns them.
+    fn parseModuleSpecifier(p: *Parser) PE!?u32 {
+        if (p.curTag() == .string_literal) return try p.bump();
         try p.fail(.expected_string_literal);
         if (canStartExpression(p.curTag()) and !p.nlBefore()) _ = try p.parseExpression(.{});
-        return 0;
+        return null;
+    }
+
+    /// `Flags.bad_module_specifier` iff `parseModuleSpecifier` refused.
+    fn badSpecifierFlag(mod: ?u32) u32 {
+        return if (mod == null) ast.Flags.bad_module_specifier else 0;
     }
 
     fn parseImportSpecifiers(p: *Parser) PE!ast.SubRange {
@@ -6633,8 +6646,8 @@ const Parser = struct {
                 const mod = try p.parseModuleSpecifier();
                 try p.skipImportAttributes();
                 try p.expectSemicolon();
-                const extra = try p.addExtra(ast.ExportAll{ .flags = 0, .name_token = ns_name });
-                return p.addNode(.{ .tag = .export_all, .main_token = kw, .data = .{ .lhs = extra, .rhs = mod } });
+                const extra = try p.addExtra(ast.ExportAll{ .flags = badSpecifierFlag(mod), .name_token = ns_name });
+                return p.addNode(.{ .tag = .export_all, .main_token = kw, .data = .{ .lhs = extra, .rhs = mod orelse 0 } });
             },
             .keyword_as => {
                 // `export as namespace <Ident>;` — UMD global declaration. The
@@ -6665,8 +6678,8 @@ const Parser = struct {
                     const mod = try p.parseModuleSpecifier();
                     try p.skipImportAttributes();
                     try p.expectSemicolon();
-                    const extra = try p.addExtra(ast.ExportAll{ .flags = ast.Flags.type_only, .name_token = ns_name });
-                    return p.addNode(.{ .tag = .export_all, .main_token = kw, .data = .{ .lhs = extra, .rhs = mod } });
+                    const extra = try p.addExtra(ast.ExportAll{ .flags = ast.Flags.type_only | badSpecifierFlag(mod), .name_token = ns_name });
+                    return p.addNode(.{ .tag = .export_all, .main_token = kw, .data = .{ .lhs = extra, .rhs = mod orelse 0 } });
                 }
                 // `export type X = ...` — a type alias declaration.
                 const decl = try p.parseStatementUnchecked();
@@ -6754,12 +6767,15 @@ const Parser = struct {
         const specs = try p.scratchToSpan(top);
 
         var mod: u32 = 0;
+        var spec_flags: u32 = 0;
         if (try p.eat(.keyword_from) != null) {
-            mod = try p.parseModuleSpecifier();
+            const spec = try p.parseModuleSpecifier();
+            mod = spec orelse 0;
+            spec_flags = badSpecifierFlag(spec);
         }
         try p.skipImportAttributes();
         try p.expectSemicolon();
-        const extra = try p.addExtra(ast.ExportNamed{ .flags = flags, .spec_start = specs.start, .spec_end = specs.end });
+        const extra = try p.addExtra(ast.ExportNamed{ .flags = flags | spec_flags, .spec_start = specs.start, .spec_end = specs.end });
         return p.addNode(.{ .tag = .export_named, .main_token = kw, .data = .{ .lhs = extra, .rhs = mod } });
     }
 
@@ -8795,8 +8811,15 @@ const Parser = struct {
                 // rather than the word and stops at its first hit — so
                 // `{ public foo() {} }` is TS1042 *and* TS1184 on the `public`,
                 // where `{ public foo: 1 }` (a property assignment, which that
-                // pass never visits) is TS1042 alone. Measured against tsgo.
-                if (first_mod) |m| try p.errAtToken(.modifiers_not_allowed_here, m);
+                // pass never visits) is TS1042 alone. An ACCESSOR is a third
+                // case: tsc dispatches it to `parseAccessorDeclaration` and
+                // `checkGrammarAccessor`, which never reaches that arm, so
+                // `{ public get foo() {} }` is TS1042 alone too. All three
+                // measured against tsgo (objectLiteralMemberWithModifiers1/2,
+                // parserAccessors10, parserComputedPropertyName5).
+                if (flags & (ast.Flags.get | ast.Flags.set) == 0) {
+                    if (first_mod) |m| try p.errAtToken(.modifiers_not_allowed_here, m);
+                }
                 // Method shorthand: value is a function_expr.
                 const saved_fn_ctx = p.fn_ctx;
                 const saved_yield_ctx = p.yield_ctx;

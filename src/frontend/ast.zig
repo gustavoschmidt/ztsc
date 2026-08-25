@@ -89,6 +89,14 @@ pub const Flags = struct {
     /// `[`, and tsc positions a declaration-name diagnostic on that node
     /// (`dupDiagTok`).
     pub const computed_lit: u32 = 1 << 25;
+    /// On an `export … from …` statement: the module specifier was PRESENT but
+    /// was not a string literal (`export * from Aaa`). tsc's
+    /// `checkExportDeclaration` reports "String literal expected." for it and
+    /// RETURNS — so the namespace-placement rule behind it (TS1194) never runs.
+    /// The module token is 0 either way, which is also what "no `from` at all"
+    /// looks like, and that case DOES earn TS1194; this bit is what tells the
+    /// two apart.
+    pub const bad_module_specifier: u32 = 1 << 26;
 };
 
 /// A member's retained computed key: `member` is the class/type member node,
