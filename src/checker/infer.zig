@@ -1053,7 +1053,20 @@ pub fn inferTypeArgs(
             // A literal that carries no un-annotated function at all has no
             // second round to lose, so it takes the parameter unconditionally
             // — see `lit_ctx_wanted` below for the literal-keeping half.
-            .object_literal => if (lit_ctx_wanted or !c.objLitIsContextSensitive(an))
+            //
+            // The question is tsc's `isContextSensitive` over the ARGUMENT,
+            // recursion and all (`expr.exprIsContextSensitive`), not just "does
+            // a property hold a function with an un-annotated parameter". A
+            // property function whose own type is settled by its parameters can
+            // still RETURN a context-sensitive value, and reading such a literal
+            // against a parameter this call has not solved yet types the inner
+            // callback from a still-free variable: `repro({ params: 1, callback:
+            // () => { return a => a + 1 } })` gave `a` the bare `T` and reported
+            // TS2365 on `a + 1` (`inferPropertyWithContextSensitiveReturn
+            // Statement`, microsoft/TypeScript#50687). Deferring to the two
+            // rounds below fixes `T := number` between them, which is the step
+            // the single contextual read has no way to take.
+            .object_literal => if (lit_ctx_wanted or !c.exprIsContextSensitive(an, 0))
                 pt
             else
                 types.no_type,
@@ -1172,7 +1185,7 @@ pub fn inferTypeArgs(
         // `slice.actions`' `{ [Type in keyof CaseReducers]: … }` to `{}`.
         // The two passes fix `State` between them, which is exactly the
         // missing step, so they run for a NESTED-only sensitivity.
-        if (tag == .object_literal and c.objLitIsContextSensitive(an) and
+        if (tag == .object_literal and c.exprIsContextSensitive(an, 0) and
             (arg_ctx == types.no_type or !c.objLitIsShallowContextSensitive(an)))
         {
             const probe_cands = try c.scratch().alloc(TypeId, tp_syms.len);

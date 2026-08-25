@@ -2703,39 +2703,16 @@ pub fn isPrimitiveLiteralish(c: *Checker, t: TypeId) Error!bool {
     };
 }
 
-/// Would contextually typing an object-literal argument by `pt` preserve a
-/// property literal that would otherwise widen? True only when `pt` (an
-/// object) has a property whose type is a *type variable* whose base
-/// constraint is primitive-literal-ish — the `name: TFieldName` (`TFieldName
-/// extends FieldPath<T>`) shape. This gates the object-literal contextual
-/// pass so it fires for react-hook-form-style literal-key inference but not
-/// for object literals whose params are plain callbacks (`openDB({ upgrade
-/// }))`) or unions, which contextual typing would perturb without benefit.
-/// Is object literal `node` CONTEXT SENSITIVE — does it carry a function
-/// value with an un-annotated parameter (`{ onChange: (value) => … }`)?
-/// tsc's `isContextSensitive` recurses into an object literal's properties
-/// for exactly this reason: such a literal's type depends on the contextual
-/// type it is checked against, so it must be handed one. Without it, an
-/// object-literal argument of a GENERIC call was checked context-free (the
-/// non-generic path types the argument by the parameter directly), and
-/// every callback parameter inside it fell to implicit `any` — TS7006 at
-/// call sites that are correct TypeScript.
-pub fn objLitIsContextSensitive(c: *Checker, node: Node) bool {
-    return objLitIsContextSensitiveAt(c, node, 0, false);
-}
-
-/// The same question restricted to the literal's OWN properties — no
-/// recursion into a nested object literal. A shallow-sensitive literal is
+/// Is object literal `node` context sensitive at its OWN properties — no
+/// recursion into a nested object literal? The unrestricted question is
+/// `exprIsContextSensitive`, tsc's `isContextSensitive` itself, which is what
+/// `infer.zig` asks of an object-literal argument. A shallow-sensitive literal is
 /// one the single contextual read already handles: every un-annotated
 /// callback parameter it carries is named directly by a property of the
 /// parameter type, so reading the literal against that parameter types
 /// them. Only a literal whose sensitivity is NESTED is read against a
 /// property type that may itself still be a bare inference variable.
 pub fn objLitIsShallowContextSensitive(c: *Checker, node: Node) bool {
-    return objLitIsContextSensitiveAt(c, node, 0, true);
-}
-
-fn objLitIsContextSensitiveAt(c: *Checker, node: Node, depth: u8, shallow: bool) bool {
     for (c.tree.nodeRange(node)) |m| {
         if (m == null_node) continue;
         // tsc's `isContextSensitive` has an explicit ParenthesizedExpression
@@ -2751,30 +2728,8 @@ fn objLitIsContextSensitiveAt(c: *Checker, node: Node, depth: u8, shallow: bool)
         };
         if (val == null_node) continue;
         switch (c.nodeTag(val)) {
-            .arrow_fn, .function_expr => {},
-            // tsc's `isContextSensitive` RECURSES through a property
-            // assignment into a nested object literal, so a bag of
-            // un-annotated callbacks one level down makes the whole
-            // argument context sensitive. redux-toolkit's
-            // `createSlice({ name, initialState, reducers })` is that
-            // shape — the sensitivity lives entirely inside `reducers`.
-            .object_literal => {
-                if (shallow) continue;
-                if (depth < 4 and objLitIsContextSensitiveAt(c, val, depth + 1, false)) return true;
-                continue;
-            },
-            else => continue,
-        }
-        const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(val).lhs);
-        for (c.tree.extraRange(proto.params_start, proto.params_end)) |p| {
-            if (p == null_node) continue;
-            const pd = c.tree.nodeData(p);
-            const ann: Node = switch (c.nodeTag(p)) {
-                .param => pd.rhs,
-                .param_full => c.tree.extraData(ast.ParamFull, pd.rhs).type_ann,
-                else => 0,
-            };
-            if (ann == 0) return true; // parameter has no type annotation
+            .arrow_fn, .function_expr => if (fnExprIsContextSensitive(c, val)) return true,
+            else => {},
         }
     }
     return false;
@@ -8211,7 +8166,13 @@ fn blockHasContextSensitiveReturn(c: *Checker, node: Node, depth: u8) bool {
 
 /// tsc's `isContextSensitive` over an EXPRESSION: the aggregate forms carry
 /// the property up from whatever they hold.
-fn exprIsContextSensitive(c: *Checker, node: Node, depth: u8) bool {
+///
+/// This is the whole predicate, function-like arm included, so it is also what
+/// `infer.zig` asks of an ARGUMENT: an object literal whose property value is
+/// context sensitive is a context-sensitive argument, and the un-annotated
+/// parameter may sit inside a property function's RETURN rather than at its own
+/// top level (`{ callback: () => { return a => a + 1 } }`).
+pub fn exprIsContextSensitive(c: *Checker, node: Node, depth: u8) bool {
     if (node == null_node or depth > 32) return false;
     return switch (c.nodeTag(node)) {
         .arrow_fn, .function_expr => fnExprIsContextSensitive(c, node),
