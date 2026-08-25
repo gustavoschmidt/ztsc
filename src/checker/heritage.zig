@@ -548,6 +548,29 @@ fn isFirstInterfaceDecl(c: *Checker, sym: SymbolId, node: Node) bool {
     return false;
 }
 
+/// `hasHeritage` for a symbol that may be declared in ANOTHER file, or be a
+/// cross-file merge of several: each part is read in its own file context,
+/// because a `Node` only indexes the tree it came from.
+///
+/// The relation's elaborator asks this to decide whether tsc's
+/// `getSingleBaseForNonAugmentingSubtype` could have swapped a class/interface
+/// source for its base before printing the missing-property sentence — the
+/// swap's first precondition is `getBaseTypes(target).length === 1`, so a
+/// declaration with no heritage clause at all is safe to name under its own
+/// name. Syntax only, and no type is interned, so callers may treat it as a
+/// pure lookup (`elaborate.sourceIsItsOwnStandIn` relies on that).
+pub fn declaresHeritage(c: *Checker, sym: SymbolId) bool {
+    if (c.prog.isMergedId(sym)) {
+        for (c.prog.mergedSym(sym).parts) |p| {
+            if (declaresHeritage(c, p)) return true;
+        }
+        return false;
+    }
+    const saved_ctx = c.enterSymFile(sym);
+    defer c.restoreCtx(saved_ctx);
+    return hasHeritage(c, sym);
+}
+
 /// Does any declaration of `sym` write a heritage clause? Syntax only: the
 /// `extends` list of any `interface` block, or the `extends` of a merged
 /// `class` half. With none, `getBaseTypes` would be empty and neither TS2320
