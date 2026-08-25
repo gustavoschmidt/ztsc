@@ -121,12 +121,39 @@ pub const Code = enum(u16) {
     /// diagnostic — `for (var in X)` reports it beside the RHS's TS2304, which
     /// a syntactic answer would suppress.
     empty_var_decl_list,
+    /// TS1099: `I<>` — a type-argument list with no arguments in it. tsc's
+    /// `checkGrammarTypeArguments`, so a GRAMMAR diagnostic like its
+    /// `empty_var_decl_list` neighbour: `var x: I<>` reports it beside the
+    /// TS2314 the reference earns for having no arguments at all, which a
+    /// syntactic answer would suppress. Anchored at the `<` (measured; tsc's
+    /// own wording blames the whole reference, tsgo 7.0.2 the list).
+    empty_type_arg_list,
     /// TS1009: the same list ended on a COMMA (`var a,`). `parseDelimitedList`
     /// only records `hasTrailingComma` on the node array; the complaint is
     /// `checkGrammarForDisallowedTrailingComma`, called from
     /// `checkGrammarVariableDeclarationList` right beside TS1123 — so it is a
     /// GRAMMAR diagnostic for the same reason that one is.
     trailing_comma,
+    /// TS1144: a function DECLARATION, method or constructor with neither a
+    /// `{` body nor anywhere to put a semicolon. tsc's
+    /// `parseFunctionBlockOrSemicolon(…, Diagnostics.or_expected)` names both
+    /// ways out where the plain statement position names only the semicolon —
+    /// `function f() => 4;` is this, at the `=>`. An ACCESSOR is deliberately
+    /// not in the list: `parseAccessorDeclaration` passes no message and gets
+    /// the bare "'{' expected" (measured).
+    expected_brace_or_semi,
+    /// TS1313: `if (x);` — the `if` body is an empty statement, which is
+    /// almost always a stray semicolon before the block that was meant to be
+    /// the body. tsc's `checkIfStatement`, so a GRAMMAR diagnostic; only the
+    /// THEN branch (an empty `else` is silent), and only `if` — `for (;;);`
+    /// and `while (x);` are legal idioms and say nothing.
+    if_body_empty_statement,
+    /// TS1015: `f(a?= 1)` — a parameter with both a `?` and an initializer,
+    /// which say the same thing twice and disagree about the type. tsc's
+    /// `checkGrammarParameterList`, on the parameter's NAME, and independent of
+    /// the TS2371 an initializer in a non-implementation earns beside it
+    /// (measured on `declare function h(a?= 1): void`, which answers both).
+    param_question_and_initializer,
     expected_string_literal,
     expected_from,
     /// TS1005 for the `as` of a namespace import (`import * as ns from "m"`)
@@ -707,6 +734,29 @@ pub const Code = enum(u16) {
     /// Reported on the name token, and NOT gated on `static` (`static get
     /// constructor` reports too — verified against tsgo 7.0.2).
     ctor_may_not_be_accessor,
+    // --- `checkGrammarAccessor` (src/frontend/accessor_grammar.zig) --------
+    // One walk with one `return`, so at most one of these fires per accessor.
+    // All GRAMMAR-class: tsc keeps them in the checker, and a sibling file's
+    // TS2322 survives beside them (measured).
+    /// TS1094: `get x<T>()` — an accessor cannot be generic. At the name.
+    accessor_type_parameters,
+    /// TS1054: `get x(a: number)` — a getter takes no parameters (a `this`
+    /// parameter is not one). At the name.
+    get_accessor_parameters,
+    /// TS1049: `set x()` / `set x(a, b)` — a setter takes exactly one. At the
+    /// name.
+    set_accessor_one_parameter,
+    /// TS1095: `set x(v: number): void` — a setter has nothing to return. At
+    /// the name.
+    set_accessor_return_type,
+    /// TS1053: `set x(...v: number[])`. At the `...`.
+    set_accessor_rest_parameter,
+    /// TS1051: `set x(v?: number)`. At the `?`.
+    set_accessor_optional_parameter,
+    /// TS1052: `set x(v: number = 1)`. At the NAME — tsc's own source blames
+    /// the initializer, tsgo 7.0.2 blames the name, and the oracle is what
+    /// this follows.
+    set_accessor_parameter_initializer,
     /// TS2528: two `export default`s that cannot share the slot. Not every pair
     /// collides — function overloads merge, and a function and an interface are
     /// legal side by side — so the rule is tsc's `declareSymbol` includes/
@@ -1065,7 +1115,10 @@ pub const Code = enum(u16) {
             .generator_in_ambient_context,
             .overload_signature_generator,
             .empty_var_decl_list,
+            .empty_type_arg_list,
             .trailing_comma,
+            .if_body_empty_statement,
+            .param_question_and_initializer,
             .for_of_one_declaration,
             .for_in_one_declaration,
             .for_of_declaration_initializer,
@@ -1249,6 +1302,13 @@ pub const Code = enum(u16) {
             .abstract_method_outside_abstract_class,
             .abstract_property_outside_abstract_class,
             .ctor_may_not_be_accessor,
+            .accessor_type_parameters,
+            .get_accessor_parameters,
+            .set_accessor_one_parameter,
+            .set_accessor_return_type,
+            .set_accessor_rest_parameter,
+            .set_accessor_optional_parameter,
+            .set_accessor_parameter_initializer,
             // The regex family: tsc's `checkGrammarRegularExpressionLiteral`
             // reaches the scanner's `scanRegularExpressionWorker`, so these are
             // semantic despite their TS1xxx codes — measured, `let x = /a/gg`
@@ -1346,7 +1406,11 @@ pub const Code = enum(u16) {
             .expected_binding => "Variable declaration expected.",
             .reserved_var_decl_name => "'{0}' is not allowed as a variable declaration name.",
             .empty_var_decl_list => "Variable declaration list cannot be empty.",
+            .empty_type_arg_list => "Type argument list cannot be empty.",
             .trailing_comma => "Trailing comma not allowed.",
+            .expected_brace_or_semi => "'{' or ';' expected.",
+            .if_body_empty_statement => "The body of an 'if' statement cannot be the empty statement.",
+            .param_question_and_initializer => "Parameter cannot have question mark and initializer.",
             .expected_string_literal => "String literal expected.",
             .expected_from => "'from' expected.",
             .expected_as => "'as' expected.",
@@ -1582,6 +1646,13 @@ pub const Code = enum(u16) {
             .param_initializer_outside_impl => "A parameter initializer is only allowed in a function or constructor implementation.",
             .ctor_as_param_property_name => "'constructor' cannot be used as a parameter property name.",
             .ctor_may_not_be_accessor => "Class constructor may not be an accessor.",
+            .accessor_type_parameters => "An accessor cannot have type parameters.",
+            .get_accessor_parameters => "A 'get' accessor cannot have parameters.",
+            .set_accessor_one_parameter => "A 'set' accessor must have exactly one parameter.",
+            .set_accessor_return_type => "A 'set' accessor cannot have a return type annotation.",
+            .set_accessor_rest_parameter => "A 'set' accessor cannot have rest parameter.",
+            .set_accessor_optional_parameter => "A 'set' accessor cannot have an optional parameter.",
+            .set_accessor_parameter_initializer => "A 'set' accessor parameter cannot have an initializer.",
             .multiple_default_exports => "A module cannot have multiple default exports.",
             .super_before_this => "'super' must be called before accessing 'this' in the constructor of a derived class.",
             .super_before_super_property => "'super' must be called before accessing a property of 'super' in the constructor of a derived class.",
@@ -1700,7 +1771,11 @@ pub const Code = enum(u16) {
             .expected_binding => 1134,
             .reserved_var_decl_name => 1389,
             .empty_var_decl_list => 1123,
+            .empty_type_arg_list => 1099,
             .trailing_comma => 1009,
+            .expected_brace_or_semi => 1144,
+            .if_body_empty_statement => 1313,
+            .param_question_and_initializer => 1015,
             .expected_declaration => 1146,
             .expected_case_or_default => 1130,
             .expected_catch_or_finally => 1472,
@@ -1801,6 +1876,13 @@ pub const Code = enum(u16) {
             .param_initializer_outside_impl => 2371,
             .ctor_as_param_property_name => 2398,
             .ctor_may_not_be_accessor => 1341,
+            .accessor_type_parameters => 1094,
+            .get_accessor_parameters => 1054,
+            .set_accessor_one_parameter => 1049,
+            .set_accessor_return_type => 1095,
+            .set_accessor_rest_parameter => 1053,
+            .set_accessor_optional_parameter => 1051,
+            .set_accessor_parameter_initializer => 1052,
             .multiple_default_exports => 2528,
             .super_before_this => 17009,
             .super_before_super_property => 17011,

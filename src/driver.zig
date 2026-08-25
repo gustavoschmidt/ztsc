@@ -625,12 +625,17 @@ pub fn build(
             if (tables.results.items[i]) |src| {
                 var misses: std.ArrayList(modules.TypeRefMiss) = .empty;
                 for (try resolve.scanReferences(resolve_scratch.allocator(), src.bytes)) |ref| {
-                    const rfid = try disco.discoverReference(importer, ref);
-                    try ref_files.append(arena, rfid);
+                    const rt = try disco.discoverReference(importer, ref);
+                    try ref_files.append(arena, rt.file);
                     // An unresolvable directive is tsc's TS2688 (`types=`) or
-                    // TS6053 (`path=`); the linker reports it, since only this
-                    // loop knows resolution failed.
-                    if (rfid == modules.no_file) try misses.append(arena, modules.typeRefMiss(ref));
+                    // TS6053 (`path=`), and one that names its own file is
+                    // TS1006; the linker reports all three, since only this
+                    // loop knows how resolution came out.
+                    if (rt.file == modules.no_file) {
+                        try misses.append(arena, modules.typeRefMiss(ref));
+                    } else if (rt.self) {
+                        try misses.append(arena, modules.typeRefSelf(ref));
+                    }
                 }
                 tables.type_ref_misses.items[i] = misses.items;
             }

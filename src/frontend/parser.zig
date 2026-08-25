@@ -54,6 +54,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const scanner = @import("scanner.zig");
+const accessor_grammar = @import("accessor_grammar.zig");
 const ast = @import("ast.zig");
 const diagnostics = @import("diagnostics.zig");
 const directives = @import("directives.zig");
@@ -2507,6 +2508,26 @@ const Parser = struct {
 
     /// ASI: `;` is consumed; `}`, EOF, or a preceding line break also
     /// terminate the statement; anything else is an error (not consumed).
+    /// The body position of a function DECLARATION, a method or a constructor:
+    /// either a `{ … }` block (the caller's business) or a semicolon (an
+    /// overload signature / ambient declaration). tsc's
+    /// `parseFunctionBlockOrSemicolon(…, Diagnostics.or_expected)` — when
+    /// neither is possible it names BOTH ways out, TS1144, where an ordinary
+    /// statement position names only the semicolon (`function f() => 4;` is
+    /// TS1144 at the `=>`, measured). The recovery is identical either way:
+    /// tsc's `parseBlock` finds no `{`, consumes nothing, and the declaration
+    /// ends with no body.
+    fn expectBodyOrSemicolon(p: *Parser) PE!void {
+        switch (p.curTag()) {
+            .semicolon => _ = try p.bump(),
+            .r_brace, .eof => {},
+            else => {
+                if (p.nlBefore()) return;
+                try p.fail(.expected_brace_or_semi);
+            },
+        }
+    }
+
     fn expectSemicolon(p: *Parser) PE!void {
         switch (p.curTag()) {
             .semicolon => _ = try p.bump(),
@@ -2834,6 +2855,13 @@ const Parser = struct {
         const cond = try p.parseExpression(.{});
         _ = try p.expect(.r_paren, .expected_r_paren);
         const then_stmt = try p.parseSubstatement();
+        // tsc's `checkIfStatement`: an `if` whose body is the EMPTY statement is
+        // almost always a stray `;` in front of the block that was meant to be
+        // the body. Only the THEN branch — an empty `else` is silent — and only
+        // `if`, since `for (;;);` and `while (x);` are legal idioms.
+        if (then_stmt != null_node and p.nodeTagAt(then_stmt) == .empty_stmt and p.spec == 0) {
+            try p.errAtToken(.if_body_empty_statement, p.nodeMainTokenAt(then_stmt));
+        }
         if (try p.eat(.keyword_else) != null) {
             const else_stmt = try p.parseSubstatement();
             const extra = try p.addExtra(ast.IfElse{ .then_stmt = then_stmt, .else_stmt = else_stmt });
@@ -3243,7 +3271,7 @@ const Parser = struct {
             body = try p.parseFunctionBody();
         } else {
             // Overload signature / ambient declaration.
-            try p.expectSemicolon();
+            try p.expectBodyOrSemicolon();
         }
         try p.checkGeneratorStar(star, body != null_node);
         return p.addNode(.{
@@ -3278,6 +3306,12 @@ const Parser = struct {
         const params = try p.parseParams();
         var ret: Node = null_node;
         if (try p.eat(.colon) != null) ret = try p.parseReturnType();
+        // Every accessor in the language funnels through here — class member,
+        // object-literal property, interface/type-literal member — so tsc's
+        // `checkGrammarAccessor` is asked once, in one place.
+        if (flags & (ast.Flags.get | ast.Flags.set) != 0) {
+            try p.reportAccessorGrammar(flags, name_tok, tp, params, ret);
+        }
         return p.addExtra(ast.FnProto{
             .flags = flags,
             .name_token = name_tok,
@@ -3396,6 +3430,11 @@ const Parser = struct {
                 if (p.curIdx() == before) break;
                 continue;
             }
+            // A type parameter's name is a DECLARATION name, not a property
+            // name, so tsc's `checkStrictModeIdentifier` reaches it (its
+            // `isIdentifierName` exemption lists only the member/property
+            // positions): `class D<public, private> {}` is two TS1213.
+            try p.checkStrictReserved();
             const name = try p.bump();
             var constraint: Node = null_node;
             var default: Node = null_node;
@@ -3546,6 +3585,87 @@ const Parser = struct {
         return p.nodeMainTokenAt(param);
     }
 
+    /// One parameter's flag word (`.param` carries none).
+    fn paramFlags(p: *const Parser, param: Node) u32 {
+        if (p.nodeTagAt(param) != .param_full) return 0;
+        return p.extraFieldAt(ast.ParamFull, "flags", p.nodeDataAt(param).rhs);
+    }
+
+    /// The `?` token of an OPTIONAL parameter — tsc's `parameter.questionToken`,
+    /// where `checkGrammarAccessor` anchors TS1051. The AST records the flag but
+    /// not the token, so it is recovered from the token stream: the `?` sits
+    /// immediately after the parameter's binding NAME, and a binding name is
+    /// either one identifier token or a bracketed pattern, so "immediately
+    /// after" is one token past the name or one token past the pattern's
+    /// matching bracket.
+    fn optionalQuestionToken(p: *Parser, param: Node) ?u32 {
+        if (p.paramFlags(param) & ast.Flags.optional == 0) return null;
+        const name = p.nodeDataAt(param).lhs;
+        if (name == null_node) return null;
+        var i = p.nodeMainTokenAt(name);
+        switch (p.tokTagAt(i)) {
+            .l_bracket, .l_brace => {
+                var depth: u32 = 0;
+                while (i < p.tok_tags.items.len) : (i += 1) {
+                    switch (p.tokTagAt(i)) {
+                        .l_bracket, .l_brace => depth += 1,
+                        .r_bracket, .r_brace => {
+                            depth -= 1;
+                            if (depth == 0) break;
+                        },
+                        else => {},
+                    }
+                }
+            },
+            else => {},
+        }
+        i += 1;
+        if (i >= p.tok_tags.items.len or p.tokTagAt(i) != .question) return null;
+        return i;
+    }
+
+    /// tsc's `checkGrammarAccessor`, over the signature `parseFnProtoRest` has
+    /// just read. A `this` parameter is not a value parameter and is excluded
+    /// from the count on both sides (`getAccessorThisParameter`); what it earns
+    /// instead is the checker's TS2784.
+    ///
+    /// Not reported while SPECULATING: a discarded parse must leave no
+    /// diagnostic behind, and `restore` would drop it anyway — but an accessor
+    /// is never speculated in practice, so the guard is only for symmetry with
+    /// the rest of the grammar reports here.
+    fn reportAccessorGrammar(
+        p: *Parser,
+        flags: u32,
+        name_tok: u32,
+        tp: ast.SubRange,
+        params: ast.SubRange,
+        ret: Node,
+    ) Error!void {
+        if (p.spec != 0 or name_tok == 0) return;
+        const nodes = p.extra.items[params.start..params.end];
+        var first: Node = null_node;
+        var n: u32 = 0;
+        for (nodes) |param| {
+            // A `this` parameter's name node is `.this_expr` (see `parseParam`).
+            const name = p.nodeDataAt(param).lhs;
+            if (name != null_node and p.nodeTagAt(name) == .this_expr) continue;
+            if (n == 0) first = param;
+            n += 1;
+        }
+        const report = accessor_grammar.check(.{
+            .kind = if (flags & ast.Flags.get != 0) .get else .set,
+            .name_token = name_tok,
+            .value_params = n,
+            .type_params = tp.start != tp.end,
+            .return_type = ret != null_node,
+            .rest = if (first == null_node) null else p.restDotsToken(first),
+            .question = if (first == null_node) null else p.optionalQuestionToken(first),
+            .initializer = first != null_node and p.nodeTagAt(first) == .param_full and
+                p.extraFieldAt(ast.ParamFull, "init", p.nodeDataAt(first).rhs) != null_node,
+        }) orelse return;
+        try p.errAtToken(report.code, report.token);
+    }
+
     fn parseParam(p: *Parser) PE!Node {
         // Parameter decorators (`@dec x: T`) are a grammar error under TC39
         // standard decorators: consume them (so the parameter itself still
@@ -3672,6 +3792,17 @@ const Parser = struct {
         }
         var init: Node = null_node;
         if (try p.eat(.eq) != null) init = try p.parseAssignExpr(.{});
+        // TS1015, tsc's `checkGrammarParameterList`: `?` and `= …` say the same
+        // thing twice, and the two disagree about the type. On the parameter's
+        // NAME, and independent of the TS2371 an initializer outside an
+        // implementation earns beside it (`declare function h(a?= 1): void`
+        // answers both). Reported while speculating for the same reason the
+        // rest-parameter rule is — an arrow's parameter list is read inside a
+        // speculation that then COMMITS, and `restore` un-reports the ones that
+        // do not.
+        if (flags & ast.Flags.optional != 0 and init != null_node and name != null_node) {
+            try p.errAtToken(.param_question_and_initializer, p.nodeMainTokenAt(name));
+        }
 
         if (flags == 0 and init == null_node) {
             return p.addNode(.{ .tag = .param, .main_token = start_tok, .data = .{ .lhs = name, .rhs = type_ann } });
@@ -3837,8 +3968,13 @@ const Parser = struct {
                 } else {
                     // Shorthand: the key IS the bound name, so `{ await }` in an
                     // await context is TS1359 — while `{ await: other }` names a
-                    // property and is fine (measured).
+                    // property and is fine (measured). The strict-reserved rule
+                    // splits the same way, and for tsc's own reason: its
+                    // `checkStrictModeIdentifier` skips an `isIdentifierName`
+                    // node, which the KEY half of `{ public: a }` is and the
+                    // shorthand `{ public }` is not.
                     try p.checkAwaitReservedNameAt(key);
+                    try p.checkStrictReservedAt(key);
                 }
                 var init: Node = null_node;
                 if (try p.eat(.eq) != null) init = try p.parseAssignExpr(.{});
@@ -3886,12 +4022,24 @@ const Parser = struct {
 
     fn parseClassDecl(p: *Parser, flags_in: u32, form: ClassForm) PE!Node {
         const kw = try p.bump(); // `class`
+        // From here to the closing `}` everything is INSIDE the class node, and
+        // tsc's `getStrictModeIdentifierMessage` asks `getContainingClass(node)`
+        // — an ancestor walk from the identifier's PARENT — so the class's own
+        // NAME is in it (`var c = class package extends public {}` is two
+        // TS1213), and so are its TYPE PARAMETERS (`class D<public, private>
+        // {}`) and its HERITAGE clauses (`class E implements yield {}`). All
+        // four were TS1212, or silent, while the counter covered only the body.
+        // A depth counter rather than a flag, because nested functions and
+        // nested classes are inside it too.
+        p.class_depth += 1;
+        defer p.class_depth -= 1;
         var name_tok: u32 = 0;
         if (isIdentLike(p.curTag()) and p.curTag() != .keyword_implements) {
             // A class name is parsed in the ENCLOSING context (tsc's
             // `parseNameOfClassDeclarationOrExpression` inherits it), so
             // `class await {}` inside a static block is TS1359.
             try p.checkAwaitReservedName();
+            try p.checkStrictReserved();
             name_tok = try p.bump();
         }
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
@@ -3928,11 +4076,6 @@ const Parser = struct {
         // as members and answered five invented TS1005s for them.
         const has_body = p.curTag() == .l_brace;
         _ = try p.expect(.l_brace, .expected_l_brace);
-        // Inside the body every strict-reserved word is TS1213 rather than
-        // TS1212 (tsc's `getContainingClass`), including in nested functions and
-        // nested classes — hence a depth counter rather than a flag.
-        p.class_depth += 1;
-        defer p.class_depth -= 1;
         const was_abstract_class = p.abstract_class;
         p.abstract_class = flags_in & ast.Flags.abstract != 0;
         defer p.abstract_class = was_abstract_class;
@@ -4051,8 +4194,12 @@ const Parser = struct {
 
     fn parseDecorator(p: *Parser) PE!Node {
         const at = try p.bump(); // `@`
-        var expr: Node = null_node;
-        if (canStartExpression(p.curTag())) expr = try p.parseLhsExpression(.{ .in_decorator = true });
+        // tsc's `parseDecorator` calls `parseLeftHandSideExpressionOrHigher`
+        // unconditionally, so a decorator with nothing behind it earns that
+        // parse's "Expression expected" — `@` on its own line before an `enum`
+        // is TS1109 at the `enum` keyword (parserErrorRecovery_ClassElement3).
+        // Declining to parse left the `@` silent and swallowed the diagnostic.
+        const expr = try p.parseLhsExpression(.{ .in_decorator = true });
         return p.addNode(.{ .tag = .decorator, .main_token = at, .data = .{ .lhs = expr, .rhs = 0 } });
     }
 
@@ -4538,7 +4685,16 @@ const Parser = struct {
             if (p.curTag() == .l_brace) {
                 body = try p.parseFunctionBody();
             } else {
-                try p.expectSemicolon(); // overload signature / abstract
+                // Overload signature / abstract. TS1144 for a method or a
+                // constructor, TS1005 "';' expected" for an ACCESSOR: tsc's
+                // `parseAccessorDeclaration` is the one caller of
+                // `parseFunctionBlockOrSemicolon` that passes no message
+                // (measured — `class G { get p() => 7; }` is "'{' expected").
+                if (flags & (ast.Flags.get | ast.Flags.set) != 0) {
+                    try p.expectSemicolon();
+                } else {
+                    try p.expectBodyOrSemicolon();
+                }
             }
             const member = try p.addNode(.{ .tag = .class_method, .main_token = name_tok, .data = .{ .lhs = proto, .rhs = body } });
             try p.checkGeneratorStar(star, body != null_node);
@@ -4821,15 +4977,34 @@ const Parser = struct {
     /// file describes an interface that may well have been written in sloppy
     /// mode, so the reserved-word rule has nothing to say about it.
     ///
-    /// Skipped while speculating: a construct that only ever gets parsed inside a
-    /// lookahead is not committed source, and the real parse reports it.
+    /// Reported even while SPECULATING, for the same reason `parseParams`
+    /// reports TS1014 there: an ARROW function and a function TYPE both read
+    /// their parameter list inside a speculative parse that is then COMMITTED,
+    /// so a `spec` guard loses `((private, public) => {})` and `(cb: (private,
+    /// public) => void)` outright — there is no "real parse" behind those to
+    /// report them. `restore` truncates `diags`, so a speculation that
+    /// BACKTRACKS un-reports this exactly as it un-reports the literal-grammar
+    /// diagnostics `checkLiteral` files, and the tokens it re-reads as an
+    /// expression are identifier REFERENCES, which this rule never sees.
     fn checkStrictReserved(p: *Parser) Error!void {
-        if (p.spec > 0 or p.ambient) return;
+        if (p.ambient) return;
         if (!p.curTag().isStrictReservedKeyword()) return;
         try p.errAtCur(if (p.class_depth > 0)
             .strict_reserved_word_in_class
         else
             .strict_reserved_word);
+    }
+
+    /// `checkStrictReserved` for a token that has already been consumed — the
+    /// two name positions that bump theirs directly, exactly as
+    /// `checkAwaitReservedNameAt` serves them.
+    fn checkStrictReservedAt(p: *Parser, tok: u32) Error!void {
+        if (p.spec > 0 or p.ambient) return;
+        if (!p.tokTagAt(tok).isStrictReservedKeyword()) return;
+        try p.errAtToken(if (p.class_depth > 0)
+            .strict_reserved_word_in_class
+        else
+            .strict_reserved_word, tok);
     }
 
     /// TS1359, tsc's `createIdentifier`: inside an await context — an `async`
@@ -5352,6 +5527,12 @@ const Parser = struct {
 
         if (isIdentLike(p.curTag())) {
             // `import d ...` — but `import x = require(...)` is out of subset.
+            // The name is a BINDING, so the strict-reserved rule applies to it
+            // (`import public from "m"`, `import public = require("m")`); a
+            // module is automatically strict, which is what turns it into
+            // TS1214 at seal. The namespace and named-specifier bindings reach
+            // the rule through their own funnels already.
+            try p.checkStrictReserved();
             default_name = try p.bump();
             // The ImportEqualsDeclaration arm — `export` belongs here, and it
             // anchors the node: a declaration's span starts at its first
@@ -5894,13 +6075,48 @@ const Parser = struct {
             const extra = try p.addExtra(ast.CondExpr{ .then_expr = then_expr, .else_expr = else_expr });
             return p.addNode(.{ .tag = .cond_expr, .main_token = q, .data = .{ .lhs = lhs, .rhs = extra } });
         }
-        if (isAssignOp(p.curTag())) {
+        if (isAssignOp(p.curTag()) and lhsAssignable(p.nodeTagAt(lhs))) {
             const op = try p.bump();
             try p.checkEvalOrArgumentsTarget(lhs);
             const rhs = try p.parseAssignExpr(ctx);
             return p.addNode(.{ .tag = .assign, .main_token = op, .data = .{ .lhs = lhs, .rhs = rhs } });
         }
         return lhs;
+    }
+
+    /// tsc's `isLeftHandSideExpression`, the SYNTACTIC gate on
+    /// `parseAssignmentExpressionOrHigher`'s assignment arm: `isLeftHandSideExpression(expr)
+    /// && isAssignmentOperator(token())`. An operand that is not a
+    /// LeftHandSideExpression does not merely earn a diagnostic about the
+    /// assignment — the `=` is never consumed at all, so the statement ends
+    /// there and the parser answers "';' expected" (measured: `x++ = 4`,
+    /// `x + y = 8`, `x as any = 1`, `<any>x = 2` and `x satisfies any = 3` are
+    /// each one TS1005 at the operator, and no TS2364).
+    ///
+    /// A BLACKLIST rather than tsc's whitelist, because the two node
+    /// vocabularies do not line up and the failure modes are asymmetric:
+    /// wrongly ADMITTING a form keeps today's behaviour, while wrongly
+    /// REJECTING one breaks a legal assignment. These eight are the tags
+    /// `parseBinaryExpr` can hand back that tsc's list does not contain —
+    /// `paren_expr`, `non_null`, `array_literal`/`object_literal` (destructuring
+    /// assignment) and every call/member/leaf form are on it, and an arrow or a
+    /// `yield` returns from `parseAssignExpr` before ever reaching here.
+    /// `error_node` stays admissible: tsc's own missing node is an Identifier,
+    /// which IS a left-hand side, so rejecting one would invent a cascade on
+    /// top of the diagnostic that produced it.
+    fn lhsAssignable(tag: ast.Tag) bool {
+        return switch (tag) {
+            .binary,
+            .assign,
+            .cond_expr,
+            .seq_expr,
+            .prefix_unary,
+            .postfix_unary,
+            .as_expr,
+            .satisfies_expr,
+            => false,
+            else => true,
+        };
     }
 
     fn parseYield(p: *Parser, ctx: ExprCtx) PE!Node {
@@ -6188,6 +6404,35 @@ const Parser = struct {
         };
     }
 
+    /// tsc's `checkGrammarNumericLiteral` blames a legacy octal literal on the
+    /// PREFIX MINUS that negates it, not on the literal:
+    /// `grammarErrorOnNode(withMinus ? node.parent : node, …)`, with the
+    /// suggested spelling negated to match (`-003` → "use `-0o3`"). So `-003`
+    /// reports one column left of where `003` alone would.
+    ///
+    /// The literal's diagnostic is already recorded — `checkLiteral` runs when
+    /// the token is CONSUMED, long before the parser knows what encloses it,
+    /// and the enclosing node is exactly what tsc's rule turns on (`1 - 03` is
+    /// a binary minus and keeps the literal's own position). So the anchor is
+    /// moved here, at the one place a prefix `-` meets its operand, rather than
+    /// guessed at scan time. `operand` must be the node just parsed, so the
+    /// entry — if there is one at all, which for nearly every `-` there is not
+    /// — is the last diagnostic in the list.
+    fn retargetOctalToMinus(p: *Parser, op: TokenIndex, operand: Node) void {
+        if (p.nodes.items(.tag)[operand] != .number_literal) return;
+        const lit = p.nodes.items(.main_token)[operand];
+        const lit_start = p.tok_starts.items[lit] & scanner.Tokens.start_mask;
+        var i = p.diags.items.len;
+        while (i > 0) {
+            i -= 1;
+            const d = &p.diags.items[i];
+            if (d.span.start < lit_start) return; // past the literal's own run
+            if (d.code != .octal_literal_not_allowed or d.span.start != lit_start) continue;
+            d.span.start = p.tok_starts.items[op] & scanner.Tokens.start_mask;
+            return;
+        }
+    }
+
     fn parseSimpleUnaryExpr(p: *Parser, ctx: ExprCtx) PE!Node {
         // Legacy angle-bracket type assertion `<T>expr`. Only in files where
         // JSX is off: in a `.tsx`/`.jsx` file a `<` in expression position
@@ -6198,12 +6443,32 @@ const Parser = struct {
         // syntax error for it too).
         if (!p.jsx and p.curTag() == .lt) return p.parseTypeAssertion(ctx);
         switch (p.curTag()) {
-            .bang, .tilde, .plus, .minus, .plus_plus, .minus_minus, .keyword_typeof, .keyword_void, .keyword_delete => {
+            // `++x` / `--x` are UPDATE expressions, and their operand is a
+            // LEFT-HAND-SIDE expression, not a unary one: tsc's
+            // `parseUpdateExpression` calls
+            // `parseLeftHandSideExpressionOrHigher` for it. The difference is
+            // observable — `++await 42` inside an async function is TS1109 at
+            // the `await` (nothing there can start an LHS expression), `++ ++y`
+            // is TS1109 at the inner `++`, and `++x++` is `++x` followed by a
+            // "';' expected", because the postfix `++` belongs to the NEXT
+            // statement. Parsing the operand as a unary expression instead
+            // swallowed all three into a well-formed tree and answered the
+            // checker's TS2357 for them.
+            .plus_plus, .minus_minus => {
+                const op = try p.bump();
+                const operand = try p.parseLhsExpression(ctx);
+                try p.checkEvalOrArgumentsTarget(operand); // `++eval` assigns to `eval`
+                return p.addNode(.{ .tag = .prefix_unary, .main_token = op, .data = .{ .lhs = operand, .rhs = 0 } });
+            },
+            .bang, .tilde, .plus, .keyword_typeof, .keyword_void, .keyword_delete => {
                 const op = try p.bump();
                 const operand = try p.parseSimpleUnaryExpr(ctx);
-                // `++eval` / `--arguments` assign to their operand.
-                const tag = p.tokTagAt(op);
-                if (tag == .plus_plus or tag == .minus_minus) try p.checkEvalOrArgumentsTarget(operand);
+                return p.addNode(.{ .tag = .prefix_unary, .main_token = op, .data = .{ .lhs = operand, .rhs = 0 } });
+            },
+            .minus => {
+                const op = try p.bump();
+                const operand = try p.parseSimpleUnaryExpr(ctx);
+                p.retargetOctalToMinus(op, operand);
                 return p.addNode(.{ .tag = .prefix_unary, .main_token = op, .data = .{ .lhs = operand, .rhs = 0 } });
             },
             .keyword_await => {
@@ -8044,6 +8309,9 @@ const Parser = struct {
                     try p.fail(.expected_type);
                     break :blk try p.errorNode();
                 };
+                // `type T = -003` blames the minus too (oracle: TS1121 with
+                // the negated suggestion `-0o3`) — one rule, both positions.
+                p.retargetOctalToMinus(op, operand);
                 return p.addNode(.{ .tag = .prefix_unary, .main_token = op, .data = .{ .lhs = operand, .rhs = 0 } });
             },
             .keyword_typeof => {
@@ -8153,11 +8421,30 @@ const Parser = struct {
     fn parseImportType(p: *Parser) PE!Node {
         const kw = try p.bump(); // import
         _ = try p.expect(.l_paren, .expected_l_paren);
+        // tsc's `parseImportType` reads the argument as a full TYPE and leaves
+        // "it has to be a string literal" to the checker
+        // (`getTypeFromImportTypeNode`'s TS1141, reported only when the type is
+        // actually RESOLVED — an unused `type A = import({x: 12})` is silent,
+        // measured). Refusing anything but a string here stalled on the
+        // argument, which cost a false TS1110 on every such node AND wrecked
+        // the recovery of a NESTED one: the `)` of `import(import("./a").X)`
+        // closed the attribute skip below, leaving the outer `)` to be blamed
+        // as a missing `;` (importTypeNested).
+        //
+        // `spec_tok` is the argument's FIRST token whatever it turned out to
+        // be; every reader checks the tag, because only a `.string_literal`
+        // names a module.
         var spec_tok: u32 = 0;
         if (p.curTag() == .string_literal) {
             spec_tok = p.curIdx();
             _ = try p.bump();
+        } else if (p.curTag() != .r_paren) {
+            spec_tok = p.curIdx();
+            _ = try p.parseType();
         } else {
+            // `import()` with nothing in it: tsc's `parseType` answers TS1110
+            // at the `)`, which is the one shape where the argument is missing
+            // rather than wrong.
             try p.fail(.expected_type);
         }
         // Tolerate `import("m", { with: {...} })` assertions: skip to `)`.
@@ -8178,15 +8465,31 @@ const Parser = struct {
         return ty;
     }
 
+    /// `<A, B>`. An EMPTY list is legal syntax and its own grammar error:
+    /// tsc's `parseDelimitedList` asks `isStartOfType()` before it parses an
+    /// element and ends the list on anything else (and on end of file, which
+    /// terminates every list), then `checkGrammarTypeArguments` answers TS1099
+    /// for the zero-length result. Both halves are observable — `I<>` is
+    /// TS1099 at the `<` PLUS the TS2314 the reference earns for supplying no
+    /// arguments, and `IPromise<` at end of file is "'>' expected", not "Type
+    /// expected" — and neither survived parsing an element unconditionally,
+    /// because the TS1110 that produced was syntactic and suppressed the rest
+    /// of the program's semantic pass.
+    ///
+    /// The two terminators here are the ones the corpus witnesses: end of file
+    /// and a `>` (a full `isStartOfType` is a larger rule than the evidence
+    /// supports, and admitting a bad element keeps today's behaviour).
     fn parseTypeArgs(p: *Parser) PE!ast.SubRange {
-        _ = try p.expectLt();
+        const lt = try p.expectLt();
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
-        while (true) {
+        while (p.curTag() != .eof and !isGtFamily(p.curTag())) {
             try p.pushScratch(try p.parseType());
             if (try p.eat(.comma) == null) break;
         }
+        const empty = p.scratchTop() == top;
         _ = try p.expectGt();
+        if (empty) try p.errAtToken(.empty_type_arg_list, lt);
         return p.scratchToSpan(top);
     }
 

@@ -174,9 +174,15 @@ pub const AliasValueVerdict = enum {
     /// The alias names something with only a TYPE meaning: TS2693 in an
     /// expression, but a legal `export =` / `export default` target.
     type_target,
-    /// The alias reaches a value through an `export type { … }` re-export,
+    /// The alias reaches a value through an `export type { … }` specifier,
     /// which strips the value meaning at the boundary: TS1362.
     export_type,
+    /// …and the same condition with an `import type` clause/specifier as the
+    /// nearest stripping declaration instead: TS1361. tsc picks by which side
+    /// of the boundary the NEAREST type-only declaration sits on, which is
+    /// what the link phase records in `Target.type_only_from_export` (see
+    /// `link/program.zig`'s `TypeOnly`).
+    import_type,
 };
 
 /// tsc's `resolveAlias` + value-meaning test for a name that resolved to an
@@ -203,7 +209,7 @@ pub fn aliasValueVerdict(c: *Checker, sym: SymbolId, f: binder.SymbolFlags) Erro
         // chains); a value target reached through `export type` is 1362.
         if (!names.hasValueMeaning(tf) and names.hasTypeMeaning(tf)) return .type_target;
     }
-    if (tgt.type_only) return .export_type;
+    if (tgt.type_only) return if (tgt.type_only_from_export) .export_type else .import_type;
     return .has_value;
 }
 

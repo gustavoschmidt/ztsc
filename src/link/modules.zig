@@ -55,6 +55,7 @@ const bind_result = @import("../frontend/bind_result.zig");
 const decl_spaces = @import("../frontend/decl_spaces.zig");
 const diagnostics = @import("../frontend/diagnostics.zig");
 const intern = @import("../intern.zig");
+const literals = @import("../frontend/literals.zig");
 const source = @import("../frontend/source.zig");
 const libs = @import("../libs.zig");
 const alias_cycle = @import("alias_cycle.zig");
@@ -95,8 +96,10 @@ pub const Program = program.Program;
 pub const ProgFile = program.ProgFile;
 pub const TypeRefMiss = program.TypeRefMiss;
 pub const typeRefMiss = program.typeRefMiss;
+pub const typeRefSelf = program.typeRefSelf;
 pub const FileLinks = program.FileLinks;
 pub const Target = program.Target;
+const TypeOnly = program.TypeOnly;
 pub const DualTarget = program.DualTarget;
 pub const LinkDiag = program.LinkDiag;
 pub const SpecMap = program.SpecMap;
@@ -224,8 +227,12 @@ pub fn buildProgram(
         // program — not import bindings, just program inputs.
         var type_ref_misses: std.ArrayList(TypeRefMiss) = .empty;
         for (try resolve.scanReferences(scratch, bytes)) |ref| {
-            const rfid = try disco.discoverReference(path, ref);
-            if (rfid == no_file) try type_ref_misses.append(arena, typeRefMiss(ref));
+            const rt = try disco.discoverReference(path, ref);
+            if (rt.file == no_file) {
+                try type_ref_misses.append(arena, typeRefMiss(ref));
+            } else if (rt.self) {
+                try type_ref_misses.append(arena, typeRefSelf(ref));
+            }
         }
 
         // Resolve this file's specifiers; discover new files.
@@ -1986,7 +1993,7 @@ fn exportEqualsMemberTarget(
                 const t = links[exeq.file].importTarget(local) orelse return null;
                 return t;
             }
-            return .{ .kind = .binding, .file = exeq.file, .payload = local, .type_only = exeq.type_only };
+            return .{ .kind = .binding, .file = exeq.file, .payload = local, .type_only = exeq.type_only, .type_only_from_export = exeq.type_only_from_export };
         },
         .namespace => return links[exeq.file].exportTarget(name),
         else => return null,
@@ -2222,6 +2229,12 @@ const Linker = struct {
     /// `declare module "spec" { … }` blocks; imports of `"spec"` resolve
     /// against it (after the on-disk module, so it augments a real module).
     ambient: std.AutoArrayHashMapUnmanaged(Atom, std.AutoArrayHashMapUnmanaged(Atom, Target)) = .empty,
+    /// The subset of `ambient`'s keys that a SCRIPT declared — the blocks that
+    /// bring a module into existence, as opposed to the ones in a module file,
+    /// which tsc reads as AUGMENTATIONS of a module that has to exist already
+    /// (`isExternalModuleAugmentation`). Only these satisfy an augmentation's
+    /// own name lookup; see `reportAugmentationName`.
+    script_ambient: std.AutoHashMapUnmanaged(Atom, void) = .empty,
     /// Augmentation index, grouped by the file being augmented: the blocks
     /// `declare module "spec" { … }` whose `spec` resolves to that file, as
     /// (augmenting file, `bind.ambient_modules` index) pairs in FileId order.
@@ -2481,7 +2494,7 @@ const Linker = struct {
                 .named => {
                     if (rec.sym != binder.no_symbol) {
                         try l.reportGlobalExportSpecifier(file, rec, f.bind.symbol_scopes[rec.sym] == binder.file_scope and !f.bind.is_module);
-                        const tgt = try l.finalizeLocal(file, rec.sym, rec.local, rec.type_only, 0);
+                        const tgt = try l.finalizeLocal(file, rec.sym, rec.local, .exported(rec.type_only), 0);
                         try l.put(t, rec.exported, tgt);
                     } else if (rec.local != 0) {
                         // A module may re-export a GLOBAL: `declare var x` in
@@ -2502,7 +2515,7 @@ const Linker = struct {
                         // Through `finalizeLocal` so `import X from "m"; export
                         // default X;` follows the chain to m's export rather
                         // than stopping at the local import binding.
-                        try l.put(t, rec.exported, try l.finalizeLocal(file, rec.sym, rec.local, rec.type_only, 0));
+                        try l.put(t, rec.exported, try l.finalizeLocal(file, rec.sym, rec.local, .exported(rec.type_only), 0));
                     } else {
                         try l.put(t, rec.exported, .{ .kind = .default_expr, .file = file, .payload = rec.node });
                     }
@@ -2531,7 +2544,7 @@ const Linker = struct {
                     }
                     if (found) |tgt| {
                         var final = tgt;
-                        final.type_only = final.type_only or rec.type_only;
+                        final.markTypeOnly(.exported(rec.type_only));
                         try l.put(t, rec.exported, final);
                     } else {
                         // Not "missing" yet — only missing FROM A TABLE THAT CAN
@@ -2558,7 +2571,7 @@ const Linker = struct {
                 },
                 .reexport_ns => {
                     if (f.specs.get(rec.module)) |mfile| {
-                        try l.put(t, rec.exported, .{ .kind = .namespace, .file = mfile, .type_only = rec.type_only });
+                        try l.put(t, rec.exported, .{ .kind = .namespace, .file = mfile, .type_only = rec.type_only, .type_only_from_export = true });
                     } else {
                         try l.put(t, rec.exported, .{ .kind = .any });
                     }
@@ -2574,7 +2587,7 @@ const Linker = struct {
                     var tgt: Target = .{ .kind = .any };
                     if (rec.local != 0) {
                         if (f.bind.lookupInScope(binder.file_scope, rec.local)) |ls| {
-                            tgt = try l.finalizeLocal(file, ls, rec.local, false, 0);
+                            tgt = try l.finalizeLocal(file, ls, rec.local, .none, 0);
                         }
                     }
                     try l.put(t, l.atom_export_equals, tgt);
@@ -2617,7 +2630,7 @@ const Linker = struct {
                 }
                 if (t.contains(name)) continue;
                 var final = tgt;
-                final.type_only = final.type_only or rec.type_only;
+                final.markTypeOnly(.exported(rec.type_only));
                 try t.put(l.scratch, name, final);
             }
         }
@@ -2653,7 +2666,7 @@ const Linker = struct {
                     const name = ab.member_atoms[i];
                     if (t.contains(name)) continue;
                     if (try l.exportEqualsHasMember(t, name)) continue;
-                    try l.put(t, name, try l.finalizeLocal(afile, local, name, false, 0));
+                    try l.put(t, name, try l.finalizeLocal(afile, local, name, .none, 0));
                 }
             }
         }
@@ -2751,8 +2764,8 @@ const Linker = struct {
                 const ns_scope = b.namespaceScopeOf(exeq.payload) orelse return null;
                 // A member DECLARED in the namespace body, under its own name.
                 if (b.lookupInScope(ns_scope, name)) |member_local| {
-                    var t = try l.finalizeLocal(exeq.file, member_local, name, exeq.type_only, 0);
-                    t.type_only = t.type_only or exeq.type_only;
+                    var t = try l.finalizeLocal(exeq.file, member_local, name, exeq.typeOnly(), 0);
+                    t.markTypeOnly(exeq.typeOnly());
                     return t;
                 }
                 // …or a member the body RE-EXPORTS under a different local name:
@@ -2776,8 +2789,8 @@ const Linker = struct {
                         rec.sym
                     else
                         b.lookupInScope(ns_scope, rec.local) orelse continue;
-                    var t = try l.finalizeLocal(exeq.file, ls, rec.local, rec.type_only or exeq.type_only, 0);
-                    t.type_only = t.type_only or exeq.type_only;
+                    var t = try l.finalizeLocal(exeq.file, ls, rec.local, TypeOnly.exported(rec.type_only).under(exeq.typeOnly()), 0);
+                    t.markTypeOnly(exeq.typeOnly());
                     return t;
                 }
                 return null;
@@ -2785,7 +2798,7 @@ const Linker = struct {
             .namespace => {
                 if (try l.lookupExport(exeq.file, name, 0)) |t| {
                     var final = t;
-                    final.type_only = final.type_only or exeq.type_only;
+                    final.markTypeOnly(exeq.typeOnly());
                     return final;
                 }
                 return null;
@@ -2841,6 +2854,7 @@ const Linker = struct {
             .payload = @intCast(l.duals.items.len - 1),
             .name = name,
             .type_only = m.type_only,
+            .type_only_from_export = m.type_only_from_export,
         };
     }
 
@@ -2898,6 +2912,7 @@ const Linker = struct {
             // dual, whose value half is a property probe), so the entry is
             // type-only only when neither meaning survives a value use.
             .type_only = val.type_only and typ.type_only,
+            .type_only_from_export = val.type_only_from_export,
         };
     }
 
@@ -2935,12 +2950,17 @@ const Linker = struct {
         return false;
     }
 
-    fn finalizeLocal(l: *Linker, file: FileId, local_sym: u32, local_atom: Atom, type_only: bool, depth: u32) Error!Target {
+    /// `type_only` is the mark the DECLARATION THAT NAMED THIS LOCAL carries —
+    /// the export specifier a caller is resolving, or the `export =` target it
+    /// came through. That declaration sits between the use site and the import
+    /// binding this walk is about to follow, so it is the NEARER hop and its
+    /// mark layers over everything found below (`TypeOnly.under`).
+    fn finalizeLocal(l: *Linker, file: FileId, local_sym: u32, local_atom: Atom, type_only: TypeOnly, depth: u32) Error!Target {
         if (depth > visit_limit) return .{ .kind = .any };
         const f = &l.files[file];
         const flags = f.bind.symbol_flags[local_sym];
         if (!flags.import_binding) {
-            return .{ .kind = .binding, .file = file, .payload = local_sym, .type_only = type_only };
+            return .{ .kind = .binding, .file = file, .payload = local_sym, .type_only = type_only.on, .type_only_from_export = type_only.from_export };
         }
         // An alias MERGED with a value declaration of the same name is not a
         // re-export of its target: tsc's export specifier names the local
@@ -2961,7 +2981,7 @@ const Linker = struct {
         if (bind_result.effectiveBits(flags) & bind_result.mask_value &
             ~bind_result.fbits(.{ .import_binding = true }) != 0)
         {
-            return .{ .kind = .binding, .file = file, .payload = local_sym, .type_only = type_only };
+            return .{ .kind = .binding, .file = file, .payload = local_sym, .type_only = type_only.on, .type_only_from_export = type_only.from_export };
         }
         // An ENTITY-NAME `import X = A.B` is an import binding with no import
         // record — it names something already in the program, so there is no
@@ -2971,7 +2991,7 @@ const Linker = struct {
         // scope-sensitive name resolution lives. preact's jsx-runtime exports
         // its whole `JSX` namespace as `export import JSX = JSXInternal`.
         if (isEntityImportEquals(f, local_sym)) {
-            return .{ .kind = .binding, .file = file, .payload = local_sym, .type_only = type_only };
+            return .{ .kind = .binding, .file = file, .payload = local_sym, .type_only = type_only.on, .type_only_from_export = type_only.from_export };
         }
         // Find the import record that created this binding. Matched on scope
         // as well as name: a `declare module` block's imports are records too,
@@ -2979,7 +2999,10 @@ const Linker = struct {
         for (f.bind.imports) |rec| {
             if (rec.local != local_atom) continue;
             if (rec.scope != f.bind.symbol_scopes[local_sym]) continue;
-            const t_only = type_only or rec.type_only;
+            // The import record is one hop FARTHER from the use site than
+            // whatever named this local, so its `import type` mark only lands
+            // when the nearer declaration carried none.
+            const t_only = TypeOnly.imported(rec.type_only).under(type_only);
             // `import x = require("m"); export = x;` — and its ES twin
             // `import * as x from "m"; export { x };` — where "m" is an
             // AMBIENT module (no file behind it). The first is how every
@@ -2997,20 +3020,20 @@ const Linker = struct {
             // same ordering caveat the `equals` form has always had.
             if ((rec.kind == .equals or rec.kind == .namespace) and f.specs.get(rec.module) == null) {
                 const key = l.ambientKey(rec.module) orelse return .{ .kind = .any };
-                var tgt: Target = .{ .kind = .ambient_ns, .payload = @intCast(l.ambient.getIndex(key).?), .type_only = t_only };
+                var tgt: Target = .{ .kind = .ambient_ns, .payload = @intCast(l.ambient.getIndex(key).?) };
                 if (l.ambient.getPtr(key).?.get(l.atom_export_equals)) |exeq| {
                     if (exeq.kind != .any) tgt = exeq;
                 }
-                tgt.type_only = tgt.type_only or t_only;
+                tgt.markTypeOnly(t_only);
                 return tgt;
             }
             const mfile = f.specs.get(rec.module) orelse return .{ .kind = .any };
             switch (rec.kind) {
-                .namespace => return .{ .kind = .namespace, .file = mfile, .type_only = t_only },
+                .namespace => return .{ .kind = .namespace, .file = mfile, .type_only = t_only.on, .type_only_from_export = t_only.from_export },
                 .named, .default => {
                     if (try l.lookupExport(mfile, rec.imported, depth + 1)) |tgt| {
                         var final = tgt;
-                        final.type_only = final.type_only or t_only;
+                        final.markTypeOnly(t_only);
                         return final;
                     }
                     // The same `export = <entity>` fallbacks `linkImports` uses
@@ -3021,7 +3044,7 @@ const Linker = struct {
                     if (try l.lookupExport(mfile, l.atom_export_equals, depth + 1)) |exeq| {
                         if (try l.exportEqualsMeanings(exeq, rec.imported)) |m| {
                             var final = m;
-                            final.type_only = final.type_only or t_only;
+                            final.markTypeOnly(t_only);
                             return final;
                         }
                     }
@@ -3032,10 +3055,10 @@ const Linker = struct {
                     // m's `export =` entity (else the module namespace object).
                     if (try l.lookupExport(mfile, l.atom_export_equals, depth + 1)) |tgt| {
                         var final = tgt;
-                        final.type_only = final.type_only or t_only;
+                        final.markTypeOnly(t_only);
                         return final;
                     }
-                    return .{ .kind = .namespace, .file = mfile, .type_only = t_only };
+                    return .{ .kind = .namespace, .file = mfile, .type_only = t_only.on, .type_only_from_export = t_only.from_export };
                 },
                 .side_effect => break,
             }
@@ -3068,6 +3091,7 @@ const Linker = struct {
                 if (f.bind.scope_parents[am.scope] != binder.file_scope) continue;
                 const gop = try l.ambient.getOrPut(l.scratch, am.spec);
                 if (!gop.found_existing) gop.value_ptr.* = .empty;
+                if (!f.bind.is_module) try l.script_ambient.put(l.scratch, am.spec, {});
             }
         }
         for (l.files, 0..) |*f, fi| {
@@ -3105,7 +3129,7 @@ const Linker = struct {
                     if (has_explicit and !fl.exported) continue;
                     const name = b.member_atoms[i];
                     if (tbl.contains(name)) continue;
-                    try tbl.put(l.scratch, name, try l.finalizeLocal(fid, local, name, false, 0));
+                    try tbl.put(l.scratch, name, try l.finalizeLocal(fid, local, name, .none, 0));
                 }
 
                 // `export default …` / `export { a, b }` forms (which carry no
@@ -3116,10 +3140,10 @@ const Linker = struct {
                             if (tbl.contains(l.atom_default)) continue;
                             var tgt: Target = .{ .kind = .default_expr, .file = fid, .payload = rec.node };
                             if (rec.sym != binder.no_symbol) {
-                                tgt = try l.finalizeLocal(fid, rec.sym, rec.local, rec.type_only, 0);
+                                tgt = try l.finalizeLocal(fid, rec.sym, rec.local, .exported(rec.type_only), 0);
                             } else if (rec.local != 0) {
                                 if (b.lookupInScope(am.scope, rec.local)) |ls| {
-                                    tgt = try l.finalizeLocal(fid, ls, rec.local, rec.type_only, 0);
+                                    tgt = try l.finalizeLocal(fid, ls, rec.local, .exported(rec.type_only), 0);
                                 }
                             }
                             try tbl.put(l.scratch, l.atom_default, tgt);
@@ -3136,7 +3160,7 @@ const Linker = struct {
                                 rec.sym
                             else
                                 b.lookupInScope(am.scope, rec.local) orelse continue;
-                            try tbl.put(l.scratch, rec.exported, try l.finalizeLocal(fid, ls, rec.local, rec.type_only, 0));
+                            try tbl.put(l.scratch, rec.exported, try l.finalizeLocal(fid, ls, rec.local, .exported(rec.type_only), 0));
                         },
                         .equals => {
                             // `declare module "m" { export = X }`: store the
@@ -3165,7 +3189,7 @@ const Linker = struct {
                                 // (`Bind.umd_sym`).
                                 const found = b.lookupInScope(am.scope, rec.local) orelse
                                     b.lookupInScope(binder.file_scope, rec.local);
-                                if (found) |ls| tgt = try l.finalizeLocal(fid, ls, rec.local, false, 0);
+                                if (found) |ls| tgt = try l.finalizeLocal(fid, ls, rec.local, .none, 0);
                             }
                             try tbl.put(l.scratch, l.atom_export_equals, tgt);
                         },
@@ -3256,7 +3280,7 @@ const Linker = struct {
                                 if (l.ambient.values()[dst_idx].contains(rec.exported)) continue;
                                 if (try l.ambientReexportTarget(f, rec, dst_idx)) |tgt| {
                                     var final = tgt;
-                                    final.type_only = final.type_only or rec.type_only;
+                                    final.markTypeOnly(.exported(rec.type_only));
                                     try l.ambient.values()[dst_idx].put(l.scratch, rec.exported, final);
                                     changed = true;
                                 }
@@ -3309,13 +3333,14 @@ const Linker = struct {
     /// object of the module the specifier names, whichever half answers it.
     fn ambientNamespaceTarget(l: *Linker, f: *const ProgFile, rec: binder.ExportRec) Error!Target {
         if (try l.effectiveModuleFile(f, rec.module)) |mfile| {
-            return .{ .kind = .namespace, .file = mfile, .type_only = rec.type_only };
+            return .{ .kind = .namespace, .file = mfile, .type_only = rec.type_only, .type_only_from_export = true };
         }
         if (l.ambientKey(rec.module)) |key| {
             return .{
                 .kind = .ambient_ns,
                 .payload = @intCast(l.ambient.getIndex(key).?),
                 .type_only = rec.type_only,
+                .type_only_from_export = true,
             };
         }
         return .{ .kind = .any };
@@ -3429,7 +3454,7 @@ const Linker = struct {
                     if (cur.kind != .any) continue;
                 }
                 var final = tgt;
-                final.type_only = final.type_only or p.type_only;
+                final.markTypeOnly(.exported(p.type_only));
                 try l.put(t, p.exported, final);
             } else {
                 try l.diagNoExportedMember(p.file, p.mfile, p.module, p.local, l.nodeSpan(p.file, p.node));
@@ -3512,7 +3537,7 @@ const Linker = struct {
         if (name == l.atom_default or name == l.atom_export_equals) return false;
         if (dst.contains(name)) return false;
         var final = tgt;
-        final.type_only = final.type_only or type_only;
+        final.markTypeOnly(.exported(type_only));
         try dst.put(l.scratch, name, final);
         return true;
     }
@@ -3534,7 +3559,7 @@ const Linker = struct {
         const dst = &l.ambient.values()[dst_idx];
         if (dst.contains(name)) return false;
         var final = tgt;
-        final.type_only = final.type_only or type_only;
+        final.markTypeOnly(.exported(type_only));
         try dst.put(l.scratch, name, final);
         return true;
     }
@@ -3631,11 +3656,25 @@ const Linker = struct {
     /// forty overlapping patterns (`*?worker` / `*?worker&inline`, `*.css` /
     /// `*.module.css`), so the distinction is not hypothetical.
     fn ambientKey(l: *Linker, spec: Atom) ?Atom {
-        if (l.ambient.contains(spec)) return spec;
+        return l.ambientKeyIn(spec, null);
+    }
+
+    /// `ambientKey`, restricted to the registry keys in `only` (null = all).
+    /// The restriction is what an AUGMENTATION's own name lookup needs: it may
+    /// only find a module a SCRIPT brought into existence, never another
+    /// augmentation.
+    fn ambientKeyIn(l: *Linker, spec: Atom, only: ?*const std.AutoHashMapUnmanaged(Atom, void)) ?Atom {
+        const admits = struct {
+            fn f(set: ?*const std.AutoHashMapUnmanaged(Atom, void), a: Atom) bool {
+                return if (set) |s| s.contains(a) else true;
+            }
+        }.f;
+        if (l.ambient.contains(spec) and admits(only, spec)) return spec;
         const text = l.atomText(spec);
         var best: ?Atom = null;
         var best_prefix: usize = 0;
         for (l.ambient.keys()) |pat_atom| {
+            if (!admits(only, pat_atom)) continue;
             const pat = l.atomText(pat_atom);
             const star = std.mem.indexOfScalar(u8, pat, '*') orelse continue;
             const prefix = pat[0..star];
@@ -3666,7 +3705,36 @@ const Linker = struct {
     /// The same walk carries TS7016 for the module that resolved but has no
     /// declarations behind it — see `untypedJsModule`.
     fn reportUnresolvedModules(l: *Linker, file: FileId) Error!void {
-        try l.reportUnresolvedIn(file, l.files[file].tree.nodeRange(ast.root_node));
+        try l.reportUnresolvedIn(file, l.files[file].tree.nodeRange(ast.root_node), true);
+        try l.reportUnresolvedImportCalls(file);
+    }
+
+    /// The same report for a DYNAMIC `import("m")`, whose specifier is an
+    /// expression operand and so is nowhere in the statement walk above.
+    /// tsc's `checkImportCallExpression` resolves it through
+    /// `resolveExternalModuleName` exactly like a static import clause —
+    /// measured: `import("./script")` where the target is a script answers
+    /// TS2306, a missing one TS2307, and `import("fs")` without
+    /// `@types/node` answers TS2591 — so it routes into `reportSpecifier`
+    /// with `side_effect = false`, the named-import arm.
+    ///
+    /// No AST walk: the binder already registered every literal-specifier
+    /// `import()` as a module reference of the file (`bindDynamicImport`),
+    /// so the records are in hand and the specifier resolution has already
+    /// happened. A record is a dynamic import exactly when its node is the
+    /// CALL — `bindImportType`'s record carries the `.import_type` node
+    /// (the checker's `resolveImportTypeModule` reports that one, at the
+    /// use site, where tsc does), and every static form carries its
+    /// statement.
+    fn reportUnresolvedImportCalls(l: *Linker, file: FileId) Error!void {
+        const f = &l.files[file];
+        for (f.bind.imports) |rec| {
+            if (f.tree.nodeTag(rec.node) != .call_expr) continue;
+            const r = f.tree.extraData(ast.SubRange, f.tree.nodeData(rec.node).rhs);
+            const args = f.tree.extraRange(r.start, r.end);
+            if (args.len == 0) continue;
+            try l.reportSpecifier(file, f, f.tree.nodeMainToken(args[0]), false);
+        }
     }
 
     /// `reportUnresolvedModules` over one statement list, recursing into the
@@ -3686,7 +3754,11 @@ const Linker = struct {
     /// The test is on the DIRECT parent, tsc's `node.parent.kind ===
     /// ModuleBlock && isAmbientModule(node.parent.parent)`, so a plain
     /// namespace nested inside an ambient module ends the walk too.
-    fn reportUnresolvedIn(l: *Linker, file: FileId, stmts: []const ast.Node) Error!void {
+    ///
+    /// `top_level` distinguishes the file's own statement list from an ambient
+    /// module BODY, which is the one thing an `declare module "spec"` block
+    /// needs to know about itself before it can be judged an augmentation.
+    fn reportUnresolvedIn(l: *Linker, file: FileId, stmts: []const ast.Node, top_level: bool) Error!void {
         const f = &l.files[file];
         const tree = f.tree;
         for (stmts) |stmt0| {
@@ -3699,7 +3771,8 @@ const Linker = struct {
             if (tag == .namespace_decl) {
                 const e = tree.extraData(ast.NamespaceData, tree.nodeData(stmt).lhs);
                 if (e.flags & ast.Flags.ambient_module != 0) {
-                    try l.reportUnresolvedIn(file, tree.extraRange(e.body_start, e.body_end));
+                    if (top_level) try l.reportAugmentationName(file, f, e.name_token);
+                    try l.reportUnresolvedIn(file, tree.extraRange(e.body_start, e.body_end), false);
                 }
                 continue;
             }
@@ -3728,31 +3801,81 @@ const Linker = struct {
                 if (e.spec_start == e.spec_end) continue;
             }
             if (mod_tok == 0) continue;
-            const text = tree.tokenSlice(f.src, mod_tok);
-            const stripped = stripQuotes(text);
-            // `import * as A from ""` resolves to nothing and is TS2307 like
-            // any other miss; it just has no atom to look anything up by (the
-            // empty string is not a name the interner hands out).
-            if (stripped.len != 0) {
-                if (try l.reportResolvedModule(file, f, stripped, mod_tok, side_effect)) continue;
-            }
-            if (side_effect) {
-                if (!l.no_unchecked_side_effect_imports) continue;
-                try l.diag(file, 2882, l.tokSpan(file, mod_tok), "Cannot find module or type declarations for side-effect import of '{s}'.", .{stripped});
-            } else if (!paths.isNodeCoreModule(stripped)) {
-                try l.diag(file, 2307, l.tokSpan(file, mod_tok), "Cannot find module '{s}' or its corresponding type declarations.", .{stripped});
-            } else if (l.types_wildcard) {
-                try l.diag(file, 2580, l.tokSpan(file, mod_tok), "Cannot find name '{s}'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node`.", .{stripped});
-            } else {
-                // A Node core module that resolved to nothing is a missing
-                // `@types/node`, and tsc says so — with the *name* wording, at
-                // the specifier. Only for the exact core-module list
-                // (`paths.isNodeCoreModule`); `bun:sqlite` and `node:nosuch`
-                // stay TS2307. A side-effect import keeps TS2882: tsgo passes
-                // its own message down and never consults the node list.
-                try l.diag(file, 2591, l.tokSpan(file, mod_tok), "Cannot find name '{s}'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node` and then add 'node' to the types field in your tsconfig.", .{stripped});
-            }
+            try l.reportSpecifier(file, f, mod_tok, side_effect);
         }
+    }
+
+    /// One module specifier token, resolved and diagnosed. Shared by every
+    /// syntactic form that names a module — the import/export STATEMENTS
+    /// `reportUnresolvedIn` walks and the `import()` CALLS
+    /// `reportUnresolvedImportCalls` walks — because tsc reaches all of them
+    /// through the same `resolveExternalModuleName`, and so answers the same
+    /// four codes at the same anchor.
+    ///
+    /// `side_effect` is the `import "m"` form, whose miss is TS2882 (see
+    /// `reportUnresolvedIn`); everything else falls through the TS2307 /
+    /// TS2591 / TS2580 arms below.
+    fn reportSpecifier(
+        l: *Linker,
+        file: FileId,
+        f: *const ProgFile,
+        mod_tok: ast.TokenIndex,
+        side_effect: bool,
+    ) Error!void {
+        const text = f.tree.tokenSlice(f.src, mod_tok);
+        const stripped = literals.stripQuotes(text);
+        // `import * as A from ""` resolves to nothing and is TS2307 like
+        // any other miss; it just has no atom to look anything up by (the
+        // empty string is not a name the interner hands out).
+        if (stripped.len != 0) {
+            if (try l.reportResolvedModule(file, f, stripped, mod_tok, side_effect)) return;
+        }
+        if (side_effect) {
+            if (!l.no_unchecked_side_effect_imports) return;
+            try l.diag(file, 2882, l.tokSpan(file, mod_tok), "Cannot find module or type declarations for side-effect import of '{s}'.", .{stripped});
+        } else if (!paths.isNodeCoreModule(stripped)) {
+            try l.diag(file, 2307, l.tokSpan(file, mod_tok), "Cannot find module '{s}' or its corresponding type declarations.", .{stripped});
+        } else if (l.types_wildcard) {
+            try l.diag(file, 2580, l.tokSpan(file, mod_tok), "Cannot find name '{s}'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node`.", .{stripped});
+        } else {
+            // A Node core module that resolved to nothing is a missing
+            // `@types/node`, and tsc says so — with the *name* wording, at
+            // the specifier. Only for the exact core-module list
+            // (`paths.isNodeCoreModule`); `bun:sqlite` and `node:nosuch`
+            // stay TS2307. A side-effect import keeps TS2882: tsgo passes
+            // its own message down and never consults the node list.
+            try l.diag(file, 2591, l.tokSpan(file, mod_tok), "Cannot find name '{s}'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node` and then add 'node' to the types field in your tsconfig.", .{stripped});
+        }
+    }
+
+    /// TS2664 for a module AUGMENTATION whose target does not exist —
+    /// tsc's `mergeModuleAugmentation`, whose `resolveExternalModuleNameWorker`
+    /// is handed `Invalid_module_name_in_augmentation_module_0_cannot_be_found`
+    /// as its not-found message.
+    ///
+    /// A top-level `declare module "spec" { … }` is an augmentation exactly
+    /// when its file is a MODULE (tsc's `isExternalModuleAugmentation`); in a
+    /// SCRIPT the same block DECLARES the module and there is nothing to
+    /// resolve — `@types/node`'s `declare module "fs"` is that, and it is the
+    /// reason the name lookup here may only find a script-declared key
+    /// (`script_ambient`) and never another augmentation.
+    ///
+    /// Skipped in a DECLARATION file: tsc's gate is `!(moduleName.parent.parent
+    /// .flags & NodeFlags.Ambient)`, and every node of a `.d.ts` carries
+    /// `Ambient`, so the same block there is silent — measured, with
+    /// `skipLibCheck` off, on a `.d.ts` that augments a module that does not
+    /// exist. Nested blocks are skipped for the same reason (their container IS
+    /// ambient), which is what `top_level` carries.
+    fn reportAugmentationName(l: *Linker, file: FileId, f: *const ProgFile, name_tok: ast.TokenIndex) Error!void {
+        if (!f.bind.is_module or name_tok == 0) return;
+        if (paths.isDeclarationPath(f.path)) return;
+        const text = f.tree.tokenSlice(f.src, name_tok);
+        const stripped = literals.stripQuotes(text);
+        if (stripped.len == 0) return;
+        const atom = l.interner.intern(l.io, l.gpa, stripped) catch return Error.OutOfMemory;
+        if ((try l.effectiveModuleFile(f, atom)) != null) return;
+        if (l.ambientKeyIn(atom, &l.script_ambient) != null) return;
+        try l.diag(file, 2664, l.tokSpan(file, name_tok), "Invalid module name in augmentation, module '{s}' cannot be found.", .{stripped});
     }
 
     /// True when specifier `stripped` resolved (to a file or to a `declare
@@ -3817,6 +3940,13 @@ const Linker = struct {
     /// whole-file `.d.ts` suppression already delivers.
     fn reportUnresolvedTypeRefs(l: *Linker, file: FileId) Error!void {
         for (l.files[file].type_ref_misses) |miss| {
+            // A directive that named its own file resolved perfectly well; what
+            // is wrong with it is the circle, and tsc words that one way for
+            // both directive kinds.
+            if (miss.self_reference) {
+                try l.diag(file, 1006, miss.span, "A file cannot have a reference to itself.", .{});
+                continue;
+            }
             switch (miss.kind) {
                 .types => try l.diag(file, 2688, miss.span, "Cannot find type definition file for '{s}'.", .{miss.name}),
                 // TS6053 names the specifier as WRITTEN, not the path resolution
@@ -4014,12 +4144,12 @@ const Linker = struct {
                         // the module namespace object.
                         if (exeq) |ee| {
                             tgt = ee;
-                            tgt.type_only = tgt.type_only or rec.type_only;
+                            tgt.markTypeOnly(.imported(rec.type_only));
                         } else if (mfile_opt) |mfile| {
-                            tgt = .{ .kind = .namespace, .file = mfile, .type_only = rec.type_only };
+                            tgt = .{ .kind = .namespace, .file = mfile, .type_only = rec.type_only, .type_only_from_export = false };
                         } else if (!l.ambientOpaque(rec.module)) {
                             if (l.ambientKey(rec.module)) |key| {
-                                tgt = .{ .kind = .ambient_ns, .payload = @intCast(l.ambient.getIndex(key).?), .type_only = rec.type_only };
+                                tgt = .{ .kind = .ambient_ns, .payload = @intCast(l.ambient.getIndex(key).?), .type_only = rec.type_only, .type_only_from_export = false };
                             }
                         }
                     },
@@ -4030,15 +4160,15 @@ const Linker = struct {
                         // under-report of TS2349 on `ns()`).
                         if (exeq) |ee| {
                             tgt = ee;
-                            tgt.type_only = tgt.type_only or rec.type_only;
+                            tgt.markTypeOnly(.imported(rec.type_only));
                         } else if (mfile_opt) |mfile| {
-                            tgt = .{ .kind = .namespace, .file = mfile, .type_only = rec.type_only };
+                            tgt = .{ .kind = .namespace, .file = mfile, .type_only = rec.type_only, .type_only_from_export = false };
                         } else if (l.ambientOpaque(rec.module)) {
                             // Opaque ambient module: `import * as p` is `any`,
                             // so member access doesn't spuriously TS2339.
                             tgt = .{ .kind = .any };
                         } else if (l.ambientKey(rec.module)) |key| {
-                            tgt = .{ .kind = .ambient_ns, .payload = @intCast(l.ambient.getIndex(key).?), .type_only = rec.type_only };
+                            tgt = .{ .kind = .ambient_ns, .payload = @intCast(l.ambient.getIndex(key).?), .type_only = rec.type_only, .type_only_from_export = false };
                         }
                     },
                     .named => {
@@ -4057,7 +4187,7 @@ const Linker = struct {
                         }
                         if (found) |ff| {
                             tgt = ff;
-                            tgt.type_only = tgt.type_only or rec.type_only;
+                            tgt.markTypeOnly(.imported(rec.type_only));
                         } else if (exeq != null or (mfile_opt == null and l.ambientOpaque(rec.module))) {
                             // A named import of an `export =` (or out-of-subset
                             // auto-export) module degrades to `any`, no spurious
@@ -4077,7 +4207,7 @@ const Linker = struct {
                         if (found == null) found = exeq;
                         if (found) |ff| {
                             tgt = ff;
-                            tgt.type_only = tgt.type_only or rec.type_only;
+                            tgt.markTypeOnly(.imported(rec.type_only));
                         } else if (l.allow_synthetic_default and mfile_opt != null and
                             paths.isDeclarationPath(l.files[mfile_opt.?].path))
                         {
@@ -4097,7 +4227,7 @@ const Linker = struct {
                             // syntax is known not to have one, and tsc reports
                             // TS1192/TS2613 there whatever the flag says
                             // (conformance modules/11, modules/25).
-                            tgt = .{ .kind = .namespace, .file = mfile_opt.?, .type_only = rec.type_only };
+                            tgt = .{ .kind = .namespace, .file = mfile_opt.?, .type_only = rec.type_only, .type_only_from_export = false };
                         } else if (mfile_opt == null and l.ambientOpaque(rec.module)) {
                             // `export =`-shaped ambient module: the CommonJS
                             // export-assignment *is* the default under interop.
@@ -4121,6 +4251,7 @@ const Linker = struct {
                                 .kind = .ambient_ns,
                                 .payload = @intCast(l.ambient.getIndex(key).?),
                                 .type_only = rec.type_only,
+                                .type_only_from_export = false,
                             };
                         } else if ((mfile_opt != null and (try l.lookupExport(mfile_opt.?, rec.local, 0)) != null) or
                             l.lookupAmbient(rec.module, rec.local) != null)
@@ -4160,14 +4291,6 @@ const Linker = struct {
 /// of the same walk via `blockedSubpathReport`.
 fn untypedJsModule(path: []const u8) bool {
     return paths.isJsModulePath(path) and paths.isInNodeModules(path);
-}
-
-fn stripQuotes(text: []const u8) []const u8 {
-    if (text.len >= 2 and (text[0] == '"' or text[0] == '\'')) {
-        if (text[text.len - 1] == text[0]) return text[1 .. text.len - 1];
-        return text[1..];
-    }
-    return text;
 }
 
 /// Sort parallel (key, value) arrays by key ascending. Export/import tables
@@ -4436,15 +4559,27 @@ pub const Discovery = struct {
     /// `resolveSpec` it records no import-specifier binding, and resolution
     /// goes through `ResolveCache.resolveRef`, so the target is keyed by its
     /// canonical path — the same identity an `import` of that file would get.
-    /// `no_file` when the directive resolves to nothing (a `types=` miss is
-    /// the linker's TS2688; the caller decides).
-    pub fn discoverReference(d: *const Discovery, importer: []const u8, ref: resolve.RefDirective) !FileId {
-        if (try d.rcache.resolveRef(d.io, d.scratch, d.dir, importer, ref)) |resolved| {
-            return try d.fileFor(resolved);
-        }
-        return no_file;
+    /// `file` is `no_file` when the directive resolves to nothing (a `types=`
+    /// miss is the linker's TS2688; the caller decides), and `self` is set when
+    /// it resolves to the very file it is written in — tsc's TS1006, which the
+    /// caller records the same way it records a miss. Both are answers about
+    /// ONE resolution, which is why they come back together.
+    pub fn discoverReference(d: *const Discovery, importer: []const u8, ref: resolve.RefDirective) !ReferenceTarget {
+        const resolved = try d.rcache.resolveRef(d.io, d.scratch, d.dir, importer, ref) orelse
+            return .{ .file = no_file, .self = false };
+        const fid = try d.fileFor(resolved);
+        // Identity is the file id, not the spelling: `resolveRef` canonicalizes,
+        // and `path_ids` is keyed by that same canonical path, so a directive
+        // that names its own file through `./x`, `../dir/x` or the bare name all
+        // land on the id the importer already has. A plain `get` (never
+        // `fileFor`) so a lookup can only ever answer about a file the program
+        // already holds.
+        return .{ .file = fid, .self = (d.path_ids.get(importer) orelse no_file) == fid };
     }
 };
+
+/// What one `/// <reference … />` resolved to. See `discoverReference`.
+pub const ReferenceTarget = struct { file: FileId, self: bool };
 
 /// Sort a file's spec map by atom, keeping the (atom, file) pairs together.
 /// Insertion sort: a file's specifiers arrive nearly sorted (atoms are handed
