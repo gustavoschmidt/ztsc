@@ -4265,10 +4265,67 @@ pub fn indexAccessTargetConstraint(c: *Checker, t: TypeId) Error!?TypeId {
     // look resolvable — silently accepting anything as `T[K]`.
     const idx_bc = try c.baseConstraintOf(c.ts.indexAccessIndex(t));
     if (try c.isGenericObjectForIndex(obj_bc) or try c.containsFreeTypeParam(idx_bc, &.{})) return null;
-    const bc = try c.reduceIndexedAccess(obj_bc, idx_bc);
+    const bc = try writingIndexedAccess(c, obj_bc, idx_bc) orelse return null;
     if (bc == t) return null;
-    if (c.ts.kind(bc) == .unknown and !try c.indexKeyDeclared(obj_bc, idx_bc)) return null;
     return bc;
+}
+
+/// `getIndexedAccessTypeOrUndefined(obj, idx, AccessFlags.Writing)` — the
+/// indexed access as a WRITE target, which is the flag tsc's
+/// `structuredTypeRelatedTo` passes when it reduces an IndexedAccess TARGET.
+///
+/// The difference from the read-side `reduceIndexedAccess` is the union key:
+///
+///     accessFlags & AccessFlags.Writing ? getIntersectionType(propTypes)
+///                                       : getUnionType(propTypes)
+///
+/// A value written through `Obj[K]` where `K` could be any of several keys has
+/// to satisfy EVERY one of those keys, not just one of them — so the constraint
+/// is the intersection. Unioning instead let a value that only fits one key
+/// through: `JSX.IntrinsicElements[T1]` (the union over `T1`'s constraint) was
+/// accepted as `JSX.IntrinsicElements[T2]`, because every constituent of the
+/// source union is also a constituent of the target union
+/// (`errorInfoForRelatedIndexTypesNoConstraintElaboration`). Intersected, only a
+/// value good for all of them — `{}`, since every intrinsic element's props are
+/// optional — gets through, which is exactly the pair tsc accepts.
+///
+/// Null is "no constraint, the rule does not apply", tsc's `undefined` return:
+/// either a reduction that lands on an `unknown` standing for a property the
+/// constraint does not have (`indexedAccessType`'s absent-property answer,
+/// `wasMissingProp` upstream — and upstream one missing key voids the WHOLE
+/// union, so the screen runs per constituent), or, for the caller, a reduction
+/// back onto the same deferred access. A key the constraint DOES declare as
+/// `unknown` is a real reduction and does apply — drizzle's `Column` writes
+/// `(value: unknown) => unknown` through `DriverValueMapper<T["data"],
+/// T["driverParam"]>` where the constraint's `data`/`driverParam` are declared
+/// `unknown`.
+fn writingIndexedAccess(c: *Checker, obj: TypeId, idx: TypeId) Error!?TypeId {
+    // A union key only distributes once the access is actually resolvable;
+    // while either side still carries a mapped-key parameter or an unbound
+    // `infer` binder, `reduceIndexedAccess` defers the whole access and there
+    // are no per-key types to intersect. (`boolean` needs no special case:
+    // ztsc gives it its own kind rather than tsc's `true | false` union, so
+    // upstream's `!(indexType.flags & TypeFlags.Boolean)` guard is implicit.)
+    const distributes = c.ts.kind(idx) == .union_type and
+        !try c.containsMappedParam(idx) and
+        !try c.containsMappedParam(obj) and
+        !try c.containsInfer(idx);
+    if (!distributes) return keyedIndexedAccess(c, obj, idx);
+    var parts: std.ArrayList(TypeId) = .empty;
+    defer parts.deinit(c.scratch());
+    for (try c.memberList(idx)) |m| {
+        const p = try keyedIndexedAccess(c, obj, m) orelse return null;
+        try parts.append(c.scratch(), p);
+    }
+    return try c.ts.makeIntersection(c.scratch(), parts.items);
+}
+
+/// One key's write type, or null when the key is absent from `obj` (see
+/// `writingIndexedAccess`).
+fn keyedIndexedAccess(c: *Checker, obj: TypeId, key: TypeId) Error!?TypeId {
+    const p = try c.reduceIndexedAccess(obj, key);
+    if (c.ts.kind(p) == .unknown and !try c.indexKeyDeclared(obj, key)) return null;
+    return p;
 }
 
 /// Does `obj` actually declare the single literal key `idx`? Used to tell
