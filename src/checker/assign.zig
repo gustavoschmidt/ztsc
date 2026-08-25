@@ -609,6 +609,20 @@ pub fn lenientOverlap(c: *Checker, s0: TypeId, t0: TypeId, depth: u32) Error!boo
     // is every react-navigation navigator's prop type — and answering "no
     // overlap" there is the false rejection the concession exists to avoid.
     if ((tk == .mapped and mappedCastPeer(sk)) or (sk == .mapped and mappedCastPeer(tk))) return true;
+    // `null` and `undefined` have no members, no signatures and no index of any
+    // kind, so they overlap NOTHING object-shaped. tsc never gets as far as
+    // asking: its relation settles the pair in `isSimpleTypeRelatedTo`, which
+    // relates `null`/`undefined` only to themselves and to `any`/`unknown`
+    // under `strictNullChecks`. A NULLABLE target is a union, and
+    // `castComparableRec` peeled it before this walk saw it.
+    //
+    // Without this the walk reached the object arm and conceded twice over: an
+    // EMPTY target (`interface I {}`, `{}`, `{ [x: number]: number }`) has no
+    // member to fail on, and `Record<string, any>` is waved through by
+    // `indexInfoOverlap`'s `any` exemption. All three are TS2352 in tsc —
+    // `null as I` is `declarationEmitExpandoPropertyPrivateName`, and
+    // `<{[x:number]: number}>null` is the last missing key of `parseTypes`.
+    if ((sk == .null or sk == .undefined) and isNonPrimitiveKind(tk)) return false;
     // Comparability distributes over a target intersection: the source must
     // overlap EACH constituent (tsc `typeRelatedToEachType`). The dogfood
     // cast `{…} as (A & { id: string })` overlaps in the `comparable(target,
