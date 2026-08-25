@@ -361,6 +361,154 @@ pub fn primitiveTypeNameUsedAsValue(text: []const u8) bool {
     return false;
 }
 
+/// tsc's `checkAndReportErrorForMissingPrefix`: an unqualified name that no
+/// scope declares, but which an enclosing CLASS declares as a member, gets the
+/// message naming the prefix it is missing instead of the bare "Cannot find
+/// name":
+///
+///     class C { static foo: string; bar() { let k = foo; } }
+///         → TS2662 "… Did you mean the static member 'C.foo'?"
+///     class T { constructor(private f: string) {}
+///               h = () => { console.log(f); } }
+///         → TS2663 "… Did you mean the instance member 'this.f'?"
+///
+/// Reported ahead of the spelling suggestion and of TS2693, which is where tsc
+/// puts it in `resolveNameHelper`'s `&&` chain.
+///
+/// The two arms have different reaches, and the difference is tsc's
+/// `location === container` test:
+///
+///   * the STATIC arm runs at every enclosing class on the way out, whatever
+///     the reference sits inside — a nested function, an object literal
+///     method, another class's method;
+///   * the INSTANCE arm runs only when the reference's own `this` CONTAINER is
+///     a non-static member of the innermost enclosing class. An arrow is not a
+///     container (tsc passes `includeArrowFunctions: false`), which is exactly
+///     what makes the field-initializer arrow above report; a `function` or an
+///     object-literal method in between is one, and silences it.
+///
+/// Membership is read off the binder's per-class member/static scopes rather
+/// than off the class TYPE, so it sees only members the class declares itself.
+/// A member reached through a base class under-reports, which is the safe
+/// direction for a suggestion.
+///
+/// Returns whether it reported. Runs on the not-found path only, so the scope
+/// scan it needs to find a class's member tables (they hang off the class NODE,
+/// not the lexical chain — see `resolvePrivateName`) costs nothing otherwise.
+pub fn reportMissingPrefix(c: *Checker, a: Atom, tok: ast.TokenIndex) Error!bool {
+    var s = c.cur_scope;
+    var container: Container = .unknown;
+    var innermost = true;
+    while (true) {
+        const owner = c.bind.scope_owners[s];
+        switch (c.bind.scope_kinds[s]) {
+            .function => if (container == .unknown) {
+                container = switch (c.nodeTag(owner)) {
+                    // No `this` of its own: tsc walks straight through.
+                    .arrow_fn => .unknown,
+                    .class_method => memberContainer(c, owner),
+                    // A class's `static { … }` block — a container, and one
+                    // tsc's `isStatic` answers true for.
+                    .block => .static_member,
+                    else => .foreign,
+                };
+            },
+            .class => {
+                // Reaching the class body without crossing a container means
+                // the reference is in a member's NAME, a field initializer or a
+                // heritage clause; the first is the shape the instance arm
+                // covers, and `classBodyContainer` reads its `static`.
+                if (container == .unknown) container = classBodyContainer(c, owner, tok);
+                if (try reportPrefixForClass(c, owner, a, tok, innermost and container == .instance_member)) {
+                    return true;
+                }
+                innermost = false;
+                // An outer class is still walked, but the container it would
+                // have to equal is inside the inner one.
+                container = .foreign;
+            },
+            else => {},
+        }
+        if (s == binder.file_scope) return false;
+        s = c.bind.scope_parents[s];
+    }
+}
+
+/// What the reference's `this` container is, for the instance arm's test.
+const Container = enum {
+    /// Not decided yet — every scope so far was transparent to `this`.
+    unknown,
+    /// A non-static class member: the one shape the instance arm accepts.
+    instance_member,
+    static_member,
+    /// A container that is not a class member at all.
+    foreign,
+};
+
+fn memberContainer(c: *const Checker, member: ast.Node) Container {
+    const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(member).lhs);
+    return if (proto.flags & ast.Flags.static != 0) .static_member else .instance_member;
+}
+
+/// The class member whose text contains `tok`, for a reference written in a
+/// member's initializer or name rather than in a member's body.
+fn classBodyContainer(c: *const Checker, class_node: ast.Node, tok: ast.TokenIndex) Container {
+    const data = c.tree.extraData(ast.ClassData, c.tree.nodeData(class_node).lhs);
+    const pos = c.tree.tokens.start(tok);
+    for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
+        if (m == ast.null_node) continue;
+        const sp = c.nodeSpan(m);
+        if (pos < sp.start or pos >= sp.end) continue;
+        const flags: u32 = switch (c.nodeTag(m)) {
+            .class_field => c.tree.extraData(ast.Field, c.tree.nodeData(m).lhs).flags,
+            .class_method => c.tree.extraData(ast.FnProto, c.tree.nodeData(m).lhs).flags,
+            else => return .foreign,
+        };
+        return if (flags & ast.Flags.static != 0) .static_member else .instance_member;
+    }
+    return .foreign;
+}
+
+/// The two arms for ONE enclosing class. `allow_instance` is tsc's
+/// `location === container && !isStatic(location)`.
+fn reportPrefixForClass(
+    c: *Checker,
+    class_node: ast.Node,
+    a: Atom,
+    tok: ast.TokenIndex,
+    allow_instance: bool,
+) Error!bool {
+    var statics: ?ScopeId = null;
+    var members: ?ScopeId = null;
+    for (c.bind.scope_kinds, 0..) |k, i| {
+        if (c.bind.scope_owners[i] != class_node) continue;
+        switch (k) {
+            .class_statics => statics = @intCast(i),
+            .class_members => members = @intCast(i),
+            else => {},
+        }
+    }
+    if (statics) |ss| {
+        if (c.bind.lookupInScope(ss, a) != null) {
+            // tsc names the class with `symbolToString`; an anonymous class
+            // expression has no name to print, so the generic message stands.
+            const data = c.tree.extraData(ast.ClassData, c.tree.nodeData(class_node).lhs);
+            if (data.name_token == 0) return false;
+            try c.diagFmt(2662, c.tokSpan(tok), "Cannot find name '{s}'. Did you mean the static member '{s}.{s}'?", .{
+                c.tokenText(tok), c.tokenText(data.name_token), c.tokenText(tok),
+            });
+            return true;
+        }
+    }
+    if (!allow_instance) return false;
+    const ms = members orelse return false;
+    if (c.bind.lookupInScope(ms, a) == null) return false;
+    try c.diagFmt(2663, c.tokSpan(tok), "Cannot find name '{s}'. Did you mean the instance member 'this.{s}'?", .{
+        c.tokenText(tok), c.tokenText(tok),
+    });
+    return true;
+}
+
 pub fn reportNameNotFound(c: *Checker, tok: ast.TokenIndex) Error!void {
     const text = c.tokenText(tok);
     // `types_wildcard` is "the program named no explicit `types` list", which is

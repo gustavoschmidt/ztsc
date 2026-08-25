@@ -1214,6 +1214,11 @@ fn checkIdentifier(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
                 // diagnostic instead of a type (TS2815 in a class static block).
                 if (try c.implicitArgumentsType(c.nodeSpan(node))) |t| return t;
             }
+            // A name an enclosing CLASS declares as a member is the prefix
+            // suggestion (TS2662/TS2663), which tsc puts FIRST in
+            // `resolveNameHelper`'s chain — ahead of TS2693 and of the spelling
+            // suggestion below.
+            if (try names_zig.reportMissingPrefix(c, a, tok)) return types.error_type;
             // A primitive TYPE name in a value position is TS2693, ahead of
             // both the suggestion and the not-found message (tsc's
             // `checkAndReportErrorForUsingTypeAsValue`).
@@ -4421,6 +4426,25 @@ fn memberChainInner(c: *Checker, node: Node, ctx: TypeId) Error!ChainLink {
     if (c.nodeTag(d.lhs) == .super_expr and site.dir != .none) {
         if (try accessibility.checkSuperField(c, name, name_tok)) site.dir = .none;
     }
+    // A `#name` on an ANY-like receiver does NOT get the free pass every other
+    // name gets there. tsc's `checkPropertyAccessExpressionOrQualifiedName`
+    // resolves the spelling LEXICALLY first and, on an any-like left type,
+    // returns the apparent type only when some enclosing class declares it; a
+    // spelling no enclosing class declares falls through to the ordinary
+    // lookup, which `any` answers with nothing — so `x.#unknown` with `x: any`
+    // is the same TS2339 a typed receiver would give
+    // (`privateNameNestedMethodAccess`). A `#name` written outside every class
+    // body is tsc's grammar error TS18016, which `checkPrivateName` deliberately
+    // does not transcribe, so `outside_class` is left alone here too.
+    if (c.tree.tokens.tag(name_tok) == .private_identifier and
+        c.ts.kind(try c.resolveStructural(obj_t)) == .any and
+        names_zig.resolvePrivateName(c, name, c.cur_scope) == .no_such_member)
+    {
+        try c.diagFmt(2339, c.tokSpan(name_tok), "Property '{s}' does not exist on type '{s}'.", .{
+            c.atomText(name), try c.typeToString(obj_t),
+        });
+        return .{ .ty = types.error_type, .chained = chained };
+    }
     var pt = try propertyTypeOf(c, obj_t, name, name_tok, site);
     // A `#name` is resolved lexically before it is looked up, so an access
     // from outside the declaring class is TS18013 even though the member
@@ -4603,6 +4627,41 @@ fn entityNameOf(c: *Checker, node: Node) ?[]const u8 {
     }
 }
 
+/// Does `cls`, or a class it extends, declare `name` as a STATIC member?
+/// tsc's `typeHasStaticProperty`, whose two halves both matter for TS2576:
+///
+///   * it asks the class's STATIC SIDE, which INHERITS — `class C2 extends A {}`
+///     with `static bar` on `A` makes `c2.bar()` this diagnostic rather than a
+///     plain TS2339 (`classSideInheritance1`, `classImplementsClass6`);
+///   * it then filters on `prop.valueDeclaration && isStatic(valueDeclaration)`,
+///     which drops everything on the static side that is not a `static` member
+///     — most importantly the exports a merged NAMESPACE contributes.
+///     `class C { static foo } namespace C { export var bar }` reads `c.foo` as
+///     TS2576 and `c.bar` as a plain TS2339 (`staticPropertyNotInClassType`,
+///     `staticMemberExportAccess`, `mergedClassNamespaceRecordCast`).
+///
+/// Walking the binder's per-class statics SCOPES gives both at once: a scope
+/// holds exactly the members the class body declared `static`, and a namespace
+/// block's exports live in a scope of its own. The walk is bounded by
+/// `max_static_base_hops`, so a base cycle the heritage checker has already
+/// reported cannot spin here.
+fn declaresStatic(c: *Checker, cls0: SymbolId, name: Atom) Error!bool {
+    var cls = cls0;
+    var hops: u8 = 0;
+    while (hops < max_static_base_hops) : (hops += 1) {
+        if (!c.symFlags(cls).class) return false;
+        const cb = c.symBind(cls);
+        if (cb.staticsScopeOf(c.localOf(cls))) |ss| {
+            if (cb.lookupInScope(ss, name) != null) return true;
+        }
+        cls = (try c.baseClassSym(cls)) orelse return false;
+    }
+    return false;
+}
+
+/// Deeper than any real class hierarchy; the cap only ever under-reports.
+const max_static_base_hops: u8 = 64;
+
 /// Property `name` on `t`, with TS2339/TS2551 on failure.
 ///
 /// `dir` is the access direction the ACCESSIBILITY check reads its modifiers
@@ -4750,16 +4809,11 @@ fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex, site
             // Instance access to a static member (TS2576).
             if (k == .ref) {
                 const cls = c.ts.refSymbol(t);
-                const cls_bind = c.symBind(cls);
-                if (c.symFlags(cls).class) {
-                    if (cls_bind.staticsScopeOf(c.localOf(cls))) |ss| {
-                        if (cls_bind.lookupInScope(ss, name) != null) {
-                            try c.diagFmt(2576, c.tokSpan(name_tok), "Property '{s}' does not exist on type '{s}'. Did you mean to access the static member '{s}.{s}' instead?", .{
-                                c.atomText(name), try c.typeToString(t), c.symbolName(cls), c.atomText(name),
-                            });
-                            return types.error_type;
-                        }
-                    }
+                if (try declaresStatic(c, cls, name)) {
+                    try c.diagFmt(2576, c.tokSpan(name_tok), "Property '{s}' does not exist on type '{s}'. Did you mean to access the static member '{s}.{s}' instead?", .{
+                        c.atomText(name), try c.typeToString(t), c.symbolName(cls), c.atomText(name),
+                    });
+                    return types.error_type;
                 }
             }
             // An unknown member of the global scope object is, for tsc, an
