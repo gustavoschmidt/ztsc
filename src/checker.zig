@@ -217,6 +217,31 @@ pub const Options = struct {
     /// on the instantiation as a side attribute; ztsc interns structurally, so
     /// the ref is the only spelling that can carry alias identity — and alias
     /// identity is what `getAliasVariances` needs (see `aliasInstance`).
+    ///
+    /// MEASURED, wave 35, and it is nowhere near shippable — the leg exists so
+    /// the next attempt starts from the numbers rather than from the idea:
+    ///
+    ///   * ts-suite: +2 keys (`genericIndexedAccessVarianceComparisonResultCorrect`
+    ///     and `consistentAliasVsNonAliasRecordBehavior`) against 11 cases that
+    ///     regress exact -> false-positive. Every regression is a `.ref` reaching
+    ///     a consumer that pattern-matches on the MATERIALIZED kind: inference
+    ///     through an alias parameter (`contravariantTypeAliasInference`,
+    ///     `unionTypeInference`, `localTypeParameterInferencePriority` —
+    ///     infer.zig's `.ref` parameter arm), mapped-to-mapped relation
+    ///     (`mappedTypes6`, `homomorphicMappedTypeIntersectionAssignability` —
+    ///     mapped.zig), `Ref[keyof M]` normalization (`indexedAccessNormalization`,
+    ///     `indexedAccessAndNullableNarrowing` — the indexed-access route), and
+    ///     deep intersection chains (`longObjectInstantiationChain1/2`).
+    ///   * The APPS are where the real cost is, and the suite badly understates
+    ///     it: excalidraw 17 -> 76 diagnostics, social-app 68 -> 319. All
+    ///     false positives.
+    ///   * DETERMINISM fails too: with the policy on, excalidraw's message text
+    ///     diverges between root orders at `--checkers=2` (same key set, printed
+    ///     type differs) — `bench/order_sweep.sh` grid, 20 cells, one differing.
+    ///
+    /// So the ref spelling is not the hard part; making every consumer of a
+    /// materialized alias body accept the lazy spelling is, and that work lives
+    /// in infer.zig / mapped.zig / the indexed-access route, not here.
     alias_refs: bool = false,
     /// `--variance-decides`: BISECT LEG. Believe a COMPLETE measured-variance
     /// comparison in BOTH directions, which is what tsc's `relateVariances`
@@ -230,6 +255,23 @@ pub const Options = struct {
     /// shortcut is a separate site from its type-reference one, and ztsc's
     /// measurement is trustworthy on a different population — see the arm in
     /// `assign.relate`.
+    ///
+    /// MEASURED, wave 35. On its own it is nearly inert — both apps are
+    /// byte-identical to their baselines, because without `alias_refs` almost
+    /// no alias pair survives interning AS a `.ref` pair to decide — but it is
+    /// not free: it costs ONE ts-suite key and converts none
+    /// (`typeInference/unionTypeInference`, whose `DeepPromised<T>` is an
+    /// intersection-bodied CYCLE member and so already keeps its ref today).
+    /// Paired with `alias_refs` it costs 3 further regressions beyond that
+    /// leg's own 8 (`nongenericPartialInstantiationsRelatedInBothDirections`,
+    /// `varianceRepeatedlyPropegatesWithUnreliableFlag`, `unionTypeInference`).
+    ///
+    /// All four are one family: ztsc reports `unmeasured` only for a
+    /// guard/budget trip, where tsc additionally has `Unreliable` /
+    /// `Unmeasurable` (its `AllowsStructuralFallback`) for a measurement that
+    /// passed through an unreliable position. Closing that gap in
+    /// `measuredVariances` is the prerequisite for believing a negative verdict
+    /// anywhere — here or at the compile-time `measured_variance_decides`.
     alias_variance_decides: bool = false,
     /// `--inst-memo-bits=N`: pin the instantiation memo at exactly 2^N slots
     /// with no growth, a measurement aid. 0 (the default) is the adaptive
