@@ -3138,6 +3138,40 @@ pub fn expandSpread(c: *Checker, an: Node, out: *std.ArrayList(EffArg)) Error!?u
     return at;
 }
 
+/// TS2488 for a spread ARGUMENT whose operand carries no `[Symbol.iterator]()`
+/// protocol — tsc's `checkSpreadExpression`, which ends in
+/// `checkIteratedTypeOrElementType(IterationUse.Spread, …, node.expression)`
+/// and so blames the OPERAND, exactly as the array-literal spread arm in
+/// `expr.zig` already does. `iter = { *[Symbol.iterator](_: number) {…} }` has
+/// a `[Symbol.iterator]` that is not callable with zero arguments, and
+/// `g(...iter)` was the one of its four uses ztsc left silent
+/// (`iteratorExtraParameters`).
+///
+/// Not in `expandSpread`: that also runs for inference (`infer.zig`) and for
+/// the silent rest-pack probe (`spreadRestMatches`), neither of which is a
+/// place to file a diagnostic. This walk is over the WRITTEN arguments and
+/// runs once the expansion has filled each operand's type memo.
+fn reportNonIterableSpreads(c: *Checker, arg_nodes: []const Node) Error!void {
+    for (arg_nodes) |an| {
+        if (an == null_node or c.nodeTag(an) != .spread_element) continue;
+        const operand = c.tree.nodeData(an).lhs;
+        if (operand == null_node) continue;
+        const raw = c.nodeType(operand) orelse continue;
+        const st = try c.resolveStructural(raw);
+        // Arrays and tuples never reach the protocol, and `none` is the
+        // "nothing was typed" answer — the same guards the array-literal arm
+        // carries.
+        switch (c.ts.kind(st)) {
+            .array, .tuple, .none => continue,
+            else => {},
+        }
+        if (try c.iterationElementType(st) != null) continue;
+        try c.diagFmt(2488, c.nodeSpan(operand), "Type '{s}' must have a '[Symbol.iterator]()' method that returns an iterator.", .{
+            try c.typeToString(st),
+        });
+    }
+}
+
 /// `checkCallArguments`, reporting back WHERE it blamed the arguments.
 ///
 /// `anchor_out`, when given, receives the span of the first diagnostic this
@@ -3189,6 +3223,7 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
     var eff: std.ArrayList(EffArg) = .empty;
     defer eff.deinit(c.scratch());
     const spread_at = try effectiveArgs(c, arg_nodes, &eff);
+    try reportNonIterableSpreads(c, arg_nodes);
     // tsc's `hasCorrectArity` for a list that still holds an UNBOUNDED spread:
     // the position it starts at must be one the signature can reach, and the
     // tail it stands for must land in a rest parameter.
