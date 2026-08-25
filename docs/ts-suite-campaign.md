@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-25, post wave 33)
+## Standings (2026-08-25, post wave 34)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7509 / 8633 (87.0%)** |
-| excess keys (false positives) | 3541 | 1444 |
-| missing keys (under-reports) | 8617 | 2731 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7565 / 8633 (87.6%)** |
+| excess keys (false positives) | 3541 | 1342 |
+| missing keys (under-reports) | 8617 | 2594 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Thirty-three waves landed (3–33), every one with ZERO match→non-match regressions in
+Thirty-four waves landed (3–34), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -517,7 +517,76 @@ bare param beside its constraint's members), generated Unicode
 ID_Start/ID_Continue tables (+6), and three recovery rules
 (numberLiteralsWithLeadingZeros 69→93/93 keys).
 
-## Ranked next queue (wave 34) — distilled from wave-33 agent reports
+Wave 34 (+56 exact → 7565/8633 87.6%; DETERMINISM FULLY CLOSED — the
+excalidraw checkers=8 shuffle defect is dead, both apps now byte-identical
+across the entire checkers 1/2/4/8 × 5-orders grid): A root-caused the
+grid failure to a `return []` never[] arm surviving un-reduced into a
+return-type union whose MEMBER ORDER (TypeId-minted → materialization-
+order-dependent) the union-callee resolution then read; fix is one line —
+inferReturnType unions with SUBTYPE reduction, so the union never exists.
+Durable lesson recorded: makeUnion's TypeId ordering is a latent hazard
+for ANY consumer of union member order; the defence is not to manufacture
+such unions. A also corrected the alias-variance analysis (tsgo fails
+line 26 b=a via getAliasVariances; c=d passes structurally because the
+aliasSymbols DIFFER) and warned the (sym,args) keying memo is unsound
+(alias_state grows; fixTypeArgs emits diagnostics). B landed tuple
+numeric properties (fixed prefix only), target-driven discriminants
+(isDiscriminantProperty semantics + boolean→true|false expansion),
+last-wins literal elaboration at every declaration node, and same-text
+template pattern↔pattern relation. C rebuilt the spread-call path: the
+packed relation now decides BOTH overload selection (argumentsMatch used
+to return true on any spread — selecting overloads checkCallArguments
+then rejected) and the check; array literals are tuples under {0:…}
+contexts; never-rest accepted. D landed +47: dynamic import() TS2307
+(bind records replayed — the specifiers were in the graph all along, the
+TS2307 walk visited statements only; exposed and fixed an exports-folder
+resolver gap), TS1361/1362 nearest-hop (first-writer-wins type_only
+origin in modules.zig — C's oracle recipe), the accessor grammar family
+(7 codes, new pure module accessor_grammar.zig), strict-reserved names,
+TS2323/TS2664. relationComplexityError does NOT flap: stable ~8.5s at
+85% of the 10s cutoff; real fix is tsc's relation step budget → TS2859.
+
+## Ranked next queue (wave 35) — distilled from wave-34 agent reports
+
+1. TS2859 relation step budget (tsc's relationCount): ztsc has no code
+   for "Excessive complexity comparing types" at all; relationComplexity
+   Error sits at ~8.5s doing real work tsc cuts off. assign.zig owner.
+2. Alias variance with CORRECTED semantics (A's probe data in its report,
+   recorded here): needs ref(T,args) kept as the spelling for a
+   NON-recursive generic alias — a materialize-vs-ref policy change
+   (instantiate.zig) landing in variance.zig/assign.zig. 1 key today but
+   the policy unlocks alias-printing fidelity broadly. Risky; own both
+   files in one agent.
+3. TS2313 (5 cases, reclassified): base-constraint resolution through
+   MAPPED TYPES over recursive interfaces (`T extends { [P in T]:
+   number }` reports on P; circularBaseTypes reports inside keyof T).
+4. Mapped `as` over keyof array — two recorded blockers in mapped.zig:
+   structural array TARGET (isAssignableInner's .array arm refuses
+   non-list sources), then the number-key index signature rebuild
+   (indexKeySurvives written, held back, no consumer).
+5. Augmentation-only specifier must NOT resolve for imports (tsc TS2307):
+   withhold the ambient-registry seed for augmentations; touches every
+   `declare module` .d.ts in both apps — re-prove app diffs.
+6. expr.zig fresh-literal widening divergence: a fresh literal's
+   `{ d20: 12 }` member is STORED widened as number, which broke reading
+   elaboration sources off src_t (B34 worked around by reading the
+   winning declaration node).
+7. template.zig: inline a template-typed span (tsc addSpans) so
+   Uppercase<`${number}`> normalizes and the placeholder whitelist
+   tightens.
+8. Expando `this` / lazy expando members (blocks TS2786 + 2 more).
+9. TS1099 residues need TS1326/TS1131; TS1268 needs the key type
+   resolved (checker-side).
+10. c1 keying perf: memo must key the whole alias_stack suffix (A's
+    soundness analysis), or attack markCycle's O(depth) inserts.
+11. Census: TS2322 excess/under pool; objectFreezeLiteralsDontWiden
+    (Object.freeze const-ness); objectRestNegative (destructure);
+    genericCallWithTupleType (out-of-range tuple index);
+    typeParameterHasSelfAsConstraint; signatureCombiningRestParameters5;
+    logicalAssignment6/7 (flow); substitution types; resolution-mode
+    attributes.
+
+## Superseded queue (wave 34, kept for context)
 
 1. STANDING GRID FAILURE, needs an owner: excalidraw at --checkers=8 ×
    shuffle=1/2 has 6 order-dependent TS2339 keys in
