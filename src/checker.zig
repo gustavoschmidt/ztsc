@@ -2174,6 +2174,17 @@ pub const Checker = struct {
     /// i.e. of the file order and of the `--checkers=N` partition. Dropping is
     /// the same answer for this query and no answer for the next one.
     rel_maybe: std.ArrayListUnmanaged(u64) = .empty,
+    /// tsc's `relationCount`: structural comparisons the LIVE outermost
+    /// relation query has already spent. Reset by the outermost `relate`
+    /// frame, bumped by every frame that misses the memo and goes on to walk
+    /// members. See `assign.max_relation_steps`.
+    rel_steps: u32 = 0,
+    /// tsc's `overflow`: the live query gave up on its step budget instead of
+    /// answering. Sticky for the rest of the query — every frame under it
+    /// returns "not related" immediately — cleared by the outermost frame on
+    /// entry, and read by `assign_report.checkAssignable`, which files TS2859
+    /// in place of the whole-type TS2322 it would otherwise have elaborated.
+    rel_overflow: bool = false,
     /// Nesting depth of an INTERSECTION-target decomposition. tsc relates a
     /// source to each constituent of an intersection target with
     /// `IntersectionState.Target`, which — among other things — turns the

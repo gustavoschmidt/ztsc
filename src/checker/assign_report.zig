@@ -65,6 +65,17 @@ pub fn checkAssignable(c: *Checker, src_t: TypeId, target: TypeId, expr_node: No
         }
         return true;
     }
+    // tsc's `checkTypeRelatedTo` epilogue: a query the step budget ABANDONED
+    // did not decide the pair, so there is no failure to elaborate — the
+    // relation is reported as the thing that went wrong. Read once and
+    // immediately: `typeToString` can itself ask a relation, which re-arms the
+    // flag for its own query. See `assign.max_relation_steps`.
+    if (c.rel_overflow) {
+        try c.diagFmt(2859, span, "Excessive complexity comparing types '{s}' and '{s}'.", .{
+            try c.typeToString(src_t), try c.typeToString(target),
+        });
+        return false;
+    }
     // tsc elaborates object/array literal mismatches per member.
     if (expr_node != 0 and try c.elaborateLiteralError(expr_node, src_t, target)) {
         return false;
@@ -1843,10 +1854,7 @@ fn branchExcessScan(c: *Checker, branches: [2]Node, src_t: TypeId, target: TypeI
 
 fn unionHasConstituent(c: *const Checker, u: TypeId, m: TypeId) bool {
     if (c.ts.kind(u) != .union_type) return false;
-    for (0..c.ts.memberCount(u)) |i| {
-        if (c.ts.memberAt(u, i) == m) return true;
-    }
-    return false;
+    return assign.unionHasMember(c.ts.members(u), m);
 }
 
 pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: TypeId, report: bool) Error!bool {

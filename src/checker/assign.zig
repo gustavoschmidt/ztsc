@@ -49,6 +49,39 @@ const template_zig = @import("template.zig");
 // assignability
 // =====================================================================
 
+/// tsc's `relationCount` budget: how many memo-missing structural comparisons
+/// ONE top-level relation query may spend before the checker gives up on it
+/// and reports TS2859 ("Excessive complexity comparing types …") instead of an
+/// answer.
+///
+/// This exists because assignability over unions is multiplicative and tsc's
+/// own guards — the depth cap, the growing-instantiation test, the pair memo —
+/// are all about TERMINATION, not about cost. A query can terminate and still
+/// be hopeless: `('0'|…|'7')⁴ & ({a:string}|{b:number})` against the same
+/// 4096-member union plus `null` is finite, decidable, and takes seconds. tsc
+/// stops counting and reports; without this ztsc answered it, correctly, after
+/// 4.4 seconds (`compiler/relationComplexityError.ts`, the corpus's only
+/// >10s case).
+///
+/// CALIBRATION, not transcription. tsc's constant counts tsc's frames, and its
+/// budget additionally shrinks as its relation cache fills — neither number
+/// means anything against a different frame decomposition. What has to match is
+/// which PROGRAMS overflow, so the value is measured: it sits far above the
+/// most expensive query in the corpus, the conformance suite and both
+/// benchmark apps, and far below the one query tsc rejects. See the wave-35
+/// notes in `docs/ts-suite-campaign.md` for the measured distribution.
+pub const max_relation_steps: u32 = 4_000_000;
+
+/// Calibration hook for `max_relation_steps`: print every top-level relation
+/// query costing at least this many steps. 0 disables it, and compiles the
+/// print — and the `s0`/`t0` reads feeding it — away entirely.
+///
+/// The measurement behind the constant above, reproducible by setting this to
+/// `50_000` and rebuilding: no query in either benchmark app (excalidraw,
+/// social-app) or anywhere in the TypeScript corpus reaches even that, while
+/// the shapes tsc gives up on are two orders of magnitude past it.
+const debug_rel_steps: u32 = 0;
+
 /// WHICH relation a `relate` walk is answering — tsc's `relation` parameter,
 /// which every one of its relation functions carries and which selects both the
 /// rule set and the pair cache (`assignableRelation` / `comparableRelation` /
@@ -953,6 +986,20 @@ pub const checkVarianceAnnotations = variance_zig.checkVarianceAnnotations;
 
 /// The generic reference a type denotes: itself when it IS one, otherwise
 /// the canonical origin ref of a materialized instantiation (see `origin`).
+/// Is `m` one of `union_members` — tsc's `containsType`, and O(log n) for the
+/// same reason: a union's constituent list is canonical, so it is sorted by
+/// `TypeId` (`Store.makeUnion`) and membership is a binary search rather than
+/// a scan. Takes the SLICE, not the union, so it can be hoisted out of a loop
+/// over a second type's constituents (`isAssignableInner`'s intersection-source
+/// fast path does exactly that).
+pub fn unionHasMember(union_members: []const TypeId, m: TypeId) bool {
+    return std.sort.binarySearch(TypeId, union_members, m, struct {
+        fn cmp(key: TypeId, mid: TypeId) std.math.Order {
+            return std.math.order(key, mid);
+        }
+    }.cmp) != null;
+}
+
 pub fn refFacetOf(c: *Checker, ty: TypeId, k: types.Kind) ?TypeId {
     if (k == .ref) return ty;
     if (!originTaggable(k)) return null;
@@ -1304,9 +1351,35 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!RelAnswer {
     // so the capped result is never cached and a shallower re-encounter of
     // the same pair still computes the real answer.
     if (c.rel_depth > max_relation_depth) return .assumed_yes;
+    // tsc's `checkTypeRelatedTo` prologue: the step budget belongs to the
+    // QUERY, not to the checker, so it is (re)armed by whichever frame is
+    // outermost and spent by everything under it. Per-query rather than
+    // running-total is what keeps the verdict independent of how many files
+    // this checker instance happened to check first — see `rel_steps`.
+    if (c.rel_depth == 0) {
+        c.rel_steps = 0;
+        c.rel_overflow = false;
+    } else if (c.rel_overflow) {
+        // Sticky: once the budget is gone the query has no answer left to
+        // give, and tsc unwinds the whole walk with `Ternary.False`. Marked
+        // ASSUMED so nothing derived from the abort reaches the memo.
+        return .assumed_no;
+    }
     c.rel_depth += 1;
     defer {
         c.rel_depth -= 1;
+        if (comptime debug_rel_steps > 0) {
+            if (c.rel_depth == 0 and c.rel_steps >= debug_rel_steps) {
+                std.debug.print("[relsteps] {d} s={d}/{s} t={d}/{s}\n", .{
+                    c.rel_steps, s0, @tagName(c.ts.kind(s0)), t0, @tagName(c.ts.kind(t0)),
+                });
+                if (c.ts.kind(s0) == .intersection) {
+                    if (c.memberList(s0)) |ms| {
+                        for (ms) |m| std.debug.print("   member {d}/{s}\n", .{ m, @tagName(c.ts.kind(m)) });
+                    } else |_| {}
+                }
+            }
+        }
         // Outermost frame: nothing may outlive the query on assumption alone.
         // See `Checker.rel_maybe`.
         if (c.rel_depth == 0 and c.rel_maybe.items.len != 0) {
@@ -1514,6 +1587,16 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!RelAnswer {
             }
             return if (v == 1) .yes else .no;
         }
+    }
+    // The memo did not know this pair, so answering it costs a structural
+    // walk: charge it to the query's budget (tsc's `relationCount--`, at the
+    // same place — past the memo probe, ahead of the in-progress mark). Past
+    // the budget the query is abandoned rather than answered; see
+    // `max_relation_steps`.
+    c.rel_steps += 1;
+    if (c.rel_steps > max_relation_steps) {
+        c.rel_overflow = true;
+        return .assumed_no;
     }
     // Growing-instantiation guard (tsc's `isDeeplyNestedType`, see
     // `max_relation_identity_repeats`). Runs BEFORE the in-progress mark is
@@ -1743,7 +1826,17 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!RelAnswer {
     // the provisional bit cannot be forgotten the way an ambient flag can.
     const answer = RelAnswer.of(verdict == .yes, c.rel_assumed);
     c.rel_assumed = saved_assumed;
-    if (cacheable) {
+    // An ABANDONED query learned nothing. Every verdict unwinding under
+    // `rel_overflow` is a fact about the budget, not about the pair, so the
+    // marks this frame stood on are withdrawn and nothing is published —
+    // otherwise the next query would read a "not related" that only means
+    // "the previous question ran out of steps first". (tsc does publish here,
+    // and that is a known wart: it makes the answer depend on which query got
+    // there first, which is exactly what the `--checkers=N` grid forbids.)
+    if (cacheable and c.rel_overflow) {
+        for (c.rel_maybe.items[maybe_start..]) |k| _ = c.relation.remove(k);
+        c.rel_maybe.shrinkRetainingCapacity(maybe_start);
+    } else if (cacheable) {
         if (answer.related()) {
             // Definite YES, or the outermost frame of the query: the walk
             // closed without contradicting anything it assumed, so the whole
@@ -2816,6 +2909,45 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
     if (sk == .template_literal_type) {
         const bc = try c.baseConstraintOf(s);
         if (bc != s and try c.isAssignable(bc, t)) return true;
+    }
+    // An intersection SOURCE one of whose constituents IS the target, or is a
+    // CONSTITUENT of a union target: `A & B` is related to `A`, and to
+    // anything `A` alone is a constituent of, by construction — for any `A`.
+    //
+    // The general rule lives further down (`sk == .intersection`: some
+    // constituent RELATES to the target, `someTypeRelatedToType`), and this is
+    // just its identity case — but the identity case has to be hoisted above
+    // the target-union arm below, because that arm decomposes the target
+    // first: it asks `A & B` against each of the union's members in turn, and
+    // the general rule then asks `A` against each member in turn, for a walk
+    // quadratic in the union's size over a question two integer comparisons
+    // answer. tsc never has to hoist anything, because its identity case IS
+    // `isRelatedTo`'s `source === target` line and its union membership test
+    // is `typeRelatedToSomeType`'s `containsType` — both reached before the
+    // per-member loop, and both O(1)/O(log n).
+    //
+    // `compiler/relationComplexityError.ts` is what this costs: `Digits⁴` is
+    // a 4096-member union, `T1 & T2` distributes to an 8192-member union of
+    // intersections (`Store.makeIntersection`, tsc's
+    // `getCrossProductIntersections`), and relating the two spent 33.5M
+    // relation steps and 4.4 seconds on a pair whose every constituent is
+    // `lit & { a: string }` against a union that literally contains `lit`.
+    //
+    // Sound in one line: `s <: m` for every constituent `m` of an
+    // intersection, and `m <: t` whenever `t` is a union with `m` among its
+    // constituents, so `s <: t`. It can only ever turn a NO into a YES, and
+    // only for a pair that was already relatable through the general rule.
+    //
+    // Both member lists are read BORROWED (`ts.members`) rather than through
+    // `memberList`, which dupes into the scratch arena: nothing in this loop
+    // calls back into the checker, so neither slice can move under it, and an
+    // allocation per intersection-source frame is not what a fast path is for.
+    if (sk == .intersection) {
+        const tms: []const TypeId = if (tk == .union_type) c.ts.members(t) else &.{};
+        for (c.ts.members(s)) |m| {
+            if (m == t) return true;
+            if (unionHasMember(tms, m)) return true;
+        }
     }
     if (tk == .union_type) {
         // A callable constituent decides for a callable source — see
