@@ -4276,6 +4276,11 @@ pub fn tupleElemTypeAt(c: *Checker, t: TypeId, i: u32) Error!?TypeId {
 /// property "missing" by exactly the rule the relation used to reject it.
 pub fn relationSrcProp(c: *Checker, s: TypeId, name: Atom) Error!?types.Prop {
     if (try c.propOfTypeEx(s, name, false)) |p| return p;
+    // A tuple's own numeric members. tsc's tuple IS an object type carrying
+    // `"0"`, `"1"`, … for its fixed elements, so no rule of the relation has to
+    // know it is a tuple; ztsc stores elements positionally, so the names need
+    // synthesizing here — see `tuple_relate.numericProp`.
+    if (tuple_zig.numericProp(c, s, name)) |p| return p;
     if (!isNonPrimitiveKind(c.ts.kind(s))) return null;
     return c.objectInterfaceProp(name);
 }
