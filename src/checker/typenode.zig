@@ -307,6 +307,17 @@ fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
             // `SignatureFlags.Abstract`) so the two spellings intern apart and
             // the relation's abstract screen has a bit to read — see
             // `assign.sourceSatisfiesSigs`.
+            //
+            // Interning them apart is not free where a program writes BOTH,
+            // and drizzle-orm's `DrizzleEntityClass<T>` is exactly that:
+            // `((abstract new (...a: any[]) => T) | (new (...a: any[]) => T))
+            // & DrizzleEntity`. The two operands used to hash-cons together,
+            // so the union collapsed to one member and the intersection
+            // distributed once; now the union has the two members tsc gives
+            // it and the distribution runs twice. That is +2.6% wall on
+            // drizzle (measured, single-threaded, 12 checks per sample) and
+            // nothing measurable on excalidraw, social-app or typebox — the
+            // price of the type actually having two operands.
             const sig0 = try c.signatureOfProto(node, d.lhs, false, true);
             const sig = if (d.rhs != 0)
                 try c.ts.withFnFlags(sig0, types.fn_flag_abstract)

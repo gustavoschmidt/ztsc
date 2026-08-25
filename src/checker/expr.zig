@@ -6790,22 +6790,44 @@ fn setterWriteType(c: *Checker, t0: TypeId, name: Atom, depth: u32) Error!?TypeI
             // `members` dangles as soon as the recursion interns anything.
             const ms = try c.scratch().dupe(TypeId, c.ts.members(t));
             defer c.scratch().free(ms);
-            var parts: std.ArrayList(TypeId) = .empty;
-            defer parts.deinit(c.scratch());
-            var diverged = false;
-            for (ms) |m| {
+            // Pass one is byte for byte the walk this used to be, and it is
+            // the one that runs on every write through a union receiver:
+            // unless SOME constituent declares a divergent setter there is
+            // nothing to combine. Reading the other constituents' property
+            // types unconditionally (the obvious single pass) cost +2.4% wall
+            // on drizzle, whose builder types are deep unions.
+            var first: usize = ms.len;
+            var first_wt: TypeId = types.no_type;
+            for (ms, 0..) |m, i| {
                 if (try setterWriteType(c, m, name, depth + 1)) |wt| {
-                    diverged = true;
-                    try parts.append(c.scratch(), wt);
-                } else if (try c.propOfType(m, name)) |p| {
-                    try parts.append(c.scratch(), p.ty);
-                } else {
-                    // A constituent that does not have the property at all:
-                    // the ACCESS is the error. Keep the read type.
-                    return null;
+                    first = i;
+                    first_wt = wt;
+                    break;
                 }
             }
-            if (!diverged) return null;
+            if (first == ms.len) return null;
+            var parts: std.ArrayList(TypeId) = .empty;
+            defer parts.deinit(c.scratch());
+            try parts.ensureTotalCapacityPrecise(c.scratch(), ms.len);
+            for (ms, 0..) |m, i| {
+                // Same split tsc's `createUnionOrIntersectionProperty` makes:
+                // it seeds `writeTypes` from the read types collected SO FAR
+                // at the first divergence, so a constituent before it
+                // contributes its read type and one after it contributes
+                // `getWriteTypeOfSymbol` — the setter's parameter when it has
+                // one, the read type when it does not.
+                const part: TypeId = blk: {
+                    if (i == first) break :blk first_wt;
+                    if (i > first) {
+                        if (try setterWriteType(c, m, name, depth + 1)) |wt| break :blk wt;
+                    }
+                    // A constituent that does not have the property at all:
+                    // the ACCESS is the error. Keep the read type.
+                    const p = (try c.propOfType(m, name)) orelse return null;
+                    break :blk p.ty;
+                };
+                parts.appendAssumeCapacity(part);
+            }
             return if (c.ts.kind(t) == .union_type)
                 try c.ts.makeUnion(c.scratch(), parts.items)
             else

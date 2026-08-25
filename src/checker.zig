@@ -913,40 +913,41 @@ pub const LazyStat = enum(u8) {
 };
 
 pub const map_containers = [_][]const u8{
-    "node_types",               "sig_cache",              "node_scopes",
-    "reassigned_syms",          "reassigned_in_loop",     "member_written_syms",
-    "member_written_in_loop",   "ns_types",               "ambient_ns_types",
-    "relation",                 "expansions",             "overload_groups",
-    "construct_groups",         "origin",                 "iface_generic",
-    "overload_group_pool",      "iface_stack",            "pending_class_decos",
-    "class_inst_generic",       "class_static_cache",     "class_static_owner",
-    "class_static_stack",       "class_ctor_cache",       "enum_value_cache",
-    "enum_info_cache",          "enum_relation_cache",    "alias_generic",
-    "alias_state",              "alias_recursive",        "flow_same",
-    "flow_narrow",              "ref_keys",               "flow_loop_stack",
-    "flow_stack",               "flow_tmp",               "flow_reduce",
-    "da_cache",                 "ctp_cache",              "cmp_cache",
-    "ctt_cache",                "ci_cache",               "infer_visited",
-    "subst_this_cache",         "mmp_cache",              "arrayish_elem_cache",
-    "tp_constraint_cache",      "erase_cache",            "erase_any_cache",
-    "inst_map_ids",             "fresh_tp_ids",           "this_tp_ids",
-    "fresh_tp_info",            "type_node_cache",        "atom_cache",
-    "infer_ids",                "infer_constraints",      "infer_scopes",
-    "mapped_key_ids",           "mapped_key_scopes",      "inst_diag_at",
-    "infer_active",             "lazy_member_active",     "this_bound_fns",
-    "chain_guards",             "never_isect",            "deep_path_list",
-    "deep_path_ids",            "flow_reach",             "member_type_stack",
-    "method_ret_cuts",          "lazy_index_objs",        "pending_type_args",
-    "pending_type_args_pool",   "pending_type_args_seen", "tp_constrained_cache",
-    "nominal_bases",            "nominal_base_pool",      "keyof_mapped_active",
-    "ctp_syms_seen",            "weak_types",             "base_ref_active",
-    "lazy_member",              "trunc_lazy_member",      "lazy_map",
-    "pattern_root_decls",       "pattern_root_ids",       "pattern_narrow_busy",
-    "key_name_types",           "enum_members",           "keyof_obj_cache",
-    "sym_key_cache",            "trunc_expansions",       "inst_map_bytes",
-    "tp_mentions",              "smk_cache",              "rel_maybe",
-    "spec_sym_types",           "spec_tainted",           "last_assign_pos",
-    "definitely_assigned_syms", "alias_stack",            "alias_self_recursive",
+    "node_types",             "sig_cache",                "node_scopes",
+    "reassigned_syms",        "reassigned_in_loop",       "member_written_syms",
+    "member_written_in_loop", "ns_types",                 "ambient_ns_types",
+    "relation",               "expansions",               "overload_groups",
+    "construct_groups",       "origin",                   "iface_generic",
+    "overload_group_pool",    "iface_stack",              "pending_class_decos",
+    "class_inst_generic",     "class_static_cache",       "class_static_owner",
+    "class_static_stack",     "class_ctor_cache",         "class_abstract_cache",
+    "enum_value_cache",       "enum_info_cache",          "enum_relation_cache",
+    "alias_generic",          "alias_state",              "alias_recursive",
+    "flow_same",              "flow_narrow",              "ref_keys",
+    "flow_loop_stack",        "flow_stack",               "flow_tmp",
+    "flow_reduce",            "da_cache",                 "ctp_cache",
+    "cmp_cache",              "ctt_cache",                "ci_cache",
+    "infer_visited",          "subst_this_cache",         "mmp_cache",
+    "arrayish_elem_cache",    "tp_constraint_cache",      "erase_cache",
+    "erase_any_cache",        "inst_map_ids",             "fresh_tp_ids",
+    "this_tp_ids",            "fresh_tp_info",            "type_node_cache",
+    "atom_cache",             "infer_ids",                "infer_constraints",
+    "infer_scopes",           "mapped_key_ids",           "mapped_key_scopes",
+    "inst_diag_at",           "infer_active",             "lazy_member_active",
+    "this_bound_fns",         "chain_guards",             "never_isect",
+    "deep_path_list",         "deep_path_ids",            "flow_reach",
+    "member_type_stack",      "method_ret_cuts",          "lazy_index_objs",
+    "pending_type_args",      "pending_type_args_pool",   "pending_type_args_seen",
+    "tp_constrained_cache",   "nominal_bases",            "nominal_base_pool",
+    "keyof_mapped_active",    "ctp_syms_seen",            "weak_types",
+    "base_ref_active",        "lazy_member",              "trunc_lazy_member",
+    "lazy_map",               "pattern_root_decls",       "pattern_root_ids",
+    "pattern_narrow_busy",    "key_name_types",           "enum_members",
+    "keyof_obj_cache",        "sym_key_cache",            "trunc_expansions",
+    "inst_map_bytes",         "tp_mentions",              "smk_cache",
+    "rel_maybe",              "spec_sym_types",           "spec_tainted",
+    "last_assign_pos",        "definitely_assigned_syms", "alias_stack",
+    "alias_self_recursive",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -1458,6 +1459,16 @@ pub const Checker = struct {
     /// Class symbol -> its *structural* constructor object (statics + construct
     /// signatures returning the instance). See `classConstructType`.
     class_ctor_cache: IntMap(SymbolId, TypeId) = .empty,
+    /// Class symbol -> `abstract`, memoized. The answer is one modifier bit on
+    /// one declaration, but reading it costs a file-context switch
+    /// (`classes.classIsAbstract` brackets the walk in
+    /// `enterSymFile`/`restoreCtx`), and the relation's abstract-constructor
+    /// screen asks it on EVERY `class_value` source related to a construct
+    /// signature — which drizzle-orm's builders do constantly: answering it
+    /// from the declaration each time cost +2.0% wall there (measured, 12
+    /// checks per sample, interleaved). A pure function of the program, so
+    /// caching it cannot move an answer with the file order.
+    class_abstract_cache: IntMap(SymbolId, bool) = .empty,
     /// The interned `typeof globalThis` marker (see `globalThisType`).
     global_this_ty: TypeId = types.no_type,
     /// Enum symbol -> value object type (the `typeof E` object with members).

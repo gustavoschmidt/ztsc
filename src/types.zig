@@ -1714,16 +1714,14 @@ pub const Store = struct {
         construct_sigs: []const TypeId,
     ) Error!TypeId {
         const has_sigs = call_sigs.len != 0 or construct_sigs.len != 0;
-        var nwrites: u32 = 0;
-        for (props) |p| {
-            if (p.write_ty != no_type and p.write_ty != p.ty) nwrites += 1;
-        }
         // Both bits are DERIVED, never taken from `flags0`: every caller that
         // passes another object's flags through (instantiation, the class
         // merge, `clearObjFlags`) would otherwise claim a block it did not
-        // build. See `obj_flag_write_types`.
-        var flags = if (has_sigs) flags0 | obj_flag_has_sigs else flags0 & ~obj_flag_has_sigs;
-        flags = if (nwrites != 0) flags | obj_flag_write_types else flags & ~obj_flag_write_types;
+        // build. See `obj_flag_write_types`. The write bit is OR'd in below,
+        // once the property loop has counted — this loop is the hot path for
+        // every object the program builds, so it stays a single pass.
+        const flags = (if (has_sigs) flags0 | obj_flag_has_sigs else flags0 & ~obj_flag_has_sigs) &
+            ~obj_flag_write_types;
         const start = s.pending.items.len;
         defer s.pending.items.len = start;
         try s.pending.append(s.alloc, flags);
@@ -1734,7 +1732,9 @@ pub const Store = struct {
             try s.pending.append(s.alloc, @intCast(construct_sigs.len));
         }
         const pstart = s.pending.items.len;
+        var nwrites: u32 = 0;
         for (props) |p| {
+            if (p.write_ty != no_type and p.write_ty != p.ty) nwrites += 1;
             try s.pending.append(s.alloc, p.name);
             try s.pending.append(s.alloc, p.ty);
             try s.pending.append(s.alloc, p.flags);
@@ -1745,6 +1745,7 @@ pub const Store = struct {
         try s.pending.appendSlice(s.alloc, call_sigs);
         try s.pending.appendSlice(s.alloc, construct_sigs);
         if (nwrites != 0) {
+            s.pending.items[start] |= obj_flag_write_types;
             try s.pending.append(s.alloc, nwrites);
             // Indices are into the SORTED records, so the block is keyed the
             // same way `objectProp` reads it and two spellings of the same
