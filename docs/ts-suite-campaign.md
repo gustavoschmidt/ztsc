@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-25, post wave 37)
+## Standings (2026-08-25, post wave 38)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7656 / 8633 (88.7%)** |
-| excess keys (false positives) | 3541 | 1280 |
-| missing keys (under-reports) | 8617 | 2451 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7688 / 8641 (89.0%)** |
+| excess keys (false positives) | 3541 | 1253 |
+| missing keys (under-reports) | 8617 | 2389 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Thirty-seven waves landed (3–37), every one with ZERO match→non-match regressions in
+Thirty-eight waves landed (3–38), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -626,7 +626,78 @@ type/defer), and the three forwarded one-liners (TS1113 latch, TS2492
 BlockScopedVariable — measured: class is silent too, print single
 construct sig). 149 cases now diverge ONLY in TS1xxx codes.
 
-## Ranked next queue (wave 38) — distilled from wave-37 agent reports
+Wave 38 (+32 exact → 7688/8641 89.0%): C landed computed-name INDEX
+SIGNATURES on all sides (shared computed_key.splitDynamicMembers pass;
+domain via an if/else chain over the key type, values union SIBLINGS
+included; fixed a pre-existing bug where [k: symbol] answered string
+keys) + TS1238 + TS2467 + numeric-key string-index fallback. D landed
+unterminated-regex recovery (tsc stops at the first UNBALANCED
+)/]/} — classes and groups nest, a {…} quantifier SUSPENDS the search;
+30 probes), non-consuming junk tokens (createMissingNode consumes
+NOTHING — removing the bump() was the whole fix), the import.defer
+EXPRESSION family (collapses to bare .import_expr, so it types as
+import() with no checker change), TS1477/TS1142×2/TS1196/TS1186.
+B landed the Parameters/ReturnType constraint family
+(decidableConstraintSet lacked callable kinds), TS2344 on type-param
+DEFAULTS, TS2315 for params/enums, `this is T` predicate forcing,
+constructor VISIBILITY compat, tsc's intersection property check
+(narrowed to comparable after an app-gate-only FP — the corpus and
+packages were clean; the app gate caught it), and the null-stripped
+union headline (text-only). A closed the echo-wipe annotated-position
+gap and REFUTED the queued reverse-mapped rule — the real axis is
+ARITY (source strictly shorter than template, A at a still-declared
+position; 30-row battery in inferOuterFromShortCallback's comment).
+coAndContraVariantInferences5 is blocked on internal union-member
+ORDERING (both compilers order-independent w.r.t. source; aligning
+means matching tsc's type-id order in makeUnion — out of scope).
+CALL-seam full-constraint reconfirmed zero-delta a second time.
+PRACTICE ADOPTED: sweeps must run against a PINNED binary copy
+(--ztsc <snapshot>) — a concurrent zig build bench invalidated a sweep.
+
+## Ranked next queue (wave 39) — distilled from wave-38 agent reports
+
+1. TS2729 "used before its initialization" — 7 cases / 15 keys,
+   entirely absent (classes/expr).
+2. TS2660 `super` placement — 6 cases / 17 keys, entirely absent
+   (expr).
+3. The QueryPersister function-relation imprecision surfaced by B's
+   intersection check (`direction?: unknown` vs a literal union fails
+   one way, succeeds the other) — the underlying relation bug is open
+   and app-visible (social-app fetchQuery witness in-code).
+4. TS2344 residue blocked on undecidableType admitting a FREE type
+   parameter (the exclusion that killed 130+ FPs): keyof-argument
+   shapes (circularlyConstrained…, styledComponents…),
+   unmetTypeConstraintInImportCall; instantiationExpressionErrorNoCrash
+   needs failed instantiation → empty-signature object (cascade risk).
+5. (Foo|Bar)['foo'] type-level indexed access: ztsc distributes in
+   keyof.zig and never reports TS2339 (needs checkIndexedAccessIndex
+   Type); plus the union-property drop rule (pinned: no shared
+   declaration AND any private/protected — blocked on Prop carrying no
+   declaring symbol).
+6. TS2416 blame column on computed member names (stmts.zig:1898 uses
+   the inner identifier token — one line, +1).
+7. Relation leads (B, measured): `new C1() as Record<string,unknown>`
+   TS2352 (4 cases, app-risky); `T[keyof T]` with T extends object
+   reduces keyof object to never (indexedAccessConstraints:6:9); async
+   deferred Promise<T[K]> 3 false TS2322 (asyncFunctionReturnType).
+8. deeplyNestedConstraints handoffs: mapped.zig reduceIndexedAccess
+   for M[K] over TypeMap<E>; assign.zig distributiveConstraint bails
+   on non-type-param checks — extend to any instantiable check with a
+   resolvable constraint.
+9. Inference one-keys: generatorYieldContextualType (Generator triple
+   — iteration/signatures); contextualTypeBasedOnIntersectionWith
+   AnyInTheMix1 (isLiteralOfContextualType uses SOME over intersection
+   constituents; ztsc intersects first → any; expr.zig);
+   mappedTypesArraysTuples:78 (mapped-over-array apparent type).
+10. Binder: TS2393/TS2300 on non-late-bindable computed names
+    collapsing to one placeholder — tsc reports nothing (~5 cases);
+    static_tp_scope TS2302→TS2467 suppression; keyof.zig:884
+    numberIndexType symbol guard; print.zig sym_only index rendering.
+11. TS1211 (needs modifiers_start seam), TS1084 (reference-directive
+    diagnostics path), parseArguments ',' vs ')' after `;` (key-neutral).
+12. Census: TS2322 pool; substitution types; resolution-mode attrs.
+
+## Superseded queue (wave 38, kept for context)
 
 1. Non-late-bindable computed member names contribute an INDEX
    SIGNATURE (tsc getIndexInfosOfIndexSymbol): object literals do this,
