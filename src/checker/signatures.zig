@@ -2661,7 +2661,17 @@ fn functionSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
             else => continue,
         }
         const d = c.tree.nodeData(decl);
-        const sig = try c.signatureOfProto(decl, d.lhs, false, true);
+        // …and it does NOT report TS7006 on the way. The expression's own
+        // check is the single place that decides: `checkFunctionLikeExpr`
+        // builds the signature under the CONTEXTUAL one and passes
+        // `report_implicit = ctx_sig == no_type`, so a contextually typed
+        // `const f: (a: string) => void = function self(a) { self("") }` has
+        // no implicit any at all — while re-deriving it here, context-free,
+        // manufactured one per parameter per self-reference
+        // (`contextuallyTypedParametersWithQuestionToken`). An UNcontextual
+        // named function expression still reports, from that same call.
+        const report = c.nodeTag(decl) != .function_expr;
+        const sig = try c.signatureOfProto(decl, d.lhs, false, report);
         if (d.rhs == 0) {
             try sigs.append(c.scratch(), sig); // overload signature
         } else {
