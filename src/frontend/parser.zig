@@ -4105,6 +4105,23 @@ const Parser = struct {
             name = try p.addNode(.{ .tag = .this_expr, .main_token = tok, .data = .{ .lhs = 0, .rhs = 0 } });
         } else {
             name = try p.parseBindingName(.private_name_as_param);
+            // tsc's `parseNameOfParameter`: when the binding name came back
+            // MISSING and this parameter carried no modifier of its own, a
+            // token that is merely SPELLED like a modifier is consumed anyway —
+            //
+            //     if (getFullWidth(name) === 0 && !some(modifiers) &&
+            //         isModifierKind(token())) nextToken();
+            //
+            // so `function f(default: number) {}` goes on to read `: number` as
+            // this parameter's annotation and answers the ONE TS1359 the name
+            // earned. Without the skip the list stalls on the keyword,
+            // `parseParams` steps over it, and the `:` behind it collects a
+            // second diagnostic (TS1138) that tsc never has. A reserved word
+            // that is not modifier-spelled (`null`, `void`, `true`) is left to
+            // stall exactly as tsc leaves it — measured against tsgo 7.0.2, one
+            // function per keyword (reservedWords2).
+            if (first_mod == null and p.nodeTagAt(name) == .error_node and
+                param_modifiers.isModifierKind(p.curTag())) _ = try p.bump();
         }
         if (p.curTag() == .question) {
             _ = try p.bump();
@@ -6955,6 +6972,30 @@ const Parser = struct {
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
         if (p.atLt()) tp = try p.parseTypeParams(.callable);
         if (p.curTag() != .l_paren) return error.Backtrack;
+        // tsc's `isParenthesizedArrowFunctionExpressionWorker`, the ONE shape it
+        // calls Tristate.True on sight rather than probing for a `=>`:
+        //
+        //     if (second === CloseParenToken) {
+        //         // Simple cases: "() =>", "(): ", and "() {}"
+        //         switch (nextToken()) {
+        //             case EqualsGreaterThanToken: case ColonToken: case OpenBraceToken:
+        //                 return Tristate.True;
+        //
+        // An empty parameter list followed by `{` or `:` is an arrow function
+        // whether or not the `=>` is actually there, so a MISSING one is
+        // reported ("'=>' expected") and the body parses on. ztsc otherwise
+        // decides arrow-ness by parsing the whole head and demanding the `=>`,
+        // which backtracks here and re-reads `()` as a parenthesized expression
+        // — inventing a TS1109 inside the empty parens that tsc never has
+        // (`function throw() {}`, reservedWords2).
+        //
+        // Held to the type-parameter-free form: tsc answers Tristate.Unknown for
+        // a leading `<`, i.e. a generic head still has to produce its `=>`.
+        const definite = tp.start == tp.end and p.peekTag(1) == .r_paren and
+            switch (p.peekTag(2)) {
+                .arrow, .colon, .l_brace => true,
+                else => false,
+            };
         const params = try p.parseParams();
         var ret: Node = null_node;
         if (try p.eat(.colon) != null) {
@@ -6973,15 +7014,19 @@ const Parser = struct {
             defer p.spec = saved_spec;
             ret = try p.parseReturnType();
         }
-        if (p.curTag() != .arrow) return error.Backtrack;
-        if (p.nlBefore()) {
+        if (p.curTag() != .arrow and !definite) return error.Backtrack;
+        if (p.curTag() == .arrow and p.nlBefore()) {
             // A line break before `=>` is a syntax error, but once we see
             // the arrow this *is* an arrow function; report and continue.
             p.spec -= 1;
             try p.errAtCur(.newline_before_arrow);
             p.spec += 1;
         }
-        const arrow_tok = try p.bump();
+        // Committed either way past this point, so the missing-`=>` diagnostic
+        // is reported rather than turned into a Backtrack.
+        p.spec -= 1;
+        const arrow_tok = try p.expect(.arrow, .expected_arrow);
+        p.spec += 1;
         const proto = try p.addExtra(ast.FnProto{
             .flags = flags,
             .name_token = 0,
