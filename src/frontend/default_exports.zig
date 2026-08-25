@@ -119,18 +119,36 @@ pub const Kind = enum {
     }
 };
 
-/// Which declarations of one file's `default` slot tsc reports TS2528 on, in
-/// declaration order. `out.len` must equal `kinds.len`; every entry is written.
-pub fn clashing(kinds: []const Kind, out: []bool) void {
-    std.debug.assert(out.len == kinds.len);
-    @memset(out, false);
+/// What one `export default` declaration earns. The two diagnostics are
+/// complements of each other — a collision is TS2528 and a MERGE of two or
+/// more is TS2323 — so one walk answers both, and no declaration ever carries
+/// them both.
+pub const Verdict = struct {
+    /// TS2528: this declaration is in a group a collision reported.
+    multiple: bool = false,
+    /// TS2323: this declaration shares a MERGED slot with another.
+    redeclared: bool = false,
+};
+
+/// What each declaration of one file's `default` slot earns, in declaration
+/// order. `out.len` must equal `kinds.len`; every entry is written.
+///
+/// `overload[i]` marks a declaration tsc's `isNotOverload` filters out of the
+/// TS2323 count — a function SIGNATURE, which is one more declaration of the
+/// same binding rather than a second binding. It has no bearing on TS2528.
+pub fn check(kinds: []const Kind, overload: []const bool, out: []Verdict) void {
+    std.debug.assert(out.len == kinds.len and overload.len == kinds.len);
+    @memset(out, .{});
     // The current merge group: the declarations since the last collision, and
     // their accumulated meaning. A collision reports the whole group.
     var group_start: usize = 0;
     var acc: u8 = 0;
     for (kinds, 0..) |k, i| {
         if (i > group_start and acc & k.excludes() != 0) {
-            for (out[group_start .. i + 1]) |*o| o.* = true;
+            for (out[group_start .. i + 1]) |*o| o.multiple = true;
+            // The group that just ENDED is the symbol tsc is about to replace,
+            // and its declarations are the ones TS2323 asks about.
+            markRedeclared(overload[group_start..i], acc, out[group_start..i]);
             // tsc answers a collision with a FRESH symbol holding only this
             // declaration, so the group restarts here.
             group_start = i;
@@ -138,6 +156,32 @@ pub fn clashing(kinds: []const Kind, out: []bool) void {
             continue;
         }
         acc |= k.includes().bits();
+    }
+    markRedeclared(overload[group_start..], acc, out[group_start..]);
+}
+
+/// TS2323 for ONE merge group: the `default` binding it leaves behind was
+/// declared more than once, and a module's export list is a set of bindings.
+/// tsc's `checkExternalModuleExports` — "It is a Syntax Error if the
+/// ExportedNames of ModuleItemList contains any duplicate entries", with the
+/// TypeScript exceptions it names in the same comment: a namespace, an
+/// interface or an enum MERGES into one binding by design and returns early,
+/// and a function SIGNATURE is not a second declaration of anything.
+///
+/// Measured: `export default foo` beside `export default class Foo {}` is
+/// TS2323 on both (they merge — `ClassExcludes` does not contain `Alias`),
+/// while `export default class A {}` twice is TS2528 and NOT TS2323, because
+/// the collision leaves two symbols of one declaration each.
+fn markRedeclared(overload: []const bool, meaning: u8, out: []Verdict) void {
+    const merging = Flags{ .interface_ = true, .enum_ = true, .ns = true };
+    if (meaning & merging.bits() != 0) return;
+    var n: usize = 0;
+    for (overload) |ov| {
+        if (!ov) n += 1;
+    }
+    if (n < 2) return;
+    for (out, overload) |*o, ov| {
+        if (!ov) o.redeclared = true;
     }
 }
 
@@ -147,10 +191,59 @@ pub fn clashing(kinds: []const Kind, out: []bool) void {
 
 const testing = std.testing;
 
+/// The TS2528 half, with no overload signatures in the set.
 fn expectClashing(kinds: []const Kind, expected: []const bool) !void {
-    var out: [8]bool = undefined;
-    clashing(kinds, out[0..kinds.len]);
-    try testing.expectEqualSlices(bool, expected, out[0..kinds.len]);
+    var out: [8]Verdict = undefined;
+    var ovl: [8]bool = @splat(false);
+    check(kinds, ovl[0..kinds.len], out[0..kinds.len]);
+    var got: [8]bool = undefined;
+    for (out[0..kinds.len], got[0..kinds.len]) |v, *g| g.* = v.multiple;
+    try testing.expectEqualSlices(bool, expected, got[0..kinds.len]);
+}
+
+/// The TS2323 half. `overload` marks the body-less function signatures.
+fn expectRedeclared(kinds: []const Kind, overload: []const bool, expected: []const bool) !void {
+    var out: [8]Verdict = undefined;
+    check(kinds, overload, out[0..kinds.len]);
+    var got: [8]bool = undefined;
+    for (out[0..kinds.len], got[0..kinds.len]) |v, *g| g.* = v.redeclared;
+    try testing.expectEqualSlices(bool, expected, got[0..kinds.len]);
+}
+
+test "a MERGED slot with two bindings is TS2323 (exportDefaultClassAndValue)" {
+    // `export default foo` then `export default class Foo {}`: no collision
+    // (`ClassExcludes` does not contain `Alias`), so the two share one symbol.
+    try expectRedeclared(&.{ .alias, .class_ }, &.{ false, false }, &.{ true, true });
+    // A COLLISION leaves two symbols of one declaration each, so the same pair
+    // in the other order is TS2528 and not this.
+    try expectRedeclared(&.{ .class_, .alias }, &.{ false, false }, &.{ false, false });
+    try expectRedeclared(&.{ .class_, .class_ }, &.{ false, false }, &.{ false, false });
+    // exportDefaultTypeClassAndValue: the merged pair reports, the collision's
+    // fresh symbol behind it does not.
+    try expectRedeclared(
+        &.{ .alias, .class_, .alias },
+        &.{ false, false, false },
+        &.{ true, true, false },
+    );
+}
+
+test "an interface in the slot makes the merge legal" {
+    try expectRedeclared(&.{ .function, .interface_ }, &.{ false, false }, &.{ false, false });
+    try expectRedeclared(&.{ .class_, .interface_ }, &.{ false, false }, &.{ false, false });
+}
+
+test "an overload set is one binding" {
+    try expectRedeclared(
+        &.{ .function, .function, .function },
+        &.{ true, true, false },
+        &.{ false, false, false },
+    );
+    // …two IMPLEMENTATIONS are two bindings.
+    try expectRedeclared(
+        &.{ .function, .function },
+        &.{ false, false },
+        &.{ true, true },
+    );
 }
 
 test "one default export never clashes" {

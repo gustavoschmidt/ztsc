@@ -3950,12 +3950,23 @@ const Binder = struct {
         }
     }
 
-    /// TS2528, once per file: which of the file's `export default`s cannot share
-    /// the `default` export slot. The rule (and why "more than one" is the wrong
-    /// test) is default_exports.zig; this half maps the export records onto it
-    /// and owns the report positions — tsc's `getNameOfDeclaration(decl) ||
-    /// decl`, i.e. the declaration's own name, or the whole `export default`
-    /// statement when it declares none.
+    /// TS2528 and TS2323, once per file: which of the file's `export default`s
+    /// cannot share the `default` export slot, and which of them SHARE it and
+    /// are therefore two bindings under one exported name. The rule (and why
+    /// "more than one" is the wrong test for either) is default_exports.zig;
+    /// this half maps the export records onto it and owns the report positions.
+    ///
+    /// The two diagnostics anchor differently, which is why two token arrays
+    /// come out of the same walk:
+    ///
+    ///   * TS2528 is tsc's `getNameOfDeclaration(decl) || decl` — the
+    ///     declaration's own name, or the whole `export default` statement when
+    ///     it declares none, so `export default Foo` blames `Foo`;
+    ///   * TS2323 goes through `createDiagnosticForNode`, whose
+    ///     `getErrorSpanForNode` narrows to the name only for the DECLARATION
+    ///     kinds it lists — a class, a function, an interface — and leaves an
+    ///     export ASSIGNMENT alone, so `export default Foo` blames the
+    ///     statement (measured: column 1, not the identifier's).
     ///
     /// Only file-scope records take part. A `declare module "spec" { export
     /// default … }` block is a container of its own and would need its own slot;
@@ -3966,6 +3977,10 @@ const Binder = struct {
         defer kinds.deinit(b.scratch);
         var toks: std.ArrayList(TokenIndex) = .empty;
         defer toks.deinit(b.scratch);
+        var span_toks: std.ArrayList(TokenIndex) = .empty;
+        defer span_toks.deinit(b.scratch);
+        var overloads: std.ArrayList(bool) = .empty;
+        defer overloads.deinit(b.scratch);
         for (b.export_recs.items) |rec| {
             if (rec.kind != .default or rec.scope != file_scope) continue;
             const inner = b.tree.nodeData(rec.node).lhs;
@@ -3973,25 +3988,40 @@ const Binder = struct {
             // anonymous `export default function () {}` and an expression that
             // is not an entity name both fall back to the statement, which is
             // why those keys sit at the `export` keyword.
-            var tok = b.tree.nodeMainToken(rec.node);
+            const stmt_tok = b.tree.nodeMainToken(rec.node);
+            var tok = stmt_tok;
+            var span_tok = stmt_tok;
+            var overload = false;
             const kind: default_exports.Kind = switch (b.nodeTag(inner)) {
                 .function_decl => k: {
                     const proto = b.tree.extraData(ast.FnProto, b.tree.nodeData(inner).lhs);
-                    if (proto.name_token != 0) tok = proto.name_token;
+                    if (proto.name_token != 0) {
+                        tok = proto.name_token;
+                        span_tok = proto.name_token;
+                    }
+                    overload = b.tree.nodeData(inner).rhs == 0;
                     break :k .function;
                 },
                 .class_decl => k: {
                     const data = b.tree.extraData(ast.ClassData, b.tree.nodeData(inner).lhs);
-                    if (data.name_token != 0) tok = data.name_token;
+                    if (data.name_token != 0) {
+                        tok = data.name_token;
+                        span_tok = data.name_token;
+                    }
                     break :k .class_;
                 },
                 .interface_decl => k: {
                     const data = b.tree.extraData(ast.InterfaceData, b.tree.nodeData(inner).lhs);
-                    if (data.name_token != 0) tok = data.name_token;
+                    if (data.name_token != 0) {
+                        tok = data.name_token;
+                        span_tok = data.name_token;
+                    }
                     break :k .interface_;
                 },
                 // `export default Foo` — an ALIAS to every meaning `Foo` has,
                 // and the one expression form that reports on its own name.
+                // `span_tok` stays on the statement: an export ASSIGNMENT is
+                // not one of the kinds `getErrorSpanForNode` narrows.
                 .identifier => k: {
                     tok = b.tree.nodeMainToken(inner);
                     break :k .alias;
@@ -4000,13 +4030,16 @@ const Binder = struct {
             };
             try kinds.append(b.scratch, kind);
             try toks.append(b.scratch, tok);
+            try span_toks.append(b.scratch, span_tok);
+            try overloads.append(b.scratch, overload);
         }
         if (kinds.items.len < 2) return;
-        const out = try b.scratch.alloc(bool, kinds.items.len);
+        const out = try b.scratch.alloc(default_exports.Verdict, kinds.items.len);
         defer b.scratch.free(out);
-        default_exports.clashing(kinds.items, out);
-        for (out, toks.items) |clashes, tok| {
-            if (clashes) try b.diag(.multiple_default_exports, tok);
+        default_exports.check(kinds.items, overloads.items, out);
+        for (out, toks.items, span_toks.items) |v, tok, span_tok| {
+            if (v.multiple) try b.diag(.multiple_default_exports, tok);
+            if (v.redeclared) try b.diag(.redeclared_exported_variable, span_tok);
         }
     }
 
