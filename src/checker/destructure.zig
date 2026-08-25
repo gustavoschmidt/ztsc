@@ -314,13 +314,19 @@ fn tupleSlice(c: *Checker, r: TypeId, from: u32) Error!TypeId {
     return c.ts.makeTupleLike(r, elems.items);
 }
 
-/// Object binding-pattern rest type: `whole` with every key named by a
-/// sibling `binding_property` in `pat` removed (tsc's `{a, ...rest}` →
-/// `rest = Omit<whole, "a">`), and every UNSPREADABLE member dropped as well
-/// (`types.Prop.spreadable`). Objects and intersections of objects are
-/// filtered (index signatures preserved); anything else (unions, generics,
-/// `any`) falls back to `whole` unchanged — lenient, matching how the rest
-/// of the checker treats non-enumerable shapes.
+/// Object rest type: `whole` with every key named by a non-rest sibling of
+/// `pat` removed (tsc's `{a, ...rest}` → `rest = Omit<whole, "a">`), and every
+/// UNSPREADABLE member dropped as well (`types.Prop.spreadable`). Objects and
+/// intersections of objects are filtered (index signatures preserved);
+/// anything else (unions, generics, `any`) falls back to `whole` unchanged —
+/// lenient, matching how the rest of the checker treats non-enumerable shapes.
+///
+/// `pat` is either a binding pattern (siblings are `binding_property`) or the
+/// expression cover grammar an object destructuring ASSIGNMENT parses to
+/// (`object_property` / `object_shorthand`) — tsc runs the one `getRestType`
+/// for both. An assignment sibling with a COMPUTED key cannot be named
+/// statically here; under-excluding it would invent an assignability error at
+/// the rest target, so the whole shape falls back to `whole`.
 pub fn objectRestType(c: *Checker, whole: TypeId, pat: Node) Error!TypeId {
     const r = try c.resolveStructural(whole);
     const kind = c.ts.kind(r);
@@ -330,8 +336,16 @@ pub fn objectRestType(c: *Checker, whole: TypeId, pat: Node) Error!TypeId {
     defer excluded.deinit(c.scratch());
     for (c.tree.nodeRange(pat)) |el| {
         if (el == null_node) continue;
-        if (c.nodeTag(el) == .binding_property) {
-            try excluded.append(c.scratch(), try c.memberAtom(c.tree.nodeMainToken(el)));
+        switch (c.nodeTag(el)) {
+            .binding_property, .object_shorthand => {
+                try excluded.append(c.scratch(), try c.memberAtom(c.tree.nodeMainToken(el)));
+            },
+            .object_property => {
+                const key = c.tree.nodeData(el).lhs;
+                if (key != null_node and c.nodeTag(key) == .computed_name) return whole;
+                try excluded.append(c.scratch(), try c.memberAtom(c.tree.nodeMainToken(el)));
+            },
+            else => {},
         }
     }
 

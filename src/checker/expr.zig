@@ -6932,7 +6932,19 @@ fn setterParamOfProto(c: *Checker, decl: Node, proto_idx: u32) Error!?TypeId {
 pub fn checkDestructuringPattern(c: *Checker, node: Node, src: TypeId) Error!void {
     switch (c.nodeTag(node)) {
         .object_literal, .object_pattern => {
-            for (c.tree.nodeRange(node)) |el| try checkObjectDestructuringProperty(c, el, src);
+            const els = c.tree.nodeRange(node);
+            for (els, 0..) |el, i| {
+                // tsc's `checkObjectLiteralDestructuringPropertyAssignment`
+                // computes the rest type only for a spread in LAST position;
+                // anywhere else it is TS2462 and no assignment is checked.
+                const is_last_spread = i + 1 == els.len and el != null_node and
+                    (c.nodeTag(el) == .spread_element or c.nodeTag(el) == .rest_element);
+                const rest_src: TypeId = if (is_last_spread and src != types.no_type)
+                    try c.objectRestType(src, node)
+                else
+                    types.no_type;
+                try checkObjectDestructuringProperty(c, el, src, rest_src);
+            }
         },
         else => {
             const iterated = try arrayPatternIteratedType(c, node, src);
@@ -7048,7 +7060,11 @@ fn destructuringElementType(c: *Checker, src: TypeId, iterated: TypeId, index: u
 /// One property of an object destructuring pattern. A property KEY is a
 /// name, not a reference — without this peel the generic expression walker
 /// checked it as one (TS2304 on `({ width: dx } = …)`).
-fn checkObjectDestructuringProperty(c: *Checker, prop: Node, src: TypeId) Error!void {
+///
+/// `rest_src` is the type a REST element in this position reads (`no_type`
+/// where the caller could not compute one, or where this element is not a
+/// last-position rest); every other element ignores it.
+fn checkObjectDestructuringProperty(c: *Checker, prop: Node, src: TypeId, rest_src: TypeId) Error!void {
     if (prop == null_node) return;
     const d = c.tree.nodeData(prop);
     switch (c.nodeTag(prop)) {
@@ -7091,9 +7107,9 @@ fn checkObjectDestructuringProperty(c: *Checker, prop: Node, src: TypeId) Error!
             if (d.rhs != null_node) try checkDestructuringTarget(c, d.rhs, types.no_type, .assignment);
         },
         // `{ ...rest } = src`: the rest object is `src` minus the names its
-        // siblings take (tsc's `getRestType`), which is not computed here.
+        // siblings take (tsc's `getRestType`), which the caller computed.
         // An object rest target has its OWN pair of reference diagnostics.
-        .spread_element, .rest_element => try checkDestructuringTarget(c, d.lhs, types.no_type, .object_rest),
+        .spread_element, .rest_element => try checkDestructuringTarget(c, d.lhs, rest_src, .object_rest),
         .omitted, .error_node, .unsupported => {},
         else => _ = try checkAssignmentTarget(c, prop),
     }
@@ -7164,8 +7180,20 @@ fn checkDestructuringTarget(c: *Checker, el0: Node, src: TypeId, site: RefSite) 
                 _ = try c.checkExprCached(el, types.no_type);
             }
         },
+        // tsc's `checkDestructuringAssignment` dispatches on the target node AS
+        // WRITTEN — it never skips parentheses — so a PARENTHESIZED pattern is
+        // not a pattern at all: it falls through to `checkReferenceAssignment`,
+        // where `checkReferenceExpression` refuses it. `({...([])} = {})` is
+        // TS2701 for that reason and carries no diagnostic from inside the
+        // array (`restPropertyWithBindingPattern`), where the unparenthesized
+        // `({...[]} = {})` on the line above IS walked and reports TS2488.
         .array_literal, .object_literal, .array_pattern, .object_pattern => {
-            try checkDestructuringPattern(c, el, src);
+            if (el == el0) {
+                try checkDestructuringPattern(c, el, src);
+            } else {
+                _ = try checkAssignmentTarget(c, el);
+                _ = try checkReferenceExpression(c, el0, site);
+            }
         },
         .omitted, .error_node, .unsupported => {},
         // tsc's `checkReferenceAssignment`: a leaf pattern element is a write,
