@@ -3581,7 +3581,9 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                         var vt = try checkPropValue(c, pd.rhs, pctx, this_marker);
                         if (c.const_ctx) {
                             vt = try c.ts.regularLiteral(vt);
-                        } else if (!try propCtxKeepsLiteral(c, rctx, ctx, key, vt)) vt = try c.widenPropValue(vt);
+                        } else if (!try propCtxKeepsLiteral(c, rctx, ctx, key, vt)) {
+                            vt = try c.widenPropValue(vt);
+                        } else vt = try names_zig.regularOfLiteral(c, vt);
                         try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
                         continue;
                     }
@@ -3599,7 +3601,9 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                     var vt = try checkPropValue(c, pd.rhs, pctx, this_marker);
                     if (c.const_ctx) {
                         vt = try c.ts.regularLiteral(vt);
-                    } else if (!try keepLiteral(c, vt, pctx)) vt = try c.widenPropValue(vt);
+                    } else if (!try keepLiteral(c, vt, pctx)) {
+                        vt = try c.widenPropValue(vt);
+                    } else vt = try names_zig.regularOfLiteral(c, vt);
                     switch (key_kind) {
                         .string, .template_literal_type, .string_mapping => try str_index_vals.append(c.scratch(), vt),
                         .number, .number_literal, .number_literal_fresh => try num_index_vals.append(c.scratch(), vt),
@@ -3612,7 +3616,9 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                 var vt = try checkPropValue(c, pd.rhs, pctx, this_marker);
                 if (c.const_ctx) {
                     vt = try c.ts.regularLiteral(vt);
-                } else if (!try propCtxKeepsLiteral(c, rctx, ctx, key, vt)) vt = try c.widenPropValue(vt);
+                } else if (!try propCtxKeepsLiteral(c, rctx, ctx, key, vt)) {
+                    vt = try c.widenPropValue(vt);
+                } else vt = try names_zig.regularOfLiteral(c, vt);
                 try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
             },
             .object_shorthand => {
@@ -3620,7 +3626,9 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                 var vt = try c.checkExprCached(pd.lhs, types.no_type);
                 if (c.const_ctx) {
                     vt = try c.ts.regularLiteral(vt);
-                } else if (!try propCtxKeepsLiteral(c, rctx, ctx, key, vt)) vt = try c.widenPropValue(vt);
+                } else if (!try propCtxKeepsLiteral(c, rctx, ctx, key, vt)) {
+                    vt = try c.widenPropValue(vt);
+                } else vt = try names_zig.regularOfLiteral(c, vt);
                 if (pd.rhs != 0) _ = try c.checkExprCached(pd.rhs, types.no_type);
                 try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
             },
