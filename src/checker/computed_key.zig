@@ -51,6 +51,19 @@ const Error = checker_zig.Error;
 ///     position that reports — is a non-ambient class FIELD's name.
 pub const Home = enum { class_body, ambient_class_body, type_space };
 
+/// Where the computed name being checked is written, which is what the two
+/// container questions inside it need to know:
+///
+///   * a `this` inside the name is TS2465 only in a CLASS member's name —
+///     `getThisContainer(…, includeClassComputedPropertyName: true)` makes the
+///     name a container of its own there and nowhere else;
+///   * `getSuperContainer` steps over the member the name belongs to, and the
+///     two homes differ in whether the walk has already ENTERED that member's
+///     scope: a class member's name is checked from the class's scope, an
+///     object literal method's from the method's own (`checkObjectLiteral`
+///     installs it so the key's own diagnostics land in the right frame).
+pub const NameHome = enum { class_member, type_member, objlit_method };
+
 /// Check a `.computed_name` node's key expression, reporting TS2464 when the
 /// type it produces cannot name a property. Returns the key type so a caller
 /// that also needs it (an object literal deciding what member the key
@@ -58,14 +71,15 @@ pub const Home = enum { class_body, ambient_class_body, type_space };
 ///
 /// Safe to call on a non-`.computed_name` node, which is what lets a member
 /// walk hand over whatever it has for a name.
-/// `on_class` says the name belongs to a CLASS member — the one home in which
-/// a `this` reference inside it is TS2465 (see `IllegalRefs`). An object
-/// literal's name passes `false`, and so does an interface's or type literal's.
-pub fn checkComputedName(c: *Checker, name_node: Node, on_class: bool) Error!TypeId {
+pub fn checkComputedName(c: *Checker, name_node: Node, home: NameHome) Error!TypeId {
     if (name_node == null_node or c.nodeTag(name_node) != .computed_name) return types.no_type;
     const expr = c.tree.nodeData(name_node).lhs;
-    const want: IllegalRefs = .{ .super = superInNameIsError(c), .this = on_class };
-    if (want.super or want.this) try reportIllegalRefs(c, expr, want, 0);
+    const want: IllegalRefs = .{
+        .super = superInNameIsError(c),
+        .super_call = superCallInNameIsError(c, home == .objlit_method),
+        .this = home == .class_member,
+    };
+    if (want.super or want.super_call or want.this) try reportIllegalRefs(c, expr, want, 0);
     // A super CALL in the name is this file's TS2466, never the call site's
     // TS2337 — tsc's `checkSuperExpression` tests the computed name first.
     // (wave-20 A: `Checker.in_computed_key`.)
@@ -96,12 +110,45 @@ pub fn checkComputedName(c: *Checker, name_node: Node, on_class: bool) Error!Typ
 /// report is confined to the case where the skip can find nothing at all: no
 /// enclosing function-like SCOPE anywhere above the name, i.e. a member of a
 /// top-level class. Everything nested stays silent, which under-reports the
-/// one shape tsc still errors on (a super CALL inside an arrow,
-/// `computedPropertyNames30`) and never invents one.
+/// shapes where the skip lands on a function-like that is legal for a
+/// CONSTRUCTOR call and not for a property reference, and never invents one.
+/// A super CALL, whose one legal container is narrower, is judged separately
+/// by `superCallInNameIsError`.
 fn superInNameIsError(c: *Checker) bool {
     var s = c.cur_scope;
     while (true) {
         if (c.bind.scope_kinds[s] == .function) return false;
+        if (s == binder.file_scope) return true;
+        s = c.bind.scope_parents[s];
+    }
+}
+
+/// Is a super CALL written inside a computed member NAME an error?
+///
+/// The same skip `superInNameIsError` describes — over the name, over the
+/// member it names, and straight through any class body, which
+/// `getSuperContainer` does not stop at — but the container it lands on then
+/// answers to `isLegalUsageOfSuperExpression`'s CALL arm, which accepts exactly
+/// one kind: a constructor. Arrows count as containers here, because the
+/// arrow-skipping loop in `checkSuperExpression` runs only for a non-call — so
+/// `constructor() { () => { var o = { [(super(), "p")]() {} } } }` lands on the
+/// arrow and reports, where the same name written directly in the constructor
+/// body lands on the constructor and does not (`computedPropertyNames30`).
+fn superCallInNameIsError(c: *Checker, own_member_entered: bool) bool {
+    var s = c.cur_scope;
+    // The member the name belongs to is stepped OVER, so when the walk starts
+    // inside it that frame is not the container.
+    var skip = own_member_entered;
+    while (true) {
+        if (c.bind.scope_kinds[s] == .function) {
+            if (!skip) {
+                const owner = c.bind.scope_owners[s];
+                if (c.nodeTag(owner) != .class_method) return true;
+                const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(owner).lhs);
+                return !c.isCtorMember(owner, proto.flags);
+            }
+            skip = false;
+        }
         if (s == binder.file_scope) return true;
         s = c.bind.scope_parents[s];
     }
@@ -112,8 +159,12 @@ fn superInNameIsError(c: *Checker) bool {
 /// both `getSuperContainer` and `getThisContainer` stop at the same set of
 /// nodes on the way out, and step over the same ones.
 const IllegalRefs = struct {
-    /// TS2466 — see `superInNameIsError` for when this is on.
+    /// TS2466 for a super PROPERTY reference — see `superInNameIsError`.
     super: bool,
+    /// TS2466 for a super CALL — see `superCallInNameIsError`. A call answers
+    /// to a stricter bar than a property reference (only a constructor will
+    /// do), so the two verdicts differ and the walk carries both.
+    super_call: bool,
     /// TS2465: `this` cannot be referenced in a computed property name.
     ///
     /// tsc's `getThisContainer(node, includeArrowFunctions: true,
@@ -144,6 +195,18 @@ const IllegalRefs = struct {
 fn reportIllegalRefs(c: *Checker, node: Node, want: IllegalRefs, depth: u16) Error!void {
     if (node == null_node or depth > max_name_depth) return;
     switch (c.nodeTag(node)) {
+        // `super(…)` — the keyword in CALLEE position, which is the shape
+        // `isLegalUsageOfSuperExpression` judges against a constructor rather
+        // than against a member.
+        .call_expr, .call_expr_targs, .optional_call => {
+            const callee = c.tree.nodeData(node).lhs;
+            if (c.nodeTag(callee) == .super_expr and want.super_call) return c.diagFmt(
+                2466,
+                c.nodeSpan(callee),
+                "'super' cannot be referenced in a computed property name.",
+                .{},
+            );
+        },
         .super_expr => if (want.super) return c.diagFmt(
             2466,
             c.nodeSpan(node),
@@ -306,7 +369,7 @@ pub fn checkMemberNames(c: *Checker, members: []const Node, home: Home, type_par
         if (type_params.len > 0) {
             try reportTypeParamRefs(c, c.tree.nodeData(key).lhs, type_params, 0);
         }
-        _ = try checkComputedName(c, key, home != .type_space);
+        _ = try checkComputedName(c, key, if (home == .type_space) .type_member else .class_member);
     }
 }
 

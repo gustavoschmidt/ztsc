@@ -3862,11 +3862,13 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                             const saved_scope = c.cur_scope;
                             defer c.cur_scope = saved_scope;
                             if (try c.scopeOf(pd.rhs)) |s| c.cur_scope = s;
-                            // `on_class = false`: an OBJECT LITERAL's computed
+                            // `.objlit_method`: an OBJECT LITERAL's computed
                             // name is not a `this` container (tsc's
                             // `getThisContainer` steps over it), so a `this`
-                            // inside it resolves outward and is not TS2465.
-                            break :blk try computed_key.checkComputedName(c, pd.lhs, false);
+                            // inside it resolves outward and is not TS2465 —
+                            // and the scope just installed is the METHOD's own,
+                            // which the `super` container walk steps over too.
+                            break :blk try computed_key.checkComputedName(c, pd.lhs, .objlit_method);
                         };
                         // tsc's `getContextualTypeForObjectLiteralElement`
                         // ends with the arm for a member whose name is NOT
