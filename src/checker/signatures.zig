@@ -1225,7 +1225,29 @@ fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) Erro
     // contextual type fixes primitive-literal freshness, not object-literal
     // widening; and where the context is concrete the caller sees the
     // annotated type anyway, so it is invisible there).
-    const raw = try c.normalizeFreshObjectSiblings(try c.ts.makeUnion(c.scratch(), parts.items));
+    // tsc's `getReturnTypeFromBody` unions the return-expression types with
+    // `UnionReduction.Subtype`, not the default `Literal` reduction — the same
+    // `strictSubtypeRelation` pass `||`/`??`/`?:` get (`reduceSubtypes`). The
+    // shape it exists for is the guard-and-fall-through function:
+    //
+    //     const convert = (xs: T[] | null) => {
+    //       if (!xs) return [];          // never[]
+    //       …
+    //       return store.getElements();  // T[]
+    //     };
+    //
+    // whose two returns give `never[] | T[]`. tsc reduces that to `T[]`;
+    // leaving the union in place made `convert(…).find(e => …)` a call on a
+    // UNION of two `find` overload sets, and the answer a union-callee
+    // resolution picks out of that depends on the order `makeUnion` sorted the
+    // two constituents into — which is TypeId order, i.e. materialization
+    // order, i.e. the root file order and the partition. excalidraw's
+    // `transform.test.ts:374` was exactly that: `ele` came out `never` at
+    // `--checkers=8` under `--file-order=shuffle=1|2` and the element type
+    // under `source`/`reverse`, six TS2339s that moved with the grid cell and
+    // that `src/checker.zig:15` promises cannot move. Reducing here removes
+    // the union, so there is no member order left to read.
+    const raw = try c.reduceSubtypes(try c.normalizeFreshObjectSiblings(try c.ts.makeUnion(c.scratch(), parts.items)));
     // No-context inference unions the *un-widened* fresh literals and
     // widens only the collapsed result (finalizeInferredReturn); a
     // contextual return keeps the widenToContext behaviour.

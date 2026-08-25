@@ -1213,3 +1213,64 @@ test "determinism: a mutual ALIAS cycle keeps ONE spelling for every member" {
         try std.testing.expectEqualStrings(ref, got);
     }
 }
+
+// The last order-dependent result on the gated corpus (wave 34), reduced to
+// the decision that carried it.
+//
+// A function that guards its argument and falls through
+//
+//     const convert = (xs: Skeleton[] | null) => {
+//       if (!xs) return [];            // never[]
+//       …
+//       return store.getElements();    // Element[]
+//     };
+//
+// infers `never[] | Element[]` unless the two return types are unioned with
+// SUBTYPE reduction, which is what tsc's `getReturnTypeFromBody` asks for
+// (`UnionReduction.Subtype`, not the default `Literal`). Left in place, that
+// union is not merely wide — it is order-SENSITIVE downstream: a method read
+// off it (`convert(…).find(…)`) is a union of the two constituents' signature
+// sets, `Store.makeUnion` orders union members by TypeId, and TypeIds are
+// minted in materialization order, so which set a union-callee resolution
+// picks depends on the root file order and on the partition. excalidraw's
+// `packages/excalidraw/data/transform.test.ts:374` was exactly that: `ele`
+// came out `never` at `--checkers=8` under `--file-order=shuffle=1|2` and the
+// element type under `source`/`reverse` — six TS2339s that moved with the grid
+// cell, which `src/checker.zig:15` promises cannot happen.
+//
+// Asserted on the MESSAGE TEXT rather than on a diagnostic count, because the
+// two readings differ only in the type they print: the conformance snapshots
+// compare (code, line) pairs and cannot see this at all.
+test "inference: a `return []` fall-through is subtype-reduced away" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+
+    try d.writeFile(io, .{ .sub_path = "conv.ts", .data =
+        \\declare const guard: boolean;
+        \\declare const items: { n: number }[];
+        \\export function convert() {
+        \\  if (guard) { return []; }
+        \\  return items;
+        \\}
+        \\export const bad: number = convert();
+    });
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var interner = Interner.init();
+    defer interner.deinit(gpa);
+    const alloc = arena.allocator();
+
+    const roots = [_][]const u8{"conv.ts"};
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &roots, .none, .{}, .{}, null);
+    const rendered = try renderProgramDiags(alloc, io, gpa, &interner, &br.program, 1);
+    // One TS2322, and it names the reduced type. `never[]` anywhere in the
+    // message is the unreduced union leaking through.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "TS2322"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, rendered, "never[]"));
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Type '{ n: number; }[]' is not assignable to type 'number'") != null);
+}
