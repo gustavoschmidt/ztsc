@@ -2651,11 +2651,22 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
         }
     }
 
-    // implements clauses: instance assignable to each interface. Skipped
-    // entirely when the class inherits from a base ztsc could not resolve —
-    // the instance type is then missing whatever that base contributed, and
-    // the verdict would be about ztsc's gap, not the code.
-    if (class_sym != binder.no_symbol and !try c.hasUnresolvedBase(class_sym)) {
+    // implements clauses: instance assignable to each interface.
+    //
+    // Every clause is RESOLVED, whatever became of the others. tsc walks the
+    // heritage elements independently (`checkClassLikeDeclaration` checks each
+    // `ExpressionWithTypeArguments` in turn), so `class C extends A implements
+    // B {}` with neither name declared is TWO TS2304s — ztsc reported only the
+    // `extends` one (`parserClassDeclaration3`/`4`/`5`,
+    // `ExtendsOrImplementsClause5`).
+    //
+    // Only the assignability VERDICT is skipped when the class inherits from a
+    // base ztsc could not resolve: the instance type is then missing whatever
+    // that base contributed, so the answer would be about ztsc's gap and not
+    // about the code. An anonymous class expression has no symbol to ask, and
+    // is skipped for the same reason it always was.
+    const impl_verdict = class_sym != binder.no_symbol and !try c.hasUnresolvedBase(class_sym);
+    {
         for (c.tree.extraRange(data.impl_start, data.impl_end)) |h| {
             if (h == null_node or c.nodeTag(h) != .heritage) continue;
             const hd = c.tree.nodeData(h);
@@ -2668,7 +2679,7 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
                 }
             }
             const iface = try c.typeFromTypeName(hd.lhs, targs.items);
-            if (iface != types.error_type and iface != types.any_type) {
+            if (impl_verdict and iface != types.error_type and iface != types.any_type) {
                 if (!try c.isAssignable(this_t, iface)) {
                     // Same shape as the `extends` side: the per-member pass
                     // blames the offending member (TS2416), and the broad
