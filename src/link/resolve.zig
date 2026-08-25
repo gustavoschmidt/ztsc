@@ -95,6 +95,15 @@ pub fn resolveStem(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8) Erro
 
 /// `resolveStem` with the resolution context (`Fs`) threaded in — the same
 /// probes under `f.cache`'s memo, or every stat re-issued without it.
+/// Does `path` name an existing file, exactly as written? The literal
+/// question — no extension probing, no `moduleSuffixes` widening — which is
+/// what a construct that names a FILE rather than a module specifier asks
+/// (tsc's `resolveTripleslashReference` is a plain path join).
+pub fn fileAt(f: Fs, alloc: Allocator, path: []const u8) Error!?[]u8 {
+    if (try f.exists(path)) return try alloc.dupe(u8, path);
+    return null;
+}
+
 pub fn resolveStemFs(f: Fs, alloc: Allocator, stem: []const u8) Error!?[]u8 {
     var buf: [6][]const u8 = undefined;
     var n: usize = 0;

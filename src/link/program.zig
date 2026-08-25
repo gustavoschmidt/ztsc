@@ -256,7 +256,16 @@ pub const ProgFile = struct {
 /// directive, TS6053 ("File 'X' not found.") for a `path=` one. `kind` picks
 /// between them, and it is the directive's own kind rather than a code so the
 /// recorder never has to know what the reporter says.
-pub const TypeRefMiss = struct { name: []const u8, span: Span, kind: resolve.RefDirective.Kind };
+pub const TypeRefMiss = struct {
+    name: []const u8,
+    span: Span,
+    kind: resolve.RefDirective.Kind,
+    /// The directive resolved to the very file it is written in — tsc's TS1006
+    /// ("A file cannot have a reference to itself."), at the same span. It
+    /// supersedes the `kind`-picked wording, which is about a directive that
+    /// resolved to NOTHING.
+    self_reference: bool = false,
+};
 
 /// Turn an unresolved reference directive into its record. `spec` and `pos`
 /// both come from `resolve.scanReferences`, which slices the live source
@@ -267,6 +276,13 @@ pub fn typeRefMiss(ref: resolve.RefDirective) TypeRefMiss {
         .span = .{ .start = ref.pos, .end = ref.pos + @as(u32, @intCast(ref.spec.len)) },
         .kind = ref.kind,
     };
+}
+
+/// …and the same record for a directive that resolved to its OWN file.
+pub fn typeRefSelf(ref: resolve.RefDirective) TypeRefMiss {
+    var r = typeRefMiss(ref);
+    r.self_reference = true;
+    return r;
 }
 
 /// Sealed link tables for one file (read-only during check).

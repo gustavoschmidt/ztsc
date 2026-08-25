@@ -124,6 +124,19 @@ pub fn resolveReference(
         .path => {
             const stem = try joinNormalize(alloc, dirnamePart(importer), ref.spec);
             defer alloc.free(stem);
+            // tsc's `resolveTripleslashReference` is a plain path join: a
+            // `path=` directive names a FILE, and nothing is probed for it —
+            // which is why `/// <reference path='typescript.ts'/>` with no such
+            // file is TS6053 rather than a search. So the literal path answers
+            // FIRST. Without that pass the stem walk below strips `.d.ts` and
+            // prefers `.ts`, so `path="a.d.ts"` written in `a.ts` resolved to
+            // `a.ts` — a different file from the one named, and (once the
+            // self-reference rule existed) one that read as the file
+            // referencing itself (`bangInModuleName`).
+            if (try resolve.fileAt(f, alloc, stem)) |p| return p;
+            // The stem probe stays behind it: ztsc has always been lenient
+            // about the extensionless spellings tsc calls TS6053, and taking
+            // that away is a diagnostic change with no evidence behind it.
             return resolve.resolveStemFs(f, alloc, stem);
         },
         .types => {

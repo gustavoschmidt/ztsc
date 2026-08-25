@@ -96,6 +96,7 @@ pub const Program = program.Program;
 pub const ProgFile = program.ProgFile;
 pub const TypeRefMiss = program.TypeRefMiss;
 pub const typeRefMiss = program.typeRefMiss;
+pub const typeRefSelf = program.typeRefSelf;
 pub const FileLinks = program.FileLinks;
 pub const Target = program.Target;
 const TypeOnly = program.TypeOnly;
@@ -226,8 +227,12 @@ pub fn buildProgram(
         // program — not import bindings, just program inputs.
         var type_ref_misses: std.ArrayList(TypeRefMiss) = .empty;
         for (try resolve.scanReferences(scratch, bytes)) |ref| {
-            const rfid = try disco.discoverReference(path, ref);
-            if (rfid == no_file) try type_ref_misses.append(arena, typeRefMiss(ref));
+            const rt = try disco.discoverReference(path, ref);
+            if (rt.file == no_file) {
+                try type_ref_misses.append(arena, typeRefMiss(ref));
+            } else if (rt.self) {
+                try type_ref_misses.append(arena, typeRefSelf(ref));
+            }
         }
 
         // Resolve this file's specifiers; discover new files.
@@ -3879,6 +3884,13 @@ const Linker = struct {
     /// whole-file `.d.ts` suppression already delivers.
     fn reportUnresolvedTypeRefs(l: *Linker, file: FileId) Error!void {
         for (l.files[file].type_ref_misses) |miss| {
+            // A directive that named its own file resolved perfectly well; what
+            // is wrong with it is the circle, and tsc words that one way for
+            // both directive kinds.
+            if (miss.self_reference) {
+                try l.diag(file, 1006, miss.span, "A file cannot have a reference to itself.", .{});
+                continue;
+            }
             switch (miss.kind) {
                 .types => try l.diag(file, 2688, miss.span, "Cannot find type definition file for '{s}'.", .{miss.name}),
                 // TS6053 names the specifier as WRITTEN, not the path resolution
@@ -4491,15 +4503,27 @@ pub const Discovery = struct {
     /// `resolveSpec` it records no import-specifier binding, and resolution
     /// goes through `ResolveCache.resolveRef`, so the target is keyed by its
     /// canonical path — the same identity an `import` of that file would get.
-    /// `no_file` when the directive resolves to nothing (a `types=` miss is
-    /// the linker's TS2688; the caller decides).
-    pub fn discoverReference(d: *const Discovery, importer: []const u8, ref: resolve.RefDirective) !FileId {
-        if (try d.rcache.resolveRef(d.io, d.scratch, d.dir, importer, ref)) |resolved| {
-            return try d.fileFor(resolved);
-        }
-        return no_file;
+    /// `file` is `no_file` when the directive resolves to nothing (a `types=`
+    /// miss is the linker's TS2688; the caller decides), and `self` is set when
+    /// it resolves to the very file it is written in — tsc's TS1006, which the
+    /// caller records the same way it records a miss. Both are answers about
+    /// ONE resolution, which is why they come back together.
+    pub fn discoverReference(d: *const Discovery, importer: []const u8, ref: resolve.RefDirective) !ReferenceTarget {
+        const resolved = try d.rcache.resolveRef(d.io, d.scratch, d.dir, importer, ref) orelse
+            return .{ .file = no_file, .self = false };
+        const fid = try d.fileFor(resolved);
+        // Identity is the file id, not the spelling: `resolveRef` canonicalizes,
+        // and `path_ids` is keyed by that same canonical path, so a directive
+        // that names its own file through `./x`, `../dir/x` or the bare name all
+        // land on the id the importer already has. A plain `get` (never
+        // `fileFor`) so a lookup can only ever answer about a file the program
+        // already holds.
+        return .{ .file = fid, .self = (d.path_ids.get(importer) orelse no_file) == fid };
     }
 };
+
+/// What one `/// <reference … />` resolved to. See `discoverReference`.
+pub const ReferenceTarget = struct { file: FileId, self: bool };
 
 /// Sort a file's spec map by atom, keeping the (atom, file) pairs together.
 /// Insertion sort: a file's specifiers arrive nearly sorted (atoms are handed
