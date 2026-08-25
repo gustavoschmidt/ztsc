@@ -147,6 +147,76 @@ pub fn asyncGeneratorYieldType(c: *Checker, t: TypeId) TypeId {
     return 0;
 }
 
+/// The yield, return and next types a generator's return type carries —
+/// `Generator<Y, R, N>`'s three arguments. `ret`/`next` are `types.no_type`
+/// when the spelling left them off.
+pub const IterationCtx = struct { yield: TypeId, ret: TypeId, next: TypeId };
+
+/// The yield, return and next contexts a generator takes from a CONTEXTUAL
+/// return type — tsc's `getContextualIterationType`, which reads
+/// `getIterationTypeOfGeneratorFunctionReturnType` off the contextual
+/// signature's return type. Null when that type names no generator.
+///
+/// The contextual type is routinely a UNION with the generator as one arm
+/// (`() => number | Generator<(arg: number) => void, any, void>` —
+/// `contextualTypeOnYield1`), so the first arm that names one wins; tsc reaches
+/// the same place through `getIterationTypesOfType` over the union.
+///
+/// Purely contextual: every half only TYPES the operands (or, for `next`,
+/// spells the third argument of the INFERRED `Generator<…>`), and nothing is
+/// reported against any of them — see `FnCtx.yield_ctx`.
+pub fn contextualIteration(c: *Checker, ctx: TypeId, is_async: bool) Error!?IterationCtx {
+    if (ctx == 0 or ctx == types.no_type) return null;
+    if (c.ts.kind(ctx) == .union_type) {
+        for (try c.memberList(ctx)) |m| {
+            if (try contextualIteration(c, m, is_async)) |it| return it;
+        }
+        return null;
+    }
+    const y = if (is_async) c.asyncGeneratorYieldType(ctx) else c.generatorYieldType(ctx);
+    if (y == 0) {
+        // `Iterable<T, TReturn, TNext>` / `AsyncIterable<…>` are legal
+        // generator return types too, and `generatorYieldType` — whose job is
+        // the CHECK target — leaves them out because a written `Iterable`
+        // annotation is not what tsc relates a `yield` to. As a CONTEXT it is:
+        // `function* (): Iterator<Iterable<(x: string) => number>>` types the
+        // inner generator of `yield (function*(){…})()` through it.
+        if (c.ts.kind(ctx) != .ref) return null;
+        const sym = c.ts.refSymbol(ctx);
+        const name = try c.atom(if (is_async) "AsyncIterable" else "Iterable");
+        const g = c.prog.globals.lookup(name) orelse return null;
+        if (sym != g) return null;
+        return iterationCtxOf(c.ts.refArgs(ctx));
+    }
+    return iterationCtxOf(c.ts.refArgs(ctx));
+}
+
+/// `Generator<Y, R, N>`'s argument list read positionally; null when it has
+/// no yield argument at all (`Iterable` written bare).
+fn iterationCtxOf(args: []const TypeId) ?IterationCtx {
+    if (args.len == 0) return null;
+    return .{
+        .yield = args[0],
+        .ret = if (args.len >= 2) args[1] else types.no_type,
+        .next = if (args.len >= 3) args[2] else types.no_type,
+    };
+}
+
+/// The NEXT type of the `Generator<Y, R, N>` inferred for an unannotated
+/// generator body: the CONTEXTUAL one when the contextual return type named a
+/// generator that spells it, else `unknown`.
+///
+/// tsc's `getReturnTypeFromBody` builds the generator type from
+/// `getIterationTypesOfGeneratorFunctionReturnType(contextualReturnType)`, so
+/// `f1<0, 0, 1>(function* () { … })` infers `Generator<0, 0, 1>` — the `1` can
+/// only come from the context, since nothing a body does pins down what a
+/// caller hands to `.next()`. Hardcoding `unknown` made that argument diverge
+/// and the call fail (`generatorYieldContextualType`).
+pub fn inferredNextType(it: ?IterationCtx) TypeId {
+    const n = (it orelse return types.unknown_type).next;
+    return if (n == types.no_type) types.unknown_type else n;
+}
+
 /// Union of a tuple's element types (the element type used when a tuple
 /// borrows `Array<T>` members).
 pub fn tupleElementUnion(c: *Checker, t: TypeId) Error!TypeId {
