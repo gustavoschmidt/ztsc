@@ -229,6 +229,24 @@ pub fn checkSatisfies(c: *Checker, src_t: TypeId, target: TypeId, expr_node: Nod
     return false;
 }
 
+/// The LAST member of the object literal `lit` that declares `key` — the one
+/// whose value the literal's type actually carries. Null when the literal has
+/// no ordinary member by that name (a spread, or a computed key).
+fn lastDeclOfKey(c: *Checker, lit: Node, key: Atom) ?Node {
+    var last: ?Node = null;
+    for (c.tree.nodeRange(lit)) |m| {
+        if (m == null_node) continue;
+        const tag = c.nodeTag(m);
+        if (tag != .object_property and tag != .object_shorthand and tag != .object_method) continue;
+        const d = c.tree.nodeData(m);
+        if ((tag == .object_property or tag == .object_method) and
+            d.lhs != 0 and c.nodeTag(d.lhs) == .computed_name) continue;
+        if (c.memberAtom(c.tree.nodeMainToken(m)) catch continue != key) continue;
+        last = m;
+    }
+    return last;
+}
+
 /// Element/property-wise TS2322 elaboration for fresh literals (what
 /// tsc reports instead of one top-level error). Returns true when at
 /// least one narrower diagnostic was emitted.
@@ -428,14 +446,29 @@ pub fn elaborateLiteralError(c: *Checker, expr_node0: Node, src_t: TypeId, targe
                     try c.makeUnion2(tp.ty, types.undefined_type)
                 else
                     tp.ty;
-                const value_node = if (tag == .object_shorthand) pd.lhs else pd.rhs;
+                // tsc reads the source side off the source TYPE for every
+                // element (`getIndexedAccessTypeOrUndefined(source, nameType)`
+                // in `elaborateElementwise`), so a name DECLARED TWICE is
+                // judged by its last declaration at BOTH of its declaration
+                // nodes — the earlier one no longer describes the property the
+                // literal has. `lastPropertyInLiteralWins`: `thunk: (str:
+                // string) => {}` followed by `thunk: (num: number) => {}` is
+                // TS2322 on both lines.
+                //
+                // Taken from the winning NODE rather than from `src_t` itself,
+                // because a fresh literal's stored property type is already
+                // widened here (`{ d20: 12 }` stores `number`) and judging
+                // `d20: 12` against `1 | … | 20` on that would invent a
+                // mismatch tsc does not have (`excessPropertyCheckWithUnions`).
+                const decl = lastDeclOfKey(c, expr_node, key) orelse prop;
+                const dd = c.tree.nodeData(decl);
+                const dtag = c.nodeTag(decl);
+                const value_node = if (dtag == .object_shorthand) dd.lhs else dd.rhs;
                 // A method's value node is its `function_expr`, whose type is
                 // the method's own — but for an ACCESSOR (same tag) that is the
                 // accessor function, where the member's type is what it gets or
-                // sets. tsc reads the source side off the source TYPE for every
-                // element (`getIndexedAccessTypeOrUndefined(source, nameType)`),
-                // so do the same here and keep the node type as the fallback.
-                const vt = if (tag == .object_method)
+                // sets, so read those off the source type instead.
+                const vt = if (dtag == .object_method)
                     (if (try c.propOfType(src_t, key)) |sp| sp.ty else c.nodeType(value_node) orelse continue)
                 else
                     c.nodeType(value_node) orelse continue;
@@ -980,6 +1013,20 @@ fn collectMissingTupleIndices(c: *Checker, rs: TypeId, rt: TypeId, out: *std.Arr
     }
 }
 
+/// tsc's `tryElaborateArrayLikeErrors(source, target, /*reportErrors*/ false)`,
+/// which is what `reportUnmatchedProperty` consults before it renders a LIST of
+/// missing names (TS2739/TS2740). Its readonly early-returns are `readonly
+/// Mismatch` — they report TS4104 and answer false — and the two branches after
+/// them say the same thing from either side: a list on one side and a non-list
+/// on the other has no name list worth printing.
+fn missingListElaborates(c: *Checker, s: TypeId, t: TypeId) bool {
+    if (tuple_zig.readonlyMismatch(c, s, t)) return false;
+    const tk = c.ts.kind(t);
+    if (c.ts.kind(s) == .tuple) return tk == .array or tk == .tuple;
+    if (tk == .tuple) return c.ts.kind(s) == .array;
+    return true;
+}
+
 /// Missing-property refinement: when `src` is object-y and `target` is an
 /// object type with required properties absent from `src`, report the
 /// specific missing-property error (TS2741 for one, TS2739 for several) at
@@ -999,7 +1046,18 @@ pub fn tryReportMissingProps(c: *Checker, src_t: TypeId, target: TypeId, span: S
         rt = try c.classConstructType(c.ts.classSymbol(target));
         if (c.ts.kind(rs) == .class_value) rs = try c.classConstructType(c.ts.classSymbol(rs));
     }
-    if (!isSourceObjecty(c.ts.kind(rs))) return false;
+    // tsc's `shouldReportUnmatchedPropertyError` turns this off only for a
+    // source that is all SIGNATURE and no property; an array or a tuple has
+    // plenty of properties, so `number[]` against `{ x: number }` is TS2741 on
+    // `x`, and against `interface Ext extends Array<number> { extra: string }`
+    // TS2741 on `extra`.
+    //
+    // Kept to an OBJECT target: a list target is decided by ARITY first
+    // (`tupleTypesRelatedTo`), and "Target requires 2 element(s) but source may
+    // have fewer" REPLACES this report rather than following it.
+    const sk = c.ts.kind(rs);
+    if (!isSourceObjecty(sk) and
+        !((sk == .array or sk == .tuple) and c.ts.kind(rt) == .object)) return false;
     var missing: std.ArrayList(Atom) = .empty;
     defer missing.deinit(c.scratch());
     switch (c.ts.kind(rt)) {
@@ -1039,6 +1097,16 @@ pub fn tryReportMissingProps(c: *Checker, src_t: TypeId, target: TypeId, span: S
         return true;
     }
     if (missing.items.len > 1) {
+        // The LIST form is gated where tsc gates it. `reportUnmatchedProperty`
+        // reaches its two multi-name messages only through
+        // `tryElaborateArrayLikeErrors`, while the single-name TS2741 above
+        // runs unconditionally — so a pair that mixes a list with a
+        // non-list on the other side falls back to the plain TS2322 wrapper
+        // once more than one name is missing. `{ 0: number; 1: number;
+        // length: 2 }` against `[number, number]` is exactly that (ztsc used
+        // to list all forty `Array` members), and so is a TUPLE source
+        // against an ordinary object target.
+        if (!missingListElaborates(c, rs, rt)) return false;
         // Past five names tsc abbreviates the list and reports TS2740 rather
         // than TS2739; the elaboration chain renders the same list, so both
         // share one formatter (`elaborate.missingList`).
@@ -1380,10 +1448,12 @@ fn unionHasExcessCheckTarget(c: *Checker, rt: TypeId) Error!bool {
 ///                                       // `{ tag: "T" }`, which has no `a1`
 /// ```
 ///
-/// A discriminator here is a source property whose own type is a unit (or a
-/// union of units) — the shape a tag actually has, and a strict subset of the
-/// properties tsc's `findDiscriminantProperties` accepts, so the reduction can
-/// only be coarser than tsc's and the check only more forgiving.
+/// Which source properties count as discriminators is decided by the TARGET,
+/// not by the source: `findDiscriminantProperties` walks the source's names but
+/// asks `isDiscriminantProperty(target, name)` about each one, and that test
+/// reads the union's synthesized property (`targetDiscriminates`). So a tag the
+/// source types as plain `string` still reduces, as long as the target union
+/// disagrees about it and at least one arm spells it as a literal.
 ///
 /// Per discriminator, every still-included constituent that does not accept the
 /// source's value drops out; a discriminator NO constituent accepts is discarded
@@ -1416,7 +1486,19 @@ fn unionHasExcessCheckTarget(c: *Checker, rt: TypeId) Error!bool {
 ///
 /// The oracle keeps the "some member reaches it" reading exactly: `"a" | "c"`
 /// against that same `U` keeps the `"a"` arm and drops the `"b"` one.
+///
+/// `boolean` is one of those unions for tsc — `booleanType` IS
+/// `true | false` — so a `boolean`-typed tag reaches a `{ k: true }` arm
+/// through its `true` member and keeps it in the running. ztsc keeps `boolean`
+/// as one kind, so without the expansion `{ k: boolean; aa } | { k: true; bb }`
+/// reduced to the first arm alone and reported `bb` as excess where tsgo is
+/// silent. (Expanded here for the same reason, and in the same shape, as
+/// `discriminatedUnionAssignable`'s own `bool_consts`.)
 fn discriminantSelects(c: *Checker, sv: TypeId, tv: TypeId) Error!bool {
+    if (c.ts.kind(sv) == .boolean) {
+        return try c.isAssignable(types.true_type, tv) or
+            try c.isAssignable(types.false_type, tv);
+    }
     if (c.ts.kind(sv) != .union_type) return c.isAssignable(sv, tv);
     // `memberList` hands out a borrowed slice and `isAssignable` re-enters the
     // checker, which can invalidate it.
@@ -1428,8 +1510,51 @@ fn discriminantSelects(c: *Checker, sv: TypeId, tv: TypeId) Error!bool {
     return false;
 }
 
+/// tsc's `isLiteralType` — does `t` consist of unit values only, so that a
+/// target property of this type carries `CheckFlags.HasLiteralType`?
+///
+/// `boolean` counts: tsc has no `boolean` type, only the union `true | false`,
+/// and `isLiteralType` short-circuits on `TypeFlags.Boolean`. A whole ENUM
+/// counts for the same reason — tsc models it as the union of its member
+/// literals (`TypeFlags.EnumLiteral`) — while ztsc keeps both nominal.
+fn isLiteralLike(c: *Checker, t: TypeId) Error!bool {
+    return switch (c.ts.kind(t)) {
+        .boolean, .enum_type => true,
+        else => c.isUnitOrUnitUnion(t),
+    };
+}
+
+/// tsc's `isDiscriminantProperty(target, name)`: does the union `ms` treat
+/// `name` as a tag? Its synthesized property must carry
+/// `CheckFlags.Discriminant` — `HasNonUniformType` (the constituents do not all
+/// give the name the same type) AND `HasLiteralType` (at least one of them
+/// gives it a unit-valued type).
+///
+/// Only constituents that HAVE the name are consulted: tsc's
+/// `createUnionOrIntersectionProperty` records a missing one as `Partial` and
+/// moves on, and `isDiscriminantProperty` reads the property through
+/// `getUnionOrIntersectionProperty`, which does not filter partials out. The
+/// caller's own loop then leaves such a constituent in the running.
+fn targetDiscriminates(c: *Checker, ms: []const TypeId, name: Atom) Error!bool {
+    var first: TypeId = 0;
+    var non_uniform = false;
+    var any_literal = false;
+    for (ms) |m| {
+        const rm = try c.resolveStructural(m);
+        const pt = (try c.targetPropType(rm, name)) orelse continue;
+        const rp = try c.resolveStructural(pt);
+        if (first == 0) first = rp else if (rp != first) non_uniform = true;
+        if (try isLiteralLike(c, rp)) any_literal = true;
+    }
+    return non_uniform and any_literal;
+}
+
 fn epcReducedUnion(c: *Checker, src_t: TypeId, rt: TypeId) Error!TypeId {
-    const ms = try c.memberList(rt);
+    // `memberList` hands out a borrowed slice and every probe below re-enters
+    // the checker (`resolveStructural`, `propOfType`, `isAssignable`), any of
+    // which can grow the store and move it — see `discriminantSelects`.
+    const ms = try c.scratch().dupe(TypeId, try c.memberList(rt));
+    defer c.scratch().free(ms);
     if (ms.len < 2) return rt;
     const rs = try c.resolveStructural(src_t);
     if (c.ts.kind(rs) != .object) return rt;
@@ -1452,7 +1577,7 @@ fn epcReducedUnion(c: *Checker, src_t: TypeId, rt: TypeId) Error!TypeId {
     var reduced = false;
     for (0..nprops) |pi| {
         const sp = c.ts.objectProp(rs, @intCast(pi));
-        if (!try c.isUnitOrUnitUnion(try c.resolveStructural(sp.ty))) continue;
+        if (!try targetDiscriminates(c, ms, sp.name)) continue;
         var matched = false;
         var maybe_out: usize = 0;
         const maybe = try c.scratch().alloc(bool, ms.len);
