@@ -2937,20 +2937,29 @@ fn checkInterfaceDecl(c: *Checker, node: Node) Error!void {
     // method signatures) fire even for unused interfaces.
     const d = c.tree.nodeData(node);
     const data = c.tree.extraData(ast.InterfaceData, d.lhs);
-    // The members' computed NAMES, in the enclosing scope (which is where a
-    // computed key is evaluated) and before the name guard, because a nameless
+    const saved = c.cur_scope;
+    defer c.cur_scope = saved;
+    // The members' computed NAMES, before the name guard, because a nameless
     // interface's members are still written down.
     // (wave-10 A: one flagged call into `computed_key.zig`.)
+    //
+    // Checked in the interface's OWN scope — the block's type-parameter scope,
+    // which is where the binder bound the key expressions. tsc resolves a
+    // computed key in its ordinary lexical scope, and an interface's type
+    // parameters are part of it: `interface I<T> { [foo<T>()](): void }` finds
+    // `T` and reports only that finding it there is illegal (TS2467). Running
+    // in the ENCLOSING scope instead left `T` unresolved and added a TS2304 the
+    // oracle does not have (`computedPropertyNames35_ES5`/`_ES6`).
+    if (try c.scopeOf(node)) |s| c.cur_scope = s;
     try computed_key.checkMemberNames(
         c,
         c.tree.extraRange(data.members_start, data.members_end),
         .type_space,
         c.tree.extraRange(data.tp_start, data.tp_end),
     );
+    c.cur_scope = saved;
     if (data.name_token == 0) return;
     const a = try c.atomOfToken(data.name_token);
-    const saved = c.cur_scope;
-    defer c.cur_scope = saved;
     if (c.bind.lookupInScope(c.cur_scope, a)) |sym| {
         if (c.bind.symbol_flags[sym].interface) {
             _ = try c.interfaceGeneric(c.toGlobal(sym));
