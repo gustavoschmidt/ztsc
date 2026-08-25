@@ -1961,13 +1961,32 @@ const RelVerdict = enum { yes, no, no_nocache };
 /// frame; with this off nothing derived from an assumption is ever published.
 const commit_at_root = true;
 
-/// A/B leg: a COMPLETE measured-variance comparison that fails decides the pair
-/// (tsc's `relateVariances` → `Ternary.False`, no structural fallback). With
-/// this off the verdict is believed only when positive and a failure falls
-/// through to the members — which is unsound for a mutually-recursive family,
-/// because the structural walk is co-inductive and comes back YES. See
-/// `measuredVarianceVerdict`.
-const measured_variance_decides = false;
+/// A COMPLETE measured-variance comparison that fails DECIDES the pair — tsc's
+/// `relateVariances` returns `Ternary.False` and `structuredTypeRelatedTo`
+/// hands that back without looking at a member. Believing only the positive
+/// half is not a conservative simplification but a different type system: the
+/// structural walk is co-inductive, so a mutually-recursive family whose
+/// arguments are genuinely unrelated walks in a circle and comes back YES (see
+/// `measuredVarianceVerdict` for the `outline` shape that showed it).
+///
+/// "Complete" is doing the work here, and it is why this was off from 60f4287
+/// until wave 36: a measurement ztsc could not fully take used to read as an
+/// ordinary verdict, so a decisive NO could be manufactured out of a walk that
+/// never finished. `measuredVariances` now carries tsc's `Unmeasurable` /
+/// `Unreliable` marks (`AllowsStructuralFallback`) beside each parameter's
+/// verdict, and `measuredVarianceVerdict` refuses to decide on a flagged one —
+/// which is exactly the set of pairs the earlier attempts got wrong. With the
+/// marks in, the `--variance-decides` leg is 0 regressions / +1 exact over the
+/// whole ts-suite, both apps byte-identical and the `--checkers` grid stable;
+/// the four cases wave 35 recorded as blockers
+/// (`varianceRepeatedlyPropegatesWithUnreliableFlag`,
+/// `nongenericPartialInstantiationsRelatedInBothDirections`,
+/// `unionTypeInference`) are clean.
+///
+/// `checker.Options.variance_decides` stays as the RUN-TIME leg, so a binary
+/// can still be asked the old question; it is now the default rather than the
+/// experiment.
+const measured_variance_decides = true;
 
 /// How many references the nominal heritage walk holds before giving up (and
 /// the size of its stack-allocated queue). A declared `extends` graph is a
