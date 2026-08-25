@@ -3227,6 +3227,12 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         // matter what the holes hold. Applying it here narrows the leniency
         // to the cases that actually need a matcher.
         if (sk == .template_literal_type) {
+            // tsc, at exactly this arm: "Report unreliable variance for type
+            // variables referenced in template literal type placeholders. For
+            // example, `foo-${number}` is related to `foo-${string}` even
+            // though number isn't related to string." A measurement whose
+            // marker sits in a placeholder therefore measured nothing.
+            try variance_zig.noteVarianceMarker(c, s, false);
             if (template_zig.definitelyUnrelated(c, s, t)) return false;
             // …and the other half tsc decides cheaply: two patterns with the
             // SAME fixed text relate exactly when each source placeholder is
@@ -3814,6 +3820,49 @@ pub fn mappedAddsOptional(c: *Checker, m: TypeId) bool {
     return c.ts.mappedFlags(m) & types.mapped_flag_optional_add != 0;
 }
 
+/// The keys a mapped TARGET actually produces, which is what a source has to
+/// supply — tsc's
+///
+/// ```ts
+/// // If target has shape `{ [P in Q as R]: T }`, then its keys have type `R`.
+/// // If target has shape `{ [P in Q]: T }`, then its keys have type `Q`.
+/// const targetKeys = keysRemapped ? getNameTypeFromMappedType(target)! : getConstraintTypeFromMappedType(target);
+/// ```
+///
+/// An `as` clause REPLACES the key set rather than filtering it, so reading
+/// the constraint for a remapped map asks about keys the map never emits.
+/// Before this existed the whole source-to-mapped-target family simply bailed
+/// on `mappedAs(t) != 0`, which made every `{ [P in keyof T as …]: … }` target
+/// unreachable from any source (`mappedTypeAsClauseRelationships`).
+fn mappedTargetKeys(c: *Checker, t: TypeId) Error!TypeId {
+    if (c.ts.mappedAs(t) == 0) return c.mappedKeySet(t);
+    return mappedBindKeyParam(c, t, c.ts.mappedAs(t));
+}
+
+/// The template a mapped TARGET's values have, with its key parameter bound
+/// the way `mappedTargetKeys` binds it — see there.
+fn mappedTargetTemplate(c: *Checker, t: TypeId) Error!TypeId {
+    if (c.ts.mappedAs(t) == 0) return c.ts.mappedValue(t);
+    return mappedBindKeyParam(c, t, c.ts.mappedValue(t));
+}
+
+/// Replace a mapped type's key parameter `P` with its CONSTRAINT — the key set
+/// the map iterates.
+///
+/// tsc's `getTypeParameterFromMappedType` hands back a `P` that carries
+/// `getConstraintTypeFromMappedType` as its constraint, so its relation
+/// questions (`R <: keyof S`, and the `S[R]` vs `T[P]` comparison that follows)
+/// are answered through that constraint. ztsc's `.mapped_param` carries none,
+/// so a free `P` relates to nothing and every remapped target was unreachable.
+/// Substituting the key set for `P` is the same information, spelled where
+/// ztsc can read it — and it is applied to BOTH sides of the comparison, so
+/// the two line up exactly as tsc's constrained `P` makes them.
+fn mappedBindKeyParam(c: *Checker, t: TypeId, ty: TypeId) Error!TypeId {
+    const kp = c.ts.mappedKeyParam(t);
+    if (c.ts.kind(kp) != .mapped_param) return ty;
+    return c.substMappedKey(ty, c.ts.mappedParamId(kp), try c.mappedKeySet(t));
+}
+
 /// The STRING INDEX SIGNATURE a still-generic mapped type apparently has, or
 /// null when it has none.
 ///
@@ -3886,7 +3935,20 @@ pub fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
         // the templates must relate with the two key parameters identified.
         if (c.mappedAddsOptional(s) and !c.mappedAddsOptional(t)) return null;
         if (c.ts.mappedAs(s) != 0 or c.ts.mappedAs(t) != 0) return null; // key remapping: not modelled
-        if (!try c.isAssignable(try c.mappedKeySet(t), try c.mappedKeySet(s))) return null;
+        const s_keys = try c.mappedKeySet(s);
+        // tsc's `mappedTypeRelatedTo` instantiates the SOURCE's constraint
+        // through `reportUnmeasurableMapper`/`reportUnreliableMapper` here: a
+        // variance measurement whose marker is inside that constraint learns
+        // nothing usable from this arm, because two mapped types relate by
+        // their KEY SETS and not by what the marker stands for. A source that
+        // REMOVES optionality is outright nonlinear (`Unmeasurable`), the rest
+        // merely `Unreliable` — see `variance.noteVarianceMarker`.
+        try variance_zig.noteVarianceMarker(
+            c,
+            s_keys,
+            c.ts.mappedFlags(s) & types.mapped_flag_optional_remove != 0,
+        );
+        if (!try c.isAssignable(try c.mappedKeySet(t), s_keys)) return null;
         const sv = try c.substMappedKey(
             c.ts.mappedValue(s),
             c.ts.mappedParamId(c.ts.mappedKeyParam(s)),
@@ -3953,11 +4015,11 @@ pub fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
         // string[] }` returned from `getErrors()` as `{ base: ["…"] }` is the
         // shape: `keyof D` is deferred, so the required-key rule below
         // rejected it outright even though `base` is the only key involved.
-        if (c.mappedAddsOptional(t) and c.ts.mappedAs(t) == 0) {
+        if (c.mappedAddsOptional(t)) {
             const skeys = try c.keyofType(try c.resolveStructural(s));
             var applicable: std.ArrayList(TypeId) = .empty;
             defer applicable.deinit(c.scratch());
-            const tkeys = try c.mappedKeySet(t);
+            const tkeys = try mappedTargetKeys(c, t);
             const tk_res = try c.resolveStructural(tkeys);
             const constituents: []const TypeId = if (c.ts.kind(tk_res) == .union_type)
                 try c.memberList(tk_res)
@@ -3991,7 +4053,7 @@ pub fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
             if (applicable.items.len == 0) return null;
             const filtered = try c.ts.makeUnion(c.scratch(), applicable.items);
             const access = try c.reduceIndexedAccess(s, filtered);
-            return if (try c.isAssignable(access, c.ts.mappedValue(t))) true else null;
+            return if (try c.isAssignable(access, try mappedTargetTemplate(c, t))) true else null;
         }
         // tsc `structuredTypeRelatedTo`: `S` is related to `{ [P in C]: X }`
         // when `keyof S` is related to `C` and `S[P]` is related to `X`.
@@ -4007,7 +4069,7 @@ pub fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
         // matching key set and a template of `T[P]` and said yes — the
         // `Required<T>`/`Denullified<T>` half of `mappedTypes6`.
         if (c.ts.mappedFlags(t) & types.mapped_flag_optional_remove != 0) return null;
-        if (c.mappedAddsOptional(t) or c.ts.mappedAs(t) != 0) return null;
+        if (c.mappedAddsOptional(t)) return null;
         // tsc relates the TARGET's key set to the SOURCE's, not the other way
         // round (`isRelatedTo(targetKeys, sourceKeys)`), and the direction is
         // the whole rule: every key the map PRODUCES has to be one the source
@@ -4016,9 +4078,16 @@ pub fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
         // `Readonly<T>` for a `T extends Thing`, because `"a" | "b"` reaches
         // `keyof T` through `T`'s constraint while `keyof T` reaches nothing
         // (`mappedTypeRelationships` f41).
-        if (!try c.isAssignable(try c.mappedKeySet(t), try c.keyofType(s))) return null;
-        const access = try c.reduceIndexedAccess(s, c.ts.mappedKeyParam(t));
-        return if (try c.isAssignable(access, c.ts.mappedValue(t))) true else null;
+        const tkeys = try mappedTargetKeys(c, t);
+        if (!try c.isAssignable(tkeys, try c.keyofType(s))) return null;
+        // tsc indexes the source by the map's own key PARAMETER (`S[P]` against
+        // the template `T[P]`, which is then free), except when the keys are
+        // REMAPPED: an `as` clause means the produced keys are `R`, not `P`, so
+        // the source is indexed by `R` — tsc's `indexingType = keysRemapped ?
+        // (filteredByApplicability || targetKeys) : …typeParameter`.
+        const idx = if (c.ts.mappedAs(t) != 0) tkeys else c.ts.mappedKeyParam(t);
+        const access = try c.reduceIndexedAccess(s, idx);
+        return if (try c.isAssignable(access, try mappedTargetTemplate(c, t))) true else null;
     }
     // A still-generic map whose key set covers the string key space has an
     // apparent INDEX SIGNATURE (`mappedApparentStringIndex`), so it relates to
@@ -5849,6 +5918,21 @@ pub fn signatureAssignableModeInner(c: *Checker, s: TypeId, t: TypeId, mode: Sig
     return c.signatureAssignableModeInnerErase(s, t, mode, .constraints);
 }
 
+/// tsc's `getNonArrayRestType`: the type of `sig`'s rest parameter when it is
+/// neither an array nor `any` — i.e. a TUPLE (or something still generic),
+/// which the relation unrolls rather than relates. Null for every other
+/// signature.
+fn nonArrayRestType(c: *Checker, sig: TypeId) ?TypeId {
+    const n = c.ts.fnParamCount(sig);
+    if (n == 0) return null;
+    const last = c.ts.fnParam(sig, @intCast(n - 1));
+    if (!last.rest()) return null;
+    return switch (c.ts.kind(last.ty)) {
+        .array, .any, .err => null,
+        else => last.ty,
+    };
+}
+
 pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode: SigMode, erase_in0: Erase) Error!bool {
     // The relation's second difference, and tsc says so in a comment of its
     // own at the one place that decides it (`signaturesRelatedTo`):
@@ -6059,6 +6143,23 @@ pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode
     // `relate`). This is an under-report by construction, never a false
     // positive: the pair could not be decided, so nothing is reported.
     if (c.ts.kind(se) != .function or c.ts.kind(te) != .function) return true;
+    // tsc's `compareSignaturesRelated`, first thing it does with the two
+    // parameter lists:
+    //
+    // ```ts
+    // const sourceRestType = getNonArrayRestType(source);
+    // const targetRestType = getNonArrayRestType(target);
+    // if (sourceRestType || targetRestType) void instantiateType(sourceRestType || targetRestType, reportUnreliableMarkers);
+    // ```
+    //
+    // A rest parameter typed by a TUPLE (or a still-generic type) is UNROLLED
+    // against the other signature's fixed parameters rather than related as a
+    // type, so a variance measurement whose marker is in that tuple learns
+    // nothing from the comparison. Marked `Unreliable`.
+    if (c.variance_probe_markers[0] != 0) {
+        const rest = nonArrayRestType(c, se) orelse nonArrayRestType(c, te);
+        if (rest) |r| try variance_zig.noteVarianceMarker(c, r, false);
+    }
     // tsc's `compareSignaturesRelated`: an explicit `this` parameter is part
     // of the relation and behaves like an ordinary parameter —
     // contravariant in a strict function position, bivariant for methods
@@ -6637,6 +6738,28 @@ fn instantiableRestType(c: *const Checker, sig: TypeId) ?TypeId {
 fn restTypeAtPosition(c: *Checker, sig: TypeId, pos: u32) Error!TypeId {
     if (instantiableRestType(c, sig)) |rt| {
         if (pos + 1 == c.ts.fnParamCount(sig)) return rt;
+    }
+    // The other half of tsc's `getEffectiveRestType`, for a rest typed by a
+    // VARIADIC tuple:
+    //
+    // ```ts
+    // if (restType.target.hasRestElement) return sliceTupleType(restType, restType.target.fixedLength);
+    // ```
+    //
+    // The slice keeps the trailing element's VARIADIC flag, so
+    // `(...x: [number, ...T])` answers `[...T]` — which normalizes to `T` —
+    // at its rest position. `restTupleAtPosition` reads that position through
+    // `paramTypeAt`, which hands back the variadic's ELEMENT type and drops
+    // the spread, so the same signature packed `[(T[number])?]` and failed
+    // against a target whose own rest IS `T`:
+    // `(...x: [number, ...T]) => void` was refused as a
+    // `(x: number, ...args: T) => void` (`restTuplesFromContextualTypes` f4).
+    if (try c.sigRestTuple(sig)) |tup| {
+        const len = c.ts.tupleLen(tup);
+        if (len > 0 and pos + 1 == c.ts.fnParamCount(sig) - 1 + len) {
+            const e = c.ts.tupleElem(tup, @intCast(len - 1));
+            if (e.rest()) return e.ty;
+        }
     }
     return loneVariadic(c, try c.restTupleAtPosition(sig, pos));
 }

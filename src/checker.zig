@@ -1267,12 +1267,28 @@ pub const Checker = struct {
     /// the measurement is trying to verify, so it would make every annotation
     /// vacuously true. tsc keeps the same exemption as its `markerTypes` set.
     variance_marker_refs: [2]TypeId = .{ 0, 0 },
+    /// The type-parameter SYMBOLS of the three markers the measurement in
+    /// flight substituted for its parameter (`sub`, `super`, `other`), or all
+    /// zero outside one. tsc's `markerSubType`/`markerSuperType`/
+    /// `markerOtherType`, and this is the state its
+    /// `outofbandVarianceMarkerHandler` closes over: a relation that reaches
+    /// one of the positions where a YES does not imply the arguments were
+    /// really related — a mapped type's constraint, a template-literal
+    /// placeholder, a non-array rest parameter — with a marker inside the type
+    /// records that in `variance_probe_fallback`. See
+    /// `variance.noteVarianceMarker`.
+    variance_probe_markers: [3]SymbolId = .{ 0, 0, 0 },
+    /// What the measurement in flight has seen: bit 0 is tsc's
+    /// `VarianceFlags.Unmeasurable`, bit 1 its `Unreliable`. Together they are
+    /// its `AllowsStructuralFallback` — a measured variance that must not be
+    /// allowed to DECIDE a pair on its own.
+    variance_probe_fallback: u2 = 0,
     /// Structurally MEASURED variance of a generic symbol's type parameters
-    /// (`Measured`, tsc's `getVariances`), packed 3 bits each, lowest bits
-    /// first. A cached 0 means "no parameter yielded a verdict", so the
-    /// relation's probe costs one hash lookup on hot paths. Parameters past
-    /// the 10th are read as unmeasured.
-    measured_variance: IntMap(SymbolId, u32) = .empty,
+    /// (`Measured` plus the two fallback bits, tsc's `VarianceFlags`), packed
+    /// 5 bits each, lowest bits first. A cached 0 means "no parameter yielded
+    /// a verdict", so the relation's probe costs one hash lookup on hot paths.
+    /// Parameters past the 10th are read as unmeasured.
+    measured_variance: IntMap(SymbolId, u64) = .empty,
     /// Generic symbols whose measurement is on the stack right now. tsc's
     /// `emptyArray` sentinel: a pair of references to a generic that is
     /// measuring ITSELF is assumed related, which is what stops the

@@ -31,6 +31,7 @@ const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
+const identity = @import("identity.zig");
 
 /// Declaration-site variance (TS 4.7 `in`/`out`) of one type parameter.
 pub const Variance = enum(u2) {
@@ -133,9 +134,10 @@ pub fn varianceVerdict(c: *Checker, s_ref: TypeId, t_ref: TypeId) Error!?bool {
 
 /// How a generic actually USES one of its type parameters, measured from its
 /// body rather than read off an `in`/`out` annotation — tsc's
-/// `VarianceFlags`. Packed 3 bits per parameter in `measured_variance`, so
-/// `unmeasured` must stay 0: an all-zero cache entry is "this generic told us
-/// nothing", the answer for every non-generic and every shape below.
+/// `VarianceFlags.VarianceMask`. Packed in the low 3 bits of a parameter's
+/// 5-bit slot in `measured_variance`, so `unmeasured` must stay 0: an all-zero
+/// cache entry is "this generic told us nothing", the answer for every
+/// non-generic and every shape below.
 pub const Measured = enum(u3) {
     /// No verdict. The parameter list is too long to pack, the body is not a
     /// materializable generic, or the measurement was declined. The relation
@@ -160,10 +162,33 @@ pub const Measured = enum(u3) {
     independent = 5,
 };
 
-/// Type parameters one generic may have and still be measured. Three bits
+/// Type parameters one generic may have and still be measured. Five bits
 /// each have to fit in the `measured_variance` word; a longer list is read as
 /// unmeasured and keeps the structural walk.
 const max_measured_params = 10;
+
+/// Bits per parameter in `measured_variance`: the 3-bit `Measured` plus the
+/// two fallback flags below.
+const measured_bits = 5;
+
+/// tsc's `VarianceFlags.Unmeasurable` — the measurement passed through a
+/// position whose relation is NONLINEAR, so relating the arguments the way the
+/// parameter is used does not decide the pair either way. Only a mapped type
+/// that REMOVES optionality (`-?`) produces it: no matter how two constraints
+/// relate, the templates they select need not.
+const fallback_unmeasurable: u64 = 1 << 3;
+
+/// tsc's `VarianceFlags.Unreliable` — the measurement passed through a
+/// position where a YES is reached WITHOUT relating the marker at all: a
+/// template-literal placeholder (`` `foo-${number}` `` relates to
+/// `` `foo-${string}` ``), a mapped type's constraint, or a non-array rest
+/// parameter. The variance verdict stands as a hint but must not decide.
+const fallback_unreliable: u64 = 1 << 4;
+
+/// tsc's `VarianceFlags.AllowsStructuralFallback`: a parameter carrying either
+/// flag lets a FAILED argument comparison fall through to the structural walk
+/// rather than settle the pair.
+const allows_structural_fallback: u64 = fallback_unmeasurable | fallback_unreliable;
 
 /// Measurements that may be on the stack at once. A measurement walks the
 /// generic's body, and every OTHER generic it meets there wants measuring
@@ -180,9 +205,16 @@ const max_measured_params = 10;
 /// minutes; 32 clears it with room to spare.
 pub const max_variance_measure_depth = 32;
 
-fn measuredAt(bits: u32, i: usize) Measured {
+fn measuredAt(bits: u64, i: usize) Measured {
     if (i >= max_measured_params) return .unmeasured;
-    return @enumFromInt(@as(u3, @truncate(bits >> @intCast(3 * i))));
+    return @enumFromInt(@as(u3, @truncate(bits >> @intCast(measured_bits * i))));
+}
+
+/// The fallback flags of parameter `i` (`fallback_unmeasurable` /
+/// `fallback_unreliable`), shifted back down to bit 3/4.
+fn fallbackAt(bits: u64, i: usize) u64 {
+    if (i >= max_measured_params) return 0;
+    return (bits >> @intCast(measured_bits * i)) & allows_structural_fallback;
 }
 
 /// Structurally measured variance of every type parameter of `owner`, packed
@@ -197,7 +229,7 @@ fn measuredAt(bits: u32, i: usize) Measured {
 /// is not measured — the annotation IS the declared answer, and whether the
 /// body agrees is TS2636's business (`checkVarianceAnnotations`), not the
 /// relation's.
-pub fn measuredVariances(c: *Checker, owner: SymbolId) Error!?u32 {
+pub fn measuredVariances(c: *Checker, owner: SymbolId) Error!?u64 {
     if (c.measured_variance.get(owner)) |v| return v;
     if (c.variance_measure_depth >= max_variance_measure_depth) return null;
     // A measurement is a property of the GENERIC, not of the question that
@@ -333,16 +365,18 @@ pub fn measuredVariances(c: *Checker, owner: SymbolId) Error!?u32 {
     }
 
     const declared = try c.declaredVariances(owner);
-    var bits: u32 = 0;
+    var bits: u64 = 0;
     for (tps.items, 0..) |_, i| {
         const dv: Variance = if (i >= 16) .none else @enumFromInt(@as(u2, @truncate(declared >> @intCast(2 * i))));
-        const m: Measured = switch (dv) {
-            .covariant => .covariant,
-            .contravariant => .contravariant,
-            .invariant => .invariant,
+        // An ANNOTATED parameter is not measured, so it carries no fallback
+        // flags either — tsc reads the modifier and never runs the probe.
+        const slot: u64 = switch (dv) {
+            .covariant => @intFromEnum(Measured.covariant),
+            .contravariant => @intFromEnum(Measured.contravariant),
+            .invariant => @intFromEnum(Measured.invariant),
             .none => try measureOneVariance(c, owner, tps.items, i),
         };
-        bits |= @as(u32, @intFromEnum(m)) << @intCast(3 * i);
+        bits |= slot << @intCast(measured_bits * i);
     }
     // Cached unconditionally, even when the relation gave up on depth
     // somewhere inside (`max_relation_depth`, "assume related"): a
@@ -358,8 +392,9 @@ pub fn measuredVariances(c: *Checker, owner: SymbolId) Error!?u32 {
 
 /// One parameter's measurement: build the two instantiations that differ only
 /// at position `i` — one carrying the `sub` marker, one the `super` — and ask
-/// the relation which way they go.
-fn measureOneVariance(c: *Checker, owner: SymbolId, tps: []const TypeParamInfo, i: usize) Error!Measured {
+/// the relation which way they go. Returns the parameter's whole 5-bit slot:
+/// the `Measured` verdict plus whatever fallback flags the walk tripped.
+fn measureOneVariance(c: *Checker, owner: SymbolId, tps: []const TypeParamInfo, i: usize) Error!u64 {
     const args = try c.scratch().alloc(TypeId, tps.len);
     defer c.scratch().free(args);
     for (tps, 0..) |tp, j| args[j] = try c.ts.makeTypeParam(tp.sym);
@@ -370,7 +405,7 @@ fn measureOneVariance(c: *Checker, owner: SymbolId, tps: []const TypeParamInfo, 
     const super_ref = try c.ts.makeRef(owner, args);
     // The parameter is not part of the reference's identity at all (a
     // defaulted tail that `makeRef` dropped): nothing to measure.
-    if (sub_ref == super_ref) return .independent;
+    if (sub_ref == super_ref) return @intFromEnum(Measured.independent);
     try c.marker_refs.put(c.cm(), sub_ref, {});
     try c.marker_refs.put(c.cm(), super_ref, {});
     // A measurement is only as good as the relation that answered it, and the
@@ -399,26 +434,89 @@ fn measureOneVariance(c: *Checker, owner: SymbolId, tps: []const TypeParamInfo, 
     const saved_inst_trip = c.inst_limit_tripped;
     c.inst_limit_tripped = false;
     defer c.inst_limit_tripped = c.inst_limit_tripped or saved_inst_trip;
+    // tsc's `outofbandVarianceMarkerHandler`, installed for the duration of
+    // exactly these probes: the marker SYMBOLS this parameter is being
+    // measured with, and the flags the relation reports back through
+    // `noteVarianceMarker`. Saved and restored rather than assumed clear — a
+    // measurement can nest inside another one (`max_variance_measure_depth`),
+    // and the inner one's markers must not be attributed to the outer one's
+    // parameter.
+    const saved_markers = c.variance_probe_markers;
+    const saved_fallback = c.variance_probe_fallback;
+    c.variance_probe_markers = .{ c.ts.typeParamSymbol(markers[0]), c.ts.typeParamSymbol(markers[1]), 0 };
+    c.variance_probe_fallback = 0;
+    defer {
+        c.variance_probe_markers = saved_markers;
+        c.variance_probe_fallback = saved_fallback;
+    }
     const co = try c.isAssignable(sub_ref, super_ref);
     const contra = try c.isAssignable(super_ref, sub_ref);
-    if ((c.rel_guard_tripped or c.inst_limit_tripped) and co and contra) return .unmeasured;
-    if (co and contra) {
-        // Bivariant may just mean the parameter is never witnessed. tsc
-        // settles it with a THIRD marker related to neither of the first two
-        // (`markerOtherType`): if that one relates as well, no member reads
-        // the parameter. A second `varianceMarkers` mint supplies it — its
-        // UNCONSTRAINED half is by construction related to nothing but
-        // itself, which is exactly the marker wanted.
-        const other = (try c.varianceMarkers(c.symbolName(tps[i].sym)))[1];
-        args[i] = other;
-        const other_ref = try c.ts.makeRef(owner, args);
-        try c.marker_refs.put(c.cm(), other_ref, {});
-        if (other_ref != super_ref and try c.isAssignable(other_ref, super_ref)) return .independent;
-        return .bivariant;
+    if ((c.rel_guard_tripped or c.inst_limit_tripped) and co and contra) {
+        return @intFromEnum(Measured.unmeasured);
     }
-    if (co) return .covariant;
-    if (contra) return .contravariant;
-    return .invariant;
+    const verdict: Measured = blk: {
+        if (co and contra) {
+            // Bivariant may just mean the parameter is never witnessed. tsc
+            // settles it with a THIRD marker related to neither of the first two
+            // (`markerOtherType`): if that one relates as well, no member reads
+            // the parameter. A second `varianceMarkers` mint supplies it — its
+            // UNCONSTRAINED half is by construction related to nothing but
+            // itself, which is exactly the marker wanted.
+            const other = (try c.varianceMarkers(c.symbolName(tps[i].sym)))[1];
+            c.variance_probe_markers[2] = c.ts.typeParamSymbol(other);
+            args[i] = other;
+            const other_ref = try c.ts.makeRef(owner, args);
+            try c.marker_refs.put(c.cm(), other_ref, {});
+            if (other_ref != super_ref and try c.isAssignable(other_ref, super_ref)) break :blk .independent;
+            break :blk .bivariant;
+        }
+        if (co) break :blk .covariant;
+        if (contra) break :blk .contravariant;
+        break :blk .invariant;
+    };
+    return @as(u64, @intFromEnum(verdict)) | @as(u64, c.variance_probe_fallback) << 3;
+}
+
+/// tsc's `outofbandVarianceMarkerHandler`: the relation has reached a position
+/// where relating `t` says nothing reliable about the marker inside it, so the
+/// variance measurement in flight must not be allowed to DECIDE a pair on its
+/// own (`fallback_unmeasurable` / `fallback_unreliable`).
+///
+/// Three positions, all tsc's, all of them places where the walk answers YES
+/// without comparing what the marker stands for:
+///
+///   * a mapped type's CONSTRAINT — `{ [K in C]: X }` relates by its keys, and
+///     under `-?` (`getCombinedMappedTypeOptionality < 0`) the relation is
+///     outright nonlinear, so the flag is `Unmeasurable` rather than merely
+///     `Unreliable`;
+///   * a TEMPLATE-LITERAL placeholder — `` `foo-${number}` `` is related to
+///     `` `foo-${string}` `` although `number` is not related to `string`;
+///   * a NON-ARRAY REST parameter, whose tuple is unrolled against the other
+///     signature's fixed parameters rather than related as a type.
+///
+/// Costs one comparison against zero outside a measurement, which is
+/// everywhere the relation is actually hot. Inside one it asks the memoized
+/// `tpMentions` whether the marker is in `t` at all: tsc's version instantiates
+/// `t` with a mapper that fires on the three marker types, which is the same
+/// question. A SATURATED mention record — the walk gave up naming its
+/// parameters — is read as "no marker", deliberately: over-reporting
+/// `Unmeasurable` turns a variance YES into a structural walk that may answer
+/// NO, so an approximation here has to fall on the side of today's answer.
+pub fn noteVarianceMarker(c: *Checker, t: TypeId, unmeasurable: bool) Error!void {
+    if (c.variance_probe_markers[0] == 0) return;
+    const flag: u2 = if (unmeasurable) 1 else 2;
+    if (c.variance_probe_fallback & flag != 0) return;
+    if (t == types.no_type or t == 0) return;
+    const m = try c.tpMentions(t);
+    if (m.saturated) return;
+    for (m.syms) |sym| {
+        for (c.variance_probe_markers) |marker| {
+            if (marker != 0 and marker == sym) {
+                c.variance_probe_fallback |= flag;
+                return;
+            }
+        }
+    }
 }
 
 /// What a measured-variance comparison of two references to the same generic
@@ -481,10 +579,11 @@ const VarianceOutcome = enum {
 ///     `void` accepts anything back, so the pair gets the structural walk
 ///     rather than a verdict.
 ///
-/// Anything the measurement could not settle — an `unmeasured` parameter, or a
-/// generic the measurement declined (`measuredVariances` → null, which is
-/// tsc's `Unmeasurable`/`Unreliable` and its `AllowsStructuralFallback`) —
-/// stays `undecided` and is left to the members as before.
+/// Anything the measurement could not settle — an `unmeasured` parameter, a
+/// generic the measurement declined (`measuredVariances` → null), or one whose
+/// probe passed through an unreliable position (`allows_structural_fallback`,
+/// tsc's `Unmeasurable`/`Unreliable`) — stays `undecided` and is left to the
+/// members as before.
 pub fn measuredVarianceVerdict(c: *Checker, s_ref: TypeId, t_ref: TypeId) Error!VarianceOutcome {
     const st = &c.ts;
     const n = st.refArgCount(s_ref);
@@ -495,16 +594,18 @@ pub fn measuredVarianceVerdict(c: *Checker, s_ref: TypeId, t_ref: TypeId) Error!
     const bits = (try c.measuredVariances(owner)) orelse return .undecided;
     if (bits == 0) return .undecided;
     // Pass 1, over the WHOLE list and relating nothing: does the measurement
-    // license a verdict at all? tsc asks the same two questions of the whole
-    // variance array before it trusts a failure — `some(variances, v => v &
-    // AllowsStructuralFallback)` for an unmeasurable/unreliable parameter, and
-    // `hasCovariantVoidArgument` for a `void` argument at a covariant one (the
-    // parameter is then only ever returned, and a caller who asked for `void`
-    // accepts anything back).
+    // license a NEGATIVE verdict at all? tsc asks the same two questions of the
+    // whole variance array before it trusts a failure — `some(variances, v => v
+    // & AllowsStructuralFallback)` for an unmeasurable/unreliable parameter,
+    // and `hasCovariantVoidArgument` for a `void` argument at a covariant one
+    // (the parameter is then only ever returned, and a caller who asked for
+    // `void` accepts anything back).
     var decisive = true;
     for (0..n) |i| {
         const v = measuredAt(bits, i);
-        if (v == .unmeasured or (v == .covariant and st.kind(st.refArgAt(t_ref, i)) == .void)) {
+        if (v == .unmeasured or fallbackAt(bits, i) != 0 or
+            (v == .covariant and st.kind(st.refArgAt(t_ref, i)) == .void))
+        {
             decisive = false;
             break;
         }
@@ -515,7 +616,14 @@ pub fn measuredVarianceVerdict(c: *Checker, s_ref: TypeId, t_ref: TypeId) Error!
         const sa = st.refArgAt(s_ref, i);
         const ta = st.refArgAt(t_ref, i);
         if (sa == ta) continue;
-        const ok = switch (measuredAt(bits, i)) {
+        // "Even an `Unmeasurable` variance works out without a structural check
+        // if the source and target are IDENTICAL" — tsc's own comment. The
+        // measured direction is not usable at such a parameter (a `-?` mapped
+        // type makes the relation nonlinear: however the inputs relate, the
+        // outputs still might not), so only identity carries.
+        const ok = if (fallbackAt(bits, i) & fallback_unmeasurable != 0)
+            try identity.identical(c, sa, ta)
+        else switch (measuredAt(bits, i)) {
             .unmeasured => false,
             .independent => true,
             .covariant => try c.isAssignable(sa, ta),
