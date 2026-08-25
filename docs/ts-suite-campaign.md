@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-25, post wave 35)
+## Standings (2026-08-25, post wave 36)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7594 / 8633 (87.9%)** |
-| excess keys (false positives) | 3541 | 1329 |
-| missing keys (under-reports) | 8617 | 2527 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7630 / 8633 (88.4%)** |
+| excess keys (false positives) | 3541 | 1298 |
+| missing keys (under-reports) | 8617 | 2473 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Thirty-five waves landed (3–35), every one with ZERO match→non-match regressions in
+Thirty-six waves landed (3–36), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -573,7 +573,70 @@ separators (+15, bucketed→5). PERF METHODOLOGY (adopt): under load use
 single-threaded user-CPU interleaved A/B; script at
 scratchpad/capC35/perfcpu.sh.
 
-## Ranked next queue (wave 36) — distilled from wave-35 agent reports
+Wave 36 (+36 exact → 7630/8633 88.4%): C landed the OBJECT-LITERAL BODY
+DEFERRAL — the mechanism half-existed (DeferredBody for class fields;
+checkFunctionBody already split at tsc's checkNodeDeferred boundary);
+the real blocker was the return-type probe memoizing an `any` receiver
+mid-literal, fixed by making the probe a side query. The expando arm
+fell out of the same machinery — closed jsxComponentTypeErrors TS2786,
+objectLiteralThisWidenedOnUse, looseThisTypeInFunctions with NO jsx
+change, +9 with census finds. B landed tsc's Unmeasurable/Unreliable
+variance marks (three sites, read from a real typescript.js bundle)
+and FLIPPED measured_variance_decides to true (all four wave-31-era
+regressions closed; --variance-decides legs now inert, plumbing kept);
+mapped `as` targets; variadic rest slice. A landed types.Prop.write_ty
+INTERNED for type literals (side tables are provably order-dependent),
+gated to type literals by measurement (+3.3% RSS if stored on
+interface tables — ~29 divergent DOM pairs); composite write types
+combine like read types; abstract on the CONSTRUCT SIGNATURE. A+C
+independently built the composite-write fix — merge kept A's lazy
+two-pass (the single pass cost +2.4% drizzle). D landed the `with`
+family (+14: body BOUND but never checked; strictModeBinder codes
+survive inside, checker-pass grammar codes don't — oracle-measured),
+import-attribute same-line rules, isTypeMemberStart ABORT semantics,
+TS1317/TS1040. A's abstract commit measured +2.4% drizzle alone
+(semantic: DrizzleEntityClass's union genuinely has two members) but
+the COMBINED wave is −3.4% on drizzle — B's relation work offset it.
+makeIntersection ORIGIN closed as redesign-sized. PERF BASELINE
+WARNING (A): never use main's prebuilt zig-out binary as a baseline —
+rebuild from the merge-base in the same worktree (~2.6% drift).
+
+## Ranked next queue (wave 37) — distilled from wave-36 agent reports
+
+1. indexAccessTargetConstraint needs tsc's AccessFlags.Writing: the
+   constraint of Obj[K] as a TARGET is the INTERSECTION over a
+   union-valued key, not the union (errorInfoForRelatedIndexTypes
+   NoConstraintElaboration + likely cluster). Strictly stricter: own
+   sweep.
+2. setterWriteType residues (each +1): element-access write with a
+   UNION key (intersection of the keys' write types;
+   divergentAccessorsTypes8:151); object literals carrying write_ty
+   through checkObjectLiteral; destructure.getRestType copies Prop
+   wholesale so write_ty survives into a rest object where tsc drops
+   it (one line).
+3. elaborate.abstractCtorTail still uses the OLD bare-construct-sig
+   proxy — the "Cannot assign an abstract constructor type"
+   sub-message is missing (one line, elaborate.zig).
+4. getAndSetNotIdenticalType2:16:1: `new C()` with no inference source
+   gives C<any> where tsc gives C<unknown> — class-instantiation path
+   only (generic functions already answer unknown).
+5. assignmentStricterConstraints: tsc's getInferredType constraint
+   clamp in instantiateSignatureInContextOf (infer.zig).
+6. TS2345/TS2322 message text widens argument literals ('42' vs
+   'number') — print/assign_report; keys match, text doesn't; live on
+   divergentAccessorsTypes2.
+7. parametersSyntaxErrorNoCrash1/2: extra TS1003 on the `}` ending a
+   broken parameter list where tsgo is silent (parseParams
+   startsNoParameter retraction).
+8. TS1268/TS1337 in TYPE LITERALS (needs a checker.zig hook).
+9. import defer type * recovery (exact reconstruction open; probe
+   data in wave-36 D's report).
+10. makeIntersection ORIGIN — redesign-sized, 0 exact today. Defer.
+11. `with` residue (no suite cases). Skip unless a witness appears.
+12. Census: TS2322 one-key pool; substitution types; resolution-mode
+    attributes.
+
+## Superseded queue (wave 36, kept for context)
 
 1. Object-literal BODY DEFERRAL (tsc checkNodeDeferred): ztsc walks
    method bodies inline so getContextualThisParameterType's
