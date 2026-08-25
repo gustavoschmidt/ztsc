@@ -1557,7 +1557,16 @@ const Binder = struct {
     ///
     /// `declare module "spec"` and `declare global` are ambient MODULES, not
     /// namespaces, and take neither arm.
-    fn checkNamespaceExportDecl(b: *Binder, node: Node, module_token: TokenIndex) Error!void {
+    /// `bad_specifier` is `Flags.bad_module_specifier`: the `from` was there but
+    /// what followed was not a string literal. tsc reports "String literal
+    /// expected." (the parser's TS1141 here) and RETURNS out of
+    /// `checkExternalImportOrExportDeclaration`, so neither arm below runs —
+    /// `namespace N { export * from Aaa; }` is that one diagnostic, not two
+    /// (measured, `exportDeclarationInInternalModule`). A module token of 0
+    /// cannot say this on its own: it also means "no `from` at all", which is
+    /// exactly the shape the second arm exists for.
+    fn checkNamespaceExportDecl(b: *Binder, node: Node, module_token: TokenIndex, bad_specifier: bool) Error!void {
+        if (bad_specifier) return;
         if (!b.inPlainNamespaceBody()) return;
         if (module_token != 0) return b.diag(.export_decl_in_namespace, module_token);
         if (b.ambient) return;
@@ -2509,7 +2518,8 @@ const Binder = struct {
                     b.saw_module_syntax = true;
                     b.saw_export_declaration = true;
                 }
-                try b.checkNamespaceExportDecl(node, d.rhs);
+                const e = b.tree.extraData(ast.ExportNamed, d.lhs);
+                try b.checkNamespaceExportDecl(node, d.rhs, e.flags & ast.Flags.bad_module_specifier != 0);
                 try b.bindExportNamed(node);
             },
             .export_all => {
@@ -2517,7 +2527,8 @@ const Binder = struct {
                     b.saw_module_syntax = true;
                     b.saw_export_declaration = true;
                 }
-                try b.checkNamespaceExportDecl(node, d.rhs);
+                const e = b.tree.extraData(ast.ExportAll, d.lhs);
+                try b.checkNamespaceExportDecl(node, d.rhs, e.flags & ast.Flags.bad_module_specifier != 0);
                 try b.bindExportAll(node);
             },
             .export_assign => {

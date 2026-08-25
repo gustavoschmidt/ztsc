@@ -17,10 +17,11 @@
 //! sharing a program hides them all, because one syntactic error suppresses
 //! every semantic diagnostic in the whole program.
 //!
-//! `const` is deliberately absent. tsc does not treat it as a modifier here at
-//! all: `constructor(const a: number)` is TS1359 ("'const' is a reserved word
-//! that cannot be used here") from the scanner, plus a "',' expected" behind
-//! it, and ztsc's existing recovery already answers there.
+//! `const` is deliberately absent from `role`. tsc does not treat it as a
+//! parameter modifier at all: `constructor(const a: number)` is TS1359
+//! ("'const' is a reserved word that cannot be used here"), and the parameter's
+//! name is then simply missing. It is still modifier-SPELLED, which is a
+//! separate question with a separate answer — see `isModifierKind`.
 
 const ast = @import("ast.zig");
 const diagnostics = @import("diagnostics.zig");
@@ -44,6 +45,27 @@ pub const Role = union(enum) {
 /// rules that ask are about the parameter, not about which modifier spelled it
 /// (TS1317, TS2369), so they want the whole set at once.
 pub const property_mask: u32 = F.public | F.private | F.protected | F.readonly | F.override;
+
+/// tsc's `isModifierKind` — "this token is spelled like a modifier", asked
+/// WITHOUT regard to whether a parameter may carry it. `role` answers the
+/// narrower question ("is it a modifier HERE, and what does it mean"); this one
+/// is the syntactic class, and it is strictly wider: `const` and `default` are
+/// modifier keywords elsewhere in the grammar (`const` type parameters, `export
+/// default`) even though a parameter never accepts them.
+///
+/// The one caller is `parseNameOfParameter`'s recovery: when the binding name
+/// came back MISSING, tsc consumes a modifier-spelled token anyway
+/// (`getFullWidth(name) === 0 && !some(modifiers) && isModifierKind(token())`),
+/// so `function f(default: number) {}` reads `: number` as the annotation and
+/// answers ONE TS1359 — where a non-modifier reserved word (`null`, `void`,
+/// `true`) stalls the list and earns a second TS1138 on the `:`. Measured
+/// against tsgo 7.0.2, one function per keyword.
+pub fn isModifierKind(tag: Tag) bool {
+    return switch (tag) {
+        .keyword_const, .keyword_default => true,
+        else => role(tag) != null,
+    };
+}
 
 /// `tag`'s standing in parameter position, or null when it is not a modifier
 /// there at all — in which case it is the parameter's own NAME.
@@ -92,6 +114,22 @@ test "the rejected modifiers carry tsc's own code, not one shared sentence" {
     try std.testing.expectEqual(@as(u16, 1274), role(.keyword_in).?.rejected.tsCode());
     try std.testing.expectEqual(@as(u16, 1274), role(.keyword_out).?.rejected.tsCode());
     try std.testing.expectEqual(@as(u16, 1090), role(.keyword_static).?.rejected.tsCode());
+}
+
+test "isModifierKind is tsc's list: every `role` plus `const` and `default`" {
+    // Widening: everything `role` names is modifier-spelled…
+    for ([_]Tag{
+        .keyword_public,   .keyword_private,  .keyword_protected, .keyword_readonly,
+        .keyword_override, .keyword_static,   .keyword_export,    .keyword_declare,
+        .keyword_async,    .keyword_abstract, .keyword_accessor,  .keyword_in,
+        .keyword_out,
+    }) |t| try std.testing.expect(isModifierKind(t));
+    // …plus exactly the two `role` refuses.
+    try std.testing.expect(isModifierKind(.keyword_const));
+    try std.testing.expect(isModifierKind(.keyword_default));
+    // Reserved words that are NOT modifiers keep stalling the parameter list.
+    for ([_]Tag{ .keyword_null, .keyword_void, .keyword_true, .keyword_enum, .identifier }) |t|
+        try std.testing.expect(!isModifierKind(t));
 }
 
 test "a non-modifier keyword is the parameter's own name" {
