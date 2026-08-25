@@ -5894,13 +5894,48 @@ const Parser = struct {
             const extra = try p.addExtra(ast.CondExpr{ .then_expr = then_expr, .else_expr = else_expr });
             return p.addNode(.{ .tag = .cond_expr, .main_token = q, .data = .{ .lhs = lhs, .rhs = extra } });
         }
-        if (isAssignOp(p.curTag())) {
+        if (isAssignOp(p.curTag()) and lhsAssignable(p.nodeTagAt(lhs))) {
             const op = try p.bump();
             try p.checkEvalOrArgumentsTarget(lhs);
             const rhs = try p.parseAssignExpr(ctx);
             return p.addNode(.{ .tag = .assign, .main_token = op, .data = .{ .lhs = lhs, .rhs = rhs } });
         }
         return lhs;
+    }
+
+    /// tsc's `isLeftHandSideExpression`, the SYNTACTIC gate on
+    /// `parseAssignmentExpressionOrHigher`'s assignment arm: `isLeftHandSideExpression(expr)
+    /// && isAssignmentOperator(token())`. An operand that is not a
+    /// LeftHandSideExpression does not merely earn a diagnostic about the
+    /// assignment — the `=` is never consumed at all, so the statement ends
+    /// there and the parser answers "';' expected" (measured: `x++ = 4`,
+    /// `x + y = 8`, `x as any = 1`, `<any>x = 2` and `x satisfies any = 3` are
+    /// each one TS1005 at the operator, and no TS2364).
+    ///
+    /// A BLACKLIST rather than tsc's whitelist, because the two node
+    /// vocabularies do not line up and the failure modes are asymmetric:
+    /// wrongly ADMITTING a form keeps today's behaviour, while wrongly
+    /// REJECTING one breaks a legal assignment. These eight are the tags
+    /// `parseBinaryExpr` can hand back that tsc's list does not contain —
+    /// `paren_expr`, `non_null`, `array_literal`/`object_literal` (destructuring
+    /// assignment) and every call/member/leaf form are on it, and an arrow or a
+    /// `yield` returns from `parseAssignExpr` before ever reaching here.
+    /// `error_node` stays admissible: tsc's own missing node is an Identifier,
+    /// which IS a left-hand side, so rejecting one would invent a cascade on
+    /// top of the diagnostic that produced it.
+    fn lhsAssignable(tag: ast.Tag) bool {
+        return switch (tag) {
+            .binary,
+            .assign,
+            .cond_expr,
+            .seq_expr,
+            .prefix_unary,
+            .postfix_unary,
+            .as_expr,
+            .satisfies_expr,
+            => false,
+            else => true,
+        };
     }
 
     fn parseYield(p: *Parser, ctx: ExprCtx) PE!Node {
@@ -6188,6 +6223,35 @@ const Parser = struct {
         };
     }
 
+    /// tsc's `checkGrammarNumericLiteral` blames a legacy octal literal on the
+    /// PREFIX MINUS that negates it, not on the literal:
+    /// `grammarErrorOnNode(withMinus ? node.parent : node, …)`, with the
+    /// suggested spelling negated to match (`-003` → "use `-0o3`"). So `-003`
+    /// reports one column left of where `003` alone would.
+    ///
+    /// The literal's diagnostic is already recorded — `checkLiteral` runs when
+    /// the token is CONSUMED, long before the parser knows what encloses it,
+    /// and the enclosing node is exactly what tsc's rule turns on (`1 - 03` is
+    /// a binary minus and keeps the literal's own position). So the anchor is
+    /// moved here, at the one place a prefix `-` meets its operand, rather than
+    /// guessed at scan time. `operand` must be the node just parsed, so the
+    /// entry — if there is one at all, which for nearly every `-` there is not
+    /// — is the last diagnostic in the list.
+    fn retargetOctalToMinus(p: *Parser, op: TokenIndex, operand: Node) void {
+        if (p.nodes.items(.tag)[operand] != .number_literal) return;
+        const lit = p.nodes.items(.main_token)[operand];
+        const lit_start = p.tok_starts.items[lit] & scanner.Tokens.start_mask;
+        var i = p.diags.items.len;
+        while (i > 0) {
+            i -= 1;
+            const d = &p.diags.items[i];
+            if (d.span.start < lit_start) return; // past the literal's own run
+            if (d.code != .octal_literal_not_allowed or d.span.start != lit_start) continue;
+            d.span.start = p.tok_starts.items[op] & scanner.Tokens.start_mask;
+            return;
+        }
+    }
+
     fn parseSimpleUnaryExpr(p: *Parser, ctx: ExprCtx) PE!Node {
         // Legacy angle-bracket type assertion `<T>expr`. Only in files where
         // JSX is off: in a `.tsx`/`.jsx` file a `<` in expression position
@@ -6198,12 +6262,32 @@ const Parser = struct {
         // syntax error for it too).
         if (!p.jsx and p.curTag() == .lt) return p.parseTypeAssertion(ctx);
         switch (p.curTag()) {
-            .bang, .tilde, .plus, .minus, .plus_plus, .minus_minus, .keyword_typeof, .keyword_void, .keyword_delete => {
+            // `++x` / `--x` are UPDATE expressions, and their operand is a
+            // LEFT-HAND-SIDE expression, not a unary one: tsc's
+            // `parseUpdateExpression` calls
+            // `parseLeftHandSideExpressionOrHigher` for it. The difference is
+            // observable — `++await 42` inside an async function is TS1109 at
+            // the `await` (nothing there can start an LHS expression), `++ ++y`
+            // is TS1109 at the inner `++`, and `++x++` is `++x` followed by a
+            // "';' expected", because the postfix `++` belongs to the NEXT
+            // statement. Parsing the operand as a unary expression instead
+            // swallowed all three into a well-formed tree and answered the
+            // checker's TS2357 for them.
+            .plus_plus, .minus_minus => {
+                const op = try p.bump();
+                const operand = try p.parseLhsExpression(ctx);
+                try p.checkEvalOrArgumentsTarget(operand); // `++eval` assigns to `eval`
+                return p.addNode(.{ .tag = .prefix_unary, .main_token = op, .data = .{ .lhs = operand, .rhs = 0 } });
+            },
+            .bang, .tilde, .plus, .keyword_typeof, .keyword_void, .keyword_delete => {
                 const op = try p.bump();
                 const operand = try p.parseSimpleUnaryExpr(ctx);
-                // `++eval` / `--arguments` assign to their operand.
-                const tag = p.tokTagAt(op);
-                if (tag == .plus_plus or tag == .minus_minus) try p.checkEvalOrArgumentsTarget(operand);
+                return p.addNode(.{ .tag = .prefix_unary, .main_token = op, .data = .{ .lhs = operand, .rhs = 0 } });
+            },
+            .minus => {
+                const op = try p.bump();
+                const operand = try p.parseSimpleUnaryExpr(ctx);
+                p.retargetOctalToMinus(op, operand);
                 return p.addNode(.{ .tag = .prefix_unary, .main_token = op, .data = .{ .lhs = operand, .rhs = 0 } });
             },
             .keyword_await => {
@@ -8044,6 +8128,9 @@ const Parser = struct {
                     try p.fail(.expected_type);
                     break :blk try p.errorNode();
                 };
+                // `type T = -003` blames the minus too (oracle: TS1121 with
+                // the negated suggestion `-0o3`) — one rule, both positions.
+                p.retargetOctalToMinus(op, operand);
                 return p.addNode(.{ .tag = .prefix_unary, .main_token = op, .data = .{ .lhs = operand, .rhs = 0 } });
             },
             .keyword_typeof => {

@@ -55,6 +55,7 @@ const bind_result = @import("../frontend/bind_result.zig");
 const decl_spaces = @import("../frontend/decl_spaces.zig");
 const diagnostics = @import("../frontend/diagnostics.zig");
 const intern = @import("../intern.zig");
+const literals = @import("../frontend/literals.zig");
 const source = @import("../frontend/source.zig");
 const libs = @import("../libs.zig");
 const alias_cycle = @import("alias_cycle.zig");
@@ -3667,6 +3668,35 @@ const Linker = struct {
     /// declarations behind it — see `untypedJsModule`.
     fn reportUnresolvedModules(l: *Linker, file: FileId) Error!void {
         try l.reportUnresolvedIn(file, l.files[file].tree.nodeRange(ast.root_node));
+        try l.reportUnresolvedImportCalls(file);
+    }
+
+    /// The same report for a DYNAMIC `import("m")`, whose specifier is an
+    /// expression operand and so is nowhere in the statement walk above.
+    /// tsc's `checkImportCallExpression` resolves it through
+    /// `resolveExternalModuleName` exactly like a static import clause —
+    /// measured: `import("./script")` where the target is a script answers
+    /// TS2306, a missing one TS2307, and `import("fs")` without
+    /// `@types/node` answers TS2591 — so it routes into `reportSpecifier`
+    /// with `side_effect = false`, the named-import arm.
+    ///
+    /// No AST walk: the binder already registered every literal-specifier
+    /// `import()` as a module reference of the file (`bindDynamicImport`),
+    /// so the records are in hand and the specifier resolution has already
+    /// happened. A record is a dynamic import exactly when its node is the
+    /// CALL — `bindImportType`'s record carries the `.import_type` node
+    /// (the checker's `resolveImportTypeModule` reports that one, at the
+    /// use site, where tsc does), and every static form carries its
+    /// statement.
+    fn reportUnresolvedImportCalls(l: *Linker, file: FileId) Error!void {
+        const f = &l.files[file];
+        for (f.bind.imports) |rec| {
+            if (f.tree.nodeTag(rec.node) != .call_expr) continue;
+            const r = f.tree.extraData(ast.SubRange, f.tree.nodeData(rec.node).rhs);
+            const args = f.tree.extraRange(r.start, r.end);
+            if (args.len == 0) continue;
+            try l.reportSpecifier(file, f, f.tree.nodeMainToken(args[0]), false);
+        }
     }
 
     /// `reportUnresolvedModules` over one statement list, recursing into the
@@ -3728,30 +3758,50 @@ const Linker = struct {
                 if (e.spec_start == e.spec_end) continue;
             }
             if (mod_tok == 0) continue;
-            const text = tree.tokenSlice(f.src, mod_tok);
-            const stripped = stripQuotes(text);
-            // `import * as A from ""` resolves to nothing and is TS2307 like
-            // any other miss; it just has no atom to look anything up by (the
-            // empty string is not a name the interner hands out).
-            if (stripped.len != 0) {
-                if (try l.reportResolvedModule(file, f, stripped, mod_tok, side_effect)) continue;
-            }
-            if (side_effect) {
-                if (!l.no_unchecked_side_effect_imports) continue;
-                try l.diag(file, 2882, l.tokSpan(file, mod_tok), "Cannot find module or type declarations for side-effect import of '{s}'.", .{stripped});
-            } else if (!paths.isNodeCoreModule(stripped)) {
-                try l.diag(file, 2307, l.tokSpan(file, mod_tok), "Cannot find module '{s}' or its corresponding type declarations.", .{stripped});
-            } else if (l.types_wildcard) {
-                try l.diag(file, 2580, l.tokSpan(file, mod_tok), "Cannot find name '{s}'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node`.", .{stripped});
-            } else {
-                // A Node core module that resolved to nothing is a missing
-                // `@types/node`, and tsc says so — with the *name* wording, at
-                // the specifier. Only for the exact core-module list
-                // (`paths.isNodeCoreModule`); `bun:sqlite` and `node:nosuch`
-                // stay TS2307. A side-effect import keeps TS2882: tsgo passes
-                // its own message down and never consults the node list.
-                try l.diag(file, 2591, l.tokSpan(file, mod_tok), "Cannot find name '{s}'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node` and then add 'node' to the types field in your tsconfig.", .{stripped});
-            }
+            try l.reportSpecifier(file, f, mod_tok, side_effect);
+        }
+    }
+
+    /// One module specifier token, resolved and diagnosed. Shared by every
+    /// syntactic form that names a module — the import/export STATEMENTS
+    /// `reportUnresolvedIn` walks and the `import()` CALLS
+    /// `reportUnresolvedImportCalls` walks — because tsc reaches all of them
+    /// through the same `resolveExternalModuleName`, and so answers the same
+    /// four codes at the same anchor.
+    ///
+    /// `side_effect` is the `import "m"` form, whose miss is TS2882 (see
+    /// `reportUnresolvedIn`); everything else falls through the TS2307 /
+    /// TS2591 / TS2580 arms below.
+    fn reportSpecifier(
+        l: *Linker,
+        file: FileId,
+        f: *const ProgFile,
+        mod_tok: ast.TokenIndex,
+        side_effect: bool,
+    ) Error!void {
+        const text = f.tree.tokenSlice(f.src, mod_tok);
+        const stripped = literals.stripQuotes(text);
+        // `import * as A from ""` resolves to nothing and is TS2307 like
+        // any other miss; it just has no atom to look anything up by (the
+        // empty string is not a name the interner hands out).
+        if (stripped.len != 0) {
+            if (try l.reportResolvedModule(file, f, stripped, mod_tok, side_effect)) return;
+        }
+        if (side_effect) {
+            if (!l.no_unchecked_side_effect_imports) return;
+            try l.diag(file, 2882, l.tokSpan(file, mod_tok), "Cannot find module or type declarations for side-effect import of '{s}'.", .{stripped});
+        } else if (!paths.isNodeCoreModule(stripped)) {
+            try l.diag(file, 2307, l.tokSpan(file, mod_tok), "Cannot find module '{s}' or its corresponding type declarations.", .{stripped});
+        } else if (l.types_wildcard) {
+            try l.diag(file, 2580, l.tokSpan(file, mod_tok), "Cannot find name '{s}'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node`.", .{stripped});
+        } else {
+            // A Node core module that resolved to nothing is a missing
+            // `@types/node`, and tsc says so — with the *name* wording, at
+            // the specifier. Only for the exact core-module list
+            // (`paths.isNodeCoreModule`); `bun:sqlite` and `node:nosuch`
+            // stay TS2307. A side-effect import keeps TS2882: tsgo passes
+            // its own message down and never consults the node list.
+            try l.diag(file, 2591, l.tokSpan(file, mod_tok), "Cannot find name '{s}'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node` and then add 'node' to the types field in your tsconfig.", .{stripped});
         }
     }
 
@@ -4160,14 +4210,6 @@ const Linker = struct {
 /// of the same walk via `blockedSubpathReport`.
 fn untypedJsModule(path: []const u8) bool {
     return paths.isJsModulePath(path) and paths.isInNodeModules(path);
-}
-
-fn stripQuotes(text: []const u8) []const u8 {
-    if (text.len >= 2 and (text[0] == '"' or text[0] == '\'')) {
-        if (text[text.len - 1] == text[0]) return text[1 .. text.len - 1];
-        return text[1..];
-    }
-    return text;
 }
 
 /// Sort parallel (key, value) arrays by key ascending. Export/import tables

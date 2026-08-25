@@ -880,14 +880,14 @@ fn resolveExportsField(
     switch (exports_val) {
         .string => |s| {
             // Sugar: a string `exports` defines only the package root ".".
-            if (std.mem.eql(u8, subpath, ".")) return statExportTarget(f, alloc, pkg_dir, s, "", probe);
+            if (std.mem.eql(u8, subpath, ".")) return statExportTarget(f, alloc, pkg_dir, s, .{}, probe);
             return null;
         },
         .object => |obj| {
             if (exportsIsSubpathMap(obj)) return resolveExportsSubpath(f, alloc, pkg_dir, obj, subpath, probe);
             // A bare conditions object (no "./" keys) is sugar for the "." target.
             if (!std.mem.eql(u8, subpath, ".")) return null;
-            return resolveConditionalTarget(f, alloc, pkg_dir, exports_val, "", probe);
+            return resolveConditionalTarget(f, alloc, pkg_dir, exports_val, .{}, probe);
         },
         else => return null,
     }
@@ -919,7 +919,7 @@ fn resolveExportsSubpath(
     probe: ExportProbe,
 ) Error!?[]u8 {
     if (std.mem.indexOfScalar(u8, subpath, '*') == null) {
-        if (obj.get(subpath)) |v| return resolveConditionalTarget(f, alloc, pkg_dir, v, "", probe);
+        if (obj.get(subpath)) |v| return resolveConditionalTarget(f, alloc, pkg_dir, v, .{}, probe);
     }
     var best: ?usize = null;
     var best_prefix: usize = 0;
@@ -942,13 +942,60 @@ fn resolveExportsSubpath(
         const prefix = key[0..star];
         const suffix = key[star + 1 ..];
         const capture = subpath[prefix.len .. subpath.len - suffix.len];
-        return resolveConditionalTarget(f, alloc, pkg_dir, obj.vals[bi], capture, probe);
+        return resolveConditionalTarget(f, alloc, pkg_dir, obj.vals[bi], .{ .star = capture }, probe);
     }
-    return null;
+    return folderExportSubpath(f, alloc, pkg_dir, obj, subpath, probe);
 }
 
-/// Resolve one `exports` target value with `*` bound to `star`: a string is a
-/// path; `null` is a blocked subpath; an array is a fallback list (first that
+/// Node's DEPRECATED "folder mapping": a key ending in `/` matches any subpath
+/// that starts with it, and the remainder is APPENDED to the target — the last
+/// branch of tsc's `loadModuleFromImportsOrExports`, reached only after the
+/// exact key and every wildcard pattern have declined.
+///
+/// `{"./": "./"}` is the shape in the wild (and in
+/// `nodeModulesExportsSpecifierGenerationDirectory`): `inner/index.js` becomes
+/// `<pkg>/index.js`, which the `.js`→`.d.ts` substitution in `statExportTarget`
+/// then finds as `index.d.ts`. Its sibling `inner/other` stays UNRESOLVED in
+/// the same package, and correctly so — an `exports` target names a full path,
+/// so there is no extensionless probing to rescue it (oracle: TS2307 for
+/// `inner/other`, nothing for `inner/index.js`).
+///
+/// Restricted to keys that end in `/`, which is the only spelling Node ever
+/// documented for the form; tsc's own test is a bare `startsWith`, but a key
+/// without the separator can only ever build a path with the remainder glued
+/// onto a filename (`"./foo"` + `bar` ⇒ `./foo.jsbar`), which never exists.
+/// Longest matching key wins, as everywhere else in the map.
+fn folderExportSubpath(
+    f: Fs,
+    alloc: Allocator,
+    pkg_dir: []const u8,
+    obj: tsconfig.Value.Object,
+    subpath: []const u8,
+    probe: ExportProbe,
+) Error!?[]u8 {
+    if (std.mem.endsWith(u8, subpath, "/")) return null;
+    var best: ?usize = null;
+    for (obj.keys, 0..) |key, i| {
+        if (!std.mem.endsWith(u8, key, "/")) continue;
+        if (!std.mem.startsWith(u8, subpath, key)) continue;
+        if (best == null or key.len > obj.keys[best.?].len) best = i;
+    }
+    const bi = best orelse return null;
+    const trailer = subpath[obj.keys[bi].len..];
+    return resolveConditionalTarget(f, alloc, pkg_dir, obj.vals[bi], .{ .trailer = trailer }, probe);
+}
+
+/// What a matched `exports` KEY contributes to its target path: the wildcard
+/// capture a `"./*"` pattern bound (substituted for every `*` in the target)
+/// and/or the remainder a deprecated folder key left over (appended after the
+/// target). A key produces one or the other, never both — the two matching
+/// branches are mutually exclusive — but they travel together because the
+/// value being resolved may be an arbitrarily nested conditions/fallback tree
+/// and every leaf needs the same pair.
+const TargetSubpath = struct { star: []const u8 = "", trailer: []const u8 = "" };
+
+/// Resolve one `exports` target value with the key's `sub` applied: a string is
+/// a path; `null` is a blocked subpath; an array is a fallback list (first that
 /// resolves); an object is a conditions map (first active condition whose
 /// target resolves, in declaration order — a failed target continues to the
 /// next, matching tsc).
@@ -957,22 +1004,22 @@ fn resolveConditionalTarget(
     alloc: Allocator,
     pkg_dir: []const u8,
     target: tsconfig.Value,
-    star: []const u8,
+    sub: TargetSubpath,
     probe: ExportProbe,
 ) Error!?[]u8 {
     switch (target) {
         .null => return null, // explicitly blocked (`"./esm": null`)
-        .string => |s| return statExportTarget(f, alloc, pkg_dir, s, star, probe),
+        .string => |s| return statExportTarget(f, alloc, pkg_dir, s, sub, probe),
         .array => |arr| {
             for (arr) |elem| {
-                if (try resolveConditionalTarget(f, alloc, pkg_dir, elem, star, probe)) |p| return p;
+                if (try resolveConditionalTarget(f, alloc, pkg_dir, elem, sub, probe)) |p| return p;
             }
             return null;
         },
         .object => |obj| {
             for (obj.keys, obj.vals) |key, v| {
                 if (!exportsConditionActive(key)) continue;
-                if (try resolveConditionalTarget(f, alloc, pkg_dir, v, star, probe)) |p| return p;
+                if (try resolveConditionalTarget(f, alloc, pkg_dir, v, sub, probe)) |p| return p;
             }
             return null;
         },
@@ -992,7 +1039,7 @@ fn statExportTarget(
     alloc: Allocator,
     pkg_dir: []const u8,
     target: []const u8,
-    star: []const u8,
+    sub: TargetSubpath,
     probe: ExportProbe,
 ) Error!?[]u8 {
     // Targets must be package-relative ("./..."). Reject anything else
@@ -1000,18 +1047,20 @@ fn statExportTarget(
     // inside the package.
     if (!std.mem.startsWith(u8, target, "./")) return null;
 
-    // Substitute the wildcard capture for every '*'.
+    // Substitute the wildcard capture for every '*', then append a deprecated
+    // folder key's remainder (tsc's `combinePaths(resolvedTarget, subpath)`).
     var subst: []const u8 = target;
-    if (std.mem.indexOfScalar(u8, target, '*') != null) {
+    if (std.mem.indexOfScalar(u8, target, '*') != null or sub.trailer.len != 0) {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(alloc);
         var rest = target;
         while (std.mem.indexOfScalar(u8, rest, '*')) |at| {
             try buf.appendSlice(alloc, rest[0..at]);
-            try buf.appendSlice(alloc, star);
+            try buf.appendSlice(alloc, sub.star);
             rest = rest[at + 1 ..];
         }
         try buf.appendSlice(alloc, rest);
+        try buf.appendSlice(alloc, sub.trailer);
         subst = try alloc.dupe(u8, buf.items);
     }
 
@@ -1058,9 +1107,17 @@ fn statExportTarget(
         cands[1] = try std.fmt.allocPrint(alloc, "{s}.d.mts", .{base});
         cands[2] = try std.fmt.allocPrint(alloc, "{s}.ts", .{base});
         n = 3;
-    } else if (std.mem.indexOfScalar(u8, std.fs.path.basename(p), '.') == null) {
-        // An extensionless target ("./index"): probe TypeScript/declaration
-        // extensions like a bare stem.
+    } else if (sub.trailer.len == 0 and std.mem.indexOfScalar(u8, std.fs.path.basename(p), '.') == null) {
+        // An extensionless TARGET ("./index"): probe TypeScript/declaration
+        // extensions like a bare stem. Only when the whole path came from the
+        // map — tsc's `loadFileNameFromPackageJsonField` reaches
+        // `loadModuleFromFileNoImplicitExtensions`, which adds no extension at
+        // all, so this arm is a deliberate leniency toward a map AUTHOR who
+        // wrote the target without one. A deprecated folder key's remainder is
+        // the REQUEST's spelling, and there tsc's strictness is observable:
+        // under `{"./": "./"}`, `inner/index.js` resolves (`.js`→`.d.ts`) and
+        // its sibling `inner/other` is TS2307 even though `other.d.ts` sits
+        // right beside it.
         cands[0] = try std.fmt.allocPrint(alloc, "{s}.d.ts", .{p});
         cands[1] = try std.fmt.allocPrint(alloc, "{s}.ts", .{p});
         n = 2;
