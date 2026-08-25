@@ -3234,6 +3234,15 @@ fn collectSpreadParts(c: *Checker, t: TypeId, depth: u8, out: *std.ArrayList(Typ
             return;
         }
         r = try c.resolveStructural(con);
+    } else if (c.ts.kind(r) == .index_access or c.ts.kind(r) == .conditional) {
+        // `getBaseConstraintOrType` is not limited to a bare type PARAMETER:
+        // every instantiable type contributes its base constraint. `T["b"]`
+        // for `T extends { b: string }` is `string`, and no more spreadable
+        // than a bare `string` — `{ ...i }` over `var i!: T["b"]` is TS2698
+        // (`spreadInvalidArgumentType`). An index access whose constraint
+        // does not reduce maps to ITSELF and stays a valid type variable.
+        const base = try c.baseConstraintOf(r);
+        if (base != r) r = try c.resolveStructural(base);
     }
     if (c.ts.kind(r) == .union_type) {
         for (try c.memberList(r)) |m| try collectSpreadParts(c, m, depth + 1, out);
