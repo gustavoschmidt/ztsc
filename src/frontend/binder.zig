@@ -736,6 +736,21 @@ const Binder = struct {
         return flags & ast.Flags.computed_expr != 0;
     }
 
+    /// tsc's `isDynamicName`: a computed key whose expression is not a string
+    /// or numeric literal. `computed_expr` is the half that names nothing at
+    /// all (`nameless` drops it); `computed_sym` is the half the parser keeps a
+    /// syntactic placeholder for because it MIGHT be a `unique symbol` — the
+    /// checker decides which, and until it has, two such members are not known
+    /// to be the same member. See `DeclOpts.dynamic_name`.
+    ///
+    /// A well-known-symbol key (`[Symbol.iterator]`, plain `computed`) is NOT
+    /// dynamic: its atom is decided by the spelling and nothing can change it,
+    /// so a repeat really is a duplicate — which is what tsc's late-binding
+    /// pass concludes about it too.
+    fn dynamicName(flags: u32) bool {
+        return flags & (ast.Flags.computed_sym | ast.Flags.computed_expr) != 0;
+    }
+
     /// Bind a member's retained computed-key EXPRESSION (`ast.Ast.computedKey`).
     /// The key is evaluated where the member is written, so it binds in the
     /// enclosing scope like any other expression there; without this the
@@ -774,6 +789,17 @@ const Binder = struct {
 
     fn diag(b: *Binder, code: Code, tok: TokenIndex) Error!void {
         try b.diags.append(b.scratch, .{ .code = code, .span = b.tokSpan(tok) });
+    }
+
+    /// `diag` over a span that is not one token's — a computed member name
+    /// (`dupDiagSpan`) is the only thing that needs it.
+    fn diagSpan(b: *Binder, code: Code, span: Span) Error!void {
+        try b.diags.append(b.scratch, .{ .code = code, .span = span });
+    }
+
+    /// `diagArg` over spans, for the same reason.
+    fn diagSpanArg(b: *Binder, code: Code, span: Span, arg: Span) Error!void {
+        try b.diags.append(b.scratch, .{ .code = code, .span = span, .arg = arg });
     }
 
     /// A diagnostic whose message interpolates the text of ANOTHER token —
@@ -877,33 +903,41 @@ const Binder = struct {
         return (@as(u64, scope) << 32) | atom;
     }
 
-    /// The token a DUPLICATE-NAME diagnostic points at for the declaration
-    /// `decl` whose name token is `name_tok`.
+    /// The span a DECLARATION-NAME diagnostic covers for the declaration
+    /// `decl` whose name token is `name_tok` — tsc's `node.name`.
     ///
-    /// For an ordinary member they are the same token. For a COMPUTED one they
-    /// are not: `name_tok` is the key's last identifier (`iterator` in
-    /// `[Symbol.iterator]`, `staticProp` in `[C1.staticProp]`) because that is
-    /// what the member name is derived from, while tsc reports at the whole
-    /// computed-name node — whose first token is the `[`. Walks back over the
-    /// key's `a.b.c` run, so it answers `name_tok` unchanged for anything that
-    /// is not that shape.
+    /// For an ordinary member that is the name token itself. For a COMPUTED one
+    /// it is not: `name_tok` is the key's last literal or identifier (`iterator`
+    /// in `[Symbol.iterator]`, `staticProp` in `[C1.staticProp]`, `"B"` in
+    /// `["B"]`) because that is what the member name is derived from, while tsc
+    /// reports on the whole `ComputedPropertyName` — brackets included. The
+    /// whole node matters twice over: it fixes the COLUMN (the `[`) and it fixes
+    /// the interpolated `{0}`, which every one of these messages fills from the
+    /// reported span, so `[uniqueSym]` prints instead of a bare `[`.
+    ///
+    /// Walks back over the key's `a.b` run and forward to the `]`, so it answers
+    /// `name_tok`'s own span unchanged for anything that is not that shape.
     ///
     /// Report-time only: every caller is a diagnostic path, so a declaration
     /// that never clashes pays nothing.
-    fn dupDiagTok(b: *Binder, decl: Node, name_tok: TokenIndex) TokenIndex {
-        if (decl == null_node or name_tok == 0) return name_tok;
-        if (!declNameIsComputed(b, decl)) return name_tok;
+    fn dupDiagSpan(b: *Binder, decl: Node, name_tok: TokenIndex) Span {
+        if (decl == null_node or name_tok == 0) return b.tokSpan(name_tok);
+        if (!declNameIsComputed(b, decl)) return b.tokSpan(name_tok);
+        if (b.tree.tokens.tag(name_tok + 1) != .r_bracket) return b.tokSpan(name_tok);
         var t = name_tok;
         const floor = if (name_tok > 8) name_tok - 8 else 1;
         while (t > floor) {
             t -= 1;
             switch (b.tree.tokens.tag(t)) {
-                .l_bracket => return t,
+                .l_bracket => return .{
+                    .start = b.tree.tokens.start(t),
+                    .end = b.tokSpan(name_tok + 1).end,
+                },
                 .identifier, .dot => {},
-                else => return name_tok,
+                else => return b.tokSpan(name_tok),
             }
         }
-        return name_tok;
+        return b.tokSpan(name_tok);
     }
 
     /// Is this member declaration's name a computed one (`[expr]`)? The flag word
@@ -918,7 +952,11 @@ const Binder = struct {
             .property_signature, .method_signature => d.rhs,
             else => return false,
         };
-        return flags & (ast.Flags.computed | ast.Flags.computed_sym) != 0;
+        // `computed_lit` (`["foo"]`, `[1]`) belongs here and nowhere else: the
+        // member it declares is an ORDINARY one keyed by the literal's text,
+        // but its name NODE still starts at the `[`, and that is what tsc
+        // positions the diagnostic on.
+        return flags & (ast.Flags.computed | ast.Flags.computed_sym | ast.Flags.computed_lit) != 0;
     }
 
     /// Pick the diagnostic code for a declaration that failed the excludes
@@ -1015,10 +1053,10 @@ const Binder = struct {
         var i: u32 = 0;
         while (link != 0) : (link = b.decl_links.items[link].next) {
             const l = b.decl_links.items[link];
-            if (i >= already) try b.diag(code, b.dupDiagTok(l.value, b.decl_name_toks.items[link]));
+            if (i >= already) try b.diagSpan(code, b.dupDiagSpan(l.value, b.decl_name_toks.items[link]));
             i += 1;
         }
-        try b.diag(code, b.dupDiagTok(decl, name_tok));
+        try b.diagSpan(code, b.dupDiagSpan(decl, name_tok));
         b.sym_reported.items[sym] = i + 1;
     }
 
@@ -1032,6 +1070,48 @@ const Binder = struct {
     /// excludes masks allow it (overloads, interface merge, var+var, value/
     /// type-space sharing); reports a diagnostic at `name_tok` otherwise
     /// (the *later* declaration site, one diagnostic per clash).
+    /// Facts about the declaration being declared that are not part of its
+    /// symbol MEANING, so they have no room in `SymbolFlags` (a full u32) and
+    /// no business there either.
+    const DeclOpts = struct {
+        /// tsc's `hasDynamicName`: the name is a computed `[expr]` whose value
+        /// the binder cannot evaluate, so it does not know whether two such
+        /// names are the same name. `bindPropertyOrMethodOrAccessor` answers
+        /// one with `bindAnonymousDeclaration(node, …, InternalSymbolName
+        /// .Computed)` — the member never enters its container's symbol table,
+        /// so tsc reports NO clash of any kind for it, and the checker's
+        /// late-binding pass is what puts a symbol back for the `unique symbol`
+        /// and literal keys it can resolve.
+        ///
+        /// ztsc declares the member anyway, because the checker reads its
+        /// member table, keyed by the syntactic `__@k$…` placeholder — so two
+        /// members whose keys are merely SPELLED alike collapse onto one
+        /// symbol. That collapse is what this silences. `static [f]() {}`
+        /// written twice with `const f = cond ? "s1" : "s2"` is two members of
+        /// one index signature to tsc and was a TS2393 to a binder that
+        /// believed the placeholder (`declarationEmitSimpleComputedNames1`,
+        /// `declarationEmitComputedNamesInaccessible`).
+        ///
+        /// It silences ONE arm — the duplicate IMPLEMENTATION (TS2393/TS2392)
+        /// — and that boundary is empirical, not structural. The placeholder
+        /// collapse is right exactly when the key IS late-bindable, and tsc
+        /// then reports the clash from `lateBindMember` /
+        /// `checkFunctionOrConstructorSymbol`, so both arms are right for a
+        /// `unique symbol` key and wrong for a `string` one. Measured over the
+        /// suite the two arms fall on opposite sides: the implementation arm
+        /// has two cases that are `string`-keyed and none that are not, while
+        /// the duplicate-identifier arm (TS2300) has a `unique symbol` case
+        /// (`uniqueSymbolsPropertyNames`) and none the other way. Suppressing
+        /// both cost that case, so only the arm with evidence is suppressed.
+        ///
+        /// The real fix is a checker-side late-binding pass that decides from
+        /// the key's TYPE; when that exists, this bit and the TS2300 arm both
+        /// belong to it and this partition goes away. Until then the residue is
+        /// a missed TS2393 on two `unique symbol`-keyed method implementations
+        /// (probed against tsgo, no corpus case).
+        dynamic_name: bool = false,
+    };
+
     fn declare(
         b: *Binder,
         scope: ScopeId,
@@ -1040,6 +1120,19 @@ const Binder = struct {
         decl_node: Node,
         name_tok: TokenIndex,
         extra_flags: SymbolFlags,
+    ) Error!SymbolId {
+        return b.declareOpts(scope, atom, kind, decl_node, name_tok, extra_flags, .{});
+    }
+
+    fn declareOpts(
+        b: *Binder,
+        scope: ScopeId,
+        atom: Atom,
+        kind: DeclKind,
+        decl_node: Node,
+        name_tok: TokenIndex,
+        extra_flags: SymbolFlags,
+        opts: DeclOpts,
     ) Error!SymbolId {
         const flags = kind.flags().merge(extra_flags);
 
@@ -1124,7 +1217,7 @@ const Binder = struct {
                 // included — `function f(): void; function f() {} function
                 // f() {}` is three TS2393s, not one. A CONSTRUCTOR gets its
                 // own message (TS2392) instead.
-                if (flags.has_impl and existing.has_impl) {
+                if (flags.has_impl and existing.has_impl and !opts.dynamic_name) {
                     // A class constructor is spelled with the `constructor`
                     // keyword and is never static.
                     const is_ctor = !extra_flags.static_member and
@@ -1434,7 +1527,7 @@ const Binder = struct {
                 while (link != 0) : (link = b.decl_links.items[link].next) {
                     const l = b.decl_links.items[link];
                     if (fns and !b.functionHasBody(l.value)) continue;
-                    try b.diag(.redeclared_exported_variable, b.dupDiagTok(l.value, b.decl_name_toks.items[link]));
+                    try b.diagSpan(.redeclared_exported_variable, b.dupDiagSpan(l.value, b.decl_name_toks.items[link]));
                 }
             }
         }
@@ -1550,9 +1643,9 @@ const Binder = struct {
                 const sp = b.declSpaces(node) orelse continue;
                 // Only the declarations that contributed to the shared space.
                 if (!sp.intersect(common).any()) continue;
-                try b.diag(
+                try b.diagSpan(
                     .merged_decl_export_mismatch,
-                    b.dupDiagTok(node, b.decl_name_toks.items[link]),
+                    b.dupDiagSpan(node, b.decl_name_toks.items[link]),
                 );
             }
         }
@@ -1686,10 +1779,12 @@ const Binder = struct {
         /// A sibling that explains the missing body without a diagnostic of its
         /// own — tsc's "we should already report error in binder" arm.
         silent,
-        /// `arg` is 0 for the codes whose message names nothing but itself, and
-        /// the token whose TEXT fills `{0}` for the one that does (TS2389 names
-        /// the overload the implementation should have been called).
-        report: struct { code: Code, tok: TokenIndex, arg: TokenIndex = 0 },
+        /// `arg` is null for the codes whose message names nothing but itself,
+        /// and the span whose TEXT fills `{0}` for the one that does (TS2389
+        /// names the overload the implementation should have been called).
+        /// Spans, not tokens, because a computed name is reported — and named —
+        /// as a whole `[…]` (`dupDiagSpan`).
+        report: struct { code: Code, span: Span, arg: ?Span = null },
     };
 
     fn overloadSiblingDiag(b: *Binder, node: Node) SiblingVerdict {
@@ -1716,14 +1811,18 @@ const Binder = struct {
             if (a_static == b_static) return .silent;
             return .{ .report = .{
                 .code = if (a_static) .overload_must_be_static else .overload_must_not_be_static,
-                .tok = next_tok,
+                .span = b.dupDiagSpan(next, next_tok),
             } };
         }
         // A misnamed IMPLEMENTATION only: a second bodyless signature of another
         // name is simply an unrelated declaration, and tsc keeps looking (which
         // for ztsc means falling through to TS2391).
         if (b.tree.nodeData(next).rhs == 0) return .fall_through;
-        return .{ .report = .{ .code = .overload_impl_name_mismatch, .tok = next_tok, .arg = name_tok } };
+        return .{ .report = .{
+            .code = .overload_impl_name_mismatch,
+            .span = b.dupDiagSpan(next, next_tok),
+            .arg = b.dupDiagSpan(node, name_tok),
+        } };
     }
 
     /// tsc's `reportImplementationExpectedError`, whole: the sharper sibling arms
@@ -1749,7 +1848,10 @@ const Binder = struct {
         switch (b.overloadSiblingDiag(node)) {
             .fall_through => {},
             .silent => return,
-            .report => |r| return if (r.arg == 0) b.diag(r.code, r.tok) else b.diagArg(r.code, r.tok, r.arg),
+            .report => |r| return if (r.arg) |a|
+                b.diagSpanArg(r.code, r.span, a)
+            else
+                b.diagSpan(r.code, r.span),
         }
         if (b.scope_kinds.items[b.sym_scopes.items[sym]] == .class_members and
             b.tree.tokens.tag(name_tok) == .keyword_constructor)
@@ -1763,8 +1865,8 @@ const Binder = struct {
             return b.diag(.abstract_decls_not_consecutive, name_tok);
         }
         // A computed method name (`[Symbol.iterator](x: string): string;`) is
-        // reported at the `[`, as every duplicate-name diagnostic is.
-        return b.diag(.missing_function_implementation, b.dupDiagTok(node, name_tok));
+        // reported on the whole `[…]`, as every declaration-name diagnostic is.
+        return b.diagSpan(.missing_function_implementation, b.dupDiagSpan(node, name_tok));
     }
 
     /// tsc's OTHER `reportImplementationExpectedError` call site: inside
@@ -2438,9 +2540,25 @@ const Binder = struct {
         }
     }
 
+    /// TS1114, tsc's `checkLabeledStatement`: an ENCLOSING labeled statement
+    /// already carries this label. The ancestor walk stops at the nearest
+    /// function-like, which is exactly what `ctx_base` marks, and a labeled
+    /// loop or switch keeps its label on its own context rather than a
+    /// `.labeled` one — so every enclosing label is a `Ctx` with `label` set
+    /// and nothing else is.
+    fn checkDuplicateLabel(b: *Binder, label: Atom, tok: TokenIndex) Error!void {
+        var i = b.ctxs.items.len;
+        while (i > b.ctx_base) {
+            i -= 1;
+            if (b.ctxs.items[i].label == label) return b.diag(.duplicate_label, tok);
+        }
+    }
+
     fn bindLabeled(b: *Binder, node: Node) Error!void {
         const d = b.tree.nodeData(node);
-        const label = try b.atomOfToken(b.tree.nodeMainToken(node));
+        const label_tok = b.tree.nodeMainToken(node);
+        const label = try b.atomOfToken(label_tok);
+        try b.checkDuplicateLabel(label, label_tok);
         switch (b.nodeTag(d.lhs)) {
             // The loop/switch consumes the label into its own context.
             .while_stmt, .do_stmt, .for_stmt, .for_in_stmt, .for_of_stmt, .switch_stmt => {
@@ -3318,12 +3436,12 @@ const Binder = struct {
                     const tok = b.tree.nodeMainToken(member);
                     try b.bindComputedKey(member, f.flags);
                     if (!nameless(f.flags)) {
-                        _ = try b.declare(if (is_static) ss else ms, try b.memberNameKey(tok, f.flags), .property, member, tok, .{
+                        _ = try b.declareOpts(if (is_static) ss else ms, try b.memberNameKey(tok, f.flags), .property, member, tok, .{
                             .static_member = is_static,
                             .optional_member = f.flags & ast.Flags.optional != 0,
                             .readonly_member = f.flags & ast.Flags.readonly != 0,
                             .non_public = f.flags & nonpublic_mask != 0 or isPrivateNameToken(b, tok),
-                        });
+                        }, .{ .dynamic_name = dynamicName(f.flags) });
                     }
                     try b.bindType(f.type_ann);
                     try b.bindExpr(f.init);
@@ -3357,7 +3475,7 @@ const Binder = struct {
                             try b.atomOf(member_names.ctor_member_name)
                         else
                             try b.memberNameKey(tok, proto.flags);
-                        _ = try b.declare(if (is_static) ss else ms, atom, kind, member, tok, .{
+                        _ = try b.declareOpts(if (is_static) ss else ms, atom, kind, member, tok, .{
                             .static_member = is_static,
                             // `m?(): number` is an OPTIONAL property whose type
                             // is `(() => number) | undefined`, exactly as
@@ -3381,7 +3499,7 @@ const Binder = struct {
                             .optional_member = proto.flags & ast.Flags.optional != 0,
                             .has_impl = md.rhs != 0 and !is_get and !is_set,
                             .non_public = proto.flags & nonpublic_mask != 0 or isPrivateNameToken(b, tok),
-                        });
+                        }, .{ .dynamic_name = dynamicName(proto.flags) });
                     }
                     const is_ctor = b.tree.tokens.tag(tok) == .keyword_constructor and !is_static;
                     const ctor: CtorKind = if (!is_ctor)
@@ -3856,10 +3974,10 @@ const Binder = struct {
                 const tok = b.tree.nodeMainToken(member);
                 try b.bindComputedKey(member, md.rhs);
                 if (!nameless(md.rhs)) {
-                    _ = try b.declare(ms, try b.memberNameKey(tok, md.rhs), .property, member, tok, .{
+                    _ = try b.declareOpts(ms, try b.memberNameKey(tok, md.rhs), .property, member, tok, .{
                         .optional_member = md.rhs & ast.Flags.optional != 0,
                         .readonly_member = md.rhs & ast.Flags.readonly != 0,
-                    });
+                    }, .{ .dynamic_name = dynamicName(md.rhs) });
                 }
                 try b.bindType(md.lhs);
             },
@@ -3870,7 +3988,9 @@ const Binder = struct {
                 const kind: DeclKind = if (is_get) .getter else if (is_set) .setter else .method;
                 try b.bindComputedKey(member, md.rhs);
                 if (!nameless(md.rhs)) {
-                    _ = try b.declare(ms, try b.memberNameKey(tok, md.rhs), kind, member, tok, .{});
+                    _ = try b.declareOpts(ms, try b.memberNameKey(tok, md.rhs), kind, member, tok, .{}, .{
+                        .dynamic_name = dynamicName(md.rhs),
+                    });
                 }
                 try b.bindFunctionType(member, md.lhs);
             },
