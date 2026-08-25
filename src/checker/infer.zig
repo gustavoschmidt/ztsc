@@ -2933,7 +2933,33 @@ pub fn combineCovariant(c: *Checker, prev: TypeId, cand: TypeId) Error!TypeId {
     // target's parameters and relates; tsc keeps `T`, so `y` fails
     // contravariantly and the pair is a TS2322
     // (`assignmentCompatWith{Call,Construct}Signatures5`/`6`).
-    if ((s.kind(prev) == .type_param) != (s.kind(cand) == .type_param)) return c.makeUnion2(prev, cand);
+    //
+    // A SIGNATURE relation (`InferCtx.sig_ctx`) is that same case one step
+    // further: there the concrete types are the target's free parameters and
+    // their arrays, so a bare variable standing beside a structural candidate
+    // is not weak evidence at all — both come from the same target signature.
+    // `interface A { <T>(x: T, y: T[][]): void }` against
+    // `interface B { <S>(x: S, y: S[]): void }` collects `T` at `x` and `T[]`
+    // at `y`; unioning them instantiated `B` to `(x: T | T[], y: (T | T[])[])`,
+    // which absorbs both of `A`'s positions and made `a = b` an accept. tsgo
+    // rejects it. The plain `getCommonSupertype` fold keeps the LEFTMOST of two
+    // unrelated candidates and the pair then fails, which is the same verdict
+    // for the same reason as the peer case above.
+    //
+    // The position tsgo BLAMES is not always ztsc's: tsgo orders the candidates
+    // reached through a type reference's type ARGUMENT (an array element, a
+    // tuple element, `Map<string, S>`'s value) ahead of the ones read off a
+    // parameter's top level, so `<T>(x: string, y: number[])` against
+    // `<S>(x: S, y: S[])` answers `number` and reports `x`, where the
+    // positional fold answers `string` and reports `y`. Both reject, and the
+    // diagnostic's own position and code — what the suite compares — are the
+    // assignment's either way; only the nested elaboration differs. Measured,
+    // not assumed: a 20-witness tsgo battery (bare/array/tuple/`Promise`/
+    // property/index-signature/union/return/callback nesting, in both orders
+    // and with subtype-related as well as unrelated candidates) agrees with the
+    // positional fold everywhere except which position is named.
+    if (c.infer_ctx.sig_ctx == 0 and
+        (s.kind(prev) == .type_param) != (s.kind(cand) == .type_param)) return c.makeUnion2(prev, cand);
     if (c.covLiteralShape(prev) and c.covLiteralShape(cand)) return c.makeUnion2(prev, cand);
     // The literal candidates' union is folded in LAST, so a literal never
     // sits on the left of the pair. Only a FRESH OBJECT triggers the
