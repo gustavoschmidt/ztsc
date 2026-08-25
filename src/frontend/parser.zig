@@ -6135,6 +6135,9 @@ const Parser = struct {
         // form and the clause therefore ended at the default binding — see the
         // import-equals arm below.
         var clause_done = false;
+        // Set when the declaration has NO import clause, so what follows is
+        // the module specifier itself — see the arm that sets it.
+        var bare_specifier = false;
 
         if (isIdentLike(p.curTag())) {
             // `import d ...` — but `import x = require(...)` is out of subset.
@@ -6192,11 +6195,22 @@ const Parser = struct {
             specs = try p.parseImportSpecifiers();
             named_bindings = true;
         } else if (default_name == 0) {
-            try p.fail(.expected_import_clause);
+            // No clause at all. tsc's
+            // `parseImportDeclarationOrImportEqualsDeclaration` then skips
+            // BOTH `parseImportClause` and the `from` and reads a module
+            // specifier straight away — "we allow arbitrary expressions here
+            // … we check that it is only a string literal later in the grammar
+            // check pass". So `import` + `import { x } from "m"` blames the
+            // SECOND `import` with the TS1109 it earns as an expression, where
+            // ztsc invented an uncoded "expected an import clause" and left the
+            // whole case unparsed (and therefore bucketed).
+            bare_specifier = true;
         }
 
         var mod: u32 = 0;
-        if (try p.eat(.keyword_from) != null) {
+        if (bare_specifier) {
+            _ = try p.parseExpression(.{});
+        } else if (try p.eat(.keyword_from) != null) {
             mod = try p.expect(.string_literal, .expected_string_literal);
         } else if (default_name != 0 or ns_name != 0 or specs.start != specs.end) {
             try p.fail(.expected_from);
@@ -7689,15 +7703,21 @@ const Parser = struct {
     fn parseNewExpr(p: *Parser, ctx: ExprCtx) PE!Node {
         const kw = try p.bump(); // `new`
         if (p.curTag() == .dot) {
-            // The `new.target` meta-property. Anything else after the dot is
-            // not a meta-property at all, so it keeps the subset boundary.
+            // The `new.target` meta-property. tsc's
+            // `parseNewExpressionOrNewDotTarget` takes WHATEVER name follows
+            // the dot and lets `checkGrammarMetaProperty` refuse the
+            // misspellings, so `new.targ` is a meta-property carrying a
+            // TS17012 — not a construct outside ztsc's subset. Answering the
+            // subset boundary instead left `misspelledNewMetaProperty` an
+            // uncoded parse error, which buckets the whole case.
             _ = try p.bump(); // `.`
-            if (isIdentLike(p.curTag()) and std.mem.eql(u8, p.laText(0), "target")) {
-                _ = try p.bump(); // `target`
-                return p.addNode(.{ .tag = .new_target, .main_token = kw, .data = .{ .lhs = 0, .rhs = 0 } });
+            const named = isNameLike(p.curTag());
+            const name = try p.expectMemberName();
+            if (named and !std.mem.eql(u8, p.tokenTextAt(name), "target")) {
+                const span = p.tokSpan(name, name);
+                try p.errAtSpanArg(.new_meta_property, span, span);
             }
-            _ = try p.eat(.identifier);
-            return p.unsupportedFrom(kw);
+            return p.addNode(.{ .tag = .new_target, .main_token = kw, .data = .{ .lhs = 0, .rhs = 0 } });
         }
         // Callee: member expression only (calls bind to the outer chain).
         var callee = try p.parsePrimaryExpr(ctx);
@@ -8290,7 +8310,20 @@ const Parser = struct {
                 }
                 return node;
             },
-            .keyword_import => return p.leaf(.import_expr),
+            .keyword_import => {
+                // tsc's `parseLeftHandSideExpressionOrHigher` gives the keyword
+                // its own arm for exactly three shapes — `import(`, `import<`
+                // and `import.meta`. Any other `import` in expression position
+                // falls through to `parsePrimaryExpression`'s default, which
+                // calls `parseIdentifier(Diagnostics.Expression_expected)`: a
+                // reserved word is no identifier, so the report is TS1109 AT
+                // the keyword and the token is NOT consumed.
+                if (!importStartsExpression(p.peekTag(1))) {
+                    try p.fail(.expected_expression);
+                    return p.errorNode();
+                }
+                return p.leaf(.import_expr);
+            },
             .keyword_function => return p.parseFunctionDecl(0, true),
             .keyword_async => {
                 if (p.peekTag(1) == .keyword_function and !p.peekNewline(1)) {

@@ -161,7 +161,6 @@ pub const Code = enum(u16) {
     /// `parseNamespaceImport`/`parseNamespaceExport` expect it the moment the
     /// `*` is consumed, then read the next token as the namespace NAME.
     expected_as,
-    expected_import_clause,
     expected_export_clause,
     expected_while,
     /// TS1005 `'try' expected`: tsc's `parseStatement` routes a bare `catch`
@@ -1196,6 +1195,12 @@ pub const Code = enum(u16) {
     /// blames `types.pos` zero-width — the end of the clause keyword — and
     /// interpolates that keyword, so this one carries `Diagnostic.arg`.
     heritage_list_empty,
+    /// TS17012 for the OTHER meta-property keyword: `new.targ`. tsc's
+    /// `parseNewExpressionOrNewDotTarget` takes whatever name follows the dot
+    /// and `checkGrammarMetaProperty` refuses the misspellings, so this is the
+    /// `new` twin of `import_meta_property` — same code, same grammar class,
+    /// different suggestion.
+    new_meta_property,
 
     /// How tsc surfaces the condition — which decides both what a diagnostic
     /// suppresses and what suppresses it. Established empirically against tsgo
@@ -1565,6 +1570,7 @@ pub const Code = enum(u16) {
             // TS2322 and both vanish behind any parse error in the program.
             .import_meta_property,
             .import_meta_property_in_call,
+            .new_meta_property,
             => .grammar,
 
             else => .syntactic,
@@ -1672,7 +1678,6 @@ pub const Code = enum(u16) {
             .expected_string_literal => "String literal expected.",
             .expected_from => "'from' expected.",
             .expected_as => "'as' expected.",
-            .expected_import_clause => "expected an import clause",
             .expected_export_clause => "expected an export clause",
             .expected_while => "'while' expected.",
             .expected_try => "'try' expected.",
@@ -1975,6 +1980,7 @@ pub const Code = enum(u16) {
             .catch_clause_type_annotation => "Catch clause variable type annotation must be 'any' or 'unknown' if specified.",
             .instantiation_property_access => "An instantiation expression cannot be followed by a property access.",
             .import_meta_property => "'{0}' is not a valid meta-property for keyword 'import'. Did you mean 'meta'?",
+            .new_meta_property => "'{0}' is not a valid meta-property for keyword 'new'. Did you mean 'target'?",
             .import_meta_property_in_call => "'{0}' is not a valid meta-property for keyword 'import'. Did you mean 'meta' or 'defer'?",
         };
     }
@@ -1987,8 +1993,8 @@ pub const Code = enum(u16) {
     /// doc comment for the method). A handful of ztsc codes are deliberately
     /// left at 0 because tsc's answer depends on context in a way one code
     /// cannot express — `unexpected_token` (a recovery catch-all tsc reaches
-    /// through half a dozen different messages), `expected_export_clause`,
-    /// `expected_of_or_in`, and `expected_import_clause`. Reporting a guess
+    /// through half a dozen different messages), `expected_export_clause` and
+    /// `expected_of_or_in`. Reporting a guess
     /// there would manufacture a wrong code where reporting none only costs a
     /// missing one.
     pub fn tsCode(code: Code) u16 {
@@ -2335,6 +2341,7 @@ pub const Code = enum(u16) {
             .catch_clause_type_annotation => 1196,
             .instantiation_property_access => 1477,
             .import_meta_property => 17012,
+            .new_meta_property => 17012,
             .import_meta_property_in_call => 18061,
             else => 0,
         };
