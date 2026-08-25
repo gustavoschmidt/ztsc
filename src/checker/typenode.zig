@@ -248,6 +248,7 @@ fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
                     else => try elems.append(c.scratch(), .{ .ty = try c.typeFromTypeNode(el) }),
                 }
             }
+            try checkTupleRestElements(c, node, elems.items);
             return c.ts.makeTuple(elems.items);
         },
         .union_type => {
@@ -409,6 +410,115 @@ fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
         .error_node, .unsupported => return types.any_type,
         else => return types.any_type,
     }
+}
+
+/// TS2574, the SEMANTIC half of tsc's `checkTupleType` walk: a spread element
+/// whose type is not array-like (`[...string]`, `[...string?]`).
+///
+/// The walk's three *syntactic* rules (TS1265/TS1266/TS1257) belong to the
+/// parser, which owns the element FLAGS they are decided by; it stops at the
+/// first spread whose array-ness it cannot know. This half is the mirror
+/// image: it speaks only TS2574 and otherwise exists to reproduce tsc's
+/// `break`, because tsc's walk is ONE pass — a grammar error before a bad
+/// spread means the spread is never reached and earns no TS2574.
+///
+/// tsc separates a REST element (`...T[]`, array-SHAPED syntax) from a
+/// VARIADIC one (`...T`) and only the latter is type-checked. Here they are
+/// one case, told apart by the resolved type instead: an array-shaped node
+/// always resolves to an array type, so the two differ in exactly one place —
+/// a second syntactic rest breaks the walk (that is the TS1265 the parser
+/// reports) while a second array-typed variadic does not. Treating every
+/// array-typed spread as a rest therefore stops the walk one element early in
+/// `[...T, ...U]`, which can only ever LOSE a downstream TS2574, never invent
+/// one; buying that back would mean a second copy of the parser's
+/// `isArrayShapedTypeNode` living on this side of the frontend boundary.
+///
+/// `elems` is the tuple's element list in AST order (the caller just built
+/// it), so a rest element's `.ty` is already the spread's operand type —
+/// tsc's `getTypeFromTypeNode((e as RestTypeNode).type)`.
+fn checkTupleRestElements(c: *Checker, node: Node, elems: []const types.TupleElem) Error!void {
+    var i: usize = 0;
+    var seen_optional = false;
+    var seen_rest = false;
+    for (c.tree.nodeRange(node)) |el| {
+        if (el == null_node) continue;
+        const e = elems[i];
+        i += 1;
+        if ((e.flags & types.elem_flag_rest) != 0) {
+            if (try spreadTypeIsNotArrayLike(c, e.ty, 0)) {
+                try c.diagFmt(2574, c.nodeSpan(el), "A rest element type must be an array type.", .{});
+                return;
+            }
+            if (seen_rest) return;
+            const r = if (c.ts.kind(e.ty) == .ref) try c.resolveStructural(e.ty) else e.ty;
+            // Only an OPEN spread makes the positions after it variable:
+            // `[...[A, B], C]` still has a fixed position 2, so a `?` may
+            // follow it (tsc sets `seenRestElement` for an array or a
+            // rest-BEARING tuple, not for a fixed one).
+            if (c.ts.kind(r) == .array) {
+                seen_rest = true;
+            } else if (c.ts.kind(r) == .tuple) {
+                for (0..c.ts.tupleLen(r)) |k| {
+                    if (c.ts.tupleElem(r, @intCast(k)).rest()) seen_rest = true;
+                }
+            }
+        } else if ((e.flags & types.elem_flag_optional) != 0) {
+            if (seen_rest) return;
+            seen_optional = true;
+        } else if (seen_optional) return;
+    }
+}
+
+/// The negation of tsc's `isArrayLikeType`, decided by KIND rather than by
+/// relation, and only where the kind SETTLES it.
+///
+/// tsc writes the positive form as `isArrayType(type) || !(type.flags &
+/// Nullable) && isTypeAssignableTo(type, anyReadonlyArrayType)`. Reproducing
+/// that literally was measured in wave 41 and REVERTED: running the relation
+/// from a type-node materialization admitted every `any`-ish and `{}`-ish
+/// source (+33 excess keys across the suite) and pushed one case past its
+/// 10s budget. Asking instead which kinds are array-like was measured too,
+/// and it is the WRONG polarity: a spread's operand is very often still
+/// deferred at materialization time (`[...Obj[Prop]]`, `[...(T extends 0 ?
+/// [c] : [])]`, `[...{ [K in keyof T]: … }]`, a substitution type), and every
+/// one of those was a false TS2574.
+///
+/// So the question asked here is the one a kind can answer on its own: is the
+/// operand a type that is FINISHED and is not an array? A primitive, a
+/// literal, an object/interface/function shape, `unknown`, `void`, an enum.
+/// Everything deferred, generic or erroneous stays silent — an under-report,
+/// never a false positive.
+fn spreadTypeIsNotArrayLike(c: *Checker, t: TypeId, depth: u32) Error!bool {
+    if (depth > 4) return false;
+    const r = if (c.ts.kind(t) == .ref) try c.resolveStructural(t) else t;
+    return switch (c.ts.kind(r)) {
+        .string, .number, .boolean, .bigint, .symbol, .unique_symbol, .object_keyword, .unknown, .void, .undefined, .null, .bool_true, .bool_false, .string_literal, .number_literal, .number_literal_fresh, .bigint_literal, .enum_type, .object, .function, .overloads, .class_value, .template_literal_type, .string_mapping => true,
+        // A type variable is its base constraint — but only when that
+        // constraint is itself settled. An unconstrained one (`unknown`) is
+        // NOT reported: tsc gives a spread position's `infer R` an implicit
+        // `unknown[]` constraint (`getInferredTypeParameterConstraint`), and
+        // a bare `T` in that position is a shape ztsc has no verdict on.
+        .type_param, .this_type, .infer_var => blk: {
+            const con = try c.baseConstraintOf(r);
+            break :blk con != r and c.ts.kind(con) != .unknown and
+                try spreadTypeIsNotArrayLike(c, con, depth + 1);
+        },
+        // One settled non-array arm sinks a union (the relation would demand
+        // every arm); an intersection needs every member to sink it.
+        .union_type => blk: {
+            for (try c.memberList(r)) |m| {
+                if (try spreadTypeIsNotArrayLike(c, m, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        .intersection => blk: {
+            for (try c.memberList(r)) |m| {
+                if (!try spreadTypeIsNotArrayLike(c, m, depth + 1)) break :blk false;
+            }
+            break :blk true;
+        },
+        else => false,
+    };
 }
 
 /// The mapped-type key parameter named `a` that is lexically in scope, or
