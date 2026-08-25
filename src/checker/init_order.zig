@@ -107,8 +107,12 @@ fn walk(c: *Checker, s: Scan, expr: Node, allow_this: bool) Error!void {
             const d = c.tree.nodeData(expr);
             const recv = receiverOf(c, s, d.lhs, allow_this);
             const name = c.tokenText(d.rhs);
-            if (recv != .none and isUnassigned(c, s, name, recv == .this_kw)) {
-                try c.diagFmt(2729, c.tokSpan(d.rhs), "Property '{s}' is used before its initialization.", .{name});
+            if (recv != .none) {
+                if (isUnassigned(c, s, name, recv == .this_kw)) {
+                    try c.diagFmt(2729, c.tokSpan(d.rhs), "Property '{s}' is used before its initialization.", .{name});
+                }
+            } else if (s.side == .static and c.nodeTag(d.lhs) == .identifier) {
+                try checkForeignMember(c, d.lhs, d.rhs);
             }
         },
         else => {},
@@ -202,6 +206,133 @@ fn staticBlockRunsFirst(c: *Checker, s: Scan, here: u32) bool {
         if (c.nodeSpanStart(m) < here) return true;
     }
     return false;
+}
+
+/// TS2729 through a FOREIGN receiver: `Enum.A`, `ObjLiteral.p`, `Namespace.v`,
+/// `Other.sp` read from a static field initializer or a static block, where the
+/// member being read is declared LATER in the same file. It has no value yet
+/// for the same reason a later sibling has none — the code that gives it one
+/// has not run.
+///
+/// tsc reaches it by the same route as the own-class case: the use is
+/// `isInPropertyInitializerOrClassStaticBlock`, so
+/// `isBlockScopedNameDeclaredBeforeUse` compares the read property's
+/// `valueDeclaration` against it. The STATIC half only — a use in an INSTANCE
+/// field initializer runs at construction time, and
+/// `isUsedInFunctionOrInstanceProperty` exempts it (measured: `class Foo { m =
+/// Later.A }` is silent where `static m = Later.A` is not).
+///
+/// A METHOD is exempt (tsc's `declaration.kind === MethodDeclaration`): it is
+/// on its object before any initializer runs, which is what makes
+/// `After.method` legal beside an illegal `After.data`
+/// (`scopeCheckStaticInitializer`). A get/set accessor is NOT a
+/// MethodDeclaration and is not exempt.
+///
+/// The member is found in the receiver's own declaration SYNTAX rather than
+/// through its type, so a name the container does not declare finds nothing
+/// and reports nothing — that shape is TS2339's, not this one's.
+fn checkForeignMember(c: *Checker, recv: Node, name_tok: ast.TokenIndex) Error!void {
+    const use = c.tree.tokens.start(name_tok);
+    const atom = try c.atomOfToken(c.tree.nodeMainToken(recv));
+    const sym = switch (c.resolveSpace(atom, c.cur_scope, true)) {
+        .sym => |x| x,
+        else => return,
+    };
+    // A declaration in another file is always "before": it is a different
+    // program point entirely, and tsc's cross-file arm of
+    // `isBlockScopedNameDeclaredBeforeUse` says so outright.
+    if (c.symFile(sym) != c.cur_file) return;
+    const name = c.tokenText(name_tok);
+    for (c.declsOf(sym)) |decl| {
+        const m = foreignMember(c, decl, name) orelse continue;
+        if (m.is_method or m.start <= use) return;
+        try c.diagFmt(2729, c.tokSpan(name_tok), "Property '{s}' is used before its initialization.", .{name});
+        return;
+    }
+}
+
+/// Where a container declares `name`, and whether that declaration is one of
+/// tsc's `MethodDeclaration`s — a class method or an object literal's `m() {}`
+/// shorthand, the one kind `isUsedInFunctionOrInstanceProperty` waves through.
+const ForeignMember = struct { start: u32, is_method: bool };
+
+/// `name` as declared by one declaration of a value: a class's STATIC members,
+/// an enum's members, a namespace body's declarations, or the properties of the
+/// object literal a `const` is initialized with. Anything else declares no
+/// members a `Recv.name` could read at class-definition time.
+fn foreignMember(c: *Checker, container: Node, name: []const u8) ?ForeignMember {
+    const d = c.tree.nodeData(container);
+    switch (c.nodeTag(container)) {
+        .class_decl => {
+            const e = c.tree.extraData(ast.ClassData, d.lhs);
+            for (c.tree.extraRange(e.members_start, e.members_end)) |m| {
+                if (m == null_node) continue;
+                const flags: u32 = switch (c.nodeTag(m)) {
+                    .class_field => c.tree.extraData(ast.Field, c.tree.nodeData(m).lhs).flags,
+                    .class_method => c.tree.extraData(ast.FnProto, c.tree.nodeData(m).lhs).flags,
+                    else => continue,
+                };
+                if (flags & ast.Flags.static == 0 or flags & ast.Flags.optional != 0) continue;
+                if (!std.mem.eql(u8, c.tokenText(c.tree.nodeMainToken(m)), name)) continue;
+                return .{
+                    .start = c.nodeSpanStart(m),
+                    .is_method = c.nodeTag(m) == .class_method and
+                        flags & (ast.Flags.get | ast.Flags.set) == 0,
+                };
+            }
+        },
+        .enum_decl => {
+            const e = c.tree.extraData(ast.EnumData, d.lhs);
+            for (c.tree.extraRange(e.members_start, e.members_end)) |m| {
+                if (m == null_node or c.nodeTag(m) != .enum_member) continue;
+                if (!std.mem.eql(u8, c.tokenText(c.tree.nodeMainToken(m)), name)) continue;
+                return .{ .start = c.nodeSpanStart(m), .is_method = false };
+            }
+        },
+        .namespace_decl => {
+            const e = c.tree.extraData(ast.NamespaceData, d.lhs);
+            for (c.tree.extraRange(e.body_start, e.body_end)) |st| {
+                if (st == null_node) continue;
+                const inner = if (c.nodeTag(st) == .export_decl) c.tree.nodeData(st).lhs else st;
+                if (inner == null_node) continue;
+                // A `var`/`let`/`const` statement declares one name
+                // (`.var_decl_one`) or several (`.var_decl`); anything else
+                // names itself.
+                const decls: []const Node = switch (c.nodeTag(inner)) {
+                    .var_decl => c.tree.nodeRange(inner),
+                    .var_decl_one => &.{c.tree.nodeData(inner).lhs},
+                    else => &.{inner},
+                };
+                for (decls) |dec| {
+                    if (dec == null_node) continue;
+                    const tok = c.tree.declNameToken(dec) orelse continue;
+                    if (!std.mem.eql(u8, c.tokenText(tok), name)) continue;
+                    return .{ .start = c.nodeSpanStart(dec), .is_method = false };
+                }
+            }
+        },
+        .declarator_init, .declarator_full => {
+            const init = if (c.nodeTag(container) == .declarator_init)
+                d.rhs
+            else
+                c.tree.extraData(ast.DeclaratorFull, d.rhs).init;
+            if (init == null_node or c.nodeTag(init) != .object_literal) return null;
+            for (c.tree.nodeRange(init)) |p| {
+                if (p == null_node) continue;
+                switch (c.nodeTag(p)) {
+                    .object_property, .object_method, .object_shorthand => {},
+                    else => continue,
+                }
+                if (!std.mem.eql(u8, c.tokenText(c.tree.nodeMainToken(p)), name)) continue;
+                const method = c.nodeTag(p) == .object_method and
+                    c.tree.extraData(ast.FnProto, c.tree.nodeData(c.tree.nodeData(p).rhs).lhs).flags &
+                        (ast.Flags.get | ast.Flags.set) == 0;
+                return .{ .start = c.nodeSpanStart(p), .is_method = method };
+            }
+        },
+        else => {},
+    }
+    return null;
 }
 
 /// Does the constructor declare `name` as a parameter property? One of those is
