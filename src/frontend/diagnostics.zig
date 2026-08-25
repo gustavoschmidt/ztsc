@@ -975,6 +975,18 @@ pub const Code = enum(u16) {
     /// inside a `with` block earns nothing.
     with_statement_not_supported,
 
+    /// TS1317, tsc's `checkGrammarModifiers`: a parameter PROPERTY
+    /// (`public`/`private`/`protected`/`readonly`/`override`) may not also be a
+    /// rest parameter. Reported on the parameter NODE, whose first token is the
+    /// modifier run's first. Measured against tsgo 7.0.2: it does not depend on
+    /// the owner being a constructor (a method, a plain function and an
+    /// overload all earn it), and it LOSES to the modifier walk's own verdict —
+    /// `constructor(static ...a: string[])` answers TS1090 alone.
+    param_property_rest,
+    /// TS1040, the `async` arm of the same walk: an ambient declaration has no
+    /// body to await in. On the `async` keyword.
+    async_modifier_in_ambient,
+
     // --- regular-expression body and flags (src/frontend/regexp.zig) ------------
     // tsc validates a regex literal in `scanRegularExpressionWorker`, called
     // from the CHECKER's grammar pass, not from the parse that produced the
@@ -1294,6 +1306,10 @@ pub const Code = enum(u16) {
             // `withStatementInternalComments.ts` reports nothing at all).
             .with_in_strict,
             .with_statement_not_supported,
+            // Both are `checkGrammarModifiers`, the same checker pass that
+            // already owns TS1090 and TS1242 below.
+            .param_property_rest,
+            .async_modifier_in_ambient,
             // `let a: string?` next to a sibling file's TS2322 lets the TS2322
             // through, and `parseInvalidNullableTypes.ts` answers TS2322/TS2677
             // alongside its own TS17019s — tsc's checker, not its parser.
@@ -1586,6 +1602,8 @@ pub const Code = enum(u16) {
             .arguments_in_module => evalModuleMessage("arguments"),
             .with_in_strict => "'with' statements are not allowed in strict mode.",
             .with_statement_not_supported => "The 'with' statement is not supported. All symbols in a 'with' block will have type 'any'.",
+            .param_property_rest => "A parameter property cannot be declared using a rest parameter.",
+            .async_modifier_in_ambient => "'async' modifier cannot be used in an ambient context.",
             .decorator_not_valid_here => "Decorators are not valid here.",
             .decorator_on_method_overload => "A decorator can only decorate a method implementation, not an overload.",
             .decorator_on_second_accessor => "Decorators cannot be applied to multiple get/set accessors of the same name.",
@@ -1959,6 +1977,8 @@ pub const Code = enum(u16) {
             .eval_in_module, .arguments_in_module => 1215,
             .with_in_strict => 1101,
             .with_statement_not_supported => 2410,
+            .param_property_rest => 1317,
+            .async_modifier_in_ambient => 1040,
 
             .duplicate_identifier => 2300,
             .block_scoped_redeclare => 2451,

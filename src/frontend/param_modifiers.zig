@@ -39,6 +39,12 @@ pub const Role = union(enum) {
     rejected: Code,
 };
 
+/// Every bit `role` can hand back as a `.property` — "this parameter is a
+/// parameter PROPERTY", tsc's `ModifierFlags.ParameterPropertyModifier`. The
+/// rules that ask are about the parameter, not about which modifier spelled it
+/// (TS1317, TS2369), so they want the whole set at once.
+pub const property_mask: u32 = F.public | F.private | F.protected | F.readonly | F.override;
+
 /// `tag`'s standing in parameter position, or null when it is not a modifier
 /// there at all — in which case it is the parameter's own NAME.
 pub fn role(tag: Tag) ?Role {
@@ -70,6 +76,9 @@ const std = @import("std");
 test "the parameter-property modifiers are the legal ones" {
     for ([_]Tag{ .keyword_public, .keyword_private, .keyword_protected, .keyword_readonly, .keyword_override }) |t| {
         try std.testing.expect(role(t).? == .property);
+        // …and every one of them is in the mask the parameter-property rules
+        // read, so the two cannot drift apart.
+        try std.testing.expect(property_mask & role(t).?.property != 0);
     }
 }
 

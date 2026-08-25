@@ -1894,6 +1894,14 @@ const Parser = struct {
     /// ModuleBlock — so a module element there is out of context whatever list
     /// encloses the whole thing (`if (x) namespace N {}` is TS1235 even at the
     /// top level of a file). See `Parser.element_home`.
+    /// TS1040 for an `async` keyword at token `kw`, when the declaration it
+    /// modifies sits in an ambient context (`checkGrammarModifiers`' `flags &
+    /// ModifierFlags.Ambient || node.parent.flags & NodeFlags.Ambient`). A
+    /// no-op outside one, so the callers need no guard of their own.
+    fn asyncInAmbient(p: *Parser, kw: TokenIndex) Error!void {
+        if (p.ambient and p.spec == 0) try p.errAtToken(.async_modifier_in_ambient, kw);
+    }
+
     fn parseSubstatement(p: *Parser) PE!Node {
         const was_home = p.element_home;
         p.element_home = .other;
@@ -2080,7 +2088,13 @@ const Parser = struct {
             },
             .keyword_async => {
                 if (p.peekTag(1) == .keyword_function and !p.peekNewline(1)) {
-                    _ = try p.bump();
+                    const kw = try p.bump();
+                    // TS1040, tsc's `checkGrammarModifiers`: an ambient
+                    // declaration has no body to await in. The context is
+                    // inherited — a `.d.ts`, a `declare namespace` body, a
+                    // `declare module` block — where the `declare async
+                    // function` spelling reaches its own arm below.
+                    try p.asyncInAmbient(kw);
                     return p.parseFunctionDecl(ast.Flags.async, false);
                 }
                 // Any OTHER declaration behind `async` is tsc's TS1042: its
@@ -2158,10 +2172,11 @@ const Parser = struct {
                     },
                     .keyword_async => {
                         _ = try p.bump();
-                        _ = try p.bump();
+                        const kw = try p.bump();
                         const was_ambient = p.ambient;
                         p.ambient = true;
                         defer p.ambient = was_ambient;
+                        try p.asyncInAmbient(kw);
                         return p.parseFunctionDecl(ast.Flags.declare | ast.Flags.async, false);
                     },
                     .keyword_class => {
@@ -3873,6 +3888,19 @@ const Parser = struct {
         // replaces whatever the walk above found.
         if (p.curTag() == .keyword_this) {
             if (first_mod) |m| problem = .{ .code = .decorator_on_this_param, .tok = m };
+        } else if (problem == null and p.curTag() == .dot_dot_dot and
+            flags & param_modifiers.property_mask != 0)
+        {
+            // TS1317: a parameter PROPERTY may not also be a rest parameter.
+            // Later in `checkGrammarModifiers` than the per-modifier walk, so
+            // it only speaks when that walk had nothing to say —
+            // `constructor(static ...a: string[])` is TS1090 alone. It does NOT
+            // depend on the owner being a constructor: measured against tsgo
+            // 7.0.2, a method, a plain function and an overload signature each
+            // answer it (alongside the TS2369 the parameter property itself
+            // earns there). Blamed on the parameter node, whose first token is
+            // the modifier run's first.
+            if (first_mod) |m| problem = .{ .code = .param_property_rest, .tok = m };
         }
         if (p.spec == 0) {
             if (problem) |it| try p.errAtToken(it.code, it.tok);
