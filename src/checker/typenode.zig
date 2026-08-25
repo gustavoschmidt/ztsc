@@ -1307,11 +1307,23 @@ pub fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, obj_flags:
     // type on both sides stores nothing — `makeObjectSigs` derives
     // `obj_flag_write_types` from the props, so the common object's shape is
     // byte-for-byte what it was.
-    var sit = setter_params.iterator();
-    while (sit.next()) |e| {
-        const idx = prop_index.get(e.key_ptr.*) orelse continue;
-        if (props.items[idx].ty == e.value_ptr.*) continue;
-        props.items[idx].write_ty = e.value_ptr.*;
+    //
+    // TYPE LITERALS ONLY. An INTERFACE (the other caller, which passes
+    // `obj_flag_not_inferable`) stays a `.ref`, so `expr.setterWriteType`
+    // reaches its `set` declarations directly and the stored copy would be
+    // redundant — and not free: the DOM lib declares ~29 divergent pairs on
+    // `Node`, `Element` and friends, every derived interface's member table
+    // inherits them, and storing them there cost +3.4 MB peak RSS on
+    // excalidraw (+3.3%, measured) for an answer the declaration walk already
+    // had. A materialized type literal is the one shape with no declaration
+    // to walk back to, and it is the only one that stores.
+    if (obj_flags & types.obj_flag_not_inferable == 0) {
+        var sit = setter_params.iterator();
+        while (sit.next()) |e| {
+            const idx = prop_index.get(e.key_ptr.*) orelse continue;
+            if (props.items[idx].ty == e.value_ptr.*) continue;
+            props.items[idx].write_ty = e.value_ptr.*;
+        }
     }
     var flags = if (sym_index and !str_index and nindex == 0)
         obj_flags | types.obj_flag_symbol_index
