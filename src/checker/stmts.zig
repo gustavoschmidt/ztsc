@@ -1364,8 +1364,12 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
     // `super(…)` written directly in it, whatever the enclosing one was.
     const saved_in_ctor = c.in_ctor_body;
     const saved_in_key = c.in_computed_key;
+    // …and the `super` container a DECORATOR steps out of its class for: a
+    // function written inside the decorator is a container of its own.
+    const saved_in_deco = c.in_decorator;
     c.in_ctor_body = c.nodeTag(node) == .class_method and c.isCtorMember(node, proto.flags);
     c.in_computed_key = false;
+    c.in_decorator = false;
     defer {
         c.cur_scope = saved_scope;
         c.fn_ctx = saved_ctx;
@@ -1373,6 +1377,7 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
         c.field_init_depth = saved_field_init;
         c.in_ctor_body = saved_in_ctor;
         c.in_computed_key = saved_in_key;
+        c.in_decorator = saved_in_deco;
     }
     if (try c.scopeOf(node)) |s| c.cur_scope = s;
     // An explicit `this` parameter types `this` inside the body.
@@ -2805,7 +2810,15 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
             .decorator => {
                 // A member decorator expression is evaluated in the scope
                 // surrounding the class (at class-definition time), so its
-                // `this` is the enclosing `this`, not the instance.
+                // `this` is the enclosing `this`, not the instance — and so is
+                // its `super` CONTAINER (`Checker.in_decorator`). The SCOPE is
+                // deliberately left alone: tsc resolves a decorator's names in
+                // the class's own scope, and moving the walk out convicted
+                // every decorator function of TS2454 in
+                // `decoratorUsedBeforeDeclaration`.
+                const saved_deco = c.in_decorator;
+                defer c.in_decorator = saved_deco;
+                c.in_decorator = true;
                 c.this_type = saved_this;
                 // The decorated member is the next non-decorator member. It
                 // is needed BEFORE the decorator expression is checked: the

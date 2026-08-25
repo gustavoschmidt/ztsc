@@ -2057,6 +2057,16 @@ pub const Checker = struct {
     /// Cleared by `checkFunctionBody`, since a function written inside the name
     /// IS a container (`{ [(() => super())()]: 1 }` is TS2337 again).
     in_computed_key: bool = false,
+    /// Is the expression currently being walked a DECORATOR's?
+    /// `getSuperContainer`'s `Decorator` arm steps to the decorated element and
+    /// then keeps walking, so the class the decorator is attached to is passed
+    /// over entirely: `@(super.deco) method() {}` in a top-level class has no
+    /// `super` container at all and is TS2660, where the same expression in the
+    /// method's body would be fine. The scope walk has no parent pointers to
+    /// see that, so the class-member walk marks it (`superContainerIsMember`).
+    /// Cleared by `checkFunctionBody`, since a function written inside the
+    /// decorator IS a container.
+    in_decorator: bool = false,
     /// The one expression node whose VALUE the enclosing construct throws away
     /// (`ast.null_node` = none) — tsc's `expressionResultIsUnused`, which walks
     /// PARENTS from the expression up through parentheses, `void`, assertions

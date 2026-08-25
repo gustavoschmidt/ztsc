@@ -267,8 +267,17 @@ fn thisBoundKey(c: *const Checker, fn_node: Node) u64 {
 /// one where the `p: function () {}` spelling beside it is not.
 fn superContainerIsMember(c: *const Checker) bool {
     var cur = c.cur_scope;
-    while (cur != binder.file_scope) {
-        switch (c.bind.scope_kinds[cur]) {
+    // A DECORATOR is written inside the class body but evaluated outside it,
+    // and `getSuperContainer` steps over the whole class to say so
+    // (`Checker.in_decorator`). Only the class the walk STARTS in is stepped
+    // over: once any other frame is seen the decorator is behind us.
+    var skip_class = c.in_decorator;
+    while (cur != binder.file_scope) : (cur = c.bind.scope_parents[cur]) {
+        const kind = c.bind.scope_kinds[cur];
+        const in_class = kind == .class or kind == .class_members or kind == .class_statics;
+        if (skip_class and in_class) continue;
+        skip_class = false;
+        switch (kind) {
             .function => {
                 const owner = c.bind.scope_owners[cur];
                 switch (c.nodeTag(owner)) {
@@ -287,7 +296,6 @@ fn superContainerIsMember(c: *const Checker) bool {
             .namespace, .enum_body => return false,
             else => {},
         }
-        cur = c.bind.scope_parents[cur];
     }
     return false;
 }
