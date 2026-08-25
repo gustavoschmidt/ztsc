@@ -5338,21 +5338,16 @@ pub fn sourceSatisfiesSigs(c: *Checker, s: TypeId, t: TypeId, is_construct: bool
     // concrete constructor satisfies an abstract-constructor target — which is
     // why the test is one-sided.
     //
-    // ztsc carries the `abstract` bit on the class DECLARATION rather than on
-    // the signature, so the source side is recognized by its `.class_value`
-    // kind — and the TARGET side has to be one ztsc can be sure is not
-    // abstract. `typenode` builds `abstract new (…) => R` and `new (…) => R`
-    // into the same object and keeps no bit apart, so the only targets this
-    // fires on are the ones that CANNOT have been written either way: an
-    // object carrying anything besides one lone construct signature.
-    // `abstract new (…) => T` is exactly that lone signature, so a genuinely
-    // abstract target is never mistaken for a concrete one — at the cost of
-    // under-reporting a target spelled `new () => A` on its own
-    // (`classAbstractAssignabilityConstructorFunction`), which is the
-    // direction this project takes when a bit is missing.
+    // The source side is recognized by its `.class_value` kind (ztsc carries
+    // the `abstract` bit on the class DECLARATION there). WAVE36-A: the TARGET
+    // side now reads `types.fn_flag_abstract` off the signature itself, which
+    // `typenode` sets for `abstract new (…) => R` — so the screen is tsc's
+    // exact test instead of the old "the target cannot have been written
+    // either way" proxy, which stood down for a target spelled `new () => A`
+    // on its own (`classAbstractAssignabilityConstructorFunction`).
     if (is_construct and sk == .class_value and
-        !bareConstructSigObject(c, t) and
         c.ts.objectConstructSigCount(t) > 0 and
+        !c.ts.fnIsAbstract(c.ts.objectConstructSig(t, 0)) and
         try c.classIsAbstract(c.ts.classSymbol(s))) return false;
     var src: std.ArrayList(TypeId) = .empty;
     defer src.deinit(c.scratch());

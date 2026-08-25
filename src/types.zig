@@ -452,6 +452,19 @@ pub const fn_flag_predicate: u32 = 2;
 /// list, so it never counts toward arity; it is used for the call-site
 /// receiver check (TS2684) and for typing `this` inside the body.
 pub const fn_flag_this: u32 = 4;
+/// tsc's `SignatureFlags.Abstract`: this CONSTRUCT signature cannot be `new`ed
+/// — it is what `abstract new (…) => R` writes, and what the static side of an
+/// `abstract class` carries. `signaturesRelatedTo` screens on it before it
+/// compares anything: an abstract source signature against a non-abstract
+/// target is rejected outright, because letting `typeof A` through a
+/// `new () => A` target would hand the caller a `new` on a class with
+/// unimplemented members. The reverse stays legal.
+///
+/// It lives on the SIGNATURE and not on the class declaration precisely so
+/// that `new () => A` and `abstract new () => A` are two types: both build the
+/// same lone-construct-signature object, and without the bit in the interned
+/// shape they hash-cons together and the screen has nothing to read.
+pub const fn_flag_abstract: u32 = 8;
 pub const param_flag_optional: u32 = 1;
 pub const param_flag_rest: u32 = 2;
 pub const param_flag_initializer: u32 = 4;
@@ -955,6 +968,10 @@ pub const Store = struct {
 
     pub fn fnHasPredicate(s: *const Store, id: TypeId) bool {
         return s.kind(id) == .function and s.fnFlags(id) & fn_flag_predicate != 0;
+    }
+    /// Is this construct signature `abstract`? See `fn_flag_abstract`.
+    pub fn fnIsAbstract(s: *const Store, id: TypeId) bool {
+        return s.kind(id) == .function and s.fnFlags(id) & fn_flag_abstract != 0;
     }
     pub fn fnPredicate(s: *const Store, id: TypeId) Predicate {
         if (id < s.base_len) return s.base.?.fnPredicate(id);
@@ -1697,6 +1714,31 @@ pub const Store = struct {
         try s.pending.appendSlice(s.alloc, own.extra.items[a .. a + len]);
         s.pending.items[start] &= ~mask;
         return s.internType(.object, s.pending.items[start..], n);
+    }
+
+    /// The same signature with `mask` added to its flags word. Used for
+    /// `fn_flag_abstract`, which the type-node path only learns AFTER the
+    /// proto has been converted; every other flag is known at build time and
+    /// goes straight into `makeFunction*`. The flags word is part of the
+    /// interned shape, so this mints a distinct type — which is the point.
+    pub fn withFnFlags(s: *Store, id: TypeId, mask: u32) Error!TypeId {
+        if (s.kind(id) != .function) return id;
+        const a = s.dataA(id);
+        const b = s.dataB(id);
+        // The signature may live in the frozen base; read its shape words from
+        // the owning store (base ids carry base-relative extra offsets).
+        const own = if (id < s.base_len) s.base.? else s;
+        const f = own.extra.items[a];
+        if (f & mask == mask) return id;
+        const tpc = own.extra.items[a + 2];
+        const pred: u32 = if (f & fn_flag_predicate != 0) 3 else 0;
+        const thisw: u32 = if (f & fn_flag_this != 0) 1 else 0;
+        const len: u32 = 3 + tpc + 3 * b + pred + thisw;
+        const start = s.pending.items.len;
+        defer s.pending.items.len = start;
+        try s.pending.appendSlice(s.alloc, own.extra.items[a .. a + len]);
+        s.pending.items[start] |= mask;
+        return s.internType(.function, s.pending.items[start..], b);
     }
 
     pub fn makeFunction(
@@ -2725,6 +2767,38 @@ test "function and tuple interning" {
     try testing.expectEqual(t1, t2);
     try testing.expectEqual(@as(u32, 2), s.tupleLen(t1));
     try testing.expect(s.tupleElem(t1, 1).optional());
+}
+
+test "an abstract construct signature is a distinct interned type" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var s = try Store.init(arena.allocator());
+
+    // `new () => number` and `abstract new () => number` must not hash-cons
+    // together, or the relation's abstract screen has nothing to read.
+    const plain = try s.makeFunction(&.{}, number_type, &.{}, 0);
+    const abst = try s.withFnFlags(plain, fn_flag_abstract);
+    try testing.expect(plain != abst);
+    try testing.expect(!s.fnIsAbstract(plain));
+    try testing.expect(s.fnIsAbstract(abst));
+    // Everything else about the signature survives the rebuild…
+    try testing.expectEqual(s.fnReturn(plain), s.fnReturn(abst));
+    try testing.expectEqual(s.fnParamCount(plain), s.fnParamCount(abst));
+    // …and the rebuild is idempotent and hash-consed.
+    try testing.expectEqual(abst, try s.withFnFlags(abst, fn_flag_abstract));
+    try testing.expectEqual(abst, try s.withFnFlags(try s.makeFunction(&.{}, number_type, &.{}, 0), fn_flag_abstract));
+
+    // The trailing payload words (predicate, `this`) are copied, not dropped:
+    // both are read off offsets past the params.
+    const params = [_]Param{.{ .name = 1, .ty = number_type }};
+    const pred = try s.makeFunctionThis(&params, boolean_type, &.{}, 0, .{ .param = 0, .ty = string_type, .asserts = false }, number_type);
+    const pred_a = try s.withFnFlags(pred, fn_flag_abstract);
+    try testing.expect(pred != pred_a);
+    try testing.expect(s.fnHasPredicate(pred_a));
+    try testing.expectEqual(s.fnPredicate(pred).ty, s.fnPredicate(pred_a).ty);
+    try testing.expectEqual(number_type, s.fnThisType(pred_a));
+    // A non-function id is returned unchanged.
+    try testing.expectEqual(number_type, try s.withFnFlags(number_type, fn_flag_abstract));
 }
 
 test "refs and type params intern by symbol + args" {

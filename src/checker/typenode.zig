@@ -302,9 +302,16 @@ fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
         .constructor_type => {
             // `new (…) => R` / `abstract new (…) => R`: an object
             // type with a single construct signature and no call signature.
-            // (Abstract-ness is not yet modelled — under-reports TS2511 on
-            // `new (abstractCtor)()`, never a false positive.)
-            const sig = try c.signatureOfProto(node, d.lhs, false, true);
+            // WAVE36-A (abstract construct signature): the parser already
+            // records the modifier in `rhs`; carry it on the SIGNATURE (tsc's
+            // `SignatureFlags.Abstract`) so the two spellings intern apart and
+            // the relation's abstract screen has a bit to read — see
+            // `assign.sourceSatisfiesSigs`.
+            const sig0 = try c.signatureOfProto(node, d.lhs, false, true);
+            const sig = if (d.rhs != 0)
+                try c.ts.withFnFlags(sig0, types.fn_flag_abstract)
+            else
+                sig0;
             return c.ts.makeObjectSigs(&.{}, 0, 0, types.obj_flag_not_inferable, &.{}, &.{sig});
         },
         .keyof_type => return c.keyofType(try c.typeFromTypeNode(d.lhs)),
