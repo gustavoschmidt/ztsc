@@ -1397,6 +1397,24 @@ const Parser = struct {
     /// lookahead, and are answered `true` here unconditionally. A false `true`
     /// only keeps ztsc's existing recovery for that token; a false `false`
     /// would manufacture a TS1128 tsc does not report.
+    /// tsc's `isDeclaration()` arm for `import`: the keyword commits to an
+    /// import DECLARATION only on a specifier, a `*`, a `{` or a name.
+    ///
+    ///     case SyntaxKind.ImportKeyword:
+    ///         nextToken();
+    ///         return token() === SyntaxKind.StringLiteral || token() === SyntaxKind.AsteriskToken ||
+    ///             token() === SyntaxKind.OpenBraceToken || tokenIsIdentifierOrKeyword(token());
+    fn importStartsDeclaration(after: TokTag) bool {
+        return after == .string_literal or after == .asterisk or after == .l_brace or
+            after == .identifier or after.isKeyword();
+    }
+
+    /// tsc's `nextTokenIsOpenParenOrLessThanOrDot`: the three tokens that make
+    /// the keyword an EXPRESSION (`import(…)`, `import<T>`, `import.meta`).
+    fn importStartsExpression(after: TokTag) bool {
+        return after == .l_paren or after == .lt or after == .dot;
+    }
+
     fn atStartOfStatement(p: *Parser) bool {
         return switch (p.curTag()) {
             .at,
@@ -1424,9 +1442,8 @@ const Parser = struct {
             // here so that a stray one is parsed and complained about later.
             .keyword_catch,
             .keyword_finally,
-            // The lookahead group (see the doc comment).
+            // The rest of the lookahead group (see the doc comment).
             .keyword_const,
-            .keyword_import,
             .keyword_async,
             .keyword_declare,
             .keyword_interface,
@@ -1443,6 +1460,19 @@ const Parser = struct {
             // treating it as junk would add a TS1128 tsc never reports.
             .unterminated_comment,
             => true,
+            // `import` is the one member of the lookahead group answered
+            // EXACTLY, because its false `true` is expensive: tsc's
+            //
+            //     case SyntaxKind.ImportKeyword:
+            //         return isStartOfDeclaration() ||
+            //             lookAhead(nextTokenIsOpenParenOrLessThanOrDot);
+            //
+            // `import 10;` starts no statement at all, so tsc reports one
+            // TS1128 at the keyword and SKIPS it, leaving `10;` to parse
+            // cleanly — where reading it as an import declaration answered
+            // TS1005 at the `10` and swallowed the rest of the line.
+            .keyword_import => importStartsDeclaration(p.peekTag(1)) or
+                importStartsExpression(p.peekTag(1)),
             // The one group tsc does NOT wave through: a class-member modifier
             // is a statement start only when a declaration follows it, or when
             // the next token cannot be a member NAME. `static test()` inside a
@@ -2691,7 +2721,7 @@ const Parser = struct {
                 if (p.curTag() == .l_brace or p.curTag() == .l_bracket) try p.errAtCur(code);
             }
             const before = p.curIdx();
-            try p.pushScratch(try p.parseDeclarator(no_in));
+            try p.pushScratch(try p.parseDeclarator(no_in, .var_stmt));
             // The comma that ended the last element, still unanswered — tsc's
             // `commaStart`, which `parseDelimitedList` carries out of the loop
             // as the node array's `hasTrailingComma`.
@@ -2811,7 +2841,25 @@ const Parser = struct {
         };
     }
 
-    fn parseDeclarator(p: *Parser, no_in: bool) PE!Node {
+    /// The token an "initializer not allowed here" diagnostic blames, given the
+    /// `=` that introduced it. tsc blames the initializer EXPRESSION; when the
+    /// expression is missing entirely (`catch (e = ` at end of file) there is no
+    /// token to blame and the `=` stands in. `eq_tok + 1` is the expression's
+    /// first token exactly when something was read after the `=` — `curIdx`
+    /// names the token the parser has NOT consumed yet, so it is a valid index
+    /// only once a bump has claimed it, which is the out-of-bounds this guards.
+    fn initializerBlame(p: *const Parser, eq_tok: u32) u32 {
+        return if (eq_tok + 1 < p.tok_tags.items.len) eq_tok + 1 else eq_tok;
+    }
+
+    /// Which declaration a declarator belongs to. Only one rule reads it —
+    /// TS1197, tsc's `checkGrammarVariableDeclaration` refusing a catch
+    /// variable's initializer — but the answer cannot be recovered afterwards:
+    /// a declarator node keeps no parent link, and its initializer node keeps
+    /// no first-token index to blame.
+    const DeclaratorHome = enum { var_stmt, catch_clause };
+
+    fn parseDeclarator(p: *Parser, no_in: bool, home: DeclaratorHome) PE!Node {
         const name_tok = p.curIdx();
         const name = try p.parseBindingName(.private_name_in_var_decl);
         var flags: u32 = 0;
@@ -2822,7 +2870,14 @@ const Parser = struct {
         var type_ann: Node = null_node;
         if (try p.eat(.colon) != null) type_ann = try p.parseType();
         var init: Node = null_node;
-        if (try p.eat(.eq) != null) init = try p.parseAssignExpr(.{ .no_in = no_in });
+        if (try p.eat(.eq)) |eq_tok| {
+            init = try p.parseAssignExpr(.{ .no_in = no_in });
+            // TS1197 at the initializer expression, tsc's
+            // `checkGrammarVariableDeclaration`. A `=` inside the BINDING
+            // PATTERN (`catch ({ a = 1 })`) is a binding element's default and
+            // never reaches here, which is also where tsc draws the line.
+            if (home == .catch_clause) try p.errAtToken(.catch_variable_initializer, initializerBlame(p, eq_tok));
+        }
 
         if (flags == 0 and type_ann == null_node) {
             if (init == null_node) {
@@ -3080,7 +3135,7 @@ const Parser = struct {
             const catch_kw = try p.bump();
             var binding: Node = null_node;
             if (try p.eat(.l_paren) != null) {
-                binding = try p.parseDeclarator(false); // allows `e: unknown`
+                binding = try p.parseDeclarator(false, .catch_clause); // allows `e: unknown`
                 _ = try p.expect(.r_paren, .expected_r_paren);
             }
             const catch_block = try p.parseBlock();
@@ -3374,10 +3429,17 @@ const Parser = struct {
         fn allowsConst(o: TypeParamOwner) bool {
             return o != .type_decl;
         }
+        /// Whether an EMPTY list is TS1098 here: `checkGrammarTypeParameterList`
+        /// is called only by `checkGrammarClassLikeDeclaration` and
+        /// `checkGrammarFunctionLikeDeclaration`, never for an interface or a
+        /// type alias.
+        fn reportsEmptyList(o: TypeParamOwner) bool {
+            return o != .type_decl;
+        }
     };
 
     fn parseTypeParams(p: *Parser, owner: TypeParamOwner) PE!ast.SubRange {
-        _ = try p.expectLt();
+        const lt = try p.expectLt();
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
         while (p.curTag() != .gt and p.curTag() != .eof) {
@@ -3443,7 +3505,15 @@ const Parser = struct {
             try p.pushScratch(try p.addNode(.{ .tag = .type_param, .main_token = name, .data = .{ .lhs = constraint, .rhs = default } }));
             if (try p.eat(.comma) == null) break;
         }
+        const empty = p.scratchTop() == top;
         _ = try p.expectGt();
+        // TS1098, tsc's `checkGrammarTypeParameterList` — TS1099's twin, and a
+        // GRAMMAR diagnostic for the same reason. It has exactly two callers,
+        // `checkGrammarClassLikeDeclaration` and
+        // `checkGrammarFunctionLikeDeclaration`, so `class C<>` and
+        // `function f<>()` report while `interface I<>` and `type A<> = number`
+        // are silent (measured). Anchored at the `<`; tsc's span runs `<`..`>`.
+        if (empty and owner.reportsEmptyList()) try p.errAtToken(.empty_type_param_list, lt);
         return p.scratchToSpan(top);
     }
 
@@ -4909,6 +4979,20 @@ const Parser = struct {
             }
             ext = try p.scratchToSpan(top);
         }
+        // `interface I implements J {}`: tsc's `parseHeritageClauses` takes
+        // BOTH keywords and `checkGrammarInterfaceDeclaration` refuses the
+        // `implements` one — at the keyword, and without ever resolving the
+        // names behind it (measured: `interface I implements Missing {}` is
+        // TS1176 alone, no TS2304). So the clause is parsed for its own
+        // syntax and dropped; only `extends` contributes base types.
+        if (p.curTag() == .keyword_implements) {
+            try p.errAtCur(.interface_implements_clause);
+            _ = try p.bump();
+            while (true) {
+                _ = try p.parseHeritage();
+                if (try p.eat(.comma) == null) break;
+            }
+        }
         const members = blk: {
             const saved = p.in_interface_body;
             defer p.in_interface_body = saved;
@@ -5466,8 +5550,22 @@ const Parser = struct {
     /// still parses, so its semantic pass runs (the `es6Import*WithExport`
     /// family is 8 corpus cases whose real keys are all downstream of that).
     fn parseImportStatement(p: *Parser, export_kw: ?u32) PE!Node {
-        // `import(` / `import.` are expressions, not declarations.
-        if (p.peekTag(1) == .l_paren or p.peekTag(1) == .dot) {
+        // `import(` / `import.` / `import<` are expressions, not declarations
+        // (`importStartsExpression`). The `<` case is what
+        // `importWithTypeArguments` needs: `import<T>` is an instantiation
+        // expression whose TS1326 is a grammar error, not the "expected an
+        // import clause" a declaration parse gives — an UNCODED report, which
+        // costs the file its whole comparison.
+        //
+        // Anything else that is not a DECLARATION start goes the same way —
+        // tsc's `parseStatement` falls through its `isStartOfDeclaration()`
+        // test to `parseExpressionOrLabeledStatement`. In a statement LIST such
+        // a token never reaches here at all (`atStartOfStatement` answered
+        // false, so TS1128 was reported and the keyword skipped); the arm still
+        // matters for the ungated positions, `if (x) import 10;` among them.
+        // An `export` modifier is the exception: tsc's `parseDeclaration`
+        // dispatches on the keyword after the modifier list without asking.
+        if (export_kw == null and !importStartsDeclaration(p.peekTag(1))) {
             return p.parseExpressionStatement();
         }
         const kw = try p.bump(); // `import`
@@ -6572,7 +6670,7 @@ const Parser = struct {
                         },
                         .lt, .lt_lt => {
                             // `a?.<T>(...)` — a call, or nothing at all.
-                            if (try p.tryParseTypeArgsInExpr(ctx, true)) |targs| {
+                            if (try p.tryParseTypeArgsInExpr(ctx, true, true)) |targs| {
                                 const info = try p.parseCallInfo(targs);
                                 lhs = try p.addNode(.{ .tag = .optional_call, .main_token = qd, .data = .{ .lhs = lhs, .rhs = info } });
                             } else {
@@ -6624,7 +6722,15 @@ const Parser = struct {
                 .lt, .lt_lt => {
                     // Generic call / instantiation-expression speculation.
                     const lt = p.curIdx();
-                    const targs = (try p.tryParseTypeArgsInExpr(ctx, false)) orelse return lhs;
+                    // `import<…>` — with or without a following argument list —
+                    // is tsc's `checkGrammarImportCallExpression`, reached from
+                    // `checkExpressionWorker`'s ImportKeyword arm BEFORE the
+                    // ordinary call path. So it also takes the TS1099 that an
+                    // EMPTY list (`import<>("./m")`) would otherwise earn:
+                    // one report per node, and this is the one that wins.
+                    const import_callee = p.nodes.items(.tag)[lhs] == .import_expr;
+                    const targs = (try p.tryParseTypeArgsInExpr(ctx, false, !import_callee)) orelse return lhs;
+                    if (import_callee) try p.errAtToken(.import_call_type_args, p.nodes.items(.main_token)[lhs]);
                     // `f<T>` with no argument list is an instantiation
                     // expression; so is a `<T>` inside a `new` callee or a
                     // heritage clause, whose owner claims the type arguments
@@ -6730,12 +6836,14 @@ const Parser = struct {
     ///
     /// `require_paren` narrows acceptance to a following `(`: the call-only
     /// sites (`a?.<T>(…)`, `new C<T>(…)`), where the grammar admits no
-    /// instantiation expression.
-    fn tryParseTypeArgsInExpr(p: *Parser, ctx: ExprCtx, require_paren: bool) PE!?ast.SubRange {
+    /// instantiation expression. `empty_is_error` carries `parseTypeArgs`'
+    /// TS1099 decision — the one caller that turns it off is the `import<>`
+    /// arm, whose own TS1326 replaces it.
+    fn tryParseTypeArgsInExpr(p: *Parser, ctx: ExprCtx, require_paren: bool, empty_is_error: bool) PE!?ast.SubRange {
         const state = p.save();
         const saved_spec = p.spec;
         p.spec += 1;
-        const result: PE!ast.SubRange = p.parseTypeArgs();
+        const result: PE!ast.SubRange = p.parseTypeArgsIn(empty_is_error);
         // Restore the depth unconditionally, on the error path too: a `spec`
         // left set past a construct's end silently mis-parses everything after
         // it (`parseType`'s `extends` guard, `unsupportedFrom`, every `fail`).
@@ -8480,6 +8588,13 @@ const Parser = struct {
     /// and a `>` (a full `isStartOfType` is a larger rule than the evidence
     /// supports, and admitting a bad element keeps today's behaviour).
     fn parseTypeArgs(p: *Parser) PE!ast.SubRange {
+        return p.parseTypeArgsIn(true);
+    }
+
+    /// `parseTypeArgs` with the TS1099 decision made by the caller. Only the
+    /// `import<>` arm passes false: tsc reports one grammar error per node
+    /// there and its ImportKeyword arm gets to it first.
+    fn parseTypeArgsIn(p: *Parser, empty_is_error: bool) PE!ast.SubRange {
         const lt = try p.expectLt();
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
@@ -8489,7 +8604,7 @@ const Parser = struct {
         }
         const empty = p.scratchTop() == top;
         _ = try p.expectGt();
-        if (empty) try p.errAtToken(.empty_type_arg_list, lt);
+        if (empty and empty_is_error) try p.errAtToken(.empty_type_arg_list, lt);
         return p.scratchToSpan(top);
     }
 
@@ -8698,18 +8813,44 @@ const Parser = struct {
             const before = p.curIdx();
             const diags_before = p.diags.items.len;
             try p.pushScratch(try p.parseTypeMember());
-            // Separators: `;` or `,`, or just a newline.
-            _ = try p.eat(.semicolon) orelse try p.eat(.comma);
             if (p.curIdx() == before) {
                 // `parseTypeMember` already reported TS1131 at this token when
                 // it failed on the member name; one diagnostic per token is
                 // what tsc emits, so do not double it.
                 if (p.diags.items.len == diags_before) try p.errAtCur(.expected_type_member);
                 _ = try p.bump();
+                continue;
             }
+            try p.typeMemberSemicolon();
         }
         _ = try p.expect(.r_brace, .expected_r_brace);
         return p.scratchToSpan(top);
+    }
+
+    /// tsc's `parseTypeMemberSemicolon`, the separator rule for every member of
+    /// an interface body or object type literal:
+    ///
+    ///     // We allow type members to be separated by commas or (possibly ASI)
+    ///     // semicolons. First check if it was a comma. If so, we're done with
+    ///     // the member. Didn't have a comma. We must have a (possible ASI)
+    ///     // semicolon.
+    ///     if (parseOptional(SyntaxKind.CommaToken)) return;
+    ///     parseSemicolon();
+    ///
+    /// So `{ foo: string bar: string }` on one line is TS1005 at `bar`, while
+    /// the same two members on separate lines are silent — ztsc used to accept
+    /// both without a word. Nothing is consumed on the failing path and the
+    /// speculation depth is honoured by hand rather than through `fail`: a
+    /// missing separator must not abort a lookahead that would otherwise
+    /// succeed (the mapped-type and arrow-return-type probes both parse type
+    /// members speculatively).
+    fn typeMemberSemicolon(p: *Parser) PE!void {
+        if (try p.eat(.comma) != null) return;
+        switch (p.curTag()) {
+            .semicolon => _ = try p.bump(),
+            .r_brace, .eof => {},
+            else => if (!p.nlBefore() and p.spec == 0) try p.errAtCur(.expected_semicolon),
+        }
     }
 
     fn parseTypeMember(p: *Parser) PE!Node {
@@ -8821,6 +8962,28 @@ const Parser = struct {
         }
         var type_ann: Node = null_node;
         if (try p.eat(.colon) != null) type_ann = try p.parseType();
+        // tsc's `parsePropertyOrMethodSignature`, verbatim comment and all:
+        //
+        //     // Although type literal properties cannot not have initializers,
+        //     // we attempt to parse an initializer so we can report in the
+        //     // checker that an interface property or type literal property
+        //     // cannot have an initializer.
+        //     if (token() === SyntaxKind.EqualsToken) node.initializer = …
+        //
+        // So the `= 5` is CONSUMED, and `checkGrammarProperty` answers TS1246
+        // (interface) or TS1247 (type literal) at the initializer expression.
+        // Refusing the `=` instead ended the member list and cost a TS1131 plus
+        // whatever the rest of the line then parsed as. The initializer node is
+        // dropped: a signature has no place to store one, and every diagnostic
+        // it can carry has already been recorded by parsing it.
+        if (p.curTag() == .eq) {
+            const eq_tok = try p.bump();
+            _ = try p.parseAssignExpr(.{});
+            try p.errAtToken(if (p.in_interface_body)
+                .interface_property_initializer
+            else
+                .type_literal_property_initializer, initializerBlame(p, eq_tok));
+        }
         const member = try p.addNode(.{ .tag = .property_signature, .main_token = name_tok, .data = .{ .lhs = type_ann, .rhs = flags } });
         if (computed) |cn| try p.finishComputedName(cn, member, p.typeMemberHome(), .property, false);
         return member;
@@ -8973,12 +9136,12 @@ const Parser = struct {
             value_type = try p.parseType();
             shape.value_type = true;
         }
-        // A type-literal member list separates with `;` OR `,`
-        // (`{ [k: string]: E, [k: number]: E }` is legal and common); the
-        // member loop eats the separator, so a `,` here is not a missing
-        // semicolon. Without this, that shape reported a false TS1005 — and a
-        // false parse error suppresses the whole file's semantic pass.
-        if (p.curTag() != .comma) try p.expectSemicolon();
+        // A CLASS member ends here; a type member's separator belongs to the
+        // member loop's `typeMemberSemicolon`, which is the one place tsc puts
+        // it (`parseTypeMemberSemicolon`) and which also accepts the `,` of
+        // `{ [k: string]: E, [k: number]: E }`. Running both consumed the `;`
+        // here and then reported a false TS1005 on the NEXT member's name.
+        if (in_class) try p.expectSemicolon();
         const reports = index_signature.check(shape);
         if (reports.trailing_comma) |r| try p.errAtToken(r.code, r.token);
         if (reports.initializer_outside_impl) |r| try p.errAtToken(r.code, r.token);

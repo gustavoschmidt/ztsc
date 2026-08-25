@@ -1033,6 +1033,35 @@ pub const Code = enum(u16) {
     unsupported_syntax,
     unsupported_satisfies,
 
+    // --- appended (kept at the end so no existing tag renumbers) ---------------
+    /// TS1326: `import<T>("m")` / `import<T>` — the `import` keyword carrying
+    /// TYPE ARGUMENTS. tsc's `checkGrammarImportCallExpression`, reached from
+    /// `checkExpressionWorker`'s ImportKeyword-callee arm BEFORE the ordinary
+    /// call path, which is why it also suppresses the TS1099 that `import<>`
+    /// would otherwise earn. A GRAMMAR diagnostic: measured, tsgo reports it
+    /// beside the TS2304 the type argument of `import<T>` earns.
+    import_call_type_args,
+    /// TS1176: `interface I implements J {}`. tsc parses the clause and
+    /// `checkGrammarInterfaceDeclaration` refuses it, so the interface still
+    /// has its members and the file still gets its semantic pass.
+    interface_implements_clause,
+    /// TS1246: `interface I { x: number = 5 }`. tsc's
+    /// `parsePropertyOrMethodSignature` parses the initializer precisely so
+    /// `checkGrammarProperty` can refuse it here rather than in the parser.
+    interface_property_initializer,
+    /// TS1247: the same refusal for a TYPE LITERAL's property (`let x: { a:
+    /// number = 5 }`), which tsc words differently.
+    type_literal_property_initializer,
+    /// TS1098: `class C<> {}` — an empty type-PARAMETER list, TS1099's twin.
+    /// tsc's `checkGrammarTypeParameterList` is reached from exactly two
+    /// callers, `checkGrammarClassLikeDeclaration` and
+    /// `checkGrammarFunctionLikeDeclaration`, so `interface I<>` and `type
+    /// A<> = number` are silent (measured). Anchored at the `<`.
+    empty_type_param_list,
+    /// TS1197: `catch (e = 1) {}`. tsc's `checkGrammarVariableDeclaration`,
+    /// at the initializer expression.
+    catch_variable_initializer,
+
     /// How tsc surfaces the condition — which decides both what a diagnostic
     /// suppresses and what suppresses it. Established empirically against tsgo
     /// 7.0.2: each candidate was compiled next to a second root file holding one
@@ -1340,6 +1369,15 @@ pub const Code = enum(u16) {
             .regex_no_group_named,
             .regex_char_cannot_be_escaped,
             .regex_unicode_escape_needs_flag,
+            // The appended grammar family: `checkGrammarImportCallExpression`,
+            // `checkGrammarInterfaceDeclaration` and `checkGrammarProperty` are
+            // all checker passes, so all four let a sibling TS2322 through.
+            .import_call_type_args,
+            .interface_implements_clause,
+            .interface_property_initializer,
+            .type_literal_property_initializer,
+            .empty_type_param_list,
+            .catch_variable_initializer,
             => .grammar,
 
             else => .syntactic,
@@ -1687,6 +1725,13 @@ pub const Code = enum(u16) {
 
             .unsupported_syntax => "syntax not yet supported by ztsc",
             .unsupported_satisfies => "'satisfies' is not yet supported by ztsc",
+
+            .import_call_type_args => "This use of 'import' is invalid. 'import()' calls can be written, but they must have parentheses and cannot have type arguments.",
+            .interface_implements_clause => "Interface declaration cannot have 'implements' clause.",
+            .interface_property_initializer => "An interface property cannot have an initializer.",
+            .type_literal_property_initializer => "A type literal property cannot have an initializer.",
+            .empty_type_param_list => "Type parameter list cannot be empty.",
+            .catch_variable_initializer => "Catch clause variable cannot have an initializer.",
         };
     }
 
@@ -2017,6 +2062,12 @@ pub const Code = enum(u16) {
             .ctor_type_in_union => 1386,
             .fn_type_in_intersection => 1387,
             .ctor_type_in_intersection => 1388,
+            .import_call_type_args => 1326,
+            .interface_implements_clause => 1176,
+            .interface_property_initializer => 1246,
+            .type_literal_property_initializer => 1247,
+            .empty_type_param_list => 1098,
+            .catch_variable_initializer => 1197,
             else => 0,
         };
     }
