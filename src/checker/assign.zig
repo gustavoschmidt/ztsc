@@ -2436,30 +2436,41 @@ fn condTrueOverExtends(c: *Checker, cond: TypeId) Error!TypeId {
 /// `Promise.resolve<T[K]>(…)` into a `Promise<T[K]>` (`asyncFunctionReturnType`
 /// lines 51 / 71 / 75).
 ///
-/// The nested conditionals are walked rather than the extends clause scanned:
-/// what tsc's mapper reaches is exactly the chain of checks that ARE binders
-/// (a reference to an enclosing conditional's binder included — `F` here is
-/// one, and tsc's mapper is merged with the enclosing mapper for that very
-/// reason). A binder appearing anywhere else in the branch is left alone,
-/// because substituting it there cannot resolve anything and would only widen
-/// the reading.
+/// Only the one shape that pays for itself is read, and it is read WITHOUT
+/// building a type. The general form — `substInfer` every binder with
+/// `unknown` and let the substitution re-reduce whatever it lands on — is the
+/// blow-up `substitutableBranch` already documents, and TypeBox is again the
+/// measurement: `@sinclair/typebox` went from 449M to 12.4G instructions and
+/// 15.8MB to 73.5MB peak RSS (+2660% / +366%), because its accumulator
+/// conditionals desugar a CONSTRAINED binder into one nested conditional per
+/// binder and each rewrite re-enters a recursive alias with a fresh argument.
 ///
-/// Additive, like the other two readings: it returns the branch untouched
-/// unless a nested check is a binder, and a branch it does rewrite can only
-/// make the relation succeed where the bare branch already failed.
+/// So: the true branch must ITSELF be a conditional whose CHECK is a binder
+/// (the only place `unknown` can decide anything), the branch that `unknown`
+/// selects is read straight off that conditional, and it is used only when it
+/// mentions no binder at all — which is what makes it a complete answer rather
+/// than a half-substituted one. `unknown extends X` is true only for an
+/// `unknown` or `any` `X`, so the decision is two integer comparisons; the
+/// selected branch is an existing interned type, so nothing is constructed.
+/// Awaited's `never` is exactly this shape, and TypeBox's is not — it bails on
+/// the `containsInfer` test and the relation behaves as it did before
+/// (re-measured: typebox back to +0.2% instructions, within noise).
+///
+/// Additive, like the other two readings: the branch is returned untouched
+/// unless all three tests pass, and a branch it does replace can only make the
+/// relation succeed where the bare branch already failed.
 fn condTrueInferBound(c: *Checker, cond: TypeId) Error!TypeId {
     const s = &c.ts;
-    var tru = s.condTrue(cond);
-    var steps: u32 = 0;
-    while (steps < max_cond_constraint_steps) : (steps += 1) {
-        if (s.kind(tru) != .conditional) break;
-        const chk = s.condCheck(tru);
-        if (s.kind(chk) != .infer_var) break;
-        const next = try generics_zig.substInfer(c, tru, &.{s.inferVarId(chk)}, &.{types.unknown_type});
-        if (next == tru) break;
-        tru = next;
-    }
-    return tru;
+    const tru = s.condTrue(cond);
+    if (s.kind(tru) != .conditional) return tru;
+    if (s.kind(s.condCheck(tru)) != .infer_var) return tru;
+    const ext_kind = s.kind(s.condExtends(tru));
+    const picked = if (ext_kind == .unknown or ext_kind == .any)
+        s.condTrue(tru)
+    else
+        s.condFalse(tru);
+    if (try c.containsInfer(picked)) return tru;
+    return picked;
 }
 
 fn condTrueSubstituted(c: *Checker, cond: TypeId) Error!TypeId {
