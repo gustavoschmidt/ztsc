@@ -705,10 +705,16 @@ fn classValueProp(c: *Checker, cls: SymbolId, name: Atom, o: PropLookup) Error!?
         const args = try c.scratch().alloc(TypeId, tps.items.len);
         defer c.scratch().free(args);
         @memset(args, types.any_type);
+        // NOT readonly. tsc's `bindClassLikeDeclaration` mints the `prototype`
+        // export as a plain `Property | Prototype` symbol — no `readonly`
+        // modifier and no `CheckFlags.Readonly` — so `isReadonlySymbol` says
+        // no and `B.prototype = { … }` is checked for assignability like any
+        // other write (`privateNameBadDeclaration`). The `readonly` seen on
+        // `Array.prototype` and friends comes from the LIB declaration, which
+        // is an ordinary member and unaffected by this arm.
         return .{
             .name = name,
             .ty = try c.ts.makeRef(cls, args),
-            .flags = types.prop_flag_readonly,
         };
     }
     if (o.skip_augment) return null;
