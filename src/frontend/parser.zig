@@ -4051,8 +4051,12 @@ const Parser = struct {
 
     fn parseDecorator(p: *Parser) PE!Node {
         const at = try p.bump(); // `@`
-        var expr: Node = null_node;
-        if (canStartExpression(p.curTag())) expr = try p.parseLhsExpression(.{ .in_decorator = true });
+        // tsc's `parseDecorator` calls `parseLeftHandSideExpressionOrHigher`
+        // unconditionally, so a decorator with nothing behind it earns that
+        // parse's "Expression expected" — `@` on its own line before an `enum`
+        // is TS1109 at the `enum` keyword (parserErrorRecovery_ClassElement3).
+        // Declining to parse left the `@` silent and swallowed the diagnostic.
+        const expr = try p.parseLhsExpression(.{ .in_decorator = true });
         return p.addNode(.{ .tag = .decorator, .main_token = at, .data = .{ .lhs = expr, .rhs = 0 } });
     }
 
@@ -8265,15 +8269,31 @@ const Parser = struct {
         return ty;
     }
 
+    /// `<A, B>`. An EMPTY list is legal syntax and its own grammar error:
+    /// tsc's `parseDelimitedList` asks `isStartOfType()` before it parses an
+    /// element and ends the list on anything else (and on end of file, which
+    /// terminates every list), then `checkGrammarTypeArguments` answers TS1099
+    /// for the zero-length result. Both halves are observable — `I<>` is
+    /// TS1099 at the `<` PLUS the TS2314 the reference earns for supplying no
+    /// arguments, and `IPromise<` at end of file is "'>' expected", not "Type
+    /// expected" — and neither survived parsing an element unconditionally,
+    /// because the TS1110 that produced was syntactic and suppressed the rest
+    /// of the program's semantic pass.
+    ///
+    /// The two terminators here are the ones the corpus witnesses: end of file
+    /// and a `>` (a full `isStartOfType` is a larger rule than the evidence
+    /// supports, and admitting a bad element keeps today's behaviour).
     fn parseTypeArgs(p: *Parser) PE!ast.SubRange {
-        _ = try p.expectLt();
+        const lt = try p.expectLt();
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
-        while (true) {
+        while (p.curTag() != .eof and !isGtFamily(p.curTag())) {
             try p.pushScratch(try p.parseType());
             if (try p.eat(.comma) == null) break;
         }
+        const empty = p.scratchTop() == top;
         _ = try p.expectGt();
+        if (empty) try p.errAtToken(.empty_type_arg_list, lt);
         return p.scratchToSpan(top);
     }
 

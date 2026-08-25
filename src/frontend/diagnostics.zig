@@ -121,6 +121,13 @@ pub const Code = enum(u16) {
     /// diagnostic — `for (var in X)` reports it beside the RHS's TS2304, which
     /// a syntactic answer would suppress.
     empty_var_decl_list,
+    /// TS1099: `I<>` — a type-argument list with no arguments in it. tsc's
+    /// `checkGrammarTypeArguments`, so a GRAMMAR diagnostic like its
+    /// `empty_var_decl_list` neighbour: `var x: I<>` reports it beside the
+    /// TS2314 the reference earns for having no arguments at all, which a
+    /// syntactic answer would suppress. Anchored at the `<` (measured; tsc's
+    /// own wording blames the whole reference, tsgo 7.0.2 the list).
+    empty_type_arg_list,
     /// TS1009: the same list ended on a COMMA (`var a,`). `parseDelimitedList`
     /// only records `hasTrailingComma` on the node array; the complaint is
     /// `checkGrammarForDisallowedTrailingComma`, called from
@@ -1065,6 +1072,7 @@ pub const Code = enum(u16) {
             .generator_in_ambient_context,
             .overload_signature_generator,
             .empty_var_decl_list,
+            .empty_type_arg_list,
             .trailing_comma,
             .for_of_one_declaration,
             .for_in_one_declaration,
@@ -1346,6 +1354,7 @@ pub const Code = enum(u16) {
             .expected_binding => "Variable declaration expected.",
             .reserved_var_decl_name => "'{0}' is not allowed as a variable declaration name.",
             .empty_var_decl_list => "Variable declaration list cannot be empty.",
+            .empty_type_arg_list => "Type argument list cannot be empty.",
             .trailing_comma => "Trailing comma not allowed.",
             .expected_string_literal => "String literal expected.",
             .expected_from => "'from' expected.",
@@ -1700,6 +1709,7 @@ pub const Code = enum(u16) {
             .expected_binding => 1134,
             .reserved_var_decl_name => 1389,
             .empty_var_decl_list => 1123,
+            .empty_type_arg_list => 1099,
             .trailing_comma => 1009,
             .expected_declaration => 1146,
             .expected_case_or_default => 1130,
