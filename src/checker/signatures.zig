@@ -2832,7 +2832,15 @@ pub fn memberTypeOf(c: *Checker, sym: SymbolId) Error!TypeId {
     c.cur_scope = c.symScope(sym);
     const f = c.symFlags(sym);
     const decls = c.declsOf(sym);
-    if (f.method) {
+    // A name DUPLICATED as both a field and a method (or a field and an
+    // accessor) is a TS2300 the redeclaration pass already reports, and the
+    // type the member still has to answer with is the FIELD's: tsc's
+    // `getTypeOfSymbolWorker` tests `Variable | Property` before `Method` and
+    // before `Accessor`, so the property arm wins whenever the symbol carries
+    // that flag at all. Asking the method arm first instead typed
+    // `this.total = total` against the method signature and invented a TS2322
+    // on top of the duplicate report (`functionWithSameNameAsField`).
+    if (f.method and !f.property) {
         var sigs: std.ArrayList(TypeId) = .empty;
         defer sigs.deinit(c.scratch());
         var impl_sig: TypeId = types.no_type;
@@ -2848,7 +2856,7 @@ pub fn memberTypeOf(c: *Checker, sym: SymbolId) Error!TypeId {
         }
         return c.ts.makeOverloads(sigs.items);
     }
-    if (f.getter or f.setter) {
+    if ((f.getter or f.setter) and !f.property) {
         // Getter return type wins; setter-only uses its param type.
         for (decls) |decl| {
             const tag = c.nodeTag(decl);
