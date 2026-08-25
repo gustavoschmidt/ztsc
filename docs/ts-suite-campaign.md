@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-25, post wave 38)
+## Standings (2026-08-26, post wave 39)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7688 / 8641 (89.0%)** |
-| excess keys (false positives) | 3541 | 1253 |
-| missing keys (under-reports) | 8617 | 2389 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7727 / 8641 (89.5%)** |
+| excess keys (false positives) | 3541 | 1237 |
+| missing keys (under-reports) | 8617 | 2283 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Thirty-eight waves landed (3–38), every one with ZERO match→non-match regressions in
+Thirty-nine waves landed (3–39), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -654,7 +654,88 @@ CALL-seam full-constraint reconfirmed zero-delta a second time.
 PRACTICE ADOPTED: sweeps must run against a PINNED binary copy
 (--ztsc <snapshot>) — a concurrent zig build bench invalidated a sweep.
 
-## Ranked next queue (wave 39) — distilled from wave-38 agent reports
+Wave 39 (+39 exact → 7727/8641 89.5%): A landed TS2729 (~60 probes;
+new init_order.zig unifying the two self-ref scans; the static-block
+carve-out steps back to position-only) and TS2660 (superContainerIs
+Member: a plain function owns `this` but is never a super container;
+shorthand-vs-property function spelling decides), plus TS2754/TS2466/
+TS2416-column. B killed the typebox canary find of the wave (+2660%
+instructions from the general infer-binding rule — the corpus was
+CLEAN, only the package benchmark caught it; shipped form constructs
+nothing), landed T[keyof T] domains, asyncFunctionReturnType, deeply
+NestedConstraints via condTrueUnderExtends ("branch IS the check type
+→ check & extends"), Record-cast TS2352 (lenientOverlap now honours
+index infos), and ROOT-CAUSED QueryPersister as inference (same-alias
+pairing). C landed exactly that inference fix (alias-args pairing arm)
++ the FULL indexed-access error tail (TS2339/TS2493/TS2537/TS2538 on
+resolved type nodes, +31 keys) — after the merge the coordinator
+re-tightened intersectionOptionalsRelated to plain assignability and
+re-verified social-app byte-identical. D landed binder computed-name
+spans (dupDiagSpan: whole [..] with interpolated name), TS1211 via
+declModifiersStart (reads the modifier run BACKWARD from the keyword),
+TS1084 via new reference_pragma.zig, TS1114/TS1319/TS1156/TS1031.
+ACCEPTED+FLAGGED: zod +1.6% CPU, bisected to C's merge — the error
+tail is work tsc also does; all other benchmarks flat-to-better.
+NOTE: D's branch claimed bucketed 0 but the combined sweep shows 5 —
+reconcile. .gitignore now covers the tsgo node_modules SYMLINK (three
+recurrences of committing it).
+
+## Ranked next queue (wave 40) — distilled from wave-39 agent reports
+
+1. CHECKER-SIDE LATE BINDING for computed names (A's + D's handoffs
+   converge): tsc's binder gives every dynamic name an anonymous
+   symbol — no binder-level duplicate possible; the checker's
+   late-binding pass recovers the nominal key iff isTypeUsableAs
+   PropertyName, and re-detects duplicates against the RESOLVED key
+   type (probe: `"a"|"b"` key is silent, unique symbol + literal keys
+   report). Also: blame literal computed names at the `[` (cols 12/23
+   not 13/24), TS2564 on computed-name properties
+   (duplicateIdentifierComputedName is one fix away), D's
+   DeclOpts.dynamic_name empirical partition retires into the pass.
+2. Element-access EXPRESSION forms of the new indexed-access errors
+   (t2[2] — unionsOfTupleTypes1:31/35/44; expr.zig) — the type-level
+   form landed, the expression form now diverges.
+3. TS2344 finish (C's full data recorded): FIRST fix props.
+   typeParamConstraint reading a MERGED interface's per-block param as
+   unconstrained (typeparams folds the sibling constraint; tsc uses
+   merged) — then admit a bare free type param WITH the conditional-
+   TRUE-branch screen (cond_true_depth in PendingTypeArgs, restore at
+   drain) for +2/−0. Also decidableConstraintSet needs .array/.tuple
+   (restTupleElements1, 8 keys, plus TS1257/TS2574 to go exact).
+4. generatorYieldContextualType: inferGeneratorReturn widens the
+   contributed literal unconditionally and hardcodes unknown for NEXT
+   (contextualIteration returns only yield+ret) — signatures/stmts.
+5. indexedAccessConstraints:6:9 one-liner: computeBaseConstraint for
+   ANY TypeFlags.Index answers string|number|symbol
+   (expr.baseConstraintOf).
+6. Same-alias inference shortcut → tsc's unconditional form: needs
+   getAliasVariances-directed pairing (pub variance.measuredAt +
+   infer_ctx.contra_pos flip per contravariant position;
+   contravariantTypeAliasInference pins it).
+7. TS1362 excess on exportNamespace5/8: a name exported by BOTH
+   `export type * from` and plain `export * from` is treated
+   type-only (link/modules.zig).
+8. TS1434 false positives — the largest parser lever left (41 excess
+   over 24 cases); then the TS1005/TS1109/TS1128 recovery cascade.
+9. types.zig items: index-info parameter NAME (prints x instead of
+   the declared k); symbol+string index coexistence (one slot + flag
+   today); Prop declaring-symbol for the union-property drop rule.
+10. TS2729 residue (ambient containers, function expandos,
+    decoratorUsedBeforeDeclaration's TS7006/TS2454); TS7023 ×5.
+11. Relation one-keys: indexedAccessRelation:17:25,
+    genericIndexedAccessVariance…:26:1 (alias variance),
+    mappedTypeInferenceFromApparentType:14:1, templateLiteralTypes5:
+    14:7, assignmentCompatWithGenericCallSignatures2:16:1; TS2352
+    residue: parseTypes:6:9 (numeric indexInfoOverlap half),
+    aliasInstantiationExpressionGenericIntersectionNoCrash1,
+    importCallExpressionCheckReturntype1,
+    declarationEmitExpandoPropertyPrivateName.
+12. Text-only: TS2339/TS2537 print the receiver as written vs tsc's
+    reduced APPARENT type; intersection member order in messages.
+13. Census: TS2322 pool (22 under / 11 excess); substitution types;
+    resolution-mode attributes; reconcile the bucketed 0-vs-5 claim.
+
+## Superseded queue (wave 39, kept for context)
 
 1. TS2729 "used before its initialization" — 7 cases / 15 keys,
    entirely absent (classes/expr).

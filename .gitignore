@@ -25,3 +25,4 @@ scratchpad/
 
 # Python bytecode from the bench scripts.
 __pycache__/
+bench/baselines/tsgo/node_modules
