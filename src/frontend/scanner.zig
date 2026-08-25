@@ -1062,11 +1062,15 @@ pub const Scanner = struct {
 
     /// Scan a regex literal; index is at the opening `/`.
     fn scanRegex(s: *Scanner) Tag {
+        const start = s.index;
         s.index += 1;
         var in_class = false;
         while (s.index < s.src.len) {
             const c = s.src[s.index];
-            if (c == '\n' or c == '\r') return .unterminated_regexp_literal;
+            if (c == '\n' or c == '\r') {
+                s.index = unterminatedRegexEnd(s.src, start, s.index);
+                return .unterminated_regexp_literal;
+            }
             switch (c) {
                 '\\' => {
                     s.index += 1;
@@ -1097,6 +1101,7 @@ pub const Scanner = struct {
                 else => s.index += 1,
             }
         }
+        s.index = unterminatedRegexEnd(s.src, start, s.index);
         return .unterminated_regexp_literal;
     }
 
@@ -1219,6 +1224,57 @@ pub const Scanner = struct {
 /// its token kind; see `errForMissingSemicolonAfterWord`.
 pub fn isKeywordText(text: []const u8) bool {
     return keyword_map.get(text) != null;
+}
+
+/// Where the body of an UNTERMINATED regex literal ends (tsc's recovery pass in
+/// `reScanSlashToken`). Without it the token swallows every character to the end
+/// of the line, the enclosing list never sees its closing token, and the parser
+/// emits a cascade of `expected` diagnostics tsgo never produces: for
+/// `foo(/notregexp);` tsgo stops the body at the unbalanced `)` so the call
+/// closes and the statement ends normally.
+///
+/// `raw_end` is where the body would stop without recovery — the line break, or
+/// end of file. Two rules, both pinned against tsgo 7.0.2:
+///   1. a trailing run of `;` is never part of the body (`foo(/abc;` reports
+///      `')' expected` AT the `;`, not on the next line);
+///   2. scanning forward from the opening `/`, the body stops at the first `)`,
+///      `]` or `}` left unbalanced — `[`…`]` classes nest, `(`…`)` groups nest,
+///      and a `{`…`}` quantifier suspends the search until its `}` (so the `)`
+///      in `/a{b)c}d)` closes nothing and only the second `)` ends the body).
+fn unterminatedRegexEnd(src: []const u8, start: u32, raw_end: u32) u32 {
+    var limit = raw_end;
+    while (limit > start + 1 and src[limit - 1] == ';') limit -= 1;
+
+    var p = start + 1;
+    var in_escape = false;
+    var class_depth: u32 = 0;
+    var group_depth: u32 = 0;
+    var in_quantifier = false;
+    while (p < limit) : (p += 1) {
+        const c = src[p];
+        if (in_escape) {
+            in_escape = false;
+        } else if (c == '\\') {
+            in_escape = true;
+        } else if (c == '[') {
+            class_depth += 1;
+        } else if (c == ']' and class_depth > 0) {
+            class_depth -= 1;
+        } else if (class_depth == 0) {
+            if (in_quantifier) {
+                if (c == '}') in_quantifier = false;
+            } else if (c == '(') {
+                group_depth += 1;
+            } else if (c == ')' and group_depth > 0) {
+                group_depth -= 1;
+            } else if (c == '{') {
+                in_quantifier = true;
+            } else if (c == ')' or c == ']' or c == '}') {
+                break;
+            }
+        }
+    }
+    return p;
 }
 
 // ---------------------------------------------------------------------------
