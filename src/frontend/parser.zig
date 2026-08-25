@@ -8917,9 +8917,16 @@ const Parser = struct {
                 bad_modifier = m;
             }
         }
-        // get/set accessor signatures.
+        // get/set accessor signatures. The name may be COMPUTED — tsc's
+        // `parseContextualModifier(GetKeyword)` ends in `canFollowModifier`,
+        // whose first arm is `token() === OpenBracketToken` — which is what
+        // `type T = { get [K in WAT](): string }` needs (noMappedGetSet): read
+        // as a property named `get` instead, the `[` that follows it is a
+        // second member on the same line and earns a TS1005 that suppresses
+        // the file's whole semantic pass.
         if ((p.curTag() == .keyword_get or p.curTag() == .keyword_set) and
-            (isNameLike(p.peekTag(1)) or p.peekTag(1) == .string_literal or p.peekTag(1) == .numeric_literal))
+            (isNameLike(p.peekTag(1)) or p.peekTag(1) == .string_literal or
+                p.peekTag(1) == .numeric_literal or p.peekTag(1) == .l_bracket))
         {
             flags |= if (p.curTag() == .keyword_get) ast.Flags.get else ast.Flags.set;
             _ = try p.bump();
