@@ -3324,6 +3324,24 @@ fn objectLiteralThis(c: *Checker, rctx: TypeId, marker: TypeId) Error!TypeId {
     return c.nonNullable(rctx);
 }
 
+/// May an object-literal member's BODY be postponed to the deferred-body
+/// queue right now — tsc's `checkNodeDeferred`, which
+/// `checkFunctionExpressionOrObjectLiteralMethod` calls for every function-like
+/// written as a literal member so the literal's own type is COMPLETE before any
+/// of its bodies runs.
+///
+/// Refused inside a walk whose diagnostics are being suppressed. A queued body
+/// is walked from `drainDeferredBodies`, where the suppression counters are all
+/// back at zero, so deferring one out of an overload probe
+/// (`no_publish_depth`), a side query (`side_query_depth`) or a
+/// context-insensitive pass (`skip_ctx_sensitive`) would PUBLISH diagnostics
+/// the caller had asked to be thrown away — a rejected overload candidate's
+/// argument body reported as if it had been the chosen one. Those walks keep
+/// the inline behaviour they have always had.
+fn objLitDeferBodies(c: *const Checker) bool {
+    return c.no_publish_depth == 0 and c.side_query_depth == 0 and !c.skip_ctx_sensitive;
+}
+
 /// tsc's `getThisTypeFromContextualType`: the argument of a `ThisType<T>`
 /// reference anywhere in the contextual type, unions mapped and intersections
 /// searched member-wise. Null when the type names no marker.
@@ -3352,6 +3370,16 @@ fn thisTypeMarker(c: *Checker, t: TypeId) Error!?TypeId {
 /// call whose argument happens to be a literal, an array, a function — is
 /// checked with the marker cleared (see `Checker.ctx_this_marker`).
 fn checkPropValue(c: *Checker, value: Node, pctx: TypeId, marker: TypeId) Error!TypeId {
+    // A `function () {}` written DIRECTLY as a property value is one of the two
+    // shapes tsc's `getContainingObjectLiteral` recognises (the other is the
+    // `m() {}` shorthand, handled in the `.object_method` arm), so its body is
+    // deferred the same way. The value's TYPE — the signature, return type
+    // included — is still built here and now; only the body walk moves.
+    const defer_body = value != null_node and c.nodeTag(value) == .function_expr and objLitDeferBodies(c);
+    if (defer_body) c.defer_bodies += 1;
+    defer if (defer_body) {
+        c.defer_bodies -= 1;
+    };
     if (marker == types.no_type or value == null_node or c.nodeTag(value) != .object_literal) {
         return c.checkExprCached(value, pctx);
     }
@@ -3639,6 +3667,16 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                 const saved_this = c.this_type;
                 defer c.this_type = saved_this;
                 c.this_type = try objectLiteralThis(c, rctx, this_marker);
+                // The body waits (tsc's `checkNodeDeferred` — see
+                // `objLitDeferBodies`). Everything below still runs eagerly:
+                // the signature, the accessor's return/parameter type, the
+                // computed key. Only the statement walk is queued, and it
+                // carries the `this` just installed.
+                const defer_body = objLitDeferBodies(c);
+                if (defer_body) c.defer_bodies += 1;
+                defer if (defer_body) {
+                    c.defer_bodies -= 1;
+                };
                 // A SYMBOL-keyed method or accessor shorthand
                 // (`{ [Symbol.toStringTag]() {…} }`,
                 // `{ set [Symbol.toPrimitive](p) {…} }`) declares a real,

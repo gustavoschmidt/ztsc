@@ -3066,6 +3066,12 @@ pub const Checker = struct {
             // TS2313 is the same kind of rule about the same lists, and runs
             // off the same `scope_owners` walk.
             try typenode_zig.checkFileCircularConstraints(c);
+            // The three once-per-file passes above materialize types, and
+            // materializing one can reach an object literal whose member
+            // bodies then queue (see `DeferredBody`). Nothing drains after
+            // them otherwise, so those bodies would go unchecked — an
+            // under-report the per-statement drain above never has.
+            try c.drainDeferredBodies();
         }
         // Every class instance type is now complete, so the written type
         // arguments collected along the way can be judged against their
