@@ -6267,6 +6267,26 @@ pub fn signatureAssignableModeErase(c: *Checker, s: TypeId, t: TypeId, mode: Sig
     const sa = try c.eraseParamsToAny(s);
     const ta = try c.eraseParamsToAny(t);
     if (sa == s and ta == t) return false;
+    // …and never when the pair was already decided by INSTANTIATING the source
+    // in the target's context. tsc's `compareSignaturesRelated` replaces the
+    // source with that instantiation and has no fallback afterwards — "where
+    // an instantiation EXISTS its verdict is final", the same rule the inner
+    // function states for its own erasure fallthrough. Reaching here means
+    // that verdict was NO (a YES returned two frames up), so an `any` erasure
+    // that says yes is overturning a decision tsc never revisits.
+    //
+    // `<T>(target: { [K in keyof T]: T[K] }) => void` against
+    // `<U extends string[]>(source: { [K in keyof U]: Obj[K] }) => void` is
+    // exactly that: the inference binds `T := U`, the instantiated parameter
+    // `{ [K in keyof U]: U[K] }` correctly refuses `Obj[K]` ("`U` could be
+    // instantiated with an arbitrary type"), and erasing both `U`s to `any`
+    // then accepted the pair anyway (`mappedTypeInferenceFromApparentType`).
+    //
+    // The `Comp<Full>["setState"]` pair the retry exists for is untouched: its
+    // two `setState<K extends keyof S>` share ONE declaration symbol, so
+    // `sameSigTypeParams` holds, the inference route declines (null), and the
+    // retry still runs.
+    if ((try c.genericSourceRelatesByInference(s, t)) != null) return false;
     return c.signatureAssignableModeInner(sa, ta, mode);
 }
 
