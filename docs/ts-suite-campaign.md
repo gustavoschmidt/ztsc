@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-26, post wave 40)
+## Standings (2026-08-26, post wave 41)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7776 / 8641 (90.0%)** |
-| excess keys (false positives) | 3541 | 1179 |
-| missing keys (under-reports) | 8617 | 2191 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7811 / 8641 (90.4%)** |
+| excess keys (false positives) | 3541 | 1108 |
+| missing keys (under-reports) | 8617 | 2125 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Forty waves landed (3–40), every one with ZERO match→non-match regressions in
+Forty-one waves landed (3–41), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -707,7 +707,82 @@ unconditional with variance direction (the .object-arm version cost
 iterator-arity protocol filter. MEASUREMENT: macOS /usr/bin/time
 reports only the last reaped child — sum individually-timed runs.
 
-## Ranked next queue (wave 41) — distilled from wave-40 agent reports
+Wave 41 (+35 exact → 7811/8641 90.4%): C REFUTED the prescribed
+contravariant-slots design with a 40-witness battery — top-level
+parameter positions fold COVARIANTLY (common supertype); only
+callback-parameter nesting is contravariant; the actual bug was one
+branch in combineCovariant (the bare-type-variable "weakest evidence"
+union rule, correct at call sites, wrong in signature relations —
+gated on sig_ctx). tsgo also orders type-reference-argument candidates
+ahead of top-level ones (elaboration position only; recorded). D
+landed 21: parameter/arrow recovery (modifier-spelled tokens skip as
+missing names; `()` before `{`/`:` is Tristate.True arrow), syntactic
+tuple-order codes TS1265/1266/1257 in the parser, non-literal module
+specifiers stopping placement rules; the cascade shrank (TS1005
+excess 113→76). B landed the erased-signature retry gate (it was
+OVERTURNING genericSourceRelatesByInference's verdict) and template-
+hole pairing in parameter positions (T0 := T2, not `${T2}`). A landed
+11: async Promise-subclass returns, spread TS2488 with constraint
+fallback (caught its own social-app regression mid-wave), TS2449/
+TS2708/const-enum, plus four handoffs including B's tupleLikeByZeroProp
+rest gap. A's TS2574 attempt REVERTED with recipe (isAssignable-based
+isArrayLikeType cost +33 excess keys and a timeout; use kind tests +
+base-constraint, treat variadic infer as unknown[]-constrained).
+
+## Ranked next queue (wave 42) — distilled from wave-41 agent reports
+
+1. jsx.zig ordering: the per-attribute pass runs UNCONDITIONALLY; tsc's
+   elaborateJsxComponents runs only after the whole-attributes-object
+   check FAILS. Fixing this unblocks B's written-and-verified
+   simplifyIntersectionIndexAccess (+1, indexedAccessRelation; with
+   the Instantiable guard; also explains reactReadonlyHOC).
+2. TS2574 with the RIGHT predicate (A's revert recipe): isArrayType ||
+   isTupleType || type-param whose BASE CONSTRAINT is array-like ||
+   any/error — never isAssignable; a variadic-position infer is
+   unknown[]-constrained. Flips restTupleElements1.
+3. Static field of a class EXPRESSION: statics.seedStaticFieldContext
+   seeds the symbol but checkClass's member walk re-checks with
+   ann=no_type (sig cache misses on different context) — thread the
+   ctx through (contextuallyTypedClassExpressionMethodDeclaration01).
+4. mergedDeclarations7 re-diagnosed AGAIN (A): polymorphic-this return
+   variance — `use(): this` on PassportStatic must not be assignable
+   to Passport (assign.zig). [The namespace/variable intersection arm
+   is measured correct — removing it makes X.member a phantom 2339.]
+5. Generalize template-hole pairing into infer.unify (calls + return
+   positions); de-duplicate simplifiedIndexPattern +
+   simplifyIntersectionIndexAccess into mapped.zig.
+6. contextualSignatureInstantiation: a FAILED contextual instantiation
+   leaves the call result `unknown` (infer.zig fold), not the folded
+   candidate that poisons downstream flow.
+7. Argument-level isContextSensitive must carry through an
+   object-literal argument's properties (infer.zig;
+   expr.exprIsContextSensitive is ready to call).
+8. TS7006 buckets: mapped/reverse-mapped inference 11 keys (B); JSX
+   generic tags 10 (D); intra-expression inference 9 (B).
+9. for…of nullish subject: TS18050 ahead of TS2488 — checkNonNullType
+   at stmts.zig:667; changes every for..of over nullish, re-prove apps.
+10. controlFlowForIndexSignatures: `typeof x` is not narrowed in TYPE
+    positions at all (typenode/flow); crashRegressionTest: element
+    access goes `any` on a TS2339 index and skips the write check
+    (expr.zig).
+11. Parser: reservedWords3 (TS1390 for enum/class/function/while/for
+    as parameter names — ztsc answers TS1359); parseInvalidNames
+    (startsDeclarationAt recursing through export into namespace's
+    same-line test); variadicTuples2's 3 residual TS1265s (variadic
+    branch); accessorWithLineTerminator (get\nx parses as two members).
+12. Flow: noImplicitAnyLoopCrash (`let bar;` in a loop is
+    number|undefined at the spread, ztsc evolving-any).
+13. Small: defaultParameterAddsUndefinedWithStrictNullChecks (the WRITE
+    target stays the declared annotation — paramBodyType);
+    staticAnonymousTypeNotReferencingTypeParameter;
+    controlFlowBindingPatternOrder; TS2300 computed-name binder keys
+    (6, blocks computedPropertyNamesWithStaticProperty).
+14. Blocked/architecture: combineValueAndTypeSymbols; alias-variance
+    relation rule; TS7023 re-entry hook; union-ordering pair.
+15. Census: TS2322 (212 under / ~250 excess pools); TS7006 54 excess;
+    substitution types; resolution-mode attributes.
+
+## Superseded queue (wave 41, kept for context)
 
 1. Per-position CONTRAVARIANT parameter candidates (B's full diagnosis,
    assignmentCompatWithGenericCallSignatures2): instantiateSigInContext
