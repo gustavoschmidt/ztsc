@@ -5376,19 +5376,6 @@ pub fn nonDiscPropsAssignable(c: *Checker, s: TypeId, member: TypeId, excl: Atom
     return true;
 }
 
-/// Is `t` an object that is nothing but ONE construct signature — the shape a
-/// `new (…) => R` / `abstract new (…) => R` type literal builds, and the one
-/// shape whose abstract-ness ztsc's model cannot recover? See the
-/// abstract-constructor screen in `sourceSatisfiesSigs`.
-pub fn bareConstructSigObject(c: *const Checker, t: TypeId) bool {
-    if (c.ts.kind(t) != .object) return false;
-    return c.ts.objectConstructSigCount(t) == 1 and
-        c.ts.objectCallSigCount(t) == 0 and
-        c.ts.objectPropCount(t) == 0 and
-        c.ts.objectStringIndex(t) == 0 and
-        c.ts.objectNumberIndex(t) == 0;
-}
-
 /// Whether `s` provides a signature assignable to each of `t`'s call
 /// (`is_construct == false`) or construct (`true`) signatures.
 /// Function ↔ callable-object relate in both directions; a `class_value`

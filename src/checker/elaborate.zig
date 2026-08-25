@@ -67,7 +67,6 @@ const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
 const accessibility = @import("accessibility.zig");
-const assign_zig = @import("assign.zig");
 const nominal_members = @import("nominal_members.zig");
 
 /// Deepest chain rendered. tsgo has no cutoff; this is a resource bound so a
@@ -441,9 +440,16 @@ fn abstractCtorTail(c: *Checker, s0: TypeId, t0: TypeId, t: TypeId) Error!bool {
     if (store.kind(t0) == .class_value) {
         return !try c.classIsAbstract(store.classSymbol(t0));
     }
+    // WAVE37-B: the target's abstractness is read off its construct signature
+    // (`types.fn_flag_abstract`, which `typenode` sets for `abstract new (…) =>
+    // R`), exactly as `assign.sourceSatisfiesSigs` does. It used to be the old
+    // "a bare `new (…) => R` object cannot have been written either way" proxy,
+    // which stood down for precisely the target tsc's rule fires on — so the
+    // sub-message never printed for `classAbstractAssignabilityConstructor-
+    // Function`-shaped pairs.
     return store.kind(t) == .object and
         store.objectConstructSigCount(t) > 0 and
-        !assign_zig.bareConstructSigObject(c, t);
+        !store.fnIsAbstract(store.objectConstructSig(t, 0));
 }
 
 /// A missing required property (the chain's tail) or the first incompatible
