@@ -689,13 +689,15 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
         // which is where any further diagnostic about them comes from.
         //
         // A WRITTEN type-argument list takes BOTH of these checks out
-        // entirely: `super<T>(0)` is TS2754 ("'super' may not use type
-        // arguments") and nothing else, tsgo-verified on
-        // `parserSuperExpression2`. ztsc does not implement TS2754, so the
-        // choice here is between silence and a different code at a different
-        // span — and silence is the one that is not wrong.
-        if (!c.in_computed_key and shape.targ_nodes.len == 0) {
-            if (!c.in_ctor_body) {
+        // entirely: `super<T>(0)` is TS2754 and nothing else — not the TS2337
+        // its container earns, not the TS2335 its class earns, and not even
+        // the TS2304 an unresolvable `T` would earn anywhere else
+        // (tsgo-verified on `parserSuperExpression2`, whose `T` is undeclared
+        // and unreported).
+        if (!c.in_computed_key) {
+            if (shape.targ_nodes.len != 0) {
+                try c.diagFmt(2754, typeArgListSpan(c, shape.targ_nodes, node), "'super' may not use type arguments.", .{});
+            } else if (!c.in_ctor_body) {
                 try c.diagFmt(2337, c.nodeSpan(shape.callee), "Super calls are not permitted outside constructors or in nested functions inside constructors.", .{});
             } else {
                 // …and TS2335 once the container IS legal: a class that writes
@@ -2552,6 +2554,27 @@ pub fn instantiationExprType(c: *Checker, base: TypeId, targ_nodes: []const Node
         inst_call.items,
         inst_construct.items,
     );
+}
+
+/// The span of a type-argument list INCLUDING its angle brackets — tsc's
+/// `node.typeArguments` NodeList, whose own `pos`/`end` are the `<` and the
+/// `>`. TS2754 is anchored on that list, where TS2558 and its neighbours are
+/// anchored on the arguments alone (`typeArgsSpan`).
+///
+/// The brackets are found in the SOURCE rather than in the token stream: a
+/// type node carries a byte span, not a token index, and the two brackets are
+/// the nearest non-space characters on either side of the arguments. Anything
+/// else in between (a comment) falls back to the arguments' own span, which
+/// costs a column on a shape no one writes.
+fn typeArgListSpan(c: *Checker, targ_nodes: []const Node, node: Node) Span {
+    const args = typeArgsSpan(c, targ_nodes, node);
+    var lo = args.start;
+    while (lo > 0 and std.ascii.isWhitespace(c.src[lo - 1])) lo -= 1;
+    var hi = args.end;
+    while (hi < c.src.len and std.ascii.isWhitespace(c.src[hi])) hi += 1;
+    if (lo == 0 or c.src[lo - 1] != '<') return args;
+    if (hi >= c.src.len or c.src[hi] != '>') return args;
+    return .{ .start = lo - 1, .end = hi + 1 };
 }
 
 /// The span of a type-argument list `<A, B>`, for the diagnostics tsc

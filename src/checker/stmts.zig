@@ -1867,6 +1867,36 @@ fn implementsTargetIsClass(c: *Checker, t: TypeId) bool {
 /// and reports the broad diagnostic instead — walking the member SCOPE, which
 /// does contain `a`, would report TS2416 where the oracle does not.
 ///
+/// The span tsc blames on a class member's NAME — its `member.name` node.
+///
+/// For an ordinary member that is the name token, which `main_token` already
+/// is. For a COMPUTED one `member.name` is the whole `[…]`, and `main_token` is
+/// deliberately not it: the parser keys the member by a token INSIDE the
+/// brackets so that a name lookup has one token to read
+/// (`parseComputedMemberName`). `[Symbol.toPrimitive]() {}` is blamed at the
+/// `[`, eight columns left of the token that names it (`symbolProperty24`).
+///
+/// Two of the four computed spellings retain their `[…]` node, and it carries
+/// the span outright. The other two do not — a well-known-symbol key and a
+/// literal key both have expressions the checker never needs back — so their
+/// bracket is recovered from the token stream, whose layout the parser pins:
+/// `[`, `Symbol`, `.`, name, `]` for the first and `[`, literal, `]` for the
+/// second. A non-computed name is never preceded by `[` in a class body (an
+/// index signature is a member node of its own), so the test cannot misfire.
+fn memberNameSpan(c: *Checker, member: Node, flags: u32) source.Span {
+    if (c.tree.computedKey(member)) |key| return c.nodeSpan(key);
+    const name = c.tree.nodeMainToken(member);
+    const l_bracket: ast.TokenIndex = if (flags & ast.Flags.computed != 0 and name >= 3)
+        name - 3
+    else if (name >= 1 and c.tree.tokens.tag(name - 1) == .l_bracket)
+        name - 1
+    else
+        return c.tokSpan(name);
+    if (c.tree.tokens.tag(l_bracket) != .l_bracket) return c.tokSpan(name);
+    const last = if (c.tree.tokens.tag(name + 1) == .r_bracket) name + 1 else name;
+    return .{ .start = c.tree.tokens.start(l_bracket), .end = c.tokSpan(last).end };
+}
+
 /// Returns whether any member reported.
 fn issueMemberSpecificError(c: *Checker, members: []const Node, this_t: TypeId, target: TypeId) Error!bool {
     const derived = try c.resolveStructural(this_t);
@@ -1896,7 +1926,7 @@ fn issueMemberSpecificError(c: *Checker, members: []const Node, this_t: TypeId, 
         // ordinary relation would have printed, so the "Type 'X' is not
         // assignable to type 'Y'." line the headline usually carries appears
         // one level in, with the structural derivation under it.
-        try c.diagFmt(2416, c.tokSpan(c.tree.nodeMainToken(member)), "Property '{s}' in type '{s}' is not assignable to the same property in base type '{s}'.\n  Type '{s}' is not assignable to type '{s}'.{s}", .{
+        try c.diagFmt(2416, memberNameSpan(c, member, flags), "Property '{s}' in type '{s}' is not assignable to the same property in base type '{s}'.\n  Type '{s}' is not assignable to type '{s}'.{s}", .{
             c.atomText(name_atom),
             try c.typeToString(this_t),
             try c.typeToString(target),
