@@ -1210,6 +1210,14 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
                 const p = s.objectProp(t, @intCast(i));
                 const before = if (charge_members) c.inst_total else 0;
                 out.* = .{ .name = p.name, .ty = try c.instantiateId(p.ty, map, map_id), .flags = p.flags };
+                // A divergent accessor pair's WRITE type mentions the same
+                // type params the read type does (`set x(v: A<T>)`), so it
+                // substitutes alongside it — dropping it here would silently
+                // turn every instantiation of a type literal with split
+                // accessors back into a read-only-typed one.
+                if (p.write_ty != types.no_type) {
+                    out.write_ty = try c.instantiateId(p.write_ty, map, map_id);
+                }
                 if (charge_members) prof_zig.noteMemberCost(c, charge_sym, p.name, out.ty, c.inst_total - before);
             }
             const sidx = if (s.objectStringIndex(t) != 0) try c.instantiateId(s.objectStringIndex(t), map, map_id) else 0;

@@ -1186,6 +1186,13 @@ pub fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, obj_flags:
     defer getter_keys.deinit(c.scratch());
     var setter_keys: std.AutoHashMapUnmanaged(Atom, void) = .empty;
     defer setter_keys.deinit(c.scratch());
+    // WAVE36-A (write type): the setter's PARAMETER type per accessor key, so
+    // a divergent pair (`get n(): number; set n(v: string)`) can be stamped on
+    // the property as `types.Prop.write_ty` in the post-pass below. Recorded
+    // in a map rather than on the prop directly because the getter may be
+    // declared either side of the setter.
+    var setter_params: std.AutoHashMapUnmanaged(Atom, TypeId) = .empty;
+    defer setter_params.deinit(c.scratch());
 
     for (member_nodes) |m| {
         if (m == null_node) continue;
@@ -1230,11 +1237,14 @@ pub fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, obj_flags:
                         try upsertProp(c.scratch(), &props, &prop_index, .{ .name = name, .ty = gt, .flags = 0 });
                     } else {
                         try setter_keys.put(c.scratch(), name, {});
+                        const st = if (c.ts.kind(sig) == .function and c.ts.fnParamCount(sig) > 0)
+                            c.ts.fnParam(sig, 0).ty
+                        else
+                            types.any_type;
+                        // WAVE36-A: kept for the write-type post-pass whether
+                        // or not a getter claimed the property type.
+                        try setter_params.put(c.scratch(), name, st);
                         if (!getter_keys.contains(name)) {
-                            const st = if (c.ts.kind(sig) == .function and c.ts.fnParamCount(sig) > 0)
-                                c.ts.fnParam(sig, 0).ty
-                            else
-                                types.any_type;
                             try upsertProp(c.scratch(), &props, &prop_index, .{ .name = name, .ty = st, .flags = 0 });
                         }
                     }
@@ -1290,6 +1300,18 @@ pub fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, obj_flags:
     while (git.next()) |k| {
         if (setter_keys.contains(k.*)) continue;
         if (prop_index.get(k.*)) |idx| props.items[idx].flags |= types.prop_flag_readonly;
+    }
+    // WAVE36-A (write type): a get/set pair whose two annotations DIFFER gets
+    // the setter's parameter as `Prop.write_ty` (tsc's `getWriteTypeOfSymbol`),
+    // so an assignment target reads it instead of the getter's return. Same
+    // type on both sides stores nothing — `makeObjectSigs` derives
+    // `obj_flag_write_types` from the props, so the common object's shape is
+    // byte-for-byte what it was.
+    var sit = setter_params.iterator();
+    while (sit.next()) |e| {
+        const idx = prop_index.get(e.key_ptr.*) orelse continue;
+        if (props.items[idx].ty == e.value_ptr.*) continue;
+        props.items[idx].write_ty = e.value_ptr.*;
     }
     var flags = if (sym_index and !str_index and nindex == 0)
         obj_flags | types.obj_flag_symbol_index

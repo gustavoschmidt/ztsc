@@ -6811,6 +6811,14 @@ fn setterWriteType(c: *Checker, t0: TypeId, name: Atom, depth: u32) Error!?TypeI
             else
                 try c.ts.makeIntersection(c.scratch(), parts.items);
         },
+        // WAVE36-A (write type): a MATERIALIZED object — a type literal, a
+        // non-generic alias naming one, an instantiation of either — has no
+        // declaration to walk back to, so it carries the divergent accessor's
+        // parameter type on the property itself. See `types.Prop.write_ty`.
+        .object => {
+            const p = c.ts.objectPropByName(t, name) orelse return null;
+            return if (p.write_ty != types.no_type) p.write_ty else null;
+        },
         .ref => {
             const sym = c.ts.refSymbol(t);
             const f = c.symFlags(sym);
