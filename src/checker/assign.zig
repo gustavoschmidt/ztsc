@@ -3625,6 +3625,49 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
 /// unrelated in BOTH directions keeps every case this check is for (`null` vs
 /// `number | undefined`, `boolean` vs `string | undefined` — primitives that
 /// are unrelated either way) and drops that one.
+///
+/// WAVE 39 ROOT-CAUSED that witness, and it is NOT a relation defect: the two
+/// `persister` types genuinely differ, because the call's `TPageParam` is
+/// INFERRED WRONG. `fetchQuery<…, TPageParam = never>` gets `unknown` where
+/// tsgo gets `never`, so the target's persister is the conditional's FALSE
+/// branch (`direction: FetchDirection`) while the source's is the true one
+/// (`direction?: unknown`). Oracle-pinned reduction (tsgo silent on the first,
+/// erroring on the second — ztsc errors on both):
+///
+/// ```ts
+/// type QFC<K, P = never> = [P] extends [never]
+///     ? { k: K; pageParam?: unknown; direction?: unknown }
+///     : { k: K; pageParam: P; direction: "f" | "b" };
+/// type QF<T, K, P = never> = (c: QFC<K, P>) => T;
+/// interface B<T, K, P = never> { k: K; queryFn?: QF<T, K, P> }
+/// declare function g<T, K, P = never>(o: B<T, K, P>): P;
+/// interface Aliased { k: string[]; queryFn?: QF<R, string[], never> }
+/// interface Raw     { k: string[]; queryFn?: (c: { k: string[]; pageParam?: unknown; direction?: unknown }) => R }
+/// declare const a: Aliased & { extra: 1 };  // tsgo: P = never
+/// declare const b: Raw & { extra: 1 };      // tsgo: P = unknown
+/// ```
+///
+/// The only difference is whether the source member is SPELLED with the same
+/// generic type ALIAS as the target member. That is tsc's `inferFromTypes`
+/// shortcut — "source and target are types originating in the same generic
+/// type alias declaration … simply infer from source type arguments to target
+/// type arguments" (`source.aliasSymbol === target.aliasSymbol` →
+/// `inferFromTypeArguments(…, getAliasVariances(…))`) — which stops the walk
+/// before it ever descends into the resolved branch. ztsc has the machinery
+/// on one side only: `instantiate.aliasInstantiation` origin-tags the source's
+/// resolved FUNCTION body with `ref(QF, [R, string[], never])`, but the
+/// target's `QF<T, K, P>` stays a `.conditional`, which `originTaggable`
+/// excludes, so `infer.unify` has nothing to pair and walks structurally into
+/// the false branch (`pageParam: P` ← `pageParam?: unknown` = `unknown`).
+///
+/// The intersection source is only what EXPOSES it: with a plain (non-
+/// intersection) argument `infer.unify`'s `.ref` arm pairs the whole
+/// `B<…>` positionally and never reaches the members at all. So the fix is
+/// origin-tagging a deferred conditional's alias identity plus an alias-args
+/// pairing arm in `infer.unify` — `instantiate.zig` / `infer.zig`, neither of
+/// them this file. Until that lands, this check must stay COMPARABLE-both-
+/// directions; tighten it to plain assignability in the same change that
+/// fixes the inference, and re-run the social-app gate to confirm.
 fn intersectionOptionalsRelated(c: *Checker, s: TypeId, t: TypeId) Error!bool {
     // `.object` is also where tsc's array/tuple exclusion lands: neither kind
     // resolves to one, so both answer "nothing owed" here.
