@@ -2403,6 +2403,65 @@ fn condTrueOverExtends(c: *Checker, cond: TypeId) Error!TypeId {
 /// (`getRestrictiveInstantiation`) while ztsc has to instantiate eagerly: a
 /// true branch that carries deferred machinery of its own. See
 /// `substitutableBranch`.
+/// tsc's `getInferredTrueTypeFromConditionalType`, the DEFERRED case — the
+/// third reading of a true branch, and the one that decides `Awaited<T>`.
+///
+/// ```ts
+/// return type.combinedMapper
+///     ? instantiateType(getTypeFromTypeNode(type.root.node.trueType), type.combinedMapper)
+///     : getTrueTypeFromConditionalType(type);
+/// ```
+///
+/// `combinedMapper` binds the conditional's own `infer` binders. When the
+/// check type is DEFERRED, `getConditionalType` never runs `inferTypes` at
+/// all, so every binder comes out of `getInferredType` with no candidate and
+/// no default — `unknown`. The true branch is then read with `unknown` in each
+/// binder's place, which frequently RESOLVES a nested conditional that tests
+/// one of them, and that resolution is the whole point:
+///
+/// ```ts
+/// type Awaited<T> = T extends null | undefined ? T
+///     : T extends object & { then(onfulfilled: infer F, ...args: infer _): any }
+///         ? F extends (value: infer V, ...args: infer _) => any ? Awaited<V> : never
+///         : T;
+/// ```
+///
+/// The middle conditional's true branch tests `F`. With `F := unknown`,
+/// `unknown extends (value: …) => any` is FALSE, so that whole branch is
+/// `never` — and the branch union of `Awaited<T>` collapses to `T | never |
+/// T` = `T`. That is why tsgo accepts `Awaited<T>` as a `T` (oracle-pinned for
+/// a bare `T`, a constrained one, `T[K]` and `T["p"]` alike), and why ztsc —
+/// which kept `F` symbolic and therefore kept `Awaited<V>` in the union —
+/// invented a TS2322 on every async function that returns a
+/// `Promise.resolve<T[K]>(…)` into a `Promise<T[K]>` (`asyncFunctionReturnType`
+/// lines 51 / 71 / 75).
+///
+/// The nested conditionals are walked rather than the extends clause scanned:
+/// what tsc's mapper reaches is exactly the chain of checks that ARE binders
+/// (a reference to an enclosing conditional's binder included — `F` here is
+/// one, and tsc's mapper is merged with the enclosing mapper for that very
+/// reason). A binder appearing anywhere else in the branch is left alone,
+/// because substituting it there cannot resolve anything and would only widen
+/// the reading.
+///
+/// Additive, like the other two readings: it returns the branch untouched
+/// unless a nested check is a binder, and a branch it does rewrite can only
+/// make the relation succeed where the bare branch already failed.
+fn condTrueInferBound(c: *Checker, cond: TypeId) Error!TypeId {
+    const s = &c.ts;
+    var tru = s.condTrue(cond);
+    var steps: u32 = 0;
+    while (steps < max_cond_constraint_steps) : (steps += 1) {
+        if (s.kind(tru) != .conditional) break;
+        const chk = s.condCheck(tru);
+        if (s.kind(chk) != .infer_var) break;
+        const next = try generics_zig.substInfer(c, tru, &.{s.inferVarId(chk)}, &.{types.unknown_type});
+        if (next == tru) break;
+        tru = next;
+    }
+    return tru;
+}
+
 fn condTrueSubstituted(c: *Checker, cond: TypeId) Error!TypeId {
     const s = &c.ts;
     const chk = s.condCheck(cond);
@@ -2776,7 +2835,8 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         // without instantiating anything). Additive: the substitution can only
         // make a branch relate that the bare branch did not.
         const tru_ok = (try c.isAssignable(try c.condTrueUnderExtends(s), t)) or
-            (try c.isAssignable(try condTrueSubstituted(c, s), t));
+            (try c.isAssignable(try condTrueSubstituted(c, s), t)) or
+            (try c.isAssignable(try condTrueInferBound(c, s), t));
         if (tru_ok and (try c.isAssignable(c.ts.condFalse(s), t))) return true;
         // Only now — with the both-branches reading already refused — is the
         // narrower DISTRIBUTIVE constraint worth computing. tsc tries it first
@@ -2957,8 +3017,10 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         const obj_bc = try relationIndexObjConstraint(c, c.ts.indexAccessObj(s));
         // Same two guards as the target rule: neither side may still be
         // generic after taking base constraints.
-        const idx_bc = try c.baseConstraintOf(c.ts.indexAccessIndex(s));
-        if (!try c.isGenericObjectForIndex(obj_bc) and !try c.containsFreeTypeParam(idx_bc, &.{})) {
+        const idx_bc = try relationIndexKeyConstraint(c, c.ts.indexAccessIndex(s));
+        if (!try c.isGenericObjectForIndex(obj_bc) and !try c.containsFreeTypeParam(idx_bc, &.{}) and
+            try keyDomainAnswerable(c, obj_bc, c.ts.indexAccessIndex(s)))
+        {
             const bc = try c.reduceIndexedAccess(obj_bc, idx_bc);
             if (bc != s and c.ts.kind(bc) != .unknown and try c.isAssignable(bc, t)) return true;
         }
@@ -4547,6 +4609,80 @@ fn relationIndexObjConstraint(c: *Checker, t: TypeId) Error!TypeId {
     if (c.ts.kind(t) == .intersection)
         return (try intersectionBaseConstraint(c, t, 0)) orelse t;
     return indexObjBaseConstraint(c, t);
+}
+
+/// The KEY side of a deferred indexed access, for the same rule — tsc's
+/// `computeBaseConstraint`, `TypeFlags.Index` case:
+///
+/// ```ts
+/// if (t.flags & TypeFlags.Index) {
+///     return keyofConstraintType;   // string | number | symbol
+/// }
+/// ```
+///
+/// A `keyof X` answers the PROPERTY-KEY domain, never `keyof <constraint of
+/// X>`: the keys of an object known only by a constraint are known only to be
+/// property keys, because a subtype may declare more of them. `baseConstraintOf`
+/// instead instantiates `X` with its constraint and answers the much narrower
+/// `keyof <constraint>`, which is a strictly smaller key set than `T[keyof T]`
+/// actually ranges over.
+///
+/// It is what decides `T[keyof T]` under `T extends object`: tsc reads the key
+/// as `string | number | symbol`, finds `object` has no index signature that
+/// answers it, and therefore gives the access NO base constraint at all — so
+/// `let b: number = a` is the TS2322 `indexedAccessConstraints:6:9` asks for.
+/// ztsc reduced `keyof object` to `never`, made the access `never`, and
+/// silently accepted every target. The same reading is why `T extends { a:
+/// number; b: number }` still errors (oracle-pinned): the constraint declares
+/// two NAMED keys and no index signature, so it cannot answer the key domain
+/// either. `T extends Record<string, number>` does answer it, and keeps
+/// reducing to `number`.
+///
+/// `narrowable.constraintOrSelf` carries the same rule for the narrowing side;
+/// this is the relation's copy of it, over the one operand the relation asks
+/// about (extracting a shared helper would mean exporting one of the two
+/// modules' notion of "resolved for inspection", which differs).
+fn relationIndexKeyConstraint(c: *Checker, idx: TypeId) Error!TypeId {
+    if (c.ts.kind(idx) == .keyof_op) return c.propertyKeyType();
+    return c.baseConstraintOf(idx);
+}
+
+/// tsc's `getIndexedAccessTypeOrUndefined` answering UNDEFINED — the other
+/// half of the `keyof` rule above, and the reason widening the key is not
+/// enough on its own.
+///
+/// `computeBaseConstraint` only keeps the reduction when the object side can
+/// answer the WHOLE key domain:
+///
+/// ```ts
+/// const baseIndexedAccess = baseObjectType && baseIndexType &&
+///     getIndexedAccessTypeOrUndefined(baseObjectType, baseIndexType, t.accessFlags);
+/// return baseIndexedAccess && getBaseConstraint(baseIndexedAccess);
+/// ```
+///
+/// ztsc's `indexedAccessType` has no "undefined": an absent NAMED property
+/// answers `unknown` (which the caller already screens out) but an absent
+/// INDEX SIGNATURE answers `any`, deliberately — every ordinary read through
+/// a `string` key wants the permissive answer. Handed `string | number |
+/// symbol` that `any` says "relates to everything", so the widened key alone
+/// changed nothing: `object[string | number | symbol]` came back `any` where
+/// it used to come back `never`, and both accept every target.
+///
+/// So the domain question is asked separately, and only for a `keyof` index —
+/// every other key shape reduces to a concrete member and keeps its existing
+/// answer. A string index signature is the one thing that answers a key known
+/// only to be a property key; a table of NAMED members does not, which is
+/// exactly why tsc still errors under `T extends { a: number; b: number }`
+/// (oracle-pinned, `indexedAccessConstraints`). An `any`/error object answers
+/// everything by definition.
+fn keyDomainAnswerable(c: *Checker, obj_bc: TypeId, idx: TypeId) Error!bool {
+    if (c.ts.kind(idx) != .keyof_op) return true;
+    const r = try c.resolveStructural(obj_bc);
+    return switch (c.ts.kind(r)) {
+        .any, .err => true,
+        .object => c.ts.objectStringIndex(r) != 0,
+        else => false,
+    };
 }
 
 /// The base constraint of an INTERSECTION object, tsc's `computeBaseConstraint`
