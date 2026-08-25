@@ -1957,15 +1957,32 @@ const Parser = struct {
             .keyword_function,
             .keyword_class,
             .keyword_enum,
-            .keyword_interface,
-            .keyword_type,
-            .keyword_namespace,
-            .keyword_module,
             .keyword_import,
             .keyword_declare,
             .keyword_abstract,
             .keyword_async,
             => true,
+            // tsc's `isDeclaration` looks one token further for these four:
+            //
+            //     case InterfaceKeyword: case TypeKeyword:
+            //         return nextTokenIsIdentifierOnSameLine();
+            //     case ModuleKeyword: case NamespaceKeyword:
+            //         return nextTokenIsIdentifierOrStringLiteralOnSameLine();
+            //
+            // Without the peek `export namespace 100 {}` reads as an exported
+            // namespace, where tsc refuses the whole thing as a statement,
+            // reports TS1128 on the `export` and re-parses from `namespace`
+            // (`parseInvalidNames`). The word alone still starts a STATEMENT
+            // (`atStartOfStatement` answers those tags true unconditionally,
+            // as tsc's `isStartOfStatement` does) — this is only about whether
+            // a preceding modifier run has a declaration to modify.
+            .keyword_interface,
+            .keyword_type,
+            => !p.peekNewline(n + 1) and isIdentLike(p.peekTag(n + 1)),
+            .keyword_namespace,
+            .keyword_module,
+            => !p.peekNewline(n + 1) and
+                (isIdentLike(p.peekTag(n + 1)) or p.peekTag(n + 1) == .string_literal),
             else => false,
         };
     }
@@ -5169,7 +5186,13 @@ const Parser = struct {
                 _ = try p.bump();
                 continue;
             }
-            if ((bit == ast.Flags.get or bit == ast.Flags.set or bit == ast.Flags.async) and p.peekNewline(1)) break;
+            // `get`/`set` are the two words tsc's `nextTokenCanFollowModifier`
+            // gives their OWN arm — `nextToken(); return canFollowModifier();`
+            // — with no same-line requirement, unlike `static`/`async`, which
+            // fall to `nextTokenIsOnSameLineAndCanFollowModifier`. So
+            // `get\nx() {}` is a getter named `x`, not a field `get` plus a
+            // method `x` (accessorWithLineTerminator).
+            if (bit == ast.Flags.async and p.peekNewline(1)) break;
             if (n_mods < mods.len) {
                 mods[n_mods] = .{ .bit = bit, .token = p.curIdx() };
                 n_mods += 1;
@@ -8719,7 +8742,10 @@ const Parser = struct {
             const t1 = p.peekTag(1);
             const name_follows = isNameLike(t1) or t1 == .string_literal or
                 t1 == .numeric_literal or t1 == .l_bracket or t1 == .asterisk;
-            if (!name_follows or p.peekNewline(1)) break;
+            // Only `async` is same-line-gated here: tsc's
+            // `nextTokenCanFollowModifier` gives `get`/`set` an arm with no
+            // line-break test (see the class-member walk).
+            if (!name_follows or (bit == ast.Flags.async and p.peekNewline(1))) break;
             _ = try p.bump();
             flags |= bit;
         }
