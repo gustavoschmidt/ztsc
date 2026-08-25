@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-24, post wave 32)
+## Standings (2026-08-25, post wave 33)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7479 / 8633 (86.6%)** |
-| excess keys (false positives) | 3541 | 1488 |
-| missing keys (under-reports) | 8617 | 2865 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7509 / 8633 (87.0%)** |
+| excess keys (false positives) | 3541 | 1444 |
+| missing keys (under-reports) | 8617 | 2731 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Thirty-two waves landed (3–32), every one with ZERO match→non-match regressions in
+Thirty-three waves landed (3–33), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -494,7 +494,75 @@ substitution mintFreshTpDeferred avoids — +4–6% on drizzle; keep
 typeParamConstraint behind cheap checks. MEASUREMENT LESSON: perf runs
 while other agents sweep read +8% noise — check `ps aux | grep ts_suite`.
 
-## Ranked next queue (wave 33) — distilled from wave-32 agent reports
+Wave 33 (+30 exact → 7509/8633 87.0%; SOCIAL-APP 46 link + 77 check →
+37 + 31 — 55 tsgo-proven FP removals in one wave; conformance 1326/1326,
+accepted divergences 33→30): A closed f08's self-echo (ctx_echo-scoped:
+drop an identity candidate, substitute one mentioning an earlier variable
+— the scoping is load-bearing, unscoped cost 7 exact) and landed the
+Pick-pattern named-key walk (+3 cases incl. two unexpected). B killed the
+TS2353 ×34 family (epcReducedUnion: tsc keeps a constituent when SOME
+member of the source tag reaches it), normalized `[...any, K]` to
+`[...any[], K]`, landed the per-frame weak rule (weakTypeMismatch runs
+ahead of the memo, so no hazard), TS2313 circular constraints (+2 pure
+cases), and A's paramTypeAt handoff WITH correction: as given it adds a
+false TS2345 (spread-call source contributes whole-union element at every
+position) — landed contextual-only. C removed the ambient TDZ (NodeFlags.
+Ambient first, as checkResolvedBlockScopedVariable), decided class_value
+identity by id, gave assigned function expressions their receiver `this`,
+and landed the accessor cluster (getter return from setter annotation,
++8 keys). D routed ambient-module `from`-re-exports through the star
+fixed point (one root cause for TS2305 ×9 AND node:cluster TS2339 ×4),
+landed narrow.reduceConstrainedTypeParams at flow joins (subtype-reduce a
+bare param beside its constraint's members), generated Unicode
+ID_Start/ID_Continue tables (+6), and three recovery rules
+(numberLiteralsWithLeadingZeros 69→93/93 keys).
+
+## Ranked next queue (wave 34) — distilled from wave-33 agent reports
+
+1. STANDING GRID FAILURE, needs an owner: excalidraw at --checkers=8 ×
+   shuffle=1/2 has 6 order-dependent TS2339 keys in
+   packages/excalidraw/data/transform.test.ts (374–376, 394–396).
+   Pre-existing (reproduced byte-for-byte on wave-32's binary); checkers
+   1/2/4 clean. Same investigation style as the closed social-app defect.
+2. Full paramTypeAt union-rest distribution — blocked on the spread-call
+   SOURCE side (calls.zig getSpreadArgumentType: a spread whose type is a
+   union of tuples must contribute position-wise, not the whole element
+   union). B33's contextual-only entry point is in; finishing needs the
+   calls.zig half first.
+3. Dynamic import('./missing') never reports TS2307 (3 cases) — dynamic-
+   import specifiers never reach the link graph.
+4. Tuple numeric properties: `[number[], string[]]` vs `{ 0:…; 1:… }`
+   interface — relationSrcProp + tuple_relate helper; the suite witness
+   arrayLiterals3 also needs expr.zig's spread-of-tuple-in-array-literal
+   typed as a tuple.
+5. TS1362→TS1361 blame ×5 (ztsc blames the `import type`, tsgo the
+   `export type`; modvalue.zig).
+6. Non-unit discriminant: tsc's findDiscriminantProperties is TARGET-
+   driven — a string-typed source tag still reduces; ztsc's
+   isUnitOrUnitUnion gate skips it.
+7. TS2313 type-level walk (5 remaining cases: base-constraint recursion
+   through unions/intersections/indexed accesses).
+8. Expando `this` (blocks jsxComponentTypeErrors' TS2786): expandoFold is
+   eager, typeOfSymbol's in-progress guard answers `any`; needs lazy
+   expando members (same cycle blocks objectLiteralThisWidenedOnUse,
+   looseThisTypeInFunctions:29).
+9. Alias variance (1 key): needs alias identity kept on instantiations —
+   instantiate.zig + types.zig + getAliasVariances; assign to an agent
+   OWNING those files.
+10. Union subtype reduction outside flow joins (`cond ? a : t` keeps the
+    param; types.zig).
+11. Small clusters: mapped `as` over keyof array; lastPropertyInLiteral
+    Wins (elaborate: tsc elaborates at EVERY declaration node with the
+    last-wins type); topFunctionTypeNotCallable (rest-argument tuple vs
+    non-array rest); divergent accessor WRITE type (types.Prop needs a
+    setter type — feature); TS1121 position ×4; TS1110→TS1005 ×3;
+    TS2357→TS1109 ×3; bare `@` before enum TS1109;
+    contravariantOnlyInferenceFromAnnotatedFunction (probe data recorded);
+    coAndContraVariantInferences5 (union-to-union multi-match refusal).
+12. c1 keying perf lead (memoize kept-ref resolution); substitution types;
+    resolution-mode attributes; census TS2322 (34 under / 17 excess).
+
+## Superseded queue (wave 33, kept for context)
 
 1. genericFunctionInference1's last 10 keys, two roots: TS2448 FP on an
    AMBIENT `declare const` used before declaration (ambient decls have no
