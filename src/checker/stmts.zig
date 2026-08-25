@@ -41,6 +41,7 @@ const diagFmt = Checker.diagFmt;
 const elaborate = @import("elaborate.zig");
 const heritage = @import("heritage.zig");
 const index_constraints = @import("index_constraints.zig");
+const init_order = @import("init_order.zig");
 const isNonPrimitiveKind = @import("assign.zig").isNonPrimitiveKind;
 const isNullishUnion = @import("flow.zig").isNullishUnion;
 const modvalue = @import("modvalue.zig");
@@ -1363,8 +1364,12 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
     // `super(…)` written directly in it, whatever the enclosing one was.
     const saved_in_ctor = c.in_ctor_body;
     const saved_in_key = c.in_computed_key;
+    // …and the `super` container a DECORATOR steps out of its class for: a
+    // function written inside the decorator is a container of its own.
+    const saved_in_deco = c.in_decorator;
     c.in_ctor_body = c.nodeTag(node) == .class_method and c.isCtorMember(node, proto.flags);
     c.in_computed_key = false;
+    c.in_decorator = false;
     defer {
         c.cur_scope = saved_scope;
         c.fn_ctx = saved_ctx;
@@ -1372,6 +1377,7 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
         c.field_init_depth = saved_field_init;
         c.in_ctor_body = saved_in_ctor;
         c.in_computed_key = saved_in_key;
+        c.in_decorator = saved_in_deco;
     }
     if (try c.scopeOf(node)) |s| c.cur_scope = s;
     // An explicit `this` parameter types `this` inside the body.
@@ -1866,6 +1872,36 @@ fn implementsTargetIsClass(c: *Checker, t: TypeId) bool {
 /// and reports the broad diagnostic instead — walking the member SCOPE, which
 /// does contain `a`, would report TS2416 where the oracle does not.
 ///
+/// The span tsc blames on a class member's NAME — its `member.name` node.
+///
+/// For an ordinary member that is the name token, which `main_token` already
+/// is. For a COMPUTED one `member.name` is the whole `[…]`, and `main_token` is
+/// deliberately not it: the parser keys the member by a token INSIDE the
+/// brackets so that a name lookup has one token to read
+/// (`parseComputedMemberName`). `[Symbol.toPrimitive]() {}` is blamed at the
+/// `[`, eight columns left of the token that names it (`symbolProperty24`).
+///
+/// Two of the four computed spellings retain their `[…]` node, and it carries
+/// the span outright. The other two do not — a well-known-symbol key and a
+/// literal key both have expressions the checker never needs back — so their
+/// bracket is recovered from the token stream, whose layout the parser pins:
+/// `[`, `Symbol`, `.`, name, `]` for the first and `[`, literal, `]` for the
+/// second. A non-computed name is never preceded by `[` in a class body (an
+/// index signature is a member node of its own), so the test cannot misfire.
+fn memberNameSpan(c: *Checker, member: Node, flags: u32) source.Span {
+    if (c.tree.computedKey(member)) |key| return c.nodeSpan(key);
+    const name = c.tree.nodeMainToken(member);
+    const l_bracket: ast.TokenIndex = if (flags & ast.Flags.computed != 0 and name >= 3)
+        name - 3
+    else if (name >= 1 and c.tree.tokens.tag(name - 1) == .l_bracket)
+        name - 1
+    else
+        return c.tokSpan(name);
+    if (c.tree.tokens.tag(l_bracket) != .l_bracket) return c.tokSpan(name);
+    const last = if (c.tree.tokens.tag(name + 1) == .r_bracket) name + 1 else name;
+    return .{ .start = c.tree.tokens.start(l_bracket), .end = c.tokSpan(last).end };
+}
+
 /// Returns whether any member reported.
 fn issueMemberSpecificError(c: *Checker, members: []const Node, this_t: TypeId, target: TypeId) Error!bool {
     const derived = try c.resolveStructural(this_t);
@@ -1895,7 +1931,7 @@ fn issueMemberSpecificError(c: *Checker, members: []const Node, this_t: TypeId, 
         // ordinary relation would have printed, so the "Type 'X' is not
         // assignable to type 'Y'." line the headline usually carries appears
         // one level in, with the structural derivation under it.
-        try c.diagFmt(2416, c.tokSpan(c.tree.nodeMainToken(member)), "Property '{s}' in type '{s}' is not assignable to the same property in base type '{s}'.\n  Type '{s}' is not assignable to type '{s}'.{s}", .{
+        try c.diagFmt(2416, memberNameSpan(c, member, flags), "Property '{s}' in type '{s}' is not assignable to the same property in base type '{s}'.\n  Type '{s}' is not assignable to type '{s}'.{s}", .{
             c.atomText(name_atom),
             try c.typeToString(this_t),
             try c.typeToString(target),
@@ -1960,46 +1996,6 @@ fn checkStaticSideExtends(c: *Checker, class_sym: SymbolId, name_token: ast.Toke
         c.symbolName(base),
         try elaborate.chainText(c, derived_static, base_static),
     });
-}
-
-/// TS2729 for one instance field initializer: a `this.x` in it that names an
-/// own instance field *not yet initialized* at that point — either a LATER
-/// sibling (`f = this.g; g = 1`) or the field being initialized itself
-/// (`p = this.p`). Both read `undefined` at construction time.
-///
-/// Syntactic, and deliberately so: tsc's rule (`isBlockScopedNameDeclaredBeforeUse`
-/// → `isUsedInFunctionOrInstanceProperty`) is a walk from the use up to the
-/// enclosing declaration, and the exemptions on that walk are all syntactic —
-/// a use inside a nested function or class runs later, so it is fine, and an
-/// access whose receiver is itself an access (`this.a.b`) is not a
-/// declaration reference at all. Both fall out of the descent below. Members
-/// other than plain instance fields are exempt: a method is on the prototype
-/// before any initializer runs, and an optional field is allowed to be
-/// missing.
-fn checkFieldInitSelfRefs(c: *Checker, members: []const Node, field: Node, expr: Node) Error!void {
-    switch (c.nodeTag(expr)) {
-        // Deferred to call time — the field is initialized by then.
-        .arrow_fn, .function_expr, .function_decl, .object_method, .class_decl => return,
-        .member_expr, .optional_member_expr => {
-            const d = c.tree.nodeData(expr);
-            if (c.nodeTag(d.lhs) == .this_expr) {
-                const name = c.tokenText(d.rhs);
-                for (members) |m| {
-                    if (m == null_node or c.nodeTag(m) != .class_field) continue;
-                    const e = c.tree.extraData(ast.Field, c.tree.nodeData(m).lhs);
-                    if (e.flags & (ast.Flags.static | ast.Flags.optional) != 0) continue;
-                    if (!std.mem.eql(u8, c.tokenText(c.tree.nodeMainToken(m)), name)) continue;
-                    // Initialized already: a strictly earlier sibling.
-                    if (m != field and c.nodeSpanStart(m) < c.nodeSpanStart(field)) break;
-                    try c.diagFmt(2729, c.tokSpan(d.rhs), "Property '{s}' is used before its initialization.", .{name});
-                    break;
-                }
-            }
-        },
-        else => {},
-    }
-    var it = c.tree.childIterator(expr);
-    while (it.next()) |child| try checkFieldInitSelfRefs(c, members, field, child);
 }
 
 /// One instance property declaration that `strictPropertyInitialization` has
@@ -2753,10 +2749,11 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
                     continue;
                 }
                 if (e.init != 0) {
-                    if (!is_static) try checkFieldInitSelfRefs(c, members, member, e.init);
-                    // …and the static half of the same rule, which a static
-                    // block shares (`static_block.zig`).
-                    if (is_static) try static_block.checkStaticSelfRefs(c, members, member, e.init, class_name);
+                    // TS2729: the initializer runs while the class is still
+                    // being set up, so what it may read is a question about
+                    // source order (`init_order.zig`). A static block runs in
+                    // the same window and shares the rule.
+                    try init_order.checkSelfRefs(c, members, member, e.init, class_name, if (is_static) .static else .instance);
                     // See `instance_field_init_depth`: an instance field's
                     // initializer runs at construction time, so a forward
                     // reference in it is not a TDZ use.
@@ -2813,7 +2810,15 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
             .decorator => {
                 // A member decorator expression is evaluated in the scope
                 // surrounding the class (at class-definition time), so its
-                // `this` is the enclosing `this`, not the instance.
+                // `this` is the enclosing `this`, not the instance — and so is
+                // its `super` CONTAINER (`Checker.in_decorator`). The SCOPE is
+                // deliberately left alone: tsc resolves a decorator's names in
+                // the class's own scope, and moving the walk out convicted
+                // every decorator function of TS2454 in
+                // `decoratorUsedBeforeDeclaration`.
+                const saved_deco = c.in_decorator;
+                defer c.in_decorator = saved_deco;
+                c.in_decorator = true;
                 c.this_type = saved_this;
                 // The decorated member is the next non-decorator member. It
                 // is needed BEFORE the decorator expression is checked: the
