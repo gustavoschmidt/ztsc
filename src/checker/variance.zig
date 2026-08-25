@@ -205,7 +205,17 @@ const allows_structural_fallback: u64 = fallback_unmeasurable | fallback_unrelia
 /// minutes; 32 clears it with room to spare.
 pub const max_variance_measure_depth = 32;
 
-fn measuredAt(bits: u64, i: usize) Measured {
+/// The measured variance packed at parameter `i` of a `measuredVariances`
+/// word, or `.unmeasured` past the packable arity.
+///
+/// `pub` for the INFERENCE side: the relation reads the word through
+/// `measuredVarianceVerdict`, but tsc also directs its same-origin
+/// type-argument PAIRING with it — `inferFromTypeArguments` sends a
+/// contravariant position through `inferFromContravariantTypes`. That caller
+/// fetches the word itself (once per pairing, see `infer.pairOriginArgs`),
+/// so what it needs published is the per-position reader, not a wrapper that
+/// re-fetches.
+pub fn measuredAt(bits: u64, i: usize) Measured {
     if (i >= max_measured_params) return .unmeasured;
     return @enumFromInt(@as(u3, @truncate(bits >> @intCast(measured_bits * i))));
 }

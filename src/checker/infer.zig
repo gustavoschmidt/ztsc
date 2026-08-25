@@ -31,6 +31,7 @@ const isUnitLikeKind = @import("assign.zig").isUnitLikeKind;
 const skipParens = @import("expr.zig").skipParens;
 const tuple_relate = @import("tuple_relate.zig");
 const typenode = @import("typenode.zig");
+const variance = @import("variance.zig");
 
 /// tsc's `InferencePriority.ReturnType`: infer still-unbound type params by
 /// unifying the signature's return type against the structurally-resolved
@@ -4427,19 +4428,14 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
             // one the oracle confirms (the same call with the context spelled
             // out inline does infer `unknown`).
             //
-            // NARROWER THAN TSC, deliberately. tsc pairs the arguments
-            // unconditionally, DIRECTED BY `getAliasVariances`; ztsc's pairing
-            // is covariant, and for a contravariant alias parameter that is the
-            // wrong direction — `Func1<T> = (x: T) => void` given `Func1<string>`
-            // and `Func1<"a">` for one `T` infers `string` where tsc infers
-            // `"a"` (`compiler/contravariantTypeAliasInference.ts`). So the
-            // shortcut is taken only where the structural walk is provably
-            // pairing different SHAPES and has no right answer to lose: a
-            // parameter position the TARGET still holds as a deferred
-            // conditional while the SOURCE has already reduced past it.
-            // Widening it to tsc's form is a variance-directed pairing away
-            // (`variance.measuredVariances` + a `contra_pos` flip per position).
-            if (s.kind(ra) == .function and try deferredParamShapeMismatch(c, param, ra)) {
+            // tsc's form, unconditional: the pairing is DIRECTED BY
+            // `getAliasVariances` (`pairOriginArgs`), so a contravariant alias
+            // parameter is inferred from contravariantly rather than taking the
+            // covariant join — which is what previously made an unconditional
+            // shortcut unsound here (`Func1<T> = (x: T) => void` given
+            // `Func1<string>` and `Func1<"a">` for one `T` must infer `"a"`,
+            // not `string` — `compiler/contravariantTypeAliasInference.ts`).
+            if (s.kind(ra) == .function) {
                 if (c.origin.get(param)) |po| {
                     if (c.origin.get(arg) orelse c.origin.get(ra)) |ao| {
                         if (s.kind(po) == .ref and s.kind(ao) == .ref and
@@ -4470,7 +4466,7 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                                 if (try c.containsTypeParam(aa[i])) skip = true;
                             }
                             if (!skip) {
-                                for (0..n) |i| try c.unify(pa[i], aa[i], tp_syms, candidates, depth + 1);
+                                try pairOriginArgs(c, s.refSymbol(po), pa[0..n], aa[0..n], tp_syms, candidates, depth);
                                 return;
                             }
                         }
@@ -5607,24 +5603,60 @@ pub fn constituentCarriesInference(c: *Checker, param: TypeId, m: TypeId, tp_sym
 /// screen for `constituentCarriesInference` — the deeper the occurrence, the
 /// less a structural pairing can invert it, and a false negative only leaves
 /// the prior behaviour.
-/// Do two signatures of the SAME generic alias disagree about whether a
-/// parameter position is still deferred — the target holding a conditional the
-/// source has already reduced past?
+/// Pair the type arguments of two SAME-ORIGIN refs — tsc's
+/// `inferFromTypeArguments`, the tail of every "source and target are types
+/// originating in the same generic type alias declaration" shortcut.
 ///
-/// That disagreement is what makes the structural walk unsound for such a pair:
-/// it pairs a conditional against ONE of its own branches, and every inference
-/// it takes out of that branch is an inference out of a shape the target may
-/// never have. It is also the only case `unify`'s same-alias shortcut is
-/// allowed to pre-empt, because a pair that agrees structurally has a real
-/// answer the covariant pairing could lose (see the caller).
-fn deferredParamShapeMismatch(c: *Checker, param: TypeId, arg: TypeId) Error!bool {
-    const s = &c.ts;
-    const n = @min(s.fnParamCount(param), s.fnParamCount(arg));
-    for (0..n) |i| {
-        if (s.kind(s.fnParam(param, @intCast(i)).ty) != .conditional) continue;
-        if (s.kind(try c.resolveStructural(s.fnParam(arg, @intCast(i)).ty)) != .conditional) return true;
+/// Position by position, EXCEPT that a position the generic measures
+/// contravariant is inferred from contravariantly: tsc reads
+/// `getAliasVariances(aliasSymbol)` (or `getVariances(target)`) and sends such
+/// a position through `inferFromContravariantTypes`, which flips exactly the
+/// bit `InferCtx.contra_pos` carries. Pairing covariantly regardless is the
+/// wrong direction for a written-only parameter — `Func1<T> = (x: T) => void`
+/// given `Func1<string>` and `Func1<"a">` for one `T` takes the SUPERTYPE
+/// `string` where tsc takes `"a"` (`compiler/contravariantTypeAliasInference.
+/// ts`), because a contravariant slot's answer is the meet of its candidates,
+/// not the join.
+///
+/// `sym` is the shared origin symbol; an unmeasured generic (a declined
+/// measurement, a too-long parameter list) pairs covariantly, which is the
+/// behaviour every one of these sites had before.
+///
+/// The measurement is taken ONCE per pairing rather than once per position,
+/// and only when some position's two arguments actually DIFFER — a position
+/// that pairs a type with itself has no direction to get wrong. That matters
+/// because `measuredVariances` is not a lookup: the first demand for a symbol
+/// walks the generic's body probing the relation with marker types. Forcing
+/// that from the inference path for every same-origin pairing cost drizzle-orm
+/// 5.3% of its check (measured, 8x25 interleaved single-threaded user CPU),
+/// which is why only this arm — where the pairing PRE-EMPTS a structural walk
+/// that would otherwise get the direction right on its own — asks at all.
+fn pairOriginArgs(
+    c: *Checker,
+    sym: u32,
+    pa: []const TypeId,
+    aa: []const TypeId,
+    tp_syms: []const u32,
+    candidates: []TypeId,
+    depth: u32,
+) Error!void {
+    var bits: ?u64 = null;
+    var measured = false;
+    for (0..@min(pa.len, aa.len)) |i| {
+        var contra = false;
+        if (pa[i] != aa[i]) {
+            if (!measured) {
+                bits = try variance.measuredVariances(c, sym);
+                measured = true;
+            }
+            if (bits) |b| contra = variance.measuredAt(b, i) == .contravariant;
+        }
+        if (contra) c.infer_ctx.contra_pos += 1;
+        defer if (contra) {
+            c.infer_ctx.contra_pos -= 1;
+        };
+        try c.unify(pa[i], aa[i], tp_syms, candidates, depth + 1);
     }
-    return false;
 }
 
 fn mentionsAnyTypeParam(c: *Checker, t: TypeId, tp_syms: []const u32) Error!bool {
