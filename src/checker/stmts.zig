@@ -131,6 +131,12 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
             try conditions.checkTruthiness(c, d.lhs, cond_t);
             try c.checkStatement(d.rhs);
         },
+        // tsc's `checkWithStatement` checks the object expression and STOPS —
+        // it never calls `checkSourceElement(node.statement)`, so nothing
+        // inside a `with` block is diagnosed at all. The statement's own
+        // TS1101/TS2410 are raised in the parser (grammar-class), so the only
+        // work left here is the expression.
+        .with_stmt => _ = try c.checkExprCached(d.lhs, types.no_type),
         .do_stmt => {
             try c.checkStatement(d.lhs);
             const cond_t = try c.checkExprCached(d.rhs, types.no_type);

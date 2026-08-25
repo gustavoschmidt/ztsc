@@ -384,6 +384,10 @@ pub const Tag = enum(u8) {
     while_stmt,
     /// `do s while (c);`. lhs = body, rhs = cond.
     do_stmt,
+    /// `with (o) s`. main_token = `with`; lhs = object expression, rhs = body.
+    /// The body is bound (its declarations exist) but never CHECKED — see
+    /// `checkStatement`'s arm and `Diagnostics.with_statement_not_supported`.
+    with_stmt,
     /// `for (init; cond; update) body`. lhs = extra→For, rhs = body.
     for_stmt,
     /// `for (left in right) body`. lhs = extra→ForInOf, rhs = body.
@@ -1014,6 +1018,7 @@ pub const Ast = struct {
                 .if_stmt,
                 .while_stmt,
                 .do_stmt,
+                .with_stmt,
                 .indexed_access_type,
                 => {
                     it.push(d.lhs);

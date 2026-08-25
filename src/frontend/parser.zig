@@ -370,6 +370,9 @@ const Parser = struct {
     /// parsed, so the diagnostics are recorded as TS1212 and rewritten in
     /// `sealInto`.
     saw_module_syntax: bool = false,
+    /// How many `with` bodies enclose the statement being parsed. A cheap
+    /// stand-in for tsc's "the checker never descends here" — see `addDiag`.
+    with_body_depth: u32 = 0,
 
     /// Copy the parsed lists into `out` at exact size. `out` is an arena, so
     /// each `dupe`/`setCapacity` is a single tight allocation with no slack
@@ -725,6 +728,12 @@ const Parser = struct {
     /// only, because the grammar-class ones do not live in tsc's
     /// `parseDiagnostics` and so neither suppress nor are suppressed by these.
     fn addDiag(p: *Parser, code: Code, span: ast.Diagnostic) Error!void {
+        // Inside a `with` body tsc's CHECKER never runs (`checkWithStatement`
+        // stops after the object expression), so every grammar-class code that
+        // belongs to the checker's grammar pass is dropped there. Its binder
+        // still walks the body, so the `checkStrictMode*` codes stay — see
+        // `Code.strictModeBinder`.
+        if (p.with_body_depth > 0 and code.class() == .grammar and !code.strictModeBinder()) return;
         if (code.class() == .syntactic) {
             if (p.last_syntactic_start) |last| {
                 if (last == span.span.start) return;
@@ -1702,6 +1711,7 @@ const Parser = struct {
             .if_else_stmt,
             .while_stmt,
             .do_stmt,
+            .with_stmt,
             .for_stmt,
             .for_in_stmt,
             .for_of_stmt,
@@ -2024,6 +2034,7 @@ const Parser = struct {
             },
             .keyword_if => return p.parseIfStatement(),
             .keyword_while => return p.parseWhileStatement(),
+            .keyword_with => return p.parseWithStatement(),
             .keyword_do => return p.parseDoStatement(),
             .keyword_for => return p.parseForStatement(),
             .keyword_switch => return p.parseSwitchStatement(),
@@ -2933,6 +2944,38 @@ const Parser = struct {
         _ = try p.expect(.r_paren, .expected_r_paren);
         const body = try p.parseLoopBody();
         return p.addNode(.{ .tag = .while_stmt, .main_token = kw, .data = .{ .lhs = cond, .rhs = body } });
+    }
+
+    /// `with (o) s`. Both of the statement's own diagnostics are raised here,
+    /// because both are grammar-class in ztsc's sense (semantic despite the
+    /// TS1101 number, hidden by `@ts-ignore`, suppressed by a syntactic error):
+    ///
+    ///   - TS1101 from tsc's BINDER (`checkStrictModeWithStatement`), on the
+    ///     `with` token alone. ztsc has no non-strict mode, so it is
+    ///     unconditional.
+    ///   - TS2410 from tsc's CHECKER (`checkWithStatement`), over
+    ///     `[getSpanOfTokenAtPosition(node.pos).start, node.statement.pos)` —
+    ///     the head `with (o)` with its trailing trivia, which is exactly the
+    ///     `)`-to-body gap `curFullStart` names once the `)` is consumed.
+    ///
+    /// The BODY is parsed and bound but never checked; `checkWithStatement`
+    /// checks the object expression and returns. Nothing inside a `with` block
+    /// is diagnosed, which is why `with (o) { bing = true }` earns no TS2304.
+    fn parseWithStatement(p: *Parser) PE!Node {
+        const kw = try p.bump();
+        const head_start = p.tok_starts.items[kw] & scanner.Tokens.start_mask;
+        try p.errAtToken(.with_in_strict, kw);
+        _ = try p.expect(.l_paren, .expected_l_paren);
+        const obj = try p.parseExpression(.{});
+        _ = try p.expect(.r_paren, .expected_r_paren);
+        try p.addDiag(.with_statement_not_supported, .{
+            .code = .with_statement_not_supported,
+            .span = .{ .start = head_start, .end = p.curFullStart() },
+        });
+        p.with_body_depth += 1;
+        defer p.with_body_depth -= 1;
+        const body = try p.parseSubstatement();
+        return p.addNode(.{ .tag = .with_stmt, .main_token = kw, .data = .{ .lhs = obj, .rhs = body } });
     }
 
     fn parseDoStatement(p: *Parser) PE!Node {
@@ -5832,14 +5875,27 @@ const Parser = struct {
     /// `assert { ... }` — on an `import`, `export * from` or `export { } from`
     /// declaration. Consumed, not modeled: the module resolver ztsc has does
     /// not vary by attribute, and a construct the parser rejects costs a false
-    /// syntax error (which suppresses the file's whole semantic pass). Must be
-    /// on the same line as the module specifier, as in tsc's
-    /// `tryParseImportAttributes`.
+    /// syntax error (which suppresses the file's whole semantic pass).
+    ///
+    /// The same-line rule is the DEPRECATED `assert` spelling's alone — tsc
+    /// writes `token() === WithKeyword || token() === AssertKeyword &&
+    /// !scanner.hasPrecedingLineBreak()`, and `importAttributes11.ts` puts the
+    /// `with { type: "json" }` on its own line for exactly that reason.
+    /// Requiring it of `with` too left the clause to statement position, where
+    /// it now parses as a `with` STATEMENT and costs three syntax errors tsgo
+    /// does not report.
     fn skipImportAttributes(p: *Parser) Error!void {
         const tag = p.curTag();
-        if (tag != .keyword_with and tag != .keyword_assert) return;
-        if (p.nlBefore() or p.peekTag(1) != .l_brace) return;
+        if (tag != .keyword_with and !(tag == .keyword_assert and !p.nlBefore())) return;
         _ = try p.bump();
+        // tsc's `parseImportAttributes` opens with `parseExpected(
+        // OpenBraceToken)`, so a keyword with no clause behind it is one "'{'
+        // expected" on the token that is there — `import * as f from "./first"
+        // with<eof>` is tsgo's single TS1005 at the end of the file.
+        // Refusing the clause instead left the keyword to statement position,
+        // which answered "';' expected" at the `with` and then a second error
+        // for the statement it is not.
+        if (p.curTag() != .l_brace) return p.errAtCur(.expected_l_brace);
         p.skipBalancedBraces();
     }
 
