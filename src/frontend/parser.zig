@@ -8917,21 +8917,109 @@ const Parser = struct {
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
         while (p.curTag() != .r_brace and p.curTag() != .eof) {
+            // tsc's `parseList` gate: the member is only PARSED when
+            // `isTypeMemberStart` says one begins here. Judging by whether the
+            // parse consumed anything instead read `interface C { var x }` as a
+            // property named `var` with a missing separator.
+            if (!p.atTypeMemberStart()) {
+                if (p.spec > 0) return error.Backtrack;
+                try p.errAtCur(.expected_type_member);
+                if (p.typeMemberListAborts()) break;
+                _ = try p.bump();
+                continue;
+            }
             const before = p.curIdx();
             const diags_before = p.diags.items.len;
-            try p.pushScratch(try p.parseTypeMember());
+            const member = try p.parseTypeMember();
             if (p.curIdx() == before) {
-                // `parseTypeMember` already reported TS1131 at this token when
-                // it failed on the member name; one diagnostic per token is
-                // what tsc emits, so do not double it.
+                // The gate said a member starts here and the parse disagreed:
+                // force progress. `parseTypeMember` has already reported at
+                // this token in that case, and one diagnostic per token is what
+                // tsc emits, so do not double it.
                 if (p.diags.items.len == diags_before) try p.errAtCur(.expected_type_member);
                 _ = try p.bump();
                 continue;
             }
+            try p.pushScratch(member);
             try p.typeMemberSemicolon();
         }
         _ = try p.expect(.r_brace, .expected_r_brace);
         return p.scratchToSpan(top);
+    }
+
+    /// tsc's `isTypeMemberStart`, the gate its TypeMembers list runs BEFORE it
+    /// will call `parseTypeMember` at all:
+    ///
+    ///     if (token() is `(`, `<`, `get` or `set`) return true;
+    ///     let idToken = false;
+    ///     while (isModifierKind(token())) { idToken = true; nextToken(); }
+    ///     if (token() === `[`) return true;              // index sig / computed
+    ///     if (isLiteralPropertyName()) { idToken = true; nextToken(); }
+    ///     if (idToken) return token() is `(` `<` `?` `:` `,` || canParseSemicolon();
+    ///     return false;
+    ///
+    /// `var` is a keyword, so it IS a literal property name — but `x` behind it
+    /// is neither a member's punctuation nor a semicolon it could ASI, so the
+    /// whole member is refused and `interface C { var x: number; }` earns
+    /// TS1131 plus the list abort. Judging by whether `parseTypeMember`
+    /// consumed anything instead read that as a property NAMED `var` and
+    /// answered a "';' expected" on the `x`.
+    ///
+    /// Peeked, not backtracked. The lookahead window bounds the modifier run,
+    /// and a run that overflows it answers `true` — a false `true` only keeps
+    /// ztsc's older behaviour for that shape, where a false `false` would
+    /// manufacture a TS1131 tsc does not report.
+    fn atTypeMemberStart(p: *Parser) bool {
+        switch (p.curTag()) {
+            .l_paren, .lt, .lt_lt, .lt_lt_eq, .keyword_get, .keyword_set => return true,
+            else => {},
+        }
+        var i: usize = 0;
+        var id_token = false;
+        while (i + 1 < max_la and isModifierKind(p.peekTag(i))) : (i += 1) id_token = true;
+        if (i + 1 >= max_la) return true;
+        if (p.peekTag(i) == .l_bracket) return true;
+        if (isLiteralPropertyName(p.peekTag(i))) {
+            id_token = true;
+            i += 1;
+        }
+        if (!id_token) return false;
+        if (i + 1 >= max_la) return true;
+        return switch (p.peekTag(i)) {
+            .l_paren, .lt, .lt_lt, .lt_lt_eq, .question, .colon, .comma => true,
+            // tsc's `canParseSemicolon`: a real `;`, or a position ASI would
+            // put one at.
+            .semicolon, .r_brace, .eof => true,
+            else => p.peekNewline(i),
+        };
+    }
+
+    /// tsc's `abortParsingListOrMoveToNextToken` for the TypeMembers list: a
+    /// token that starts no member is SKIPPED only when NO enclosing list would
+    /// take it (`isInSomeParsingContext`). When one would, the member list ENDS
+    /// where it is — and the `}` it never found falls to whatever encloses it,
+    /// which is how `interface C { var x: number; }` earns a TS1128 on its
+    /// trailing brace. (The `'}' expected` the aborted list still asks for lands
+    /// on the same token as the TS1131 and is dropped by `addDiag`'s
+    /// one-per-position rule, exactly as in tsc.)
+    ///
+    /// A type-member list is, in practice, nested inside a statement list, so
+    /// the question is tsc's `isListElement(SourceElements, inErrorRecovery:
+    /// true)` — does this token start a STATEMENT — with `;` excluded, because
+    /// tsc refuses to read a stray semicolon as an empty statement while
+    /// recovering ("';' can show up in far too many contexts, and if we see one
+    /// and assume it's a statement, then we may bail out inappropriately").
+    /// `isStartOfStatement` ends in `isStartOfExpression`, which is why an
+    /// operator aborts where a comma does not.
+    ///
+    /// Measured against tsgo 7.0.2: `interface A { a: string;; }` and
+    /// `interface B { , }` each answer TS1131 and keep going, while
+    /// `interface C { var x: number; }` and
+    /// `type D = { a: string, + , b: number }` abort and earn a TS1128 on the
+    /// trailing `}`.
+    fn typeMemberListAborts(p: *Parser) bool {
+        if (p.curTag() == .semicolon) return false;
+        return p.atStartOfStatement() or canStartExpression(p.curTag());
     }
 
     /// tsc's `parseTypeMemberSemicolon`, the separator rule for every member of
