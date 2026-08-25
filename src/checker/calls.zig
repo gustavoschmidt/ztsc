@@ -908,7 +908,7 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
             } else if (tps.items.len > 0) {
                 // Infer class type args from ctor arguments.
                 const ctor = if (ctor_sigs.items.len > 0) ctor_sigs.items[0] else types.no_type;
-                if (ctor != types.no_type) {
+                {
                     // …and from the CONTEXTUAL TYPE, which for a class value
                     // has to be matched against the instance type: a
                     // constructor's own declared return is not it. tsc adds
@@ -926,14 +926,28 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
                     // still wins, as it does in tsc.
                     const self_args = try c.scratch().alloc(TypeId, tps.items.len);
                     for (tps.items, 0..) |tp, i| self_args[i] = try c.ts.makeTypeParam(tp.sym);
-                    const self_sig = try c.sigWithReturn(ctor, try c.ts.makeRef(cls, self_args));
+                    const self_ty = try c.ts.makeRef(cls, self_args);
+                    // A class with NO declared constructor still has the
+                    // implicit `constructor()`, and it goes through the very
+                    // same path: no parameters to infer from, so every class
+                    // parameter falls to `inferTypeArgs`'s no-candidate answer
+                    // (its default, else its constraint, else `unknown`) —
+                    // where filling `any` instead made `new C()` a `C<any>`
+                    // that swallowed its own errors
+                    // (`getAndSetNotIdenticalType2`) — while the CONTEXTUAL
+                    // inference above still reaches the instance return, which
+                    // is what keeps `function asList<T>(a: T): List<T> {
+                    // return new List(); }` a `List<T>`
+                    // (`enumLiteralUnionNotWidened`).
+                    const self_sig = if (ctor != types.no_type)
+                        try c.sigWithReturn(ctor, self_ty)
+                    else
+                        try c.ts.makeFunction(&.{}, self_ty, &.{}, 0);
                     // A `new` expression's result is the instance, never a
                     // signature, so there is nothing to generalize a minted
                     // parameter onto: the list is discarded (and `unify`'s
                     // `ho_result_fn` gate keeps it empty anyway).
                     _ = try inferTypeArgs(c, self_sig, tp_syms, shape.arg_nodes, inst_args, ctx, types.no_type);
-                } else {
-                    for (inst_args) |*x| x.* = types.any_type;
                 }
             }
             instance_ret = try c.ts.makeRef(cls, inst_args);
