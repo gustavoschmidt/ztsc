@@ -225,6 +225,12 @@ pub const Options = struct {
     /// (`alias_refs`) is only half of tsc's rule; the other half is that the
     /// failure is decisive with NO structural fallback.
     variance_decides: bool = false,
+    /// `--alias-variance-decides`: the same rule as `variance_decides`,
+    /// restricted to the pairs whose shared symbol is a type ALIAS. tsc's alias
+    /// shortcut is a separate site from its type-reference one, and ztsc's
+    /// measurement is trustworthy on a different population — see the arm in
+    /// `assign.relate`.
+    alias_variance_decides: bool = false,
     /// `--inst-memo-bits=N`: pin the instantiation memo at exactly 2^N slots
     /// with no growth, a measurement aid. 0 (the default) is the adaptive
     /// table that starts at `memo.min_bits` and doubles to `memo.max_bits`.

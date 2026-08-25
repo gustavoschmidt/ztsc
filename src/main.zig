@@ -181,6 +181,9 @@ const Cli = struct {
     /// `--variance-decides`: believe a complete measured-variance comparison in
     /// both directions (see `checker.Options.variance_decides`). A bisect leg.
     variance_decides: bool = false,
+    /// `--alias-variance-decides`: the same, restricted to type ALIAS pairs
+    /// (see `checker.Options.alias_variance_decides`). A bisect leg.
+    alias_variance_decides: bool = false,
     /// `--lazy-stats`: dump the lazy relation route.s hit/bail tally to stderr
     /// at seal. A diagnostic instrument; pair with `--checkers=1`.
     lazy_stats: bool = false,
@@ -426,6 +429,7 @@ pub fn main(init: std.process.Init) !void {
         .lazy_members = !cli.eager_members,
         .alias_refs = cli.alias_refs,
         .variance_decides = cli.variance_decides,
+        .alias_variance_decides = cli.alias_variance_decides,
         .lazy_stats = cli.lazy_stats,
         .mem_prof = cli.mem_profile,
         .inst_memo_bits = cli.inst_memo_bits,
@@ -1261,6 +1265,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8) error{OutOfMe
             cli.alias_refs = true;
         } else if (std.mem.eql(u8, arg, "--variance-decides")) {
             cli.variance_decides = true;
+        } else if (std.mem.eql(u8, arg, "--alias-variance-decides")) {
+            cli.alias_variance_decides = true;
         } else if (std.mem.eql(u8, arg, "--decl-profile")) {
             cli.decl_profile = true;
         } else if (std.mem.eql(u8, arg, "--mem-profile")) {
