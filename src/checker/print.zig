@@ -150,18 +150,29 @@ fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!voi
             const ncall = s.objectCallSigCount(t);
             const nconstruct = s.objectConstructSigCount(t);
             if (n == 0 and sidx == 0 and nidx == 0 and ncall == 0 and nconstruct == 0) return w.writeAll("{}");
+            // tsc's `createAnonymousTypeNode`: a resolved type carrying exactly
+            // ONE call signature and nothing else is a FunctionType, and one
+            // carrying exactly one CONSTRUCT signature and nothing else a
+            // ConstructorType — so `var AAA: new() => A` reads back as
+            // `new () => A`, not `{ new (): A; }`
+            // (`classAbstractAssignabilityConstructorFunction`).
+            if (objectPrintsAsSignature(c, t)) {
+                const is_construct = nconstruct == 1;
+                const sig = if (is_construct) s.objectConstructSig(t, 0) else s.objectCallSig(t, 0);
+                return printSig(c, w, sig, is_construct, .arrow, depth);
+            }
             try w.writeAll("{ ");
             var first = true;
             // Call / construct signatures, printed member-style.
             for (0..ncall) |i| {
                 if (!first) try w.writeAll(" ");
                 first = false;
-                try printSigMember(c, w, s.objectCallSig(t, @intCast(i)), false, depth + 1);
+                try printSig(c, w, s.objectCallSig(t, @intCast(i)), false, .member, depth + 1);
             }
             for (0..nconstruct) |i| {
                 if (!first) try w.writeAll(" ");
                 first = false;
-                try printSigMember(c, w, s.objectConstructSig(t, @intCast(i)), true, depth + 1);
+                try printSig(c, w, s.objectConstructSig(t, @intCast(i)), true, .member, depth + 1);
             }
             // Properties are *stored* sorted by name atom (canonical for
             // interning), but atom ids depend on the parallel intern order,
@@ -347,7 +358,29 @@ fn stringMappingName(kind_idx: u32) []const u8 {
 
 /// Print a call/construct signature in object-member form:
 /// `<T>(a: A): R;` for a call sig, `new <T>(a: A): R;` for a construct sig.
-fn printSigMember(c: *Checker, w: *std.Io.Writer, sig: TypeId, is_construct: bool, depth: u32) PrintErr!void {
+/// How a signature joins its return type: as a type-literal MEMBER
+/// (`new (a: T): R;`) or as a standalone signature TYPE (`new (a: T) => R`).
+/// tsc's `signatureToSignatureDeclarationHelper` picks between
+/// `SyntaxKind.ConstructSignature` and `SyntaxKind.ConstructorType` the same
+/// way, and the two spellings differ in exactly this suffix.
+const SigForm = enum { member, arrow };
+
+/// Does this object type print as a bare signature rather than a type literal?
+/// tsc's `createAnonymousTypeNode`: exactly one call signature and nothing
+/// else, or exactly one construct signature and nothing else. Shared with
+/// `printTypeParen`, because a signature type needs the same parentheses a
+/// function type does.
+fn objectPrintsAsSignature(c: *Checker, t: TypeId) bool {
+    const s = c.ts;
+    if (s.kind(t) != .object) return false;
+    if (s.objectFlags(t) & types.obj_flag_global_this != 0) return false;
+    if (s.objectPropCount(t) != 0 or s.objectStringIndex(t) != 0 or s.objectNumberIndex(t) != 0) return false;
+    const ncall = s.objectCallSigCount(t);
+    const nconstruct = s.objectConstructSigCount(t);
+    return (ncall == 1 and nconstruct == 0) or (nconstruct == 1 and ncall == 0);
+}
+
+fn printSig(c: *Checker, w: *std.Io.Writer, sig: TypeId, is_construct: bool, form: SigForm, depth: u32) PrintErr!void {
     const s = c.ts;
     if (is_construct) try w.writeAll("new ");
     const tps = s.fnTypeParams(sig);
@@ -369,9 +402,9 @@ fn printSigMember(c: *Checker, w: *std.Io.Writer, sig: TypeId, is_construct: boo
         }
         try printType(c, w, p.ty, depth + 1);
     }
-    try w.writeAll("): ");
+    try w.writeAll(if (form == .arrow) ") => " else "): ");
     try printType(c, w, s.fnReturn(sig), depth + 1);
-    try w.writeAll(";");
+    if (form == .member) try w.writeAll(";");
 }
 
 /// Where a nested type is being printed, for precedence parenthesization.
@@ -431,6 +464,9 @@ fn printOptionalElem(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) Prin
 fn printTypeParen(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32, pos: PrintPos) PrintErr!void {
     const needs = switch (c.ts.kind(t)) {
         .function => true,
+        // A lone call/construct signature prints as `(…) => R` / `new (…) => R`
+        // and binds exactly as loosely as a function type does.
+        .object => objectPrintsAsSignature(c, t),
         .union_type => pos != .union_member,
         // `&` already binds tighter than `|`, so the parentheses around an
         // intersection written as a union member are redundant — and tsc

@@ -3132,7 +3132,12 @@ const Parser = struct {
 
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
+        // tsc's `checkSwitchStatement` carries a `hasDuplicateDefaultClause`
+        // LATCH beside `firstDefaultClause`, and stops reporting once it is
+        // set — so a switch with three `default:` clauses is ONE TS1113, on the
+        // second (`switchStatementsWithMultipleDefaults1`).
         var seen_default = false;
+        var reported_default = false;
         while (p.curTag() != .r_brace and p.curTag() != .eof) {
             const before = p.curIdx();
             switch (p.curTag()) {
@@ -3146,7 +3151,10 @@ const Parser = struct {
                 },
                 .keyword_default => {
                     const def_kw = try p.bump();
-                    if (seen_default) try p.errAtToken(.multiple_default_clauses, def_kw);
+                    if (seen_default and !reported_default) {
+                        try p.errAtToken(.multiple_default_clauses, def_kw);
+                        reported_default = true;
+                    }
                     seen_default = true;
                     _ = try p.expect(.colon, .expected_colon);
                     const range = try p.parseClauseStatements();
