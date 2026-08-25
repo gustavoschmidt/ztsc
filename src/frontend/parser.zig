@@ -5780,33 +5780,48 @@ const Parser = struct {
             return p.addNode(.{ .tag = .import_decl, .main_token = kw, .data = .{ .lhs = extra, .rhs = mod } });
         }
 
-        // `import type ...` (but `import type from "m"` imports a default
-        // named `type`).
+        // The two contextual words that can lead an import clause: `type`
+        // (type-only) and `defer` (TC39 deferred module evaluation, TS 5.9).
+        // tsc reads AT MOST ONE of them — its `parseImportDeclarationOr
+        // ImportEqualsDeclaration` takes the `type` arm or the `defer` arm,
+        // never both — so whichever comes second is the imported NAME:
+        // `import defer type * as ns from "m"` is a DEFERRED import whose
+        // default binding is `type`, and `import type defer * as ns from "m"`
+        // is a TYPE-ONLY import-equals named `defer` (measured against tsgo,
+        // `importDeferTypeConflict1`/`2`).
+        //
+        // Both are recognized by the same shape, tsc's
+        //
+        //     (token() !== FromKeyword || …) &&
+        //     (isIdentifier() || token() === AsteriskToken || token() === OpenBraceToken)
+        //
+        // which is what keeps `import type from "m"` and `import defer from
+        // "m"` ordinary default imports of a binding so named, while `import
+        // defer from from "m"` defers an import of a default named `from`
+        // (`importDeferFromInvalid`).
+        var deferred_tok: u32 = 0;
         if (p.curTag() == .keyword_type) {
-            const t1 = p.peekTag(1);
-            const is_type_only = (isIdentLike(t1) and !(t1 == .keyword_from and p.peekTag(2) == .string_literal)) or
-                t1 == .l_brace or t1 == .asterisk;
-            if (is_type_only) {
+            if (leadsImportClause(p.peekTag(1), p.peekTag(2))) {
                 _ = try p.bump();
                 flags |= ast.Flags.type_only;
             }
+        } else if (isIdentLike(p.curTag()) and std.mem.eql(u8, p.laText(0), "defer") and
+            leadsImportClause(p.peekTag(1), p.peekTag(2)))
+        {
+            deferred_tok = try p.bump();
         }
 
         var default_name: u32 = 0;
         var ns_name: u32 = 0;
         var specs: ast.SubRange = .{ .start = 0, .end = 0 };
-
-        // `import defer * as ns from "m"` (TC39 deferred module evaluation,
-        // TS 5.9): `defer` is a CONTEXTUAL keyword, not a binding, and the
-        // namespace clause is the only one the form admits. Nothing about the
-        // TYPES changes — deferral is an evaluation-order guarantee — so the
-        // token is simply dropped and `* as ns` binds as usual. Recognized
-        // only immediately before `*`: `import defer from "m"` and `import
-        // defer, * as ns from "m"` are both ordinary DEFAULT imports of a
-        // binding named `defer`, and reading `defer` as the keyword there
-        // invented a namespace and lost a TS1192.
-        if (isIdentLike(p.curTag()) and p.peekTag(1) == .asterisk and
-            std.mem.eql(u8, p.laText(0), "defer")) _ = try p.bump();
+        // Whether a `{ … }` was READ, which an empty `specs` cannot say —
+        // `import defer { } from "m"` is still a NamedImports clause and still
+        // TS18059.
+        var named_bindings = false;
+        // Set when a phase modifier already committed the declaration to the ES
+        // form and the clause therefore ended at the default binding — see the
+        // import-equals arm below.
+        var clause_done = false;
 
         if (isIdentLike(p.curTag())) {
             // `import d ...` — but `import x = require(...)` is out of subset.
@@ -5835,11 +5850,25 @@ const Parser = struct {
             // reference, and "';' expected" on the string — where ztsc used to
             // guess "'from' expected" and then trip over the rest of the line.
             if (p.curTag() != .comma and p.curTag() != .keyword_from) {
-                return p.finishImportEquals(export_kw orelse kw, default_name, flags | (if (export_kw != null) ast.Flags.exported else 0));
+                // …but a PHASE modifier has already committed the declaration
+                // to the ES form: `import defer x = require("m")` is not a
+                // thing, so tsc's import-equals arm is unreachable behind one
+                // and the missing `from` is what gets reported instead
+                // (`import defer type * as ns from "m"` — "'from' expected" on
+                // the `*`, not "'=' expected" on the `type`).
+                if (deferred_tok == 0) {
+                    return p.finishImportEquals(export_kw orelse kw, default_name, flags | (if (export_kw != null) ast.Flags.exported else 0));
+                }
+                // tsc's `parseImportClause` reads named bindings only after a
+                // COMMA, so the clause is over: `* as ns` belongs to the module
+                // specifier's expression, not to this import.
+                clause_done = true;
             }
             _ = try p.eat(.comma);
         }
-        if (p.curTag() == .asterisk) {
+        if (clause_done) {
+            // nothing more in the clause
+        } else if (p.curTag() == .asterisk) {
             _ = try p.bump();
             // tsc's `parseNamespaceImport` expects `as` and then reads the next
             // token as the namespace NAME whether or not it found one, so
@@ -5848,6 +5877,7 @@ const Parser = struct {
             ns_name = try p.expectIdentLike();
         } else if (p.curTag() == .l_brace) {
             specs = try p.parseImportSpecifiers();
+            named_bindings = true;
         } else if (default_name == 0) {
             try p.fail(.expected_import_clause);
         }
@@ -5871,6 +5901,18 @@ const Parser = struct {
         try p.skipImportAttributes();
         try p.expectSemicolon();
         if (export_kw) |m| try p.errAtToken(.import_cannot_have_modifiers, m);
+        // tsc's `checkImportClause`: a deferred import may only name a
+        // NAMESPACE. Both refusals are blamed on the `defer` itself, and both
+        // are GRAMMAR-class, so a file that also failed to parse shows its
+        // TS1005s alone — which is exactly how tsgo answers the `defer`
+        // conflict cases.
+        if (deferred_tok != 0) {
+            if (default_name != 0) {
+                try p.errAtToken(.defer_import_default_binding, deferred_tok);
+            } else if (named_bindings) {
+                try p.errAtToken(.defer_import_named_bindings, deferred_tok);
+            }
+        }
 
         const extra = try p.addExtra(ast.ImportData{
             .flags = flags,
@@ -5880,6 +5922,24 @@ const Parser = struct {
             .spec_end = specs.end,
         });
         return p.addNode(.{ .tag = .import_decl, .main_token = kw, .data = .{ .lhs = extra, .rhs = mod } });
+    }
+
+    /// Is the contextual word just read (`type` or `defer`) a MODIFIER of the
+    /// import clause rather than the imported name itself? tsc asks the same
+    /// two questions of both words:
+    ///
+    ///     (token() !== FromKeyword || …) &&
+    ///     (isIdentifier() || token() === AsteriskToken || token() === OpenBraceToken)
+    ///
+    /// `t1` is the token after the word, `t2` the one after that. A `from`
+    /// followed by a STRING is the module specifier, so the word was the name
+    /// (`import type from "m"`, `import defer from "m"`); a `from` followed by
+    /// anything else is a BINDING named `from` and the word was the modifier
+    /// (`import defer from from "m"`, `importDeferFromInvalid`).
+    fn leadsImportClause(t1: TokTag, t2: TokTag) bool {
+        if (t1 == .asterisk or t1 == .l_brace) return true;
+        if (!isIdentLike(t1)) return false;
+        return !(t1 == .keyword_from and t2 == .string_literal);
     }
 
     /// `import <name> = require("m");` or `import <name> = A.B;` (CommonJS /
