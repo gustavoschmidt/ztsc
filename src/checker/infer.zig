@@ -5628,6 +5628,99 @@ fn reverseMappedElem(c: *Checker, template: TypeId, src_ty: TypeId, fp_sym: u32,
     return c.stripSourceParam(if (elem[0] != types.no_type) elem[0] else types.unknown_type, src_sym);
 }
 
+/// The reverse-mapped rebuild resolves ONE variable — the element `S[K]` —
+/// and every OTHER type parameter the value template names is left to whatever
+/// the rest of the call supplies. tsc's `inferReverseMappedType` does the same
+/// (`inferTypes([inference], sourceType, templateType)` sees a one-element
+/// inference list), so most of the time both answer that parameter's default.
+///
+/// Except in one measured shape, where tsgo 7.0.2 answers it from the
+/// reverse-mapped source after all. Battery, all against
+///
+///     type F<A, B extends Rec> = { [K in keyof B]: { fn: <TEMPLATE>; thing: B[K] } };
+///     declare function f<A, B extends Rec>(x: F<A, B>): [A, B];
+///     f({ bar: { fn: <SOURCE>, thing: 'asd' } });
+///
+/// | template `fn`                  | source `fn`                 | tsgo `A` |
+/// |--------------------------------|-----------------------------|----------|
+/// | `(a: A) => void`               | `(a: string) => {}`         | unknown  |
+/// | `(a: A, b: B) => void`         | `(a: string) => {}`         | string   |
+/// | `(a: A, b: B[K]) => void`      | `(a: string) => {}`         | string   |
+/// | `(a: A, k: K) => void`         | `(a: string) => {}`         | string   |
+/// | `(a: A, x: number) => void`    | `(a: string) => {}`         | string   |
+/// | `(a: A, x?: number) => void`   | `(a: string) => {}`         | string   |
+/// | `(a: A, ...r: number[]) => …`  | `(a: string) => {}`         | string   |
+/// | `(a: A, x: number, y: b) => …` | `(a: string, x: number)=>{}`| string   |
+/// | `(a: A, b: B) => void`         | `(a: string, b: {…}) => {}` | unknown  |
+/// | `(x: number, a: A) => void`    | `(x: number) => {}`         | unknown  |
+/// | `(x: number, y: string) => A`  | `(x: number) => 'q'`        | unknown  |
+/// | `{ a: A; b: B }` (not a fn)    | `{ a: 'x', b: {…} }`        | unknown  |
+/// | `(a: A) => void` + `all: B`    | `(a: string) => {}`         | unknown  |
+///
+/// The axis is ARITY and nothing else — `B`, `B[K]` and `K` appear on both
+/// sides of the split, and so does their absence. `A` is answered exactly when
+/// the SOURCE signature is SHORTER than the template's and `A` sits at a
+/// position the source still declares; rows 9 and 10 are the two ways that
+/// fails. Rows 11-13 confirm it is a PARAMETER-position rule.
+///
+/// tsgo also declines when the source property is a declared value rather than
+/// a function EXPRESSION written at the call site (same type, `declare const
+/// fn1: (a: string) => void` answers `unknown` where the arrow answers
+/// `string`) — a node-level distinction this seam, which sees only types,
+/// cannot make. The arity test is the type-level half, it is what the corpus
+/// pays for (`contravariantOnlyInferenceFromAnnotatedFunction`), and over-
+/// firing on a declared short callback is the documented price.
+///
+/// Covariant, matching `inferTypes(inferenceContext.inferences, source, target)`
+/// — the annotated-parameter seam is not a contravariant one in tsc either.
+fn inferOuterFromShortCallback(
+    c: *Checker,
+    template: TypeId,
+    src_ty: TypeId,
+    tp_syms: []const u32,
+    candidates: []TypeId,
+    depth: u32,
+) Error!void {
+    const s = &c.ts;
+    const pat = try c.resolveStructural(template);
+    const src = try c.resolveStructural(src_ty);
+    if (s.kind(pat) == .function and s.kind(src) == .function)
+        return shortCallbackParams(c, pat, src, tp_syms, candidates, depth);
+    // The mapped VALUE is normally a wrapper object around the element access
+    // (`{ fn: …; thing: S[K] }`), so the callback sits one property down. One
+    // level only: that is the shape the corpus has, and each extra level is an
+    // extra chance to invent evidence this seam has no oracle for.
+    if (s.kind(pat) != .object or s.kind(src) != .object) return;
+    for (0..s.objectPropCount(pat)) |i| {
+        const tp_prop = s.objectProp(pat, @intCast(i));
+        const pf = try c.resolveStructural(tp_prop.ty);
+        if (s.kind(pf) != .function) continue;
+        const sp = (try c.propOfType(src, tp_prop.name)) orelse continue;
+        const sf = try c.resolveStructural(sp.ty);
+        if (s.kind(sf) != .function) continue;
+        try shortCallbackParams(c, pf, sf, tp_syms, candidates, depth);
+    }
+}
+
+/// The pairing itself: positions `[0, sourceCount)` of a source signature that
+/// is STRICTLY SHORTER than the template's, and declares no rest of its own.
+fn shortCallbackParams(
+    c: *Checker,
+    pat: TypeId,
+    src: TypeId,
+    tp_syms: []const u32,
+    candidates: []TypeId,
+    depth: u32,
+) Error!void {
+    const s = &c.ts;
+    const src_n = s.fnParamCount(src);
+    if (src_n == 0 or src_n >= s.fnParamCount(pat)) return;
+    if (s.fnParam(src, src_n - 1).rest()) return;
+    for (0..src_n) |i| {
+        try c.unify(s.fnParam(pat, @intCast(i)).ty, s.fnParam(src, @intCast(i)).ty, tp_syms, candidates, depth + 1);
+    }
+}
+
 /// tsc's `createReverseMappedType` precondition: a string index signature, or
 /// at least one property AND `isPartiallyInferableType`. A source built entirely
 /// out of `anyFunctionType` placeholders is not evidence about anything.
@@ -5858,6 +5951,7 @@ fn inferReverseMappedFrom(
             .ty = try reverseMappedElem(c, template, p.ty, fp_sym, src_sym, depth),
             .flags = p.flags & keep_mask,
         });
+        try inferOuterFromShortCallback(c, template, p.ty, tp_syms, candidates, depth);
     }
     if (props.items.len == 0) return;
     const obj = try c.objectFromProps(props.items, 0, 0);
