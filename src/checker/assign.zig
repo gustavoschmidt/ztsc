@@ -39,6 +39,7 @@ const resolveStructural = @import("instantiate.zig").resolveStructural;
 const restUnionOptionalAt = @import("typenode.zig").restUnionOptionalAt;
 const sliceTuple = @import("typenode.zig").sliceTuple;
 const generics_zig = @import("generics.zig");
+const infer_zig = @import("infer.zig");
 const tuple_zig = @import("tuple_relate.zig");
 const variance_zig = @import("variance.zig");
 const report_zig = @import("assign_report.zig");
@@ -5642,7 +5643,12 @@ pub fn instantiateSigInContextOf(c: *Checker, s: TypeId, t: TypeId) Error!?TypeI
     const ret_cand = try c.scratch().alloc(TypeId, tp_syms.len);
     for (ret_cand) |*x| x.* = types.no_type;
     try c.unify(c.ts.fnReturn(s), c.ts.fnReturn(t), tp_syms, ret_cand, 0);
-    for (cand, ret_cand) |*x, r| {
+    // Which position each candidate came from — `applyToParameterTypes` runs
+    // contravariantly and `applyToReturnTypes` covariantly, and the constraint
+    // clamp below reads that (see `infer.clampSigInference`).
+    const pos = try c.scratch().alloc(infer_zig.SigInferPos, tp_syms.len);
+    for (cand, ret_cand, pos) |*x, r, *p| {
+        p.* = if (x.* != types.no_type) .parameter else .ret;
         if (x.* == types.no_type) x.* = r;
     }
     // Build the substitution. tsc's `getInferredType` closes with
@@ -5693,32 +5699,24 @@ pub fn instantiateSigInContextOf(c: *Checker, s: TypeId, t: TypeId) Error!?TypeI
         }
         if (!changed) break;
     }
-    // Now the constraint check, against the RESOLVED constraint. tsc replaces
-    // an offending candidate with the constraint
-    // (`inference.inferredType = inferredType = instantiatedConstraint`); ztsc
-    // DECLINES the whole instantiation instead, and the reason is
-    // oracle-measured rather than deduced. In tsgo 7.0.2
-    //
-    //     declare var s1: <T extends string>() => T;
-    //     var q: <T extends string>() => T | Promise<T> = s1;   // accepted
-    //
-    // is legal, and the candidate the return position infers for the source's
-    // `T` is the target's `T2 | Promise<T2>` — which plainly fails the `string`
-    // constraint. So whatever tsc does with such a candidate, it is not "use
-    // the constraint and then reject": substituting `string` yields
-    // `() => string`, which does not relate to `() => T2 | Promise<T2>` with
-    // `T2` free (`inferenceContextualReturnTypeUnion4`, and the abstract
-    // `Storage.get` override it comes from).
-    //
-    // Declining hands the pair to the erase-to-constraints path below, and
-    // tsgo agrees with that path in both directions: it accepts the pair above
-    // (both sides erase to a `string`-returning signature) and still rejects
-    // `043`'s negative control, whose `Ret` constraint collapses to `object`.
+    // Now the constraint clamp, against the RESOLVED constraint —
+    // `infer.clampSigInference`, which carries the tsgo battery that fixes what
+    // an offending candidate is replaced with. A clamped entry no longer
+    // mentions any of `tp_syms` (the fixed point above already substituted them
+    // out of both the candidate and the constraint), so no second fixed-point
+    // pass is needed. `assignmentStricterConstraints` is the witness: `S extends
+    // T` infers the target's `S2`, which the clamp replaces with the target's
+    // `T2`, and the instantiated `(x: T2, y: T2) => void` then rejects the
+    // target's `y: S2` exactly as tsc does.
+    const t_tps = c.ts.fnTypeParams(t);
+    const bound = try c.scratch().alloc(u32, tp_syms.len + t_tps.len);
+    @memcpy(bound[0..tp_syms.len], tp_syms);
+    @memcpy(bound[tp_syms.len..], t_tps);
     for (tp_syms, 0..) |tp, k| {
         if (cand[k] == types.no_type) continue; // already the constraint
         const con = try c.typeParamConstraint(tp);
         if (con == types.no_type) continue;
-        if (!try c.isAssignable(cand[k], try c.instantiate(con, map))) return null;
+        map[k].ty = try infer_zig.clampSigInference(c, map[k].ty, try c.instantiate(con, map), pos[k], bound) orelse return null;
     }
     const inst = try c.instantiate(s, map);
     // A full map over the source's own params yields a non-generic sig; if

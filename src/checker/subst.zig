@@ -765,6 +765,28 @@ pub const DeferredBounds = struct {
     default_moved: bool = false,
 };
 
+/// Does the fresh parameter ENFORCE its rewritten bound `nc`?
+///
+/// `eligible` is `higherOrderSigEligible`: the bound is a structured, reducible
+/// shape whose substituted form is worth enforcing (idb's `StoreName extends
+/// StoreNames<DBTypes>` reduces to a concrete store-name union that makes
+/// `"requests"` assignable).
+///
+/// A BARE bound (`filter<S extends T>`, `bar2<U extends T>`) is the other
+/// enforceable case, and only after it MOVED. Pre-rewrite it names the
+/// containing type's parameter, which the receiver's instantiation has just
+/// substituted away, so enforcing it then would test against a symbol nothing
+/// binds — that is why it used to be dropped outright. But once `T` has become
+/// `number`, `U extends number` is exactly what tsc enforces: it clones a
+/// generic method's own type parameters with substituted constraints whenever
+/// the containing type is instantiated (`createCanonicalSignature`). Dropping
+/// it lost the TS2344 on `new C<number>().bar2<string>(2, "")` and let a call
+/// that infers `U` keep a candidate the receiver's `T` forbids
+/// (`genericConstraint1`, `primitiveConstraints2`).
+fn boundEnforced(eligible: bool, bare: bool, moved: bool) bool {
+    return if (bare) moved else eligible;
+}
+
 /// `mintFreshTp` with the CONSTRAINT left unevaluated: `bounds.pending_bound`
 /// is the unsubstituted bound and `mid` the map to substitute it under, both
 /// recorded on the record and forced by `resolveFreshBound` the first time
@@ -831,8 +853,9 @@ pub fn resolveFreshBound(c: *Checker, sym: SymbolId) Error!void {
         rec.widen_bound = types.no_type;
         return;
     }
-    rec.constraint = if (enforce) nc else types.no_type;
-    rec.widen_bound = if (!enforce and nc != oc) nc else types.no_type;
+    const keep = boundEnforced(enforce, c.ts.kind(oc) == .type_param, nc != oc);
+    rec.constraint = if (keep) nc else types.no_type;
+    rec.widen_bound = if (!keep and nc != oc) nc else types.no_type;
 }
 
 /// The pre-deferral mint path, unchanged, for the two cases a deferral does
@@ -857,14 +880,10 @@ fn eagerBound(
     const bound_cost = if (c.prof.on) c.inst_total - bound_before else 0;
     if (c.prof.on) c.stats.inst_bound_visits += bound_cost;
     // Fresh param carries the substituted *default* (so a no-arg
-    // `<AD = DispatchType>()` resolves to the supplied dispatch). Its
-    // *constraint* is enforced only when it was a structured, reducible bound
-    // (idb `StoreName extends StoreNames<DBTypes>` → a concrete store-name
-    // union that makes `"requests"` assignable). A *bare* bound
-    // (`filter<S extends T>`) carries no constraint: it was never enforceable
-    // pre-rewrite (`bare_outer`), and enforcing its substituted form would
-    // erase a legitimate inference. Mint only when a bound moved.
-    const fc = if (eligible and oc != types.no_type and c.ts.kind(oc) != .type_param) nc else types.no_type;
+    // `<AD = DispatchType>()` resolves to the supplied dispatch). Which
+    // constraint it enforces is `boundEnforced`. Mint only when a bound moved.
+    const fc = if (oc != types.no_type and
+        boundEnforced(eligible, c.ts.kind(oc) == .type_param, nc != oc)) nc else types.no_type;
     // A bare bound stays unenforced, but its substituted form rides along for
     // the literal-widening rule — see `FreshTp.widen_bound`.
     const wb = if (fc == types.no_type and oc != types.no_type and nc != oc) nc else types.no_type;
