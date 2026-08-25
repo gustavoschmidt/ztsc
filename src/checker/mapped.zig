@@ -296,6 +296,24 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
             .array => {
                 // A homomorphic map over an array yields an array; the
                 // element is the value with `K` bound to the number index.
+                //
+                // tsc guards this shortcut (and the tuple one below) with
+                // `if (!type.declaration.nameType)`: an `as` clause may DELETE
+                // a position, and the result is then an ordinary object.
+                // `{ [K in keyof number[] as Exclude<K, "length">]: … }` has
+                // every `Array<number>` member EXCEPT `length`, which is why
+                // tsc refuses it as a `number[]`
+                // (`mappedTypeWithAsClauseAndLateBoundProperty`, an
+                // under-report here). Mapping the apparent object instead was
+                // tried and reverted: ztsc's ARRAY TARGET is nominal (a
+                // non-list source is refused outright — see the `.array` arm of
+                // `isAssignableInner`), so the UN-filtered spelling `as K`,
+                // which tsc still spends as a list, became a false TS2345
+                // (`mappedTypeWithNameClauseAppliedToArrayType`). Trading a
+                // false positive for an under-report is the wrong direction;
+                // the object form needs a structural array target first — and
+                // then also needs the index signature tsc rebuilds from the
+                // `number` key, which the `as_clause == 0` guard below drops.
                 const elem = try c.substMappedKey(value, key_id, types.number_type);
                 // `+readonly` makes it a `readonly T[]` and `-readonly` a
                 // mutable one, exactly as for the tuple arm below
