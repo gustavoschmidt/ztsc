@@ -210,6 +210,21 @@ pub const Options = struct {
     lazy_stats: bool = false,
     /// `--mem-profile`: dump this instance's own-footprint samples at seal.
     mem_prof: bool = false,
+    /// `--alias-refs`: BISECT LEG for the alias-identity experiment. Keep
+    /// `ref(alias, args)` as the spelling for EVERY generic alias whose body is
+    /// `originTaggable`, not only for the cycle members `aliasInstance`
+    /// already keeps refs for. tsc carries `aliasSymbol`/`aliasTypeArguments`
+    /// on the instantiation as a side attribute; ztsc interns structurally, so
+    /// the ref is the only spelling that can carry alias identity — and alias
+    /// identity is what `getAliasVariances` needs (see `aliasInstance`).
+    alias_refs: bool = false,
+    /// `--variance-decides`: BISECT LEG. Believe a COMPLETE measured-variance
+    /// comparison in BOTH directions, which is what tsc's `relateVariances`
+    /// does — see `assign.measured_variance_decides`, the compile-time leg this
+    /// mirrors at run time so one binary can carry both. Alias identity
+    /// (`alias_refs`) is only half of tsc's rule; the other half is that the
+    /// failure is decisive with NO structural fallback.
+    variance_decides: bool = false,
     /// `--inst-memo-bits=N`: pin the instantiation memo at exactly 2^N slots
     /// with no growth, a measurement aid. 0 (the default) is the adaptive
     /// table that starts at `memo.min_bits` and doubles to `memo.max_bits`.

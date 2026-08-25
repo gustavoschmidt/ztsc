@@ -1684,7 +1684,7 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!RelAnswer {
                     if (!c.marker_refs.contains(sref) and !c.marker_refs.contains(tref)) {
                         switch (try c.measuredVarianceVerdict(sref, tref)) {
                             .related => break :blk .yes,
-                            .unrelated => if (measured_variance_decides) break :blk .no,
+                            .unrelated => if (measured_variance_decides or c.opts.variance_decides) break :blk .no,
                             .undecided => {},
                         }
                     }
