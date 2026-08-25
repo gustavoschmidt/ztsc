@@ -41,6 +41,7 @@ const std = @import("std");
 const types = @import("../types.zig");
 
 const TypeId = types.TypeId;
+const Atom = types.Atom;
 
 const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
@@ -120,6 +121,48 @@ pub fn fixedLength(c: *const Checker, tup: TypeId) u32 {
         if (elemKindAt(c, tup, @intCast(i)).variable()) return @intCast(i);
     }
     return len;
+}
+
+/// The member `createTupleTargetType` declares for a numeric NAME — the thing
+/// `fixedLength`'s doc comment describes, handed back as a `Prop`.
+///
+/// A tuple in tsc is an ordinary object type whose members are `"0"`, `"1"`, …
+/// one per FIXED element, plus `length`. Nothing about the relation is
+/// tuple-aware once those exist: `[number[], string[]]` meets
+/// `interface Tup { 0: number[]; 1: string[] }` because the source genuinely
+/// *has* properties by those names. ztsc stores a tuple as a positional
+/// element list instead, so the names had no answer at all and every such
+/// target was a spurious TS2322 — including `Record<"0" | "1", …>`,
+/// `T extends { 0: number }`, and an interface that adds a numeric member to
+/// `Array<T>`.
+///
+/// Deliberately NOT wired into `propOfType`: the members tsc synthesizes here
+/// are the tuple's own, so they are visible to the relation and to `keyof`,
+/// but ztsc answers element ACCESS (`t[0]`) positionally through
+/// `tupleElemTypeAt` and answers `keyof` in `keyof.zig`, both of which already
+/// agree with tsc. The relation is the one caller that was missing them, and
+/// it reaches them through `assign.relationSrcProp`.
+///
+/// Only the fixed prefix: past the first rest or variadic element a position
+/// is not a fixed name, so `[...number[], string]` has NO property `"0"` and
+/// tsc says so (TS2741, oracle-verified). Optionality and readonly-ness come
+/// from the element and the tuple, matching `createTupleTargetType`'s
+/// `ElementFlags.Optional` and `readonly` modifier.
+pub fn numericProp(c: *Checker, tup: TypeId, name: Atom) ?types.Prop {
+    if (c.ts.kind(tup) != .tuple) return null;
+    const text = c.atomText(name);
+    // Canonical decimal spelling only — `"+1"`, `"007"` and `"1e0"` name no
+    // tuple member (and `parseInt` would accept the first two).
+    if (!Checker.isNumericPropName(text)) return null;
+    const idx = std.fmt.parseInt(u32, text, 10) catch return null;
+    if (idx >= fixedLength(c, tup)) return null;
+    const e = c.ts.tupleElem(tup, idx);
+    var flags: u32 = 0;
+    // The element type already carries `| undefined` for an optional element
+    // (`makeTuple` adds it), so the flag alone is what is left to report.
+    if (e.optional()) flags |= types.prop_flag_optional;
+    if (e.readonly()) flags |= types.prop_flag_readonly;
+    return .{ .name = name, .ty = e.ty, .flags = flags };
 }
 
 /// tsc's `getEndElementCount(t, ElementFlags.Fixed)`: how many TRAILING

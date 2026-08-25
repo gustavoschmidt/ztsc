@@ -3038,7 +3038,15 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         // text that diverges at the head or the tail rules the pair out no
         // matter what the holes hold. Applying it here narrows the leniency
         // to the cases that actually need a matcher.
-        if (sk == .template_literal_type) return !template_zig.definitelyUnrelated(c, s, t);
+        if (sk == .template_literal_type) {
+            if (template_zig.definitelyUnrelated(c, s, t)) return false;
+            // …and the other half tsc decides cheaply: two patterns with the
+            // SAME fixed text relate exactly when each source placeholder is
+            // valid for the target's (`sameTextPatternRelated`). `null` keeps
+            // the leniency above for the texts that do not line up.
+            if (try template_zig.sameTextPatternRelated(c, s, t)) |v| return v;
+            return true;
+        }
         // A string-transform intrinsic gets no such concession: tsc's
         // `isTypeMatchedByTemplateLiteralType` infers nothing from a
         // `StringMapping` source, and the base constraint it falls back on is
@@ -4276,6 +4284,11 @@ pub fn tupleElemTypeAt(c: *Checker, t: TypeId, i: u32) Error!?TypeId {
 /// property "missing" by exactly the rule the relation used to reject it.
 pub fn relationSrcProp(c: *Checker, s: TypeId, name: Atom) Error!?types.Prop {
     if (try c.propOfTypeEx(s, name, false)) |p| return p;
+    // A tuple's own numeric members. tsc's tuple IS an object type carrying
+    // `"0"`, `"1"`, … for its fixed elements, so no rule of the relation has to
+    // know it is a tuple; ztsc stores elements positionally, so the names need
+    // synthesizing here — see `tuple_relate.numericProp`.
+    if (tuple_zig.numericProp(c, s, name)) |p| return p;
     if (!isNonPrimitiveKind(c.ts.kind(s))) return null;
     return c.objectInterfaceProp(name);
 }
@@ -6305,16 +6318,19 @@ pub fn paramTypeAt(c: *Checker, sig: TypeId, i: u32) Error!?TypeId {
 /// `handles.test.ts`, whose `e` came out `string` where tsc has `"a" | "b"`,
 /// and whose `IsValidHandle[e]` was a false TS7053 for it.
 ///
-/// Kept OUT of `paramTypeAt`, which is also what the argument RELATION reads.
-/// A call with a SPREAD argument is checked position by position rather than
-/// against a whole arm (`checkArgs` drops `sigNonArrayRest` when a spread is
-/// present), and a spread whose own type is a union of tuples contributes that
-/// union's whole element type at EVERY position — so narrowing the parameter
-/// side alone invents rejections there. `navigation.navigate(...args)` is
-/// exactly that shape (social-app's `useNavigationDeduped.ts`): position 0
-/// would go from "anything any arm holds" to "a screen name", which the
-/// spread's whole-element `options` object then fails. Contextual typing has
-/// no such other side, which is why this is the CONTEXTUAL entry point.
+/// Kept OUT of `paramTypeAt`, which is also what the argument RELATION reads —
+/// but no longer because the relation would break on it. `checkCallArguments`
+/// and `argumentsMatch` now route every in-window argument through one PACKED
+/// relation, which decides a union-typed rest per ARM, so the whole-list
+/// question is already answered where it belongs and nothing at the parameter
+/// side needs distributing (the earlier note here — that a spread made the call
+/// go position by position, and that `useNavigationDeduped`'s
+/// `navigation.navigate(...args)` would start failing — described machinery
+/// that is gone).
+///
+/// Contextual typing is the side with no packed form to fall back on: a
+/// callback parameter is typed from its own position and nothing else, which is
+/// why the distributing read lives here rather than in the shared accessor.
 ///
 /// An arm too SHORT to reach the position contributes nothing; the `undefined`
 /// such an arm admits is `restUnionOptionalAt`'s answer, which `paramTypeAt`
