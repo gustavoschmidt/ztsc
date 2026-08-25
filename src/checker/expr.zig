@@ -1248,7 +1248,38 @@ fn checkTdz(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex) Error!void 
     // — the ambient test comes FIRST and short-circuits the position check
     // entirely, so `var y = identity(x); declare const identity: <T>(v: T) => T`
     // is clean (`genericFunctionInference1`).
-    if (isAmbientDecl(c, decls[0])) return;
+    // …and neither does anything written in a DECLARATION FILE: tsc gates the
+    // whole check on `!(declaration.flags & NodeFlags.Ambient)`, and every node
+    // of a `.d.ts` carries that flag whether or not a `declare` modifier was
+    // spelled. A declaration file states an order-free API, so
+    // `export class C { static readonly p: unique symbol; [C.p](): void }` in
+    // one is clean (`declarationTypecheckNoUseBeforeReferenceCheck`).
+    if (isAmbientDecl(c, decls[0]) or c.symInDeclFile(sym)) return;
+    // A CLASS named inside a computed member name of its OWN body is in a
+    // temporal dead zone however the positions read: the name is evaluated
+    // while the binding is still being initialized. tsc closes the
+    // "declaration is before usage" arm of `isBlockScopedNameDeclaredBeforeUse`
+    // with exactly this exception —
+    //
+    //     else if (isClassDeclaration(declaration)) {
+    //         return !findAncestor(usage, n => isComputedPropertyName(n) &&
+    //             n.parent.parent === declaration);
+    //     }
+    //
+    // — so `class A { static p = 1; [A.p]() {} }` is TS2449 at `A`, for every
+    // member spelling (field, method, accessor, static or not) and for a class
+    // EXPRESSION just the same (`classDeclarationShouldBeOutOfScopeInComputed
+    // Names`, `computedPropertyNamesWithStaticProperty`). It runs ahead of the
+    // position, deferral and container tests below because it overrules all
+    // three: the declaration IS earlier, the name IS a deferred one for a
+    // method, and the containers differ.
+    if (c.symFlags(sym).class and c.computed_key_owner != 0) {
+        for (decls) |d| {
+            if (d != c.computed_key_owner) continue;
+            try c.diagFmt(2449, c.tokSpan(tok), "Class '{s}' used before its declaration.", .{c.tokenText(tok)});
+            return;
+        }
+    }
     const decl_start = c.nodeSpanStart(decls[0]);
     const use_start = c.tree.tokens.start(tok);
     if (use_start >= decl_start) return;
@@ -1794,6 +1825,16 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
                     }
                 }
             }
+            // …and a constraint that is tuple-like by NAME rather than by
+            // shape. tsc asks `isTupleLikeType` of the apparent type, and
+            // `T extends { "0": (p1: number) => number }` passes on its `"0"`
+            // property alone — so `f([x => x])` types the arrow from that
+            // property and `x` is a `number`, not an implicit any
+            // (`inferringAnyFunctionType1`). A DECLARED property only: see
+            // `tupleLikeByZeroProp`'s `allow_index`.
+            if (ctx_tuple_ty == types.no_type and try tupleLikeByZeroProp(c, rcon, false)) {
+                ctx_tuple_ty = rcon;
+            }
         }
     }
     // Union contextual type (`T[] | [A, B] | T`, or the react-hook-form
@@ -1830,7 +1871,7 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     // TUPLE. Reading it as an array folded both positions into one element
     // union, which `tup` accepts at neither (`arrayLiterals3`).
     if (ctx_tuple_ty == types.no_type and rctx != types.no_type and
-        try tupleLikeByZeroProp(c, rctx))
+        try tupleLikeByZeroProp(c, rctx, true))
     {
         ctx_tuple_ty = rctx;
     }
@@ -2346,15 +2387,40 @@ fn tupleLikeByLength(c: *Checker, r: TypeId) Error!bool {
 /// tsc's TS7006 on the arrow's parameter, which the whole-array element read
 /// (which sees only the array constituent) never reported
 /// (`contextualSignatureInArrayElementLibEs2015`, the #53280 repro).
-fn tupleLikeByZeroProp(c: *Checker, r: TypeId) Error!bool {
+///
+/// `allow_index` is that latitude, and only the DIRECT contextual type gets
+/// it. A type parameter's CONSTRAINT does not: the constraint decides which
+/// overload the literal is measured against, and `Object.freeze`'s
+/// `<T extends { [idx: string]: U | null | undefined | object }>` would
+/// otherwise claim `[1, 2, 3]` for tuple context and beat the
+/// `readonly any[]` overload — turning `a[0] = …`'s TS2322 + TS2542 into a
+/// TS2540 (`objectFreeze`). There the strict `getPropertyOfType` reading is
+/// the right one.
+fn tupleLikeByZeroProp(c: *Checker, r: TypeId, allow_index: bool) Error!bool {
     switch (c.ts.kind(r)) {
         .union_type => {
             for (try c.memberList(r)) |m| {
-                if (try tupleLikeByZeroProp(c, try c.resolveStructural(m))) return true;
+                if (try tupleLikeByZeroProp(c, try c.resolveStructural(m), allow_index)) return true;
             }
             return false;
         },
-        .object, .intersection => return (try c.propOfType(r, try c.atom("0"))) != null,
+        // A TUPLE constituent of an intersection answers `"0"` from its fixed
+        // prefix, which the named lookup misses the moment the tuple carries a
+        // REST element: `[number, ...number[]]` declares no `"0"` member, only
+        // a numeric domain. `const yy: number[] & [number, ...number[]] = [1]`
+        // is that shape — and `tupleLikeByLength` cannot rescue it either,
+        // because a rest element makes `length` plain `number`. Without the
+        // arm `[1]` took no tuple context, widened to `number[]`, and the
+        // declaration was a false TS2322 (#38348,
+        // `intersectionsAndOptionalProperties`).
+        .intersection => {
+            for (try c.memberList(r)) |m| {
+                const rm = try c.resolveStructural(m);
+                if (c.ts.kind(rm) == .tuple and tuple_relate.fixedLength(c, rm) > 0) return true;
+            }
+            return (try c.propOfTypeEx(r, try c.atom("0"), allow_index)) != null;
+        },
+        .object => return (try c.propOfTypeEx(r, try c.atom("0"), allow_index)) != null,
         else => return false,
     }
 }
@@ -4800,7 +4866,21 @@ fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex, site
                 }
                 return types.any_type;
             }
-            if (try c.propOfType(r, name)) |p| {
+            // tsc's `checkPropertyAccessExpressionOrQualifiedName` passes
+            // `getPropertyOfType(apparentType, name,
+            // /*skipObjectFunctionPropertyAugment*/
+            // isConstEnumObjectType(apparentType))`: the value side of a
+            // `const enum` inherits nothing from the global `Object`
+            // interface, so `const enum E { A }; E.toString` is TS2339 where a
+            // non-const `enum` and a plain object literal keep the augment
+            // (oracle-verified). An EMPTY const enum is the gap
+            // `isConstEnumObjectType` documents, and is what leaves
+            // `constEnumNoObjectPrototypePropertyAccess` under-reporting.
+            const found = if (isConstEnumObjectType(c, r))
+                try props_zig.propOfTypeNoAugment(c, r, name)
+            else
+                try c.propOfType(r, name);
+            if (found) |p| {
                 if (p.nonPublic()) try accessibility.check(c, t, name, name_tok, site);
                 var pt = try c.substThis(p.ty, t);
                 if (p.optional()) pt = try c.makeUnion2(pt, types.undefined_type);
@@ -6658,8 +6738,36 @@ fn baseOfLiteralType(c: *Checker, t: TypeId) Error!TypeId {
 /// generic TS7053. Both are gated on `noImplicitAny`; the access types as
 /// `any` either way.
 pub fn reportIndexImplicitAny(c: *Checker, node: Node, recv: Node, idx_t: TypeId, obj_t: TypeId) Error!void {
-    if (!c.prog.no_implicit_any) return;
     const r = try c.resolveStructural(obj_t);
+    // tsc wraps its ENTIRE implicit-any block in
+    // `if (accessExpression && !isConstEnumObjectType(objectType))`, so the
+    // value side of a `const enum` never earns a TS7052/TS7053 at all: the walk
+    // falls through to `getPropertyTypeForIndexType`'s last report instead —
+    // `Property '0' does not exist on type '1'`, blamed on the INDEX expression
+    // (`getIndexNodeForAccessExpression`) rather than on the access, and NOT
+    // gated on `noImplicitAny`. `const enum E { A }; E["B"]` is that case
+    // (`constEnumBadPropertyNames`, `constEnumErrors`).
+    if (isConstEnumObjectType(c, r)) {
+        const lit = try c.ts.regularLiteral(idx_t);
+        // The key, unquoted — `typeToString` of a string literal carries quotes
+        // this message must not (same rule as the object-literal arm below).
+        const name: ?[]const u8 = switch (c.ts.kind(lit)) {
+            .string_literal => c.atomText(c.ts.literalAtom(lit)),
+            .number_literal => try c.typeToString(lit),
+            else => null,
+        };
+        if (name) |n| {
+            const idx_node = switch (c.nodeTag(node)) {
+                .index_expr, .optional_index_expr => c.tree.nodeData(node).rhs,
+                else => node,
+            };
+            try c.diagFmt(2339, c.nodeSpan(idx_node), "Property '{s}' does not exist on type '{s}'.", .{
+                n, try c.typeToString(obj_t),
+            });
+        }
+        return;
+    }
+    if (!c.prog.no_implicit_any) return;
     // tsc picks `set` for an assignment target and `get` otherwise. ztsc has
     // no write context at this site, so it asks for `get` only: an object
     // carrying BOTH (the map-like shape this diagnostic exists for) reports
@@ -6712,6 +6820,31 @@ pub fn reportIndexImplicitAny(c: *Checker, node: Node, recv: Node, idx_t: TypeId
     try c.diagFmt(7053, c.nodeSpan(node), "Element implicitly has an 'any' type because expression of type '{s}' can't be used to index type '{s}'.", .{
         try c.typeToString(idx_t), try c.typeToString(obj_t),
     });
+}
+
+/// tsc's `isConstEnumObjectType`: the VALUE side (`typeof E`) of a `const
+/// enum`, which its indexed-access walk exempts from every implicit-any
+/// report.
+///
+/// tsc reads `objectType.symbol`; ztsc's enum value object
+/// (`enums.enumValueType`) is an anonymous `makeObject` that carries no symbol,
+/// so the enum is recovered from its MEMBERS — every property of that object is
+/// an `.enum_type` member of one enum symbol, a shape nothing else builds. An
+/// enum with NO members has no property to read and stays a gap (an under-
+/// report there: `const enum Empty {}; Empty["x"]` keeps its TS7053).
+fn isConstEnumObjectType(c: *Checker, t: TypeId) bool {
+    if (c.ts.kind(t) != .object) return false;
+    const n = c.ts.objectPropCount(t);
+    if (n == 0) return false;
+    var sym: u32 = 0;
+    for (0..n) |i| {
+        const p = c.ts.objectProp(t, @intCast(i));
+        if (!c.ts.isEnumMember(p.ty)) return false;
+        const s = c.ts.enumSymbol(p.ty);
+        if (sym != 0 and s != sym) return false;
+        sym = s;
+    }
+    return constEnumOnly(c, c.declsOf(sym));
 }
 
 /// The expression inside any number of parentheses. tsc's `skipParentheses`:
@@ -7999,13 +8132,45 @@ pub fn contextualCallSig(c: *Checker, ctx: TypeId, fn_node: Node) Error!TypeId {
     return ctx_sig;
 }
 
-/// tsc's `isContextSensitive` for a function expression / arrow: does its TYPE
-/// depend on the contextual type it is checked against? It does exactly when
-/// some parameter carries no annotation — such a parameter takes its type from
-/// the contextual signature, and with no contextual signature it is implicit
-/// `any`, which makes the whole function tsc's `anyFunctionType`.
+/// tsc's `isContextSensitiveFunctionLikeDeclaration` — `hasContextSensitive-
+/// Parameters(node) || hasContextSensitiveReturnExpression(node)`: does this
+/// function expression / arrow's TYPE depend on the contextual type it is
+/// checked against?
+///
+/// The first disjunct is a parameter carrying no annotation — such a parameter
+/// takes its type from the contextual signature, and with no contextual
+/// signature it is implicit `any`, which makes the whole function tsc's
+/// `anyFunctionType`.
+///
+/// The second is the RETURN side, which ztsc did not ask at all:
+///
+/// ```ts
+/// function hasContextSensitiveReturnExpression(node: SignatureDeclaration) {
+///     if (node.typeParameters || getEffectiveReturnTypeNode(node) || !node.body) return false;
+///     if (node.body.kind !== SyntaxKind.Block) return isContextSensitive(node.body);
+///     return !!forEachReturnStatement(node.body, s => !!s.expression && isContextSensitive(s.expression));
+/// }
+/// ```
+///
+/// A function whose own type is fully determined by its parameters can still
+/// PRODUCE a context-sensitive value, and skipping it means the enclosing call
+/// fixes its type parameter a round too early:
+/// `repro({ params: 1, callback: () => { return a => a + 1 } })` typed `a`
+/// from an already-fixed `T` (microsoft/TypeScript#50687,
+/// `inferPropertyWithContextSensitiveReturnStatement`).
+///
+/// Memoized per node: the walk is over the whole body, and the inference loops
+/// in `infer.zig` ask this once per candidate signature per round.
 pub fn fnExprIsContextSensitive(c: *Checker, node: Node) bool {
-    const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(node).lhs);
+    if (c.ctx_sensitive_memo.get(c.nodeKey(node))) |v| return v;
+    const v = computeFnExprIsContextSensitive(c, node);
+    c.ctx_sensitive_memo.put(c.cm(), c.nodeKey(node), v) catch {};
+    return v;
+}
+
+fn computeFnExprIsContextSensitive(c: *Checker, node: Node) bool {
+    const d = c.tree.nodeData(node);
+    const proto = c.tree.extraData(ast.FnProto, d.lhs);
     for (c.tree.extraRange(proto.params_start, proto.params_end)) |p| {
         if (p == null_node) continue;
         const pd = c.tree.nodeData(p);
@@ -8016,7 +8181,69 @@ pub fn fnExprIsContextSensitive(c: *Checker, node: Node) bool {
         };
         if (ann == 0) return true;
     }
+    // `hasContextSensitiveReturnExpression`'s three guards: own type
+    // parameters, a written return type, or no body at all — any of them and
+    // the function's type is settled without the context.
+    if (proto.tp_end > proto.tp_start or proto.return_type != 0 or d.rhs == null_node) return false;
+    if (c.nodeTag(d.rhs) != .block) return exprIsContextSensitive(c, d.rhs, 0);
+    return blockHasContextSensitiveReturn(c, d.rhs, 0);
+}
+
+/// `forEachReturnStatement(body, …)`: any `return <expr>` in the statement
+/// subtree, not descending into a nested function or class — their returns are
+/// their own (the same boundary `signatures.walkReturns` draws).
+fn blockHasContextSensitiveReturn(c: *Checker, node: Node, depth: u8) bool {
+    if (node == null_node or depth > 32) return false;
+    switch (c.nodeTag(node)) {
+        .return_stmt => {
+            const e = c.tree.nodeData(node).lhs;
+            return e != 0 and exprIsContextSensitive(c, e, 0);
+        },
+        .arrow_fn, .function_expr, .function_decl, .class_decl, .class_method => return false,
+        else => {},
+    }
+    var it = c.tree.childIterator(node);
+    while (it.next()) |child| {
+        if (blockHasContextSensitiveReturn(c, child, depth + 1)) return true;
+    }
     return false;
+}
+
+/// tsc's `isContextSensitive` over an EXPRESSION: the aggregate forms carry
+/// the property up from whatever they hold.
+fn exprIsContextSensitive(c: *Checker, node: Node, depth: u8) bool {
+    if (node == null_node or depth > 32) return false;
+    return switch (c.nodeTag(node)) {
+        .arrow_fn, .function_expr => fnExprIsContextSensitive(c, node),
+        .paren_expr => exprIsContextSensitive(c, c.tree.nodeData(node).lhs, depth + 1),
+        .object_literal, .array_literal => blk: {
+            for (c.tree.nodeRange(node)) |el| {
+                if (el != null_node and exprIsContextSensitive(c, el, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        // A property's VALUE (`{ cb: x => x }`); an object METHOD is a
+        // function-like of its own, which tsc reaches through the same switch.
+        // `object_method` holds its `function_expr` in `rhs` (`lhs` is the
+        // key), so the proto is one hop further down.
+        .object_property => exprIsContextSensitive(c, c.tree.nodeData(node).rhs, depth + 1),
+        .object_method => exprIsContextSensitive(c, c.tree.nodeData(node).rhs, depth + 1),
+        .cond_expr => blk: {
+            const e = c.tree.extraData(ast.CondExpr, c.tree.nodeData(node).rhs);
+            break :blk exprIsContextSensitive(c, e.then_expr, depth + 1) or
+                exprIsContextSensitive(c, e.else_expr, depth + 1);
+        },
+        // Only `||` and `??` — tsc names those two operators alone, because
+        // they are the only ones whose result can BE an operand.
+        .binary => blk: {
+            const op = c.tree.tokens.tag(c.tree.nodeMainToken(node));
+            if (op != .pipe_pipe and op != .question_question) break :blk false;
+            const bd = c.tree.nodeData(node);
+            break :blk exprIsContextSensitive(c, bd.lhs, depth + 1) or
+                exprIsContextSensitive(c, bd.rhs, depth + 1);
+        },
+        else => false,
+    };
 }
 
 fn checkFunctionLikeExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {

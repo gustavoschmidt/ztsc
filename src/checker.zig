@@ -1129,6 +1129,13 @@ pub const Checker = struct {
     /// file (right-sizing), so a checker only maps scopes for files it
     /// actually traverses — not every file of the program, per instance.
     node_scopes: IntMap(u64, ScopeId) = .empty,
+    /// (file << 32 | function-like node) -> `fnExprIsContextSensitive`.
+    /// A pure function of the SYNTAX (parameter annotations, and the shape of
+    /// the returned expressions), so one answer per node is the only answer —
+    /// tsc caches it the same way, on `getNodeLinks`. Memoized because the
+    /// inference loops in `infer.zig` ask it once per candidate signature per
+    /// round while the answer costs a walk of the whole body.
+    ctx_sensitive_memo: IntMap(u64, bool) = .empty,
     /// Per-file flag: has this file's scope-owner map been faulted into
     /// `node_scopes` yet?
     scopes_faulted: []bool = &.{},
@@ -1896,6 +1903,16 @@ pub const Checker = struct {
     /// only around `computed_key.checkMemberNames`, which documents the boundary.
     /// (wave-10 A.)
     defer_computed_key_tdz: bool = false,
+    /// The CLASS whose member names `computed_key.checkMemberNames` is walking,
+    /// or 0 outside one (and for an interface / type literal, which have no
+    /// runtime binding to be dead). A reference to *this* class from inside one
+    /// of its own computed member names is in a temporal dead zone however the
+    /// positions read — tsc's `isBlockScopedNameDeclaredBeforeUse` closes its
+    /// "declaration is before usage" arm with
+    /// `isClassDeclaration(declaration) && !findAncestor(usage, n =>
+    /// isComputedPropertyName(n) && n.parent.parent === declaration)`. Read by
+    /// `checkTdz`; set only around `checkMemberNames`. (wave-41 A.)
+    computed_key_owner: Node = 0,
     /// The bare identifier being checked is the operand of `export = X`. tsc's
     /// `isBlockScopedNameDeclaredBeforeUse` exempts it by name — "inside a TS
     /// export= declaration (since we will move the export statement during emit
@@ -2769,6 +2786,9 @@ pub const Checker = struct {
     // Names of the lib interfaces async/await + generators bridge to.
     atom_Promise: Atom = 0,
     atom_PromiseLike: Atom = 0,
+    /// The thenable member `signatures.promisedTypeOfPromise` reads a payload
+    /// off when the type is not one of the two names above.
+    atom_then: Atom = 0,
     atom_Generator: Atom = 0,
     atom_Iterator: Atom = 0,
     atom_IterableIterator: Atom = 0,
@@ -3017,6 +3037,7 @@ pub const Checker = struct {
         c.atom_prototype = try c.atom("prototype");
         c.atom_Promise = try c.atom("Promise");
         c.atom_PromiseLike = try c.atom("PromiseLike");
+        c.atom_then = try c.atom("then");
         c.atom_Generator = try c.atom("Generator");
         c.atom_Iterator = try c.atom("Iterator");
         c.atom_IterableIterator = try c.atom("IterableIterator");

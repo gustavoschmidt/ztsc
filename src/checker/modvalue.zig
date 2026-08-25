@@ -57,11 +57,24 @@ pub fn valuelessNamespace(c: *const Checker, sym: SymbolId) bool {
     return m.parts.len != 0;
 }
 
-/// `valuelessNamespace` through an ENTITY-NAME alias. `import U = Outer.uninst`
-/// carries exactly the meanings its right-hand side has, so `typeof U` and
-/// `U.member` in value position are the same TS2708 the namespace's own name
-/// earns (`typeofInternalModules`). The `= require("m")` form has an import
-/// RECORD and is the linker's; only the entity form is walked here.
+/// `valuelessNamespace` through an ALIAS. An import binding carries exactly the
+/// meanings its target has, so `typeof U` and `U.member` in value position are
+/// the same TS2708 the namespace's own name earns (`typeofInternalModules`).
+///
+/// Both alias spellings answer here:
+///
+///   * the ENTITY form `import U = Outer.uninst`, resolved by walking the
+///     right-hand side (`importEqualsEntityContainer`);
+///   * an import RECORD — `import U = require("m")` and `import * as U from
+///     "m"` where `m` is `export = <uninstantiated namespace>`, and
+///     `import { N } from "m"` where `N` is one. The linker has already
+///     resolved these to the target BINDING, so the namespace test applies to
+///     it directly. Without this the alias typed as the namespace OBJECT and
+///     a member read off it was TS2339 at the member instead of TS2708 at the
+///     binding (`typeUsedAsValueError2`, `aliasOnMergedModuleInterface`).
+///
+/// A `type_only` chain is a different failure with its own codes (TS1361 /
+/// TS1362, `aliasValueVerdict`), so it is left to them.
 ///
 /// `f` is the caller's already-loaded `symFlags(sym)`: every call site has it,
 /// and `interesting(f)` — one branch on two bits — is what keeps this off the
@@ -69,7 +82,14 @@ pub fn valuelessNamespace(c: *const Checker, sym: SymbolId) bool {
 pub fn valuelessNamespaceRef(c: *Checker, sym: SymbolId, f: binder.SymbolFlags) Error!bool {
     if (!interesting(f)) return false;
     if (valuelessNamespace(c, sym)) return true;
-    if (!f.import_binding or c.importTarget(sym) != null) return false;
+    if (!f.import_binding) return false;
+    if (c.importTarget(sym)) |tgt| {
+        // A merged symbol that declares a value of its own is that value, and
+        // the alias is never consulted — the same rule `aliasValueVerdict`
+        // opens with (`symbolMergeValueAndImportedType`).
+        if (names.hasOwnValueMeaning(f) or tgt.type_only or tgt.kind != .binding) return false;
+        return valuelessNamespace(c, c.toGlobalIn(tgt.file, tgt.payload));
+    }
     return switch ((try c.importEqualsEntityContainer(sym)) orelse return false) {
         .ns => |ns| valuelessNamespace(c, ns),
         .module => false,

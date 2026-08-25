@@ -57,17 +57,28 @@ pub fn propOfTypeViaIndex(c: *Checker, t: TypeId, name: Atom, via_index: *bool) 
     return propOfTypeIdx(c, t, name, .{ .from_index = via_index });
 }
 
-/// tsc's `getPropertyOfType(t, name, /*skipObjectFunctionPropertyAugment*/ true)`
-/// — the lookup CONTEXTUAL typing runs. A property's contextual type is what
-/// the target DECLARES for that name, never what the global `Function` and
-/// `Object` interfaces lend every value: an object literal written against
-/// `WebpackPluginInstance | ((c: Compiler) => void)` must take `apply` from the
-/// interface alone, because reading `CallableFunction.apply` off the function
-/// constituent puts a second, disagreeing signature into a union that
-/// `contextualCallSig` then refuses outright (TS7006 on the callback).
-pub fn ctxPropOfType(c: *Checker, t: TypeId, name: Atom) Error!?types.Prop {
+/// tsc's `getPropertyOfType(t, name, /*skipObjectFunctionPropertyAugment*/ true)`:
+/// the DECLARED members alone, without what the global `Function` and `Object`
+/// interfaces lend every value. Two callers, both spelling tsc's argument:
+///
+///   * CONTEXTUAL typing (`ctxPropOfType` below) — a property's contextual type
+///     is what the target declares for that name, and reading
+///     `CallableFunction.apply` off the function constituent of
+///     `WebpackPluginInstance | ((c: Compiler) => void)` put a second,
+///     disagreeing signature into a union that `contextualCallSig` then refuses
+///     outright (TS7006 on the callback);
+///   * a CONST ENUM object receiver —
+///     `getPropertyOfType(apparentType, name, isConstEnumObjectType(apparentType))`
+///     in `checkPropertyAccessExpressionOrQualifiedName`, which is why
+///     `const enum E { A }; E.toString` is TS2339 and not the `Object` member
+///     (oracle-verified against tsgo, alongside a non-const `enum` and a plain
+///     object literal, which both keep the augment).
+pub fn propOfTypeNoAugment(c: *Checker, t: TypeId, name: Atom) Error!?types.Prop {
     return propOfTypeIdx(c, t, name, .{ .skip_augment = true });
 }
+
+/// `propOfTypeNoAugment` under the name its contextual-typing caller uses.
+pub const ctxPropOfType = propOfTypeNoAugment;
 
 /// What a property lookup should answer beyond the name itself.
 const PropLookup = struct {
