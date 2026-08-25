@@ -2310,20 +2310,35 @@ const Parser = struct {
                         // `declare namespace N { ... }` (ambient, identifier
                         // name) or `declare module "spec" { ... }` (ambient
                         // module / augmentation). Both in subset.
-                        _ = try p.bump(); // `declare`
-                        if (isIdentLike(p.peekTag(1)) and !p.peekNewline(1)) {
-                            return p.parseNamespaceDecl(ast.Flags.declare);
+                        //
+                        // Anything else is not a DECLARATION at all: tsc's
+                        // `isDeclaration` asks
+                        // `nextTokenIsIdentifierOrStringLiteralOnSameLine()` of
+                        // the keyword, so `declare namespace debugger {}` is an
+                        // expression statement `declare`, then one `namespace`
+                        // (TS2819 on the reserved name it cannot read), then a
+                        // `debugger` statement whose TS1005 lands on the `{`.
+                        // The name is peeked BEFORE the `declare` is consumed
+                        // so the fall-through statement still starts there.
+                        // Answering ztsc's subset boundary instead left the two
+                        // `ambientModuleDeclarationWithReservedIdentifierIn
+                        // DottedPath` cases unparsed, and so bucketed.
+                        const name_tag = p.peekTag(2);
+                        if (!p.peekNewline(2)) {
+                            if (isIdentLike(name_tag)) {
+                                _ = try p.bump(); // `declare`
+                                return p.parseNamespaceDecl(ast.Flags.declare);
+                            }
+                            if (isModuleNameLiteral(name_tag)) {
+                                _ = try p.bump(); // `declare`
+                                return p.parseAmbientModule(true);
+                            }
+                            if (name_tag == .l_brace) {
+                                _ = try p.bump(); // `declare`
+                                return p.parseAnonymousNamespace(true);
+                            }
                         }
-                        if (isModuleNameLiteral(p.peekTag(1)) and !p.peekNewline(1)) {
-                            return p.parseAmbientModule(true);
-                        }
-                        if (p.peekTag(1) == .l_brace and !p.peekNewline(1)) {
-                            return p.parseAnonymousNamespace(true);
-                        }
-                        const start = p.curIdx();
-                        _ = try p.bump();
-                        p.skipUnsupportedBlockish();
-                        return p.unsupportedFrom(start);
+                        return p.parseExpressionStatement();
                     },
                     .keyword_global => {
                         // `declare global { ... }` — global-scope augmentation
