@@ -1735,6 +1735,10 @@ pub fn inferTypeArgs(
     // ones named by the contextual type of an UN-ANNOTATED parameter position.
     // See the contravariant-echo guard below.
     const echoable = try c.scratch().alloc(bool, tp_syms.len);
+    // …and which ones an ANNOTATED parameter position of the SAME callback also
+    // names. Those carry real evidence and are exempt from the wipe — see the
+    // guard below.
+    const annotated_pos = try c.scratch().alloc(bool, tp_syms.len);
     ai = 0;
     for (arg_nodes) |an| {
         if (an == null_node) continue;
@@ -1841,13 +1845,37 @@ pub fn inferTypeArgs(
         // `Record<string, true>` in tsc, where wiping `U`'s contravariant
         // candidate wholesale left the `{}` the second argument supplies (and
         // annotating `e`, or dropping the `{}`, already made ztsc agree).
+        //
+        // "Per-parameter-position" has to be read off BOTH position sets, not
+        // just the un-annotated one: a callback that annotates one parameter and
+        // leaves another to the contextual type names the same variable twice,
+        // once as evidence and once as an echo, and marking only the echo wiped
+        // the evidence with it. tsc keeps them apart at a different seam —
+        // `inferFromAnnotatedParameters` runs the annotated positions into the
+        // inference context BEFORE the callback's own type exists, so the echo
+        // it later reads back cannot displace them — and the exemption below is
+        // the same statement made after the fact. Oracle
+        // (`partiallyAnnotatedFunctionInferenceWithTypeParameter`, tsgo 7.0.2,
+        // `test<T extends C>(a: (t: T, t1: T) => void)` with `class D extends C`):
+        //
+        //   | argument                     | tsgo `T` |
+        //   |------------------------------|----------|
+        //   | `(t1: D, t2) => …`           | `D`      |
+        //   | `(t1, t2: D) => …`           | `D`      |
+        //   | `(t1, t2, t3) => …`          | `C`      |
+        //
+        // Row 3 is the case the wipe exists for and is untouched: no annotated
+        // position names `T`, so nothing exempts it and the echoed `C` still
+        // goes. Rows 1 and 2 are the ones it was taking with it.
         const ctx_sensitive = c.fnExprIsContextSensitive(fn_node);
         if (ctx_sensitive) {
             for (echoable) |*e| e.* = false;
-            try markEchoablePositions(c, fn_node, pt0, tp_syms, echoable);
+            for (annotated_pos) |*e| e.* = false;
+            try markCallbackPositions(c, fn_node, pt0, tp_syms, echoable, annotated_pos);
         }
         for (contra, 0..) |*cc, i| {
             if (cc.* == before_contra[i]) continue;
+            if (ctx_sensitive and annotated_pos[i]) continue;
             if (cc.* == fed[i] or (ctx_sensitive and echoable[i] and fed[i] != types.any_type))
                 cc.* = before_contra[i];
         }
@@ -2464,16 +2492,33 @@ fn paramsMentionFreeVar(c: *Checker, sig: TypeId, tp_syms: []const u32, candidat
     return false;
 }
 
-/// Mark every type parameter named by the contextual type of an UN-ANNOTATED
-/// parameter of `fn_node` — the positions whose type the callback ADOPTED from
-/// the contextual signature, and so the only ones whose contravariant evidence
-/// can be this call's own guess coming home. `sig` is the (uninstantiated)
-/// contextual signature; a position it does not reach marks nothing.
-fn markEchoablePositions(c: *Checker, fn_node: Node, sig: TypeId, tp_syms: []const u32, out: []bool) Error!void {
+/// Split the type parameters `fn_node`'s contextual signature names by the kind
+/// of parameter position that names them:
+///
+///   * `echoable` — named by the contextual type of an UN-ANNOTATED parameter,
+///     the positions whose type the callback ADOPTED from that signature, and so
+///     the only ones whose contravariant evidence can be this call's own guess
+///     coming home;
+///   * `annotated` — named by the contextual type of an ANNOTATED parameter,
+///     where what the position yields is what the SOURCE says and is evidence
+///     whatever else the callback declares.
+///
+/// The two are not exclusive — one variable can appear in both roles — which is
+/// exactly why they are answered separately (see the echo guard's call site).
+/// `sig` is the (uninstantiated) contextual signature; a position it does not
+/// reach marks nothing.
+fn markCallbackPositions(
+    c: *Checker,
+    fn_node: Node,
+    sig: TypeId,
+    tp_syms: []const u32,
+    echoable: []bool,
+    annotated: []bool,
+) Error!void {
     if (c.ts.kind(sig) != .function) {
         // No contextual signature to pair positions with: fall back to the
         // whole-argument reading rather than sparing evidence blindly.
-        for (out) |*e| e.* = true;
+        for (echoable) |*e| e.* = true;
         return;
     }
     const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(fn_node).lhs);
@@ -2482,14 +2527,28 @@ fn markEchoablePositions(c: *Checker, fn_node: Node, sig: TypeId, tp_syms: []con
         defer pos += 1;
         if (p == null_node) continue;
         const pd = c.tree.nodeData(p);
-        const ann: Node = switch (c.nodeTag(p)) {
-            .param => pd.rhs,
-            .param_full => c.tree.extraData(ast.ParamFull, pd.rhs).type_ann,
-            else => 0,
-        };
-        if (ann != 0) continue; // annotated: its type is the source's, not ours
+        var ann: Node = 0;
+        var rest = false;
+        switch (c.nodeTag(p)) {
+            .param => ann = pd.rhs,
+            .param_full => {
+                const pf = c.tree.extraData(ast.ParamFull, pd.rhs);
+                ann = pf.type_ann;
+                rest = pf.flags & ast.Flags.rest != 0;
+            },
+            else => {},
+        }
         const pt = (try c.paramTypeAt(sig, pos)) orelse continue;
-        try markMentionedTps(c, pt, tp_syms, out, 0);
+        // tsc's `inferFromAnnotatedParameters` walks
+        // `signature.parameters.length - (hasRestParameter ? 1 : 0)`: an
+        // annotated REST parameter is never one of its sources. It matters —
+        // `testRest((t2, ...t3: D[]) => {})` against `(t: T, t1: T, ...ts: T[])`
+        // is `T := C` in tsgo, because the un-annotated `t2` FIXES `T` (to its
+        // constraint, there being no candidate yet) before the rest's `D` can be
+        // offered, and a fixed inference takes no further candidates. Exempting
+        // the rest here would have kept that `D`.
+        if (ann != 0 and rest) continue;
+        try markMentionedTps(c, pt, tp_syms, if (ann != 0) annotated else echoable, 0);
     }
 }
 
@@ -4800,7 +4859,53 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
             // where the answer is `V` — so `pipe(list, pipe(box))` then rejected
             // its FIRST argument against `(...args: [T]) => [V]`.
             const src_rest_tuple = try restTupleOf(c, ra);
-            const n = @min(paramPositions(c, ra, src_rest_tuple), pat_fixed);
+            // …and a trailing rest in the SOURCE that is NOT a fixed tuple
+            // covers every remaining PATTERN position, one element at a time.
+            // tsc: `paramCount = sourceRestType ? targetNonRestCount :
+            // min(sourceCount, targetNonRestCount)`, with `getTypeAtPosition`
+            // answering `restType[index]` past the fixed parameters.
+            //
+            // Without it a rest-only source offered exactly ONE position and
+            // offered the whole ARRAY there: `test<T extends C>(a: (t: T, t1: T)
+            // => void)` fed `(...ts: D[]) => void` inferred `T := D[]`, which
+            // fails `T extends C` and clamped `T` back to `C` — a TS2345 tsgo
+            // does not report (`partiallyAnnotatedFunctionInferenceWithType
+            // Parameter`:26). The source's own arity is no longer a bound here,
+            // exactly as in tsc: a rest parameter accepts every position.
+            //
+            // Restricted to a source that declares NOTHING BUT the rest
+            // parameter, which is the narrowest shape the corpus pays for — and
+            // the one where the rule is unambiguous. With a FIXED parameter in
+            // front of the rest, tsc's answer stops being a question about
+            // `applyToParameterTypes` at all and becomes one about FIXING:
+            // contextually typing an un-annotated leading parameter calls
+            // `getInferredType` and latches the variable, so what the rest would
+            // offer at the positions behind it is dropped.
+            // `testRest((t2, ...t3: D[]) => {})` against `(t: T, t1: T, ...ts:
+            // T[])` is `T := C` in tsgo for that reason, not because position 1
+            // saw the array — and ztsc has no fixing latch to reproduce it with,
+            // so the shape stays on the old path where the array it offers loses
+            // the common-subtype fold to the leading position's `C` and lands on
+            // the same answer.
+            const src_rest_elem: TypeId = blk: {
+                if (src_rest_tuple != null or src_count != 1) break :blk types.no_type;
+                if (!s.fnParam(ra, 0).rest()) break :blk types.no_type;
+                const rt = try c.resolveStructural(s.fnParam(ra, 0).ty);
+                break :blk switch (s.kind(rt)) {
+                    .array => s.arrayElem(rt),
+                    // A rest tuple `restTupleOf` declined (it has a rest or
+                    // optional element) still hands out a single element type
+                    // for every position past its fixed head; the number index
+                    // is that union, which is what tsc's `restType[index]`
+                    // answers once `index` runs past the fixed elements.
+                    .tuple => try c.numberIndexType(rt),
+                    else => types.no_type,
+                };
+            };
+            const n = if (src_rest_elem != types.no_type)
+                pat_fixed
+            else
+                @min(paramPositions(c, ra, src_rest_tuple), pat_fixed);
             {
                 // Parameters are a contravariant position — unless the
                 // signature was written as a METHOD, whose parameters tsc
@@ -4811,7 +4916,10 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                     c.infer_ctx.contra_pos -= 1;
                 };
                 for (0..n) |i| {
-                    const at = paramTypeAt(c, ra, src_rest_tuple, @intCast(i));
+                    const at = if (src_rest_elem != types.no_type)
+                        src_rest_elem
+                    else
+                        paramTypeAt(c, ra, src_rest_tuple, @intCast(i));
                     try c.unify(s.fnParam(param, @intCast(i)).ty, at, tp_syms, candidates, depth + 1);
                 }
                 if (pat_has_rest and src_count >= pat_fixed) {
