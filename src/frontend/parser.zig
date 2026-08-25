@@ -257,6 +257,21 @@ const Parser = struct {
     /// TS1184 there; no corpus case writes it.
     element_home: ElementHome = .source_file,
 
+    /// tsc's `allowLetAndConstDeclarations(node.parent) == false`: the statement
+    /// now being parsed is the single SUBSTATEMENT of an `if`/`else`/`do`/
+    /// `while`/`with`/`for`, so a `let`, `const`, `type` or `interface`
+    /// declaration standing here is TS1156 — it would have no block to live in.
+    ///
+    /// Deliberately NOT a fifth `element_home`, even though both answer a
+    /// question about `node.parent`, because a LABEL sits on opposite sides of
+    /// the two: `allowLetAndConstDeclarations` recurses THROUGH a
+    /// LabeledStatement to its parent (so `{ l: let x = 1 }` is fine and
+    /// `if (c) l: let x = 1;` is not), while
+    /// `checkGrammarModuleElementContext` stops AT it (`l: namespace N {}` is
+    /// TS1235 wherever it stands). Folding them into one field would have to
+    /// pick one behaviour for labels and be wrong about the other rule.
+    substatement: bool = false,
+
     /// Lookahead queue of scanned-but-not-consumed tokens; la[0] is current.
     la: [max_la]Token = undefined,
     la_len: u8 = 0,
@@ -909,6 +924,18 @@ const Parser = struct {
         const start = p.tok_starts.items[tok] & scanner.Tokens.start_mask;
         const at = scanner.tokenEnd(p.src, p.tok_tags.items[tok], start);
         try p.addDiag(code, .{ .code = code, .span = .{ .start = at, .end = at } });
+    }
+
+    /// `errAtToken` whose `{0}` comes from ANOTHER consumed token — TS1156 on a
+    /// `type`/`interface` declaration is reported on the NAME while naming the
+    /// keyword.
+    fn errAtTokenArg(p: *Parser, code: Code, tok: u32, arg_tok: u32) Error!void {
+        try p.errAtSpanArg(code, p.tokenSpan(tok), p.tokenSpan(arg_tok));
+    }
+
+    fn tokenSpan(p: *Parser, tok: u32) Span {
+        const start = p.tok_starts.items[tok] & scanner.Tokens.start_mask;
+        return .{ .start = start, .end = scanner.tokenEnd(p.src, p.tok_tags.items[tok], start) };
     }
 
     fn errAtToken(p: *Parser, code: Code, tok: u32) Error!void {
@@ -1655,6 +1682,13 @@ const Parser = struct {
     /// scratch. Guarantees progress on every iteration.
     fn parseStatementList(p: *Parser, top: usize, terminator: TokTag, ambient_reported: bool) PE!void {
         _ = top;
+        // A real statement LIST — a block, a module body, a source file, a
+        // `case` clause — is where `let`/`const`/`type`/`interface` are allowed
+        // (`substatement`). One assignment here covers every list, however it
+        // was reached.
+        const was_sub = p.substatement;
+        p.substatement = false;
+        defer p.substatement = was_sub;
         // TS1036, tsc's `checkGrammarStatementInAmbientContext`: an ambient
         // context declares, it does not execute. tsc reports it ONCE per
         // containing block ("we only want to really report an error once to
@@ -1946,6 +1980,17 @@ const Parser = struct {
     }
 
     fn parseSubstatement(p: *Parser) PE!Node {
+        const was_sub = p.substatement;
+        p.substatement = true;
+        defer p.substatement = was_sub;
+        return p.parseLabeledBody();
+    }
+
+    /// The body a LABEL carries. Out of module-element context like any other
+    /// substatement, but TRANSPARENT to `Parser.substatement` — tsc's
+    /// `allowLetAndConstDeclarations` recurses through a LabeledStatement, so
+    /// `l: let x = 1` inherits the answer of wherever the label itself stands.
+    fn parseLabeledBody(p: *Parser) PE!Node {
         const was_home = p.element_home;
         p.element_home = .other;
         defer p.element_home = was_home;
@@ -2386,7 +2431,7 @@ const Parser = struct {
         // outside — a function nested in it starts its own slice of the stack.
         try p.labels.append(p.gpa, label | (if (p.labelTargetsIteration()) label_on_iteration else 0));
         defer p.labels.shrinkRetainingCapacity(p.labels.items.len - 1);
-        const body = try p.parseSubstatement();
+        const body = try p.parseLabeledBody();
         if (isDeclarationTag(p.nodes.items(.tag)[body])) {
             try p.errAtToken(.label_not_allowed, label);
         }
@@ -2640,6 +2685,30 @@ const Parser = struct {
     }
 
     fn parseVarStatement(p: *Parser) PE!Node {
+        // TS1156 for `if (c) let x = 1;`, reported on the keyword — which is
+        // also the text `{0}` interpolates, so `errAtCur` needs no argument
+        // span. Only the STATEMENT form: a `for (let i = 0; …)` head reaches
+        // `parseVarDecl` directly, and its `let` is a head binding rather than
+        // a substatement. `var` is exempt (it hoists out of the position
+        // anyway) and so is `const enum`, a declaration of another kind
+        // entirely; `using` is NOT (measured — tsgo reports it, worded for the
+        // `using`). An `await using` reaches here on its `await` and is left
+        // alone: tsc words that one "'await using' declarations", which no
+        // single token spells.
+        //
+        // A MODIFIER run in front of the statement takes the report away, and
+        // only here: `checkVariableStatement` chains
+        // `!checkGrammarModifiers(node) && !checkGrammarVariableDeclarationList(…)`
+        // before reaching `checkGrammarForDisallowedBlockScopedVariableStatement`,
+        // so `if (c) export const x;` is the TS1184 alone — while
+        // `checkTypeAliasDeclaration` and `checkInterfaceDeclaration` run their
+        // grammar check unconditionally and answer BOTH (all three measured).
+        if (p.substatement and p.spec == 0 and
+            !isStatementModifier(p.tokTagAt(p.lastIdx()))) switch (p.curTag()) {
+            .keyword_let, .keyword_using => try p.errAtCur(.decl_only_in_block),
+            .keyword_const => if (p.peekTag(1) != .keyword_enum) try p.errAtCur(.decl_only_in_block),
+            else => {},
+        };
         const node = try p.parseVarDecl(false);
         try p.checkDestructuringInitializers(node);
         try p.expectSemicolon();
@@ -4359,13 +4428,21 @@ const Parser = struct {
     fn declModifiersStart(p: *const Parser, kw: u32) ?u32 {
         var t = kw;
         while (t > 0) {
-            switch (p.tok_tags.items[t - 1]) {
-                .keyword_default => return null,
-                .keyword_export, .keyword_declare, .keyword_abstract => t -= 1,
-                else => break,
-            }
+            if (p.tok_tags.items[t - 1] == .keyword_default) return null;
+            if (!isStatementModifier(p.tok_tags.items[t - 1])) break;
+            t -= 1;
         }
         return t;
+    }
+
+    /// A modifier a STATEMENT-position declaration can carry — the run
+    /// `declModifiersStart` walks back over, and the one whose presence a
+    /// variable statement's TS1156 defers to.
+    fn isStatementModifier(tag: TokTag) bool {
+        return switch (tag) {
+            .keyword_export, .keyword_declare, .keyword_abstract, .keyword_default => true,
+            else => false,
+        };
     }
 
     fn parseClassDecl(p: *Parser, flags_in: u32, form: ClassForm) PE!Node {
@@ -5272,6 +5349,9 @@ const Parser = struct {
     fn parseInterfaceDecl(p: *Parser, flags: u32) PE!Node {
         const kw = try p.bump(); // `interface`
         const name_tok = try p.expectIdentLike();
+        // TS1156 for `if (c) interface I { … }` — on the NAME, as the type
+        // alias arm is.
+        if (p.substatement and p.spec == 0) try p.errAtTokenArg(.decl_only_in_block, name_tok, kw);
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
         if (p.atLt()) tp = try p.parseTypeParams(.type_decl);
         var ext: ast.SubRange = .{ .start = 0, .end = 0 };
@@ -5476,6 +5556,9 @@ const Parser = struct {
         // (`typeAliasDeclareKeywordNewlines` still declares `T1`).
         if (p.nlBefore()) try p.fail(.line_break_before_alias_name);
         const name_tok = try p.expectIdentLike();
+        // TS1156 for `if (c) type T = X;`. tsc anchors this arm on the NAME
+        // (measured), unlike the `let`/`const` one, which takes the keyword.
+        if (p.substatement and p.spec == 0) try p.errAtTokenArg(.decl_only_in_block, name_tok, kw);
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
         if (p.atLt()) tp = try p.parseTypeParams(.type_decl);
         _ = try p.expect(.eq, .expected_eq);

@@ -266,6 +266,16 @@ pub const Code = enum(u16) {
     /// TS1344: `label: var x = 1` — a label on a DECLARATION. tsc's grammar
     /// pass, so it is gated rather than gating.
     label_not_allowed,
+    /// TS1156: a `let`, `const`, `type` or `interface` declaration standing as
+    /// the single SUBSTATEMENT of an `if`/`else`/`do`/`while`/`with`/`for` —
+    /// tsc's `allowLetAndConstDeclarations`, which recurses through a LABEL and
+    /// so lets `{ l: let x = 1 }` through. `{0}` is the keyword; the `let`/
+    /// `const` arm is reported ON it, while the `type`/`interface` arm is
+    /// reported on the declaration's NAME and names the keyword through `arg`
+    /// (both anchors measured against tsgo). A `var`, a `using`, a `class`, a
+    /// `function` and an `enum` are all silent there.
+    decl_only_in_block,
+
     /// TS1319: `export default …` inside a `namespace N { … }` body. tsc
     /// reports it from two places with two anchors — `checkGrammarModifiers`
     /// on the `default` MODIFIER of a declaration, `checkExportAssignment` on
@@ -556,6 +566,11 @@ pub const Code = enum(u16) {
     mod_seen_async,
     mod_seen_abstract,
     mod_seen_declare,
+    /// TS1031: `declare` on a class element that is not a PROPERTY —
+    /// `declare constructor() {}`, `declare get x() {}`, `declare m() {}`.
+    /// tsc's `checkGrammarModifiers` (`isClassLike(node.parent) &&
+    /// !isPropertyDeclaration(node)`), blamed on the `declare` keyword.
+    declare_on_class_element,
     /// `export export class C {}` — the one repeat a STATEMENT-level modifier
     /// run can spell. Reported by `parseExportStatement`, not by the class-member
     /// walk, because `export` is not a class-member modifier at all.
@@ -1266,6 +1281,9 @@ pub const Code = enum(u16) {
             // `checkGrammarModifiers` / `checkExportAssignment` — the checker's
             // pass either way.
             .default_export_needs_esm,
+            // `checkGrammarLexicalDeclaration` and its type-declaration
+            // siblings, all three in the checker's grammar pass.
+            .decl_only_in_block,
             .public_not_on_module_element,
             .private_not_on_module_element,
             .protected_not_on_module_element,
@@ -1414,6 +1432,7 @@ pub const Code = enum(u16) {
             .mod_seen_async,
             .mod_seen_abstract,
             .mod_seen_declare,
+            .declare_on_class_element,
             .mod_seen_export,
             .export_assign_with_modifiers,
             .mod_order_public_static,
@@ -1708,6 +1727,7 @@ pub const Code = enum(u16) {
             .label_not_allowed => "A label is not allowed here.",
             .duplicate_label => "Duplicate label '{0}'.",
             .default_export_needs_esm => "A default export can only be used in an ECMAScript-style module.",
+            .decl_only_in_block => "'{0}' declarations can only be declared inside a block.",
             .public_not_on_module_element => moduleElementModifierMessage("public"),
             .private_not_on_module_element => moduleElementModifierMessage("private"),
             .protected_not_on_module_element => moduleElementModifierMessage("protected"),
@@ -1792,6 +1812,7 @@ pub const Code = enum(u16) {
             .mod_seen_async => modSeenMessage("async"),
             .mod_seen_abstract => modSeenMessage("abstract"),
             .mod_seen_declare => modSeenMessage("declare"),
+            .declare_on_class_element => "'declare' modifier cannot appear on class elements of this kind.",
             .mod_seen_export => modSeenMessage("export"),
             .export_assign_with_modifiers => "An export assignment cannot have modifiers.",
             .mod_order_public_static => modOrderMessage("public", "static"),
@@ -2133,6 +2154,7 @@ pub const Code = enum(u16) {
             .label_not_allowed => 1344,
             .duplicate_label => 1114,
             .default_export_needs_esm => 1319,
+            .decl_only_in_block => 1156,
             .public_not_on_module_element,
             .private_not_on_module_element,
             .protected_not_on_module_element,
@@ -2222,6 +2244,7 @@ pub const Code = enum(u16) {
             .mod_seen_declare,
             .mod_seen_export,
             => 1030,
+            .declare_on_class_element => 1031,
             .export_assign_with_modifiers => 1120,
             .mod_order_public_static,
             .mod_order_private_static,

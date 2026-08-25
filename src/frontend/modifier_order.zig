@@ -176,7 +176,17 @@ pub fn check(already: u32, bit: u32, member: Member, in_abstract_class: bool) ?C
                 .constructor, .method, .other => null,
             };
         },
-        F.declare => if (already & F.declare != 0) .mod_seen_declare else null,
+        // TS1031 after the repeat, as tsc's `case DeclareKeyword` chain has it:
+        // a `declare` on a class element that is not a PROPERTY. `.other` is
+        // left out — the kinds it covers (an index signature, a member whose
+        // name failed to parse) answer their position rules elsewhere or not at
+        // all, and guessing here could only invent a diagnostic.
+        F.declare => if (already & F.declare != 0)
+            .mod_seen_declare
+        else switch (member) {
+            .constructor, .method, .accessor => .declare_on_class_element,
+            .property, .other => null,
+        },
 
         else => null,
     };
