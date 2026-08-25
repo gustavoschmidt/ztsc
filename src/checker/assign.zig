@@ -3833,9 +3833,9 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
 /// `B<…>` positionally and never reaches the members at all. So the fix is
 /// origin-tagging a deferred conditional's alias identity plus an alias-args
 /// pairing arm in `infer.unify` — `instantiate.zig` / `infer.zig`, neither of
-/// them this file. Until that lands, this check must stay COMPARABLE-both-
-/// directions; tighten it to plain assignability in the same change that
-/// fixes the inference, and re-run the social-app gate to confirm.
+/// them this file. WAVE 39 C LANDED that inference fix (the same-alias
+/// pairing arm), and the merge re-tightened this check to plain
+/// assignability with the social-app gate re-run to confirm.
 fn intersectionOptionalsRelated(c: *Checker, s: TypeId, t: TypeId) Error!bool {
     // `.object` is also where tsc's array/tuple exclusion lands: neither kind
     // resolves to one, so both answer "nothing owed" here.
@@ -3852,9 +3852,7 @@ fn intersectionOptionalsRelated(c: *Checker, s: TypeId, t: TypeId) Error!bool {
         const sp = (try relationSrcProp(c, s, tp.name)) orelse continue;
         const want = try c.makeUnion2(tp.ty, types.undefined_type);
         const have = if (sp.optional()) try c.makeUnion2(sp.ty, types.undefined_type) else sp.ty;
-        // BOTH directions, not just the assignable one — see the doc comment's
-        // last paragraph.
-        if (!try c.isComparable(have, want)) return false;
+        if (!try c.isAssignable(have, want)) return false;
     }
     return true;
 }
