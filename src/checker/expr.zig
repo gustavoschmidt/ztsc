@@ -5096,8 +5096,8 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
                 result = if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
             } else if (try numericNameIndexHit(c, r, rk, c.atomText(key))) |nt| {
                 result = nt;
-            } else if (rk == .object and c.ts.objectStringIndex(r) != 0) {
-                result = c.ts.objectStringIndex(r);
+            } else if (rk == .object and props_zig.stringIndexForStringKey(c, r) != 0) {
+                result = props_zig.stringIndexForStringKey(c, r);
             } else {
                 // Element access `o['k']` with a string-literal key that is
                 // neither a known property nor covered by a string index is,
@@ -5165,7 +5165,7 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
                 //
                 // Both stay silent — an under-report rather than an invention.
                 const v = c.ts.numberValue(rl);
-                if (rk == .object and c.ts.objectNumberIndex(r) == 0 and c.ts.objectStringIndex(r) == 0 and
+                if (rk == .object and c.ts.objectNumberIndex(r) == 0 and props_zig.stringIndexForStringKey(c, r) == 0 and
                     c.ts.objectFlags(r) & types.obj_flag_global_this == 0 and
                     !c.ts.objectIsLiteralOrigin(r) and
                     v == @floor(v) and @abs(v) < 9007199254740992.0)
@@ -5177,8 +5177,8 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
         },
         .number => result = try c.numberIndexType(r),
         .string => {
-            if (rk == .object and c.ts.objectStringIndex(r) != 0) {
-                result = c.ts.objectStringIndex(r);
+            if (rk == .object and props_zig.stringIndexForStringKey(c, r) != 0) {
+                result = props_zig.stringIndexForStringKey(c, r);
             } else if (rk == .array or rk == .tuple or rk == .string) {
                 result = types.any_type;
             } else if (rk == .object and c.ts.objectIsLiteralOrigin(r)) {
@@ -5238,8 +5238,8 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
             if (ia != types.no_type and ia != types.error_type) {
                 result = ia;
             } else if (try c.typeIsStringLike(ri)) {
-                result = if (rk == .object and c.ts.objectStringIndex(r) != 0)
-                    c.ts.objectStringIndex(r)
+                result = if (rk == .object and props_zig.stringIndexForStringKey(c, r) != 0)
+                    props_zig.stringIndexForStringKey(c, r)
                 else
                     types.any_type;
             } else if (try c.typeIsNumberLike(ri)) {

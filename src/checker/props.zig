@@ -155,9 +155,19 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, o: PropLookup) Error!?types
             // `props.hasOwnProperty(k)` on a `{ [k: string]: ReactNode |
             // ((el) => ReactNode) }` type as the index VALUE rather than
             // as `Object.hasOwnProperty`, so calling it was TS2349.
-            if (s.objectStringIndex(t) != 0) {
+            // …and a `[k: symbol]` signature is not a string index at all: it
+            // shares the slot (`obj_flag_symbol_index`), so the domain has to
+            // be re-checked against the NAME. Only a synthetic symbol atom —
+            // `__@iterator`, `__@u<id>`, `__@k$<ident>` — is inside it;
+            // `z["x"]` on a `{ [k: symbol]: number }` is a TS7053 in tsc, and
+            // answering it from the shared slot silenced every such report.
+            const sidx = if (s.objectFlags(t) & types.obj_flag_symbol_index != 0)
+                (if (symbolNamed(c, name)) s.objectStringIndex(t) else 0)
+            else
+                s.objectStringIndex(t);
+            if (sidx != 0) {
                 if (from_index) |f| f.* = true;
-                return .{ .name = name, .ty = s.objectStringIndex(t), .flags = 0 };
+                return .{ .name = name, .ty = sidx, .flags = 0 };
             }
             return null;
         },
@@ -990,6 +1000,27 @@ pub const filterUnion = nullability.filterUnion;
 pub const getFalsyPart = nullability.getFalsyPart;
 pub const getTruthyPart = nullability.getTruthyPart;
 pub const isZeroBigInt = nullability.isZeroBigInt;
+/// The value of `t`'s `[k: string]` index signature — 0 when the slot really
+/// holds a `[k: symbol]` one. The two share it (`types.obj_flag_symbol_index`),
+/// so every reader asking on behalf of a STRING-domain key has to go through
+/// here: `c.ts.objectStringIndex` alone answers a symbol signature for
+/// `z["x"]`, which tsc reports as TS7053. A reader that has the member NAME
+/// (`propOfTypeEx`) asks the sharper question instead — a `__@`-prefixed atom
+/// IS inside a symbol signature.
+pub fn stringIndexForStringKey(c: *Checker, t: TypeId) TypeId {
+    if (c.ts.objectFlags(t) & types.obj_flag_symbol_index != 0) return 0;
+    return c.ts.objectStringIndex(t);
+}
+
+/// Does `name` stand for a SYMBOL-keyed member? Every one of ztsc's symbol
+/// atoms is synthetic and shares the `__@` prefix a real identifier cannot
+/// start with — `__@iterator` (well-known), `__@u<id>` (a `unique symbol`),
+/// `__@k$<ident>` (an unresolved computed key). Asked only of an object whose
+/// index slot is symbol-keyed, so the text fetch is off every hot lookup.
+fn symbolNamed(c: *Checker, name: Atom) bool {
+    return std.mem.startsWith(u8, c.atomText(name), "__@");
+}
+
 pub const nonNullable = nullability.nonNullable;
 pub const nonNullableChain = nullability.nonNullableChain;
 pub const nonNullableNullish = nullability.nonNullableNullish;
