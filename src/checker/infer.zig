@@ -2579,6 +2579,83 @@ pub fn clampToConstraint(c: *Checker, cand: TypeId, constraint: TypeId) Error!Cl
     return .{ .ty = constraint, .fell_back = true };
 }
 
+/// Which position a signature-relation candidate was inferred from. tsc's
+/// `instantiateSignatureInContextOf` runs `applyToParameterTypes` with
+/// `contravariant: true` and `applyToReturnTypes` covariantly, and the two
+/// answer the constraint clamp below differently.
+pub const SigInferPos = enum { parameter, ret };
+
+/// tsc's `getInferredType` closing clamp, for the SIGNATURE-relation context
+/// (`instantiateSignatureInContextOf`):
+///
+/// ```ts
+/// const constraint = getConstraintOfTypeParameter(inference.typeParameter);
+/// if (constraint) {
+///     const instantiatedConstraint = instantiateType(constraint, context.nonFixingMapper);
+///     if (!inferredType || !context.compareTypes(inferredType, getTypeWithThisArgument(instantiatedConstraint, inferredType))) {
+///         inference.inferredType = inferredType = instantiatedConstraint;
+///     }
+/// }
+/// ```
+///
+/// A candidate that satisfies its already-instantiated constraint is kept; one
+/// that does not is REPLACED — and tsgo 7.0.2 replaces it with different
+/// things depending on where the candidate came from. Measured battery (`T` is
+/// the source signature's own parameter; the target's parameters stay free):
+///
+/// | source | target | tsgo 7.0.2 |
+/// |---|---|---|
+/// | `<T extends string>() => T` | `<Z>() => number` | error, source prints `string` |
+/// | `<T extends string>() => T` | `<Z>() => "a" \| number` | ACCEPTED |
+/// | `<T extends string>() => [T, T]` | `<Z>() => ["a" \| number, "a"]` | ACCEPTED |
+/// | `<T extends string>(x: T) => void` | `<Z>(x: "a" \| number) => void` | error, source param prints `string` |
+///
+/// Row 1 is the plain full-constraint replacement. Row 2 rules the full
+/// constraint OUT in a RETURN position: `() => string` against
+/// `() => "a" | number` IS an error (measured with a non-generic source, where
+/// no instantiation runs), so the source cannot have become `() => string`.
+/// Row 3 rules out keeping the candidate whole, since
+/// `["a" | number, "a" | number]` does not relate to `["a" | number, "a"]`.
+/// What satisfies all three is the constraint-satisfying SUBSET of a union
+/// candidate — which is exactly what `clampToConstraint` computes. Row 4 is
+/// that same partially-satisfying union candidate in a PARAMETER position and
+/// does take the whole constraint, so the position is the axis, not the shape.
+///
+/// `bound` is every type parameter the instantiated constraint may legitimately
+/// still name — the source signature's own and the target's, which stay free.
+/// Anything ELSE in it is a parameter of the type that DECLARED this signature,
+/// left standing because ztsc keys a type parameter by its declaration symbol
+/// and does not clone a generic method's parameters when the containing type is
+/// instantiated (the same gap `instantiateSigInContextOf`'s occurs-check names).
+/// `GrowthBook<AppFeatures>.getFeatureValue<V extends AppFeatures[K], …>` read
+/// off a `GrowthBook<Record<string, any>>` has parameter types with no
+/// `AppFeatures` left in them but a bound that still says `AppFeatures[K]`,
+/// where tsc's clone says `Record<string, any>[K]` — i.e. `any`, which every
+/// candidate satisfies. Clamping to the stale bound invented a `.bind`-shaped
+/// TS2345 on the social-app; declining keeps the pair on the erase path, which
+/// is where it was before this clamp existed.
+pub fn clampSigInference(
+    c: *Checker,
+    cand: TypeId,
+    constraint: TypeId,
+    pos: SigInferPos,
+    bound: []const u32,
+) Error!SigClamp {
+    if (try c.isAssignable(cand, constraint)) return .{ .use = cand };
+    if (try c.containsFreeTypeParam(constraint, bound)) return .decline;
+    return .{ .use = switch (pos) {
+        .parameter => constraint,
+        .ret => (try c.clampToConstraint(cand, constraint)).ty,
+    } };
+}
+
+/// What `clampSigInference` answered for one type parameter: the type to
+/// substitute, or "no trustworthy answer", which drops the whole instantiation.
+pub const SigClamp = union(enum) {
+    use: TypeId,
+    decline,
+};
+
 /// Is this candidate one of the *literal* shapes tsc's
 /// `unionObjectAndArrayLiteralCandidates` pulls out of the covariant set —
 /// an object literal or an array literal? Freshness answers it exactly for
@@ -4415,6 +4492,11 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 }
                 var map_list: std.ArrayList(TpMap) = .empty;
                 defer map_list.deinit(c.scratch());
+                // Clones minted by THIS walk, so their bounds can be rebased
+                // onto the rest of the map once it is complete — see the
+                // `renameMintedBounds` call below.
+                var minted_here: std.ArrayList(u32) = .empty;
+                defer minted_here.deinit(c.scratch());
                 var all_unbound = true;
                 var erased_self = false;
                 for (own_syms, own_cands) |sym, cand0| {
@@ -4576,7 +4658,9 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                             }
                             if (c.infer_ctx.ho_result_fn) if (c.infer_ctx.ho_minted) |list| {
                                 if (!param_rest) try ho_fix.arm(c, param, tp_syms, candidates);
-                                const ft = try s.makeTypeParam(try uniqueTypeParam(c, sym, list));
+                                const clone = try uniqueTypeParam(c, sym, list);
+                                try minted_here.append(c.scratch(), clone);
+                                const ft = try s.makeTypeParam(clone);
                                 if (!param_rest) {
                                     candidates[oi] = ft;
                                     // The slot this instantiation DETERMINED is
@@ -4631,7 +4715,9 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                         try paramsMentionFreeVar(c, param, tp_syms, candidates))
                     {
                         if (c.infer_ctx.ho_minted) |list| {
-                            const ft = try s.makeTypeParam(try uniqueTypeParam(c, sym, list));
+                            const clone = try uniqueTypeParam(c, sym, list);
+                            try minted_here.append(c.scratch(), clone);
+                            const ft = try s.makeTypeParam(clone);
                             all_unbound = false;
                             try map_list.append(c.scratch(), .{ .sym = sym, .ty = ft });
                             continue;
@@ -4643,6 +4729,7 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                     const v = if (cand != types.no_type) cand else try c.typeParamFallback(sym);
                     try map_list.append(c.scratch(), .{ .sym = sym, .ty = v });
                 }
+                try renameMintedBounds(c, minted_here.items, map_list.items);
                 // Only substitute when something was actually inferred —
                 // an unbound-everything map would erase params to their
                 // fallbacks and *lose* inference the caller could still do.
@@ -5951,6 +6038,34 @@ fn mintUniqueTypeParam(c: *Checker, src: u32) Error!u32 {
         c.fresh_tp_info.items[id - c.fresh_tp_base].constraint = try c.instantiate(con0, &ren);
     }
     return id;
+}
+
+/// Rebase the bounds of the clones a higher-order walk just minted onto the
+/// map that walk built, so a bound naming a SIBLING of the parameter it came
+/// from names that sibling's clone instead of the original.
+///
+/// `mintUniqueTypeParam` can only rename the self-reference: when it runs, the
+/// siblings have not been minted yet. tsc has no such ordering problem — it
+/// instantiates the whole signature with one mapper over all of its type
+/// parameters (`getUniqueTypeParameters` feeding `instantiateSignature`), so
+/// `<T, U extends T>` clones to `<T', U' extends T'>` in one step. Leaving the
+/// bound pointing at the original `T` left `U'` constrained by a parameter
+/// nothing in the instantiated signature binds, and the ensuing
+/// `instantiateSigInContextOf` then found `U'` unassignable to the `T'` that
+/// stood in the same position: `wrap3(baz)` with
+/// `baz<T, U extends T>(t1: T, t2: T, u: U)` rejected a call tsc accepts
+/// (`genericFunctionInference1`'s `f60`).
+///
+/// Idempotent: a clone reused from an earlier argument of the same call has a
+/// bound that already names clones, and this map is keyed by the ORIGINAL
+/// parameter symbols, so re-running it substitutes nothing.
+fn renameMintedBounds(c: *Checker, minted: []const u32, map: []const TpMap) Error!void {
+    if (minted.len == 0 or map.len == 0) return;
+    for (minted) |id| {
+        const slot = &c.fresh_tp_info.items[id - c.fresh_tp_base];
+        if (slot.constraint == types.no_type) continue;
+        slot.constraint = try c.instantiate(slot.constraint, map);
+    }
 }
 
 /// Mint a throwaway element inference variable for `inferReverseMapped`.
