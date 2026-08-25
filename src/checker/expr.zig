@@ -3569,6 +3569,13 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
     defer getter_keys.deinit(c.scratch());
     var setter_keys: std.AutoHashMapUnmanaged(Atom, void) = .empty;
     defer setter_keys.deinit(c.scratch());
+    // The setter's PARAMETER type per accessor key, so a divergent pair
+    // (`get x(): string; set x(v: string | number)`) can be stamped on the
+    // property as `types.Prop.write_ty` in the post-pass below. Recorded in a
+    // map rather than on the prop directly because the getter may be written
+    // either side of the setter.
+    var setter_params: std.AutoHashMapUnmanaged(Atom, TypeId) = .empty;
+    defer setter_params.deinit(c.scratch());
     // Value types of computed keys that widen to `string`/`number` — they
     // become the object's index signatures (`{ [layer]: v }` → `{ [x:
     // string]: v }`), matching tsc. Multiple such keys union their values.
@@ -3826,12 +3833,15 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
                         try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = gt });
                     } else {
                         try setter_keys.put(c.scratch(), key, {});
+                        const st = if (c.ts.kind(sig) == .function and c.ts.fnParamCount(sig) > 0)
+                            c.ts.fnParam(sig, 0).ty
+                        else
+                            types.any_type;
+                        // Kept for the write-type post-pass whether or not a
+                        // getter claimed the property type.
+                        try setter_params.put(c.scratch(), key, st);
                         // A getter, if present, wins the property type.
                         if (!getter_keys.contains(key)) {
-                            const st = if (c.ts.kind(sig) == .function and c.ts.fnParamCount(sig) > 0)
-                                c.ts.fnParam(sig, 0).ty
-                            else
-                                types.any_type;
                             try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = st });
                         }
                     }
@@ -3945,9 +3955,30 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
         if (setter_keys.contains(k.*)) continue;
         if (prop_index.get(k.*)) |idx| props.items[idx].flags |= types.prop_flag_readonly;
     }
-    // `{...} as const`: every property is readonly.
+    // A get/set pair whose two annotations DIFFER writes at the SETTER's
+    // parameter (tsc's `getWriteTypeOfSymbol`), so `o.x = 42` against
+    // `get x(): string; set x(v: string | number)` is legal. An object
+    // literal is a MATERIALIZED object with no declaration to walk back to,
+    // which is exactly the shape `types.Prop.write_ty` exists for — see the
+    // longer note on the type-literal builder in `typenode.zig`. Same type on
+    // both sides stores nothing, so an ordinary literal's shape is unchanged.
+    {
+        var sit = setter_params.iterator();
+        while (sit.next()) |e| {
+            const idx = prop_index.get(e.key_ptr.*) orelse continue;
+            if (props.items[idx].ty == e.value_ptr.*) continue;
+            props.items[idx].write_ty = e.value_ptr.*;
+        }
+    }
+    // `{...} as const`: every property is readonly. tsc reaches the same
+    // place through `getSpreadSymbol(prop, /*readonly*/ true)`, which rebuilds
+    // the symbol with a `links.type` alone — no write type survives, which is
+    // the right answer anyway since nothing may be written.
     if (c.const_ctx) {
-        for (props.items) |*p| p.flags |= types.prop_flag_readonly;
+        for (props.items) |*p| {
+            p.flags |= types.prop_flag_readonly;
+            p.write_ty = types.no_type;
+        }
     }
     // A literal that SPREADS takes its index signatures from the fold — every
     // part has to declare one (`SpreadIndexFold`). One that does not spread
@@ -6853,12 +6884,18 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
             // The index expression is checked here rather than only inside
             // `readonlyIndexWriteAt` below; that call re-asks it through
             // `checkExprCached`, so the ordinary path pays nothing extra.
+            const key_ty: TypeId = if (c.nodeTag(d.rhs) == .string_literal)
+                types.no_type
+            else
+                try c.checkExprCached(d.rhs, types.no_type);
             const key: ?Atom = if (c.nodeTag(d.rhs) == .string_literal)
                 try c.memberAtom(c.tree.nodeMainToken(d.rhs))
             else
-                try computed_key.lateBoundName(c, d.rhs, try c.checkExprCached(d.rhs, types.no_type));
+                try computed_key.lateBoundName(c, d.rhs, key_ty);
             if (key) |name| {
                 if (try setterWriteType(c, obj_t, name, 0)) |wt| return wt;
+            } else if (key_ty != types.no_type and c.ts.kind(key_ty) == .union_type) {
+                if (try unionKeyWriteType(c, obj_t, key_ty)) |wt| return wt;
             }
             const r = try c.resolveStructural(obj_t);
             if (try readonlyIndexWriteAt(c, r, node, d.rhs)) return types.error_type;
@@ -6892,6 +6929,49 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
         },
         else => return c.checkExprCached(node, types.no_type),
     }
+}
+
+/// `o[k] = v` where `k`'s type is a UNION of string-literal keys writes at
+/// the INTERSECTION of the per-key write types: tsc's `getIndexedAccessType`
+/// under `AccessFlags.Writing` distributes over the index union and
+/// intersects, because the value has to be legal for whichever key `k` turns
+/// out to name. With `set prop1(s: boolean | string)` and
+/// `set prop2(s: boolean | null)`, `s1[k1] = 42` is a TS2322 against
+/// `boolean` even though 42 is fine against the READ type of both
+/// (`divergentAccessorsTypes8`).
+///
+/// Answers null unless SOME key declares a divergent setter, so an ordinary
+/// indexed write keeps the read-type path — and pays only the first pass,
+/// which is the same "look before you gather" split `setterWriteType`'s own
+/// union arm makes for the same reason.
+fn unionKeyWriteType(c: *Checker, obj_t: TypeId, key_ty: TypeId) Error!?TypeId {
+    // `members` dangles as soon as the recursion interns anything.
+    const ks = try c.scratch().dupe(TypeId, c.ts.members(key_ty));
+    defer c.scratch().free(ks);
+    var any_divergent = false;
+    for (ks) |k| {
+        if (c.ts.kind(k) != .string_literal) return null;
+        if (try setterWriteType(c, obj_t, c.ts.literalAtom(k), 0)) |_| {
+            any_divergent = true;
+            break;
+        }
+    }
+    if (!any_divergent) return null;
+    var parts: std.ArrayList(TypeId) = .empty;
+    defer parts.deinit(c.scratch());
+    try parts.ensureTotalCapacityPrecise(c.scratch(), ks.len);
+    for (ks) |k| {
+        const name = c.ts.literalAtom(k);
+        if (try setterWriteType(c, obj_t, name, 0)) |wt| {
+            parts.appendAssumeCapacity(wt);
+            continue;
+        }
+        // A key the receiver does not have at all: the ACCESS is the error,
+        // so leave the write type to the ordinary read-type path.
+        const p = (try c.propOfType(obj_t, name)) orelse return null;
+        parts.appendAssumeCapacity(p.ty);
+    }
+    return try c.ts.makeIntersection(c.scratch(), parts.items);
 }
 
 /// Since TS 4.3 a get/set pair may declare DIFFERENT types

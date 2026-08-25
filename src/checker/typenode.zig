@@ -1613,8 +1613,23 @@ fn addSpreadProp(
     if (p.flags & types.prop_flag_optional != 0) {
         if (prop_index.get(p.name)) |idx| {
             props.items[idx].ty = try c.logicalUnion(props.items[idx].ty, try c.removeUndefined(p.ty));
+            // tsc builds a BRAND-NEW symbol for this merge and gives it only
+            // a `links.type`, so whatever divergent write type either side
+            // had is gone: the merged property writes at its read type.
+            props.items[idx].write_ty = types.no_type;
             return;
         }
     }
-    try upsertProp(c.scratch(), props, prop_index, .{ .name = p.name, .ty = p.ty, .flags = p.flags & types.prop_flag_optional });
+    // A property the spread carries over WHOLE is tsc's
+    // `getSpreadSymbol(prop, /*readonly*/ false)`, which hands back the very
+    // symbol it was given — so a divergent get/set pair keeps its write type
+    // and `({ ...t }).x = 42` is legal wherever `t.x = 42` is. (The `readonly`
+    // spelling that would rebuild the symbol without one is `as const`, and
+    // `checkObjectLiteral` clears the write types there for that reason.)
+    try upsertProp(c.scratch(), props, prop_index, .{
+        .name = p.name,
+        .ty = p.ty,
+        .write_ty = p.write_ty,
+        .flags = p.flags & types.prop_flag_optional,
+    });
 }
