@@ -68,8 +68,8 @@ const template_zig = @import("template.zig");
 /// means anything against a different frame decomposition. What has to match is
 /// which PROGRAMS overflow, so the value is measured: it sits far above the
 /// most expensive query in the corpus, the conformance suite and both
-/// benchmark apps, and far below the one query tsc rejects. See the wave-35
-/// notes in `docs/ts-suite-campaign.md` for the measured distribution.
+/// benchmark apps, and far below the one query tsc rejects. `debug_rel_steps`
+/// below is the hook that measured it, and re-measures it.
 pub const max_relation_steps: u32 = 4_000_000;
 
 /// Calibration hook for `max_relation_steps`: print every top-level relation
@@ -986,6 +986,48 @@ pub const checkVarianceAnnotations = variance_zig.checkVarianceAnnotations;
 
 /// The generic reference a type denotes: itself when it IS one, otherwise
 /// the canonical origin ref of a materialized instantiation (see `origin`).
+/// The constraint the RELATION may read off type parameter `tp`, or `no_type`
+/// when it may read none.
+///
+/// The one case where a written constraint is not one is the CIRCULAR one
+/// (TS2313): in `<T extends T>`, or `<T extends U, U extends T>`, the chain of
+/// bare parameter-to-parameter constraints closes on the parameter it started
+/// from, and a parameter constrained by itself says nothing about its values.
+/// tsc resolves that chain to its `circularConstraintType` marker, whose
+/// apparent type is `unknown` — so `function foo<T extends T>(x: T): number {
+/// return x }` is a TS2322 there (`compiler/typeParameterHasSelfAsConstraint`).
+///
+/// Without the check the relation reads `T`'s constraint as `T`, re-asks its
+/// own question, and the in-progress mark answers YES (the co-inductive cycle
+/// cut — see `RelAnswer`), so `T` came out assignable to `number`, to
+/// `string`, and to everything else. The cut is right for a recursive TYPE,
+/// whose members really do close the circle one level down; here there is no
+/// second constituent to close it with, so the circle is the whole answer.
+///
+/// Walks the chain rather than testing `constraint == tp` alone so the mutual
+/// form is caught too, and bounds the walk: `typeParamConstraint` breaks its
+/// own re-entry with `no_type`, but only for a parameter already being
+/// RESOLVED, which a fully-resolved chain read from here is not.
+fn relationConstraintOf(c: *Checker, tp: TypeId) Error!TypeId {
+    const constraint = try c.typeParamConstraint(c.ts.typeParamSymbol(tp));
+    if (constraint == types.no_type) return types.no_type;
+    var cur = constraint;
+    var steps: u32 = 0;
+    while (c.ts.kind(cur) == .type_param and steps < max_tp_constraint_chain) : (steps += 1) {
+        if (cur == tp) return types.no_type;
+        const next = try c.typeParamConstraint(c.ts.typeParamSymbol(cur));
+        if (next == types.no_type) break;
+        cur = next;
+    }
+    return constraint;
+}
+
+/// How far `relationConstraintOf` follows a parameter-to-parameter constraint
+/// chain looking for the parameter it started from. A written type-parameter
+/// list is what bounds the real chains; the constant only keeps a malformed
+/// one from spinning.
+const max_tp_constraint_chain: u32 = 64;
+
 /// Is `m` one of `union_members` — tsc's `containsType`, and O(log n) for the
 /// same reason: a union's constituent list is canonical, so it is sorted by
 /// `TypeId` (`Store.makeUnion`) and membership is a binary search rather than
@@ -2975,9 +3017,8 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         // after single-member matching, and exactly tsc's rule (relate the
         // constraint), so it only ever accepts more.
         if (sk == .type_param) {
-            const constraint = try c.typeParamConstraint(c.ts.typeParamSymbol(s));
-            if (constraint != types.no_type and constraint != s and
-                try c.isAssignable(constraint, t)) return true;
+            const constraint = try relationConstraintOf(c, s);
+            if (constraint != types.no_type and try c.isAssignable(constraint, t)) return true;
         }
         // Discriminated-union normalization: a source object whose
         // discriminant property is a union may still be assignable to a
@@ -3300,7 +3341,7 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
     }
     // Type parameters.
     if (sk == .type_param) {
-        const constraint = try c.typeParamConstraint(c.ts.typeParamSymbol(s));
+        const constraint = try relationConstraintOf(c, s);
         if (constraint != types.no_type) return c.isAssignable(constraint, t);
         return false;
     }
