@@ -992,6 +992,32 @@ pub fn decidableConstraintSet(c: *Checker, con: TypeId) Error!bool {
             // Structural: decided by the relation. `undecidableType` has
             // already refused anything still deferred inside it.
             .object, .ref => if (try c.undecidableType(cur)) return false,
+            // A CALLABLE constraint — `T extends (...args: any) => any`,
+            // `T extends () => void` — is structural in exactly the same
+            // sense: signature compatibility is what the relation decides,
+            // and it decides it correctly (`typeof C` against `(...args:
+            // any) => any` is already the right TS2322 at an assignment).
+            // Excluded before, only because the kind was absent from this
+            // list, which silently skipped the whole `Parameters<…>` /
+            // `ReturnType<…>` family.
+            //
+            // `undecidableType` treats a `.function` as an opaque leaf (it
+            // is written for the ARGUMENT side, where descending into a
+            // signature would judge every generic's own members), so the
+            // deferral screen is applied to the signature's own parts here.
+            // A constraint signature with its OWN type parameters
+            // (`T extends <U>(x: U) => U`) is not a decided set: the
+            // relation would have to infer, so it stays out.
+            .function => {
+                if (s.fnTypeParams(cur).len != 0) return false;
+                if (try c.undecidableType(s.fnReturn(cur))) return false;
+                for (0..s.fnParamCount(cur)) |i| {
+                    if (try c.undecidableType(s.fnParam(cur, @intCast(i)).ty)) return false;
+                }
+            },
+            .overloads => {
+                for (0..s.memberCount(cur)) |i| try stack.append(c.scratch(), s.memberAt(cur, i));
+            },
             .string,
             .number,
             .boolean,
