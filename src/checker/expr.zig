@@ -51,6 +51,7 @@ const narrowable = @import("narrowable.zig");
 const hasTypeMeaning = @import("names.zig").hasTypeMeaning;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
 const identity = @import("identity.zig");
+const keyof = @import("keyof.zig");
 const indexableConstituent = @import("typenode.zig").indexableConstituent;
 const negatedBigIntLiteral = @import("typenode.zig").negatedBigIntLiteral;
 const init = Checker.init;
@@ -5229,6 +5230,10 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
                     });
                     result = types.error_type;
                 }
+            } else if (c.ts.kind(rt) == .union_type and
+                try unionTupleIndexMiss(c, rt, obj_t, c.ts.numberValue(rl), d.rhs))
+            {
+                result = types.error_type;
             } else if (try c.numericKeyProp(r, rl)) |p| {
                 // tsc's `getPropertyNameFromIndex`: a NUMERIC-literal key
                 // names a property exactly as a string-literal one does —
@@ -7352,6 +7357,24 @@ pub fn checkDestructuringPattern(c: *Checker, node: Node, src: TypeId) Error!voi
     }
 }
 
+/// `o[n]` with a numeric-literal key and a receiver whose every constituent is
+/// a TUPLE, past the end of all of them — the element-access spelling of the
+/// rule `keyof.zig` runs on a written `T[2]`. A single tuple is handled by the
+/// arm above (which has the arity in hand); this is the UNION case, where tsc's
+/// `getPropertyOfUnionOrIntersectionType` finds no property at all and reports
+/// the generic TS2339 rather than the tuple-arity TS2493.
+///
+/// The 4096 bound is `refkey.constIndexOf`'s: past it no tuple has the
+/// position anyway, and the report would be about a receiver ztsc does not
+/// model — silence is the safe answer.
+fn unionTupleIndexMiss(c: *Checker, rt: TypeId, obj: TypeId, v: f64, at: Node) Error!bool {
+    if (v < 0 or v != @floor(v) or v >= 4096) return false;
+    const n: u32 = @intFromFloat(v);
+    if (try keyof.tupleIndexVerdict(c, rt, n) != .out_of_range) return false;
+    try keyof.reportTupleIndexOutOfRange(c, rt, obj, n, at);
+    return true;
+}
+
 /// The element type an ARRAY destructuring-assignment pattern reads its
 /// positions through when the source carries no numeric domain of its own —
 /// tsc's `checkArrayLiteralAssignment` computes it once for the whole pattern
@@ -7443,11 +7466,26 @@ fn destructuringHasDefault(c: *Checker, el0: Node) bool {
 /// by indexed access only where `isArrayLikeType(source)` holds and otherwise
 /// hands every element that one iterated type, so a source with no numeric
 /// domain (a `Set`, a `Generator`) still types its positions.
-fn destructuringElementType(c: *Checker, src: TypeId, iterated: TypeId, index: u32) Error!TypeId {
+///
+/// A position past the end of every TUPLE constituent is that indexed access's
+/// own diagnostic, not the write's: tsc reaches the position through
+/// `getIndexedAccessTypeOrUndefined(source, <index>, ExpressionPosition |
+/// (hasDefaultValue ? AllowMissing : 0), <synthetic node at the element>)`, and
+/// the access reports TS2493 (one tuple) / TS2339 (a union of them) at the
+/// element and answers `errorType`. Reporting it here is what keeps
+/// `[a, b, c] = someTwoTuple` from being the TS2322 the widened iterated type
+/// would otherwise produce at the third target.
+fn destructuringElementType(c: *Checker, el: Node, src: TypeId, iterated: TypeId, index: u32) Error!TypeId {
     if (src == types.no_type) return types.no_type;
     const r = try c.resolveStructural(src);
     const rk = c.ts.kind(r);
     if (rk == .any or rk == .err) return types.any_type;
+    if (!destructuringHasDefault(c, el) and
+        try keyof.tupleIndexVerdict(c, r, index) == .out_of_range)
+    {
+        try keyof.reportTupleIndexOutOfRange(c, r, src, index, el);
+        return types.error_type;
+    }
     if (try numericIndexHit(c, r, rk, @floatFromInt(index))) |t| return t;
     return iterated;
 }
@@ -7543,7 +7581,7 @@ fn checkArrayDestructuringElement(c: *Checker, el: Node, src: TypeId, iterated: 
             }
             try checkDestructuringTarget(c, target, try arrayRestSourceType(c, src, iterated, index), .assignment);
         },
-        else => try checkDestructuringTarget(c, el, try destructuringElementType(c, src, iterated, index), .assignment),
+        else => try checkDestructuringTarget(c, el, try destructuringElementType(c, el, src, iterated, index), .assignment),
     }
 }
 
