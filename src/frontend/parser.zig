@@ -274,6 +274,14 @@ const Parser = struct {
     /// Speculation depth; > 0 makes expectation failures raise Backtrack.
     spec: u32 = 0,
 
+    /// tsc's `parsingContext` bitset, kept for exactly the two list contexts a
+    /// BINDING PATTERN's error recovery has to consult — see
+    /// `abandonsBindingPattern`. Purely a save/restore stack discipline,
+    /// like tsc's own `saveParsingContext`; it accumulates
+    /// on the way down and is never cleared, so a pattern inside a function
+    /// nested in a declarator's initializer still sees the declarator list.
+    list_ctx: u8 = 0,
+
     /// Start offset of the last SYNTACTIC diagnostic recorded, for tsc's
     /// one-per-position rule (`addDiag`). Not derivable from `diags` — the last
     /// entry there may be a grammar-class one, which does not participate.
@@ -2700,6 +2708,13 @@ const Parser = struct {
         }
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
+        // tsc's `parsingContext |= 1 << ParsingContext.VariableDeclarations`.
+        // It stays set for the whole list, INITIALIZERS included, which is why
+        // `const f = function({ ; }) {}` abandons the pattern at the `;` where
+        // the same pattern in a plain `function f({ ; }) {}` skips it.
+        const saved_ctx = p.list_ctx;
+        defer p.list_ctx = saved_ctx;
+        p.list_ctx |= ListCtx.var_decls;
         var trailing_comma: ?u32 = null;
         list: while (true) {
             // `parseDelimitedList` asks `isListElement` at the top of EVERY
@@ -3604,6 +3619,12 @@ const Parser = struct {
         _ = try p.bump();
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
+        // tsc's `parsingContext |= 1 << ParsingContext.Parameters`, restored on
+        // the way out; a binding pattern in here consults it to decide whether
+        // a token it cannot use belongs to this list (`abandonsBindingPattern`).
+        const saved_ctx = p.list_ctx;
+        defer p.list_ctx = saved_ctx;
+        p.list_ctx |= ListCtx.params;
         // TS1014, tsc's `checkGrammarParameterList`: a rest parameter must be
         // LAST. Blamed on the `...` (`grammarErrorOnNode(parameter.
         // dotDotDotToken, …)`), and the walk RETURNS at its first hit, so only
@@ -3677,7 +3698,12 @@ const Parser = struct {
             // exactly when the last thing consumed was a comma — i.e. when the
             // list has a TRAILING one (tsc's `NodeArray.hasTrailingComma`).
             trailing_comma = try p.eat(.comma);
-            if (trailing_comma == null and p.curTag() != .r_paren) {
+            // End of file ends EVERY list in tsc — `isListTerminator` answers
+            // `true` for it before it looks at `kind` at all — so the list is
+            // over and the missing `)` is the only thing left to say. Demanding
+            // the comma first put "',' expected" where tsgo has "')' expected"
+            // (same code, same position, wrong wording).
+            if (trailing_comma == null and p.curTag() != .r_paren and p.curTag() != .eof) {
                 try p.fail(.expected_comma);
             }
         }
@@ -3955,6 +3981,62 @@ const Parser = struct {
 
     // --- binding patterns ---------------------------------------------------
 
+    /// The two members of tsc's `ParsingContext` a binding pattern's recovery
+    /// asks about (`list_ctx`, `abandonsBindingPattern`). Nothing else needs a
+    /// bit: the statement list is on tsc's stack unconditionally, and the
+    /// pattern's OWN list answers for itself before the recovery runs.
+    const ListCtx = struct {
+        /// `ParsingContext.Parameters`.
+        const params: u8 = 1 << 0;
+        /// `ParsingContext.VariableDeclarations`.
+        const var_decls: u8 = 1 << 1;
+    };
+
+    /// The tokens `isStartOfParameter` accepts that `abandonsBindingPattern`
+    /// does not already reach through `atStartOfStatement`. Everything else in
+    /// that predicate — `<`, `|`, `&`, `*`, `!`, `@`, every literal, every
+    /// template — is a statement start too, and `...` plus the binding names
+    /// are elements of the pattern rather than tokens its recovery ever sees.
+    /// `)` and `]` are the list's TERMINATORS (tsc's `isListTerminator(
+    /// Parameters)`), and `?` is a type start.
+    fn startsOrEndsParameter(tag: TokTag) bool {
+        return switch (tag) {
+            .r_paren, .r_bracket, .question => true,
+            else => false,
+        };
+    }
+
+    /// tsc's `isInSomeParsingContext`, as `abortParsingListOrMoveToNextToken`
+    /// asks it from an object- or array-BINDING-PATTERN list: does some
+    /// ENCLOSING list want this token, so the pattern must end and hand it
+    /// back, or is it junk to step over and keep reading? Three contexts can be
+    /// on the stack:
+    ///
+    ///   - the statement list, always — `isStartOfStatement`, MINUS `;`. tsc
+    ///     passes `inErrorRecovery: true` from here, and its
+    ///     `isListElement(SourceElements)` then refuses to read a `;` as an
+    ///     empty statement ("';' can show up in far too many contexts"). That
+    ///     one exclusion is why `function f({ ; }) {}` is a lone TS1180 for
+    ///     tsgo where ztsc used to abandon the pattern and invent a TS1003 on
+    ///     the `}` (`parametersSyntaxErrorNoCrash1`/`2`).
+    ///   - `Parameters`, when the pattern is a parameter's name.
+    ///   - `VariableDeclarations`, when it is a declarator's name. This is the
+    ///     bit that keeps `const { ; } = x` abandoning the pattern —
+    ///     `isVariableDeclaratorListTerminator` accepts anything a `;` could
+    ///     stand in for, a PRECEDING LINE BREAK included — while the very same
+    ///     `;` inside a parameter list is skipped.
+    ///
+    /// A declarator's own `atStartOfDeclarator` and a parameter's own start
+    /// tokens are folded in for completeness; neither can actually reach here,
+    /// since a token that starts a declarator starts a pattern element too.
+    fn abandonsBindingPattern(p: *Parser) bool {
+        if (p.curTag() != .semicolon and p.atStartOfStatement()) return true;
+        if (p.list_ctx & ListCtx.params != 0 and startsOrEndsParameter(p.curTag())) return true;
+        if (p.list_ctx & ListCtx.var_decls != 0 and
+            (p.varDeclaratorListDone() or p.atStartOfDeclarator())) return true;
+        return false;
+    }
+
     /// A binding name: an identifier or a destructuring pattern.
     ///
     /// `private_code` is what a `#name` here earns — tsc's
@@ -4024,15 +4106,14 @@ const Parser = struct {
                 //
                 // …and `abortParsingListOrMoveToNextToken`'s two-way recovery.
                 // A token some ENCLOSING list would take ends this one and is
-                // left where it is (`isInSomeParsingContext`, approximated by
-                // the statement list, which is the enclosing context that
-                // matters here): `let[0] = 100` leaves `0` to become the
-                // expression statement tsc parses. Anything else — an operator
-                // no list starts with — is SKIPPED and the pattern keeps
-                // reading, so `var [...x = a]` stays one diagnostic instead of
-                // handing `= a]` to the enclosing declarator.
+                // left where it is (`abandonsBindingPattern`): `let[0] = 100`
+                // leaves `0` to become the expression statement tsc parses.
+                // Anything else — an operator no list starts with — is SKIPPED
+                // and the pattern keeps reading, so `var [...x = a]` stays one
+                // diagnostic instead of handing `= a]` to the enclosing
+                // declarator.
                 try p.fail(.expected_binding_pattern_element);
-                if (p.atStartOfStatement()) break;
+                if (p.abandonsBindingPattern()) break;
                 _ = try p.bump();
                 continue;
             }
@@ -4141,8 +4222,18 @@ const Parser = struct {
                     .data = .{ .lhs = key_expr, .rhs = target },
                 }));
             } else {
+                // `abortParsingListOrMoveToNextToken`, exactly as the array
+                // pattern above: report the LIST's TS1180 and then either hand
+                // the token back to an enclosing list or step over it and keep
+                // reading. Ending the pattern unconditionally left the `}` for
+                // the enclosing parameter list to answer for, which is the
+                // TS1003 `parametersSyntaxErrorNoCrash1`/`2` used to carry;
+                // `function f({ , a }) {}` and `const { , a } = x` are the same
+                // shape one token earlier.
                 try p.fail(.expected_binding_pattern_property);
-                if (p.curIdx() == before) break;
+                if (p.abandonsBindingPattern()) break;
+                _ = try p.bump();
+                continue;
             }
             if (try p.eat(.comma) == null and p.curTag() != .r_brace) {
                 try p.fail(.expected_comma);
