@@ -2628,10 +2628,7 @@ const Linker = struct {
                 } else if (!sameStarTarget(gop.value_ptr.target, tgt)) {
                     try star_dups.append(l.scratch, .{ .name = name, .node = rec.node });
                 }
-                if (t.contains(name)) continue;
-                var final = tgt;
-                final.markTypeOnly(.exported(rec.type_only));
-                try t.put(l.scratch, name, final);
+                _ = try l.starPutFile(t, name, tgt, rec.type_only);
             }
         }
         try l.reportStarCollisions(file, t, own_exports, &star_first, star_dups.items);
@@ -3532,8 +3529,23 @@ const Linker = struct {
         }
     }
 
-    /// One `export *`-merged name into a FILE's export table (`starPut`'s twin
-    /// for the file side). True when it was actually new.
+    /// One `export *`-merged name into an export table. True when the table
+    /// actually changed — the fixed-point drivers' signal.
+    ///
+    /// `default` and the reserved `export=` key never travel, and the first
+    /// contributor of a name wins. The one thing a LATER contributor can still
+    /// change is the type-only mark: tsc's `getExportsOfModuleWorker` builds
+    /// `typeOnlyExportStarMap` from the `export type *` clauses and then
+    /// deletes from it every name a NON-type-only visit also reached, so
+    ///
+    ///     export type * from "./a";
+    ///     export * from "./a";
+    ///
+    /// publishes `./a`'s names as VALUES. Keeping the first star's mark made
+    /// every use of them TS1362 (`exportNamespace5`, `exportNamespace8`).
+    /// Only the star's own mark is cancelled; a mark the target already
+    /// carried — an `export type { X }` specifier upstream — is a property of
+    /// the alias and stands.
     fn starPutFile(
         l: *Linker,
         dst: *std.AutoArrayHashMapUnmanaged(Atom, Target),
@@ -3542,9 +3554,16 @@ const Linker = struct {
         type_only: bool,
     ) Error!bool {
         if (name == l.atom_default or name == l.atom_export_equals) return false;
-        if (dst.contains(name)) return false;
+        if (dst.getPtr(name)) |cur| {
+            if (type_only or !cur.type_only_from_star) return false;
+            cur.type_only = false;
+            cur.type_only_from_export = false;
+            cur.type_only_from_star = false;
+            return true;
+        }
         var final = tgt;
         final.markTypeOnly(.exported(type_only));
+        final.type_only_from_star = type_only and !tgt.type_only;
         try dst.put(l.scratch, name, final);
         return true;
     }
@@ -3559,16 +3578,10 @@ const Linker = struct {
         return false;
     }
 
-    /// One `export *`-merged name into ambient table `dst_idx`. True when it
-    /// was actually new (the fixed-point driver's change signal).
+    /// `starPutFile` addressed by ambient-registry index rather than by table
+    /// pointer — the registry's values are the same kind of export table.
     fn starPut(l: *Linker, dst_idx: usize, name: Atom, tgt: Target, type_only: bool) Error!bool {
-        if (name == l.atom_default or name == l.atom_export_equals) return false;
-        const dst = &l.ambient.values()[dst_idx];
-        if (dst.contains(name)) return false;
-        var final = tgt;
-        final.markTypeOnly(.exported(type_only));
-        try dst.put(l.scratch, name, final);
-        return true;
+        return l.starPutFile(&l.ambient.values()[dst_idx], name, tgt, type_only);
     }
 
     fn lookupAmbient(l: *Linker, spec: Atom, name: Atom) ?Target {

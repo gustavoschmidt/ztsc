@@ -373,6 +373,14 @@ pub const Target = struct {
     /// Which side of the boundary the NEAREST such declaration sits on —
     /// meaningful only when `type_only`. See `TypeOnly`.
     type_only_from_export: bool = false,
+    /// The `type_only` mark above is owed to an `export type * from "m"` —
+    /// tsc's `typeOnlyExportStarMap` — and not to a declaration of the name
+    /// itself. Only THAT mark is cancellable: `getExportsOfModuleWorker`
+    /// collects the names every NON-type-only visit reaches and deletes them
+    /// from the map, so a name a module publishes through both `export type *`
+    /// and a plain `export *` is a value. An `export type { X }` specifier's
+    /// mark travels with the alias symbol and survives regardless.
+    type_only_from_star: bool = false,
 
     pub fn typeOnly(t: Target) TypeOnly {
         return .{ .on = t.type_only, .from_export = t.type_only_from_export };
