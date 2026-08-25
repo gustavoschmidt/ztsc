@@ -561,10 +561,18 @@ pub fn sigNonArrayRest(c: *Checker, sig: TypeId) Error!?NonArrayRest {
     const p = c.ts.fnParam(sig, count - 1);
     if (!p.rest()) return null;
     switch (c.ts.kind(p.ty)) {
-        .union_type, .ref, .tuple => {},
+        .union_type, .ref, .tuple, .never => {},
         else => return null,
     }
     const r = try c.resolveStructural(p.ty);
+    // A `never` rest (`(...args: never) => void`, the #48840 "top function
+    // type") takes no argument list at all: `getEffectiveRestType` hands it
+    // back untouched and the packed argument tuple then has to satisfy
+    // `never`, which nothing does. `foo()` is "Argument of type '[]' is not
+    // assignable to parameter of type 'never'" — an EMPTY list is still a
+    // list, so the call is rejected where the per-position walk, having no
+    // position to look at, said nothing (`topFunctionTypeNotCallable`).
+    if (c.ts.kind(r) == .never) return .{ .ty = r, .from = count - 1 };
     if (c.ts.kind(r) == .union_type) return .{ .ty = r, .from = count - 1 };
     if (c.ts.kind(r) != .tuple) return null;
     const fixed = tuple_relate.fixedLength(c, r);

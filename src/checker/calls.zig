@@ -28,6 +28,7 @@ const ModuleRef = @import("typenode.zig").ModuleRef;
 const identity = @import("identity.zig");
 const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
+const NonArrayRest = @import("typenode.zig").NonArrayRest;
 const tuple_relate = @import("tuple_relate.zig");
 const accessibility = @import("accessibility.zig");
 const classes = @import("classes.zig");
@@ -2712,6 +2713,36 @@ fn forgetNodeTypesCovering(c: *Checker, file: modules.FileId, root: Node, spots:
     }
 }
 
+/// `getSignatureApplicabilityError`'s REST half, asked silently: does the
+/// spread argument list, packed as one type, satisfy `sig`'s non-array rest?
+///
+/// Answers "yes" for everything it cannot pack faithfully — a signature with
+/// no non-array rest, and any window `checkCallArguments` also declines to
+/// pack — so this only ever WITHDRAWS the unconditional pass a spread used to
+/// get, never adds one.
+fn spreadRestMatches(c: *Checker, rest: ?NonArrayRest, arg_nodes: []const Node) Error!bool {
+    const w = rest orelse return true;
+    var eff: std.ArrayList(EffArg) = .empty;
+    defer eff.deinit(c.scratch());
+    const spread_at = try effectiveArgs(c, arg_nodes, &eff);
+    if (w.from > eff.items.len) return true;
+    const whole = wholeSpreadPack(eff.items, spread_at, w.from);
+    if (whole != types.no_type) return try c.isAssignable(whole, w.ty);
+    // A spread that expanded to a FIXED list leaves no unbounded entry, so
+    // the pack is just those entries — but only when the expansion typed
+    // every one of them: an argument WRITTEN at the call site is typed
+    // against its parameter, which is a question this silent probe is not
+    // the place to answer.
+    if (spread_at != null) return true;
+    var elems: std.ArrayList(types.TupleElem) = .empty;
+    defer elems.deinit(c.scratch());
+    for (eff.items[w.from..]) |ea| {
+        if (ea.ty == types.no_type) return true;
+        try elems.append(c.scratch(), .{ .ty = ea.ty });
+    }
+    return try c.isAssignable(try c.ts.makeTuple(elems.items), w.ty);
+}
+
 /// Would every argument check against `sig`? (Silent, for overload
 /// selection.)
 pub fn argumentsMatch(c: *Checker, sig: TypeId, arg_nodes: []const Node) Error!bool {
@@ -2736,15 +2767,65 @@ pub fn argumentsMatch(c: *Checker, sig: TypeId, arg_nodes: []const Node) Error!b
     // never checked".
     const saved_diags = c.diags.items.len;
     const spec_file = c.cur_file;
+    // tsc's `getSignatureApplicabilityError` stops the positional walk at a
+    // NON-ARRAY rest and relates the arguments from there on, PACKED into one
+    // tuple, to the rest type. Overload selection runs that same check — it
+    // *is* `getSignatureApplicabilityError` — so a candidate whose rest no
+    // argument list of this shape satisfies has to be rejected HERE, or it
+    // wins and `checkCallArguments` reports the failure moments later, which
+    // is exactly the error overload resolution exists to avoid.
+    //
+    // `navigation.navigate('Feeds' as never)` is the case: `never` for the
+    // screen name collapses the first overload's rest to `never`, which no
+    // list — not even the empty one — satisfies, so the OPTIONS-bag overload
+    // is the one that takes the call (social-app's `ProfileFeedgens`).
+    const whole_rest = try c.sigNonArrayRest(sig);
+    const whole_from: u32 = if (whole_rest) |w| w.from else std.math.maxInt(u32);
+    const nargs = countArgs(arg_nodes);
+    var packed_elems: std.ArrayList(types.TupleElem) = .empty;
+    defer packed_elems.deinit(c.scratch());
     var ai: u32 = 0;
     for (arg_nodes) |an| {
         if (an == null_node) continue;
         defer ai += 1;
-        if (c.nodeTag(an) == .spread_element) return true; // don't reject on spreads
-        const pt = try c.paramTypeAt(sig, ai) orelse {
+        if (c.nodeTag(an) == .spread_element) {
+            // A spread is not an automatic pass. tsc runs
+            // `getSignatureApplicabilityError` on every candidate, and a
+            // candidate with a NON-ARRAY rest type has the whole argument
+            // list packed and related to that rest — so an overload whose
+            // rest no spread of this shape can satisfy is REJECTED here, and
+            // the next one gets its turn.
+            //
+            // react-navigation's `navigate` is the case: its first overload
+            // takes `...args: [screen, params?, options?] | …` and its second
+            // a single `{ name; params; … }` options bag, and
+            // `Parameters<typeof navigation.navigate>` is the SECOND one's
+            // list. `navigate(...args)` therefore has to fall through to the
+            // second overload; accepting the first left `checkCallArguments`
+            // to report a TS2345 tsc never sees (social-app's
+            // `useNavigationDeduped`).
+            //
+            // Only the packs `checkCallArguments` itself spells exactly are
+            // judged (`wholeSpreadPack`, and a spread that expanded to a
+            // FIXED list) — every other spread keeps the unconditional pass.
+            if (try spreadRestMatches(c, whole_rest, arg_nodes)) return true;
+            rollbackArgProbe(c, saved_diags, spec_file, arg_nodes, .all_args);
+            return false;
+        }
+        var pt = try c.paramTypeAt(sig, ai) orelse {
             rollbackArgProbe(c, saved_diags, spec_file, arg_nodes, .all_args);
             return false;
         };
+        // The same end-relative read `checkCallArguments` uses inside the
+        // window (`getContextualTypeForElementExpression`). The two have to
+        // type an in-window argument identically, or this walk packs a type
+        // the argument check never builds and rejects a candidate that check
+        // would have accepted.
+        if (whole_rest) |w| {
+            if (ai >= w.from and c.ts.kind(w.ty) == .tuple) {
+                if (try tuple_relate.contextualElemType(c, w.ty, ai - w.from, @intCast(nargs -| w.from))) |ct| pt = ct;
+            }
+        }
         const tag = c.nodeTag(an);
         // Array literals are contextually typed by the (already-inferred)
         // parameter, so a tuple parameter sees a tuple — otherwise the
@@ -2817,6 +2898,13 @@ pub fn argumentsMatch(c: *Checker, sig: TypeId, arg_nodes: []const Node) Error!b
                 try c.checkExprCached(an, types.no_type);
         };
         if (fn_arg) c.no_publish_depth -= 1;
+        // Inside the whole-list window the PACKED relation below is the
+        // verdict; position `ai` of a union rest relates to no single arm and
+        // could only reject a candidate tsc accepts.
+        if (ai >= whole_from) {
+            try packed_elems.append(c.scratch(), .{ .ty = at });
+            continue;
+        }
         if (!try c.isAssignable(at, pt)) {
             rollbackArgProbe(c, saved_diags, spec_file, arg_nodes, .all_args);
             return false;
@@ -2828,6 +2916,12 @@ pub fn argumentsMatch(c: *Checker, sig: TypeId, arg_nodes: []const Node) Error!b
         // `checkCallArguments`, which is exactly the error tsc avoids by
         // moving on to the next overload.
         if (try c.freshLiteralRejects(an, at, pt)) {
+            rollbackArgProbe(c, saved_diags, spec_file, arg_nodes, .all_args);
+            return false;
+        }
+    }
+    if (whole_rest) |w| {
+        if (!try c.isAssignable(try c.ts.makeTuple(packed_elems.items), w.ty)) {
             rollbackArgProbe(c, saved_diags, spec_file, arg_nodes, .all_args);
             return false;
         }
@@ -2849,7 +2943,35 @@ fn checkCallArguments(c: *Checker, node: Node, sig: TypeId, arg_nodes: []const N
 pub const EffArg = struct {
     node: Node,
     ty: TypeId = types.no_type,
+    /// The spread's OWN type, for an entry that stands for a spread the
+    /// expansion left WHOLE (an array, an iterable, a union of tuples). `ty`
+    /// is then only what one position of it yields, which is all the
+    /// positional walk can use; the PACKED whole-list relation
+    /// (`getSpreadArgumentType`) needs the un-iterated type instead.
+    /// `no_type` on every entry that came out of a tuple expansion or was
+    /// written at the call site.
+    whole: TypeId = types.no_type,
 };
+
+/// `getSpreadArgumentType`'s FAST PATH: the type a spread the expansion left
+/// WHOLE contributes to the packed rest relation, when it fills the whole-list
+/// window by itself.
+///
+/// ```ts
+/// if (index >= argCount - 1) {
+///     const arg = args[argCount - 1];
+///     if (isSpreadArgument(arg)) return getMutableArrayOrTupleType(…);
+/// }
+/// ```
+///
+/// `no_type` for every other window: with fixed arguments beside the spread
+/// the pack needs a VARIADIC tuple element, which the tuple representation has
+/// no flag for, and guessing one can only invent a rejection.
+fn wholeSpreadPack(eff: []const EffArg, spread_at: ?u32, from: u32) TypeId {
+    const si = spread_at orelse return types.no_type;
+    if (si != from or si + 1 != eff.len) return types.no_type;
+    return eff[si].whole;
+}
 
 /// tsc's `getEffectiveCallArguments`, spread half.
 ///
@@ -2940,7 +3062,7 @@ pub fn expandSpread(c: *Checker, an: Node, out: *std.ArrayList(EffArg)) Error!?u
         try out.append(c.scratch(), .{ .node = an, .ty = types.error_type });
         return at;
     };
-    try out.append(c.scratch(), .{ .node = an, .ty = elem });
+    try out.append(c.scratch(), .{ .node = an, .ty = elem, .whole = st });
     return at;
 }
 
@@ -2967,7 +3089,6 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
     const nargs = countArgs(arg_nodes);
     const required = @min(try c.requiredParams(sig), iifeMinArgs(c, node, nargs));
     const total = try c.paramTotal(sig);
-    const has_spread = hasSpreadArg(c, arg_nodes);
     // A TRUNCATION IS NOT AN ARITY. `instantiateId`'s depth/count guard fires
     // *before* the `.function` arm runs and collapses the whole signature to
     // `error_type`, and every `fn*` accessor then reads that as a signature
@@ -3071,9 +3192,42 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
     // relation, which subsumes it — a per-position failure fails the packed
     // one too, so the two never both fire.
     //
-    // Skipped when the call has a spread argument: the packed tuple would be
-    // a guess, and guessing here can only invent a rejection.
-    const whole_rest = if (has_spread) null else try c.sigNonArrayRest(sig);
+    // A spread does not by itself put the packed relation out of reach — it
+    // only decides what goes INTO the tuple:
+    //
+    //   * a spread the expansion turned into a FIXED list (`spread_at` null)
+    //     contributes exactly those entries, so the pack is the same one the
+    //     no-spread walk builds;
+    //   * a spread left WHOLE that fills the window BY ITSELF is
+    //     `getSpreadArgumentType`'s fast path — the packed type IS the
+    //     spread's own type, no positional guess involved:
+    //
+    //     ```ts
+    //     if (index >= argCount - 1) {
+    //         const arg = args[argCount - 1];
+    //         if (isSpreadArgument(arg)) return getMutableArrayOrTupleType(…);
+    //     }
+    //     ```
+    //
+    //     so `h(...u)` with `u: [number] | [number, number]` against
+    //     `(...rest: [string] | [string, number])` relates the two unions
+    //     directly — the shape social-app's `navigate(...args)` is written in,
+    //     where `Parameters<typeof navigate>` is a union of tuples and NO
+    //     per-position reading of it relates to any single arm.
+    //
+    // Anything else — a whole spread with fixed arguments beside it in the
+    // window — would need a VARIADIC tuple element to pack faithfully, which
+    // the tuple representation has no flag for, so it keeps the drop: the
+    // packed tuple would be a guess, and guessing here can only invent a
+    // rejection.
+    var packed_whole: TypeId = types.no_type;
+    const whole_rest: ?NonArrayRest = wr: {
+        const w = try c.sigNonArrayRest(sig) orelse break :wr null;
+        if (spread_at == null) break :wr w;
+        if (!spread_fits) break :wr null;
+        packed_whole = wholeSpreadPack(eff.items, spread_at, w.from);
+        break :wr if (packed_whole == types.no_type) null else w;
+    };
     const whole_from: u32 = if (whole_rest) |w| w.from else std.math.maxInt(u32);
     var packed_elems: std.ArrayList(types.TupleElem) = .empty;
     defer packed_elems.deinit(c.scratch());
@@ -3153,7 +3307,10 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
     }
     if (report_args and !reported_arg and whole_rest != null) {
         const rest_ty = whole_rest.?.ty;
-        const packed_ty = try c.ts.makeTuple(packed_elems.items);
+        const packed_ty = if (packed_whole != types.no_type)
+            packed_whole
+        else
+            try c.ts.makeTuple(packed_elems.items);
         if (!try c.isAssignable(packed_ty, rest_ty)) {
             // tsc's error node: the single rest argument, or the range from
             // the first to the last of them; with none at all, the call.
@@ -3343,13 +3500,6 @@ fn calleeErrorSpan(c: *Checker, node: Node) Span {
         .member_expr, .optional_member_expr => c.tokSpan(c.tree.nodeData(callee).rhs),
         else => c.nodeSpan(callee),
     };
-}
-
-fn hasSpreadArg(c: *Checker, arg_nodes: []const Node) bool {
-    for (arg_nodes) |an| {
-        if (an != null_node and c.nodeTag(an) == .spread_element) return true;
-    }
-    return false;
 }
 
 /// `args[max].pos` through the last argument's end — tsc's span for a call
