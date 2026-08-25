@@ -2228,13 +2228,13 @@ const Linker = struct {
     /// table (export-name atom → Target). Built from every file's
     /// `declare module "spec" { … }` blocks; imports of `"spec"` resolve
     /// against it (after the on-disk module, so it augments a real module).
+    /// Keyed by the blocks a SCRIPT declared — the ones that bring a module
+    /// into existence, as opposed to the ones in a module file (or nested in
+    /// another ambient module), which tsc reads as AUGMENTATIONS of a module
+    /// that has to exist already (`isModuleAugmentationExternal`). An
+    /// augmentation contributes members to an existing key and never mints
+    /// one; see `buildAmbient`.
     ambient: std.AutoArrayHashMapUnmanaged(Atom, std.AutoArrayHashMapUnmanaged(Atom, Target)) = .empty,
-    /// The subset of `ambient`'s keys that a SCRIPT declared — the blocks that
-    /// bring a module into existence, as opposed to the ones in a module file,
-    /// which tsc reads as AUGMENTATIONS of a module that has to exist already
-    /// (`isExternalModuleAugmentation`). Only these satisfy an augmentation's
-    /// own name lookup; see `reportAugmentationName`.
-    script_ambient: std.AutoHashMapUnmanaged(Atom, void) = .empty,
     /// Augmentation index, grouped by the file being augmented: the blocks
     /// `declare module "spec" { … }` whose `spec` resolves to that file, as
     /// (augmenting file, `bind.ambient_modules` index) pairs in FileId order.
@@ -3078,20 +3078,27 @@ const Linker = struct {
         // `declare module "node:x" { import x = require("x"); export = x; }`
         // block may be reached before the `"x"` block it names.
         //
-        // A NESTED block seeds nothing. tsc's `isModuleAugmentationExternal`
-        // makes `declare module "Map" { module "Observable" { … } }` an
-        // *augmentation* of "Observable", and `mergeModuleAugmentation`
-        // resolves that name and gives up silently when nothing answers — it
-        // never brings a module into existence. So the nested block still
-        // CONTRIBUTES members (which is what moduleAugmentationInAmbientModule
-        // 1-4 need, alongside `mergeAmbientBlocks`), but a specifier only
-        // nested blocks name stays unknown, and an import of it is TS2307.
+        // Only an AUGMENTATION-FREE block seeds a key, i.e. exactly the blocks
+        // tsc's `bindModuleDeclaration` puts in `globals` (and in
+        // `patternAmbientModules`). tsc's `isModuleAugmentationExternal` calls
+        // a top-level `declare module "X"` an *augmentation* whenever its file
+        // is a module, and a NESTED one whenever its container is an ambient
+        // module — `declare module "Map" { module "Observable" { … } }`. Both
+        // are declared into the FILE's locals, never into `globals`, and
+        // `mergeModuleAugmentation` then resolves the name and gives up
+        // silently when nothing answers: an augmentation never brings a module
+        // into existence. So such a block still CONTRIBUTES members to a key a
+        // script declared (which is what moduleAugmentationInAmbientModule 1-4
+        // need, alongside `mergeAmbientBlocks`), but a specifier only
+        // augmentations name stays unknown, and an import of it is TS2307
+        // (`ambientExternalModuleInAnotherExternalModule`) — while the
+        // augmentation itself earns TS2664 from `reportAugmentationName`.
         for (l.files) |*f| {
+            if (f.bind.is_module) continue;
             for (f.bind.ambient_modules) |am| {
                 if (f.bind.scope_parents[am.scope] != binder.file_scope) continue;
                 const gop = try l.ambient.getOrPut(l.scratch, am.spec);
                 if (!gop.found_existing) gop.value_ptr.* = .empty;
-                if (!f.bind.is_module) try l.script_ambient.put(l.scratch, am.spec, {});
             }
         }
         for (l.files, 0..) |*f, fi| {
@@ -3656,25 +3663,11 @@ const Linker = struct {
     /// forty overlapping patterns (`*?worker` / `*?worker&inline`, `*.css` /
     /// `*.module.css`), so the distinction is not hypothetical.
     fn ambientKey(l: *Linker, spec: Atom) ?Atom {
-        return l.ambientKeyIn(spec, null);
-    }
-
-    /// `ambientKey`, restricted to the registry keys in `only` (null = all).
-    /// The restriction is what an AUGMENTATION's own name lookup needs: it may
-    /// only find a module a SCRIPT brought into existence, never another
-    /// augmentation.
-    fn ambientKeyIn(l: *Linker, spec: Atom, only: ?*const std.AutoHashMapUnmanaged(Atom, void)) ?Atom {
-        const admits = struct {
-            fn f(set: ?*const std.AutoHashMapUnmanaged(Atom, void), a: Atom) bool {
-                return if (set) |s| s.contains(a) else true;
-            }
-        }.f;
-        if (l.ambient.contains(spec) and admits(only, spec)) return spec;
+        if (l.ambient.contains(spec)) return spec;
         const text = l.atomText(spec);
         var best: ?Atom = null;
         var best_prefix: usize = 0;
         for (l.ambient.keys()) |pat_atom| {
-            if (!admits(only, pat_atom)) continue;
             const pat = l.atomText(pat_atom);
             const star = std.mem.indexOfScalar(u8, pat, '*') orelse continue;
             const prefix = pat[0..star];
@@ -3857,8 +3850,9 @@ const Linker = struct {
     /// when its file is a MODULE (tsc's `isExternalModuleAugmentation`); in a
     /// SCRIPT the same block DECLARES the module and there is nothing to
     /// resolve — `@types/node`'s `declare module "fs"` is that, and it is the
-    /// reason the name lookup here may only find a script-declared key
-    /// (`script_ambient`) and never another augmentation.
+    /// reason the name lookup here may only find a script-declared key, never
+    /// another augmentation. `buildAmbient` keys the registry on exactly those,
+    /// so a plain `ambientKey` is that lookup.
     ///
     /// Skipped in a DECLARATION file: tsc's gate is `!(moduleName.parent.parent
     /// .flags & NodeFlags.Ambient)`, and every node of a `.d.ts` carries
@@ -3874,7 +3868,7 @@ const Linker = struct {
         if (stripped.len == 0) return;
         const atom = l.interner.intern(l.io, l.gpa, stripped) catch return Error.OutOfMemory;
         if ((try l.effectiveModuleFile(f, atom)) != null) return;
-        if (l.ambientKeyIn(atom, &l.script_ambient) != null) return;
+        if (l.ambientKey(atom) != null) return;
         try l.diag(file, 2664, l.tokSpan(file, name_tok), "Invalid module name in augmentation, module '{s}' cannot be found.", .{stripped});
     }
 
