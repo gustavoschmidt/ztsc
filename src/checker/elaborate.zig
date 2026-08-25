@@ -67,6 +67,7 @@ const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
 const accessibility = @import("accessibility.zig");
+const heritage = @import("heritage.zig");
 const nominal_members = @import("nominal_members.zig");
 
 /// Deepest chain rendered. tsgo has no cutoff; this is a resource bound so a
@@ -229,7 +230,8 @@ fn stepTo(kind: StepKind, s: TypeId, t: TypeId) Found {
 /// ztsc has no descent for the second kind — `resolveStructural` folds a
 /// constraint, and heritage is folded into the derived shape at build time — so
 /// `sourceIsItsOwnStandIn` declines the refinement for the source shapes where
-/// tsc would have taken that step, rather than guess which name tsc printed.
+/// tsc COULD have taken that step, rather than guess which name tsc printed.
+/// "Could" is read off the declaration where that is possible: see there.
 pub fn reachesUnmatchedProperty(c: *Checker, s0: TypeId, t0: TypeId) Error!bool {
     if (!sourceIsItsOwnStandIn(c, s0)) return false;
     const found = (try findStep(c, s0, t0, true)) orelse return false;
@@ -259,8 +261,27 @@ fn sourceIsItsOwnStandIn(c: *Checker, s: TypeId) bool {
         else => {},
     }
     // A named class/interface: `getSingleBaseForNonAugmentingSubtype` may swap
-    // it for its base, and ztsc cannot see that it did.
-    return c.refFacetOf(s, k) == null;
+    // it for its base, and ztsc cannot see that it did — heritage is folded
+    // into the derived shape at build time, so the resolved table looks the
+    // same either way.
+    //
+    // Not every named reference is at risk, though. The swap's FIRST
+    // precondition is `getBaseTypes(target).length !== 1 → return undefined`,
+    // and that one ztsc can read straight off the declaration: a class or
+    // interface that writes no heritage clause at all has no base to be
+    // swapped for, so it is always named under its own name. Declining there
+    // too cost the refinement on exactly the pairs it is for — `foo(d, c)`
+    // with `class C { x }` against `class D { x; y }` printed the TS2345 head
+    // where tsc prints TS2741 (`genericCallWithObjectTypeArgsAndConstraints4`
+    // /`5`, `narrowingGenericTypeFromInstanceof01`).
+    //
+    // A reference that DOES write one stays declined: the swap's second
+    // precondition ("declares no members of its own") is not readable from the
+    // folded shape, and `takeOpt(str: Str)` — `class Str extends Base2 {}` —
+    // is a live example of the swap firing, where tsc keeps the TS2345 head
+    // and names `Base2` underneath.
+    const r = c.refFacetOf(s, k) orelse return true;
+    return !heritage.declaresHeritage(c, c.ts.refSymbol(r));
 }
 
 /// The single most informative sub-relation of a pair already known to fail,
