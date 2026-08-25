@@ -1088,6 +1088,12 @@ fn checkArrayPatternProps(c: *Checker, pat: Node, whole: TypeId) Error!void {
             try c.diagFmt(2493, c.nodeSpan(el), "Tuple type '{s}' of length '{d}' has no element at index '{d}'.", .{
                 try c.typeToString(r), c.ts.tupleLen(r), i,
             });
+            // …and the walk carries on with what the access ANSWERED. tsc's
+            // `getIndexedAccessTypeOrUndefined` reports and yields
+            // `undefinedType`, which a NESTED pattern then destructures — so
+            // `var [[a0]] = []` is the TS2493 *and* a TS2488 for `undefined`
+            // at the inner pattern (`destructuringArrayBindingPatternAndAssignment2`).
+            try checkPatternProps(c, el, types.undefined_type);
             continue;
         }
         try checkPatternProps(c, el, c.ts.tupleElem(r, i).ty);

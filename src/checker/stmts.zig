@@ -704,6 +704,19 @@ fn checkForInOf(c: *Checker, node: Node) Error!void {
                             }
                         } else {
                             try assignPatternFromType(c, dd.lhs, elem_t);
+                            // …and what the PATTERN demands of the element
+                            // type, which the type-setting walk above does not
+                            // ask: tsc's `checkForInOrForOfVariableDeclaration`
+                            // ends in `checkVariableLikeDeclaration`, the same
+                            // walk a `var [a] = xs` runs. `for (const [,] of [])`
+                            // destructures a `never` element and is TS2488 at
+                            // the pattern (`omittedExpressionForOfLoop`).
+                            //
+                            // Only for the unannotated `.declarator` head: the
+                            // `.declarator_full` arm below has an annotation to
+                            // materialize from, and a head may not carry one
+                            // anyway (TS2404, raised in the parser).
+                            try destructure.checkPatternProps(c, dd.lhs, elem_t);
                         }
                     },
                     .declarator_full => {
