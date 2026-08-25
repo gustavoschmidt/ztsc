@@ -193,7 +193,7 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
         .labeled_stmt => try c.checkStatement(d.lhs),
         .function_decl => try checkFunctionDecl(c, node),
         .decorator => try c.pending_class_decos.append(c.cm(), node),
-        .class_decl => try c.checkClass(node),
+        .class_decl => try c.checkClass(node, types.no_type),
         .interface_decl => try checkInterfaceDecl(c, node),
         .type_alias => try checkTypeAliasDecl(c, node),
         .enum_decl => try c.checkEnum(node),
@@ -2532,7 +2532,12 @@ fn heritageNotConstructor(c: *Checker, t: TypeId) Error!bool {
     };
 }
 
-pub fn checkClass(c: *Checker, node: Node) Error!void {
+/// `ctx` is the class EXPRESSION's own contextual type (`no_type` for a class
+/// declaration, which has none). It is threaded rather than looked up because
+/// ztsc pushes contextual types down; its one consumer is the static-field arm
+/// of the member walk below, which must check an initializer under the same
+/// context `statics.seedStaticFieldContext` typed the member's symbol with.
+pub fn checkClass(c: *Checker, node: Node, ctx: TypeId) Error!void {
     const d = c.tree.nodeData(node);
     const data = c.tree.extraData(ast.ClassData, d.lhs);
     const saved_scope = c.cur_scope;
@@ -2790,7 +2795,22 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
                     // shares (see `field_init_depth`).
                     c.field_init_depth += 1;
                     defer c.field_init_depth -= 1;
-                    const it = try c.checkExprCached(e.init, ann);
+                    // An un-annotated STATIC field of a class EXPRESSION is
+                    // contextually typed by the same property of the class's
+                    // own contextual type that `seedStaticFieldContext` typed
+                    // its symbol with. Re-reading it under `no_type` here is
+                    // not a cache hit but a second, context-free reading —
+                    // which is how `static method1 = (arg) => …` earned a
+                    // TS7006 after `Foo`'s `method1` had already supplied
+                    // `arg`'s type. No TS2322 follows from it: a contextual
+                    // type is not a declared one, and the class-to-interface
+                    // relation is what reports a real mismatch.
+                    const init_ctx: TypeId = if (ann != types.no_type) ann else blk: {
+                        const sc = try statics.staticFieldContext(c, class_sym, member, ctx) orelse
+                            break :blk types.no_type;
+                        break :blk sc.ty;
+                    };
+                    const it = try c.checkExprCached(e.init, init_ctx);
                     if (ann != types.no_type and ann != types.error_type) {
                         _ = try c.checkAssignable(it, ann, e.init, c.tokSpan(c.tree.nodeMainToken(member)));
                     }
