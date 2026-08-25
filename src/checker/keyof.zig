@@ -838,20 +838,30 @@ fn indexedAccessTypeInner(c: *Checker, obj: TypeId, idx: TypeId) Error!TypeId {
 /// downstream assignability still reports the TS2322 through the unusable
 /// access, which is the diagnostic that keeps the bad value from passing.
 pub fn checkIndexedAccessIndexType(c: *Checker, acc: TypeId, node: Node) Error!void {
-    if (c.ts.kind(acc) != .index_access) return;
+    if (c.ts.kind(acc) != .index_access) return checkResolvedIndexKey(c, node);
     if (c.cond_true_depth > 0) return;
     const obj = c.ts.indexAccessObj(acc);
-    if (c.ts.kind(obj) != .type_param) return;
+    if (c.ts.kind(obj) != .type_param) {
+        return checkGenericKeyIntoConcrete(c, obj, c.ts.indexAccessIndex(acc), node);
+    }
     const idx = try c.ts.regularLiteral(c.ts.indexAccessIndex(acc));
     if (c.ts.kind(idx) != .string_literal) return;
     const con = try c.typeParamConstraint(c.ts.typeParamSymbol(obj));
     if (con == types.no_type) return;
     const bc = try c.resolveStructural(con);
     // A shape whose members are knowable. `any`/`err`/`unknown`, a
-    // still-deferred mapped/conditional form, an array/tuple (approximate
-    // key set) and the primitives are all "cannot tell".
-    if (c.ts.kind(bc) != .object) return;
-    if (c.ts.objectStringIndex(bc) != 0 or c.ts.objectNumberIndex(bc) != 0) return;
+    // still-deferred mapped/conditional form and the primitives are all
+    // "cannot tell". An ARRAY/TUPLE is decidable for a NON-NUMERIC name
+    // alone: every numeric name is answered by the element type, so only a
+    // key that is not one at all (`T["0.0"]` under `T extends string[]` —
+    // `"0.0"` is not the canonical rendering of `0`) can be missing, and then
+    // the `Array` interface's own members are the whole key set `propOfType`
+    // has to consult.
+    switch (c.ts.kind(bc)) {
+        .object => if (c.ts.objectStringIndex(bc) != 0 or c.ts.objectNumberIndex(bc) != 0) return,
+        .array, .tuple => if (numericLiteralName(c.atomText(c.ts.literalAtom(idx))) != null) return,
+        else => return,
+    }
     // A CLASS instance constraint is not authoritative: a same-named
     // interface merges extra members into it (drizzle's `MySqlDeleteBase`
     // declares its `_` on the interface half), and ztsc does not model that
@@ -864,6 +874,402 @@ pub fn checkIndexedAccessIndexType(c: *Checker, acc: TypeId, node: Node) Error!v
     try c.diagFmt(2536, c.nodeSpan(node), "Type '{s}' cannot be used to index type '{s}'.", .{
         try c.typeToString(idx), try c.typeToString(obj),
     });
+}
+
+/// Upper bound on the keys a generic index's constraint may offer before the
+/// check gives up. `keyof ElementTagNameMap` is ~120 names and must be judged;
+/// beyond a few hundred the per-key lookup stops being free and the shape
+/// stops being one anybody wrote deliberately.
+const max_generic_key_probe = 512;
+
+/// TS2536's OTHER decidable shape: a CONCRETE receiver indexed by a bare type
+/// PARAMETER — `HTMLElementTagNameMap[T]` with `T extends keyof
+/// ElementTagNameMap`, or `T3[K]` with `K extends 'a' | 'b'` over
+/// `type T3 = { a: true }`.
+///
+/// tsc's test is the same one `checkIndexedAccessIndexType` makes for the
+/// mirror shape — "is the index assignable to `keyof obj`" — read the other
+/// way round: the parameter's CONSTRAINT is the set of keys the index may
+/// take, and every one of them must be a key the receiver has.
+///
+/// Gated exactly as the mirror shape is, and for the same reason — only a set
+/// ztsc can enumerate on BOTH sides is judged:
+///
+///   * the index is a bare type parameter whose written constraint is an
+///     enumerable set of STRING-LITERAL keys (a `keyof` of a knowable object
+///     reduces to one; a mapped/conditional/`infer` constraint does not);
+///   * the receiver resolves to a plain OBJECT with no index signature — an
+///     index signature answers every name, so nothing is missing — and is not
+///     a class instance, whose member set a same-named interface may extend
+///     in ways ztsc does not model.
+fn checkGenericKeyIntoConcrete(c: *Checker, obj: TypeId, idx: TypeId, node: Node) Error!void {
+    const s = &c.ts;
+    if (s.kind(idx) != .type_param) return;
+    const con = try c.typeParamConstraint(s.typeParamSymbol(idx));
+    if (con == types.no_type) return;
+    const keys = try c.resolveStructural(con);
+    if (!keySetAllLiterals(c, keys)) return;
+    const ms = try keySetMembers(c, keys);
+    if (ms.len == 0 or ms.len > max_generic_key_probe) return;
+
+    const r = try c.resolveStructural(obj);
+    if (s.kind(r) != .object) return;
+    if (s.objectStringIndex(r) != 0 or s.objectNumberIndex(r) != 0) return;
+    if (c.refFacetOf(r, s.kind(r))) |ref| {
+        if (c.symFlags(s.refSymbol(ref)).class) return;
+    }
+    for (ms) |m| {
+        // Only a plain name is decided here: a template pattern or a
+        // `Uppercase<…>` key names a family no member table enumerates.
+        if (s.kind(m) != .string_literal) return;
+        if (try c.propOfType(r, s.literalAtom(m)) == null) {
+            return c.diagFmt(2536, c.nodeSpan(node), "Type '{s}' cannot be used to index type '{s}'.", .{
+                try c.typeToString(idx), try c.typeToString(obj),
+            });
+        }
+    }
+}
+
+/// tsc's `getPropertyTypeForIndexType` ERROR TAIL, run on a type node whose
+/// indexed access RESOLVED — the other half of tsc's indexed-access checking,
+/// the half `checkIndexedAccessIndexType` (TS2536, above) does not cover.
+///
+/// `indexedAccessType` answers `unknown` for an absent key and `any` for "no
+/// signature applies", and says nothing, so the whole family was silent. tsc
+/// reports on the INDEX node:
+///
+///   * TS2493 — a numeric literal past the end of a rest-free tuple;
+///   * TS2339 — a string/number literal key the receiver has no member and no
+///     applicable index signature for. This is what makes `(Foo | Bar)['foo']`
+///     an error: the lookup runs against the WHOLE union, and `propOfType`'s
+///     union arm answers only when *every* constituent has the key — where
+///     `indexedAccessTypeInner` distributes and unions the misses into a
+///     silent `unknown`;
+///   * TS2537 — a `string`/`number` index with no matching signature;
+///   * TS2538 — a key that is not string-, number- or symbol-like at all
+///     (`boolean`, `void`, `null`, `bigint`, an object type, a bare `symbol`
+///     against a receiver with no symbol index). That arm runs BEFORE the
+///     receiver is consulted, exactly as tsc's `isTypeAssignableToKind` gate
+///     does: `any[boolean]` and `never[boolean]` are errors even though those
+///     receivers answer every key.
+///
+/// Reached only for an access that RESOLVED, which is the safety property the
+/// whole check rests on: `reduceIndexedAccess` defers every access whose
+/// object or index still mentions a type variable, a mapped key or an `infer`
+/// binder, so nothing generic can arrive here and no constraint has to be
+/// chased to decide the key.
+fn checkResolvedIndexKey(c: *Checker, node: Node) Error!void {
+    // Inside a conditional type's TRUE branch tsc's substitution types narrow
+    // the check type to its `extends` type, so keys the written type does not
+    // have are legal there (`A extends Record<'foo', string> ? A['foo'] : …`).
+    // ztsc has no substitution types — the same gap `condTrueUnderExtends`
+    // names on the relation side, and the same bail the TS2536 arm makes.
+    if (c.cond_true_depth > 0) return;
+    const d = c.tree.nodeData(node);
+    // Both operands are re-read from the node rather than threaded down from
+    // the caller: `typeFromTypeNode` memoizes every compound annotation by
+    // `(file, node)`, so this is a hash probe for the shapes that cost
+    // anything and an O(1) re-walk for the bare names that do not.
+    const obj = try c.typeFromTypeNode(d.lhs);
+    const idx = try c.typeFromTypeNode(d.rhs);
+    // A chained access whose RECEIVER is itself an access that came back
+    // `unknown` — ztsc's "key absent" answer — is tsc's `errorType` receiver,
+    // which it indexes silently: `Color["Red"]["toString"]` is one TS2339 on
+    // `"Red"`, not two.
+    if (obj == types.unknown_type and c.nodeTag(d.lhs) == .indexed_access_type) return;
+    try reportIndexKeyMiss(c, obj, idx, d.rhs, 0);
+}
+
+/// A type still standing in for something else: whether a key fits it is a
+/// question about instantiation, which this check does not answer.
+///
+/// The resolved-access gate keeps most of these out on its own, but
+/// `reduceIndexedAccess` distributes a UNION index BEFORE its generic screen,
+/// so `T[K | "0"]` arrives here as a union of one deferred access and one
+/// resolved one — with both a generic OBJECT and a generic key constituent.
+fn instantiableIndexOperand(c: *const Checker, t: TypeId) bool {
+    return switch (c.ts.kind(t)) {
+        .type_param,
+        .infer_var,
+        .mapped_param,
+        .this_type,
+        .index_access,
+        .conditional,
+        .mapped,
+        .keyof_op,
+        => true,
+        else => false,
+    };
+}
+
+/// One index constituent against `obj`. Recurses through a union index (tsc
+/// distributes and reports once per constituent) and through an enum key
+/// (which names the properties its member VALUES spell — the same reading
+/// `indexedAccessTypeInner` gives it).
+fn reportIndexKeyMiss(c: *Checker, obj: TypeId, idx_in: TypeId, at: Node, depth: u8) Error!void {
+    // union -> member -> enum -> literal is the deepest legitimate chain.
+    if (depth > 3) return;
+    const s = &c.ts;
+    const idx = try s.regularLiteral(idx_in);
+    switch (s.kind(idx)) {
+        // `boolean` is deliberately NOT distributed (tsc's `!(indexType.flags
+        // & TypeFlags.Boolean)`), and it is a kind of its own here, so it
+        // never reaches this arm — it reports as `boolean`, not `true`/`false`.
+        .union_type => {
+            const ms = try c.memberList(idx);
+            if (ms.len > max_union_index_keys) return;
+            for (ms) |m| try reportIndexKeyMiss(c, obj, m, at, depth + 1);
+            return;
+        },
+        .enum_type => {
+            if (s.isEnumMember(idx)) {
+                if (try c.enumMemberValue(s.enumSymbol(idx), s.enumMemberAtom(idx))) |v| {
+                    return reportIndexKeyMiss(c, obj, try s.regularLiteral(v), at, depth + 1);
+                }
+                return;
+            }
+            if (try c.enumMemberTypeUnion(s.enumSymbol(idx), 0)) |mu| {
+                if (mu != idx) return reportIndexKeyMiss(c, obj, mu, at, depth + 1);
+            }
+            return;
+        },
+        else => {},
+    }
+    if (instantiableIndexOperand(c, idx)) return;
+
+    const r = try c.resolveStructural(obj);
+    if (instantiableIndexOperand(c, obj) or instantiableIndexOperand(c, r)) return;
+    // The global-scope object stores no members of its own: they are the
+    // program's merged global declarations, which `propOfType` resolves on
+    // demand (`globalThisProp`) — so its key set IS knowable, with one
+    // exception. Its own NAME is a member tsc synthesizes (`globalThis: typeof
+    // globalThis`) and no declaration spells, so `(typeof
+    // globalThis)["globalThis"]` has to be admitted here.
+    if (s.kind(r) == .object and s.objectFlags(r) & types.obj_flag_global_this != 0 and
+        s.kind(idx) == .string_literal and s.literalAtom(idx) == try c.internText("globalThis"))
+    {
+        return;
+    }
+    const receiver_answers_anything = switch (s.kind(r)) {
+        .any, .err, .never => true,
+        else => false,
+    };
+
+    // 1. A key the receiver HAS. `propOfType` is the same lookup the access
+    //    itself made, so members, inheritance, apparent members and the string
+    //    index signature answer here exactly as they do there — including its
+    //    UNION arm, which is the point of this check.
+    if (!receiver_answers_anything) {
+        if (try indexKeyName(c, idx)) |name| {
+            // A SYMBOL key must not be answered by the string index signature
+            // (`{ [k: string]: V }[typeof s]` is an error, oracle-confirmed),
+            // so its lookup skips index signatures; the symbol slot is asked
+            // separately by `applicableIndexSignature`.
+            const allow_index = s.kind(idx) != .unique_symbol;
+            if (try c.propOfTypeEx(r, name, allow_index) != null) return;
+            if (try tupleIndexMiss(c, r, obj, name, at)) return;
+        }
+    }
+
+    // 2. tsc's `isTypeAssignableToKind(indexType, StringLike | NumberLike |
+    //    ESSymbolLike)` gate, then its index-signature lookup.
+    if (try indexKeyIsIndexLike(c, idx)) {
+        if (receiver_answers_anything) return;
+        // `T[never]` is `never`.
+        if (s.kind(idx) == .never) return;
+        if (try applicableIndexSignature(c, r, idx)) return;
+    }
+
+    // 3. The tail. The receiver is printed AS WRITTEN rather than as its
+    //    apparent type: tsc prints the reduced apparent type, which is the
+    //    same text for every named object shape and differs only for the
+    //    primitives (`string` vs `String`) — a message-text divergence, not a
+    //    position or code one.
+    switch (s.kind(idx)) {
+        .string_literal => try c.diagFmt(2339, c.nodeSpan(at), "Property '{s}' does not exist on type '{s}'.", .{
+            c.atomText(s.literalAtom(idx)), try c.typeToString(obj),
+        }),
+        .number_literal, .number_literal_fresh => {
+            const name = (try numericKeyAtom(c, s.numberValue(idx))) orelse return;
+            try c.diagFmt(2339, c.nodeSpan(at), "Property '{s}' does not exist on type '{s}'.", .{
+                c.atomText(name), try c.typeToString(obj),
+            });
+        },
+        .string, .number => try c.diagFmt(2537, c.nodeSpan(at), "Type '{s}' has no matching index signature for type '{s}'.", .{
+            try c.typeToString(obj), try c.typeToString(idx),
+        }),
+        else => try c.diagFmt(2538, c.nodeSpan(at), "Type '{s}' cannot be used as an index type.", .{
+            try c.typeToString(idx),
+        }),
+    }
+}
+
+/// The member name an index key spells, or null when the key names no single
+/// member (`string`, `number`, `boolean`, an object type, …).
+fn indexKeyName(c: *Checker, idx: TypeId) Error!?types.Atom {
+    return switch (c.ts.kind(idx)) {
+        .string_literal => c.ts.literalAtom(idx),
+        .number_literal, .number_literal_fresh => numericKeyAtom(c, c.ts.numberValue(idx)),
+        .unique_symbol => symbolKeyAtom(c, idx),
+        else => null,
+    };
+}
+
+/// tsc's `isNumericLiteralName`: the text is the CANONICAL rendering of the
+/// number it parses to. `"1"` and `"1.5"` are numeric names, `"01"`, `"1.0"`,
+/// `"1e3"` and `"x"` are not. The distinction decides whether a NUMBER index
+/// signature answers the key: `string[]["1.5"]` is legal, `string[]["0.0"]` is
+/// not.
+fn numericLiteralName(text: []const u8) ?f64 {
+    if (text.len == 0) return null;
+    // `parseFloat` also takes hex floats, `inf`/`nan` and digit separators,
+    // none of which any JS number ever renders as.
+    for (text) |ch| switch (ch) {
+        '0'...'9', '.', '-', '+', 'e', 'E' => {},
+        else => return null,
+    };
+    const v = std.fmt.parseFloat(f64, text) catch return null;
+    if (!std.math.isFinite(v)) return null;
+    var buf: [40]u8 = undefined;
+    const back = std.fmt.bufPrint(&buf, "{d}", .{v}) catch return null;
+    return if (std.mem.eql(u8, text, back)) v else null;
+}
+
+/// `numericLiteralName` narrowed to the INTEGRAL names — the ones that can
+/// name a tuple element.
+fn integralName(text: []const u8) ?i64 {
+    const v = numericLiteralName(text) orelse return null;
+    if (v != @floor(v) or @abs(v) >= 9007199254740992.0) return null;
+    return @intFromFloat(v);
+}
+
+/// The member name a numeric key spells (`2` -> `"2"`), or null when the value
+/// has no integral name (tsc's `isNumericLiteralName` round-trip).
+fn numericKeyAtom(c: *Checker, v: f64) Error!?types.Atom {
+    if (v != @floor(v) or @abs(v) >= 9007199254740992.0) return null;
+    var buf: [24]u8 = undefined;
+    const txt = std.fmt.bufPrint(&buf, "{d}", .{@as(i64, @intFromFloat(v))}) catch return null;
+    return try c.internText(txt);
+}
+
+/// tsc's `everyType(objectType, isTupleType)` arm of
+/// `getPropertyTypeForIndexType`: a non-negative integral key into a receiver
+/// whose every constituent is a tuple is answered by POSITION, and past the
+/// end of ALL of them it is its own diagnostic — TS2493 naming the tuple's
+/// arity for a single tuple, plain TS2339 for a union of them. A REST element
+/// makes every index valid.
+///
+/// "Past the end of all of them" is tsc's `CheckFlags.ReadPartial` filter in
+/// `getPropertyOfUnionOrIntersectionType`, not an every-constituent test: a
+/// union member that lacks the position but has an APPLICABLE INDEX SIGNATURE
+/// — which every tuple has — contributes `undefined` and keeps the property
+/// alive, so `([boolean] | [string, number])[1]` is `number | undefined` and
+/// only `[2]`, absent from both, is an error.
+///
+/// True when this arm CONSUMED the key (reported or not), so the caller stops.
+fn tupleIndexMiss(c: *Checker, r: TypeId, obj: TypeId, name: types.Atom, at: Node) Error!bool {
+    const s = &c.ts;
+    const txt = c.atomText(name);
+    const signed = integralName(txt) orelse return false;
+    if (signed < 0 or signed > std.math.maxInt(u32)) return false;
+    const n: u32 = @intCast(signed);
+
+    const ms: []const TypeId = if (s.kind(r) == .union_type) try c.memberList(r) else &.{r};
+    for (ms) |m| {
+        const rm = try c.resolveStructural(m);
+        if (s.kind(rm) != .tuple) return false;
+        // In range on ANY constituent, or reachable through a rest element:
+        // the access answers and this arm is done.
+        if (n < s.tupleLen(rm)) return true;
+        for (0..s.tupleLen(rm)) |i| {
+            if (s.tupleElem(rm, @intCast(i)).rest()) return true;
+        }
+    }
+    if (ms.len == 1 and s.kind(r) == .tuple) {
+        try c.diagFmt(2493, c.nodeSpan(at), "Tuple type '{s}' of length '{d}' has no element at index '{s}'.", .{
+            try c.typeToString(r), s.tupleLen(r), txt,
+        });
+    } else {
+        try c.diagFmt(2339, c.nodeSpan(at), "Property '{s}' does not exist on type '{s}'.", .{
+            txt, try c.typeToString(obj),
+        });
+    }
+    return true;
+}
+
+/// tsc's `isTypeAssignableToKind(indexType, StringLike | NumberLike |
+/// ESSymbolLike)` plus its `Nullable` screen — the gate deciding whether a key
+/// is a plausible index at all. `bigint`, `boolean`, `void`, `null`,
+/// `undefined`, `unknown` and object types are not (all oracle-confirmed).
+fn indexKeyIsIndexLike(c: *Checker, idx: TypeId) Error!bool {
+    return switch (c.ts.kind(idx)) {
+        .any, .never, .symbol, .unique_symbol => true,
+        else => (try c.typeIsStringLike(idx)) or (try c.typeIsNumberLike(idx)),
+    };
+}
+
+/// tsc's `getApplicableIndexInfo`, reduced to "is there a signature that
+/// answers this key". A number-like key takes the number signature and falls
+/// back to the string one (tsc's `isApplicableIndexType` admits a numeric
+/// source for a `string` key type); a string-like key takes the string one; a
+/// symbol-like key takes the SYMBOL one ALONE — `{ [k: string]: V }[typeof s]`
+/// is TS2538, `{ [k: symbol]: V }[symbol]` is fine.
+fn applicableIndexSignature(c: *Checker, r0: TypeId, idx: TypeId) Error!bool {
+    const s = &c.ts;
+    // A BRANDED tuple/array or index signature (`[X, Y] & { _brand }`) is
+    // judged by the constituent that actually carries the index — the same
+    // unwrapping `indexedAccessTypeInner`'s numeric arm does. tsc reaches it
+    // through `getApplicableIndexInfo` on the intersection; note that its
+    // TUPLE-BOUNDS arm (TS2493) is NOT reached this way, since an
+    // intersection is not itself a tuple type.
+    const r = switch (s.kind(r0)) {
+        .intersection => (try indexableConstituent(c, r0)) orelse r0,
+        // A class VALUE's index signatures are declared `static` and live on
+        // its static-side object (`class B { static [s: string]: number }`
+        // makes `(typeof B)[string]` legal), exactly as `numberIndexType`
+        // reads them.
+        .class_value => try c.classStaticType(s.classSymbol(r0)),
+        else => r0,
+    };
+    // tsc's `isApplicableIndexType` also admits a NUMERICALLY NAMED string
+    // literal against a number signature: `{ [k: number]: V }["0"]` is legal.
+    //
+    // A PATTERN key (`\`${number}\``, `Uppercase<T>`) is admitted against
+    // either signature: `boolean[][\`${number}\`]` is `boolean`, and the
+    // string-vs-number half of the rule is finer than this check needs — an
+    // extra silence, never an extra report.
+    const numeric = switch (s.kind(idx)) {
+        .any, .template_literal_type, .string_mapping => true,
+        .string_literal => numericLiteralName(c.atomText(s.literalAtom(idx))) != null or
+            try c.typeIsNumberLike(idx),
+        else => try c.typeIsNumberLike(idx),
+    };
+    switch (s.kind(r)) {
+        // Arrays and tuples carry a numeric element type and no string one.
+        .array, .tuple => return numeric,
+        // For a NAMED key the step-1 `propOfType` lookup already consulted
+        // every constituent — including each one's string index signature —
+        // so it was authoritative and there is nothing left to find. For any
+        // other key, whether a signature answers depends on the constituents
+        // in a way this check does not walk: stay silent.
+        .union_type, .intersection => return switch (s.kind(idx)) {
+            .string_literal, .number_literal, .number_literal_fresh => false,
+            else => true,
+        },
+        .object => {},
+        else => return false,
+    }
+    // A symbol index occupies the string slot under its own flag, so the two
+    // are mutually exclusive (see `indexedAccessTypeInner`'s symbol arm).
+    const slot = s.objectStringIndex(r);
+    const has_sym = slot != 0 and s.objectFlags(r) & types.obj_flag_symbol_index != 0;
+    const has_str = slot != 0 and !has_sym;
+    const has_num = s.objectNumberIndex(r) != 0;
+    return switch (s.kind(idx)) {
+        .symbol, .unique_symbol => has_sym,
+        .any => has_str or has_num or has_sym,
+        else => if (numeric) has_num or has_str else has_str,
+    };
 }
 
 /// tsc's `TypeFlags.NumberLike` over a resolved type (union/intersection
@@ -901,7 +1307,14 @@ pub fn numberIndexType(c: *Checker, r: TypeId) Error!TypeId {
         },
         .object => {
             if (c.ts.objectNumberIndex(r) != 0) return c.ts.objectNumberIndex(r);
-            if (c.ts.objectStringIndex(r) != 0) return c.ts.objectStringIndex(r);
+            // A SYMBOL index occupies the string slot under its own flag, and
+            // does NOT stand in for a numeric key: `{ [k: symbol]: V }[number]`
+            // is TS2537, not `V` (oracle-confirmed).
+            if (c.ts.objectStringIndex(r) != 0 and
+                c.ts.objectFlags(r) & types.obj_flag_symbol_index == 0)
+            {
+                return c.ts.objectStringIndex(r);
+            }
             return types.any_type;
         },
         .intersection => {
