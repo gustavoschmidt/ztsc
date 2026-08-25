@@ -770,6 +770,12 @@ pub const PendingTypeArgs = struct {
     /// positionally paired with the non-hole entries of the node list.
     args_start: u32,
     args_len: u32,
+    /// Whether the reference was written inside a conditional type's TRUE
+    /// branch (`cond_true_depth` non-zero). Replayed at the drain, where the
+    /// gate needs it to keep a free type parameter out of the verdict: the
+    /// branch narrows the check type and ztsc models none of that narrowing.
+    /// See `typeparams.undecidableTypeArg`.
+    cond_true: bool = false,
 };
 
 /// A memoized expression type together with the contextual type it was
@@ -2118,6 +2124,16 @@ pub const Checker = struct {
     /// Per-generic-symbol memo of "declares a constrained type parameter"
     /// (see `symHasConstrainedTypeParam`) — the queue's admission test.
     tp_constrained_cache: IntMap(SymbolId, bool) = .empty,
+    /// Memoized `typeParamsOf` lists, per generic symbol. A list holds only
+    /// SYMBOLS and unconverted NODES — never a TypeId — so it is a pure
+    /// function of the program's declarations and can never go stale; the memo
+    /// exists because the walk is a scan of every declaration block of a
+    /// (possibly merged) symbol, and the reference materializer, `buildInstMap`
+    /// and the TS2344 gate all ask for it per written reference. tsc caches the
+    /// same thing on the symbol's links
+    /// (`getTypeParametersForTypeReferenceOrImport`). The slices are owned by
+    /// the checker's own allocator and live as long as it does.
+    tp_list_cache: IntMap(SymbolId, []const typenode_zig.TypeParamInfo) = .empty,
     /// Depth of "checking a NON-STATIC class field's initializer" frames. Such
     /// an initializer runs at construction time, not at class-definition time,
     /// so a forward reference in it is not in the temporal dead zone — tsc's

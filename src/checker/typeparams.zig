@@ -90,6 +90,13 @@ pub const TypeParamInfo = struct {
 /// own `sym`, pre-existing entries included, before the merged-default pass
 /// (which may replace some of them again) runs.
 pub fn typeParamsOf(c: *Checker, sym: SymbolId, buf: *std.ArrayList(TypeParamInfo)) Error!void {
+    // Memoized on the way in and out (`Checker.tp_list_cache`). Only for the
+    // empty-`buf` call, which is every caller — a pre-filled `buf` ends the
+    // scan before it starts and is not this symbol's list.
+    const memoizable = buf.items.len == 0;
+    if (memoizable) {
+        if (c.tp_list_cache.get(sym)) |l| return buf.appendSlice(c.scratch(), l);
+    }
     var one = [_]SymbolId{sym};
     const parts: []const SymbolId = if (c.prog.isMergedId(sym)) c.prog.mergedSym(sym).parts else one[0..];
     outer: for (parts) |csym| {
@@ -100,10 +107,86 @@ pub fn typeParamsOf(c: *Checker, sym: SymbolId, buf: *std.ArrayList(TypeParamInf
             if (buf.items.len > 0) break :outer;
         }
     }
-    if (buf.items.len == 0) return;
-    for (buf.items) |*tp| tp.default_sym = tp.sym;
-    try fillMergedTypeParamDefaults(c, sym, buf);
-    if (c.symFlags(sym).class) try c.canonicalizeClassTypeParams(sym, buf);
+    if (buf.items.len != 0) {
+        for (buf.items) |*tp| tp.default_sym = tp.sym;
+        try fillMergedTypeParamDefaults(c, sym, buf);
+        if (c.symFlags(sym).class) try c.canonicalizeClassTypeParams(sym, buf);
+    }
+    if (memoizable) {
+        try c.tp_list_cache.put(c.cm(), sym, try c.cm().dupe(TypeParamInfo, buf.items));
+    }
+}
+
+/// The `extends` clause a SIBLING declaration block of the same merged
+/// interface writes for the same-named type parameter, as a type — `no_type`
+/// when there is none, or when `sym` is not an interface block's parameter.
+///
+/// tsc binds an interface's type parameters into the interface SYMBOL's member
+/// table (`declareSymbolAndAddToSymbolTable`'s `InterfaceDeclaration` arm), so
+/// every declaration block of a merged interface contributes its `<…>` entries
+/// to ONE type-parameter symbol per name, and `getConstraintDeclaration`
+/// answers with the first of that symbol's declarations that writes a
+/// constraint. ztsc binds each block's list into that block's OWN scope, so
+/// `interface F<T> { … }` beside `interface F<T extends C> { … }` reads its own
+/// `T` as unconstrained — and which of the two the parameter list is taken from
+/// depends on declaration order (`typeParamsOf` takes the first block that
+/// declares any). That order dependence is exactly what
+/// `interfaceMergedUnconstrainedNoErrorIrrespectiveOfOrder` pins: the same two
+/// blocks in either order must behave identically, and a bare `T` reaching
+/// `ReturnType<T>` unconstrained is a TS2344 false positive.
+///
+/// Read by `props.typeParamConstraint` only, on the branch where the
+/// parameter's OWN declaration writes no clause; the caller has already opened
+/// `sym`'s file.
+pub fn mergedTypeParamConstraint(c: *Checker, sym: SymbolId, tp_decl: Node) Error!TypeId {
+    // Cheap gate first: nearly every unconstrained parameter belongs to a
+    // function, method or alias, whose scope owner fails this tag test with
+    // two array reads.
+    const tp_scope = c.symScope(sym);
+    const owner = c.bind.scope_owners[tp_scope];
+    if (owner == null_node or c.tree.nodeTag(owner) != .interface_decl) return types.no_type;
+    const name_tok = c.tree.declNameToken(owner) orelse return types.no_type;
+    const name = try c.atomOfToken(name_tok);
+    // The interface's own symbol is bound in the scope enclosing its block.
+    const iface_local = c.bind.lookupInScope(c.bind.scope_parents[tp_scope], name) orelse return types.no_type;
+    const iface = c.toGlobal(iface_local);
+    if (std.mem.indexOfScalar(Node, c.declsOf(iface), owner) == null) return types.no_type;
+    const merged = c.prog.mergedOf(iface) orelse iface;
+    if (!c.prog.isMergedId(merged) and c.declsOf(merged).len < 2) return types.no_type;
+
+    const tp_name = try c.atomOfToken(c.tree.nodeMainToken(tp_decl));
+    var one = [_]SymbolId{merged};
+    const parts: []const SymbolId = if (c.prog.isMergedId(merged)) c.prog.mergedSym(merged).parts else one[0..];
+    for (parts) |csym| {
+        const saved = c.enterSymFile(csym);
+        defer c.restoreCtx(saved);
+        for (c.declsOf(csym)) |decl| {
+            // ONLY the declaration forms whose type parameters tsc routes into
+            // the symbol's member table. A function declaration merged with the
+            // interface (`interface Tag<Id, Value>` beside `declare function
+            // Tag<const Id extends string>(…)`, which
+            // contextualParamTypeVsNestedReturnTypeInference2-4 write) keeps its
+            // parameters in its own `locals` and donates nothing — reading its
+            // `Id extends string` onto the interface's `Id` was six false
+            // TS2344s.
+            switch (c.nodeTag(decl)) {
+                .interface_decl, .class_decl => {},
+                else => continue,
+            }
+            const tps = writtenTypeParamRange(c, decl) orelse continue;
+            for (tps) |tp| {
+                if (tp == null_node or c.nodeTag(tp) != .type_param) continue;
+                if (try c.atomOfToken(c.tree.nodeMainToken(tp)) != tp_name) continue;
+                const td = c.tree.nodeData(tp);
+                // `sym`'s own block lands here too, and falls through on the
+                // very condition that brought us here.
+                if (td.lhs == 0) continue;
+                c.cur_scope = (try c.scopeOf(decl)) orelse continue;
+                return c.typeFromTypeNode(td.lhs);
+            }
+        }
+    }
+    return types.no_type;
 }
 
 /// Fill a parameter's missing default from a LATER declaring block of the
@@ -598,7 +681,10 @@ pub fn symHasConstrainedTypeParam(c: *Checker, sym: SymbolId) Error!bool {
     try c.typeParamsOf(sym, &tps);
     var any = false;
     for (tps.items) |tp| {
-        if (tp.constraint != 0) any = true;
+        // A bare parameter of a MERGED interface may still be constrained by a
+        // sibling block, which is the constraint `checkTypeArgConstraints`
+        // goes on to check (`mergedTypeParamConstraint`).
+        if (tp.constraint != 0 or try c.typeParamConstraint(tp.sym) != types.no_type) any = true;
     }
     try c.tp_constrained_cache.put(c.cm(), sym, any);
     return any;
@@ -676,7 +762,7 @@ fn queuePendingTypeArgs(c: *Checker, node: Node, sym: SymbolId, sig: TypeId, arg
         for (args[0..@min(args.len, arg_nodes.len)], 0..) |a, i| {
             if (arg_nodes[i] == null_node) continue;
             if (a == types.any_type or a == types.unknown_type) continue;
-            if (try c.undecidableType(a)) continue;
+            if (try undecidableTypeArg(c, a)) continue;
             any_decidable = true;
             break;
         }
@@ -692,7 +778,33 @@ fn queuePendingTypeArgs(c: *Checker, node: Node, sym: SymbolId, sig: TypeId, arg
         .this_type = c.this_type,
         .args_start = args_start,
         .args_len = @intCast(args.len),
+        .cond_true = c.cond_true_depth > 0,
     });
+}
+
+/// `undecidableType` for a WRITTEN type argument, which can afford one
+/// exclusion the general predicate cannot: a BARE free type parameter.
+///
+/// `undecidableType` refuses every type variable, and for a NESTED one that is
+/// right — `Foo<T["k"]>`, `Foo<{ a: T }>` are questions about ztsc's own
+/// deferral machinery. But `Foo<T>` written whole is the shape tsc decides
+/// directly, by relating `T`'s constraint to the parameter's
+/// (`checkTypeArgumentConstraints` → `isTypeAssignableTo(getTypeWithThisArgument
+/// (typeArgument), constraint)`), and that is a relation ztsc runs correctly:
+/// `assign.zig` walks a source type parameter's constraint chain. So an
+/// unconstrained `T` handed to `ReturnType<T>` is a real TS2344, and the whole
+/// `Parameters<typeof C>` / `unmetTypeConstraintInImportCall` family turns on it.
+///
+/// The one place it must NOT apply is a conditional type's TRUE branch. There
+/// tsc replaces every occurrence of the check type with a SUBSTITUTION type
+/// constrained by the `extends` clause, so `T extends (...a: any) => any ?
+/// ReturnType<T> : never` sees a `T` that already satisfies the bound; ztsc
+/// models no substitution types, reads `T`'s declared constraint instead, and
+/// invents a false positive for every guarded use. Measured: 79 excess keys
+/// without this screen, 0 with it.
+fn undecidableTypeArg(c: *Checker, t: TypeId) Error!bool {
+    if (c.ts.kind(t) == .type_param and c.cond_true_depth == 0) return false;
+    return c.undecidableType(t);
 }
 
 /// The WRITTEN type-argument nodes of one of the four nodes that can carry a
@@ -725,10 +837,12 @@ pub fn drainTypeArgConstraints(c: *Checker) Error!void {
     const saved_file = c.cur_file;
     const saved_scope = c.cur_scope;
     const saved_this = c.this_type;
+    const saved_cond_true = c.cond_true_depth;
     defer {
         c.setFile(saved_file);
         c.cur_scope = saved_scope;
         c.this_type = saved_this;
+        c.cond_true_depth = saved_cond_true;
     }
     // Index-walked, and the entry's arguments are copied out before the check
     // runs: a check can convert a type node that queues a further reference,
@@ -743,6 +857,9 @@ pub fn drainTypeArgConstraints(c: *Checker) Error!void {
         c.setFile(p.file);
         c.cur_scope = binder.file_scope;
         c.this_type = p.this_type;
+        // Replayed, not inherited: `undecidableTypeArg` reads it, and the
+        // reference's own true-branch nesting is not the drain's.
+        c.cond_true_depth = @intFromBool(p.cond_true);
         const arg_nodes = writtenTypeArgNodes(c, p.node);
         args.clearRetainingCapacity();
         try args.appendSlice(c.scratch(), c.pending_type_args_pool.items[p.args_start..][0..p.args_len]);
@@ -891,14 +1008,20 @@ pub fn checkTypeArgConstraints(c: *Checker, sym: SymbolId, args: []const TypeId,
     try c.buildInstMap(sym, args, &map_list);
     for (tps.items, 0..) |tp, i| {
         if (i >= args.len or i >= arg_nodes.len) break;
-        if (tp.constraint == 0) continue;
-        var con: TypeId = undefined;
-        {
+        var con: TypeId = types.no_type;
+        if (tp.constraint != 0) {
             const saved = c.enterSymFile(tp.sym);
             defer c.restoreCtx(saved);
             c.cur_scope = c.symScope(tp.sym);
             con = try c.typeFromTypeNode(tp.constraint);
+        } else {
+            // The list came from a block that writes this parameter bare. A
+            // MERGED interface still constrains it if any sibling block does
+            // (`mergedTypeParamConstraint`), and that is the constraint tsc
+            // checks against — order-independently.
+            con = try c.typeParamConstraint(tp.sym);
         }
+        if (con == types.no_type) continue;
         try checkOneTypeArgConstraint(c, args[i], con, map_list.items, arg_nodes[i]);
     }
 }
@@ -954,7 +1077,7 @@ pub fn checkSigTypeArgConstraints(c: *Checker, sig: TypeId, args: []const TypeId
 fn checkOneTypeArgConstraint(c: *Checker, arg: TypeId, con0: TypeId, map: []const TpMap, an: Node) Error!void {
     if (an == null_node) return;
     if (arg == types.any_type or arg == types.unknown_type) return;
-    if (try c.undecidableType(arg)) return;
+    if (try undecidableTypeArg(c, arg)) return;
     // A class whose `extends` chain reaches a base ztsc could not resolve has
     // an INCOMPLETE member set by construction, so "does not satisfy" against
     // it is a verdict about the missing base, not about the code — the same
@@ -1116,6 +1239,17 @@ pub fn decidableConstraintSet(c: *Checker, con: TypeId) Error!bool {
             => {},
             .union_type, .intersection => {
                 for (0..s.memberCount(cur)) |i| try stack.append(c.scratch(), s.memberAt(cur, i));
+            },
+            // An ARRAY or TUPLE constraint is structural in the same sense a
+            // `.object` is — `S extends T` with `T = [number, ...number[]]` is
+            // decided element by element by the relation, including arity and
+            // the rest element — so it is decidable exactly when its elements
+            // are. `restTupleElements1` writes eight of them
+            // (`assign<[number, ...number[]], [number]>()`), every one of which
+            // this arm's absence dropped on the floor.
+            .array => try stack.append(c.scratch(), s.arrayElem(cur)),
+            .tuple => for (0..s.tupleLen(cur)) |i| {
+                try stack.append(c.scratch(), s.tupleElem(cur, @intCast(i)).ty);
             },
             else => return false,
         }
