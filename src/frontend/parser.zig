@@ -8850,11 +8850,64 @@ const Parser = struct {
     /// because the TS1110 that produced was syntactic and suppressed the rest
     /// of the program's semantic pass.
     ///
-    /// The two terminators here are the ones the corpus witnesses: end of file
-    /// and a `>` (a full `isStartOfType` is a larger rule than the evidence
-    /// supports, and admitting a bad element keeps today's behaviour).
+    /// The list ENDS on anything but a comma — tsc's `isListTerminator` says so
+    /// in as many words:
+    ///
+    ///     case ParsingContext.TypeArguments:
+    ///         // All other tokens should cause the type-argument to terminate
+    ///         // except comma token
+    ///         return token() !== SyntaxKind.CommaToken;
+    ///
+    /// so a token no type can start with is never handed to `parseType`, and
+    /// the `>` is expected right WHERE that token is — which the one-per-
+    /// position rule then folds into whatever the token already earned.
+    /// `let x: Foo<A,\ B>` is the shape: tsgo answers the scanner's TS1127 and
+    /// nothing else, where ztsc read the invalid character AS a type and then
+    /// wanted its `>` one token later (`TypeArgumentList1`).
+    ///
+    /// A COMMA is the one token that does NOT terminate: it is
+    /// `abortParsingListOrMoveToNextToken`'s case — TS1110 and a skip — which
+    /// is why `Foo<A,,B>` is "Type expected" on the second comma and still has
+    /// exactly two arguments.
+    ///
+    /// The terminator test is written as the tokens `isStartOfType` CERTAINLY
+    /// refuses (`startsNoTypeArgument`, the same caution as
+    /// `startsNoParameter`): a wrong `true` ends a list tsc keeps reading.
     fn parseTypeArgs(p: *Parser) PE!ast.SubRange {
         return p.parseTypeArgsIn(true);
+    }
+
+    /// The tokens `isStartOfType` certainly REFUSES — deliberately narrower
+    /// than that predicate, which admits `|`, `&`, `*`, `?`, `!`, `<`, `(`,
+    /// `[`, `{`, `...`, `-`, `new`, `import`, `infer`, `asserts`, every
+    /// literal, every template head, and any identifier. Answering `true` here
+    /// ends a type-argument list; answering it where tsc would have parsed an
+    /// element throws that element away, so the list is only what is certain.
+    fn startsNoTypeArgument(tag: TokTag) bool {
+        return switch (tag) {
+            // tsc's `SyntaxKind.Unknown` — the scanner's invalid character,
+            // which is the shape this rule was measured on (`Foo<A,B,\ C>(4,
+            // 5, 6)`, `let x: Foo<A,\ B>`).
+            .unknown,
+            .r_paren,
+            .r_bracket,
+            .r_brace,
+            .semicolon,
+            .colon,
+            .eq,
+            .arrow,
+            .dot,
+            .at,
+            .percent,
+            .slash,
+            .plus,
+            .plus_plus,
+            .minus_minus,
+            .tilde,
+            .caret,
+            => true,
+            else => false,
+        };
     }
 
     /// `parseTypeArgs` with the TS1099 decision made by the caller. Only the
@@ -8864,7 +8917,16 @@ const Parser = struct {
         const lt = try p.expectLt();
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
-        while (p.curTag() != .eof and !isGtFamily(p.curTag())) {
+        while (true) {
+            if (p.curTag() == .comma) {
+                // `parsingContextErrors(TypeArguments)` and a SKIP: no
+                // enclosing list starts with a comma, so
+                // `isInSomeParsingContext` is false and the list keeps reading.
+                try p.fail(.expected_type);
+                _ = try p.bump();
+                continue;
+            }
+            if (p.curTag() == .eof or isGtFamily(p.curTag()) or startsNoTypeArgument(p.curTag())) break;
             try p.pushScratch(try p.parseType());
             if (try p.eat(.comma) == null) break;
         }
