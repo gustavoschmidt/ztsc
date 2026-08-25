@@ -1644,7 +1644,15 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!RelAnswer {
     // the same way the union-target arm resolves one.
     if (tk == .void) {
         if (sk == .undefined or sk == .void) return .yes;
-        if (sk != .union_type) {
+        // A TYPE PARAMETER is not a "simple" type either: tsc never reaches
+        // `isSimpleTypeRelatedTo` with one, it reaches
+        // `structuredTypeRelatedTo`'s type-variable arm and relates the
+        // CONSTRAINT. `<W extends void>` IS assignable to `void`; the
+        // `sk == .type_param` arm further down is what says so, and this arm
+        // only has to stop answering ahead of it. `inferTypes1`'s
+        // `type C2<S, U extends void> = S extends A2<infer T, U> ? …` is the
+        // witness — a false TS2344 on `U` against `A2<T, U extends void>`.
+        if (sk != .union_type and sk != .type_param) {
             if (sk == .ref and !c.refExpandsToObject(s)) {
                 const rs = try c.resolveStructural(s);
                 // Delegated wholesale, as the `this` rewrite above is.

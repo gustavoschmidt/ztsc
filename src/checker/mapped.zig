@@ -588,7 +588,20 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
                     // bring the names across or `keyof` loses the enum. Only
                     // an un-remapped map keeps the key: an `as` clause names
                     // the property itself.
-                    if (as_clause == 0) try c.carryKeyNameTypes(mapped, &.{src});
+                    if (as_clause == 0) {
+                        // `carryKeyNameTypes` reads the side table by OBJECT
+                        // id, so an INTERSECTION source has to be handed its
+                        // constituents — the same flattening `collectHomoProps`
+                        // did to reach their members. `PartMappings =
+                        // Omit<M, "foo"> & Partial<Pick<M, "foo">>` is that
+                        // shape, and handing it the intersection carried
+                        // nothing: a numeric key `42` came out of the map named
+                        // `"42"`.
+                        var srcs: std.ArrayList(TypeId) = .empty;
+                        defer srcs.deinit(c.scratch());
+                        try collectHomoSources(c, src, &srcs);
+                        try c.carryKeyNameTypes(mapped, srcs.items);
+                    }
                     return mapped;
                 }
                 if (!empty) try arrayish.append(c.scratch(), try c.objectFromPropsFlags(props.items, sindex, nindex, obj_flags));
@@ -782,6 +795,19 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
                 }
                 const pt = try stripMappedOptional(c, try c.substMappedKey(value, key_id, key_lit), base, flags);
                 try props.append(c.scratch(), .{ .name = nm, .ty = pt, .flags = applyPropModifiers(base, flags) });
+                // The member is KEYED by the digits, but it is NAMED by the
+                // number — tsc's `addMemberForKeyType` stores the key type as
+                // `links.nameType`, and `getLiteralTypeFromProperty` reads it
+                // back. Without the entry `keyof` re-mints the atom as a STRING
+                // literal, so `keyof Omit<{ 42: string }, "x">` came back
+                // `"42"` where `keyof { 42: string }` (which typenode.zig does
+                // record) is `42` — the two disagree, and a `K extends keyof
+                // typeof mapper` argument then failed a `(typeof arr)[number]`
+                // constraint whose numeric member it does contain
+                // (`mappedTypeIndexedAccessConstraint` 57/60).
+                if (as_clause == 0) {
+                    try name_types.append(c.scratch(), .{ .name = nm, .ty = try s.regularLiteral(key_lit) });
+                }
             },
             // A key that is not usable as a property name on its own. With
             // an `as` clause it still names a property: tsc's
@@ -926,6 +952,19 @@ pub fn collectHomoProps(c: *Checker, t: TypeId, out: *std.ArrayList(types.Prop))
             const statics = try c.classStaticType(c.ts.classSymbol(r));
             if (statics != r) try c.collectHomoProps(statics, out);
         },
+        else => {},
+    }
+}
+
+/// The OBJECT tables a homomorphic map's source contributes members from —
+/// itself, or an intersection's constituents. Mirrors `collectHomoProps`'
+/// flattening; `carryKeyNameTypes` needs the tables themselves rather than
+/// their props, because the `key_name_types` side table is keyed by object id.
+fn collectHomoSources(c: *Checker, t: TypeId, out: *std.ArrayList(TypeId)) Error!void {
+    const r = try c.resolveStructural(t);
+    switch (c.ts.kind(r)) {
+        .object => try out.append(c.scratch(), r),
+        .intersection => for (try c.memberList(r)) |m| try collectHomoSources(c, m, out),
         else => {},
     }
 }

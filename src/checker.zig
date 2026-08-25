@@ -2124,6 +2124,16 @@ pub const Checker = struct {
     /// Per-generic-symbol memo of "declares a constrained type parameter"
     /// (see `symHasConstrainedTypeParam`) — the queue's admission test.
     tp_constrained_cache: IntMap(SymbolId, bool) = .empty,
+    /// Memoized `typeParamsOf` lists, per generic symbol. A list holds only
+    /// SYMBOLS and unconverted NODES — never a TypeId — so it is a pure
+    /// function of the program's declarations and can never go stale; the memo
+    /// exists because the walk is a scan of every declaration block of a
+    /// (possibly merged) symbol, and the reference materializer, `buildInstMap`
+    /// and the TS2344 gate all ask for it per written reference. tsc caches the
+    /// same thing on the symbol's links
+    /// (`getTypeParametersForTypeReferenceOrImport`). The slices are owned by
+    /// the checker's own allocator and live as long as it does.
+    tp_list_cache: IntMap(SymbolId, []const typenode_zig.TypeParamInfo) = .empty,
     /// Depth of "checking a NON-STATIC class field's initializer" frames. Such
     /// an initializer runs at construction time, not at class-definition time,
     /// so a forward reference in it is not in the temporal dead zone — tsc's

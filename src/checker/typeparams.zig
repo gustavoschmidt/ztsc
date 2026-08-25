@@ -90,6 +90,13 @@ pub const TypeParamInfo = struct {
 /// own `sym`, pre-existing entries included, before the merged-default pass
 /// (which may replace some of them again) runs.
 pub fn typeParamsOf(c: *Checker, sym: SymbolId, buf: *std.ArrayList(TypeParamInfo)) Error!void {
+    // Memoized on the way in and out (`Checker.tp_list_cache`). Only for the
+    // empty-`buf` call, which is every caller — a pre-filled `buf` ends the
+    // scan before it starts and is not this symbol's list.
+    const memoizable = buf.items.len == 0;
+    if (memoizable) {
+        if (c.tp_list_cache.get(sym)) |l| return buf.appendSlice(c.scratch(), l);
+    }
     var one = [_]SymbolId{sym};
     const parts: []const SymbolId = if (c.prog.isMergedId(sym)) c.prog.mergedSym(sym).parts else one[0..];
     outer: for (parts) |csym| {
@@ -100,10 +107,14 @@ pub fn typeParamsOf(c: *Checker, sym: SymbolId, buf: *std.ArrayList(TypeParamInf
             if (buf.items.len > 0) break :outer;
         }
     }
-    if (buf.items.len == 0) return;
-    for (buf.items) |*tp| tp.default_sym = tp.sym;
-    try fillMergedTypeParamDefaults(c, sym, buf);
-    if (c.symFlags(sym).class) try c.canonicalizeClassTypeParams(sym, buf);
+    if (buf.items.len != 0) {
+        for (buf.items) |*tp| tp.default_sym = tp.sym;
+        try fillMergedTypeParamDefaults(c, sym, buf);
+        if (c.symFlags(sym).class) try c.canonicalizeClassTypeParams(sym, buf);
+    }
+    if (memoizable) {
+        try c.tp_list_cache.put(c.cm(), sym, try c.cm().dupe(TypeParamInfo, buf.items));
+    }
 }
 
 /// The `extends` clause a SIBLING declaration block of the same merged
