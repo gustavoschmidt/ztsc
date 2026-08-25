@@ -58,7 +58,7 @@ pub fn typeFromTypeNameEx(c: *Checker, name_node: Node, args: []const TypeId, ou
     // (class/interface `extends` clauses); it shares qualified_name's
     // layout (lhs = base node, rhs = name token).
     if (c.nodeTag(name_node) == .qualified_name or c.nodeTag(name_node) == .member_expr)
-        return c.typeFromQualifiedName(name_node, args);
+        return c.typeFromQualifiedName(name_node, args, out_sym);
     if (c.nodeTag(name_node) != .identifier) return types.any_type;
     const tok = c.tree.nodeMainToken(name_node);
     switch (c.tree.tokens.tag(tok)) {
@@ -289,8 +289,17 @@ fn noInferWrapper(c: *Checker, t: TypeId) Error!TypeId {
 /// `declare module` augmentation fallback so both build the identical type.
 pub fn materializeTypeRef(c: *Checker, sym: SymbolId, args: []const TypeId, tok: TokenIndex, a: Atom) Error!TypeId {
     const f = c.symFlags(sym);
-    if (f.type_param) return c.ts.makeTypeParam(sym);
-    if (f.enum_decl) return c.ts.makeEnumType(sym);
+    // A type parameter and an enum take no parameter list, and neither
+    // reaches `fixTypeArgs` (which is where every other kind's TS2315 comes
+    // from) — see `reportNoTypeArguments`.
+    if (f.type_param) {
+        try c.reportNoTypeArguments(sym, args, tok);
+        return c.ts.makeTypeParam(sym);
+    }
+    if (f.enum_decl) {
+        try c.reportNoTypeArguments(sym, args, tok);
+        return c.ts.makeEnumType(sym);
+    }
     if (f.type_alias) {
         // The real lib declares the four string transforms as
         // `type Uppercase<S extends string> = intrinsic;`. Recognize an
@@ -707,16 +716,22 @@ pub fn targetTypeSym(c: *Checker, tgt0: modules.Target) ?SymbolId {
 /// `import("m").T[<args>]` in type position: resolve the module, then
 /// its exported type `T`. Unresolved module ⇒ TS2307 (in the resolver);
 /// missing/non-type member ⇒ TS2694, matching tsc.
-pub fn importTypeMember(c: *Checker, import_node: Node, name_tok: TokenIndex, args: []const TypeId) Error!TypeId {
+pub fn importTypeMember(c: *Checker, import_node: Node, name_tok: TokenIndex, args: []const TypeId, out_sym: ?*SymbolId) Error!TypeId {
     const m = (try c.resolveImportTypeModule(import_node, true)) orelse return types.error_type;
     const name = try c.memberAtom(name_tok);
     if (c.moduleExportTarget(m, name)) |tgt| {
         if (c.targetTypeSym(tgt)) |sym| {
-            if (hasTypeMeaning(c.symFlags(sym))) return c.namedTypeFromSymbol(sym, args, name_tok);
+            if (hasTypeMeaning(c.symFlags(sym))) {
+                if (out_sym) |o| o.* = sym;
+                return c.namedTypeFromSymbol(sym, args, name_tok);
+            }
         }
     }
     if (c.exportEqualsMemberSym(m, name)) |sym| {
-        if (hasTypeMeaning(c.symFlags(sym))) return c.namedTypeFromSymbol(sym, args, name_tok);
+        if (hasTypeMeaning(c.symFlags(sym))) {
+            if (out_sym) |o| o.* = sym;
+            return c.namedTypeFromSymbol(sym, args, name_tok);
+        }
     }
     const spec_tok = c.tree.nodeData(import_node).lhs;
     try c.diagFmt(2694, c.tokSpan(name_tok), "Namespace '{s}' has no exported member '{s}'.", .{ stripQuotes(c.tokenText(spec_tok)), c.atomText(name) });
@@ -1090,11 +1105,18 @@ fn reportBadNsQualifier(c: *Checker, node: Node, member_tok: TokenIndex) Error!b
 /// Resolve a qualified type name `A.B.T` (in type position) by walking
 /// namespace containers left-to-right, then building the final member's
 /// type. Missing/non-exported members report TS2694 like tsc.
-pub fn typeFromQualifiedName(c: *Checker, node: Node, args: []const TypeId) Error!TypeId {
+///
+/// `out_sym` reports WHICH generic symbol the dotted name resolved to, the
+/// same out-parameter `typeFromTypeNameEx` carries for a bare name and for
+/// the same single consumer: the TS2344 gate, which needs the symbol whose
+/// constraints the written argument list is checked against. Without it a
+/// qualified reference (`NS.Foo<number>`, `import("./m").Foo<number>`)
+/// resolved to `no_symbol` and its arguments were never checked at all.
+pub fn typeFromQualifiedName(c: *Checker, node: Node, args: []const TypeId, out_sym: ?*SymbolId) Error!TypeId {
     const d = c.tree.nodeData(node);
     const name_tok: TokenIndex = d.rhs;
     // `import("m").T` — the qualifier base is a module, not a namespace sym.
-    if (c.nodeTag(d.lhs) == .import_type) return c.importTypeMember(d.lhs, name_tok, args);
+    if (c.nodeTag(d.lhs) == .import_type) return c.importTypeMember(d.lhs, name_tok, args, out_sym);
     const name = try c.memberAtom(name_tok);
     // A qualified ENUM MEMBER in type position (`WS.INIT`, `NS.E.X`): the
     // member's own nominal unit type. Checked before the namespace walk —
@@ -1122,7 +1144,10 @@ pub fn typeFromQualifiedName(c: *Checker, node: Node, args: []const TypeId) Erro
             if (c.namespaceMemberSym(ns_sym, name)) |g| {
                 const mf = c.symFlags(g);
                 if (mf.exported) {
-                    if (memberNamesAType(mf)) return c.namedTypeFromSymbol(g, args, name_tok);
+                    if (memberNamesAType(mf)) {
+                        if (out_sym) |o| o.* = g;
+                        return c.namedTypeFromSymbol(g, args, name_tok);
+                    }
                     // Names a value and no type: tsc's `resolveEntityName`
                     // falls through to the VALUE meaning and answers TS2749
                     // over the whole dotted name, not TS2694 on the member.
@@ -1159,7 +1184,10 @@ pub fn typeFromQualifiedName(c: *Checker, node: Node, args: []const TypeId) Erro
         .module => |m| {
             if (c.moduleExportTarget(m, name)) |tgt| {
                 if (c.targetTypeSym(tgt)) |g| {
-                    if (hasTypeMeaning(c.symFlags(g))) return c.namedTypeFromSymbol(g, args, name_tok);
+                    if (hasTypeMeaning(c.symFlags(g))) {
+                        if (out_sym) |o| o.* = g;
+                        return c.namedTypeFromSymbol(g, args, name_tok);
+                    }
                 }
             }
             // A member ztsc cannot resolve through a namespace-import module

@@ -285,17 +285,84 @@ fn writtenTypeParamRange(c: *const Checker, node: Node) ?[]const Node {
 /// shorter than `nodeCount`. (A node owning several scopes appears several
 /// times; `diagFmt` dedupes on `(file, code, span-start)`, so a repeat is
 /// free.)
+/// The walk also carries tsc's OTHER per-default rule, TS2344 on a default
+/// that does not satisfy its own parameter's constraint — see
+/// `reportDefaultConstraintViolation`. The two rules read the same syntax off
+/// the same list, so they share one traversal rather than two.
 pub fn checkFileTypeParamDefaults(c: *Checker) Error!void {
     for (c.prog.files[c.cur_file].bind.scope_owners, 0..) |node, s| {
         if (s == 0 or node == null_node) continue;
         const tps = writtenTypeParamRange(c, node) orelse continue;
+        const decl_scope = (try c.scopeOf(node)) orelse continue;
         for (tps, 0..) |tp, i| {
             if (tp == null_node or c.nodeTag(tp) != .type_param) continue;
-            const def = c.tree.nodeData(tp).rhs;
-            if (def == null_node) continue;
-            try reportForwardDefaultRefs(c, def, tps[i..]);
+            const d = c.tree.nodeData(tp);
+            if (d.rhs == null_node) continue;
+            try reportForwardDefaultRefs(c, d.rhs, tps[i..]);
+            // A parameter with no `extends` has nothing to violate, and the
+            // symbol lookup is only paid for the ones that do.
+            if (d.lhs == null_node) continue;
+            const tp_sym = (try typeParamSymOfNode(c, decl_scope, tp)) orelse continue;
+            try reportDefaultConstraintViolation(c, tp_sym, d.rhs);
         }
     }
+}
+
+/// TS2344 on a type parameter's DEFAULT — tsc's `checkTypeParameter`:
+///
+/// ```ts
+/// const constraintType = getConstraintOfTypeParameter(typeParameter);
+/// const defaultType = getDefaultFromTypeParameter(typeParameter);
+/// if (constraintType && defaultType) {
+///     checkTypeAssignableTo(defaultType,
+///         instantiateType(constraintType, makeTypeMapper([typeParameter], [defaultType])),
+///         node.default, Diagnostics.Type_0_does_not_satisfy_the_constraint_1);
+/// }
+/// ```
+///
+/// `<T extends string = number>` is the plain case; the mapper is what makes
+/// a SELF-referential bound (`<T extends Array<T> = string[]>`) read in the
+/// world the default supplies, exactly as a written argument list's
+/// constraint does (`checkTypeArgConstraints`).
+///
+/// The written-argument gate's two decidability screens apply here as well,
+/// with ONE relaxation each — a default is not the closed type it first looks
+/// like, and both relaxations were measured rather than assumed:
+///
+///   * the default may name an earlier parameter of the same list (TS2744
+///     permits exactly that), so `undecidableType` refuses most of them.
+///     Typebox writes `P extends TProperties = TFromMappedResult<R>` on
+///     eighteen declarations and drizzle three more; judging those deferred
+///     mapped applications produced 32 false TS2344s across the package
+///     corpus, which is the same verdict-about-our-own-resolution the screen
+///     exists to refuse. A BARE sibling parameter is the exception: the
+///     relation judges it through its own written constraint, which is the
+///     comparison tsc makes — so `<T extends string, U extends number = T>`
+///     reports, screened on THAT constraint being decidable in turn.
+///   * a bare parameter is admitted as the CONSTRAINT (`<T, U extends T =
+///     number>`): a type variable as a target accepts only itself and things
+///     constrained by it, so the relation settles it without enumerating a
+///     set — the reason `decidableConstraintSet` cannot say yes to one.
+fn reportDefaultConstraintViolation(c: *Checker, tp_sym: SymbolId, def_node: Node) Error!void {
+    const con0 = try c.typeParamConstraint(tp_sym);
+    if (con0 == types.no_type) return;
+    const def = try c.typeParamDefault(tp_sym);
+    if (def == types.no_type) return;
+    if (def == types.any_type or con0 == types.any_type or con0 == types.unknown_type) return;
+    if (c.ts.kind(def) == .type_param) {
+        const sib = try c.typeParamConstraint(c.ts.typeParamSymbol(def));
+        if (sib != types.no_type and try c.undecidableType(sib)) return;
+    } else if (try c.undecidableType(def)) return;
+    const map = [_]TpMap{.{ .sym = tp_sym, .ty = def }};
+    const con = try c.instantiate(con0, &map);
+    if (con == types.any_type or con == types.unknown_type) return;
+    if (c.ts.kind(con) != .type_param and !try c.decidableConstraintSet(con)) return;
+    if (try c.isAssignable(def, con)) return;
+    try c.diagFmt(2344, c.nodeSpan(def_node), "Type '{s}' does not satisfy the constraint '{s}'.{s}", .{
+        try c.typeToString(def),
+        try c.typeToString(con),
+        try elaborate.chainText(c, def, con),
+    });
 }
 
 /// TS2313, "Type parameter 'T' has a circular constraint" — tsc's
@@ -481,11 +548,18 @@ pub fn typeParamSymsOfDecl(c: *Checker, decl: Node, buf: *std.ArrayList(SymbolId
     const tps = writtenTypeParamRange(c, decl) orelse return;
     const decl_scope = (try c.scopeOf(decl)) orelse return;
     for (tps) |tp| {
-        if (tp == null_node or c.nodeTag(tp) != .type_param) continue;
-        const a = try c.atomOfToken(c.tree.nodeMainToken(tp));
-        const tp_sym = c.bind.lookupInScope(decl_scope, a) orelse continue;
-        try buf.append(c.scratch(), c.toGlobal(tp_sym));
+        try buf.append(c.scratch(), (try typeParamSymOfNode(c, decl_scope, tp)) orelse continue);
     }
+}
+
+/// The symbol one written `<T …>` entry declares, looked up in the scope the
+/// list opens. Null when the entry is a hole, is not a type parameter, or has
+/// no binder entry — every caller then skips that position.
+fn typeParamSymOfNode(c: *Checker, decl_scope: binder.ScopeId, tp: Node) Error!?SymbolId {
+    if (tp == null_node or c.nodeTag(tp) != .type_param) return null;
+    const a = try c.atomOfToken(c.tree.nodeMainToken(tp));
+    const local = c.bind.lookupInScope(decl_scope, a) orelse return null;
+    return c.toGlobal(local);
 }
 
 /// Build the type-parameter → argument substitution map for instantiating
@@ -1121,6 +1195,21 @@ pub fn undecidableType(c: *Checker, t: TypeId) Error!bool {
         }
     }
     return false;
+}
+
+/// TS2315 for a type-space name that CANNOT take a parameter list at all —
+/// tsc's `checkNoTypeArguments`, which `getTypeReferenceType` runs on the two
+/// kinds that never reach `checkTypeReferenceNode`'s generic path: a type
+/// PARAMETER (`function f<U>() { var v: U<string> }`) and an ENUM
+/// (`enum E {}; var v: E<string>`).
+///
+/// `fixTypeArgs` already reports the same code for an interface / class /
+/// alias that declares no parameters, from the same span and with the same
+/// text; these two kinds skip it because they have no parameter list to fix,
+/// which is why the diagnostic went missing rather than being duplicated.
+pub fn reportNoTypeArguments(c: *Checker, sym: SymbolId, args: []const TypeId, tok: TokenIndex) Error!void {
+    if (args.len == 0 or tok == 0) return;
+    try c.diagFmt(2315, c.tokSpan(tok), "Type '{s}' is not generic.", .{c.symbolName(sym)});
 }
 
 /// Check type-argument arity against a generic symbol and fill defaults.

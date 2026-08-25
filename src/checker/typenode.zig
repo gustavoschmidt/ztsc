@@ -101,6 +101,7 @@ pub const declTypeParams = typeparams_zig.declTypeParams;
 pub const drainTypeArgConstraints = typeparams_zig.drainTypeArgConstraints;
 pub const fixTypeArgs = typeparams_zig.fixTypeArgs;
 pub const queueSigTypeArgConstraints = typeparams_zig.queueSigTypeArgConstraints;
+pub const reportNoTypeArguments = typeparams_zig.reportNoTypeArguments;
 pub const queueTypeArgConstraints = typeparams_zig.queueTypeArgConstraints;
 pub const symHasConstrainedTypeParam = typeparams_zig.symHasConstrainedTypeParam;
 pub const typeParamSymsOfDecl = typeparams_zig.typeParamSymsOfDecl;
@@ -192,7 +193,7 @@ fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
             }
             return result;
         },
-        .qualified_name => return c.typeFromQualifiedName(node, &.{}),
+        .qualified_name => return c.typeFromQualifiedName(node, &.{}, null),
         .import_type => {
             // Bare `import("m")` in type position: resolve for discovery /
             // TS2307; the module namespace itself is not a type — `any`.
