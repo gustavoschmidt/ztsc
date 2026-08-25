@@ -274,6 +274,14 @@ const Parser = struct {
     /// Speculation depth; > 0 makes expectation failures raise Backtrack.
     spec: u32 = 0,
 
+    /// tsc's `parsingContext` bitset, kept for exactly the two list contexts a
+    /// BINDING PATTERN's error recovery has to consult — see
+    /// `abandonsBindingPattern`. Purely a save/restore stack discipline,
+    /// like tsc's own `saveParsingContext`; it accumulates
+    /// on the way down and is never cleared, so a pattern inside a function
+    /// nested in a declarator's initializer still sees the declarator list.
+    list_ctx: u8 = 0,
+
     /// Start offset of the last SYNTACTIC diagnostic recorded, for tsc's
     /// one-per-position rule (`addDiag`). Not derivable from `diags` — the last
     /// entry there may be a grammar-class one, which does not participate.
@@ -2700,6 +2708,13 @@ const Parser = struct {
         }
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
+        // tsc's `parsingContext |= 1 << ParsingContext.VariableDeclarations`.
+        // It stays set for the whole list, INITIALIZERS included, which is why
+        // `const f = function({ ; }) {}` abandons the pattern at the `;` where
+        // the same pattern in a plain `function f({ ; }) {}` skips it.
+        const saved_ctx = p.list_ctx;
+        defer p.list_ctx = saved_ctx;
+        p.list_ctx |= ListCtx.var_decls;
         var trailing_comma: ?u32 = null;
         list: while (true) {
             // `parseDelimitedList` asks `isListElement` at the top of EVERY
@@ -3117,7 +3132,12 @@ const Parser = struct {
 
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
+        // tsc's `checkSwitchStatement` carries a `hasDuplicateDefaultClause`
+        // LATCH beside `firstDefaultClause`, and stops reporting once it is
+        // set — so a switch with three `default:` clauses is ONE TS1113, on the
+        // second (`switchStatementsWithMultipleDefaults1`).
         var seen_default = false;
+        var reported_default = false;
         while (p.curTag() != .r_brace and p.curTag() != .eof) {
             const before = p.curIdx();
             switch (p.curTag()) {
@@ -3131,7 +3151,10 @@ const Parser = struct {
                 },
                 .keyword_default => {
                     const def_kw = try p.bump();
-                    if (seen_default) try p.errAtToken(.multiple_default_clauses, def_kw);
+                    if (seen_default and !reported_default) {
+                        try p.errAtToken(.multiple_default_clauses, def_kw);
+                        reported_default = true;
+                    }
                     seen_default = true;
                     _ = try p.expect(.colon, .expected_colon);
                     const range = try p.parseClauseStatements();
@@ -3604,6 +3627,12 @@ const Parser = struct {
         _ = try p.bump();
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
+        // tsc's `parsingContext |= 1 << ParsingContext.Parameters`, restored on
+        // the way out; a binding pattern in here consults it to decide whether
+        // a token it cannot use belongs to this list (`abandonsBindingPattern`).
+        const saved_ctx = p.list_ctx;
+        defer p.list_ctx = saved_ctx;
+        p.list_ctx |= ListCtx.params;
         // TS1014, tsc's `checkGrammarParameterList`: a rest parameter must be
         // LAST. Blamed on the `...` (`grammarErrorOnNode(parameter.
         // dotDotDotToken, …)`), and the walk RETURNS at its first hit, so only
@@ -3677,7 +3706,12 @@ const Parser = struct {
             // exactly when the last thing consumed was a comma — i.e. when the
             // list has a TRAILING one (tsc's `NodeArray.hasTrailingComma`).
             trailing_comma = try p.eat(.comma);
-            if (trailing_comma == null and p.curTag() != .r_paren) {
+            // End of file ends EVERY list in tsc — `isListTerminator` answers
+            // `true` for it before it looks at `kind` at all — so the list is
+            // over and the missing `)` is the only thing left to say. Demanding
+            // the comma first put "',' expected" where tsgo has "')' expected"
+            // (same code, same position, wrong wording).
+            if (trailing_comma == null and p.curTag() != .r_paren and p.curTag() != .eof) {
                 try p.fail(.expected_comma);
             }
         }
@@ -3955,6 +3989,62 @@ const Parser = struct {
 
     // --- binding patterns ---------------------------------------------------
 
+    /// The two members of tsc's `ParsingContext` a binding pattern's recovery
+    /// asks about (`list_ctx`, `abandonsBindingPattern`). Nothing else needs a
+    /// bit: the statement list is on tsc's stack unconditionally, and the
+    /// pattern's OWN list answers for itself before the recovery runs.
+    const ListCtx = struct {
+        /// `ParsingContext.Parameters`.
+        const params: u8 = 1 << 0;
+        /// `ParsingContext.VariableDeclarations`.
+        const var_decls: u8 = 1 << 1;
+    };
+
+    /// The tokens `isStartOfParameter` accepts that `abandonsBindingPattern`
+    /// does not already reach through `atStartOfStatement`. Everything else in
+    /// that predicate — `<`, `|`, `&`, `*`, `!`, `@`, every literal, every
+    /// template — is a statement start too, and `...` plus the binding names
+    /// are elements of the pattern rather than tokens its recovery ever sees.
+    /// `)` and `]` are the list's TERMINATORS (tsc's `isListTerminator(
+    /// Parameters)`), and `?` is a type start.
+    fn startsOrEndsParameter(tag: TokTag) bool {
+        return switch (tag) {
+            .r_paren, .r_bracket, .question => true,
+            else => false,
+        };
+    }
+
+    /// tsc's `isInSomeParsingContext`, as `abortParsingListOrMoveToNextToken`
+    /// asks it from an object- or array-BINDING-PATTERN list: does some
+    /// ENCLOSING list want this token, so the pattern must end and hand it
+    /// back, or is it junk to step over and keep reading? Three contexts can be
+    /// on the stack:
+    ///
+    ///   - the statement list, always — `isStartOfStatement`, MINUS `;`. tsc
+    ///     passes `inErrorRecovery: true` from here, and its
+    ///     `isListElement(SourceElements)` then refuses to read a `;` as an
+    ///     empty statement ("';' can show up in far too many contexts"). That
+    ///     one exclusion is why `function f({ ; }) {}` is a lone TS1180 for
+    ///     tsgo where ztsc used to abandon the pattern and invent a TS1003 on
+    ///     the `}` (`parametersSyntaxErrorNoCrash1`/`2`).
+    ///   - `Parameters`, when the pattern is a parameter's name.
+    ///   - `VariableDeclarations`, when it is a declarator's name. This is the
+    ///     bit that keeps `const { ; } = x` abandoning the pattern —
+    ///     `isVariableDeclaratorListTerminator` accepts anything a `;` could
+    ///     stand in for, a PRECEDING LINE BREAK included — while the very same
+    ///     `;` inside a parameter list is skipped.
+    ///
+    /// A declarator's own `atStartOfDeclarator` and a parameter's own start
+    /// tokens are folded in for completeness; neither can actually reach here,
+    /// since a token that starts a declarator starts a pattern element too.
+    fn abandonsBindingPattern(p: *Parser) bool {
+        if (p.curTag() != .semicolon and p.atStartOfStatement()) return true;
+        if (p.list_ctx & ListCtx.params != 0 and startsOrEndsParameter(p.curTag())) return true;
+        if (p.list_ctx & ListCtx.var_decls != 0 and
+            (p.varDeclaratorListDone() or p.atStartOfDeclarator())) return true;
+        return false;
+    }
+
     /// A binding name: an identifier or a destructuring pattern.
     ///
     /// `private_code` is what a `#name` here earns — tsc's
@@ -4024,15 +4114,14 @@ const Parser = struct {
                 //
                 // …and `abortParsingListOrMoveToNextToken`'s two-way recovery.
                 // A token some ENCLOSING list would take ends this one and is
-                // left where it is (`isInSomeParsingContext`, approximated by
-                // the statement list, which is the enclosing context that
-                // matters here): `let[0] = 100` leaves `0` to become the
-                // expression statement tsc parses. Anything else — an operator
-                // no list starts with — is SKIPPED and the pattern keeps
-                // reading, so `var [...x = a]` stays one diagnostic instead of
-                // handing `= a]` to the enclosing declarator.
+                // left where it is (`abandonsBindingPattern`): `let[0] = 100`
+                // leaves `0` to become the expression statement tsc parses.
+                // Anything else — an operator no list starts with — is SKIPPED
+                // and the pattern keeps reading, so `var [...x = a]` stays one
+                // diagnostic instead of handing `= a]` to the enclosing
+                // declarator.
                 try p.fail(.expected_binding_pattern_element);
-                if (p.atStartOfStatement()) break;
+                if (p.abandonsBindingPattern()) break;
                 _ = try p.bump();
                 continue;
             }
@@ -4141,8 +4230,18 @@ const Parser = struct {
                     .data = .{ .lhs = key_expr, .rhs = target },
                 }));
             } else {
+                // `abortParsingListOrMoveToNextToken`, exactly as the array
+                // pattern above: report the LIST's TS1180 and then either hand
+                // the token back to an enclosing list or step over it and keep
+                // reading. Ending the pattern unconditionally left the `}` for
+                // the enclosing parameter list to answer for, which is the
+                // TS1003 `parametersSyntaxErrorNoCrash1`/`2` used to carry;
+                // `function f({ , a }) {}` and `const { , a } = x` are the same
+                // shape one token earlier.
                 try p.fail(.expected_binding_pattern_property);
-                if (p.curIdx() == before) break;
+                if (p.abandonsBindingPattern()) break;
+                _ = try p.bump();
+                continue;
             }
             if (try p.eat(.comma) == null and p.curTag() != .r_brace) {
                 try p.fail(.expected_comma);
@@ -5689,33 +5788,48 @@ const Parser = struct {
             return p.addNode(.{ .tag = .import_decl, .main_token = kw, .data = .{ .lhs = extra, .rhs = mod } });
         }
 
-        // `import type ...` (but `import type from "m"` imports a default
-        // named `type`).
+        // The two contextual words that can lead an import clause: `type`
+        // (type-only) and `defer` (TC39 deferred module evaluation, TS 5.9).
+        // tsc reads AT MOST ONE of them — its `parseImportDeclarationOr
+        // ImportEqualsDeclaration` takes the `type` arm or the `defer` arm,
+        // never both — so whichever comes second is the imported NAME:
+        // `import defer type * as ns from "m"` is a DEFERRED import whose
+        // default binding is `type`, and `import type defer * as ns from "m"`
+        // is a TYPE-ONLY import-equals named `defer` (measured against tsgo,
+        // `importDeferTypeConflict1`/`2`).
+        //
+        // Both are recognized by the same shape, tsc's
+        //
+        //     (token() !== FromKeyword || …) &&
+        //     (isIdentifier() || token() === AsteriskToken || token() === OpenBraceToken)
+        //
+        // which is what keeps `import type from "m"` and `import defer from
+        // "m"` ordinary default imports of a binding so named, while `import
+        // defer from from "m"` defers an import of a default named `from`
+        // (`importDeferFromInvalid`).
+        var deferred_tok: u32 = 0;
         if (p.curTag() == .keyword_type) {
-            const t1 = p.peekTag(1);
-            const is_type_only = (isIdentLike(t1) and !(t1 == .keyword_from and p.peekTag(2) == .string_literal)) or
-                t1 == .l_brace or t1 == .asterisk;
-            if (is_type_only) {
+            if (leadsImportClause(p.peekTag(1), p.peekTag(2))) {
                 _ = try p.bump();
                 flags |= ast.Flags.type_only;
             }
+        } else if (isIdentLike(p.curTag()) and std.mem.eql(u8, p.laText(0), "defer") and
+            leadsImportClause(p.peekTag(1), p.peekTag(2)))
+        {
+            deferred_tok = try p.bump();
         }
 
         var default_name: u32 = 0;
         var ns_name: u32 = 0;
         var specs: ast.SubRange = .{ .start = 0, .end = 0 };
-
-        // `import defer * as ns from "m"` (TC39 deferred module evaluation,
-        // TS 5.9): `defer` is a CONTEXTUAL keyword, not a binding, and the
-        // namespace clause is the only one the form admits. Nothing about the
-        // TYPES changes — deferral is an evaluation-order guarantee — so the
-        // token is simply dropped and `* as ns` binds as usual. Recognized
-        // only immediately before `*`: `import defer from "m"` and `import
-        // defer, * as ns from "m"` are both ordinary DEFAULT imports of a
-        // binding named `defer`, and reading `defer` as the keyword there
-        // invented a namespace and lost a TS1192.
-        if (isIdentLike(p.curTag()) and p.peekTag(1) == .asterisk and
-            std.mem.eql(u8, p.laText(0), "defer")) _ = try p.bump();
+        // Whether a `{ … }` was READ, which an empty `specs` cannot say —
+        // `import defer { } from "m"` is still a NamedImports clause and still
+        // TS18059.
+        var named_bindings = false;
+        // Set when a phase modifier already committed the declaration to the ES
+        // form and the clause therefore ended at the default binding — see the
+        // import-equals arm below.
+        var clause_done = false;
 
         if (isIdentLike(p.curTag())) {
             // `import d ...` — but `import x = require(...)` is out of subset.
@@ -5744,11 +5858,25 @@ const Parser = struct {
             // reference, and "';' expected" on the string — where ztsc used to
             // guess "'from' expected" and then trip over the rest of the line.
             if (p.curTag() != .comma and p.curTag() != .keyword_from) {
-                return p.finishImportEquals(export_kw orelse kw, default_name, flags | (if (export_kw != null) ast.Flags.exported else 0));
+                // …but a PHASE modifier has already committed the declaration
+                // to the ES form: `import defer x = require("m")` is not a
+                // thing, so tsc's import-equals arm is unreachable behind one
+                // and the missing `from` is what gets reported instead
+                // (`import defer type * as ns from "m"` — "'from' expected" on
+                // the `*`, not "'=' expected" on the `type`).
+                if (deferred_tok == 0) {
+                    return p.finishImportEquals(export_kw orelse kw, default_name, flags | (if (export_kw != null) ast.Flags.exported else 0));
+                }
+                // tsc's `parseImportClause` reads named bindings only after a
+                // COMMA, so the clause is over: `* as ns` belongs to the module
+                // specifier's expression, not to this import.
+                clause_done = true;
             }
             _ = try p.eat(.comma);
         }
-        if (p.curTag() == .asterisk) {
+        if (clause_done) {
+            // nothing more in the clause
+        } else if (p.curTag() == .asterisk) {
             _ = try p.bump();
             // tsc's `parseNamespaceImport` expects `as` and then reads the next
             // token as the namespace NAME whether or not it found one, so
@@ -5757,6 +5885,7 @@ const Parser = struct {
             ns_name = try p.expectIdentLike();
         } else if (p.curTag() == .l_brace) {
             specs = try p.parseImportSpecifiers();
+            named_bindings = true;
         } else if (default_name == 0) {
             try p.fail(.expected_import_clause);
         }
@@ -5780,6 +5909,18 @@ const Parser = struct {
         try p.skipImportAttributes();
         try p.expectSemicolon();
         if (export_kw) |m| try p.errAtToken(.import_cannot_have_modifiers, m);
+        // tsc's `checkImportClause`: a deferred import may only name a
+        // NAMESPACE. Both refusals are blamed on the `defer` itself, and both
+        // are GRAMMAR-class, so a file that also failed to parse shows its
+        // TS1005s alone — which is exactly how tsgo answers the `defer`
+        // conflict cases.
+        if (deferred_tok != 0) {
+            if (default_name != 0) {
+                try p.errAtToken(.defer_import_default_binding, deferred_tok);
+            } else if (named_bindings) {
+                try p.errAtToken(.defer_import_named_bindings, deferred_tok);
+            }
+        }
 
         const extra = try p.addExtra(ast.ImportData{
             .flags = flags,
@@ -5789,6 +5930,24 @@ const Parser = struct {
             .spec_end = specs.end,
         });
         return p.addNode(.{ .tag = .import_decl, .main_token = kw, .data = .{ .lhs = extra, .rhs = mod } });
+    }
+
+    /// Is the contextual word just read (`type` or `defer`) a MODIFIER of the
+    /// import clause rather than the imported name itself? tsc asks the same
+    /// two questions of both words:
+    ///
+    ///     (token() !== FromKeyword || …) &&
+    ///     (isIdentifier() || token() === AsteriskToken || token() === OpenBraceToken)
+    ///
+    /// `t1` is the token after the word, `t2` the one after that. A `from`
+    /// followed by a STRING is the module specifier, so the word was the name
+    /// (`import type from "m"`, `import defer from "m"`); a `from` followed by
+    /// anything else is a BINDING named `from` and the word was the modifier
+    /// (`import defer from from "m"`, `importDeferFromInvalid`).
+    fn leadsImportClause(t1: TokTag, t2: TokTag) bool {
+        if (t1 == .asterisk or t1 == .l_brace) return true;
+        if (!isIdentLike(t1)) return false;
+        return !(t1 == .keyword_from and t2 == .string_literal);
     }
 
     /// `import <name> = require("m");` or `import <name> = A.B;` (CommonJS /
@@ -8691,11 +8850,64 @@ const Parser = struct {
     /// because the TS1110 that produced was syntactic and suppressed the rest
     /// of the program's semantic pass.
     ///
-    /// The two terminators here are the ones the corpus witnesses: end of file
-    /// and a `>` (a full `isStartOfType` is a larger rule than the evidence
-    /// supports, and admitting a bad element keeps today's behaviour).
+    /// The list ENDS on anything but a comma — tsc's `isListTerminator` says so
+    /// in as many words:
+    ///
+    ///     case ParsingContext.TypeArguments:
+    ///         // All other tokens should cause the type-argument to terminate
+    ///         // except comma token
+    ///         return token() !== SyntaxKind.CommaToken;
+    ///
+    /// so a token no type can start with is never handed to `parseType`, and
+    /// the `>` is expected right WHERE that token is — which the one-per-
+    /// position rule then folds into whatever the token already earned.
+    /// `let x: Foo<A,\ B>` is the shape: tsgo answers the scanner's TS1127 and
+    /// nothing else, where ztsc read the invalid character AS a type and then
+    /// wanted its `>` one token later (`TypeArgumentList1`).
+    ///
+    /// A COMMA is the one token that does NOT terminate: it is
+    /// `abortParsingListOrMoveToNextToken`'s case — TS1110 and a skip — which
+    /// is why `Foo<A,,B>` is "Type expected" on the second comma and still has
+    /// exactly two arguments.
+    ///
+    /// The terminator test is written as the tokens `isStartOfType` CERTAINLY
+    /// refuses (`startsNoTypeArgument`, the same caution as
+    /// `startsNoParameter`): a wrong `true` ends a list tsc keeps reading.
     fn parseTypeArgs(p: *Parser) PE!ast.SubRange {
         return p.parseTypeArgsIn(true);
+    }
+
+    /// The tokens `isStartOfType` certainly REFUSES — deliberately narrower
+    /// than that predicate, which admits `|`, `&`, `*`, `?`, `!`, `<`, `(`,
+    /// `[`, `{`, `...`, `-`, `new`, `import`, `infer`, `asserts`, every
+    /// literal, every template head, and any identifier. Answering `true` here
+    /// ends a type-argument list; answering it where tsc would have parsed an
+    /// element throws that element away, so the list is only what is certain.
+    fn startsNoTypeArgument(tag: TokTag) bool {
+        return switch (tag) {
+            // tsc's `SyntaxKind.Unknown` — the scanner's invalid character,
+            // which is the shape this rule was measured on (`Foo<A,B,\ C>(4,
+            // 5, 6)`, `let x: Foo<A,\ B>`).
+            .unknown,
+            .r_paren,
+            .r_bracket,
+            .r_brace,
+            .semicolon,
+            .colon,
+            .eq,
+            .arrow,
+            .dot,
+            .at,
+            .percent,
+            .slash,
+            .plus,
+            .plus_plus,
+            .minus_minus,
+            .tilde,
+            .caret,
+            => true,
+            else => false,
+        };
     }
 
     /// `parseTypeArgs` with the TS1099 decision made by the caller. Only the
@@ -8705,7 +8917,16 @@ const Parser = struct {
         const lt = try p.expectLt();
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
-        while (p.curTag() != .eof and !isGtFamily(p.curTag())) {
+        while (true) {
+            if (p.curTag() == .comma) {
+                // `parsingContextErrors(TypeArguments)` and a SKIP: no
+                // enclosing list starts with a comma, so
+                // `isInSomeParsingContext` is false and the list keeps reading.
+                try p.fail(.expected_type);
+                _ = try p.bump();
+                continue;
+            }
+            if (p.curTag() == .eof or isGtFamily(p.curTag()) or startsNoTypeArgument(p.curTag())) break;
             try p.pushScratch(try p.parseType());
             if (try p.eat(.comma) == null) break;
         }
@@ -9159,7 +9380,16 @@ const Parser = struct {
                 _ = try p.parseFunctionBody();
             }
             const member = try p.addNode(.{ .tag = .method_signature, .main_token = name_tok, .data = .{ .lhs = proto, .rhs = flags } });
-            if (computed) |cn| try p.finishComputedName(cn, member, p.typeMemberHome(), .method_signature, false);
+            if (computed) |cn| {
+                // A `get`/`set` signature is a GetAccessor/SetAccessor node in
+                // tsc, and `checkGrammarForInvalidDynamicName` is reached only
+                // from `checkGrammarProperty` and `checkGrammarMethod` — so its
+                // computed name earns nothing, in a type literal exactly as in
+                // a class body (`noMappedGetSet`).
+                const kind: computed_member.MemberKind =
+                    if (flags & (ast.Flags.get | ast.Flags.set) != 0) .accessor else .method_signature;
+                try p.finishComputedName(cn, member, p.typeMemberHome(), kind, false);
+            }
             return member;
         }
         var type_ann: Node = null_node;

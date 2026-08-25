@@ -1091,6 +1091,13 @@ pub const Code = enum(u16) {
     /// an empty list is the `>` itself. So `constructor<>()` earns this beside
     /// the TS1098 the empty list earns at the `<`, one column apart.
     ctor_type_parameters,
+    /// TS18058: `import defer d from "m"` — a DEFERRED import (TC39 deferred
+    /// module evaluation) may only name a namespace, so a default binding is
+    /// refused. tsc's `checkImportClause` grammar arm, blamed on the `defer`.
+    defer_import_default_binding,
+    /// TS18059: the same refusal for NAMED imports, `import defer { a } from
+    /// "m"`, likewise on the `defer`.
+    defer_import_named_bindings,
 
     /// How tsc surfaces the condition — which decides both what a diagnostic
     /// suppresses and what suppresses it. Established empirically against tsgo
@@ -1421,6 +1428,13 @@ pub const Code = enum(u16) {
             .catch_variable_initializer,
 
             .ctor_type_parameters,
+            // `checkImportClause`'s deferred-import arm is a checker pass too:
+            // measured, tsgo reports TS18058 for `import defer d from "./a"`
+            // and the TS2322 of a sibling root file together, and reports
+            // NEITHER once any file in the program has a parse error (which is
+            // why `import defer type * as ns from "m"` shows only its TS1005s).
+            .defer_import_default_binding,
+            .defer_import_named_bindings,
             => .grammar,
 
             else => .syntactic,
@@ -1814,6 +1828,8 @@ pub const Code = enum(u16) {
             .catch_variable_initializer => "Catch clause variable cannot have an initializer.",
 
             .ctor_type_parameters => "Type parameters cannot appear on a constructor declaration.",
+            .defer_import_default_binding => "Default imports are not allowed in a deferred import.",
+            .defer_import_named_bindings => "Named imports are not allowed in a deferred import.",
         };
     }
 
@@ -2156,6 +2172,8 @@ pub const Code = enum(u16) {
             .catch_variable_initializer => 1197,
 
             .ctor_type_parameters => 1092,
+            .defer_import_default_binding => 18058,
+            .defer_import_named_bindings => 18059,
             else => 0,
         };
     }

@@ -933,8 +933,25 @@ const Binder = struct {
     /// Both halves were verified against the pinned oracle in each order:
     /// `let x; var x;` and `let x; class x {}` are TS2451, while `var x;
     /// let x;`, `class x {} let x;` and `class x {} var x;` are all TS2300.
-    fn dupCode(existing: SymbolFlags, kind: DeclKind) Code {
-        if (existing.catch_param) return .catch_redeclare;
+    fn dupCode(existing: SymbolFlags, kind: DeclKind) ?Code {
+        // TS2492 is not a merge failure at all in tsc — the catch parameter
+        // lives in the CatchClause's own `locals` and the block's declarations
+        // in the BLOCK's, so `declareSymbol` never sees a clash.
+        // `checkCatchClause` adds the rule afterwards, and only for a block
+        // local that is a `SymbolFlags.BlockScopedVariable`:
+        //
+        //     if (blockLocal?.valueDeclaration && (blockLocal.flags & SymbolFlags.BlockScopedVariable) !== 0)
+        //         grammarErrorOnNode(…, Cannot_redeclare_identifier_0_in_catch_clause, …)
+        //
+        // which is `let` and `const` (and `using`, which binds as one) — NOT a
+        // `class` and NOT a `function`, whose flags are `Class`/`Function`.
+        // Measured: `try {} catch (e) { function e() {} }` and `… { class e {} }`
+        // are silent for tsgo, where ztsc — which puts both names in one scope
+        // — answered TS2492 (`duplicateIdentifierInCatchBlock`). A `var` never
+        // reaches here: it hoists past the block.
+        if (existing.catch_param) {
+            return if (kind == .let_decl or kind == .const_decl) .catch_redeclare else null;
+        }
         // Two import bindings of one name are an ordinary duplicate; an import
         // beside a local declaration is no binder clash at all (the excludes
         // table merges them, and TS2440 is the checker's — see
@@ -1087,8 +1104,9 @@ const Binder = struct {
             if (effectiveBits(prior) & kind.excludes() != 0 and
                 !b.mergesAcrossBlocks(scope, sym))
             {
-                const code = dupCode(prior, kind);
-                switch (code) {
+                // Null when tsc has nothing to say about the clash at all —
+                // see `dupCode`'s catch-clause arm.
+                if (dupCode(prior, kind)) |code| switch (code) {
                     // TS2492 names the REDECLARATION alone and leaves the
                     // `catch (e)` binding unmarked; a duplicate TYPE
                     // PARAMETER likewise names only the later one (tsc
@@ -1099,7 +1117,7 @@ const Binder = struct {
                         try b.diag(code, name_tok)
                     else
                         try b.reportDuplicate(sym, code, decl_node, name_tok),
-                }
+                };
             } else if (kind == .function or kind == .method) {
                 // Overload grouping: at most one implementation. tsc names
                 // every declaration of the name, overload signatures
