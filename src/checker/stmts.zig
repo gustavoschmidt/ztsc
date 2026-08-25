@@ -1363,8 +1363,13 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
         if (is_promise) {
             eff_ann = try c.awaitedType(ann);
         } else if (k != .err and k != .none) {
-            try c.diagFmt(1064, c.nodeSpan(proto.return_type), "The return type of an async function or method must be the global Promise<T> type. Did you mean to write 'Promise<{s}>'?", .{try c.typeToString(ann)});
-            eff_ann = types.no_type; // suppress payload assignability noise
+            // TS1064 is `checkAsyncFunctionReturnType`'s alone: tsc's
+            // `checkReturnStatement` reads `unwrapReturnType` — the AWAITED
+            // annotation — whether or not the annotation was the global
+            // `Promise`, so the return check still runs, against the same
+            // payload TS1064's text names.
+            eff_ann = try signatures.asyncReturnPayload(c, ann);
+            try c.diagFmt(1064, c.nodeSpan(proto.return_type), "The return type of an async function or method must be the global Promise<T> type. Did you mean to write 'Promise<{s}>'?", .{try c.typeToString(eff_ann)});
         }
     } else if (is_generator) {
         // Generators: relate `yield x` to `T` from `Generator<T>`; return
@@ -2708,7 +2713,7 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
     try computed_key.checkMemberNames(c, members, if (c.ambient_ctx or data.flags & ast.Flags.declare != 0)
         .ambient_class_body
     else
-        .class_body, c.tree.extraRange(data.tp_start, data.tp_end));
+        .class_body, c.tree.extraRange(data.tp_start, data.tp_end), node);
     // The same pairing, for the other question the two halves answer together:
     // whose annotation supplies the property's type (TS7032/TS7033).
     try implicit_any.reportAccessorImplicitAny(c, members);
@@ -2924,6 +2929,7 @@ fn checkInterfaceDecl(c: *Checker, node: Node) Error!void {
         c.tree.extraRange(data.members_start, data.members_end),
         .type_space,
         c.tree.extraRange(data.tp_start, data.tp_end),
+        null_node,
     );
     c.cur_scope = saved;
     if (data.name_token == 0) return;

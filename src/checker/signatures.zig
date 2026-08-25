@@ -698,6 +698,49 @@ pub fn getterReturnFromSetter(c: *Checker, node: Node, proto: ast.FnProto) Error
     return types.no_type;
 }
 
+/// The return-check target for an `async` function from its WRITTEN return
+/// type — tsc's `unwrapReturnType`, which is `getAwaitedType(annotation)`
+/// unconditionally. TS1064 (`checkAsyncFunctionReturnType`, "must be the
+/// global Promise<T> type") is an independent report that does NOT suppress
+/// the return check, so `async example<T>(): Task<T> { return; }` over
+/// `class Task<T> extends Promise<T>` is still TS2322 `undefined` vs `T`
+/// (`asyncImportedPromise_es5`/`_es6`). It is also the type tsc names in
+/// TS1064's own text — `Did you mean to write 'Promise<T>'?`, not
+/// `'Promise<Task<T>>'`.
+///
+/// `awaitedType` unwraps the two lib NAMES it knows; a `Promise` subclass or
+/// a hand-written thenable needs the structural read below, so the two
+/// alternate to a fixed point.
+pub fn asyncReturnPayload(c: *Checker, t: TypeId) Error!TypeId {
+    var cur = try c.awaitedType(t);
+    // `Promise<Thenable<T>>` needs one structural step per name step; the cap
+    // is far above any real nesting and only ever leaves the type unwrapped.
+    for (0..8) |_| {
+        const promised = (try promisedTypeOfPromise(c, cur)) orelse return cur;
+        const next = try c.awaitedType(promised);
+        if (next == cur) return cur;
+        cur = next;
+    }
+    return cur;
+}
+
+/// tsc's `getPromisedTypeOfPromise`, read off the `then` member: `then`'s
+/// first parameter is `onfulfilled`, and ITS first parameter is the payload.
+/// Null when `t` carries no such `then` — the overwhelmingly common answer,
+/// which is why this only runs behind `awaitedType`'s name test.
+fn promisedTypeOfPromise(c: *Checker, t: TypeId) Error!?TypeId {
+    const then = (try c.propOfType(t, c.atom_then)) orelse return null;
+    const then_sig = (try lastCallSig(c, then.ty)) orelse return null;
+    if (c.ts.fnParamCount(then_sig) == 0) return null;
+    // `onfulfilled?: ((value: T) => …) | undefined | null` — tsc strips the
+    // nullish arms (`TypeFacts.NEUndefinedOrNull`) before asking for its
+    // signatures.
+    const onfulfilled = try c.nonNullable(c.ts.fnParam(then_sig, 0).ty);
+    const cb = (try lastCallSig(c, onfulfilled)) orelse return null;
+    if (c.ts.fnParamCount(cb) == 0) return null;
+    return c.ts.fnParam(cb, 0).ty;
+}
+
 /// The accessor of the OTHER kind (`want` is `ast.Flags.get` or
 /// `ast.Flags.set`) declared for the same key beside `node`, or null. Both
 /// accessor spellings tsc pairs: a class member, and an object literal's

@@ -347,19 +347,26 @@ fn reportTypeParamRefsInType(c: *Checker, node: Node, tps: []const Node, depth: 
 /// `type_params` are the CONTAINING class's or interface's own type-parameter
 /// nodes, which a name may not reference (TS2467, see `reportTypeParamRefs`).
 /// A type literal has none of its own and passes an empty slice.
-pub fn checkMemberNames(c: *Checker, members: []const Node, home: Home, type_params: []const Node) Error!void {
+///
+/// `owner` is the class node these names belong to, for the self-reference
+/// dead zone `Checker.computed_key_owner` documents; an interface or a type
+/// literal has no runtime binding and passes 0.
+pub fn checkMemberNames(c: *Checker, members: []const Node, home: Home, type_params: []const Node, owner: Node) Error!void {
     // Almost every file has no computed member name at all.
     if (c.tree.computed_keys.len == 0) return;
     const saved = c.in_type_space_name;
     const saved_tdz = c.defer_computed_key_tdz;
     const saved_in_name = c.in_computed_member_name;
+    const saved_owner = c.computed_key_owner;
     defer {
         c.in_type_space_name = saved;
         c.defer_computed_key_tdz = saved_tdz;
         c.in_computed_member_name = saved_in_name;
+        c.computed_key_owner = saved_owner;
     }
     c.in_type_space_name = home != .class_body;
     c.in_computed_member_name = true;
+    c.computed_key_owner = owner;
     for (members) |m| {
         if (m == null_node) continue;
         const key = c.tree.computedKey(m) orelse continue;
