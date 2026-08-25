@@ -285,6 +285,7 @@ fn writtenTypeParamRange(c: *const Checker, node: Node) ?[]const Node {
 /// shorter than `nodeCount`. (A node owning several scopes appears several
 /// times; `diagFmt` dedupes on `(file, code, span-start)`, so a repeat is
 /// free.)
+///
 /// The walk also carries tsc's OTHER per-default rule, TS2344 on a default
 /// that does not satisfy its own parameter's constraint — see
 /// `reportDefaultConstraintViolation`. The two rules read the same syntax off
@@ -293,15 +294,17 @@ pub fn checkFileTypeParamDefaults(c: *Checker) Error!void {
     for (c.prog.files[c.cur_file].bind.scope_owners, 0..) |node, s| {
         if (s == 0 or node == null_node) continue;
         const tps = writtenTypeParamRange(c, node) orelse continue;
-        const decl_scope = (try c.scopeOf(node)) orelse continue;
         for (tps, 0..) |tp, i| {
             if (tp == null_node or c.nodeTag(tp) != .type_param) continue;
             const d = c.tree.nodeData(tp);
             if (d.rhs == null_node) continue;
             try reportForwardDefaultRefs(c, d.rhs, tps[i..]);
-            // A parameter with no `extends` has nothing to violate, and the
-            // symbol lookup is only paid for the ones that do.
+            // A parameter with no `extends` has nothing to violate, and
+            // neither the scope lookup nor the symbol lookup is paid for one.
+            // (Resolved here rather than once per list so a list whose scope
+            // the checker cannot find still gets its TS2744 above.)
             if (d.lhs == null_node) continue;
+            const decl_scope = (try c.scopeOf(node)) orelse continue;
             const tp_sym = (try typeParamSymOfNode(c, decl_scope, tp)) orelse continue;
             try reportDefaultConstraintViolation(c, tp_sym, d.rhs);
         }

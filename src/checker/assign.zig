@@ -3626,21 +3626,18 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
 /// `number | undefined`, `boolean` vs `string | undefined` — primitives that
 /// are unrelated either way) and drops that one.
 fn intersectionOptionalsRelated(c: *Checker, s: TypeId, t: TypeId) Error!bool {
+    // `.object` is also where tsc's array/tuple exclusion lands: neither kind
+    // resolves to one, so both answer "nothing owed" here.
     const rt = try c.resolveStructural(t);
     if (c.ts.kind(rt) != .object) return true;
-    const n = c.ts.objectPropCount(rt);
-    if (n == 0) return true;
-    for (0..n) |i| {
+    for (0..c.ts.objectPropCount(rt)) |i| {
         const tp = c.ts.objectProp(rt, @intCast(i));
         if (!tp.optional()) continue;
         // `relationSrcProp`, not `propOfType`: the relation's own source
         // lookup, which refuses to answer a NAMED property out of a string
-        // index signature. `propOfType` does answer from one, and ztsc uses an
-        // `any`-valued index as its stand-in for a constituent it could not
-        // reduce — so the plain lookup handed this check a synthetic member
-        // that the structural walk would never have compared (social-app's
-        // `queryClient.fetchQuery(queryOptions({…}))`, whose source is
-        // `Opts & { queryKey: DataTag<…> }`, was a false TS2345 on `persister`).
+        // index signature. ztsc uses an `any`-valued index as its stand-in for
+        // a constituent it could not reduce, so the plain lookup hands this
+        // check synthetic members the structural walk would never compare.
         const sp = (try relationSrcProp(c, s, tp.name)) orelse continue;
         const want = try c.makeUnion2(tp.ty, types.undefined_type);
         const have = if (sp.optional()) try c.makeUnion2(sp.ty, types.undefined_type) else sp.ty;
@@ -6467,16 +6464,13 @@ pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode
     // target has no predicate, so this block is skipped).
     if (c.ts.fnHasPredicate(te)) {
         const tp = c.ts.fnPredicate(te);
-        if (!c.ts.fnHasPredicate(se)) {
-            return false;
-        } else {
-            const spd = c.ts.fnPredicate(se);
-            if (spd.asserts != tp.asserts) return false;
-            if (spd.param != tp.param) return false;
-            if (tp.ty != types.no_type) {
-                if (spd.ty == types.no_type) return false;
-                if (!try c.isAssignable(spd.ty, tp.ty)) return false;
-            }
+        if (!c.ts.fnHasPredicate(se)) return false;
+        const spd = c.ts.fnPredicate(se);
+        if (spd.asserts != tp.asserts) return false;
+        if (spd.param != tp.param) return false;
+        if (tp.ty != types.no_type) {
+            if (spd.ty == types.no_type) return false;
+            if (!try c.isAssignable(spd.ty, tp.ty)) return false;
         }
     }
     const s_ret = c.ts.fnReturn(se);
