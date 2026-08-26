@@ -2018,21 +2018,7 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     defer raw_types.deinit(c.scratch());
     var tuple_elems: std.ArrayList(types.TupleElem) = .empty;
     defer tuple_elems.deinit(c.scratch());
-    // How many positions the literal occupies — the length a tuple context
-    // with trailing fixed elements needs to place each one (see
-    // `contextualElemTypeAt`). A SPREAD stands for an unknown number of them,
-    // so from one on no position is knowable and there is no length to give;
-    // tsc gives up the same way (`getContextualTypeForElementExpression`
-    // threads the spread indices through and answers `undefined` past them).
-    const lit_len: ?u32 = blk: {
-        var n: u32 = 0;
-        for (c.tree.nodeRange(node)) |el| {
-            if (el == null_node) continue;
-            if (c.nodeTag(el) == .spread_element) break :blk null;
-            n += 1;
-        }
-        break :blk n;
-    };
+    const spreads = spreadCtx(c, node);
     var i: u32 = 0;
     for (c.tree.nodeRange(node)) |el| {
         if (el == null_node) continue;
@@ -2113,7 +2099,7 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // gives the inner literal a contextual `number`, so it widens to
             // `number[]` and matches neither branch.
             ectx_src = if (c.ts.kind(rctx) == .union_type) rctx else ctx_tuple_ty;
-            ectx = try contextualElemTypeAt(c, ectx_src, i, lit_len);
+            ectx = try contextualElemTypeAt(c, ectx_src, i, spreads);
         }
         // An element of an array literal is the one place a NON-CALLABLE tag
         // gets a different diagnostic (`checkTaggedTemplate`'s TS2796); ztsc
@@ -2128,7 +2114,7 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         // `elemCtxKeepsLiteral`. `ectx` itself is the reduced one, and stays
         // the type the element expression was checked against.
         const keeps = if (ctx_tuple)
-            try elemCtxKeepsLiteral(c, ectx_src, i, lit_len, et)
+            try elemCtxKeepsLiteral(c, ectx_src, i, spreads, et)
         else
             try keepLiteral(c, et, ectx);
         if (!keeps) et = try c.widenLiteral(et);
@@ -2381,6 +2367,98 @@ fn contextualArrayElemOrIterated(c: *Checker, rctx: TypeId) Error!TypeId {
     return (try c.contextualIterationElementType(rctx)) orelse types.no_type;
 }
 
+/// Where an array literal's SPREADS sit. `len` counts syntactic elements, a
+/// spread being ONE slot (tsc's `elementCount`); `first`/`last` are the
+/// indices of the first and last spread element, or null when the literal has
+/// none. Together they are tsc's `getContextualTypeForElementExpression`
+/// arguments, and they are what decides whether a position is knowable at all.
+const SpreadCtx = struct {
+    len: u32,
+    first: ?u32,
+    last: ?u32,
+};
+
+fn spreadCtx(c: *Checker, node: Node) SpreadCtx {
+    var sp: SpreadCtx = .{ .len = 0, .first = null, .last = null };
+    for (c.tree.nodeRange(node)) |el| {
+        if (el == null_node) continue;
+        if (c.nodeTag(el) == .spread_element) {
+            if (sp.first == null) sp.first = sp.len;
+            sp.last = sp.len;
+        }
+        sp.len += 1;
+    }
+    return sp;
+}
+
+/// What a tuple contextual type has to say about a position a spread has
+/// displaced. The union arm hands back the SLICE rather than a type because
+/// the union tsc builds there is UN-REDUCED, and `elemCtxKeepsLiteral` has to
+/// see its members (see that function).
+const SpreadElemCtx = union(enum) {
+    none,
+    /// Exactly the tuple element at this slot.
+    slot: u32,
+    /// The un-reduced union of the tuple's elements in `[from, to)`.
+    slice: struct { from: u32, to: u32 },
+};
+
+/// Which element of a tuple contextual type answers position `i` of an array
+/// literal that has a SPREAD at or before `i` — the case where the naive index
+/// no longer names the position, because the spread stands for an unknown
+/// number of slots.
+///
+/// tsc's answers (wave-46 oracle probes over tsgo 7.0.2; the whole rule is
+/// empirical, and every clause below has a probe that fails without it):
+///
+///   * A tuple with NO variable element cannot place ANY position past the
+///     first spread, so the answer is the union of everything from the first
+///     spread on: `[string, (a: 2) => void]` gives `[...one, x => …]`'s arrow
+///     `(a: 2) => void` (the `string` half carries no call signature), while
+///     `[(a: 1) => void, (a: 2) => void]` gives it nothing — two DISAGREEING
+///     signatures contextually type no callback. The slice starts at the first
+///     spread and not at 0: `[(a: 1) => void, (a: 3) => void, (a: 3) => void]`
+///     types the second arrow of `[x => …, ...one, x => …]` by `(a: 3) => void`.
+///     A spread AFTER `i` does not change this reading.
+///
+///   * A tuple WITH a variable element has a knowable TAIL: the trailing fixed
+///     elements line up with the literal's trailing elements, so an element
+///     with `after` elements behind it takes tuple slot `arity - 1 - after`.
+///     `[...M9[], M2, M3]` types the three arrows of `[...one, x, x, x]` as
+///     `M9`, `M2`, `M3`. That needs a countable tail, so a spread AFTER `i`
+///     gives up entirely; and a position that lands BEFORE the fixed tail is
+///     the union of everything the variable region could stand for
+///     (`[M1, ...M9[], M3]` answers `M1 | M9` there, which is again two
+///     disagreeing signatures and so no contextual type at all).
+fn spreadTupleElemCtx(c: *const Checker, tup: TypeId, i: u32, sp: SpreadCtx) SpreadElemCtx {
+    const arity = c.ts.tupleLen(tup);
+    const first = sp.first orelse return .none;
+    if (tuple_relate.fixedLength(c, tup) >= arity) {
+        return if (first < arity) .{ .slice = .{ .from = first, .to = arity } } else .none;
+    }
+    if (sp.last) |last| if (i <= last) return .none;
+    const end_fixed = tuple_relate.endFixedCount(c, tup);
+    const after = sp.len - 1 - i;
+    if (after < end_fixed) return .{ .slot = arity - 1 - after };
+    const to = arity - end_fixed;
+    return if (first < to) .{ .slice = .{ .from = first, .to = to } } else .none;
+}
+
+/// The tuple element at `k`, as a contextual type: an OPTIONAL element also
+/// admits `undefined` (`tuple_relate.contextualElemType` reads it the same way).
+fn tupleSlotCtx(c: *Checker, tup: TypeId, k: u32) Error!TypeId {
+    const e = c.ts.tupleElem(tup, k);
+    return if (e.optional()) try c.makeUnion2(e.ty, types.undefined_type) else e.ty;
+}
+
+/// One member of a `SpreadElemCtx.slice`: a variable element stands for its
+/// ELEMENT type, since what sits at the position is one of the things it holds.
+fn tupleSliceMember(c: *Checker, tup: TypeId, k: u32) Error!TypeId {
+    const e = c.ts.tupleElem(tup, k);
+    if (tuple_relate.elemKind(c, e).variable()) return c.elemOfArrayish(e.ty);
+    return e.ty;
+}
+
 /// The contextual type for the element at index `i` of an array literal in
 /// TUPLE context, given a (structurally resolved) contextual type — tsc's
 /// `getTypeOfPropertyOfContextualType(ctx, "" + i)`, which `mapType`s over a
@@ -2389,24 +2467,43 @@ fn contextualArrayElemOrIterated(c: *Checker, rctx: TypeId) Error!TypeId {
 /// and anything else nothing. Returns `no_type` when no constituent holds an
 /// element there.
 ///
-/// `length` is how many elements the literal has, or `null` when a spread
-/// makes that unknowable. A tuple whose FIXED elements sit after a variable
-/// one (`[...((a: number) => void)[], (a: string) => void]`) decides a
-/// position by counting back from the END, which is a question only the
-/// length can answer — `tuple_relate.contextualElemType`, the same reading
-/// the CALL-argument path already uses for a non-array rest parameter. Read
-/// from the start instead, `const a1: Funcs = [x => str(x)]` typed its lone
-/// element by the leading `(a: number) => void` and reported inside its body.
-/// Every other tuple shape keeps the positional read.
-fn contextualElemTypeAt(c: *Checker, rctx: TypeId, i: u32, length: ?u32) Error!TypeId {
+/// With no spread, `sp.len` is how many elements the literal has. A tuple whose
+/// FIXED elements sit after a variable one (`[...((a: number) => void)[],
+/// (a: string) => void]`) decides a position by counting back from the END,
+/// which is a question only the length can answer —
+/// `tuple_relate.contextualElemType`, the same reading the CALL-argument path
+/// already uses for a non-array rest parameter. Read from the start instead,
+/// `const a1: Funcs = [x => str(x)]` typed its lone element by the leading
+/// `(a: number) => void` and reported inside its body. Every other tuple shape
+/// keeps the positional read.
+///
+/// A SPREAD at or before `i` takes the position out of the naive index's hands
+/// altogether — `spreadTupleElemCtx`.
+fn contextualElemTypeAt(c: *Checker, rctx: TypeId, i: u32, sp: SpreadCtx) Error!TypeId {
     switch (c.ts.kind(rctx)) {
         .tuple => {
-            if (length) |n| {
-                if (tuple_relate.fixedLength(c, rctx) < c.ts.tupleLen(rctx) and
-                    tuple_relate.endFixedCount(c, rctx) > 0)
-                {
-                    return (try tuple_relate.contextualElemType(c, rctx, i, n)) orelse types.no_type;
-                }
+            const fixed = tuple_relate.fixedLength(c, rctx);
+            if (sp.first) |first| {
+                // BEFORE the first spread the position is exactly `i` — but a
+                // tuple only declares a member for its FIXED PREFIX, and a
+                // spread later in the literal has already made the count-back
+                // reading unanswerable, so a position inside the variable
+                // region has no contextual type at all.
+                if (i < first and i >= fixed and fixed < c.ts.tupleLen(rctx)) return types.no_type;
+                if (i >= first) return switch (spreadTupleElemCtx(c, rctx, i, sp)) {
+                    .none => types.no_type,
+                    .slot => |k| try tupleSlotCtx(c, rctx, k),
+                    .slice => |s| blk: {
+                        var parts: std.ArrayList(TypeId) = .empty;
+                        defer parts.deinit(c.scratch());
+                        for (s.from..s.to) |k| {
+                            try parts.append(c.scratch(), try tupleSliceMember(c, rctx, @intCast(k)));
+                        }
+                        break :blk try c.ts.makeUnion(c.scratch(), parts.items);
+                    },
+                };
+            } else if (fixed < c.ts.tupleLen(rctx) and tuple_relate.endFixedCount(c, rctx) > 0) {
+                return (try tuple_relate.contextualElemType(c, rctx, i, sp.len)) orelse types.no_type;
             }
             return try c.tupleElemTypeAt(rctx, i) orelse types.no_type;
         },
@@ -2415,7 +2512,7 @@ fn contextualElemTypeAt(c: *Checker, rctx: TypeId, i: u32, length: ?u32) Error!T
             var elems: std.ArrayList(TypeId) = .empty;
             defer elems.deinit(c.scratch());
             for (try c.memberList(rctx)) |m| {
-                const e = try contextualElemTypeAt(c, try c.resolveStructural(m), i, length);
+                const e = try contextualElemTypeAt(c, try c.resolveStructural(m), i, sp);
                 if (e != types.no_type) try elems.append(c.scratch(), e);
             }
             if (elems.items.len == 0) return types.no_type;
@@ -2445,7 +2542,7 @@ fn contextualElemTypeAt(c: *Checker, rctx: TypeId, i: u32, length: ?u32) Error!T
             var parts: std.ArrayList(TypeId) = .empty;
             defer parts.deinit(c.scratch());
             for (try c.memberList(rctx)) |m| {
-                const e = try contextualElemTypeAt(c, try c.resolveStructural(m), i, length);
+                const e = try contextualElemTypeAt(c, try c.resolveStructural(m), i, sp);
                 if (e != types.no_type) try parts.append(c.scratch(), e);
             }
             if (parts.items.len == 0) return types.no_type;
@@ -2578,14 +2675,29 @@ fn allNumberLiterals(c: *Checker, t: TypeId) Error!bool {
 /// union is a `some` — so ask it per CONSTITUENT, which is exactly what the
 /// unreduced union would have answered. The contextual type flowing into the
 /// element expression stays the reduced one, as it already was.
-fn elemCtxKeepsLiteral(c: *Checker, rctx: TypeId, i: u32, length: ?u32, cand: TypeId) Error!bool {
+fn elemCtxKeepsLiteral(c: *Checker, rctx: TypeId, i: u32, sp: SpreadCtx, cand: TypeId) Error!bool {
     if (c.ts.kind(rctx) == .union_type) {
         for (try c.memberList(rctx)) |m| {
-            if (try elemCtxKeepsLiteral(c, try c.resolveStructural(m), i, length, cand)) return true;
+            if (try elemCtxKeepsLiteral(c, try c.resolveStructural(m), i, sp, cand)) return true;
         }
         return false;
     }
-    return keepLiteral(c, cand, try contextualElemTypeAt(c, rctx, i, length));
+    // The slice a SPREAD leaves is un-reduced for the same reason and by the
+    // same route: `[...s2, 'q']` against `[string, string, 'q']` reads
+    // `string | 'q'`, whose reduction to `string` would widen the `'q'`.
+    if (c.ts.kind(rctx) == .tuple and sp.first != null and i >= sp.first.?) {
+        switch (spreadTupleElemCtx(c, rctx, i, sp)) {
+            .none => return false,
+            .slot => |k| return keepLiteral(c, cand, try tupleSlotCtx(c, rctx, k)),
+            .slice => |s| {
+                for (s.from..s.to) |k| {
+                    if (try keepLiteral(c, cand, try tupleSliceMember(c, rctx, @intCast(k)))) return true;
+                }
+                return false;
+            },
+        }
+    }
+    return keepLiteral(c, cand, try contextualElemTypeAt(c, rctx, i, sp));
 }
 
 /// `[...] as const` -> a readonly tuple. Elements keep their literal

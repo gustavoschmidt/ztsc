@@ -313,7 +313,7 @@ pub fn signatureOfProtoCtx(
         (c.nodeTag(node) == .arrow_fn or c.nodeTag(node) == .function_expr or
             c.nodeTag(node) == .function_decl or c.nodeTag(node) == .class_method))
     {
-        pred = try inferredPredicate(c, params.items, ret, c.tree.nodeData(node).rhs);
+        pred = try inferredPredicate(c, params.items, ret, node, c.tree.nodeData(node).rhs);
     }
 
     const sig = try c.ts.makeFunctionThis(params.items, ret, tps.items, if (is_method) types.fn_flag_method else 0, pred, this_ty);
@@ -330,7 +330,7 @@ pub fn signatureOfProtoCtx(
 /// must differ from the declared type AND the false branch must exclude the
 /// narrowed type entirely. That gate rejects truthiness (`!!x`, `x => !!x`)
 /// exactly as tsc does: the falsy branch of `number | null` keeps `number`.
-fn inferredPredicate(c: *Checker, params: []const types.Param, ret: TypeId, body: Node) Error!?types.Predicate {
+fn inferredPredicate(c: *Checker, params: []const types.Param, ret: TypeId, fn_node: Node, body: Node) Error!?types.Predicate {
     if (body == null_node) return null;
     switch (c.ts.kind(ret)) {
         .boolean, .bool_true, .bool_false => {},
@@ -338,21 +338,34 @@ fn inferredPredicate(c: *Checker, params: []const types.Param, ret: TypeId, body
     }
     if (params.len == 0) return null;
 
-    // The single guard expression: an expression body, or a block whose
-    // only statement is `return <expr>`.
+    // The single guard expression: an expression body, or a block body's ONE
+    // `return <expr>`.
+    //
+    // tsc's `getTypePredicateFromBody` finds it with `forEachReturnStatement`
+    // — every return ANYWHERE in the body except inside a nested function —
+    // and bails on a second return, on a bare `return;`, and on
+    // `functionHasImplicitReturn` (the end of the body being reachable). The
+    // one return therefore does not have to be the block's only STATEMENT,
+    // and the statements before it may narrow the parameter the guard then
+    // tests. `inferTypePredicates`' `assertAndPredicate` is the shape:
+    //
+    //     function f(x: string | number | Date) {
+    //       if (x instanceof Date) { throw new Error(); }
+    //       return typeof x === 'string';
+    //     }
+    //
+    // "the return is the block's only statement" rejected it, so `f` got no
+    // predicate and the call site never narrowed.
     var guard = body;
+    var guard_scope = c.cur_scope;
     if (c.nodeTag(body) == .block) {
-        var expr: Node = null_node;
-        var count: usize = 0;
-        for (c.tree.nodeRange(body)) |st| {
-            if (st == null_node) continue;
-            count += 1;
-            if (c.nodeTag(st) == .return_stmt and c.tree.nodeData(st).lhs != 0) {
-                expr = c.tree.nodeData(st).lhs;
-            } else return null;
-        }
-        if (count != 1 or expr == null_node) return null;
-        guard = expr;
+        const base_scope = (try c.scopeOf(fn_node)) orelse c.cur_scope;
+        var rets = try c.collectReturns(c.tree.nodeRange(body), base_scope);
+        defer rets.deinit(c.scratch());
+        if (rets.bare or rets.exprs.items.len != 1) return null;
+        if (!c.stmtListTerminal(c.tree.nodeRange(body))) return null;
+        guard = rets.exprs.items[0];
+        guard_scope = rets.scopes.items[0];
     }
 
     // Unwrap the wrappers tsc's `narrowType` sees through before it looks at
@@ -387,6 +400,11 @@ fn inferredPredicate(c: *Checker, params: []const types.Param, ret: TypeId, body
     // gate — an ambiguous guard (two params both narrowed) has no clear
     // oracle semantics, so it keeps the old (no-predicate) behavior.
     var found: ?types.Predicate = null;
+    // The guard's own scope: a `return` nested in an `if` block resolves its
+    // identifiers there, and the parameter is still reachable outward from it.
+    const prev_scope = c.cur_scope;
+    c.cur_scope = guard_scope;
+    defer c.cur_scope = prev_scope;
     for (params, 0..) |p, pi| {
         if (p.name == 0) continue;
         const declared = p.ty;
