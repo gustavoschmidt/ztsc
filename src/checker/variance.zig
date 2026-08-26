@@ -858,6 +858,21 @@ pub fn varianceMeasurable(c: *Checker, t: TypeId, sc: *VarianceScan) Error!bool 
             const sym = s.refSymbol(t);
             if (sym == sc.owner) {
                 sc.cyclic = true;
+                // The spine has come back to the generic being measured, and
+                // its args (walked just above) are measurable. Its BODY is the
+                // type this walk started from, so descending again asks the
+                // same question one instantiation deeper — and when the
+                // recursion grows its argument (`Foo1<T[]>` reached through
+                // `Bar1<T[]>`), every level is a distinct TypeId that `seen`
+                // cannot cut, so the walk only ever ran out of `budget` and
+                // declined to measure at all. Terminating here is what the
+                // relation itself does with the pair: `relate`'s in-progress
+                // mark cuts the cycle, and a growth it cannot cut sets
+                // `rel_guard_tripped`, which `checkVarianceAnnotations`
+                // already refuses to report on. varianceAnnotations.ts's
+                // `Foo1<in T>` / `Foo2<out T>` circular-type pair (64:11,
+                // 75:11 TS2636) is the witness.
+                return true;
             } else if (try c.declaredVariances(sym) != 0) {
                 sc.via_annotated = true;
             }
