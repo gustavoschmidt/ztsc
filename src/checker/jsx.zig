@@ -1860,8 +1860,7 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
             // `<MyComponent data-bar='hello'/>` against
             // `{ [s: string]: boolean }` is clean. Only a prop the target
             // DECLARES relates it (`propertiesRelatedTo` has no such waiver).
-            if (b.hyphenated and (try c.propOfTypeEx(rt, b.name, false)) == null and
-                (try c.unionNestedPropType(rt, b.name)) == null) continue;
+            if (b.hyphenated and !try jsxDeclaresName(c, rt, b.name)) continue;
             if (!try c.isAssignable(b.ty, target)) {
                 if (b.hyphenated) hyphen_failed = true else attr_failed = true;
             } else if (!b.hyphenated and b.value != null_node and
@@ -2012,6 +2011,17 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     } else {
         try c.reportNotAssignable(2322, combined, props, span);
     }
+}
+
+/// Does the props target DECLARE `name` as a member, rather than merely
+/// covering it with an index signature? The distinction is what
+/// `isIgnoredJsxProperty` draws: it takes a hyphenated attribute out of
+/// `membersRelatedToIndexInfo` and out of nothing else, so an index signature
+/// says nothing about such a value while a declared prop still relates it.
+fn jsxDeclaresName(c: *Checker, rt: TypeId, name: Atom) Error!bool {
+    var via_index = false;
+    if ((try c.propOfTypeViaIndex(rt, name, &via_index)) != null and !via_index) return true;
+    return false;
 }
 
 /// tsc's `isHyphenatedJsxName`: an attribute name containing a `-` (`data-*`,
