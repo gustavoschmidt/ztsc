@@ -2921,11 +2921,28 @@ const Binder = struct {
                 for (b.tree.nodeRange(node)) |el| try b.bindPattern(el, kind, decl_node, extra);
             },
             .binding_default => {
-                try b.bindPattern(d.lhs, kind, decl_node, extra);
-                try b.bindExpr(d.rhs);
+                // tsc's `bindBindingElementFlow`: a binding element whose NAME
+                // is itself a pattern evaluates its DEFAULT before the pattern,
+                // because the pattern's computed keys are read out of the
+                // defaulted value. Only the flow order changes — the symbols a
+                // pattern declares do not care which side is walked first.
+                if (isBindingPatternNode(b, d.lhs)) {
+                    try b.bindInitializerFlow(d.rhs);
+                    try b.bindPattern(d.lhs, kind, decl_node, extra);
+                } else {
+                    try b.bindPattern(d.lhs, kind, decl_node, extra);
+                    try b.bindExpr(d.rhs);
+                }
             },
             .rest_element => try b.bindPattern(d.lhs, kind, decl_node, extra),
             .binding_property => {
+                // Same rule, for `{ k: <pattern> = init }` — the default is a
+                // sibling of the target here rather than a `binding_default`.
+                if (d.rhs != 0 and isBindingPatternNode(b, d.lhs)) {
+                    try b.bindInitializerFlow(d.rhs);
+                    try b.bindPattern(d.lhs, kind, decl_node, extra);
+                    return;
+                }
                 if (d.lhs != 0) {
                     // `key: target` — the key is a property name, not a binding.
                     try b.bindPattern(d.lhs, kind, decl_node, extra);
@@ -2946,6 +2963,38 @@ const Binder = struct {
             .omitted, .error_node, .unsupported => {},
             else => {}, // not a pattern (recovery); no bindings
         }
+    }
+
+    /// tsc's `bindInitializer`: an initializer that MAY NOT RUN — a binding
+    /// element's `= default`, taken only when the destructured slot is
+    /// `undefined` — leaves the flow at a join of "ran" and "did not run".
+    ///
+    /// The join is what makes the computed key of `const [{ [a]: b } = [9, a =
+    /// 0] as const] = []` read `a` as `0 | 1` rather than as either branch's
+    /// answer alone (`controlFlowBindingPatternOrder`, oracle-checked against
+    /// tsgo 7.0.2 in all five of its shapes). It costs nothing when the
+    /// initializer contains no assignment at all: `currentFlow` is then
+    /// unchanged and tsc's own early return applies, so no node is minted.
+    fn bindInitializerFlow(b: *Binder, node: Node) Error!void {
+        if (node == null_node) return;
+        const entry = b.cur_flow;
+        try b.bindExpr(node);
+        if (entry == unreachable_flow or entry == b.cur_flow) return;
+        const pid = try b.newPending();
+        try b.pendAdd(pid, entry);
+        try b.pendAdd(pid, b.cur_flow);
+        b.cur_flow = try b.finishPending(pid);
+    }
+
+    /// tsc's `isBindingPattern` on a binding element's NAME: the two
+    /// destructuring shapes, and nothing else (an identifier target, an
+    /// omitted slot, a recovery node all answer no).
+    fn isBindingPatternNode(b: *const Binder, node: Node) bool {
+        if (node == null_node) return false;
+        return switch (b.nodeTag(node)) {
+            .array_pattern, .object_pattern => true,
+            else => false,
+        };
     }
 
     fn bindFunctionDecl(b: *Binder, node: Node) Error!void {

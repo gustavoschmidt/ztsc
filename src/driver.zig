@@ -956,6 +956,7 @@ fn linkProgram(
         .constit_vals = lr.constit_vals,
         .export_equals_atom = lr.export_equals_atom,
         .dual_targets = lr.dual_targets,
+        .eq_default_imports = lr.eq_default_imports,
         .no_implicit_any = link_opts.no_implicit_any,
         .allow_synthetic_default = link_opts.allow_synthetic_default,
         .es_module_interop = link_opts.es_module_interop,
