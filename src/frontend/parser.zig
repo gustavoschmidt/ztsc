@@ -1199,6 +1199,27 @@ const Parser = struct {
         };
     }
 
+    /// `atLt` for the type arguments of a TYPE REFERENCE — tsc's
+    /// `tryParseTypeArgumentsOfTypeReference`, whose whole body is
+    /// `if (!scanner.hasPrecedingLineBreak() && reScanLessThanToken() === …)`.
+    ///
+    /// The line-break half is not decoration. A type literal writes its call
+    /// signatures one per line with no separator between them —
+    ///
+    ///     type A = {
+    ///         <T>(x: T): T
+    ///         <U>(y: U): U
+    ///     };
+    ///
+    /// — and without the guard the first member's return type `T` swallows the
+    /// next line's `<U>` as its type arguments, so the `(` that follows is a
+    /// missing `;` (TS1005) and the second signature is lost.
+    /// `declarationEmitHigherOrderRetainedGenerics` is the corpus witness; the
+    /// same shape appears in every `dual`-style overload table.
+    fn atTypeRefTargs(p: *Parser) bool {
+        return p.atLt() and !p.nlBefore();
+    }
+
     // --- speculation -------------------------------------------------------
 
     const State = struct {
@@ -9426,7 +9447,7 @@ const Parser = struct {
                     // IdentifierName and stays exempt.
                     try p.checkStrictReserved();
                     const name = try p.parseEntityName();
-                    if (p.atLt()) {
+                    if (p.atTypeRefTargs()) {
                         const lt_tok = p.curIdx();
                         const targs = try p.parseTypeArgs();
                         const extra = try p.addExtra(targs);
@@ -9513,7 +9534,10 @@ const Parser = struct {
             const part = try p.expectMemberName();
             ty = try p.addNode(.{ .tag = .qualified_name, .main_token = dot, .data = .{ .lhs = ty, .rhs = part } });
         }
-        if (p.atLt()) {
+        // `import("m").G<number>` reads its type arguments through the same
+        // `tryParseTypeArgumentsOfTypeReference` a plain reference does, line
+        // break and all (`atTypeRefTargs`).
+        if (p.atTypeRefTargs()) {
             const lt_tok = p.curIdx();
             const targs = try p.parseTypeArgs();
             const extra = try p.addExtra(targs);
