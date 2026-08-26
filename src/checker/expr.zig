@@ -1384,7 +1384,7 @@ fn checkTdz(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex) Error!void 
         code = 2449;
         kindname = "Class";
     } else if (f.enum_decl) {
-        if (constEnumOnly(c, decls)) return;
+        if (constEnumOnly(c, sym)) return;
         code = 2450;
         kindname = "Enum";
     }
@@ -1394,10 +1394,18 @@ fn checkTdz(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex) Error!void 
 /// Every enum declaration of the symbol is `const enum` — a declaration merge
 /// may mix them, and one non-const block gives the whole enum a runtime
 /// binding. See `checkTdz`.
-fn constEnumOnly(c: *Checker, decls: []const Node) bool {
-    for (decls) |decl| {
-        if (c.nodeTag(decl) != .enum_decl) continue;
-        const e = c.tree.extraData(ast.EnumData, c.tree.nodeData(decl).lhs);
+///
+/// The decls of a symbol are node ids in the tree of `symFile(sym)`, which is
+/// NOT the file being checked when the enum is imported: `isConstEnumObjectType`
+/// reaches this from an arbitrary `typeof E` value, and reading a foreign node
+/// id against `c.tree` indexes past the end of the current file's node array
+/// (a Debug-build panic on excalidraw; ReleaseFast merely read garbage flags).
+/// So resolve the owning file's tree rather than assuming the current one.
+fn constEnumOnly(c: *Checker, sym: SymbolId) bool {
+    const tree = c.prog.files[c.symFile(sym)].tree;
+    for (c.declsOf(sym)) |decl| {
+        if (tree.nodeTag(decl) != .enum_decl) continue;
+        const e = tree.extraData(ast.EnumData, tree.nodeData(decl).lhs);
         if (e.flags & ast.Flags.const_enum == 0) return false;
     }
     return true;
@@ -6962,7 +6970,7 @@ fn isConstEnumObjectType(c: *Checker, t: TypeId) bool {
         if (sym != 0 and s != sym) return false;
         sym = s;
     }
-    return constEnumOnly(c, c.declsOf(sym));
+    return constEnumOnly(c, sym);
 }
 
 /// The expression inside any number of parentheses. tsc's `skipParentheses`:
