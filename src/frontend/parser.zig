@@ -6710,11 +6710,6 @@ const Parser = struct {
         const tag = p.curTag();
         if (tag != .keyword_with and !(tag == .keyword_assert and !p.nlBefore())) return;
         const kw = try p.bump();
-        // tsc's `checkImportAttributes`: a type-only import or export makes no
-        // runtime request, so there is nothing for an attributes clause to
-        // qualify. Blamed on the whole `ImportAttributes` node, whose first
-        // token is this keyword.
-        if (type_only) try p.errAtToken(.import_attributes_on_type_only, kw);
         // tsc's `parseImportAttributes` opens with `parseExpected(
         // OpenBraceToken)`, so a keyword with no clause behind it is one "'{'
         // expected" on the token that is there — `import * as f from "./first"
@@ -6723,10 +6718,58 @@ const Parser = struct {
         // which answered "';' expected" at the `with` and then a second error
         // for the statement it is not.
         if (p.curTag() != .l_brace) return p.errAtCur(.expected_l_brace);
+        const lb = p.curIdx();
         // `parseImportAttributes` closes with `parseExpected(CloseBraceToken)`,
         // so a clause that runs off the end of the file is one "'}' expected"
         // there — `import x from "m" with {<eof>`.
-        if (!p.skipBalancedBraces()) try p.errAtCur(.expected_r_brace);
+        const closed = p.skipBalancedBraces();
+        if (!closed) try p.errAtCur(.expected_r_brace);
+        // tsc's `checkImportAttributes`: a type-only import or export makes no
+        // runtime request, so there is nothing for an attributes clause to
+        // qualify — EXCEPT a `resolution-mode` override, which is a
+        // type-space instruction and is what the clause is for there. Blamed
+        // on the whole `ImportAttributes` node, whose first token is the
+        // `with`/`assert` keyword.
+        if (type_only and !(closed and p.isResolutionModeClause(lb, p.lastIdx()))) {
+            try p.errAtToken(.import_attributes_on_type_only, kw);
+        }
+    }
+
+    /// tsc's `getResolutionModeOverrideForClause`, reduced to the one question
+    /// `checkImportAttributes` asks of a TYPE-ONLY declaration: is this clause
+    /// the single `"resolution-mode": "import" | "require"` attribute that is
+    /// legal there? Read off the TOKENS between `lb` and `rb` — ztsc keeps no
+    /// node for an attributes clause — and deliberately strict: a second
+    /// attribute, another key, a non-literal value or a value outside the two
+    /// words all leave the clause unexcused, which is tsc's `return undefined`
+    /// falling through to TS2857.
+    ///
+    /// Only the QUOTED key spelling is accepted, and that is not a shortcut:
+    /// `resolution-mode` is not an identifier outside JSX name position, so an
+    /// unquoted one lexes as three tokens and is not the attribute at all.
+    fn isResolutionModeClause(p: *Parser, lb: TokenIndex, rb: TokenIndex) bool {
+        const tags = p.tok_tags.items;
+        var i = lb + 1;
+        if (i >= rb or tags[i] != .string_literal) return false;
+        if (!std.mem.eql(u8, unquoted(p.tokenTextAt(i)), "resolution-mode")) return false;
+        i += 1;
+        if (i >= rb or tags[i] != .colon) return false;
+        i += 1;
+        if (i >= rb or tags[i] != .string_literal) return false;
+        const v = unquoted(p.tokenTextAt(i));
+        if (!std.mem.eql(u8, v, "import") and !std.mem.eql(u8, v, "require")) return false;
+        i += 1;
+        // `parseDelimitedList` accepts a trailing comma and still counts one
+        // element.
+        if (i < rb and tags[i] == .comma) i += 1;
+        return i == rb;
+    }
+
+    /// A string literal's text without its quotes. No escape decoding: every
+    /// spelling this is compared against is plain ASCII.
+    fn unquoted(text: []const u8) []const u8 {
+        if (text.len >= 2) return text[1 .. text.len - 1];
+        return text;
     }
 
     /// `export export = x` / `export declare export = y`: an export ASSIGNMENT
