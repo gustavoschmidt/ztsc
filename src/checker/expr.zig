@@ -7106,6 +7106,13 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
                         try c.diagFmt(what.code, c.tokSpan(tok), "Cannot assign to '{s}' because it is {s}.", .{ c.tokenText(tok), what.text });
                         return types.error_type;
                     }
+                    // A parameter written `x: string | undefined = "s"` is
+                    // `string` inside the body and `string | undefined` as a
+                    // write target — see `signatures.paramWriteAnnType`.
+                    if (sf.param) {
+                        const ann = try sig_zig.paramWriteAnnType(c, sym);
+                        if (ann != types.no_type) return ann;
+                    }
                     return c.typeOfSymbol(sym);
                 },
                 .wrong_space => return types.error_type,

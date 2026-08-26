@@ -614,6 +614,36 @@ pub fn paramBodyType(c: *Checker, pn: Node, ann: TypeId, has_default: bool) Erro
     return stripped;
 }
 
+/// The written annotation of a parameter that has BOTH an annotation and a
+/// default, or `no_type` for every other symbol.
+///
+/// `paramBodyType` strips `| undefined` from such a parameter, and that is
+/// right for the body — but it is right only for the body. tsc's
+/// `removeOptionalityFromDeclaredType` feeds the INITIAL FLOW TYPE that
+/// `getFlowTypeOfReference` starts from; `getTypeOfSymbol` keeps the
+/// annotation, and `checkIdentifier` returns exactly that for an assignment
+/// TARGET, returning before the flow step ever runs. So `x.length` inside
+/// `foo(x: string | undefined = "string")` is legal AND so is `x = undefined`,
+/// which ztsc reported as a TS2322 against the stripped `string`.
+/// The parameter must be a plain NAME. A destructured one
+/// (`({ nextWidth }: { nextWidth?: number } = {})`) lists the very same
+/// `param_full` as the declaration of every binding inside it, so answering
+/// the annotation there hands each binding the whole OBJECT type as its write
+/// target — excalidraw's `nextWidth = width` became a TS2559 against the
+/// options bag. What such a binding writes at is the pattern element's own
+/// type, which is what `typeOfSymbol` already answers.
+pub fn paramWriteAnnType(c: *Checker, sym: SymbolId) Error!TypeId {
+    for (c.declsOf(sym)) |pn| {
+        if (c.nodeTag(pn) != .param_full) continue;
+        const d = c.tree.nodeData(pn);
+        if (d.lhs == null_node or c.nodeTag(d.lhs) != .identifier) continue;
+        const e = c.tree.extraData(ast.ParamFull, d.rhs);
+        if (e.type_ann == 0 or e.init == 0) continue;
+        return c.typeFromTypeNode(e.type_ann);
+    }
+    return types.no_type;
+}
+
 /// tsc's `parameterInitializerContainsUndefined`: can the parameter's
 /// default expression itself produce `undefined`? If it can, the parameter
 /// really is undefined-able inside the body and
