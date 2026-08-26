@@ -1619,8 +1619,8 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
             // against a class value: `.class_value` is nominal and carries
             // no structural signatures, so bridge it to its constructor
             // object first. Only for signature-bearing patterns — a plain
-            // property pattern reads a class value's statics through the
-            // ordinary `propOfTypeEx` route.
+            // property pattern reads the statics directly, in the
+            // `.class_value` arm below.
             if (s.kind(src) == .class_value and
                 (s.objectConstructSigCount(pattern) > 0 or s.objectCallSigCount(pattern) > 0))
             {
@@ -1666,6 +1666,33 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
                             const psig = if (is_construct) s.objectConstructSig(pattern, pn - 1) else s.objectCallSig(pattern, pn - 1);
                             try c.inferFromExtends(ssig, psig, ids, vals, contra, depth + 1);
                         }
+                    }
+                }
+                return;
+            }
+            // A CLASS VALUE against a plain property pattern — `C extends {
+            // defaultProps: infer D }`, which is every arm of JSX's
+            // `LibraryManagedAttributes`. `.class_value` is nominal: its
+            // statics and its `prototype` come from the class SYMBOL, not from
+            // a member table, so the `!= .object` bail below left every infer
+            // var of such a pattern unbound and it resolved to `unknown`.
+            //
+            // The failure was silent because the conditional still MATCHED —
+            // the relation reads statics perfectly well — so `T extends {
+            // defaultProps: infer X } ? X : "NO"` took the TRUE branch and
+            // answered `unknown` rather than falling to `"NO"`.
+            //
+            // `propOfTypeEx` is the lookup that reads a class value's statics
+            // (the same one `C.defaultProps` and the `extends` check use), so
+            // this is the plain-object walk below with the source read through
+            // it. `allow_index = false` for the reason that walk gives: an
+            // apparent `Object`/`Function` member is not a declared property
+            // and must not seed a candidate.
+            if (s.kind(src) == .class_value) {
+                for (0..s.objectPropCount(pattern)) |i| {
+                    const pp = s.objectProp(pattern, @intCast(i));
+                    if (try c.propOfTypeEx(src, pp.name, false)) |sp| {
+                        try c.inferFromExtends(sp.ty, pp.ty, ids, vals, contra, depth + 1);
                     }
                 }
                 return;
