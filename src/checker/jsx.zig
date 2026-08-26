@@ -1937,6 +1937,14 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     // worse than the under-report.
     const whole_object_checkable = is_obj_target and !(has_spread and spread_opaque);
 
+    const weak_hit = whole_object_checkable and has_spread and target_open and
+        try jsxWeakTypeHit(c, rt, target_props.items, provided.items, ia_names.items, spread_non_object);
+    // A prop the tag's own `defaultProps` supplies is never missing (see
+    // `jsxMissingRequiredProp`); not evaluated at all when the weak-type
+    // verdict already stands, since that report wins.
+    const missing_hit = whole_object_checkable and !weak_hit and
+        try jsxMissingRequiredProp(c, e, target_props.items, provided.items, is_component);
+
     // A property the attributes object gets from a `{...spread}`, whose value
     // the target's own prop rejects. tsc's `generateJsxAttributes` skips
     // spreads, so `elaborateElementwise` produces nothing for it and
@@ -1945,16 +1953,29 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     // through the same arm. `<div {...{text: 42}} />` against
     // `{ text?: string }`.
     //
-    // Only the LAST contributor of a name is in the object (later wins), and
-    // a name some WRITTEN attribute also carries is the elaboration's to
-    // report — it has a name node to anchor at, and the walk above already
-    // took that name's verdict from the object's member type.
+    // Reached only when nothing ELSE has a verdict, and only past tsc's silent
+    // first stage — which is both the faithful order (`isTypeRelatedTo` before
+    // `elaborateError`) and the cheap one. The per-property walk it guards is
+    // quadratic in the attribute count and asks the relation once per name; a
+    // react-native `{...props}` spreads a ~250-property type, so running it on
+    // every clean element would have cost more than the whole check. The
+    // whole-object query costs ONE relation, is memoized on the type pair, and
+    // is the same one the reporting path below re-asks.
+    //
+    // Inside it: only the LAST contributor of a name is in the object (later
+    // wins), and a name some WRITTEN attribute also carries is the
+    // elaboration's to report — it has a name node to anchor at, and the walk
+    // above already took that name's verdict from the object's member type.
     //
     // Gated on `whole_object_checkable` for the reason every other
     // whole-object verdict is: with an un-enumerable spread the source type
     // ztsc can spell is not the one tsc relates.
     var spread_failed = false;
-    if (whole_object_checkable and has_spread) {
+    if (whole_object_checkable and has_spread and
+        !attr_failed and !attr_fresh_failed and !hyphen_failed and
+        !have_excess and !weak_hit and !missing_hit and
+        !try c.isAssignable(try c.jsxAttrsObject(provided.items, .relate), props))
+    {
         for (provided.items, 0..) |p, i| {
             if (!from_spread.items[i]) continue;
             if (lastProvidedIndex(provided.items, p.name) != i) continue;
@@ -1967,14 +1988,6 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
             }
         }
     }
-
-    const weak_hit = whole_object_checkable and has_spread and target_open and
-        try jsxWeakTypeHit(c, rt, target_props.items, provided.items, ia_names.items, spread_non_object);
-    // A prop the tag's own `defaultProps` supplies is never missing (see
-    // `jsxMissingRequiredProp`); not evaluated at all when the weak-type
-    // verdict already stands, since that report wins.
-    const missing_hit = whole_object_checkable and !weak_hit and
-        try jsxMissingRequiredProp(c, e, target_props.items, provided.items, is_component);
 
     // Nothing to say: neither the elaboration nor the whole-object report has
     // a candidate, so tsc's silent first stage cannot change the outcome and
