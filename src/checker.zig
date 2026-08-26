@@ -920,41 +920,41 @@ pub const LazyStat = enum(u8) {
 };
 
 pub const map_containers = [_][]const u8{
-    "node_types",             "sig_cache",                "node_scopes",
-    "reassigned_syms",        "reassigned_in_loop",       "member_written_syms",
-    "member_written_in_loop", "ns_types",                 "ambient_ns_types",
-    "relation",               "expansions",               "overload_groups",
-    "construct_groups",       "origin",                   "iface_generic",
-    "overload_group_pool",    "iface_stack",              "pending_class_decos",
-    "class_inst_generic",     "class_static_cache",       "class_static_owner",
-    "class_static_stack",     "class_ctor_cache",         "class_abstract_cache",
-    "enum_value_cache",       "enum_info_cache",          "enum_relation_cache",
-    "alias_generic",          "alias_state",              "alias_recursive",
-    "flow_same",              "flow_narrow",              "ref_keys",
-    "flow_loop_stack",        "flow_stack",               "flow_tmp",
-    "flow_reduce",            "da_cache",                 "ctp_cache",
-    "cmp_cache",              "ctt_cache",                "ci_cache",
-    "infer_visited",          "subst_this_cache",         "mmp_cache",
-    "arrayish_elem_cache",    "tp_constraint_cache",      "erase_cache",
-    "erase_any_cache",        "inst_map_ids",             "fresh_tp_ids",
-    "this_tp_ids",            "fresh_tp_info",            "type_node_cache",
-    "atom_cache",             "infer_ids",                "infer_constraints",
-    "infer_scopes",           "mapped_key_ids",           "mapped_key_scopes",
-    "inst_diag_at",           "infer_active",             "lazy_member_active",
-    "this_bound_fns",         "chain_guards",             "never_isect",
-    "deep_path_list",         "deep_path_ids",            "flow_reach",
-    "member_type_stack",      "method_ret_cuts",          "lazy_index_objs",
-    "pending_type_args",      "pending_type_args_pool",   "pending_type_args_seen",
-    "tp_constrained_cache",   "nominal_bases",            "nominal_base_pool",
-    "keyof_mapped_active",    "ctp_syms_seen",            "weak_types",
-    "base_ref_active",        "lazy_member",              "trunc_lazy_member",
-    "lazy_map",               "pattern_root_decls",       "pattern_root_ids",
-    "pattern_narrow_busy",    "key_name_types",           "enum_members",
-    "keyof_obj_cache",        "sym_key_cache",            "trunc_expansions",
-    "inst_map_bytes",         "tp_mentions",              "smk_cache",
-    "rel_maybe",              "spec_sym_types",           "spec_tainted",
-    "last_assign_pos",        "definitely_assigned_syms", "alias_stack",
-    "alias_self_recursive",
+    "node_types",             "sig_cache",            "node_scopes",
+    "reassigned_syms",        "reassigned_in_loop",   "member_written_syms",
+    "member_written_in_loop", "ns_types",             "ambient_ns_types",
+    "relation",               "expansions",           "overload_groups",
+    "construct_groups",       "origin",               "iface_generic",
+    "overload_group_pool",    "iface_stack",          "pending_class_decos",
+    "class_inst_generic",     "class_static_cache",   "class_static_owner",
+    "class_static_stack",     "class_ctor_cache",     "class_abstract_cache",
+    "enum_value_cache",       "enum_info_cache",      "enum_relation_cache",
+    "alias_generic",          "alias_state",          "alias_recursive",
+    "flow_same",              "flow_narrow",          "ref_keys",
+    "flow_loop_stack",        "flow_stack",           "flow_tmp",
+    "flow_reduce",            "da_cache",             "ctp_cache",
+    "cmp_cache",              "ctt_cache",            "ci_cache",
+    "infer_visited",          "subst_this_cache",     "mmp_cache",
+    "arrayish_elem_cache",    "tp_constraint_cache",  "erase_cache",
+    "erase_any_cache",        "inst_map_ids",         "fresh_tp_ids",
+    "this_tp_ids",            "fresh_tp_info",        "type_node_cache",
+    "atom_cache",             "infer_ids",            "infer_constraints",
+    "infer_scopes",           "mapped_key_ids",       "mapped_key_scopes",
+    "inst_diag_at",           "infer_active",         "lazy_member_active",
+    "this_bound_fns",         "chain_guards",         "never_isect",
+    "deep_path_list",         "deep_path_ids",        "flow_reach",
+    "member_type_stack",      "method_ret_cuts",      "lazy_index_objs",
+    "sym_res_stack",          "pending_type_args",    "pending_type_args_pool",
+    "pending_type_args_seen", "tp_constrained_cache", "nominal_bases",
+    "nominal_base_pool",      "keyof_mapped_active",  "ctp_syms_seen",
+    "weak_types",             "base_ref_active",      "lazy_member",
+    "trunc_lazy_member",      "lazy_map",             "pattern_root_decls",
+    "pattern_root_ids",       "pattern_narrow_busy",  "key_name_types",
+    "enum_members",           "keyof_obj_cache",      "sym_key_cache",
+    "trunc_expansions",       "inst_map_bytes",       "tp_mentions",
+    "smk_cache",              "rel_maybe",            "spec_sym_types",
+    "spec_tainted",           "last_assign_pos",      "definitely_assigned_syms",
+    "alias_stack",            "alias_self_recursive",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -964,6 +964,10 @@ pub const map_containers = [_][]const u8{
 /// off the end of a numeric chain — which `enumInfo.has_computed` needs and
 /// the value alone cannot tell apart.
 pub const EnumMemberEntry = struct { name: Atom, value: TypeId, computed: bool = false };
+/// One frame of `Checker.sym_res_stack`: the variable symbol being resolved
+/// and tsc's `resolutionResults` bit for it (`ok = false` once something
+/// inside its own resolution asked for it again).
+pub const SymResolution = struct { sym: SymbolId, ok: bool };
 /// A memoized `keyof <object table>`, tagged with the `key_name_types`
 /// generation it was computed under — see `Checker.keyof_obj_cache`.
 const KeyofEntry = struct { ty: TypeId, gen: u32 };
@@ -1428,6 +1432,15 @@ pub const Checker = struct {
     /// `reportMemberCycle` names (TS2502 / TS7022 / TS7023), and where the
     /// recursion is cut: re-entry answers `any`, tsc's `pushTypeResolution`.
     member_type_stack: std.ArrayListUnmanaged(SymbolId) = .empty,
+    /// VARIABLE symbols whose type `variableSymbolType` is resolving, innermost
+    /// last — tsc's `pushTypeResolution`/`popTypeResolution` pair around
+    /// `getTypeOfVariableOrParameterOrProperty`. A re-entrant `typeOfSymbol`
+    /// clears the `ok` bit of every frame from the re-entered one to the top
+    /// (so `var b: typeof c; var c: typeof b` names BOTH), and a frame that
+    /// pops a cleared bit ran tsc's `reportCircularityError`: an annotated
+    /// variable is TS2502 and resolves to `any`, which is what makes a later
+    /// `var f: any` redeclaration agree instead of reporting TS2403.
+    sym_res_stack: std.ArrayListUnmanaged(SymResolution) = .empty,
     /// `nodeKey`s of the unannotated METHODS in a member circle that
     /// `memberTypeOf` cut WITHOUT reporting, because the circle is not one in
     /// tsc: a method's type is a signature object whose RETURN stays deferred
@@ -2157,6 +2170,15 @@ pub const Checker = struct {
     /// frames. While non-zero, `checkFunctionBody` queues the body onto
     /// `deferred_bodies` instead of walking it — see `DeferredBody`.
     defer_bodies: u32 = 0,
+    /// Depth of type-node frames tsc materializes LAZILY: a type literal's
+    /// members and a function/constructor type's signature. tsc's
+    /// `getTypeFromTypeNode` hands those back as an anonymous type whose
+    /// members resolve on demand, so a `typeof <self>` inside one is not part
+    /// of the variable's own type resolution and is not a circularity —
+    /// `var g: { x: typeof g }` and `var h: () => typeof h` are both legal,
+    /// while the eagerly-resolved `var f: Array<typeof f>` is TS2502. Read by
+    /// `signatures.markVarCycle`.
+    type_defer_depth: u32 = 0,
     /// Function bodies whose check was postponed out of a member-type
     /// materialization; drained once the enclosing class's instance type is
     /// complete. See `DeferredBody` / `drainDeferredBodies`.
