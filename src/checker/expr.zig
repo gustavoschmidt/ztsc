@@ -730,6 +730,19 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // scope walk rather than the dynamic `fn_ctx` (see
             // `enclosingFnIsGenerator`).
             if (!enclosingFnIsGenerator(c)) return types.any_type;
+            // TS2523, the other grammar rule in tsc's `checkYieldExpression`:
+            //
+            //     if (isInParameterInitializerBeforeContainingFunction(node)) {
+            //         error(node, yield_expressions_cannot_be_used_in_a_parameter_initializer);
+            //     }
+            //
+            // A generator's parameter defaults are evaluated by the CALLER,
+            // before the generator body ever runs, so there is no suspension
+            // point for `yield` to name. `inParameterList` is ztsc's
+            // parentless answer to that parent walk.
+            if (inParameterList(c, node)) {
+                try c.diagFmt(2523, c.nodeSpan(node), "'yield' expressions cannot be used in a parameter initializer.", .{});
+            }
             const yt: TypeId = if (c.fn_ctx) |fc| fc.yield_type else 0;
             const in_async = if (c.fn_ctx) |fc| fc.is_async else false;
             const delegate = d.rhs != 0;
@@ -846,6 +859,47 @@ fn enclosingFnNode(c: *const Checker) Node {
 /// An arrow is not transparent: `function* g() { const f = () => yield 1 }`
 /// has the ARROW as its containing function, which is exactly why the
 /// `yield` there is not a yield at all.
+/// tsc's `isInParameterInitializerBeforeContainingFunction` — a parent walk
+/// that stops at the first function-like and answers true if it passed through
+/// a parameter's initializer on the way:
+///
+/// ```ts
+/// while (node.parent && !isFunctionLike(node.parent)) {
+///     if (isParameter(node.parent) && (inBindingInitializer || node.parent.initializer === node)) return true;
+///     if (isBindingElement(node.parent) && node.parent.initializer === node) inBindingInitializer = true;
+///     node = node.parent;
+/// }
+/// ```
+///
+/// ztsc's AST carries no parent links, so the same question is asked of the
+/// SPANS: `enclosingFnNode` is the walk's stopping point, and a node inside one
+/// of that function's own parameter nodes is a node the walk would have reached
+/// through that parameter. The only expression positions a parameter node
+/// covers are its initializer and the defaults inside its binding pattern —
+/// `yield` is a syntax error in the annotation — so the two tests coincide for
+/// this caller.
+///
+/// Deliberately not a checker flag maintained by the walkers: a parameter
+/// initializer is checked by whichever of `checkFunctionBody` and the
+/// return-type inference probe reaches it first, and that expression's type
+/// then MEMOIZES, so a flag set on one path alone loses the diagnostic
+/// whenever the other path wins the race.
+fn inParameterList(c: *const Checker, node: Node) bool {
+    const fn_node = enclosingFnNode(c);
+    if (fn_node == null_node) return false;
+    const proto = switch (c.tree.nodeTag(fn_node)) {
+        .arrow_fn, .function_expr, .function_decl, .class_method, .function_type => c.tree.extraData(ast.FnProto, c.tree.nodeData(fn_node).lhs),
+        else => return false,
+    };
+    const s = c.nodeSpan(node);
+    for (c.tree.extraRange(proto.params_start, proto.params_end)) |pn| {
+        if (pn == null_node) continue;
+        const p = c.nodeSpan(pn);
+        if (s.start >= p.start and s.end <= p.end) return true;
+    }
+    return false;
+}
+
 fn enclosingFnIsGenerator(c: *const Checker) bool {
     const owner = enclosingFnNode(c);
     if (owner == null_node) return false;
