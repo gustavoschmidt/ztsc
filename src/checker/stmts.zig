@@ -426,12 +426,23 @@ fn constLikeKeyword(c: *Checker, node: Node) ?[]const u8 {
     };
 }
 
-/// tsc's `checkAmbientInitializer` for a variable declarator: an initializer
-/// is not allowed in an ambient context (TS1039) unless the declaration is a
-/// `const` WITHOUT a type annotation — the one form that carries a literal
-/// value into the declaration file. (tsc additionally requires that
-/// exempted initializer to be a literal, TS1254; ztsc stays silent there, a
-/// deliberate under-report rather than a guess at "literal enum reference".)
+/// tsc's `checkAmbientInitializer`, shared by the two declaration forms that
+/// reach it: a variable declarator and a class FIELD. An initializer is not
+/// allowed in an ambient context (TS1039) unless the declaration is
+/// `const`-like WITHOUT a type annotation — the one form that carries a
+/// literal value into the declaration file. `const_like` is tsc's
+/// `isDeclarationReadonly(node) || isVariableDeclaration(node) && isVarConst(node)`:
+/// `const` for a declarator, `readonly` for a field.
+///
+/// (tsc additionally requires that exempted initializer to be a literal,
+/// TS1254; ztsc stays silent there, a deliberate under-report rather than a
+/// guess at "literal enum reference".)
+fn reportAmbientInitializer(c: *Checker, init: Node, has_ann: bool, const_like: bool) Error!void {
+    if (init == null_node) return;
+    if (const_like and !has_ann) return;
+    try c.diagFmt(1039, c.nodeSpan(init), "Initializers are not allowed in ambient contexts.", .{});
+}
+
 fn checkAmbientInitializer(c: *Checker, decl: Node, is_const: bool) Error!void {
     const d = c.tree.nodeData(decl);
     const init: Node, const has_ann: bool = switch (c.nodeTag(decl)) {
@@ -442,9 +453,7 @@ fn checkAmbientInitializer(c: *Checker, decl: Node, is_const: bool) Error!void {
         },
         else => return,
     };
-    if (init == null_node) return;
-    if (is_const and !has_ann) return;
-    try c.diagFmt(1039, c.nodeSpan(init), "Initializers are not allowed in ambient contexts.", .{});
+    try reportAmbientInitializer(c, init, has_ann, is_const);
 }
 
 fn checkDeclarator(c: *Checker, decl: Node, is_const: bool, ambient: bool) Error!void {
@@ -764,7 +773,10 @@ fn checkForInOf(c: *Checker, node: Node) Error!void {
                             // `.declarator_full` arm below has an annotation to
                             // materialize from, and a head may not carry one
                             // anyway (TS2404, raised in the parser).
-                            try destructure.checkPatternProps(c, dd.lhs, elem_t);
+                            // A `for…of` head carries no initializer, so an
+                            // empty array pattern takes only the iterability
+                            // report (tsc's `needCheckInitializer` is false).
+                            try destructure.checkPatternProps(c, dd.lhs, elem_t, false);
                         }
                     },
                     .declarator_full => {
@@ -1579,7 +1591,7 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
                 // per element, TS2488 for a non-iterable array pattern), the
                 // parameter's half of what `checkDeclPattern` runs for a
                 // `var`/`let`. `function f({ q }: { a: number })` was silent.
-                try destructure.checkPatternProps(c, name, ann_t);
+                try destructure.checkPatternProps(c, name, ann_t, init != 0);
             } else {
                 try materializePatternTypes(c, name, types.no_type, .contextual_only);
             }
@@ -2802,8 +2814,12 @@ pub fn checkClass(c: *Checker, node: Node, ctx: TypeId) Error!void {
     // queried. Foreign files are skipped for the same reason
     // `checkFunctionBody` skips them: `seal` drops their diagnostics, and their
     // bodies are never walked, so the query would have nothing to read.
-    const check_prop_init = !(c.ambient_ctx or data.flags & ast.Flags.declare != 0) and
-        c.owned_mask[c.cur_file];
+    // The class BODY is an ambient context: a `declare class`, or any class in
+    // a `.d.ts` or `declare namespace` body (tsc's `node.flags &
+    // NodeFlags.Ambient`). A single member may also be ambient on its own, via
+    // the `declare` modifier — see the field arm below.
+    const class_ambient = c.ambient_ctx or data.flags & ast.Flags.declare != 0;
+    const check_prop_init = !class_ambient and c.owned_mask[c.cur_file];
     var init_cands: std.ArrayList(InitCand) = .empty;
     defer init_cands.deinit(c.scratch());
     var computed_init_cands: std.ArrayList(Node) = .empty;
@@ -2822,7 +2838,7 @@ pub fn checkClass(c: *Checker, node: Node, ctx: TypeId) Error!void {
     // cannot name a property). Driven from here, like the two calls around it,
     // so it runs once, in the file that owns the class.
     // (wave-10 A: one flagged call into `computed_key.zig`.)
-    try computed_key.checkMemberNames(c, members, if (c.ambient_ctx or data.flags & ast.Flags.declare != 0)
+    try computed_key.checkMemberNames(c, members, if (class_ambient)
         .ambient_class_body
     else
         .class_body, c.tree.extraRange(data.tp_start, data.tp_end), node);
@@ -2842,6 +2858,35 @@ pub fn checkClass(c: *Checker, node: Node, ctx: TypeId) Error!void {
             .class_field => {
                 const e = c.tree.extraData(ast.Field, md.lhs);
                 const is_static = e.flags & ast.Flags.static != 0;
+                // tsc's `checkGrammarProperty` -> `checkAmbientInitializer`.
+                // A field is ambient when its class body is, and also on its
+                // own with the `declare` modifier — which is the whole point
+                // of that modifier and the only way a NON-ambient class can
+                // hold one (`illegalModifiersOnClassElements`,
+                // `classExpressionPropertyModifiers`). `readonly` is the
+                // field's `const`.
+                //
+                // tsc runs it as `!checkGrammarModifiers(node) &&
+                // !checkGrammarProperty(node)`, so a modifier-grammar error on
+                // the same member swallows this one. The combination that
+                // actually occurs is a DECORATED `declare` field: standard
+                // decorators' `nodeCanBeDecorated` rejects a property with an
+                // ambient MODIFIER (and only that — a decorated field of a
+                // `declare class` is decoratable and does earn TS1039), so the
+                // pair is always TS1206 instead
+                // (`esDecorators-classDeclaration-fields-staticAmbient`).
+                // Decorators are siblings that precede the member they
+                // decorate. The purely syntactic suppressors — a duplicate or
+                // misordered modifier, `export` on a class element — are not
+                // modelled; each needs the parser's own verdict, and the
+                // corpus holds no case that pairs one with an initializer.
+                const decorated = mi > 0 and members[mi - 1] != null_node and
+                    c.nodeTag(members[mi - 1]) == .decorator;
+                if ((class_ambient or e.flags & ast.Flags.declare != 0) and
+                    !(decorated and e.flags & ast.Flags.declare != 0))
+                {
+                    try reportAmbientInitializer(c, e.init, e.type_ann != 0, e.flags & ast.Flags.readonly != 0);
+                }
                 c.this_type = if (is_static and class_sym != binder.no_symbol)
                     try c.ts.makeClassValue(class_sym)
                 else
