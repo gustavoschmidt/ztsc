@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-28, post wave 44)
+## Standings (2026-08-28, post wave 45)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7867 / 8641 (91.0%)** |
-| excess keys (false positives) | 3541 | 1010 |
-| missing keys (under-reports) | 8617 | 2007 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7880 / 8641 (91.2%)** |
+| excess keys (false positives) | 3541 | 962 |
+| missing keys (under-reports) | 8617 | 1904 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Forty-four waves landed (3–44), every one with ZERO match→non-match regressions in
+Forty-five waves landed (3–45), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -815,7 +815,85 @@ modifier-changing deferral for DIRECT receivers only. Machine slept
 repeatedly; agents resumed; C's worktree was auto-removed (recreated
 as worktree-agent-w44c); D looped on stale waiters until TaskStop.
 
-## Ranked next queue (wave 45) — distilled from wave-44 agent reports
+Wave 45 (+13 exact → 7880/8641 91.2%): THE LMA WAVE — C implemented
+JSX.LibraryManagedAttributes completely and CORRECTLY (all 15 keys
+match when ON; both apps byte-identical; grid 60/60) but it ships
+FLAG-OFF on a measured +15.6% social-app wall: ~1300 distinct
+(tag,props) pairs × ~0.4ms of @types/react's 3-deep conditional chain;
+the memo hits 91% but misses are irreducible, and the cost is NOT
+instantiation (+2.2% expandRef visits vs +15% wall) — it is
+assign.relate inside ~5200 conditional checks (~77µs each). THE LEVER
+IS THE RELATION, not jsx. C also fixed memoized type-param shadowing
+(tp_shadow only in aliasGeneric — interface/class generics memoize the
+FIRST reference's binding; `infer U` leaked into Box<U>'s table). A
+landed the TS2502 resolution-stack machinery (pushTypeResolution/
+popTypeResolution around variableSymbolType; eager-vs-lazy split is
+exactly why `var g: {x: typeof g}` is legal and `var f: Array<typeof
+f>` is not) — recursiveTypesWithTypeof's 11 divergent keys were ONE
+bug; predicate gate widened to all function-likes; satisfies unwrap;
+never-receiver destructuring. B landed the intersection index
+DISTRIBUTION (authoritative — the constraint route accepts the bad
+write, so no fallback; +1.3% drizzle, semantic), the error-type
+placeholder for unsupplied type args, transitive index-key constraints
+(mappedTypeRelationships now MATCHES), TS2637. B's reactReadonlyHOC
+finding: the wave-42 jsx ordering was NOT the blocker — ztsc's JSX
+spread of a GENERIC enumerates props and drops the Readonly<P> half;
+contained by tsc's own "don't elaborate indexes on generic variables"
+guards; the real fix (getSpreadType keeping an intersection) needs an
+owner. D landed the .d.<ext>.ts link key, the auto-accessor modifier
+family (TS1243 via modPairMessage; TS1042 is a TRAILING check),
+variance parser half (TS1273/1274/1030 — the file's semantic pass now
+runs), typeof entity names, TS1183. PERF FLAG: drizzle +2.7% CPU
+cumulative this wave (B +1.3% semantic + A +0.6%); recovery on watch.
+
+## Ranked next queue (wave 46) — distilled from wave-45 agent reports
+
+1. RELATION CHEAPENING for conditional checks — the LMA blocker and a
+   general win: ~77µs per conditional-branch relation on social-app's
+   component types. Profile assign.relate on the jsx_lma=true
+   workload (flip the const to re-measure), find the hot predicate,
+   land the optimization, then ship LMA (everything else is proven).
+2. JSX spread of a GENERIC type produces an INTERSECTION (tsc
+   getSpreadType) — reactReadonlyHOC root; B's containment guards can
+   then retire (jsx.zig).
+3. varianceAnnotations' remaining 12 under keys (pure checker, now
+   unblocked by D's parser half — TS2637/TS2636/TS2322/TS2741; B).
+4. spreadsAndContextualTupleTypes (20 excess, ONE root): an array
+   literal's positional contextual type must account for spread
+   expansion (wave-44 A recorded tsc's rule: naive index, then
+   getElementTypeOfSliceOfTupleType — an UN-REDUCED union of the
+   remaining slice keeps literals literal). Changes every
+   spread-in-tuple-context literal — own sweep (expr, A).
+5. Defaultize-with-type-param-keyset: an alias instantiated with a
+   type param in its key set + an infer binder supplying excluded
+   keys loses the Extract/Exclude split (2 residual LMA keys; repro
+   in the jsx_lma doc comment; mapped/conditions, B).
+6. Hyphenated JSX attributes: isKnownProperty waives only the EXCESS
+   check — `<test1 data-foo={32}/>` against {"data-foo"?: string}
+   still owes TS2322 (jsx.zig:1698 drops .jsx_name attributes from
+   the walk entirely; touches every aria-*/data-* in both apps — own
+   app cycle; D).
+7. conditionalTypeVarianceBigArrayConstraintsPerformance:
+   isDistributionDependent guard in structuredTypeRelatedTo
+   (conditions.zig, B).
+8. TS2411 type-literal hook: needs a pub entry point in
+   index_constraints.zig reaching checkOne with a type literal's
+   members (B provides the entry, A wires typenode's .object_type).
+9. inferTypePredicates residue: the non-union false-in-guard
+   narrowing (narrow.zig — D deprioritized; REASSIGN with the pinned
+   witness 'bar' in value on Bar = Foo & {bar}); the single-return-
+   plus-unreachable-end widening (A, 1 key).
+10. controlFlowAssignmentPatternOrder flow half (12 keys: `b` keeps
+    its declared union after destructuring; flow.zig, D).
+11. mappedTypeConstraints2:94:9 (indexed access into an as-clause
+    mapped type stays deferred; mapped.zig, B);
+    crashDeclareGlobalTypeofExport (global-augmentation decl walk).
+12. DRIZZLE RECOVERY WATCH: +2.7% cumulative — hunt an offset (the
+    wave-43/44 pattern recovered prior debts).
+13. Census: regularExpressionScanning is 108 keys/dozen codes (not
+    one rule — descoped); one-key pools regen.
+
+## Superseded queue (wave 45, kept for context)
 
 1. The .d.<ext>.ts link one-key (READY, pinned): `export * as mod from
    "./component.html"` must also try component.d.html.ts — one
