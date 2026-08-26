@@ -39,6 +39,7 @@ const resolveStructural = @import("instantiate.zig").resolveStructural;
 const restUnionOptionalAt = @import("typenode.zig").restUnionOptionalAt;
 const sliceTuple = @import("typenode.zig").sliceTuple;
 const generics_zig = @import("generics.zig");
+const simplifyIndexAccess = @import("mapped.zig").simplifyIndexAccess;
 const simplifyMappedIndexAccessRead = @import("mapped.zig").simplifyMappedIndexAccessRead;
 const infer_zig = @import("infer.zig");
 const tuple_zig = @import("tuple_relate.zig");
@@ -3321,7 +3322,7 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
             for (try c.memberList(s)) |m| {
                 const mk = c.ts.kind(m);
                 if (mk == .type_param) bare_param = true;
-                if (!isInstantiableForUnionSpan(mk)) continue;
+                if (!isInstantiableKind(mk)) continue;
                 if (try c.isAssignable(m, t)) return true;
             }
             // The cross product is only built for an intersection that names a
@@ -3431,6 +3432,14 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         // `Partial<T>` source only fits it because both sides admit
         // `undefined` (`mappedTypes5` `d1`).
         if (try simplifyMappedIndexAccessRead(c, t)) |sim| return c.isAssignable(s, sim);
+        // The other half of `getSimplifiedIndexedAccessType`, and it must be
+        // asked AHEAD of the constraint route because it is a normalization,
+        // not a widening: `(S & State<T>)["a"]` IS `S["a"] & (T | undefined)`,
+        // so its constraint is the intersection's, and answering from the
+        // constraint alone drops `S["a"]`'s half of the requirement.
+        // `indexedAccessRelation`'s `setState({ a: a })` is the case — a `T`
+        // satisfies `State<T>["a"]` but nothing is known about `S["a"]`.
+        if (try simplifyIndexAccess(c, t, .relation)) |dist| return c.isAssignable(s, dist);
         if (try c.indexAccessTargetConstraint(t)) |bc| return c.isAssignable(s, bc);
         // An INTERSECTION source still gets tsc's "some constituent is
         // immediately related to the target" test
@@ -5116,11 +5125,20 @@ fn intersectionMemberBaseConstraint(c: *Checker, m: TypeId, depth: u32) Error!?T
 /// `baseConstraintOf` substitutes each type param in `t` with its
 /// *immediate* constraint from a fixed map, so `U extends T extends Base`
 /// only reaches `T`; re-running it to a fixpoint reaches `Base`.
-/// Kinds whose relation to a UNION target may need the target taken whole —
-/// tsc's `TypeFlags.Instantiable`. A type variable and the deferred operators
-/// over one all answer from a constraint that can itself be a union, so asking
-/// them against one union member at a time can only under-answer.
-fn isInstantiableForUnionSpan(k: types.Kind) bool {
+/// tsc's `TypeFlags.Instantiable`: a type variable, or one of the deferred
+/// operators over one, whose meaning is still pending a substitution.
+///
+/// Two callers ask it, for the two reasons tsc asks it. Against a UNION target
+/// such a type answers from a constraint that can itself be a union, so asking
+/// it one union member at a time can only under-answer. As the INDEX of an
+/// indexed access it may still instantiate to a union and re-trigger index
+/// distribution, which is why `getSimplifiedIndexedAccessType` refuses to
+/// distribute over the object until the index is not one
+/// (`mapped.IndexSimplify.relation`).
+///
+/// A union OF instantiables is not itself instantiable, so the shallow kind
+/// test is the whole test — matching tsc, where the flag is a leaf property.
+pub fn isInstantiableKind(k: types.Kind) bool {
     return switch (k) {
         .type_param, .this_type, .index_access, .conditional, .keyof_op, .mapped, .string_mapping, .template_literal_type => true,
         else => false,

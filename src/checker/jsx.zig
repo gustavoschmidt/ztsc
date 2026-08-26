@@ -44,6 +44,7 @@ const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const containsAtom = @import("expr.zig").containsAtom;
 const discriminate_ctx = @import("discriminate_ctx.zig");
+const elaborate = @import("elaborate.zig");
 const hasTypeMeaning = @import("names.zig").hasTypeMeaning;
 const NsContainer = @import("typespace.zig").NsContainer;
 const tpIndex = @import("calls.zig").tpIndex;
@@ -1706,6 +1707,9 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     for (built.items) |b| {
         if (b.overwritten) continue; // shadowed by a later spread (TS2783)
         if (try jsxAttrTarget(c, rt, b)) |target| {
+            // Mirrors the elaboration loop below: an attribute the elaboration
+            // will skip cannot be the reason it runs.
+            if (elaborate.skipsDeferredIndexAccess(c, target)) continue;
             if (!try c.isAssignable(b.ty, target)) {
                 attr_failed = true;
             } else if (b.value != null_node and try c.freshLiteralRejects(b.value, b.ty, target)) {
@@ -1758,6 +1762,7 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     for (built.items) |b| {
         if (b.overwritten) continue;
         if (try jsxAttrTarget(c, rt, b)) |target| {
+            if (elaborate.skipsDeferredIndexAccess(c, target)) continue;
             // tsc anchors a JSX attribute value mismatch at the attribute
             // NAME node (not the value), matching the excess-property anchor
             // above. Per-member elaboration for object/array-literal values

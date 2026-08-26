@@ -251,6 +251,31 @@ pub fn reachesUnmatchedProperty(c: *Checker, s0: TypeId, t0: TypeId) Error!bool 
     };
 }
 
+/// tsc's `elaborateElementwise` skips a member outright when the target's type
+/// for it is still a deferred indexed access:
+///
+/// ```ts
+/// let targetPropType = getBestMatchIndexedAccessTypeOrUndefined(source, target, nameType);
+/// if (!targetPropType || targetPropType.flags & TypeFlags.IndexedAccess) continue; // Don't elaborate on indexes on generic variables
+/// ```
+///
+/// The member is not merely *reported* differently — it is not judged at all.
+/// Elaboration exists to point at the member that explains a failure of the
+/// WHOLE relation, and `T[K]` over a still-generic object explains nothing: it
+/// is exactly the shape whose verdict changes once `T` is known, so blaming a
+/// member for it invents a diagnostic that the whole-object relation, which
+/// can take the target as a unit, never asked for.
+///
+/// `reactReadonlyHOCAssignabilityReal` is the live case:
+/// `<Inner {...this.props} name="Matt"/>` against
+/// `ComponentClass<P & {name: string}>` gives `name` the target
+/// `({ name: string } & P)["name"]`, which `getSimplifiedIndexedAccessType`
+/// distributes to `string & P["name"]` — a genuine rejection, which tsc
+/// declines to blame the attribute for.
+pub fn skipsDeferredIndexAccess(c: *Checker, target: TypeId) bool {
+    return c.ts.kind(target) == .index_access;
+}
+
 /// Is `s` a type tsc would relate under its OWN name — i.e. neither a type
 /// variable (whose apparent type stands in) nor a named class/interface
 /// reference (whose single base may stand in)? An intersection qualifies only

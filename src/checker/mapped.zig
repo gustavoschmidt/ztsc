@@ -19,6 +19,7 @@ const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 const max_instantiation_depth = checker_zig.max_instantiation_depth;
 
+const assign_zig = @import("assign.zig");
 const EnumMemberCollect = @import("enums.zig").EnumMemberCollect;
 const symbolKeyAtom = @import("keyof.zig").symbolKeyAtom;
 
@@ -1359,6 +1360,18 @@ pub const IndexSimplify = enum {
     /// resolving the object through aliases or distributing an intersection
     /// would answer about a different type than the one being related.
     mapped_only,
+    /// `mapped_only` plus tsc's `distributeIndexOverObjectType`:
+    /// `(A & B)[K]` -> `A[K] & B[K]`, over the object type AS WRITTEN. This is
+    /// the rest of `getSimplifiedIndexedAccessType`, which `getNormalizedType`
+    /// runs over both operands of every relation — so the relation asks for it
+    /// too, just not through the alias-resolving `pattern` reading.
+    ///
+    /// Guarded, as tsc guards it, on a NON-INSTANTIABLE index: "only do the
+    /// inner distributions if the index can no longer be instantiated to cause
+    /// index distribution again". `(A & B)[K]` with a generic `K` must stay
+    /// whole, because instantiating `K` to a union re-enters the
+    /// distribute-over-INDEX step, and the two distributions do not commute.
+    relation,
     /// The inference-PATTERN reading: resolve the object structurally,
     /// re-simplify the substituted value (which is how the intersection
     /// underneath a `Readonly<A & E>` surfaces), and distribute an
@@ -1402,16 +1415,20 @@ fn simplifyIndexAccessAt(c: *Checker, acc: TypeId, mode: IndexSimplify, depth: u
     if (s.kind(acc) != .index_access) return null;
     const idx = s.indexAccessIndex(acc);
     const obj = switch (mode) {
-        .mapped_only => s.indexAccessObj(acc),
+        .mapped_only, .relation => s.indexAccessObj(acc),
         .pattern => try c.resolveStructural(s.indexAccessObj(acc)),
     };
     if (s.kind(obj) == .mapped and s.mappedAs(obj) == 0) {
         const val = try c.substMappedKey(s.mappedValue(obj), s.mappedParamId(s.mappedKeyParam(obj)), idx);
         if (val == acc) return null;
-        if (mode == .mapped_only) return val;
+        if (mode != .pattern) return val;
         return (try simplifyIndexAccessAt(c, val, mode, depth + 1)) orelse val;
     }
     if (mode == .mapped_only or s.kind(obj) != .intersection) return null;
+    // The `pattern` reading distributes unguarded on purpose: it is extracting
+    // the shape a candidate can pair with, not computing a type, so a naked
+    // type variable behind a generic index is exactly what it is looking for.
+    if (mode == .relation and assign_zig.isInstantiableKind(s.kind(idx))) return null;
     var parts: std.ArrayList(TypeId) = .empty;
     defer parts.deinit(c.scratch());
     const ms = try c.scratch().dupe(TypeId, try c.memberList(obj));
