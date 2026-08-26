@@ -3569,12 +3569,19 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         if (tk != .conditional) return false;
     }
     // Deferred conditional *target*: the source must satisfy whichever
-    // branch the conditional resolves to, so require it against both — unless
-    // the target DISTRIBUTES over its check parameter and names it in a
-    // branch, in which case the branches as written are not the alternatives
-    // (see `distributionDependent`, tsc's guard on this very arm).
+    // branch the conditional resolves to, so require it against both.
+    //
+    // tsc guards this arm with `isDistributionDependent` (see
+    // `distributionDependent`) and ztsc applies that guard only where BOTH
+    // sides are conditionals, in `isAssignableInner`'s source arm. Applying it
+    // here too was measured and costs `recursiveReverseMappedType`: the target
+    // there is `(T extends unknown[] ? {} : {…}) | ['marker', ...Recur<T>[]]`,
+    // and it is the CONDITIONAL member — whose `{}` true branch accepts
+    // anything — that carries the tuple, because ztsc's tuple-vs-variadic-tuple
+    // rule does not. Refusing the branch reading turned a clean case into a
+    // false TS2322, which the no-false-positive rule outranks the missing
+    // diagnostic it would have bought.
     if (tk == .conditional) {
-        if (try distributionDependent(c, t)) return false;
         return (try c.isAssignable(s, c.ts.condTrue(t))) and (try c.isAssignable(s, c.ts.condFalse(t)));
     }
     // Template-literal pattern *target*: a concrete string literal is

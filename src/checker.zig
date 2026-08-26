@@ -920,42 +920,42 @@ pub const LazyStat = enum(u8) {
 };
 
 pub const map_containers = [_][]const u8{
-    "node_types",             "sig_cache",                "node_scopes",
-    "reassigned_syms",        "reassigned_in_loop",       "member_written_syms",
-    "member_written_in_loop", "ns_types",                 "ambient_ns_types",
-    "relation",               "expansions",               "overload_groups",
-    "construct_groups",       "origin",                   "iface_generic",
-    "overload_group_pool",    "iface_stack",              "pending_class_decos",
-    "class_inst_generic",     "class_static_cache",       "class_static_owner",
-    "class_static_stack",     "class_ctor_cache",         "class_abstract_cache",
-    "enum_value_cache",       "enum_info_cache",          "enum_relation_cache",
-    "alias_generic",          "alias_state",              "alias_recursive",
-    "flow_same",              "flow_narrow",              "ref_keys",
-    "flow_loop_stack",        "flow_stack",               "flow_tmp",
-    "flow_reduce",            "da_cache",                 "ctp_cache",
-    "cmp_cache",              "ctt_cache",                "ci_cache",
-    "cftp_cache",             "base_constraint_cache",    "infer_visited",
-    "subst_this_cache",       "mmp_cache",                "arrayish_elem_cache",
-    "tp_constraint_cache",    "erase_cache",              "erase_any_cache",
-    "inst_map_ids",           "fresh_tp_ids",             "this_tp_ids",
-    "fresh_tp_info",          "type_node_cache",          "atom_cache",
-    "infer_ids",              "infer_constraints",        "infer_scopes",
-    "mapped_key_ids",         "mapped_key_scopes",        "inst_diag_at",
-    "infer_active",           "lazy_member_active",       "this_bound_fns",
-    "chain_guards",           "never_isect",              "deep_path_list",
-    "deep_path_ids",          "flow_reach",               "member_type_stack",
-    "method_ret_cuts",        "lazy_index_objs",          "sym_res_stack",
-    "pending_type_args",      "pending_type_args_pool",   "pending_type_args_seen",
-    "tp_constrained_cache",   "nominal_bases",            "nominal_base_pool",
-    "keyof_mapped_active",    "ctp_syms_seen",            "weak_types",
-    "base_ref_active",        "lazy_member",              "trunc_lazy_member",
-    "lazy_map",               "pattern_root_decls",       "pattern_root_ids",
-    "pattern_narrow_busy",    "key_name_types",           "enum_members",
-    "keyof_obj_cache",        "sym_key_cache",            "trunc_expansions",
-    "inst_map_bytes",         "tp_mentions",              "smk_cache",
-    "rel_maybe",              "spec_sym_types",           "spec_tainted",
-    "last_assign_pos",        "definitely_assigned_syms", "alias_stack",
-    "alias_self_recursive",   "jsx_lma_cache",
+    "node_types",             "sig_cache",             "node_scopes",
+    "reassigned_syms",        "reassigned_in_loop",    "member_written_syms",
+    "member_written_in_loop", "ns_types",              "ambient_ns_types",
+    "relation",               "expansions",            "overload_groups",
+    "construct_groups",       "origin",                "iface_generic",
+    "overload_group_pool",    "iface_stack",           "pending_class_decos",
+    "class_inst_generic",     "class_static_cache",    "class_static_owner",
+    "class_static_stack",     "class_ctor_cache",      "class_abstract_cache",
+    "enum_value_cache",       "enum_info_cache",       "enum_relation_cache",
+    "alias_generic",          "alias_state",           "alias_recursive",
+    "flow_same",              "flow_narrow",           "ref_keys",
+    "flow_loop_stack",        "flow_stack",            "flow_tmp",
+    "flow_reduce",            "da_cache",              "ctp_cache",
+    "cmp_cache",              "ctt_cache",             "ci_cache",
+    "cftp_cache",             "base_constraint_cache", "type_string_cache",
+    "infer_visited",          "subst_this_cache",      "mmp_cache",
+    "arrayish_elem_cache",    "tp_constraint_cache",   "erase_cache",
+    "erase_any_cache",        "inst_map_ids",          "fresh_tp_ids",
+    "this_tp_ids",            "fresh_tp_info",         "type_node_cache",
+    "atom_cache",             "infer_ids",             "infer_constraints",
+    "infer_scopes",           "mapped_key_ids",        "mapped_key_scopes",
+    "inst_diag_at",           "infer_active",          "lazy_member_active",
+    "this_bound_fns",         "chain_guards",          "never_isect",
+    "deep_path_list",         "deep_path_ids",         "flow_reach",
+    "member_type_stack",      "method_ret_cuts",       "lazy_index_objs",
+    "sym_res_stack",          "pending_type_args",     "pending_type_args_pool",
+    "pending_type_args_seen", "tp_constrained_cache",  "nominal_bases",
+    "nominal_base_pool",      "keyof_mapped_active",   "ctp_syms_seen",
+    "weak_types",             "base_ref_active",       "lazy_member",
+    "trunc_lazy_member",      "lazy_map",              "pattern_root_decls",
+    "pattern_root_ids",       "pattern_narrow_busy",   "key_name_types",
+    "enum_members",           "keyof_obj_cache",       "sym_key_cache",
+    "trunc_expansions",       "inst_map_bytes",        "tp_mentions",
+    "smk_cache",              "rel_maybe",             "spec_sym_types",
+    "spec_tainted",           "last_assign_pos",       "definitely_assigned_syms",
+    "alias_stack",            "alias_self_recursive",  "jsx_lma_cache",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -1664,6 +1664,9 @@ pub const Checker = struct {
     ctp_cache: std.ArrayList(u8) = .empty,
     /// containsMappedParam memo, dense like `ctp_cache`.
     cmp_cache: std.ArrayList(u8) = .empty,
+    /// `typeToString` memo — see the method. The strings live in `out` and so
+    /// outlive every reader.
+    type_string_cache: IntMap(TypeId, []const u8) = .empty,
     /// `baseConstraintOf` memo — see the method. Sparse rather than dense:
     /// only a constraint-sensitive question reaches it, so the asked set is a
     /// small fraction of the type store.
@@ -3886,7 +3889,26 @@ pub const Checker = struct {
     pub const Resolved = names_zig.Resolved;
 
     const print_zig = @import("checker/print.zig");
-    pub const typeToString = print_zig.typeToString;
+    /// `print.typeToString`, memoized on `type_string_cache`.
+    ///
+    /// The printer reads nothing but the type store, the atom table and the
+    /// program's symbol names — all immutable by the time a diagnostic is
+    /// formed — so one interned `TypeId` has one display string, and the memo
+    /// only ever removes work. It also removes ALLOCATION: every call dupes its
+    /// result into `out`, which is the diagnostic arena and is never released,
+    /// so a type printed twice used to be stored twice.
+    ///
+    /// Worth memoizing because a failing relation prints a lot: the headline
+    /// names both sides, and `elaborate.chainText` re-prints a pair per level
+    /// of the derivation, so the same outer type is spelled once per step.
+    /// On social-app that walk was 166 of 1676 single-threaded samples — 10 %
+    /// of the run for 31 diagnostics, because the types are @types/react's.
+    pub fn typeToString(c: *Checker, t: TypeId) Error![]const u8 {
+        if (c.type_string_cache.get(t)) |s| return s;
+        const s = try print_zig.typeToString(c, t);
+        try c.type_string_cache.put(c.cm(), t, s);
+        return s;
+    }
     pub const symbolName = print_zig.symbolName;
     pub const dumpTypes = print_zig.dumpTypes;
     pub const PrintErr = print_zig.PrintErr;
