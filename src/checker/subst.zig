@@ -1564,9 +1564,22 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
                         // was rejected, and the element re-checked against the
                         // polymorphic `as` signature with `AsC` inferred as
                         // `string`/`unknown` — one TS2322 per styled element.
+                        //
+                        // An unresolved `infer` VARIABLE is a way to grow too,
+                        // and it is not a free type parameter, so the scan below
+                        // has to ask for it separately. `keyof P` for a `P` the
+                        // ENCLOSING conditional has not bound yet is exactly the
+                        // JSX.LibraryManagedAttributes shape: `C extends
+                        // {defaultProps: infer D; propTypes: infer P} ?
+                        // Exclude<keyof (TProps & P), keyof D> : never` froze
+                        // that member as one whole-union test, and once `P`
+                        // arrived the test read `"foo" | "bar" | "baz" extends
+                        // "foo"` — false — so `Exclude` kept every key and the
+                        // defaulted prop stayed required.
                         const m_open = try c.containsFreeTypeParam(m, &.{}) or
                             try c.containsMappedParam(m) or
-                            try c.containsThisType(m);
+                            try c.containsThisType(m) or
+                            try c.containsInfer(m);
                         try parts.append(c.scratch(), try c.reduceConditional(m, ext_m, tru_m, fls_m, m_open));
                     }
                     break :blk try s.makeUnion(c.scratch(), parts.items);
