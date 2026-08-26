@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-28, post wave 46)
+## Standings (2026-08-29, post wave 47)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7903 / 8641 (91.5%)** |
-| excess keys (false positives) | 3541 | 899 |
-| missing keys (under-reports) | 8617 | 1870 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7920 / 8641 (91.7%)** |
+| excess keys (false positives) | 3541 | 872 |
+| missing keys (under-reports) | 8617 | 1828 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Forty-six waves landed (3–46), every one with ZERO match→non-match regressions in
+Forty-seven waves landed (3–47), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -879,7 +879,80 @@ RE-RANKED the generic-JSX-spread item: reactReadonlyHOC already
 matches; the guards are tsc-faithful and permanent; the spread gap is
 a quality item worth 0 keys.
 
-## Ranked next queue (wave 47) — distilled from wave-46 agent reports
+Wave 47 (+17 exact → 7920/8641 91.7%; LMA SHIPPED): B decomposed the
+flag's cost — the re-enabled attribute-checking arms are FREE (+0.00%);
+the whole delta is the transform's own evaluation, 1.41% inclusive by
+five load-immune 1ms profiles (the wave-46 medians were CONTENTION:
++1.54% at load 11 vs +4.17% at load 20). jsx_lma=true; apps
+byte-identical; −15 under keys. RECORD CORRECTIONS: the LMA subtree is
+91% subst.instantiate, 4% assign.relate (wave-46's attribution was
+wrong); recursiveReverseMappedType is NOT the tuple-vs-variadic rule
+(it is alias interning: an in-progress self-reference TypeId differs
+from an external ref); varianceAnnotations 75:11's guard does not
+suppress — it MANUFACTURES the yes (growth-guard variants measured out
+in checker.zig). C then made tsxLibraryManagedAttributes EXACT: the
+check-substitution distribution loop kept distributivity only for
+members that can still grow, and an unresolved INFER var wasn't
+counted — one-term widening (or containsInfer) in subst.zig. C also
+landed the array-literal two-round pass (contextualOverloadListFrom
+ArrayUnion exact), probe-table extraction, fresh-literal-vs-seeded-
+param, type predicates count as contextual returns. A landed TS2411
+type-literal wiring (comptime keeper deleted), the empty-pattern
+non-null MATRIX (void|null is TS2531 ALONE — getNonNullableType
+strips void with the nullables), TS1039 class-field half; and
+confirmed outer-type-params needs class_value to carry ARGS (~30
+consumer sites — dedicated wave, full design in report). D landed
+escape cooking (string_value.zig: cook + writeEscaped inverse pair,
+zero-copy fast path, 50-run grid), three parser recoveries (escaped
+def\u0061ult cooks into the keyword), mask_type alias-merge. PERF:
+social-app +3.0% this wave (LMA transform + inference work) but −5%
+NET vs wave-45 — watch continues; next shave target is
+subst.instantiate's alias-body machinery.
+
+## Ranked next queue (wave 48) — distilled from wave-47 agent reports
+
+1. JSX SPREAD ATTRIBUTE relation pool (B's re-rank: the densest single
+   remaining pool now that LMA landed the props target): tsxAttribute
+   Errors (`<div {...attribs}/>`), tsxSpreadAttributesResolution5/12,
+   jsxChildWrongType — 4+ single-key cases, one root (jsx/relations).
+2. subst.instantiate shave for alias bodies (the 91% of the LMA
+   subtree; also the social-app watch item).
+3. recursiveReverseMappedType: alias interning — expansion(R) must
+   meet ref(R) for a recursive generic alias whose body is a union
+   containing a deferred conditional (typespace/instantiate; repros
+   t6-t8 in w47b probe dir).
+4. Named class EXPRESSION's own name must shadow a same-named outer
+   declaration inside its body (binder/scope; 16-line repro v3.ts;
+   varianceAnnotations 176:9 and beyond).
+5. class_value ARGS (the outer-type-params dedicated wave): payload +
+   ~30 consumer sites across narrow/assign_report/generics/print/
+   heritage; instance half needs typeParamsOf = outer ++ local
+   (localTypeParameters split). One agent owns types.zig + consumers.
+6. TS7023 cluster (5 one-key cases): circular inferred returns for a
+   class GETTER and object-literal METHODS — extend signatures.zig's
+   reportMemberCycle/methodReturnDeferred beyond class methods (A).
+7. intraExpressionInferences last 4 keys: getContextualType for a
+   SPREAD operand inside an object literal (expr.zig).
+8. contextualTypeWithUnionTypeIndexSignatures (5 excess): ctxPropType
+   misses the NUMBER index signature for a numeric property name
+   (string half works; expr.zig).
+9. declare-global SCOPING in the binder (crashDeclareGlobalTypeofExport:
+   ztsc binds the body into the file's own scope; tsc keeps the
+   augmentation's locals separate — that's what makes typeof foo
+   circular; real binder change).
+10. Small pinned: computedPropertyNames12 TS2411 class half (index
+    infos from computed keys); TS1239 decorators (unimplemented, ×2);
+    jsxAndTypeAssertion TS1109; mappedTypesGenericTuples2 TS1360;
+    TS1039 syntactic suppressors.
+11. Print slot (own cycle, app-churn): tsc's quote rule (quote any
+    non-identifier name); method-vs-property signature rendering;
+    [declaration-order members remain a deliberate divergence].
+12. coAndContraVariantInferences3 (10 excess TS7031 multi-hop builder
+    chain — real, not quick).
+13. Census: 183 one-key cases; TS2322 pools (29 under-cases/46 keys,
+    12 JSX); TS2339 ×6; blocked list unchanged.
+
+## Superseded queue (wave 47, kept for context)
 
 1. LMA FINAL SHAVE + FLIP: +2.7% med / +1.9% min vs same-gen false —
    one more diffuse shave (or a quiet-machine re-measure) clears the
