@@ -30,6 +30,7 @@ const classes = @import("classes.zig");
 const comma = @import("comma.zig");
 const computed_key = @import("computed_key.zig");
 const conditions = @import("conditions.zig");
+const keyof_zig = @import("keyof.zig");
 const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const buildRefKey = @import("flow.zig").buildRefKey;
@@ -5278,9 +5279,27 @@ fn checkDeferredIndexType(c: *Checker, acc: TypeId, node: Node) Error!bool {
 /// before deferral existed, so nothing that reports today stops reporting.
 fn indexDeferrableObject(c: *Checker, obj: TypeId) Error!bool {
     if (!try c.isGenericObjectForIndex(obj)) return false;
-    if (c.ts.kind(try c.resolveStructural(obj)) == .mapped) return false;
+    const ro = try c.resolveStructural(obj);
+    if (c.ts.kind(ro) == .mapped) return renamingMap(c, ro);
     const bc = try c.indexObjBaseConstraint(obj);
-    return bc == obj or c.ts.kind(try c.resolveStructural(bc)) != .mapped;
+    if (bc == obj) return true;
+    const rb = try c.resolveStructural(bc);
+    return c.ts.kind(rb) != .mapped or renamingMap(c, rb);
+}
+
+/// A mapped receiver whose keys are RENAMED (`{ [P in K as `get${P}`]: … }`),
+/// the one shape the exclusion above must let through.
+///
+/// The exclusion protects `Partial<T>[K]` and `Record<keyof T, V>[K]`, whose
+/// meaning lives in `getSimplifiedIndexedAccessType` — and those have no `as`
+/// clause at all. A renaming map has no member the eager path can find (its
+/// key set is an `as`-clause IMAGE, not `K`), so the eager answer is `any`,
+/// which is assignable to everything and silently swallows the TS2322 tsc
+/// reports. The same predicate decides `keyof`'s answer for these maps, so the
+/// deferred access and its index type stay in step.
+fn renamingMap(c: *const Checker, m: TypeId) bool {
+    const as_clause = c.ts.mappedAs(m);
+    return as_clause != 0 and keyof_zig.isKeyRename(c, as_clause);
 }
 
 /// Element access as an optional-chain link (see `memberChainInner`).
