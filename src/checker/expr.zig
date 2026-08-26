@@ -5326,9 +5326,12 @@ fn indexDeferrableObject(c: *Checker, obj: TypeId) Error!bool {
     const bc = try c.indexObjBaseConstraint(obj);
     if (bc == obj) return true;
     const rb = try c.resolveStructural(bc);
-    if (c.ts.kind(rb) != .mapped) return true;
-    return renamingMap(c, rb) or
-        (c.ts.mappedHomomorphic(rb) and mappedChangesModifiers(c, rb));
+    // Through the BASE-CONSTRAINT route only the renaming shape defers: a
+    // type parameter constrained by `Partial<S>` reads eagerly (its element
+    // narrows through `undefined` filters the deferred spelling defeats —
+    // indexedAccessAndNullableNarrowing:45/47), while the direct-receiver
+    // modifier-changing arm above keeps mappedTypeRelationships f10–f23.
+    return c.ts.kind(rb) != .mapped or renamingMap(c, rb);
 }
 
 /// A mapped receiver whose keys are RENAMED (`{ [P in K as `get${P}`]: … }`),
