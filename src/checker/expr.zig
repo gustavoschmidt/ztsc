@@ -6517,7 +6517,27 @@ fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
     switch (op) {
         .eq => {
             if (is_ref and !unchecked and target_t != types.error_type and target_t != types.any_type) {
-                _ = try c.checkAssignable(rt, target_t, d.rhs, c.nodeSpan(d.lhs));
+                // tsc's `checkIdentifier`, assignment-target arm:
+                //
+                //     return isInCompoundLikeAssignment(node)
+                //         ? getBaseTypeOfLiteralType(type) : type;
+                //
+                // A COMPOUND-LIKE assignment is a plain `=` whose right side
+                // (parens skipped) is a binary expression at shift precedence
+                // or higher — exactly the operators that also have a compound
+                // form. `let n: 0 = 0; n = n + 1` is therefore legal for the
+                // same reason `n += 1` is: the write target reads as its base
+                // primitive. `n = n & 1` is below shift precedence and still
+                // reports, and so does `o.a = o.a + "x"` — the rule lives in
+                // `checkIdentifier`, so a property write never gets it. All
+                // three oracle-pinned against tsgo 7.0.2 (#13865,
+                // `literalWideningWithCompoundLikeAssignments`).
+                const write_t = if (c.nodeTag(skipParens(c, d.lhs)) == .identifier and
+                    isCompoundLikeRhs(c, d.rhs))
+                    try baseOfLiteralType(c, target_t)
+                else
+                    target_t;
+                _ = try c.checkAssignable(rt, write_t, d.rhs, c.nodeSpan(d.lhs));
             }
             return rt;
         },
@@ -6713,13 +6733,14 @@ fn isBooleanLike(c: *Checker, t: TypeId) bool {
 /// `number & { _brand }` is not a literal type and stays exactly as
 /// declared.
 ///
-/// Two positions need it. A compound assignment's TARGET reads (and is
+/// Three positions need it. A compound assignment's TARGET reads (and is
 /// written back) as its base type — `checkIdentifier` returns
 /// `getBaseTypeOfLiteralType(flowType)` for a reference in assignment-target
 /// position — which is what makes `let d: -1 | 1 = 1; d *= -1` and
 /// `let s: "a" | "b"; s += "x"` legal while `mv += 1` on a branded number
-/// still fails. A relational operand is widened the same way, so `"a" > 1`
-/// is classified as (and REPORTED as) `string` against `number`.
+/// still fails. A COMPOUND-LIKE assignment's target widens the same way (see
+/// `isCompoundLikeRhs`). A relational operand is widened the same way too, so
+/// `"a" > 1` is classified as (and REPORTED as) `string` against `number`.
 fn baseOfLiteralType(c: *Checker, t: TypeId) Error!TypeId {
     if (c.ts.kind(t) == .union_type) {
         var list: std.ArrayList(TypeId) = .empty;
@@ -6735,6 +6756,26 @@ fn baseOfLiteralType(c: *Checker, t: TypeId) Error!TypeId {
     }
     const base = try c.literalBaseOf(t);
     return if (base != types.no_type) base else t;
+}
+
+/// tsc's `isCompoundLikeAssignment`:
+///
+///     const right = skipParenthesizedNodes(assignment.right);
+///     return right.kind === SyntaxKind.BinaryExpression
+///         && isShiftOperatorOrHigher(right.operatorToken.kind);
+///
+/// `isShiftOperatorOrHigher` is `<< >> >>>` plus additive-or-higher
+/// (`+ - * / % **`) — the operators that also spell a compound assignment.
+/// `& | ^` sit BELOW shift precedence and are deliberately not in the set,
+/// which is why `n = n & 1` reports on a literal-typed `n` and `n = n << 1`
+/// does not.
+fn isCompoundLikeRhs(c: *const Checker, rhs: Node) bool {
+    const r = skipParens(c, rhs);
+    if (r == null_node or c.nodeTag(r) != .binary) return false;
+    return switch (c.tree.tokens.tag(c.tree.nodeMainToken(r))) {
+        .lt_lt, .gt_gt, .gt_gt_gt, .plus, .minus, .asterisk, .asterisk_asterisk, .slash, .percent => true,
+        else => false,
+    };
 }
 
 /// One implicit-'any' ELEMENT ACCESS report, TS7052 or TS7053.
