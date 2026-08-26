@@ -78,6 +78,32 @@ pub const LinkResult = struct {
     constit_vals: []const u32 = &.{},
     export_equals_atom: Atom = 0,
     dual_targets: []const DualTarget = &.{},
+    eq_default_imports: []const EqDefaultImport = &.{},
+};
+
+/// A named import/re-export of a name that an `export = <entity>` module
+/// reaches through neither its entity's members nor its export table — and
+/// where the name IS the export-assigned entity itself. tsc's
+/// `reportInvalidImportEqualsExportMember`: `import { Foo } from "./a"` of a
+/// module whose whole body is `class Foo {} export = Foo` is TS2595, "'Foo'
+/// can only be imported by using a default import."
+///
+/// Only ONE half of tsc's condition is undecidable in the link phase — whether
+/// the export-assigned value's TYPE happens to carry a property of that name
+/// (`class Foo { static Foo }` really does, and tsc then binds and reports
+/// nothing). So the link phase settles the name/identity half and parks the
+/// property question here; `checker/export_equals_import.zig` answers it.
+/// Nothing else can: the link phase compares no types.
+pub const EqDefaultImport = struct {
+    /// File holding the import/export specifier (where the diagnostic lands).
+    file: FileId = 0,
+    /// Span of the specifier's name — tsc reports at the name, not the clause.
+    span: Span = .{ .start = 0, .end = 0 },
+    /// The imported name: both the property to probe and the message's `{0}`.
+    name: Atom = 0,
+    /// The export-assigned entity's declaration: a local SymbolId in `sym_file`.
+    sym_file: FileId = 0,
+    sym: u32 = 0,
 };
 
 /// The sealed multi-file program handed to the checkers. Everything is
@@ -113,6 +139,9 @@ pub const Program = struct {
     /// Backing store for `Target.dual` payloads: the (value, type) meaning
     /// pair of a name an `export =` module reaches through both halves.
     dual_targets: []const DualTarget = &.{},
+    /// Parked TS2595 questions, sorted by `(file, span.start)`. Empty for
+    /// almost every program — see `EqDefaultImport`.
+    eq_default_imports: []const EqDefaultImport = &.{},
     /// Effective `noImplicitAny` (true = on = report). When false, the checker
     /// suppresses the implicit-'any' diagnostic family (TS7006/TS7053); the
     /// affected values still type as `any`. Defaults on (strict semantics); the
@@ -202,6 +231,22 @@ pub const Program = struct {
             if (p.constit_keys[mid] < sym) lo = mid + 1 else hi = mid;
         }
         return null;
+    }
+
+    /// The parked TS2595 questions belonging to `file`. The list is sorted by
+    /// file, so a file's questions are one contiguous run; the binary search
+    /// keeps the per-file cost off programs that park none (almost all).
+    pub fn eqDefaultImportsOf(p: *const Program, file: FileId) []const EqDefaultImport {
+        const all = p.eq_default_imports;
+        var lo: usize = 0;
+        var hi: usize = all.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (all[mid].file < file) lo = mid + 1 else hi = mid;
+        }
+        var end = lo;
+        while (end < all.len and all[end].file == file) end += 1;
+        return all[lo..end];
     }
 
     /// True for a merged-range symbol id (indexes `merged`, not a file).

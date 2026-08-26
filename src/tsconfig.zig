@@ -350,7 +350,9 @@ fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8) Lo
             if (std.mem.eql(u8, t, "*")) cfg.types_wildcard = true;
         }
     }
-    cfg.auto_type_files = try collectAutoTypes(io, arena, base, cfg.dir, type_roots_abs, acc.types, cfg.resolve_pkg_json_exports);
+    const auto_types = try collectAutoTypes(io, arena, base, cfg.dir, type_roots_abs, acc.types, cfg.resolve_pkg_json_exports);
+    cfg.auto_type_files = auto_types.files;
+    cfg.missing_types = auto_types.missing;
     if (cfg.auto_type_files.len > 0) {
         try cx.note("auto-included {d} '@types' package(s) as ambient roots (tsc's default typeRoots); override with 'typeRoots'/'types'", .{cfg.auto_type_files.len});
     }
@@ -514,6 +516,18 @@ pub const Config = struct {
     /// TS5102 for a removed option). Positions are byte offsets into `text`.
     /// See `ConfigDiag` for the two gates around them.
     config_diags: []const ConfigDiag = &.{},
+    /// `compilerOptions.types` entries that resolved to no package at all, in
+    /// config order and deduplicated. Each is tsc's TS2688 "Cannot find type
+    /// definition file for 'X'." — a diagnostic with NO file, because the
+    /// directive lives in the options rather than in a source file.
+    ///
+    /// It sits beside `config_diags` rather than inside it for exactly that
+    /// reason (a `ConfigDiag` carries a byte range in `text`), but shares the
+    /// gate: tsc collects it in `getGlobalDiagnostics`, which runs after the
+    /// syntactic pass and *before* the semantic one, and the semantic pass is
+    /// skipped when it produced anything (verified against tsgo 7.0.2 — a
+    /// missing `types` entry hides a TS2322 in the same program).
+    missing_types: []const []const u8 = &.{},
     /// The root config file's source text, retained only so `config_diags`
     /// have something to resolve their offsets against (and to underline
     /// under `--pretty`). Arena-owned like every other field here.
@@ -767,11 +781,15 @@ const dirCoversPath = glob.dirCoversPath;
 /// resolves to `node_modules/vitest/globals.d.ts` through the package's
 /// `exports` map — unless `use_pkg_exports` is false
 /// (`resolvePackageJsonExports`), which resolves the directive through the
-/// legacy fields like every other specifier. An empty `types` yields nothing;
-/// an entry that resolves nowhere is skipped: tsc's TS2688 for it is a *file-less* global diagnostic
-/// (the directive lives in the config, not in a source file), and ztsc prints
-/// only file-anchored ones — an under-report. The same directive written as a
-/// `/// <reference types="…" />` inside a source file does get TS2688, from
+/// legacy fields like every other specifier. An empty `types` yields nothing.
+///
+/// An entry that resolves NOWHERE comes back in `missing`, in the order the
+/// config wrote it and deduplicated by name: it is tsc's TS2688, a *file-less*
+/// program diagnostic (the directive lives in the config, not in a source
+/// file). The caller emits it and — like every other global diagnostic —
+/// suppresses the semantic pass behind it (`TypeDirectiveMisses`). The same
+/// directive written as a `/// <reference types="…" />` inside a source file is
+/// file-anchored instead, suppresses nothing, and comes from
 /// `Linker.reportUnresolvedTypeRefs`.
 fn collectAutoTypes(
     io: Io,
@@ -781,7 +799,7 @@ fn collectAutoTypes(
     type_roots: ?[]const []const u8,
     types: ?[]const []const u8,
     use_pkg_exports: bool,
-) Error![]const []const u8 {
+) Error!AutoTypes {
     // The `@types` root directories to scan, nearest first.
     var roots: std.ArrayList([]const u8) = .empty;
     if (type_roots) |trs| {
@@ -808,8 +826,15 @@ fn collectAutoTypes(
     // `@types` directories: resolve each one instead of enumerating.
     if (types) |list| {
         var seen: std.StringHashMapUnmanaged(void) = .empty;
+        var missing: std.ArrayList([]const u8) = .empty;
+        var missing_seen: std.StringHashMapUnmanaged(void) = .empty;
         for (list) |name| {
             if (name.len == 0) continue;
+            // `types: ["*"]` is tsc's wildcard (`usesWildcardTypes`), not a
+            // package name: it re-enables the automatic enumeration alongside
+            // the explicit list rather than naming a directive to resolve, so
+            // it can never be missing. Oracle-checked (tsgo is silent on it).
+            if (std.mem.eql(u8, name, "*")) continue;
             const mangled = try typesDirName(arena, name);
             var found: ?[]u8 = null;
             primary: for (roots.items) |root| {
@@ -832,6 +857,9 @@ fn collectAutoTypes(
             if (found) |f| {
                 const gop = try seen.getOrPut(arena, f);
                 if (!gop.found_existing) try out.append(arena, f);
+            } else {
+                const gop = try missing_seen.getOrPut(arena, name);
+                if (!gop.found_existing) try missing.append(arena, name);
             }
         }
         // NOT sorted: the enumeration branch sorts because directory iteration
@@ -842,7 +870,10 @@ fn collectAutoTypes(
         // `vitest/globals` and, transitively, `@types/jest`, each declaring
         // `expect`): sorting would silently reshuffle which declaration the
         // merge sees last.
-        return out.toOwnedSlice(arena);
+        return .{
+            .files = try out.toOwnedSlice(arena),
+            .missing = try missing.toOwnedSlice(arena),
+        };
     }
 
     // Collect unique package directory names (nearest root wins) -> package dir.
@@ -875,8 +906,17 @@ fn collectAutoTypes(
             return std.mem.order(u8, a, b) == .lt;
         }
     }.lessThan);
-    return out.toOwnedSlice(arena);
+    // The enumeration branch names no directive, so nothing can be missing.
+    return .{ .files = try out.toOwnedSlice(arena) };
 }
+
+/// What `collectAutoTypes` found: the ambient program roots to load, and the
+/// `types` entries that resolved to nothing (tsc's TS2688 — see the doc
+/// comment there, and `Config.missing_types`).
+const AutoTypes = struct {
+    files: []const []const u8 = &.{},
+    missing: []const []const u8 = &.{},
+};
 
 /// Map a `compilerOptions.types` entry to its `@types` subdirectory name:
 /// `"@scope/name"` → `"scope__name"` (DefinitelyTyped's scoped convention),

@@ -393,6 +393,15 @@ const Emitter = struct {
             try e.out.print("{s}:{d}:{d}: error: {s}\n", .{ path, lc.line + 1, lc.col + 1, msg });
         }
     }
+
+    /// A diagnostic with no file and no position — tsc's file-less shape,
+    /// `error TSxxxx: <message>` on a line of its own. `--pretty` prints the
+    /// same line: the renderer's whole job is the source excerpt, and there is
+    /// no source to excerpt.
+    fn emitGlobal(e: *Emitter, ts_code: u16, comptime fmt: []const u8, args: anytype) !void {
+        e.total += 1;
+        try e.out.print("error TS{d}: " ++ fmt ++ "\n", .{ts_code} ++ args);
+    }
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -891,12 +900,24 @@ pub fn main(init: std.process.Init) !void {
     // asked for. Verified against tsgo 7.0.2.
     const config_diags: []const ztsc.tsconfig.ConfigDiag =
         if (syntactic_error) &.{} else if (config) |c| c.config_diags else &.{};
-    if (config_diags.len != 0) {
-        const cfg = config.?;
-        var config_src = try Source.fromBytes(arena, cfg.path, cfg.text);
-        emitter.beginFile();
-        for (config_diags) |d|
-            try emitter.emit(cfg.path, &config_src, .{ .start = d.start, .end = d.end }, d.code, d.msg);
+    // …and the other half of the same gate: `getGlobalDiagnostics`, which for
+    // ztsc holds exactly one family — TS2688 for a `compilerOptions.types`
+    // entry that resolves to no package. It has no file at all (the directive
+    // is an option, not source text), so it prints in tsc's file-less shape.
+    // Same suppression: with a type library missing, the program the checker
+    // would have walked is not the program the user asked for.
+    const missing_types: []const []const u8 =
+        if (syntactic_error) &.{} else if (config) |c| c.missing_types else &.{};
+    if (config_diags.len != 0 or missing_types.len != 0) {
+        if (config_diags.len != 0) {
+            const cfg = config.?;
+            var config_src = try Source.fromBytes(arena, cfg.path, cfg.text);
+            emitter.beginFile();
+            for (config_diags) |d|
+                try emitter.emit(cfg.path, &config_src, .{ .start = d.start, .end = d.end }, d.code, d.msg);
+        }
+        for (missing_types) |name|
+            try emitter.emitGlobal(2688, "Cannot find type definition file for '{s}'.", .{name});
         // Suppressed, so not reported and not counted (they drive the exit
         // code and the `--stats` line alike).
         parse_diags = 0;
@@ -913,7 +934,7 @@ pub fn main(init: std.process.Init) !void {
     };
     // Zero under the options gate: the per-file loop below is what tsc's
     // suppressed semantic pass would have produced.
-    const n_emit_files: usize = if (config_diags.len != 0) 0 else n_files;
+    const n_emit_files: usize = if (config_diags.len != 0 or missing_types.len != 0) 0 else n_files;
     for (0..n_emit_files) |i| {
         const path = paths.items[i];
         const src = results.items[i] orelse continue;
@@ -1195,7 +1216,7 @@ pub fn main(init: std.process.Init) !void {
     // failures (unloadable files, internal checker errors), 1 when any
     // diagnostics were reported, 0 for a clean check.
     if (failed > 0) std.process.exit(2);
-    if (config_diags.len > 0 or parse_diags > 0 or bind_diags > 0 or link_diags > 0 or check_diags > 0) std.process.exit(1);
+    if (config_diags.len > 0 or missing_types.len > 0 or parse_diags > 0 or bind_diags > 0 or link_diags > 0 or check_diags > 0) std.process.exit(1);
 }
 
 /// Why an argument was rejected. One message per case, printed by main.

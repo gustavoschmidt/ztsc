@@ -73,6 +73,7 @@ pub const prof_zig = @import("checker/prof.zig");
 const memprof_zig = @import("checker/memprof.zig");
 const memo_zig = @import("checker/memo.zig");
 const alias_conflict_zig = @import("checker/alias_conflict.zig");
+const export_equals_import_zig = @import("checker/export_equals_import.zig");
 
 const Ast = ast.Ast;
 const Node = ast.Node;
@@ -3154,6 +3155,11 @@ pub const Checker = struct {
             // seal sorts every diagnostic back into position order).
             c.cur_scope = binder.file_scope;
             try alias_conflict_zig.checkFileAliases(c);
+            // TS2595 is the other half of a question the link phase parked: it
+            // needs the TYPE of an `export =` entity, so it cannot be answered
+            // where the specifier was resolved. Same once-per-file shape, over
+            // a list that is empty for every program without the error.
+            try export_equals_import_zig.checkFileExportEqualsImports(c);
             // TS2744 is a property of a type-parameter LIST's own syntax, so
             // it must not depend on anything demanding the declaration's type
             // (see `checkFileTypeParamDefaults`); same once-per-file shape.

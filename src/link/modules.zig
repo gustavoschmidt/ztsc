@@ -291,6 +291,7 @@ pub fn buildProgram(
             .constit_vals = lr.constit_vals,
             .export_equals_atom = lr.export_equals_atom,
             .dual_targets = lr.dual_targets,
+            .eq_default_imports = lr.eq_default_imports,
             .types_wildcard = link_opts.types_wildcard,
             .es_module_interop = link_opts.es_module_interop,
             .experimental_decorators = link_opts.experimental_decorators,
@@ -434,7 +435,18 @@ pub fn link(
         amb[i] = .{ .atoms = atoms, .targets = tgts };
     }
 
-    return .{ .links = out, .sym_base = sym_base, .globals = gm.globals, .merged = gm.merged, .ambient_exports = amb, .ambient_specs = amb_specs, .constit_keys = gm.constit_keys, .constit_vals = gm.constit_vals, .export_equals_atom = l.atom_export_equals, .dual_targets = try arena.dupe(DualTarget, l.duals.items) };
+    // Parked TS2595 questions, in `(file, position)` order so one file's run is
+    // contiguous (`Program.eqDefaultImportsOf`). The two producers sweep the
+    // program separately, so the raw list is not in file order.
+    const eq_defaults = try arena.dupe(program.EqDefaultImport, l.eq_default_imports.items);
+    std.mem.sort(program.EqDefaultImport, eq_defaults, {}, struct {
+        fn lessThan(_: void, x: program.EqDefaultImport, y: program.EqDefaultImport) bool {
+            if (x.file != y.file) return x.file < y.file;
+            return x.span.start < y.span.start;
+        }
+    }.lessThan);
+
+    return .{ .links = out, .sym_base = sym_base, .globals = gm.globals, .merged = gm.merged, .ambient_exports = amb, .ambient_specs = amb_specs, .constit_keys = gm.constit_keys, .constit_vals = gm.constit_vals, .export_equals_atom = l.atom_export_equals, .dual_targets = try arena.dupe(DualTarget, l.duals.items), .eq_default_imports = eq_defaults };
 }
 
 /// Give a globally declared ambient module precedence over the file the
@@ -2258,6 +2270,11 @@ const Linker = struct {
     /// TS2305/TS2459/TS2724 — are settled by `resolvePendingReexports`, once
     /// every star merge has run. See the `reexport_named` arm of `table`.
     pending_reexports: std.ArrayListUnmanaged(PendingReexport) = .empty,
+    /// TS2595 questions the checker has to finish (`EqDefaultImport`). Filled
+    /// out of order — `table` walks re-exports and `linkImports` walks imports,
+    /// each in its own file sweep — and sorted by `(file, span.start)` at the
+    /// seal, so `Program.eqDefaultImportsOf` can bracket one file's run.
+    eq_default_imports: std.ArrayListUnmanaged(program.EqDefaultImport) = .empty,
 
     /// One file's import table before it is sealed: parallel arrays of local
     /// import-binding symbol and resolved `Target`, scratch-owned and in
@@ -2538,8 +2555,9 @@ const Linker = struct {
                     // rather than accusing it of a missing member.
                     if (found == null) {
                         if (try l.lookupExport(mfile, l.atom_export_equals, 0)) |exeq| {
-                            found = (try l.exportEqualsMeanings(exeq, rec.local)) orelse
-                                .{ .kind = .any };
+                            found = try l.exportEqualsMeanings(exeq, rec.local);
+                            try l.noteEqDefaultImport(file, l.nodeSpan(file, rec.node), rec.local, found);
+                            if (found == null) found = .{ .kind = .any };
                         }
                     }
                     if (found) |tgt| {
@@ -2823,6 +2841,39 @@ const Linker = struct {
         const e = exeq orelse return null;
         if (e.kind != .binding) return null;
         return .{ .kind = .export_equals_prop, .file = e.file, .payload = e.payload, .name = name, .type_only = e.type_only };
+    }
+
+    /// Park the TS2595 question for `import { name } from "m"` / `export {
+    /// name } from "m"` when `m` is `export = <entity>` and the entity IS the
+    /// thing called `name` — tsc's `reportInvalidImportEqualsExportMember`,
+    /// reached from `getExternalModuleMember` when neither the entity's members
+    /// nor the module's exports produced a symbol.
+    ///
+    /// `found` is what `exportEqualsMeanings` answered: anything other than a
+    /// bare `.export_equals_prop` means a MEMBER was found (tsc's
+    /// `symbolFromModule`), which settles the import and reports nothing. The
+    /// remaining half — does the export-assigned value's type carry a property
+    /// of that name (`class Foo { static Foo }` does) — needs a type, so it
+    /// travels to `checker/export_equals_import.zig` with the specifier's span.
+    ///
+    /// The identity test is tsc's `getSymbolIfSameReference(exportEquals,
+    /// locals.get(name))`, in the only spelling the link phase can be sure of:
+    /// the export-assigned declaration is itself named `name`. An entity
+    /// reached through an alias chain (`export = someNs.Foo`) is left alone —
+    /// its declaration is not one of `m`'s locals, which is exactly when tsc
+    /// takes a different branch.
+    fn noteEqDefaultImport(l: *Linker, file: FileId, span: Span, name: Atom, found: ?Target) Error!void {
+        const t = found orelse return;
+        if (t.kind != .export_equals_prop) return;
+        const b = l.files[t.file].bind;
+        if (t.payload >= b.symbol_names.len or b.symbol_names[t.payload] != name) return;
+        try l.eq_default_imports.append(l.scratch, .{
+            .file = file,
+            .span = span,
+            .name = name,
+            .sym_file = t.file,
+            .sym = t.payload,
+        });
     }
 
     /// Both meanings of `name` against an `export = <entity>` module, combined
@@ -3448,8 +3499,9 @@ const Linker = struct {
             // in practice a module with an `export =` never parks a record.
             if (found == null) {
                 if (try l.lookupExport(p.mfile, l.atom_export_equals, 0)) |exeq| {
-                    found = (try l.exportEqualsMeanings(exeq, p.local)) orelse
-                        .{ .kind = .any };
+                    found = try l.exportEqualsMeanings(exeq, p.local);
+                    try l.noteEqDefaultImport(p.file, l.nodeSpan(p.file, p.node), p.local, found);
+                    if (found == null) found = .{ .kind = .any };
                 }
             }
             if (found) |tgt| {
@@ -4191,6 +4243,7 @@ const Linker = struct {
                             // module — without member resolution the heritage
                             // base degrades to `any` and its matchers vanish.
                             found = try l.exportEqualsMeanings(exeq, rec.imported);
+                            try l.noteEqDefaultImport(file, l.nodeSpan(file, rec.node), rec.imported, found);
                         }
                         if (found) |ff| {
                             tgt = ff;

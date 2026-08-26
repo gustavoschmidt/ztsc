@@ -1626,11 +1626,23 @@ fn resolvePackageAt(f: Fs, alloc: Allocator, d: []const u8, pkg: []const u8, sub
                 return null;
             }
             // Subpath unmatched by a present `exports` map → opaque `any`
-            // module (see above; NOT null — that dangles a symbol). The
-            // root (".") still falls through to legacy probing, so a package
-            // whose `.` entry our condition set misses entirely is not
-            // regressed.
+            // module (see above; NOT null — that dangles a symbol).
             if (sub.len != 0) return try blockedSubpathPath(alloc, nm, sub);
+            // An unmatched ROOT is the same verdict, and the map is just as
+            // authoritative about it: a package that publishes `exports` is a
+            // closed set of entry points, so a `.` that no active condition
+            // reaches is not published at all and tsc never re-reads the
+            // legacy `"types"`/`"main"` keys for it. `tripleSlashTypesReference
+            // WithMissingExports` is the witness — `{"types": "index.d.ts",
+            // "exports": "some-other-thing.js"}`, where the map names a file
+            // that does not exist and tsgo answers TS2688 rather than the
+            // perfectly good `index.d.ts` sitting behind `"types"`.
+            //
+            // `null`, not a blocked stand-in: the ROOT of a package still has
+            // to reach `@types/<pkg>` (react's `exports` names JavaScript only
+            // and its declarations are a separate package) and phase 2, both of
+            // which the walk in `resolvePackage` reaches only through a null.
+            return null;
         }
     }
     // Phase 2 has nothing to say about a package with no `exports` map.

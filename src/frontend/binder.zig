@@ -2921,11 +2921,28 @@ const Binder = struct {
                 for (b.tree.nodeRange(node)) |el| try b.bindPattern(el, kind, decl_node, extra);
             },
             .binding_default => {
-                try b.bindPattern(d.lhs, kind, decl_node, extra);
-                try b.bindExpr(d.rhs);
+                // tsc's `bindBindingElementFlow`: a binding element whose NAME
+                // is itself a pattern evaluates its DEFAULT before the pattern,
+                // because the pattern's computed keys are read out of the
+                // defaulted value. Only the flow order changes — the symbols a
+                // pattern declares do not care which side is walked first.
+                if (isBindingPatternNode(b, d.lhs)) {
+                    try b.bindInitializerFlow(d.rhs);
+                    try b.bindPattern(d.lhs, kind, decl_node, extra);
+                } else {
+                    try b.bindPattern(d.lhs, kind, decl_node, extra);
+                    try b.bindExpr(d.rhs);
+                }
             },
             .rest_element => try b.bindPattern(d.lhs, kind, decl_node, extra),
             .binding_property => {
+                // Same rule, for `{ k: <pattern> = init }` — the default is a
+                // sibling of the target here rather than a `binding_default`.
+                if (d.rhs != 0 and isBindingPatternNode(b, d.lhs)) {
+                    try b.bindInitializerFlow(d.rhs);
+                    try b.bindPattern(d.lhs, kind, decl_node, extra);
+                    return;
+                }
                 if (d.lhs != 0) {
                     // `key: target` — the key is a property name, not a binding.
                     try b.bindPattern(d.lhs, kind, decl_node, extra);
@@ -2946,6 +2963,38 @@ const Binder = struct {
             .omitted, .error_node, .unsupported => {},
             else => {}, // not a pattern (recovery); no bindings
         }
+    }
+
+    /// tsc's `bindInitializer`: an initializer that MAY NOT RUN — a binding
+    /// element's `= default`, taken only when the destructured slot is
+    /// `undefined` — leaves the flow at a join of "ran" and "did not run".
+    ///
+    /// The join is what makes the computed key of `const [{ [a]: b } = [9, a =
+    /// 0] as const] = []` read `a` as `0 | 1` rather than as either branch's
+    /// answer alone (`controlFlowBindingPatternOrder`, oracle-checked against
+    /// tsgo 7.0.2 in all five of its shapes). It costs nothing when the
+    /// initializer contains no assignment at all: `currentFlow` is then
+    /// unchanged and tsc's own early return applies, so no node is minted.
+    fn bindInitializerFlow(b: *Binder, node: Node) Error!void {
+        if (node == null_node) return;
+        const entry = b.cur_flow;
+        try b.bindExpr(node);
+        if (entry == unreachable_flow or entry == b.cur_flow) return;
+        const pid = try b.newPending();
+        try b.pendAdd(pid, entry);
+        try b.pendAdd(pid, b.cur_flow);
+        b.cur_flow = try b.finishPending(pid);
+    }
+
+    /// tsc's `isBindingPattern` on a binding element's NAME: the two
+    /// destructuring shapes, and nothing else (an identifier target, an
+    /// omitted slot, a recovery node all answer no).
+    fn isBindingPatternNode(b: *const Binder, node: Node) bool {
+        if (node == null_node) return false;
+        return switch (b.nodeTag(node)) {
+            .array_pattern, .object_pattern => true,
+            else => false,
+        };
     }
 
     fn bindFunctionDecl(b: *Binder, node: Node) Error!void {
@@ -4198,6 +4247,83 @@ const Binder = struct {
         for (out, toks.items, span_toks.items) |v, tok, span_tok| {
             if (v.multiple) try b.diag(.multiple_default_exports, tok);
             if (v.redeclared) try b.diag(.redeclared_exported_variable, span_tok);
+        }
+    }
+
+    /// The NAME a member-name token spells, quotes stripped — the text half of
+    /// `memberAtom`, for the one caller that must not intern.
+    fn nameTextOfToken(b: *Binder, tok: TokenIndex) []const u8 {
+        const text = b.tokenText(tok);
+        return switch (b.tree.tokens.tag(tok)) {
+            .string_literal, .no_substitution_template_literal => stripQuotes(text),
+            else => text,
+        };
+    }
+
+    /// TS2300, once per file: two or more export SPECIFIERS that publish the
+    /// same exported name.
+    ///
+    /// tsc gets this from `declareSymbol`: an export specifier declares an
+    /// `Alias` in the module's `exports` table, and `SymbolFlags.AliasExcludes`
+    /// excludes every meaning including another alias, so a repeat is an
+    /// ordinary duplicate — reported at every spelling, the newcomer and each
+    /// declaration already in the group. ztsc has no `exports` symbol table
+    /// (a file's exports are a record list), so the count stands in for it.
+    ///
+    /// Scope, measured shape by shape against tsgo 7.0.2:
+    ///
+    ///   * one clause or several (`export {x as n}; export {y as n}`), a local
+    ///     clause or a re-export one, a `type`-only specifier beside a value
+    ///     one, and `export * as ns` twice — all duplicates;
+    ///   * the anchor is the EXPORTED name (`z` in `x as z`), not the local;
+    ///   * three spellings earn three diagnostics, not two;
+    ///   * `export {q as r, q as s}` — one local, two names — is legal;
+    ///   * a specifier against an export DECLARATION of the same name
+    ///     (`export const p = 1; export {p}`) is NOT this: tsc words it
+    ///     TS2323/TS2484, so only specifier-vs-specifier counts here;
+    ///   * `as default` twice is TS2528's slot (`checkDefaultExportClashes`),
+    ///     and stays out of this rule rather than being worded TS2300.
+    ///
+    /// Only file-scope records take part, for `checkDefaultExportClashes`'s
+    /// reason: a `declare module "spec" { … }` block and a `namespace N { … }`
+    /// body are containers of their own.
+    fn checkDuplicateExportSpecifiers(b: *Binder) Error!void {
+        // Exported atom -> (first spelling's token, already reported?). Scratch
+        // only, and empty for every file whose exports are all declarations.
+        var seen: std.AutoHashMapUnmanaged(Atom, struct { tok: TokenIndex, reported: bool }) = .empty;
+        defer seen.deinit(b.scratch);
+        for (b.export_recs.items) |rec| {
+            if (rec.scope != file_scope or rec.exported == 0) continue;
+            const tok: TokenIndex = switch (rec.kind) {
+                // `export { local as exported }` / `export { … } from "m"`: the
+                // record's node IS the specifier, whose `lhs` holds the
+                // exported-name token (0 for the shorthand, where the local
+                // name — the specifier's own main token — is both).
+                .named, .reexport_named => blk: {
+                    if (b.nodeTag(rec.node) != .export_specifier) continue;
+                    const sd = b.tree.nodeData(rec.node);
+                    break :blk if (sd.lhs != 0) sd.lhs else b.tree.nodeMainToken(rec.node);
+                },
+                // `export * as ns from "m"`: the name is on the statement.
+                .reexport_ns => b.tree.extraData(ast.ExportAll, b.tree.nodeData(rec.node).lhs).name_token,
+                else => continue,
+            };
+            if (tok == 0) continue;
+            // `as default` belongs to TS2528's slot. Tested on the token's own
+            // text rather than against an interned `"default"`: interning at
+            // seal time would add an atom the file never touched, which is
+            // exactly what the atom-renumbering contract forbids.
+            if (std.mem.eql(u8, nameTextOfToken(b, tok), "default")) continue;
+            const gop = try seen.getOrPut(b.scratch, rec.exported);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .{ .tok = tok, .reported = false };
+                continue;
+            }
+            if (!gop.value_ptr.reported) {
+                try b.diag(.duplicate_identifier, gop.value_ptr.tok);
+                gop.value_ptr.reported = true;
+            }
+            try b.diag(.duplicate_identifier, tok);
         }
     }
 
@@ -5782,6 +5908,7 @@ const Binder = struct {
             }
         }
         try b.checkDefaultExportClashes();
+        try b.checkDuplicateExportSpecifiers();
         // tsc's *export context* (`setExportContextFlag` / `hasExportDeclarations`):
         // a declaration file whose top level contains no export DECLARATION
         // (`export { … }`, `export * from`, `export =`, `export default <expr>`)
