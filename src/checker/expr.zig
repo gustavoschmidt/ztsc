@@ -4526,6 +4526,24 @@ pub fn ctxPropType(c: *Checker, rctx: TypeId, ctx: TypeId, key: Atom) Error!Type
             // members `Function` and `Object` lend every value never become
             // one — see `ctxPropOfType`.
             if (try c.ctxPropOfType(rctx, key)) |p| return p.ty;
+            // tsc's `getTypeOfPropertyOfContextualType` does not stop at the
+            // property lookup: its tail is `findApplicableIndexInfo(
+            // getIndexInfosOfStructuredType(t), nameType)`, and
+            // `isApplicableIndexType` admits a NUMERIC-literal name to a
+            // `[k: number]` signature. `ctxPropOfType` answers from the STRING
+            // index alone, so `{ 0: a => a }` written for
+            // `{ 0: string } | { [a: number]: (n: number) => number }` saw only
+            // the declared `string` half: its callback parameter fell to
+            // implicit `any` (TS7006) and the arrow then failed against
+            // `string` (contextualTypeWithUnionTypeIndexSignatures).
+            //
+            // Objects only. An `.array`/`.tuple` receiver has a numeric domain
+            // too, but an object literal is never contextually typed by one in
+            // the corpus, and `numericIndexHit`'s past-the-end tuple answers
+            // are a separate rule — see `numericNameIndexHit`.
+            if (c.ts.kind(rctx) == .object) {
+                if (try c.numericNameIndexHit(rctx, .object, c.atomText(key))) |nt| return nt;
+            }
             return types.no_type;
         },
     }

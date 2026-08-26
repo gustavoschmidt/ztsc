@@ -780,6 +780,19 @@ pub fn freshLiteralUnionMismatch(c: *Checker, expr_node: Node, src_t: TypeId, ta
             const rm = try c.resolveStructural(m);
             if (try c.targetKnowsProp(rm, key)) known = true;
             const pt = (try c.targetPropType(rm, key)) orelse blk: {
+                // WAVE-48 AGENT-C FLAGGED ARM (out-of-scope file; self-contained
+                // — drop these three lines alone if they conflict).
+                // tsc's `getTypeOfPropertyInTypes` falls back to
+                // `getApplicableIndexInfoForName(type, name)`, not to the string
+                // index alone: `isApplicableIndexType` admits a NUMERIC-literal
+                // name to a `[k: number]` signature. Without it, `{ 0: 1 }`
+                // against `{ 0: string } | { [a: number]: number }` computed
+                // `want = string | undefined` and manufactured a TS2322 for a
+                // pair the relation had just accepted
+                // (contextualTypeWithUnionTypeIndexSignatures).
+                if (c.ts.kind(rm) == .object) {
+                    if (try c.numericNameIndexHit(rm, .object, c.atomText(key))) |nt| break :blk nt;
+                }
                 if (c.ts.kind(rm) == .object and c.ts.objectStringIndex(rm) != 0) {
                     break :blk c.ts.objectStringIndex(rm);
                 }
