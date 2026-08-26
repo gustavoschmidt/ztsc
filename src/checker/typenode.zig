@@ -44,6 +44,7 @@ const mergeBaseObjectPlain = @import("classes.zig").mergeBaseObjectPlain;
 const scratch = Checker.scratch;
 const signatureOfProto = @import("signatures.zig").signatureOfProto;
 
+const expr_zig = @import("expr.zig");
 const keyof_zig = @import("keyof.zig");
 const tuple_relate = @import("tuple_relate.zig");
 const typeparams_zig = @import("typeparams.zig");
@@ -402,6 +403,7 @@ fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
         // `parse(): output<this>` (→ `this["_zod"]["output"]`) is the shape
         // that needs it.
         .this_expr => {
+            if (try thisTypeInCtorParams(c, node)) return types.error_type;
             if (c.this_type == 0) return types.any_type;
             if (c.ts.kind(c.this_type) != .ref) return c.this_type;
             c.has_this_types = true;
@@ -410,6 +412,62 @@ fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
         .error_node, .unsupported => return types.any_type,
         else => return types.any_type,
     }
+}
+
+/// TS2526, tsc's `getThisType`, for the one position ztsc can settle without
+/// AST parent links:
+///
+/// ```ts
+/// const container = getThisContainer(node, /*includeArrowFunctions*/ false, …);
+/// if (parent && (isClassLike(parent) || parent.kind === InterfaceDeclaration)) {
+///     if (!isStatic(container) &&
+///         (!isConstructorDeclaration(container) || isNodeDescendantOf(node, container.body))) {
+///         return getDeclaredTypeOfClassOrInterface(…).thisType;
+///     }
+/// }
+/// error(node, A_this_type_is_available_only_in_a_non_static_member_of_a_class_or_interface);
+/// ```
+///
+/// A CONSTRUCTOR is a this-container that admits `this` only inside its BODY:
+/// the parameter list is evaluated against the class before any instance
+/// exists, so `constructor(x: this)` has no `this` to name. Every other clause
+/// of the rule (a static member, a top-level annotation, a member of a nested
+/// type literal, an object-literal method) needs the container walk itself and
+/// stays unreported for now — the safe half, since a missing report is not a
+/// false one.
+///
+/// Two things make the constructor case answerable here. The binder's scope
+/// chain reaches tsc's container whenever that container is function-like, and
+/// the SPAN test (`expr.nodeInParameterList`) says whether the node is in that
+/// function's parameter list rather than in its body — which is the
+/// constructor clause verbatim. Every `this` a parameter's annotation contains
+/// is caught,
+/// however deeply: a `G<this>`, a `this[]`, a nested `(x: this) => void`, a
+/// `{ x: this }` — tsc reports all four, since a FunctionType is not a
+/// container at all and a nested type literal's member is a container whose
+/// parent is not the class. All oracle-pinned against tsgo 7.0.2, along with
+/// the negatives: a method parameter, a property annotation, `typeof this` (a
+/// type QUERY, which never reaches this arm), and `interface I { new (x: this) }`
+/// — a construct SIGNATURE in an interface is not a constructor declaration.
+fn thisTypeInCtorParams(c: *Checker, node: Node) Error!bool {
+    var cur = c.cur_scope;
+    var fn_node: Node = null_node;
+    while (cur != binder.file_scope) : (cur = c.bind.scope_parents[cur]) {
+        if (c.bind.scope_kinds[cur] != .function) continue;
+        const owner = c.bind.scope_owners[cur];
+        // A function/constructor TYPE is not one of tsc's this-containers, so
+        // the walk passes straight through it — which is why the `this` in
+        // `constructor(f: (x: this) => void)` is the constructor's and reports.
+        if (c.nodeTag(owner) == .function_type or c.nodeTag(owner) == .constructor_type) continue;
+        fn_node = owner;
+        break;
+    }
+    if (fn_node == null_node or c.nodeTag(fn_node) != .class_method) return false;
+    const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(fn_node).lhs);
+    if (!c.isCtorMember(fn_node, proto.flags)) return false;
+    if (!expr_zig.nodeInParameterList(c, fn_node, node)) return false;
+    try c.diagFmt(2526, c.nodeSpan(node), "A 'this' type is available only in a non-static member of a class or interface.", .{});
+    return true;
 }
 
 /// TS2574, the SEMANTIC half of tsc's `checkTupleType` walk: a spread element

@@ -730,6 +730,19 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // scope walk rather than the dynamic `fn_ctx` (see
             // `enclosingFnIsGenerator`).
             if (!enclosingFnIsGenerator(c)) return types.any_type;
+            // TS2523, the other grammar rule in tsc's `checkYieldExpression`:
+            //
+            //     if (isInParameterInitializerBeforeContainingFunction(node)) {
+            //         error(node, yield_expressions_cannot_be_used_in_a_parameter_initializer);
+            //     }
+            //
+            // A generator's parameter defaults are evaluated by the CALLER,
+            // before the generator body ever runs, so there is no suspension
+            // point for `yield` to name. `inParameterList` is ztsc's
+            // parentless answer to that parent walk.
+            if (inParameterList(c, node)) {
+                try c.diagFmt(2523, c.nodeSpan(node), "'yield' expressions cannot be used in a parameter initializer.", .{});
+            }
             const yt: TypeId = if (c.fn_ctx) |fc| fc.yield_type else 0;
             const in_async = if (c.fn_ctx) |fc| fc.is_async else false;
             const delegate = d.rhs != 0;
@@ -827,7 +840,7 @@ fn checkYieldImplicitAny(c: *Checker, node: Node, ctx: TypeId, delegate: bool) E
 /// The function-like that lexically contains the node now being checked —
 /// tsc's `getContainingFunction`, which an arrow is NOT transparent to.
 /// `null_node` at the top level of a file.
-fn enclosingFnNode(c: *const Checker) Node {
+pub fn enclosingFnNode(c: *const Checker) Node {
     var cur = c.cur_scope;
     while (cur != binder.file_scope) {
         if (c.bind.scope_kinds[cur] == .function) return c.bind.scope_owners[cur];
@@ -846,6 +859,59 @@ fn enclosingFnNode(c: *const Checker) Node {
 /// An arrow is not transparent: `function* g() { const f = () => yield 1 }`
 /// has the ARROW as its containing function, which is exactly why the
 /// `yield` there is not a yield at all.
+/// tsc's `isInParameterInitializerBeforeContainingFunction` — a parent walk
+/// that stops at the first function-like and answers true if it passed through
+/// a parameter's initializer on the way:
+///
+/// ```ts
+/// while (node.parent && !isFunctionLike(node.parent)) {
+///     if (isParameter(node.parent) && (inBindingInitializer || node.parent.initializer === node)) return true;
+///     if (isBindingElement(node.parent) && node.parent.initializer === node) inBindingInitializer = true;
+///     node = node.parent;
+/// }
+/// ```
+///
+/// ztsc's AST carries no parent links, so the same question is asked of the
+/// SPANS: `enclosingFnNode` is the walk's stopping point, and a node inside one
+/// of that function's own parameter nodes is a node the walk would have reached
+/// through that parameter. The only expression positions a parameter node
+/// covers are its initializer and the defaults inside its binding pattern —
+/// `yield` is a syntax error in the annotation — so the two tests coincide for
+/// this caller.
+///
+/// Deliberately not a checker flag maintained by the walkers: a parameter
+/// initializer is checked by whichever of `checkFunctionBody` and the
+/// return-type inference probe reaches it first, and that expression's type
+/// then MEMOIZES, so a flag set on one path alone loses the diagnostic
+/// whenever the other path wins the race.
+///
+/// `typenode.zig`'s TS2526 asks the same question of a `this` TYPE node, where
+/// the containing function has to be a CONSTRUCTOR besides — hence `pub`, and
+/// hence `enclosingFnNode` beside it.
+pub fn inParameterList(c: *const Checker, node: Node) bool {
+    return nodeInParameterList(c, enclosingFnNode(c), node);
+}
+
+/// `inParameterList` against a container the caller picked. `typenode.zig`
+/// needs its own: tsc's `getThisContainer` does NOT list `FunctionType` or
+/// `ConstructorType`, so a `this` under `constructor(f: (x: this) => void)`
+/// belongs to the CONSTRUCTOR, while `enclosingFnNode` stops at the function
+/// type's own scope.
+pub fn nodeInParameterList(c: *const Checker, fn_node: Node, node: Node) bool {
+    if (fn_node == null_node) return false;
+    const proto = switch (c.tree.nodeTag(fn_node)) {
+        .arrow_fn, .function_expr, .function_decl, .class_method, .function_type => c.tree.extraData(ast.FnProto, c.tree.nodeData(fn_node).lhs),
+        else => return false,
+    };
+    const s = c.nodeSpan(node);
+    for (c.tree.extraRange(proto.params_start, proto.params_end)) |pn| {
+        if (pn == null_node) continue;
+        const p = c.nodeSpan(pn);
+        if (s.start >= p.start and s.end <= p.end) return true;
+    }
+    return false;
+}
+
 fn enclosingFnIsGenerator(c: *const Checker) bool {
     const owner = enclosingFnNode(c);
     if (owner == null_node) return false;
@@ -2942,15 +3008,17 @@ pub fn contextAdmitsLiteral(c: *Checker, ctx: TypeId, lit: TypeId) Error!bool {
         // field-name literal so the type param infers to it rather than
         // widening to `string`.
         .template_literal_type, .string_mapping => return lk == .string_literal and try c.isAssignable(lit, r),
-        // No `.keyof_op` arm, even though tsc's `isLiteralOfContextualType`
-        // final mask lists `TypeFlags.Index` beside `StringLiteral`: every
-        // shape that reaches it here arrives as the type PARAMETER whose
-        // constraint is the `keyof` (`K extends readonly (keyof R)[]`), and
-        // the `.type_param` arm below already keeps the literal for those.
-        // Adding the arm changed no corpus or probe output, so it stays out
-        // rather than being carried unexercised. What still clamps —
-        // `...keys: [...K]` inferring `K` as its constraint instead of the
-        // argument tuple — is a variadic-tuple inference gap, not this test.
+        // tsc's `isLiteralOfContextualType` final mask lists `TypeFlags.Index`
+        // beside `StringLiteral`, and a `keyof X` therefore names the
+        // string-literal domain exactly as a string literal does — a fresh
+        // `"a"` read against it keeps its literal type instead of widening to
+        // `string`. (An earlier note here claimed the arm changed no corpus or
+        // probe output and left it out; that is no longer true — it is worth
+        // two cases, `keyofIsLiteralContexualType` and
+        // `twiceNestedKeyofIndexInference`. Wave-43 C measured it, wave-43 A
+        // landed it.) The sibling reader `literalOfContextualTypeAt` has
+        // carried the same arm all along.
+        .keyof_op => return clk == .string_literal,
         .index_access => return c.isConstTypeVar(r),
         .type_param => {
             if (c.isConstTypeParamSym(c.ts.typeParamSymbol(r))) return true;
@@ -4262,7 +4330,7 @@ pub fn ctxPropType(c: *Checker, rctx: TypeId, ctx: TypeId, key: Atom) Error!Type
             // tsc's guard: the name must satisfy the map's key set, taken
             // through its base constraint (`keyof T` for `T extends
             // Record<string, …>` bottoms out at `string | number`).
-            const con = try c.transitiveBaseConstraint(c.ts.mappedConstraint(rctx));
+            const con = try mappedKeyBaseConstraint(c, c.ts.mappedConstraint(rctx));
             if (con != types.no_type and !try c.isAssignable(key_lit, con)) return types.no_type;
             return c.substMappedKey(
                 c.ts.mappedValue(rctx),
@@ -4299,6 +4367,45 @@ pub fn ctxPropType(c: *Checker, rctx: TypeId, ctx: TypeId, key: Atom) Error!Type
             return types.no_type;
         },
     }
+}
+
+/// The key domain a generic mapped type admits, as
+/// `getTypeOfPropertyOfContextualType` reads it:
+///
+///     const constraint = getConstraintTypeFromMappedType(t);
+///     const constraintOfConstraint = getBaseConstraintOfType(constraint) || constraint;
+///     if (isTypeAssignableTo(nameType, constraintOfConstraint)) …
+///
+/// `transitiveBaseConstraint` alone is not that walk. tsc's
+/// `computeBaseConstraint` answers `keyofConstraintType` — `string | number |
+/// symbol` — for an INDEX type and stops there, because the keys of an object
+/// known only by a constraint are known only to be property keys (a subtype may
+/// declare more). ztsc's `baseConstraintOf` instead SUBSTITUTES the operand's
+/// type parameters with their constraints and keeps going, so
+/// `K extends keyof T` with `T` unconstrained walked `K` → `keyof T` →
+/// `keyof unknown` = `never`, and every property name failed the test: the
+/// literal got no contextual type, its callback parameters fell to implicit
+/// `any`, and `mapped5({foo: s => 42})` reported TS7006 on `s`
+/// (`mappedTypeContextualTypesApplied`).
+///
+/// Deliberately local to this one reader rather than folded into
+/// `baseConstraintOf`: the whole-substitution answer is what the deferred
+/// indexed-access rules in `assign.zig` are tuned against, and swapping it
+/// there traded this case for false positives on `T[K]` property access
+/// (`mappedTypeRelationships` f50/f51) and lost six `keyof T` relation
+/// diagnostics (`conditionalTypes1` f7/f8). `assign.relationIndexKeyConstraint`
+/// and `narrowable.constraintOrSelf` carry the same rule for their own
+/// operands, each over a differently-resolved type.
+fn mappedKeyBaseConstraint(c: *Checker, t: TypeId) Error!TypeId {
+    var cur = t;
+    var i: u32 = 0;
+    while (i < 8) : (i += 1) {
+        if (c.ts.kind(cur) == .keyof_op) return c.propertyKeyType();
+        const next = try c.baseConstraintOf(cur);
+        if (next == cur) break;
+        cur = next;
+    }
+    return cur;
 }
 
 /// Does `node` denote an optional chain — i.e. does its object/callee
@@ -6478,7 +6585,27 @@ fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
     switch (op) {
         .eq => {
             if (is_ref and !unchecked and target_t != types.error_type and target_t != types.any_type) {
-                _ = try c.checkAssignable(rt, target_t, d.rhs, c.nodeSpan(d.lhs));
+                // tsc's `checkIdentifier`, assignment-target arm:
+                //
+                //     return isInCompoundLikeAssignment(node)
+                //         ? getBaseTypeOfLiteralType(type) : type;
+                //
+                // A COMPOUND-LIKE assignment is a plain `=` whose right side
+                // (parens skipped) is a binary expression at shift precedence
+                // or higher — exactly the operators that also have a compound
+                // form. `let n: 0 = 0; n = n + 1` is therefore legal for the
+                // same reason `n += 1` is: the write target reads as its base
+                // primitive. `n = n & 1` is below shift precedence and still
+                // reports, and so does `o.a = o.a + "x"` — the rule lives in
+                // `checkIdentifier`, so a property write never gets it. All
+                // three oracle-pinned against tsgo 7.0.2 (#13865,
+                // `literalWideningWithCompoundLikeAssignments`).
+                const write_t = if (c.nodeTag(skipParens(c, d.lhs)) == .identifier and
+                    isCompoundLikeRhs(c, d.rhs))
+                    try baseOfLiteralType(c, target_t)
+                else
+                    target_t;
+                _ = try c.checkAssignable(rt, write_t, d.rhs, c.nodeSpan(d.lhs));
             }
             return rt;
         },
@@ -6674,13 +6801,14 @@ fn isBooleanLike(c: *Checker, t: TypeId) bool {
 /// `number & { _brand }` is not a literal type and stays exactly as
 /// declared.
 ///
-/// Two positions need it. A compound assignment's TARGET reads (and is
+/// Three positions need it. A compound assignment's TARGET reads (and is
 /// written back) as its base type — `checkIdentifier` returns
 /// `getBaseTypeOfLiteralType(flowType)` for a reference in assignment-target
 /// position — which is what makes `let d: -1 | 1 = 1; d *= -1` and
 /// `let s: "a" | "b"; s += "x"` legal while `mv += 1` on a branded number
-/// still fails. A relational operand is widened the same way, so `"a" > 1`
-/// is classified as (and REPORTED as) `string` against `number`.
+/// still fails. A COMPOUND-LIKE assignment's target widens the same way (see
+/// `isCompoundLikeRhs`). A relational operand is widened the same way too, so
+/// `"a" > 1` is classified as (and REPORTED as) `string` against `number`.
 fn baseOfLiteralType(c: *Checker, t: TypeId) Error!TypeId {
     if (c.ts.kind(t) == .union_type) {
         var list: std.ArrayList(TypeId) = .empty;
@@ -6696,6 +6824,26 @@ fn baseOfLiteralType(c: *Checker, t: TypeId) Error!TypeId {
     }
     const base = try c.literalBaseOf(t);
     return if (base != types.no_type) base else t;
+}
+
+/// tsc's `isCompoundLikeAssignment`:
+///
+///     const right = skipParenthesizedNodes(assignment.right);
+///     return right.kind === SyntaxKind.BinaryExpression
+///         && isShiftOperatorOrHigher(right.operatorToken.kind);
+///
+/// `isShiftOperatorOrHigher` is `<< >> >>>` plus additive-or-higher
+/// (`+ - * / % **`) — the operators that also spell a compound assignment.
+/// `& | ^` sit BELOW shift precedence and are deliberately not in the set,
+/// which is why `n = n & 1` reports on a literal-typed `n` and `n = n << 1`
+/// does not.
+fn isCompoundLikeRhs(c: *const Checker, rhs: Node) bool {
+    const r = skipParens(c, rhs);
+    if (r == null_node or c.nodeTag(r) != .binary) return false;
+    return switch (c.tree.tokens.tag(c.tree.nodeMainToken(r))) {
+        .lt_lt, .gt_gt, .gt_gt_gt, .plus, .minus, .asterisk, .asterisk_asterisk, .slash, .percent => true,
+        else => false,
+    };
 }
 
 /// One implicit-'any' ELEMENT ACCESS report, TS7052 or TS7053.
