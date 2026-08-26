@@ -4039,6 +4039,7 @@ pub const Checker = struct {
     pub const enumsStructurallyRelated = enums_zig.enumsStructurallyRelated;
     pub const enumHasStringValue = enums_zig.enumHasStringValue;
     pub const enumIsStringValued = enums_zig.enumIsStringValued;
+    pub const enumDisjointDomain = enums_zig.enumDisjointDomain;
     pub const checkEnum = enums_zig.checkEnum;
     pub const ownStaticMemberProp = enums_zig.ownStaticMemberProp;
     pub const classStaticType = enums_zig.classStaticType;

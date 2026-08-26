@@ -4022,6 +4022,16 @@ const Parser = struct {
         ret: Node,
     ) Error!void {
         if (p.spec != 0 or name_tok == 0) return;
+        // An ACCESSOR is not one of the seven declarations tsc's
+        // `getTypePredicateParent` admits (arrow, call signature, function
+        // declaration/expression/type, method declaration/signature), so
+        // `get isFile(): this is File` is a TS1228 even though the predicate
+        // sits in return-type position. Independent of every other accessor
+        // rule below — tsc asks the two questions in different passes and can
+        // report both — so it is not folded into `accessor_grammar.check`.
+        if (ret != null_node and p.nodeTagAt(ret) == .type_predicate) {
+            try p.errAtToken(.type_predicate_not_allowed_here, p.nodeMainTokenAt(ret));
+        }
         const nodes = p.extra.items[params.start..params.end];
         var first: Node = null_node;
         var n: u32 = 0;
@@ -9359,7 +9369,38 @@ const Parser = struct {
             .keyword_true => return p.leaf(.true_literal),
             .keyword_false => return p.leaf(.false_literal),
             .keyword_null => return p.leaf(.null_literal),
-            .keyword_this => return p.leaf(.this_expr),
+            .keyword_this => {
+                // `this is T` is a TYPE, parseable anywhere a type is — tsc's
+                // `parseNonArrayType` reads the predicate off the `this`
+                // keyword itself, and only the CHECKER (`checkTypePredicate`)
+                // then says where it was allowed to appear. Parsing it here is
+                // what keeps a class body like
+                //
+                //     isFSO: this is FileSystemObject;
+                //     get isFile(): this is File { … }
+                //
+                // from collapsing: without it the annotation stopped at `this`,
+                // the `is` was a TS1005, and statement recovery turned every
+                // member after it into a TS1434/TS1005/TS1128 cascade — 16
+                // invented diagnostics on `typeGuardOfFormThisMemberErrors`
+                // and the four real TS1228s (plus three TS2564s) lost with
+                // them.
+                //
+                // A general type position is never a legal one, so the
+                // diagnostic is owed right here: `parseReturnType` reads the
+                // predicate forms BEFORE calling into the type grammar, so
+                // nothing that reaches this arm is a return type. The one
+                // return position that is still illegal — an accessor — is
+                // answered by `reportAccessorGrammar`.
+                if (p.peekTag(1) == .keyword_is and !p.peekNewline(1)) {
+                    const name_tok = try p.bump(); // `this`
+                    _ = try p.bump(); // `is`
+                    const target = try p.parseType();
+                    try p.errAtToken(.type_predicate_not_allowed_here, name_tok);
+                    return p.addNode(.{ .tag = .type_predicate, .main_token = name_tok, .data = .{ .lhs = target, .rhs = 0 } });
+                }
+                return p.leaf(.this_expr);
+            },
             .keyword_void => return p.leaf(.identifier),
             .minus => {
                 // Negative literal type.

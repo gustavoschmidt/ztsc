@@ -1397,6 +1397,12 @@ pub const Code = enum(u16) {
             .enum_member_numeric_name,
             .enum_member_private_name,
             .computed_name_in_enum,
+            // `checkTypePredicate`: tsc PARSES `this is T` wherever a type may
+            // appear and only the checker says where it was allowed to be, so
+            // a class whose field is annotated with one still gets its
+            // strictPropertyInitialization pass (`typeGuardOfFormThisMember
+            // Errors`: three TS2564s next to four TS1228s, measured).
+            .type_predicate_not_allowed_here,
             // The TS116x family is `checkGrammarProperty`/`checkGrammarMethod`
             // in tsc's CHECKER, so a real parse error suppresses it exactly as
             // it suppresses a TS2322: `class C { ["a" + "b"]: number = 1 }`
