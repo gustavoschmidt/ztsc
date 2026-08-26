@@ -655,22 +655,30 @@ fn noteCandidate(c: *Checker, text: []const u8, name: Atom, best: *?Atom, best_d
 // =====================================================================
 
 /// tsc's `isConstTypeVariable`: is `t` a `const` TYPE PARAMETER (TS 5.0
-/// `f<const T>(…)`), or a union with one as a member? An expression whose
+/// `f<const T>(…)`), or a union/intersection with one as a member? An expression whose
 /// CONTEXTUAL type is one is checked in a const context — literal types kept,
 /// object/array literals readonly — which is the whole of what `const` on a
 /// type parameter means at an argument position (tsc's `isConstContext`:
 /// `isValidConstAssertionArgument(node) && isConstTypeVariable(contextualType)`).
 ///
-/// The union arm is the only nesting ztsc's contextual types actually produce
-/// here (`T | undefined` at an optional parameter); tsc also descends indexed
-/// accesses, conditionals, mapped types and variadic tuples, which ztsc leaves
-/// as a deliberate under-application — the literal is then checked as if the
-/// parameter had no `const`, i.e. exactly today's behavior.
+/// The union and INTERSECTION arms are `some`, not `every` — tsc's own test
+/// for both. The union one is `T | undefined` at an optional parameter; the
+/// intersection one is a parameter written `{ produceThing: T1 } & TConfig`
+/// (`typeParameterConstModifiersWithIntersection`), where only the second
+/// constituent carries the `const`. Without it the argument literal was checked
+/// as if `TConfig` had no `const`, so `useIt: { type: "foo" }` widened to
+/// `{ type: string }`, that candidate failed `TConfig extends Config<T1>`, the
+/// inference was clamped back to the constraint, and the literal's extra
+/// property was then excess-reported against a type that never had it (TS2353).
+///
+/// tsc also descends conditionals, mapped types and variadic tuples, which ztsc
+/// leaves as a deliberate under-application — the literal is then checked as if
+/// the parameter had no `const`, i.e. exactly today's behavior.
 pub fn isConstTypeVar(c: *Checker, t: TypeId) bool {
     switch (c.ts.kind(t)) {
         .type_param => return c.isConstTypeParamSym(c.ts.typeParamSymbol(t)),
         .index_access => return isConstTypeVar(c, c.ts.indexAccessObj(t)),
-        .union_type => {
+        .union_type, .intersection => {
             for (0..c.ts.memberCount(t)) |i| {
                 const m = c.ts.memberAt(t, @intCast(i));
                 if (c.ts.kind(m) == .type_param and
