@@ -644,16 +644,6 @@ fn headDeclarationsEmpty(c: *const Checker, head: Node) bool {
     };
 }
 
-/// Is this head node a DESTRUCTURING pattern — the shape `for…in` refuses?
-/// Both spellings, because a `for` head's target arrives as a binding pattern
-/// when it is declared and as the expression cover grammar when it is not.
-fn isBindingPattern(c: *const Checker, n: Node) bool {
-    return switch (c.nodeTag(n)) {
-        .array_pattern, .object_pattern, .array_literal, .object_literal => true,
-        else => false,
-    };
-}
-
 /// tsc's `getIndexTypeOrString`: the subject's own STRING-valued key set, or
 /// `string` when it has none — what a `for…in` binding will actually hold.
 ///
@@ -741,7 +731,7 @@ fn checkForInOf(c: *Checker, node: Node) Error!void {
                 // NAME and carries on typing it. (`for…of` destructures
                 // happily; the expression-head spelling of the same refusal
                 // is in the pattern arm below.)
-                if (!is_of and dd.lhs != null_node and isBindingPattern(c, dd.lhs)) {
+                if (!is_of and implicit_any.isBindingPattern(c, dd.lhs)) {
                     try c.diagFmt(2491, c.nodeSpan(dd.lhs), "The left-hand side of a 'for...in' statement cannot be a destructuring pattern.", .{});
                 }
                 switch (c.nodeTag(decl)) {
@@ -1529,14 +1519,24 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
         // `.param` is the plain spelling (`x`, `x: T`) and carries its
         // annotation directly; `.param_full` is everything with a default,
         // a modifier or a `?`.
-        const name: Node, const type_ann: Node, const init: Node = switch (c.nodeTag(pn)) {
-            .param => .{ pd.lhs, pd.rhs, null_node },
+        const name: Node, const type_ann: Node, const init: Node, const pflags: u32 = switch (c.nodeTag(pn)) {
+            .param => .{ pd.lhs, pd.rhs, null_node, 0 },
             .param_full => blk: {
                 const e = c.tree.extraData(ast.ParamFull, pd.rhs);
-                break :blk .{ pd.lhs, e.type_ann, e.init };
+                break :blk .{ pd.lhs, e.type_ann, e.init, e.flags };
             },
             else => continue,
         };
+        // TS2463, tsc's `checkParameter`: `node.questionToken &&
+        // isBindingPattern(node.name) && func.body`. A destructured parameter
+        // may be declared optional in an OVERLOAD or an ambient signature —
+        // there is nothing to destructure there — but not in one that runs.
+        // The body is this function's precondition, so the rule is complete
+        // where it stands. Blamed on the whole PARAMETER, which for a pattern
+        // carrying no modifier starts at the pattern itself.
+        if (pflags & ast.Flags.optional != 0 and implicit_any.isBindingPattern(c, name)) {
+            try c.diagFmt(2463, c.nodeSpan(pn), "A binding pattern parameter cannot be optional in an implementation signature.", .{});
+        }
         // A DESTRUCTURED parameter's own elements each carry a declaration of
         // their own (tsc's `checkVariableLikeDeclaration` runs on every
         // `BindingElement`), so each default inside the pattern is checked and
