@@ -8766,14 +8766,6 @@ pub fn contextualReturnType(c: *const Checker, node: Node, ctx_sig: TypeId) Type
     return types.no_type;
 }
 
-pub fn templateAtom(c: *Checker, tok: TokenIndex) Error!Atom {
-    const text = c.tokenText(tok);
-    if (text.len >= 2 and text[0] == '`' and text[text.len - 1] == '`') {
-        return c.atom(text[1 .. text.len - 1]);
-    }
-    return c.atom(text);
-}
-
 pub fn numberTokenValue(c: *const Checker, tok: TokenIndex) f64 {
     return numeric_lit.value(c.tokenText(tok));
 }

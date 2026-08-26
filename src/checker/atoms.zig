@@ -32,6 +32,8 @@ const ast = @import("../frontend/ast.zig");
 const scanner = @import("../frontend/scanner.zig");
 const intern = @import("../intern.zig");
 const binder = @import("../frontend/binder.zig");
+const literals = @import("../frontend/literals.zig");
+const string_value = @import("../frontend/string_value.zig");
 const types = @import("../types.zig");
 const numeric_lit = @import("../numeric_lit.zig");
 const print_zig = @import("print.zig");
@@ -85,22 +87,59 @@ pub fn atomOfToken(c: *Checker, tok: TokenIndex) Error!Atom {
     return atomOfIdentText(c, c.tokenText(tok));
 }
 
-/// Property-name atom: string keys lose quotes; an identifier key's `\uXXXX`
-/// escapes are decoded (a string key's are not — see `Binder.memberAtom`); a
+/// Property-name atom: string keys lose quotes and have their escapes DECODED
+/// — the member `{ "\x41": 1 }` declares is `A` — and this is also where a
+/// string-literal TYPE's value comes from, so `"\x41"` IS the type `"A"`. An
+/// identifier key's `\uXXXX` escapes are decoded by the identifier grammar. A
 /// NUMERIC key is canonicalized to the string JavaScript names it by, so `0`,
 /// `0.0` and `"0"` are one member and `0b11010` is `26`.
+///
+/// A JSX attribute value only sheds quotes: `\` is a literal byte there.
+/// Mirrors `Binder.memberAtom`, and must keep mirroring it.
 pub fn memberAtom(c: *Checker, tok: TokenIndex) Error!Atom {
     const text = c.tokenText(tok);
     switch (c.tree.tokens.tag(tok)) {
-        // `.jsx_string` is a JSX attribute's quoted value; a no-substitution
-        // template is a string literal for naming purposes (`isStringLiteralLike`).
-        .string_literal, .jsx_string, .no_substitution_template_literal => return c.atom(stripQuotes(text)),
+        .string_literal => return cookedAtom(c, text, .string),
+        .no_substitution_template_literal => return templateAtom(c, tok),
+        .jsx_string => return c.atom(stripQuotes(text)),
         .numeric_literal => {
             var buf: [numeric_lit.max_name]u8 = undefined;
             return c.internText(numeric_lit.name(&buf, text));
         },
         else => return atomOfIdentText(c, text),
     }
+}
+
+/// Atom of a no-substitution template's VALUE — the string it spells, which
+/// is what it contributes as an expression (`` `a` `` is the type `"a"`), as a
+/// literal TYPE, as an `import()` specifier and as a string enum member's
+/// value. Backticks shed, escapes decoded and raw line endings normalized
+/// (`string_value.cook`), so `` `AB<CRLF>C` `` is `"AB\nC"` — which is how it
+/// differs from the annotation `"AB\r\nC"` that tsc rejects it against.
+///
+/// An UNTERMINATED template keeps its raw text: it has no value tsc and ztsc
+/// would agree on, and nothing downstream of a TS1160 is comparable anyway.
+///
+/// Lives here rather than beside the expression walk because it is the same
+/// question `memberAtom` answers for the same token — one rule, one place.
+pub fn templateAtom(c: *Checker, tok: TokenIndex) Error!Atom {
+    const text = c.tokenText(tok);
+    if (!(text.len >= 2 and text[0] == '`' and text[text.len - 1] == '`')) return c.atom(text);
+    return cookedAtom(c, text, .template);
+}
+
+/// Atom of a quoted literal's VALUE: quotes shed, then escapes decoded. The
+/// no-escape body is the value verbatim, so the common case keeps the
+/// zero-copy source slice and the `atom_cache`; a cooked one is built in
+/// scratch and goes straight to the interner, whose copy outlives the arena.
+/// Mirrors `Binder.cookedAtom`, which must agree byte for byte — the two
+/// index the same member tables.
+fn cookedAtom(c: *Checker, text: []const u8, kind: string_value.Kind) Error!Atom {
+    const body = stripQuotes(text);
+    if (!string_value.needsCook(body, kind)) return c.atom(body);
+    const buf = try c.scratch().alloc(u8, body.len);
+    const value = string_value.cook(body, kind, buf) orelse return c.atom(body);
+    return c.internText(value);
 }
 
 /// Member-name atom honoring a `[Symbol.iterator]` computed key (mirrors the
@@ -419,11 +458,7 @@ pub fn wellKnownKeyOfExpr(c: *const Checker, node: Node) ?[]const u8 {
     return ast.wellKnownSymbolKey(c.tokenText(md.rhs));
 }
 
-pub fn stripQuotes(text: []const u8) []const u8 {
-    if (text.len >= 2 and (text[0] == '"' or text[0] == '\'')) {
-        if (text[text.len - 1] == text[0]) return text[1 .. text.len - 1];
-        return text[1..];
-    }
-    if (text.len >= 1 and (text[0] == '"' or text[0] == '\'')) return text[1..];
-    return text;
-}
+/// One copy of the rule, in `literals.zig`, shared with the binder: a
+/// backtick is a delimiter too (`` obj[`k`] ``, `` import(`./m`) ``), which
+/// the private copy this replaced did not know.
+pub const stripQuotes = literals.stripQuotes;
