@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-27, post wave 42)
+## Standings (2026-08-27, post wave 43)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7838 / 8641 (90.7%)** |
-| excess keys (false positives) | 3541 | 1070 |
-| missing keys (under-reports) | 8617 | 2096 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7858 / 8641 (90.9%)** |
+| excess keys (false positives) | 3541 | 1055 |
+| missing keys (under-reports) | 8617 | 2077 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Forty-two waves landed (3–42), every one with ZERO match→non-match regressions in
+Forty-three waves landed (3–43), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -756,7 +756,86 @@ resolution (names/typespace). PERF: combined wave +1.79% drizzle CPU
 (bisect: mostly B's mapped work, semantic; the +4.3% wall reading was
 4-checker noise) — accepted under the 2% bar; watch drizzle next wave.
 
-## Ranked next queue (wave 43) — distilled from wave-42 agent reports
+Wave 43 (+20 exact → 7858/8641 90.9%; drizzle watch met at −0.44%):
+D landed TS2595 (link parks an EqDefaultImport with the specifier span;
+new export_equals_import.zig answers the type half; 15 probes incl. the
+two property-exists escapes), BOTH TS2688 halves (correction: tsgo DOES
+suppress the semantic pass for config-level 2688 — separate channel,
+not config_diags; exports-map authority + the `"exports": null`
+JS-truthiness bug), binding-element JOIN semantics (not a bare ordering
+swap — 3 of 5 shapes wrong without the join), duplicate export
+specifiers. A landed compound-LIKE assignment widening
+(isCompoundLikeAssignment: shift precedence or higher), the mapped
+contextual key domain (NARROWED — the global Index rule cost 2 FPs and
+9 lost keys; it lives in ctxPropType's .mapped arm), TS2523/2675/2526-
+constructor, and C's keyof-literal-context recipe (+2). C disproved the
+const-clamp diagnosis (tsc DOES excess-check const-context literals) —
+the real bug was isConstTypeVar lacking an INTERSECTION arm (one
+token); de-duplicated the index simplifiers byte-neutrally. B landed
+Partial<T>[K] read optionality in the RELATION (with normalization so
+{} cancels the undefined) and constraint-step disjoint domains; its
+8-key expr-defer patch is SAVED but blocked on a {}-absorption chain
+(canBeNullish for deferred access + reduceSubtypes letting {} absorb).
+TWO PRE-EXISTING DEFECTS CONFIRMED (both reproduce at merge-base):
+excalidraw UserList.tsx:285:11 TS2345 is ORDER-DEPENDENT at checkers
+2/4/8 (crept in during waves 41-42; the default-order app gate can't
+see it); the DEBUG binary panics on excalidraw (constEnumOnly at
+expr.zig:1333 reads a foreign-file decl node — masked by ReleaseFast).
+
+## Ranked next queue (wave 44) — distilled from wave-43 agent reports
+
+1. DETERMINISM DEFECT: excalidraw UserList.tsx:285:11 TS2345
+   order-dependent at checkers 2/4/8. Method that closed the prior
+   three: shrink with --partition-file to a two-file repro, instrument
+   node_types, find the consumer of an order-dependent artifact
+   (makeUnion member order is the known hazard class).
+2. Debug-binary panic: constEnumOnly (expr.zig:1333) reads c.declsOf
+   (sym) against the CURRENT file's tree for a foreign-file symbol —
+   index OOB; real cross-file bug masked by ReleaseFast. Fix + consider
+   a debug-build app smoke test in CI.
+3. TS2449 single-rule target (27 keys, 21 in useBeforeDeclaration_
+   classDecorators.1): checkTdz needs tsc's isUsedInFunctionOr
+   InstanceProperty INCLUDING the !getImmediatelyInvokedFunction
+   Expression clause (an IIFE does NOT defer). expr.zig.
+4. The mapped-read defer chain (B's saved patch at scratchpad/w43b/
+   expr-defer.patch, fixes all 8 mappedTypeRelationships keys):
+   FIRST land canBeNullish answering deferred accesses
+   (nullability.zig) + reduceSubtypes letting {} absorb after
+   getNonNullableType's intersection (typenode.zig), verify the
+   excalidraw change.ts:189/190 chain matches tsgo, THEN flip
+   indexDeferrableObject's mapped arm.
+5. mergedDeclarations7 COORDINATED fix (design final): combined_sym
+   minted at link time on DualTarget (src/link) + checker gate in
+   typespace.typeMeaningTarget (fresh nominal interface ONLY when the
+   value half is a property of the export= value's type — static_named
+   must stay non-fresh).
+6. Homomorphic flag split (mapped.zig): syntactic keyof-constraint vs
+   bare-type-param homomorphic — naive deferral cost 3 regressions +
+   a timeout; needs the two-flag design.
+7. keyof of a key-remapped generic map: keyof Mapped6<K> answers
+   string|number|symbol (keyof.zig).
+8. TS2411 (index_constraints.zig): member-vs-index-signature
+   constraint checks (propertiesAndIndexers:51,
+   computedPropertyNames12).
+9. intersectionReductionStrict legs: empty const enum types as never
+   (enums.zig); write-type intersection for a union key on a concrete
+   receiver (expr.zig).
+10. deeplyNestedMappedTypes: the depth guard answers "related" —
+    needs an isDeeplyNestedType equivalent that REPORTS (2 keys).
+11. Excess pools: spreadsAndContextualTupleTypes (19),
+    controlFlowAssignmentPatternOrder (12), inferTypePredicates (11).
+12. JSX under cluster (~10 cases / 40+ keys incl.
+    tsxLibraryManagedAttributes 15): real LibraryManagedAttributes —
+    own-wave-sized, changes every component check in both apps.
+13. indexSignatures1 (9 under), keyofAndIndexedAccess2 (7),
+    varianceAnnotations (7); TS2526 remaining clauses (needs a parent
+    map or syntactic pass, 30 keys); TS2502 circularity family.
+14. Blocked (unchanged): alias identity at relation use sites (5 keys
+    2 cases — both recovery routes are settled NOs); TS7023; union
+    ordering pair.
+15. Cosmetic: TS2675 fully-qualified name in message.
+
+## Superseded queue (wave 43, kept for context)
 
 1. mergedDeclarations7, the REAL fix (fourth diagnosis, proven):
    combineValueAndTypeSymbols in import/alias resolution — a named
