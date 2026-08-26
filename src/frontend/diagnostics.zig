@@ -370,6 +370,14 @@ pub const Code = enum(u16) {
     /// type-alias type parameter — the two declaration forms that have no
     /// call site to infer from, so `const` inference has nothing to mean.
     const_modifier_not_valid_here,
+    /// TS1273: any modifier OTHER than `in`/`out`/`const` on a type parameter
+    /// — `type T<public U> = U`. tsc's parser reads the whole `parseModifiers`
+    /// run in front of a type parameter's name, so the parameter itself still
+    /// parses and this is the one thing the run earns. The word is the source
+    /// text of the token it is reported on, so this carries `Diagnostic.arg`
+    /// (one code over a dozen keywords) the way TS1070/TS1071 do. tsc's
+    /// sentence has no closing period, like TS1274's and TS1277's above.
+    type_param_modifier,
     /// TS17006: `ExponentiationExpression : UpdateExpression ** Exponentiation`
     /// — the left operand of `**` may not be a *unary* expression, because
     /// `-a ** b` reads as `-(a ** b)` in some languages and `(-a) ** b` in
@@ -573,6 +581,12 @@ pub const Code = enum(u16) {
     mod_seen_async,
     mod_seen_abstract,
     mod_seen_declare,
+    /// The two variance annotations, whose repeat lives in the same TS1030 —
+    /// `type T<in out in U> = U`. tsc's `in`/`out` arm asks the repeat BEFORE
+    /// the TS1029 order rule, so `<in out in U>` is the `in` repeat and not
+    /// "'in' must precede 'out'".
+    mod_seen_in,
+    mod_seen_out,
     /// TS1031: `declare` on a class element that is not a PROPERTY —
     /// `declare constructor() {}`, `declare get x() {}`, `declare m() {}`.
     /// tsc's `checkGrammarModifiers` (`isClassLike(node.parent) &&
@@ -1390,6 +1404,7 @@ pub const Code = enum(u16) {
             .accessor_modifier_not_valid_here,
             .in_must_precede_out,
             .const_modifier_not_valid_here,
+            .type_param_modifier,
             .nullish_mixed_with_logical,
             .tagged_template_in_optional_chain,
             .newline_before_arrow,
@@ -1524,6 +1539,8 @@ pub const Code = enum(u16) {
             .mod_seen_async,
             .mod_seen_abstract,
             .mod_seen_declare,
+            .mod_seen_in,
+            .mod_seen_out,
             .declare_on_class_element,
             .mod_seen_export,
             .export_assign_with_modifiers,
@@ -1867,6 +1884,7 @@ pub const Code = enum(u16) {
             .accessor_modifier_not_valid_here => "'accessor' modifier can only appear on a property declaration.",
             .in_must_precede_out => "'in' modifier must precede 'out' modifier.",
             .const_modifier_not_valid_here => "'const' modifier can only appear on a type parameter of a function, method or class",
+            .type_param_modifier => "'{0}' modifier cannot appear on a type parameter",
             .exp_lhs_plus => expLhsMessage("+"),
             .exp_lhs_minus => expLhsMessage("-"),
             .exp_lhs_tilde => expLhsMessage("~"),
@@ -1927,6 +1945,8 @@ pub const Code = enum(u16) {
             .mod_seen_async => modSeenMessage("async"),
             .mod_seen_abstract => modSeenMessage("abstract"),
             .mod_seen_declare => modSeenMessage("declare"),
+            .mod_seen_in => modSeenMessage("in"),
+            .mod_seen_out => modSeenMessage("out"),
             .declare_on_class_element => "'declare' modifier cannot appear on class elements of this kind.",
             .mod_seen_export => modSeenMessage("export"),
             .export_assign_with_modifiers => "An export assignment cannot have modifiers.",
@@ -2314,6 +2334,7 @@ pub const Code = enum(u16) {
             .accessor_modifier_not_valid_here => 1275,
             .in_must_precede_out => 1029,
             .const_modifier_not_valid_here => 1277,
+            .type_param_modifier => 1273,
             .exp_lhs_plus,
             .exp_lhs_minus,
             .exp_lhs_tilde,
@@ -2376,6 +2397,8 @@ pub const Code = enum(u16) {
             .mod_seen_async,
             .mod_seen_abstract,
             .mod_seen_declare,
+            .mod_seen_in,
+            .mod_seen_out,
             .mod_seen_export,
             => 1030,
             .declare_on_class_element => 1031,

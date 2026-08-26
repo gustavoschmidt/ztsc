@@ -3779,35 +3779,65 @@ const Parser = struct {
             // `<out>`, `<out, T>` and `<out = X>` still declare a parameter
             // *named* `out`, as tsc parses them.
             var out_tok: ?u32 = null;
+            var in_tok: ?u32 = null;
             // tsc's `checkGrammarModifiers` reports the FIRST offending
             // modifier of a type parameter and stops, so `<const in out T>` on
             // a function is one TS1274 (at `in`), not two.
             var reported = false;
             while (true) {
                 const tag = p.curTag();
+                // tsc reads the run with `parseModifiers(allowDecorators=false,
+                // permitConstAsModifier=true)`, so EVERY modifier keyword is
+                // taken here and `checkGrammarModifiers` answers TS1273 for the
+                // ones a type parameter cannot carry — the parameter itself
+                // still parses, where refusing the word cost a TS1005 cascade
+                // that suppressed the whole file's semantic pass
+                // (varianceAnnotations). `in` and `const` are fully reserved,
+                // so no lookahead can mistake them for a name; every other word
+                // is a modifier exactly when a name follows it (tsc's
+                // `nextTokenCanFollowModifier`), which is what keeps
+                // `<out>`, `<out, T>` and `class D<public, private> {}`
+                // declaring parameters named `out`/`public`/`private`.
                 const is_modifier = switch (tag) {
                     .keyword_const, .keyword_in => true,
-                    .keyword_out => typeParamNameFollows(p.peekTag(1)),
-                    else => false,
+                    else => isModifierKind(tag) and typeParamNameFollows(p.peekTag(1)),
                 };
                 if (!is_modifier) break;
                 const tok = try p.bump();
                 // Diagnostics only — `errAtToken` does not backtrack, and a
                 // speculative parse that loses discards them with `restore`,
                 // so reporting here cannot cost us an arrow function.
-                const bad: ?diagnostics.Code = if (tag == .keyword_const)
-                    (if (owner.allowsConst()) null else .const_modifier_not_valid_here)
-                else if (!owner.allowsVariance())
-                    (if (tag == .keyword_in) .in_modifier_not_valid_here else .out_modifier_not_valid_here)
-                else if (tag == .keyword_in and out_tok != null)
-                    .in_must_precede_out
-                else
-                    null;
+                const bad: ?diagnostics.Code = switch (tag) {
+                    .keyword_const => if (owner.allowsConst()) null else .const_modifier_not_valid_here,
+                    // tsc's `in`/`out` arm, in its own order: position first,
+                    // then the repeat, then the pair.
+                    .keyword_in, .keyword_out => if (!owner.allowsVariance())
+                        (if (tag == .keyword_in) .in_modifier_not_valid_here else .out_modifier_not_valid_here)
+                    else if (tag == .keyword_in and in_tok != null)
+                        .mod_seen_in
+                    else if (tag == .keyword_out and out_tok != null)
+                        .mod_seen_out
+                    else if (tag == .keyword_in and out_tok != null)
+                        .in_must_precede_out
+                    else
+                        null,
+                    else => .type_param_modifier,
+                };
                 if (bad) |code| {
-                    if (!reported) try p.errAtToken(code, tok);
+                    if (!reported) {
+                        // TS1273 names the word it stands on, so it carries the
+                        // token's own text as `{0}`.
+                        if (code == .type_param_modifier) {
+                            const at = p.tokSpan(tok, tok);
+                            try p.errAtSpanArg(code, at, at);
+                        } else {
+                            try p.errAtToken(code, tok);
+                        }
+                    }
                     reported = true;
                 }
                 if (tag == .keyword_out) out_tok = tok;
+                if (tag == .keyword_in) in_tok = tok;
             }
             if (!isIdentLike(p.curTag())) {
                 try p.fail(.expected_identifier);
@@ -5236,16 +5266,34 @@ const Parser = struct {
         // 1` declares `H`), and `checkGrammarModifiers` then rejects it on the
         // member NAME.
         var saw_const = false;
+        // The FIRST `in`/`out` of the run, which is TS1274 whatever else the
+        // run carries — a variance annotation belongs to a type PARAMETER of a
+        // class/interface/type alias and nowhere else. tsc's parser takes the
+        // word as a modifier (`nextTokenIsOnSameLineAndCanFollowModifier`), so
+        // `class C { in a = 0 }` still declares `a`; refusing it read `in` as
+        // the member's NAME and answered TS1005 at `a`, a syntactic error that
+        // took the whole file's semantic pass with it (varianceAnnotations).
+        var in_out: ?ModifierErr = null;
         while (true) {
+            const variance: ?Code = switch (p.curTag()) {
+                .keyword_in => .in_modifier_not_valid_here,
+                .keyword_out => .out_modifier_not_valid_here,
+                else => null,
+            };
             const is_const = p.curTag() == .keyword_const;
             const bit = classMemberModifierBit(p.curTag());
-            if (bit == 0 and !is_const) break;
+            if (bit == 0 and !is_const and variance == null) break;
             // A modifier only if a member name (or `*`/`[`) follows on any
             // line (get/set/async additionally require same-line names).
             const t1 = p.peekTag(1);
             const name_follows = isNameLike(t1) or t1 == .string_literal or
                 t1 == .numeric_literal or t1 == .l_bracket or t1 == .asterisk;
             if (!name_follows) break;
+            if (variance) |code| {
+                const tok = try p.bump();
+                if (in_out == null) in_out = .{ .code = code, .token = tok };
+                continue;
+            }
             if (is_const) {
                 saw_const = true;
                 _ = try p.bump();
@@ -5276,7 +5324,7 @@ const Parser = struct {
             .l_bracket => {
                 // Computed member name / index signature in class.
                 if (p.atIndexSignature()) {
-                    _ = try p.reportMemberGrammar(deco_at, .{ .kind = .other }, p.memberModErr(mods[0..n_mods], .other, 0));
+                    _ = try p.reportMemberGrammar(deco_at, .{ .kind = .other }, p.memberModErr(mods[0..n_mods], .other, 0, in_out));
                     return p.parseIndexSignatureAsClassMember(flags);
                 }
                 const cn = try p.parseComputedMemberName();
@@ -5310,7 +5358,7 @@ const Parser = struct {
                 } else {
                     // A CLASS member name: tsc's `parseClassElement` answers
                     // TS1068 here, not the object-literal TS1136.
-                    _ = try p.reportMemberGrammar(deco_at, .{ .kind = .other }, p.memberModErr(mods[0..n_mods], .other, 0));
+                    _ = try p.reportMemberGrammar(deco_at, .{ .kind = .other }, p.memberModErr(mods[0..n_mods], .other, 0, in_out));
                     try p.fail(.expected_class_member);
                     return p.errorNode();
                 }
@@ -5418,7 +5466,7 @@ const Parser = struct {
                 .in_class_decl = p.in_class_decl,
                 .second_accessor_of_modified_pair = is_accessor and computed == null and
                     p.isSecondAccessorOfModifiedPair(members_top, name_tok, flags),
-            }, p.memberModErr(mods[0..n_mods], mod_member, const_at));
+            }, p.memberModErr(mods[0..n_mods], mod_member, const_at, in_out));
             if (computed) |cn| {
                 // An accessor is judged by neither `checkGrammarProperty` nor
                 // `checkGrammarMethod`; a method is, and what it earns turns on
@@ -5470,7 +5518,7 @@ const Parser = struct {
             .abstract = flags & ast.Flags.abstract != 0,
             .declare = flags & ast.Flags.declare != 0,
             .in_class_decl = p.in_class_decl,
-        }, p.memberModErr(mods[0..n_mods], .property, const_at));
+        }, p.memberModErr(mods[0..n_mods], .property, const_at, in_out));
         if (computed) |cn| try p.finishComputedName(cn, member, .class_body, .property, grammar_err);
         // TS1276, tsc's `checkGrammarProperty`: an auto-accessor field stands
         // for a get/set pair, and there is no way to spell an optional one.
@@ -5494,10 +5542,21 @@ const Parser = struct {
         mods: []const modifier_order.Mod,
         member: modifier_order.Member,
         const_at: TokenIndex,
+        in_out: ?ModifierErr,
     ) ?ModifierErr {
-        if (modifier_order.walk(mods, member, p.abstract_class)) |f| {
-            return .{ .code = f.code, .token = f.token };
+        const found: ?ModifierErr = if (modifier_order.walk(mods, member, p.abstract_class)) |f|
+            .{ .code = f.code, .token = f.token }
+        else
+            null;
+        // `in`/`out` is an ARM of tsc's walk, not a trailing check, and the
+        // walk returns at the first modifier that errors — so the EARLIER
+        // token wins. (`modifier_order` does not model the two: they carry no
+        // `ast.Flags` bit, because nothing downstream of a class member ever
+        // asks about a variance annotation.)
+        if (in_out) |v| {
+            if (found == null or v.token < found.?.token) return v;
         }
+        if (found) |f| return f;
         if (const_at != 0) return .{ .code = .const_class_member, .token = const_at };
         return null;
     }
