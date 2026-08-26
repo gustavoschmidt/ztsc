@@ -1382,6 +1382,28 @@ pub fn fixTypeArgs(c: *Checker, sym: SymbolId, args: []const TypeId, tok: TokenI
         return null;
     }
     var out = try c.scratch().alloc(TypeId, tps.items.len);
+    // tsc's `fillMissingTypeArguments` seeds EVERY unsupplied position with the
+    // error type *before* evaluating any default, and maps over the WHOLE
+    // parameter list rather than the prefix:
+    //
+    // ```ts
+    // for (let i = numTypeArguments; i < numTypeParameters; i++) result[i] = errorType;
+    // for (let i = numTypeArguments; i < numTypeParameters; i++) {
+    //     let defaultType = getDefaultFromTypeParameter(typeParameters[i]);
+    //     …
+    //     result[i] = defaultType ? instantiateType(defaultType, createTypeMapper(typeParameters, result)) : baseDefaultType;
+    // }
+    // ```
+    //
+    // So a default that names its OWN parameter — or a later one, which TS2744
+    // rejects outright — resolves to that placeholder, not to the naked
+    // parameter: `type Test<T extends string = T>` is `Test<any>`, which is
+    // why `let zzy: Test = { value: {} }` is accepted. Leaving `T` free instead
+    // made every write through `Test` a phantom TS2322 against a parameter no
+    // argument can ever satisfy. The `tp_default_stack` guard below does not
+    // catch this shape: the default resolves to the parameter itself without
+    // ever re-entering `fixTypeArgs`.
+    for (out[args.len..]) |*slot| slot.* = types.any_type;
     for (tps.items, 0..) |tp, i| {
         if (i < args.len) {
             out[i] = args[i];
@@ -1589,8 +1611,11 @@ pub fn fixTypeArgs(c: *Checker, sym: SymbolId, args: []const TypeId, tok: TokenI
                 // (and `C = B` the defaulted `B`) for user generics.
                 c.tp_default_subst_depth += 1;
                 defer c.tp_default_subst_depth -= 1;
-                const pmap = try c.scratch().alloc(TpMap, i);
-                for (tps.items[0..i], 0..) |ptp, j| pmap[j] = .{ .sym = ptp.sym, .ty = out[j] };
+                // The WHOLE parameter list, not the `[0..i]` prefix — that is
+                // what turns the pre-seeded placeholder above from a value
+                // nothing reads into the answer for a self-referential default.
+                const pmap = try c.scratch().alloc(TpMap, tps.items.len);
+                for (tps.items, 0..) |ptp, j| pmap[j] = .{ .sym = ptp.sym, .ty = out[j] };
                 out[i] = try c.instantiate(def, pmap);
             }
         } else {
