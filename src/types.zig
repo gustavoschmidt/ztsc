@@ -163,7 +163,24 @@ pub const Kind = enum(u8) {
     ref,
     /// Generic type parameter. a = symbol id.
     type_param,
-    /// Class value (static side / constructor). a = class symbol id.
+    /// Class value (static side / constructor), i.e. `typeof C`.
+    ///
+    /// Two spellings, discriminated by `b`:
+    ///
+    ///   * `b == 0`: `a` = class symbol id, stored inline. Every class whose
+    ///     declaration has no generic declaration around it — which is nearly
+    ///     all of them — lands here, and the payload is byte-identical to the
+    ///     argument-free form this kind had before.
+    ///   * `b > 0`: `a` = extra index, `b` = type-argument count;
+    ///     `extra[a..]` = `[symbol, args...]`. The arguments fill the OUTER
+    ///     type parameters in scope at the class's declaration (tsc's
+    ///     `outerTypeParameters` on the anonymous static-side type), so a
+    ///     local or anonymous class inside a generic instantiates with its
+    ///     enclosing call's arguments. See `checker/class_value.zig`.
+    ///
+    /// The two never collide in the intern map: an argument is a TypeId and
+    /// `no_type` (0) is not a legal one, so the inline shape `[sym, 0]` is
+    /// unreachable as a one-argument extra shape.
     class_value,
     /// Enum type (nominal). a = enum symbol id.
     /// b = 0 for the WHOLE enum (`let x: E`); otherwise this is the enum
@@ -1189,7 +1206,18 @@ pub const Store = struct {
         return s.dataA(id);
     }
     pub fn classSymbol(s: *const Store, id: TypeId) u32 {
-        return s.dataA(id);
+        if (s.dataB(id) == 0) return s.dataA(id);
+        if (id < s.base_len) return s.base.?.classSymbol(id);
+        return s.extra.items[s.dataA(id)];
+    }
+    /// The OUTER type arguments of a class value — empty for the inline
+    /// spelling, which is every class value outside a generic scope.
+    /// See `Kind.class_value`.
+    pub fn classValueArgs(s: *const Store, id: TypeId) []const TypeId {
+        if (s.dataB(id) == 0) return &.{};
+        if (id < s.base_len) return s.base.?.classValueArgs(id);
+        const base = s.dataA(id);
+        return s.extra.items[base + 1 .. base + 1 + s.dataB(id)];
     }
     pub fn enumSymbol(s: *const Store, id: TypeId) u32 {
         return s.dataA(id);
@@ -1301,6 +1329,17 @@ pub const Store = struct {
                 return s.extra.items[a .. a + 3 + tpc + 3 * b + pred + thisw];
             },
             .ref => return s.extra.items[a .. a + 1 + b],
+            // Two spellings — see `Kind.class_value`. The argument-free one
+            // is inline, so it hashes exactly as it did before the arguments
+            // existed and every existing class value keeps its id.
+            .class_value => {
+                if (b == 0) {
+                    buf[0] = a;
+                    buf[1] = b;
+                    return buf[0..2];
+                }
+                return s.extra.items[a .. a + 1 + b];
+            },
             .conditional => return s.extra.items[a .. a + 4],
             .mapped => return s.extra.items[a .. a + 6],
             .template_literal_type => return s.extra.items[a .. a + 1 + 2 * b],
@@ -1415,6 +1454,15 @@ pub const Store = struct {
                 try s.extra.appendSlice(s.alloc, words);
                 try s.appendRaw(kind_, start, b_count, h);
             },
+            // Inline when there are no outer type arguments (`b_count == 0`),
+            // in `extra` when there are — see `Kind.class_value`.
+            .class_value => if (b_count == 0) {
+                try s.appendRaw(kind_, words[0], words[1], h);
+            } else {
+                const start: u32 = @intCast(s.extra.items.len);
+                try s.extra.appendSlice(s.alloc, words);
+                try s.appendRaw(kind_, start, b_count, h);
+            },
             else => try s.appendRaw(kind_, words[0], words[1], h),
         }
         gop.key_ptr.* = id;
@@ -1479,6 +1527,21 @@ pub const Store = struct {
 
     pub fn makeClassValue(s: *Store, symbol: u32) Error!TypeId {
         return s.internType(.class_value, &.{ symbol, 0 }, 0);
+    }
+
+    /// `typeof C` with `C`'s OUTER type parameters filled in. Degenerates to
+    /// `makeClassValue` for the empty list, so a class outside any generic
+    /// scope keeps the exact id it had before this payload existed.
+    pub fn makeClassValueArgs(s: *Store, symbol: u32, args: []const TypeId) Error!TypeId {
+        if (args.len == 0) return s.makeClassValue(symbol);
+        const start = s.pending.items.len;
+        defer s.pending.items.len = start;
+        try s.pending.append(s.alloc, symbol);
+        try s.pending.appendSlice(s.alloc, args);
+        // `no_type` would make the one-argument shape collide with the inline
+        // one — see `Kind.class_value`. No producer can supply it.
+        for (args) |a| std.debug.assert(a != no_type);
+        return s.internType(.class_value, s.pending.items[start..], @intCast(args.len));
     }
 
     pub fn makeEnumType(s: *Store, symbol: u32) Error!TypeId {
