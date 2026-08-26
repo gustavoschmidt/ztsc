@@ -6451,6 +6451,25 @@ pub fn inferMappedKeySet(c: *Checker, m: TypeId, arg: TypeId, tp_syms: []const u
         },
         else => try c.keyofType(ra),
     };
+    // `InferencePriority.MappedTypeConstraint`, which tsc files this
+    // inference at and which any DIRECT candidate outranks — so a call that
+    // also names the key parameter in an ordinary position takes the key it
+    // was HANDED, not the argument's whole key domain. `appendToOptionalArray<
+    // K, T>(object: { [x in K]?: Lower<T>[] }, key: K, value: T)` is the shape
+    // the test is named for: unioning the two answered `K = "x" | "y"`, so
+    // `appendToOptionalArray(foo, "x", 123)` was checked against BOTH of
+    // `foo`'s properties and two correct calls became TS2345.
+    //
+    // Same tier as the reverse-mapped rebuild (`InferCtx.Rev`): tsc keeps
+    // `HomomorphicMappedType` and `MappedTypeConstraint` at different
+    // priorities, but only relative to each other, and both stand down for a
+    // direct match — which is the distinction that matters here. The symmetric
+    // half is already in `unify`'s `.type_param` arm: a direct candidate
+    // arriving later WIPES a slot this tier filled.
+    if (c.revSlot(candidates, ki)) |rf| {
+        if (candidates[ki] != types.no_type and !rf.*) return;
+        rf.* = true;
+    }
     // A key set is authoritative for its own param: an uninformative `any`
     // bound by a sibling union member (`Pick<S, K> | S | null`, where the
     // whole-`S` member matched first) must not survive next to it.
