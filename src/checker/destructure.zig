@@ -366,10 +366,19 @@ pub fn objectRestType(c: *Checker, whole: TypeId, pat: Node) Error!TypeId {
     var sidx: TypeId = 0;
     var nidx: TypeId = 0;
     // Flatten one level: a plain object contributes its own props; an
-    // intersection contributes each object member's props (later members
-    // win on a name clash, mirroring intersection member order). A member
-    // that is not a plain object makes the shape non-enumerable → bail to
-    // `whole` rather than drop constraints.
+    // intersection contributes each object member's props, and a name TWO
+    // members declare contributes ONE property whose type is their
+    // INTERSECTION — tsc's `getRestType` walks `getPropertiesOfType(source)`,
+    // which for an intersection synthesizes exactly that (and `propOfType`'s
+    // intersection arm already computes it, so it is asked rather than
+    // re-derived). Letting the later member win instead invented a false
+    // TS2322 at every use of the rest binding whose value the earlier member
+    // constrained more tightly: `function f({label, ...rest}:
+    // Base & { color?: string })` typed `rest.color` as bare `string` where
+    // `Base` declares `color?: "red" | "blue"`, so `const b: Base = rest`
+    // rejected. social-app's `PostControlButton` is that shape.
+    // A member that is not a plain object makes the shape non-enumerable →
+    // bail to `whole` rather than drop constraints.
     const members: []const TypeId = if (kind == .intersection) try c.memberList(r) else &.{r};
     for (members) |m| {
         const rm = try c.resolveStructural(m);
@@ -388,7 +397,7 @@ pub fn objectRestType(c: *Checker, whole: TypeId, pat: Node) Error!TypeId {
             var replaced = false;
             for (props.items) |*existing| {
                 if (existing.name == p.name) {
-                    existing.* = p;
+                    existing.* = (try c.propOfType(r, p.name)) orelse p;
                     replaced = true;
                     break;
                 }
