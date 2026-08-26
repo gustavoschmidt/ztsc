@@ -6,6 +6,7 @@ const std = @import("std");
 const ast = @import("../frontend/ast.zig");
 const binder = @import("../frontend/binder.zig");
 const numeric_lit = @import("../numeric_lit.zig");
+const string_value = @import("../frontend/string_value.zig");
 const types = @import("../types.zig");
 
 const Io = std.Io;
@@ -66,7 +67,14 @@ fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!voi
         .object_keyword => try w.writeAll("object"),
         .bool_true => try w.writeAll("true"),
         .bool_false => try w.writeAll("false"),
-        .string_literal => try w.print("\"{s}\"", .{c.atomText(s.literalAtom(t))}),
+        // The atom holds the literal's VALUE (escapes decoded — `atoms.cookedAtom`),
+        // so printing it back re-escapes: tsc renders a string-literal type as
+        // `"` ++ `escapeString(value)` ++ `"`.
+        .string_literal => {
+            try w.writeByte('"');
+            try string_value.writeEscaped(w, c.atomText(s.literalAtom(t)), '"');
+            try w.writeByte('"');
+        },
         .bigint_literal => try w.print("{s}", .{c.atomText(s.literalAtom(t))}),
         .number_literal, .number_literal_fresh => try printNumber(w, s.numberValue(t)),
         .union_type => {
@@ -349,6 +357,18 @@ fn writeMemberName(c: *Checker, w: *std.Io.Writer, name: Atom) PrintErr!void {
             try w.print("[Symbol.{s}]", .{well_known});
             return;
         }
+    }
+    // A member's atom holds the name's VALUE, so a name that cannot be spelled
+    // bare goes back out as tsc writes it: quoted, escapes restored
+    // (`{ "a\nb": number }`). Only names that actually need an escape are
+    // quoted here — a plain non-identifier (`a-b`) prints bare, as it always
+    // has, so nothing that used to round-trip through the source text moves.
+    if (string_value.needsEscape(text)) {
+        const q = string_value.quoteFor(text);
+        try w.writeByte(q);
+        try string_value.writeEscaped(w, text, q);
+        try w.writeByte(q);
+        return;
     }
     try w.writeAll(text);
 }

@@ -3010,10 +3010,10 @@ const Linker = struct {
         if (!flags.import_binding) {
             return .{ .kind = .binding, .file = file, .payload = local_sym, .type_only = type_only.on, .type_only_from_export = type_only.from_export };
         }
-        // An alias MERGED with a value declaration of the same name is not a
+        // An alias MERGED with a real declaration of the same name is not a
         // re-export of its target: tsc's export specifier names the local
-        // symbol, which carries both meanings, and a value use of it resolves
-        // through the local declaration.
+        // symbol, which carries both meanings, and a use of it resolves
+        // through whichever declaration the use's meaning selects.
         //
         //     // a.ts                 // b.ts
         //     interface A {}          import { A } from "./a";
@@ -3025,8 +3025,19 @@ const Linker = struct {
         // `exportNamespace9`) and `typeof import("./b")` was missing the
         // member outright (`namespaceImportTypeQuery2`). Targeting the local
         // symbol keeps BOTH meanings reachable — the checker follows the alias
-        // itself for the type-space half.
-        if (bind_result.effectiveBits(flags) & bind_result.mask_value &
+        // itself for the half the local declaration does not carry.
+        //
+        // The TYPE half is the mirror image, and needs the same answer:
+        //
+        //     // a.ts                              // index.ts
+        //     import * as B from "./b";            import { B } from "./a";
+        //     interface B { x: string }            const x: B = { x: "" };
+        //     export { B };                        B.zzz;
+        //
+        // Following the alias published a's `B` as the module NAMESPACE alone,
+        // so the annotation resolved to a namespace and earned a phantom
+        // TS2709 (`noCrashOnImportShadowing`).
+        if (bind_result.effectiveBits(flags) & (bind_result.mask_value | bind_result.mask_type) &
             ~bind_result.fbits(.{ .import_binding = true }) != 0)
         {
             return .{ .kind = .binding, .file = file, .payload = local_sym, .type_only = type_only.on, .type_only_from_export = type_only.from_export };

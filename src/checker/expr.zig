@@ -35,6 +35,7 @@ const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const buildRefKey = @import("flow.zig").buildRefKey;
 const checkAssignPatternExcessProps = @import("destructure.zig").checkAssignPatternExcessProps;
+const checkEmptyAssignPatternSource = @import("destructure.zig").checkEmptyAssignPatternSource;
 const patternContextualType = @import("destructure.zig").patternContextualType;
 const checkFunctionBody = @import("stmts.zig").checkFunctionBody;
 const containerOf = Checker.containerOf;
@@ -7945,6 +7946,14 @@ pub fn checkDestructuringPattern(c: *Checker, node: Node, src: TypeId) Error!voi
     switch (c.nodeTag(node)) {
         .object_literal, .object_pattern => {
             const els = c.tree.nodeRange(node);
+            // tsc's `checkObjectLiteralAssignment` head: an empty object
+            // literal target binds nothing, so the per-property walk below says
+            // nothing about a source it cannot destructure at all
+            // (`strictNullEmptyDestructuring`). The ARRAY spelling has no such
+            // early return — `[] = null` is the TS2488 alone.
+            if (c.nodeTag(node) == .object_literal) {
+                try checkEmptyAssignPatternSource(c, node, src);
+            }
             for (els, 0..) |el, i| {
                 // tsc's `checkObjectLiteralDestructuringPropertyAssignment`
                 // computes the rest type only for a spread in LAST position;
@@ -8764,14 +8773,6 @@ pub fn contextualReturnType(c: *const Checker, node: Node, ctx_sig: TypeId) Type
     }
     if (node != 0 and c.iife_ret_ctx_callee == c.nodeKey(node)) return c.iife_ret_ctx;
     return types.no_type;
-}
-
-pub fn templateAtom(c: *Checker, tok: TokenIndex) Error!Atom {
-    const text = c.tokenText(tok);
-    if (text.len >= 2 and text[0] == '`' and text[text.len - 1] == '`') {
-        return c.atom(text[1 .. text.len - 1]);
-    }
-    return c.atom(text);
 }
 
 pub fn numberTokenValue(c: *const Checker, tok: TokenIndex) f64 {

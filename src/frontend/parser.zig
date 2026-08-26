@@ -2732,11 +2732,20 @@ const Parser = struct {
     /// the token tsc's scanner would have handed back as that keyword? The
     /// backslash probe short-circuits every ordinary word before the decode.
     fn isEscapedKeyword(p: *const Parser, tok: u32) bool {
-        const text = p.tokenTextAt(tok);
-        if (std.mem.indexOfScalar(u8, text, '\\') == null) return false;
         var buf: [scanner.max_unescaped_ident]u8 = undefined;
-        const cooked = scanner.unescapeIdentifier(text, &buf) orelse return false;
+        const cooked = cookedWord(p.tokenTextAt(tok), &buf) orelse return false;
         return scanner.isKeywordText(cooked);
+    }
+
+    /// The name `text` spells with its `\uXXXX` escapes decoded, but ONLY when
+    /// it carries one — the backslash probe short-circuits every ordinary word
+    /// before the decode, and a word with no escape is never a keyword the
+    /// scanner failed to recognize. Null when there is nothing to cook or the
+    /// escape is malformed. Shared by the two sites that have to see through
+    /// an escaped keyword (`isEscapedKeyword`, `clauseKeyword`).
+    fn cookedWord(text: []const u8, buf: []u8) ?[]const u8 {
+        if (std.mem.indexOfScalar(u8, text, '\\') == null) return null;
+        return scanner.unescapeIdentifier(text, buf);
     }
 
     /// Token tags the SCANNER has already reported on, so the parser must not
@@ -3363,6 +3372,37 @@ const Parser = struct {
         return p.addNode(.{ .tag = .for_stmt, .main_token = kw, .data = .{ .lhs = extra, .rhs = body } });
     }
 
+    /// The tag a switch-clause head SPELLS: the current token's own tag,
+    /// except that an identifier whose `\uXXXX` escapes cook down to `case` or
+    /// `default` reads as that keyword. tsc's scanner cooks the text before it
+    /// consults `textToKeyword`, so `default:` is a fourth `default`
+    /// clause there and the escape is the only complaint (TS1260); ztsc's
+    /// scanner deliberately never keyword-matches an escaped token, so the
+    /// clause parser asks here — the same shape as `isEscapedKeyword` at the
+    /// missing-semicolon report site.
+    ///
+    /// Without it `default:` read as a LABEL on the next statement, and
+    /// the `default:` that followed became "Expression expected"
+    /// (`switchStatementsWithMultipleDefaults`).
+    fn clauseKeyword(p: *Parser) TokTag {
+        const tag = p.curTag();
+        if (tag != .identifier) return tag;
+        var buf: [scanner.max_unescaped_ident]u8 = undefined;
+        // The current token is still in lookahead, so its text comes off the
+        // `Token` — `tokenTextAt` only answers for a CONSUMED index.
+        const cooked = cookedWord(p.tokenText(p.cur()), &buf) orelse return tag;
+        if (std.mem.eql(u8, cooked, "default")) return .keyword_default;
+        if (std.mem.eql(u8, cooked, "case")) return .keyword_case;
+        return tag;
+    }
+
+    /// Consume a `case`/`default` clause head, reporting TS1260 first when it
+    /// was spelled with an escape (see `clauseKeyword`).
+    fn bumpClauseKeyword(p: *Parser) PE!u32 {
+        if (p.curTag() == .identifier) try p.errAtCur(.keyword_with_escape);
+        return p.bump();
+    }
+
     fn parseSwitchStatement(p: *Parser) PE!Node {
         const kw = try p.bump();
         _ = try p.expect(.l_paren, .expected_l_paren);
@@ -3383,9 +3423,9 @@ const Parser = struct {
         var reported_default = false;
         while (p.curTag() != .r_brace and p.curTag() != .eof) {
             const before = p.curIdx();
-            switch (p.curTag()) {
+            switch (p.clauseKeyword()) {
                 .keyword_case => {
-                    const case_kw = try p.bump();
+                    const case_kw = try p.bumpClauseKeyword();
                     const test_expr = try p.parseExpression(.{});
                     _ = try p.expect(.colon, .expected_colon);
                     const range = try p.parseClauseStatements();
@@ -3393,7 +3433,7 @@ const Parser = struct {
                     try p.pushScratch(try p.addNode(.{ .tag = .case_clause, .main_token = case_kw, .data = .{ .lhs = test_expr, .rhs = extra } }));
                 },
                 .keyword_default => {
-                    const def_kw = try p.bump();
+                    const def_kw = try p.bumpClauseKeyword();
                     if (seen_default and !reported_default) {
                         try p.errAtToken(.multiple_default_clauses, def_kw);
                         reported_default = true;
@@ -3426,7 +3466,7 @@ const Parser = struct {
         p.element_home = .other;
         defer p.element_home = was_home;
         while (true) {
-            switch (p.curTag()) {
+            switch (p.clauseKeyword()) {
                 .keyword_case, .keyword_default, .r_brace, .eof => break,
                 else => {},
             }
@@ -8819,6 +8859,22 @@ const Parser = struct {
                 return p.errorNode();
             },
             else => {
+                // tsc's `isIdentifier()` refuses `yield` inside a GENERATOR:
+                // it is a reserved word there, so `parsePrimaryExpression`'s
+                // `parseIdentifier(Diagnostics.Expression_expected)` reports
+                // TS1109 at the keyword and consumes NOTHING — the `yield`
+                // then starts its own statement.
+                //
+                // Only an operand position reaches here: `parseAssignExpr`
+                // takes every `yield` that may be an EXPRESSION, so what is
+                // left is the one a unary operator asked for and cannot have
+                // — `<number> yield 0` in a generator (`castOfYield`), where
+                // ztsc used to read `yield` as the assertion's operand and
+                // then answer "';' expected" at the `0`.
+                if (p.curTag() == .keyword_yield and p.yield_ctx) {
+                    try p.fail(.expected_expression);
+                    return p.errorNode();
+                }
                 if (isIdentLike(p.curTag())) {
                     try p.checkStrictReserved();
                     return p.leaf(.identifier);
@@ -10164,8 +10220,21 @@ const Parser = struct {
     }
 
     /// `{ member; member, ... }` shared by interfaces and object types.
+    ///
+    /// tsc's `parseObjectTypeMembers` only parses a member list when the `{`
+    /// is really there; without one the list is MISSING, not empty-and-then-
+    /// recovered, and no `}` is expected either — the declaration ends at the
+    /// token that should have opened it and the enclosing list resumes from
+    /// there. `interface Foo.I1 { }` is TS1005 at the `.` and then ordinary
+    /// statement recovery over `I1 { }` (TS1434 on the name); recovering
+    /// INSIDE the body instead answered "Property or signature expected" at
+    /// the `I1` and swallowed the rest of the line.
     fn parseTypeMemberList(p: *Parser) PE!ast.SubRange {
-        _ = try p.expect(.l_brace, .expected_l_brace);
+        if (p.curTag() != .l_brace) {
+            try p.fail(.expected_l_brace);
+            return .{ .start = 0, .end = 0 };
+        }
+        _ = try p.bump();
         return p.parseTypeMembersRest();
     }
 

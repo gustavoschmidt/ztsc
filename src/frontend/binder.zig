@@ -72,6 +72,7 @@ const intern = @import("../intern.zig");
 const numeric_lit = @import("../numeric_lit.zig");
 const diagnostics = @import("diagnostics.zig");
 const literals = @import("literals.zig");
+const string_value = @import("string_value.zig");
 const default_exports = @import("default_exports.zig");
 const member_names = @import("member_names.zig");
 const decl_spaces = @import("decl_spaces.zig");
@@ -676,10 +677,14 @@ const Binder = struct {
     }
 
     /// Atom of a member/property name token; string keys lose their quotes
-    /// so `"a"` and `a` name the same member. An identifier key's `\uXXXX`
-    /// escapes are decoded (`o.a` is `o.a`); a STRING key's are not —
-    /// string escapes are a different grammar, and `memberAtom`'s job is the
-    /// syntactic key.
+    /// so `"a"` and `a` name the same member, and their escapes are DECODED —
+    /// `{ "\x41": 1 }` declares `A` and `{ 'te\<newline>xt': 1 }` declares
+    /// `text`, because tsc names a member by the value the literal spells, not
+    /// by how it was spelled (`string_value.cook`). An identifier key's
+    /// `\uXXXX` escapes are decoded the same way, by the identifier grammar.
+    ///
+    /// A JSX attribute value is the exception: `\` is a literal byte there
+    /// (`scanString(/*jsxAttributeString*/ true)`), so it only sheds quotes.
     ///
     /// A NUMERIC key is keyed by the string JavaScript names it by, not by how
     /// it was spelled: `{ 0: x }`, `{ 0.0: x }` and `{ "0": x }` all declare the
@@ -688,10 +693,12 @@ const Binder = struct {
     fn memberAtom(b: *Binder, tok: TokenIndex) Error!Atom {
         const text = b.tokenText(tok);
         switch (b.tree.tokens.tag(tok)) {
-            // `.jsx_string` is a JSX attribute's quoted value; a
-            // no-substitution template is a string literal for naming purposes
-            // (tsc's `isStringLiteralLike`), so `` obj[`k`] `` keys under `k`.
-            .string_literal, .jsx_string, .no_substitution_template_literal => return b.atomOf(stripQuotes(text)),
+            // A no-substitution template is a string literal for naming
+            // purposes (tsc's `isStringLiteralLike`), so `` obj[`k`] `` keys
+            // under `k`.
+            .string_literal => return b.cookedAtom(text, .string),
+            .no_substitution_template_literal => return b.cookedAtom(text, .template),
+            .jsx_string => return b.atomOf(stripQuotes(text)),
             .numeric_literal => {
                 var buf: [numeric_lit.max_name]u8 = undefined;
                 // Stack buffer: `atomOf` copies into the interner, but the
@@ -703,6 +710,21 @@ const Binder = struct {
             },
             else => return b.atomOfIdent(text),
         }
+    }
+
+    /// Atom of a quoted literal's VALUE: quotes shed, then escapes decoded.
+    /// The no-escape body is the value verbatim, so the common case keeps the
+    /// zero-copy source slice and allocates nothing; a cooked one is built in
+    /// the scratch arena before it reaches `atom_cache`, which stores the
+    /// caller's slice as its key (the same dance as `atomOfIdent`).
+    /// Mirrors the checker's `cookedAtom`, which must agree byte for byte.
+    fn cookedAtom(b: *Binder, text: []const u8, kind: string_value.Kind) Error!Atom {
+        const body = stripQuotes(text);
+        if (!string_value.needsCook(body, kind)) return b.atomOf(body);
+        const buf = try b.scratch.alloc(u8, body.len);
+        const value = string_value.cook(body, kind, buf) orelse return b.atomOf(body);
+        if (b.atom_cache.get(value)) |a| return a;
+        return b.atomOf(value);
     }
 
     /// Member-name atom honoring a `[Symbol.iterator]` computed key: when the
