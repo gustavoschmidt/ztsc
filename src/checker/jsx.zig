@@ -210,6 +210,9 @@ pub fn checkJsxElement(c: *Checker, node: Node) Error!TypeId {
             .no_namespace => .{ .props = null },
         } else try c.jsxComponentProps(tag_ty, targs.items, node);
         props = chosen.props orelse types.no_type;
+        if (jsx_lma and props != types.no_type) {
+            props = try libraryManagedAttributes(c, tag_ty, props);
+        }
         overloads_exhausted = chosen.overloads_exhausted;
         // TS2604, tsc's `resolveJsxOpeningLikeElement`: with no signature to
         // resolve against there is no component here at all. Blamed on the TAG
@@ -1451,19 +1454,72 @@ fn jsxPropsSelector(c: *Checker) Error!JsxPropsSelector {
     return .{ .member = c.ts.objectProp(rt, 0).name };
 }
 
-/// Does the JSX namespace declare `LibraryManagedAttributes`? ztsc does not
-/// apply it (tsc's `getJsxManagedAttributesFromLocatedAttributes` runs the
-/// resolved props type through it before anything checks an attribute), and the
-/// transform's whole job is to make props OPTIONAL — `Defaultize<P, typeof
-/// C.defaultProps>` and the `propTypes` widening both only ever loosen the
-/// target. So a namespace that declares one is a namespace where ztsc's
-/// un-managed props type is known to be too strict, and every missing/excess
-/// complaint against it is a false positive: `tsxLibraryManagedAttributes` grew
-/// 18 of them the moment the first-parameter arm below started answering.
+/// BISECT LEG: apply `JSX.LibraryManagedAttributes` for real
+/// (`libraryManagedAttributes`) instead of surrendering the props target
+/// wherever the namespace declares one (`jsxHasManagedAttributes`).
+///
+/// The transform is a rule of the LIBRARY, not of the language: whatever the
+/// namespace's alias says happens to the props type before a single attribute
+/// is checked. React's is `Defaultize<P, typeof C.defaultProps>` plus the
+/// `propTypes` widening — both of which only LOOSEN — but emotion's is
+/// `P & { css: string }`, which tightens nothing and adds a name, and a
+/// hand-rolled one can say anything at all. So "declares one" was never a
+/// verdict; it was a stand-in for evaluating it, kept while the prerequisite
+/// (`generics.inferFromExtendsInner` walking a `.class_value`'s statics, so
+/// `C extends { defaultProps: infer D }` can match) was missing.
+///
+/// Kept as a compile-time const rather than deleted so the two behaviours stay
+/// one binary apart — see `assign.measured_variance_decides` for the same
+/// pattern.
+const jsx_lma = true;
+
+/// tsc's `getJsxManagedAttributesFromLocatedAttributes`: run the located props
+/// type through `JSX.LibraryManagedAttributes<TagType, Props>` before anything
+/// checks an attribute against it.
+///
+/// `ctor` is `getStaticTypeOfReferencedJsxConstructor`'s answer — for a
+/// component tag, the type of the tag expression itself (the class's STATIC
+/// side, which is what carries `defaultProps`/`propTypes`).
+///
+/// Both of tsc's arms are covered by `namedTypeFromSymbol`, which instantiates
+/// an alias and an interface alike; the shared precondition is tsc's
+/// `length(params) >= 2`. Two arguments are supplied and the rest are left to
+/// `fixTypeArgs` to fill from their DEFAULTS, which is `fillMissingTypeArguments`
+/// with `minTypeArgumentCount = 2`. A declaration whose third parameter has no
+/// default is where the two part ways — tsc fills `unknown`, `fixTypeArgs` would
+/// report a TS2314 against a synthetic span — so that shape declines instead.
+fn libraryManagedAttributes(c: *Checker, ctor: TypeId, props: TypeId) Error!TypeId {
+    const sym = (try c.jsxNamespaceMember(c.atom_LibraryManagedAttributes)) orelse return props;
+    var tps: std.ArrayList(TypeParamInfo) = .empty;
+    defer tps.deinit(c.scratch());
+    try c.typeParamsOf(sym, &tps);
+    if (tps.items.len < 2) return props;
+    var required: usize = 0;
+    for (tps.items) |tp| {
+        if (tp.default == 0) required += 1;
+    }
+    if (required > 2) return props;
+    const managed = try c.namedTypeFromSymbol(sym, &.{ ctor, props }, 0);
+    // A declaration that is neither alias nor interface answers `any_type`
+    // here; an arity/cycle failure answers `error_type`. Neither is a props
+    // target, and tsc reaches neither, so keep the located type.
+    if (managed == types.error_type or managed == types.any_type) return props;
+    return managed;
+}
+
+/// Does the JSX namespace declare `LibraryManagedAttributes`? The `!jsx_lma`
+/// leg's stand-in for evaluating it (see `jsx_lma`): the transform's whole job
+/// in React is to make props OPTIONAL — `Defaultize<P, typeof C.defaultProps>`
+/// and the `propTypes` widening both only ever loosen the target — so a
+/// namespace that declares one is a namespace where an un-managed props type is
+/// known to be too strict, and every missing/excess complaint against it is a
+/// false positive: `tsxLibraryManagedAttributes` grew 18 of them the moment the
+/// first-parameter arm below started answering.
 ///
 /// Consulted only by the arms that had NO target at all before, so this cannot
 /// take a check away from anything that already worked.
 fn jsxHasManagedAttributes(c: *Checker) Error!bool {
+    if (jsx_lma) return false;
     return (try c.jsxNamespaceMember(c.atom_LibraryManagedAttributes)) != null;
 }
 
