@@ -1502,6 +1502,28 @@ fn jsxPropsSelector(c: *Checker) Error!JsxPropsSelector {
 /// lever is `assign.relate`'s cost for `<component type> vs <exotic-component
 /// interface>`, not anything this file can memoize.
 ///
+/// WAVE 46 TOOK MOST OF IT. Sampling the `true` binary named two whole-type
+/// predicates, both recomputed from scratch at every ask and both pure
+/// functions of one interned TypeId, as 17 % of the run between them:
+/// `subst.containsFreeTypeParam(t, &.{})` under `generics.planConditional`
+/// (160 of 1615 samples — the check type of every conditional it plans) and
+/// `expr.baseConstraintOf` (162 inclusive). Memoizing both — see
+/// `Checker.cftp_cache` and `Checker.baseConstraintOf` — plus
+/// `Checker.typeToString`, took the LMA delta from +15.56 % to:
+///
+///   * social-app, `--workers=1 --checkers=1`, interleaved min-of-9 CPU:
+///     2.61 s off vs 2.68 s on, **+2.7 % median (+1.9 % min)**, RSS +0.1 %.
+///     Against the wave-45 binary the flag was measured on (2.82 s), `true`
+///     is now **-5.0 %** — the optimization more than pays for LMA.
+///   * excalidraw single-threaded: 0.87 s for all three binaries; free.
+///
+/// STILL OFF: the decision gate was +2 % against the same-generation `false`
+/// binary, and +2.7 % misses it. The residue is diffuse — a fresh
+/// off-vs-on profile diff has no term above 0.9 %, the direct LMA computation
+/// (`jsx.zig`'s call below) is 22 of 1452 samples, and the rest is the extra
+/// attribute checking a `Defaultize<…>` target genuinely costs. Closing the
+/// last 0.7 pt needs a different idea, not another memo.
+///
 /// Kept as a compile-time const rather than deleted so the two behaviours stay
 /// one binary apart — see `assign.measured_variance_decides` for the same
 /// pattern. Flip it to `true` to re-measure.
