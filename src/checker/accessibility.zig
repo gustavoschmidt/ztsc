@@ -648,6 +648,42 @@ pub fn constructorCheck(c: *Checker, cls: SymbolId, node: Node) Error!bool {
     return false;
 }
 
+/// TS2675, tsc's `checkBaseTypeAccessibility` — the `extends` half of the rule
+/// `constructorCheck` above enforces for `new`:
+///
+/// ```ts
+/// const signatures = getSignaturesOfType(type, SignatureKind.Construct);
+/// if (signatures.length) {
+///     const declaration = signatures[0].declaration;
+///     if (declaration && hasEffectiveModifier(declaration, ModifierFlags.Private)) {
+///         const typeClassDeclaration = getClassLikeDeclarationOfSymbol(type.symbol)!;
+///         if (!isNodeWithinClass(node, typeClassDeclaration)) {
+///             error(node, Cannot_extend_a_class_0_Class_constructor_is_marked_as_private,
+///                   getFullyQualifiedName(type.symbol));
+///         }
+///     }
+/// }
+/// ```
+///
+/// PRIVATE only — a `protected` constructor is extendable, which is the whole
+/// point of one (`classConstructorAccessibility2`'s `DerivedB`). The lexical
+/// test is `private`'s, not `protected`'s: only the declaring class itself
+/// enclosing the `extends` clause admits it, so a class nested in its own base's
+/// static block may extend it and nothing else may.
+///
+/// `base_sym` names the class the clause WRITES and `declaringCtor` finds whose
+/// constructor actually answers for it, and the two differ whenever the ctor is
+/// inherited: `class M extends B {}` (B private) followed by `class D extends M`
+/// reports 'M', not 'B' — oracle-pinned against tsgo 7.0.2.
+pub fn baseTypeAccessibility(c: *Checker, base_sym: SymbolId, node: Node) Error!void {
+    const found = (try statics_zig.declaringCtor(c, base_sym)) orelse return;
+    if (Access.of(found.flags) != .private) return;
+    if (try withinClass(c, found.cls, false)) return;
+    try c.diagFmt(2675, c.nodeSpan(node), "Cannot extend a class '{s}'. Class constructor is marked as private.", .{
+        c.symbolName(base_sym),
+    });
+}
+
 /// `private` is tsc's `isNodeWithinClass(location, declaringClassDeclaration)`
 /// — the enclosing class must BE the declaring one; `protected` is
 /// `forEachEnclosingClass(location, isClassDerivedFromDeclaringClasses)` — any

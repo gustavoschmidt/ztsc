@@ -2672,8 +2672,16 @@ pub fn checkClass(c: *Checker, node: Node, ctx: TypeId) Error!void {
     // extends: base must be a class (checked in baseClassRef); type
     // args arity checked there too.
     if (class_sym != binder.no_symbol and data.extends != 0) {
-        _ = try c.baseClassRef(class_sym);
+        const base_ref = try c.baseClassRef(class_sym);
         const hd = c.tree.nodeData(data.extends);
+        // TS2675: the base's constructor must be reachable from the `extends`
+        // clause — tsc's `checkBaseTypeAccessibility`, blamed on the heritage
+        // EXPRESSION (`abc.XYZ`), not on the class name.
+        if (base_ref) |br| {
+            if (c.ts.kind(br) == .ref) {
+                try accessibility.baseTypeAccessibility(c, c.ts.refSymbol(br), hd.lhs);
+            }
+        }
         // An AMBIENT class's `extends` clause is emitted nowhere, so tsc does
         // not treat it as a value reference: `import type { Base }` followed by
         // `declare class D extends Base<T>` is legal, and a `.d.ts` is ambient
