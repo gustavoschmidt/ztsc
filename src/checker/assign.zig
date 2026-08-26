@@ -2705,6 +2705,50 @@ pub fn distributiveConstraint(c: *Checker, cond: TypeId) Error!?TypeId {
     return constraintWalk(c, cond, chk, con);
 }
 
+/// tsc's `isDistributionDependent`, the ONE guard on the both-branches reading
+/// of a conditional TARGET (`structuredTypeRelatedTo`'s `Conditional` arm):
+///
+/// ```ts
+/// return root.isDistributive && (
+///     isTypeParameterPossiblyReferenced(root.checkType, root.node.trueType) ||
+///     isTypeParameterPossiblyReferenced(root.checkType, root.node.falseType));
+/// ```
+///
+/// A DISTRIBUTIVE conditional whose branches name the check parameter is not
+/// the union of its two branches — it is a union with one member per
+/// constituent of whatever the parameter turns out to be, and each of those
+/// members has that constituent substituted INTO the branch. So `S` satisfying
+/// both branches as WRITTEN says nothing about `S` satisfying the result, and
+/// answering yes there is a false negative on the assignment.
+///
+/// `Stuff<T> = T extends keyof JSX.IntrinsicElements ? JSX.IntrinsicElements[T]
+/// : any` is the witness (`conditionalTypeVarianceBigArrayConstraints
+/// Performance`): `p1 = p2` between `Stuff<T>` and `Stuff<U>` for two unrelated
+/// parameters is an error, and the `any` false branch made the both-branches
+/// rule accept it.
+///
+/// `tpMentions` saturates rather than enumerate a signature's own parameters,
+/// and a saturated set answers TRUE here — which is the conservative direction:
+/// tsc's own test is "POSSIBLY referenced".
+fn distributionDependent(c: *Checker, cond: TypeId) Error!bool {
+    const s = &c.ts;
+    // tsc's `root.isDistributive` is exactly "the check type is a naked type
+    // parameter"; ztsc records the flag at construction and the kind test is
+    // what tells a naked parameter from a substituted one.
+    if (!s.condDistributive(cond)) return false;
+    const chk = s.condCheck(cond);
+    if (s.kind(chk) != .type_param) return false;
+    const sym = s.typeParamSymbol(chk);
+    return (try branchMentionsParam(c, s.condTrue(cond), sym)) or
+        (try branchMentionsParam(c, s.condFalse(cond), sym));
+}
+
+fn branchMentionsParam(c: *Checker, branch: TypeId, sym: u32) Error!bool {
+    const m = try c.tpMentions(branch);
+    if (m.saturated) return true;
+    return std.mem.indexOfScalar(u32, m.syms, sym) != null;
+}
+
 /// One pass of `distributiveConstraint`'s three-way decision down the
 /// false-branch chain, with `sub` — the whole constraint, or one constituent of
 /// it — standing in for the check parameter `chk`. `null` = undecided.
@@ -2960,6 +3004,14 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
                 if (try condBranchwiseRelated(c, s, rm)) return true;
             }
         }
+        // Everything below asks the TARGET to accept a reading of the source —
+        // a branch, or the distributive constraint — and a target that
+        // DISTRIBUTES over its check parameter and names it in a branch has no
+        // such answer to give (`distributionDependent`, tsc's guard on its own
+        // conditional-target arm). Placed after the two rules that compare the
+        // two conditionals AS conditionals, which do not consult the target's
+        // branches in isolation.
+        if (tk == .conditional and try distributionDependent(c, t)) return false;
         // Both readings of the true branch under the extends assumption, the
         // cheap special case first (`condTrueUnderExtends` rewrites one index
         // without instantiating anything). Additive: the substitution can only
@@ -3518,6 +3570,17 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
     }
     // Deferred conditional *target*: the source must satisfy whichever
     // branch the conditional resolves to, so require it against both.
+    //
+    // tsc guards this arm with `isDistributionDependent` (see
+    // `distributionDependent`) and ztsc applies that guard only where BOTH
+    // sides are conditionals, in `isAssignableInner`'s source arm. Applying it
+    // here too was measured and costs `recursiveReverseMappedType`: the target
+    // there is `(T extends unknown[] ? {} : {…}) | ['marker', ...Recur<T>[]]`,
+    // and it is the CONDITIONAL member — whose `{}` true branch accepts
+    // anything — that carries the tuple, because ztsc's tuple-vs-variadic-tuple
+    // rule does not. Refusing the branch reading turned a clean case into a
+    // false TS2322, which the no-false-positive rule outranks the missing
+    // diagnostic it would have bought.
     if (tk == .conditional) {
         return (try c.isAssignable(s, c.ts.condTrue(t))) and (try c.isAssignable(s, c.ts.condFalse(t)));
     }

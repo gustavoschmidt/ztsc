@@ -515,11 +515,30 @@ fn addSym(c: *Checker, out: *std.ArrayList(u32), sym: u32) Error!void {
 /// now — indexing/mapping over such an object must reduce eagerly, else the
 /// generic member is stranded as an unresolved `Obj["f"]` and lost.
 /// `bound` is the stack of type-param symbols currently in scope.
+///
+/// The EMPTY-scope question is memoized on `Checker.cftp_cache`, because it is
+/// a pure function of `t` and it is the one every caller outside this file
+/// asks. `containsTypeParam` (also cached) answers the easy half — a type that
+/// mentions no parameter at all is trivially free of one — and what remains is
+/// the expensive half: a CONCRETE type carrying signature-local parameters,
+/// where the walk has to descend everywhere and prove each one bound. That
+/// walk keeps no seen-set, so a shared sub-DAG costs once per path into it.
+/// See the field for the measurement.
 pub fn containsFreeTypeParam(c: *Checker, t: TypeId, bound: []const u32) Error!bool {
+    if (bound.len != 0) return containsFreeTypeParamInner(c, t, bound);
+    // No enclosing signature scope and no type param anywhere: the cached
+    // whole-type predicate is an exact, cheaper answer.
+    if (!try c.containsTypeParam(t)) return false;
+    const v = c.triGet(&c.cftp_cache, t);
+    if (v != 0) return v == 2;
+    try c.triSet(&c.cftp_cache, t, 1); // assume no while computing (cycles)
+    const result = try containsFreeTypeParamInner(c, t, &.{});
+    try c.triSet(&c.cftp_cache, t, if (result) 2 else 1);
+    return result;
+}
+
+fn containsFreeTypeParamInner(c: *Checker, t: TypeId, bound: []const u32) Error!bool {
     const s = &c.ts;
-    // No enclosing signature scope and no free var found up to here: the
-    // cached whole-type predicate is an exact, cheaper answer.
-    if (bound.len == 0 and !try c.containsTypeParam(t)) return false;
     switch (s.kind(t)) {
         .type_param => {
             const sym = s.typeParamSymbol(t);

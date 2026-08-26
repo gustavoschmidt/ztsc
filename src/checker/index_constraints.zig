@@ -268,6 +268,35 @@ pub fn checkInterfaceIndexConstraints(
     });
 }
 
+/// tsc's `checkTypeLiteral` -> `checkIndexConstraints(type, type.symbol)`:
+/// TS2411 / TS2413 for an anonymous object TYPE LITERAL, whose contradiction is
+/// just as invisible at every use as an interface's.
+///
+/// `members` is the literal's member range as written and `obj` the type it
+/// resolved to; the caller is already in the literal's file and scope, and
+/// spells the members with the same node tags an interface block does.
+///
+/// A type literal has no heritage, so there is no interface fallback and no
+/// base that could be blamed instead: every member it carries is an OWN
+/// declaration and the site is always the member itself. That makes this the
+/// simplest of the three entry points — no merged blocks, no static half.
+///
+/// Deliberately NOT `checkIndexGrammar`: the grammar rules about an index
+/// signature's own syntax are `checkSourceElement`'s business and run for the
+/// signature node wherever it appears, while the two entry points above call
+/// them only because their own index-info screen would otherwise hide a
+/// signature that never became an index info.
+pub fn checkTypeLiteralIndexConstraints(c: *Checker, members: []const Node, obj: TypeId) Error!void {
+    const t = try c.resolveStructural(obj);
+    if (c.ts.kind(t) != .object) return;
+    const infos = Infos.of(c, t);
+    if (infos.none()) return;
+    var own: Own = .{};
+    defer own.deinit(c.scratch());
+    try gatherTypeMembers(c, members, &own);
+    try checkOne(c, t, own, null);
+}
+
 // ------------------------------------------------------------------ the check
 
 fn checkOne(c: *Checker, obj: TypeId, own: Own, fallback: ?IfaceFallback) Error!void {
@@ -484,18 +513,27 @@ fn gatherInterfaceBlocks(c: *Checker, sym: SymbolId, out: *Own) Error!void {
         defer c.cur_scope = saved_scope;
         if (try c.scopeOf(decl)) |s| c.cur_scope = s;
         const data = c.tree.extraData(ast.InterfaceData, c.tree.nodeData(decl).lhs);
-        for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
-            if (m == null_node) continue;
-            const md = c.tree.nodeData(m);
-            switch (c.nodeTag(m)) {
-                .property_signature, .method_signature => {
-                    const tok = c.tree.nodeMainToken(m);
-                    try addProp(c, out, try c.memberKey(tok, md.rhs), tok, md.rhs);
-                },
-                .index_signature => try addIndex(c, out, m, md.lhs),
-                // Call and construct signatures name no member.
-                else => {},
-            }
+        try gatherTypeMembers(c, c.tree.extraRange(data.members_start, data.members_end), out);
+    }
+}
+
+/// The members an interface block or a type LITERAL writes, as own
+/// declarations. Both spell their members with the same node tags, and the
+/// index-constraint rule cares about exactly two of them: a name (which an
+/// applicable index signature constrains) and an index signature (which
+/// another one may constrain). The caller supplies the file and scope.
+fn gatherTypeMembers(c: *Checker, members: []const Node, out: *Own) Error!void {
+    for (members) |m| {
+        if (m == null_node) continue;
+        const md = c.tree.nodeData(m);
+        switch (c.nodeTag(m)) {
+            .property_signature, .method_signature => {
+                const tok = c.tree.nodeMainToken(m);
+                try addProp(c, out, try c.memberKey(tok, md.rhs), tok, md.rhs);
+            },
+            .index_signature => try addIndex(c, out, m, md.lhs),
+            // Call and construct signatures name no member.
+            else => {},
         }
     }
 }
@@ -751,4 +789,10 @@ test "a numeric index signature judges the names that spell their own number" {
     for ([_][]const u8{ "", " 1", "1 ", "1 0 1", "hunter2", "+Infinity", "+NaN", "-NaN", "+1", "1e0", "-0", "-0e0", "0xF00D", "0123", "0o123", "0b101101001010", "0.000000000000000000012", "1e21", "0.0000001", "1000000000000000000000" }) |s| {
         try t.expect(!isNumericIndexName(s));
     }
+}
+// Wave 46: `checkTypeLiteralIndexConstraints` has no in-tree consumer yet —
+// typenode.zig's `.object_type` arm is the one being wired. Keep it analyzed
+// until then; DELETE this block with the call site's landing.
+comptime {
+    _ = &checkTypeLiteralIndexConstraints;
 }
