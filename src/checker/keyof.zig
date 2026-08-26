@@ -577,10 +577,56 @@ pub fn keyofMapped(c: *Checker, m: TypeId) Error!TypeId {
                 const nm = (try c.remapKey(as_clause, key_id, k)) orelse continue;
                 try parts.append(c.scratch(), try s.makeStringLiteral(nm, false));
             },
-            else => return c.ts.makeKeyof(m), // non-enumerable key set — defer
+            else => return genericRemappedKeys(c, m, as_clause, key_id, constraint),
         }
     }
     return s.makeUnion(c.scratch(), parts.items);
+}
+
+/// The key set of a key-remapped mapped type whose key set is NOT enumerable
+/// (`{ [P in K as `_${P}`]: … }` with `K` a free type parameter).
+///
+/// tsc's `getIndexTypeForMappedType` splits here on `isFilteringMappedType` —
+/// "is the `as` clause assignable to the key parameter?" A clause that only
+/// SELECTS from `K` (`P extends `_${string}` ? P : never`) has no closed form
+/// for the surviving subset and stays deferred; anything else RENAMES, and
+/// every key of `M` is then the clause applied to some key of `K`, so the
+/// clause ITSELF is the key set.
+///
+/// ztsc names the rename half positively (`isKeyRename`) instead of taking
+/// tsc's complement, because the two implementations pay different costs for
+/// it. tsc leaves `P` free in the answer and lets `P`'s constraint settle
+/// relation questions later; ztsc's `.mapped_param` carries no constraint (see
+/// `mappedBindKeyParam`), so it has to SUBSTITUTE the key set for `P` here and
+/// now — and substitution is not free. An `as` clause that recurses through
+/// `keyof` of another instantiation of its own alias
+/// (`mappedTypeAsClauseRecursiveNoCrash1`'s `FlattenType`) expands without
+/// bound under substitution where tsc's free `P` simply stops. Deferring the
+/// shapes ztsc cannot expand in closed form costs only the precision it never
+/// had.
+///
+/// So `keyof Mapped6<K>` is `` `_${K}` `` where tsc prints `` `_${P}` ``; the
+/// two agree in the direction that matters (`keyof M` → `` `_${string}` ``
+/// holds, `` `_${string}` `` → `keyof M` does not). Before this the renaming
+/// case deferred too, and a deferred `keyof` falls back on `string | number |
+/// symbol`, which swallowed every diagnostic about the remapped keys.
+fn genericRemappedKeys(c: *Checker, m: TypeId, as_clause: TypeId, key_id: u32, constraint: TypeId) Error!TypeId {
+    if (!isKeyRename(c, as_clause)) return c.ts.makeKeyof(m);
+    return c.substMappedKey(as_clause, key_id, constraint);
+}
+
+/// Is this `as` clause a pure RENAME whose image ztsc can spell in closed form
+/// — a template literal (`` `_${P}` ``) or a `Uppercase`-style string mapping?
+///
+/// Everything else — filters, and any clause that computes through a
+/// conditional or another `keyof` — keeps the deferral. See
+/// `genericRemappedKeys` for why the bar is "expandable", not tsc's
+/// "not a filter".
+fn isKeyRename(c: *const Checker, as_clause: TypeId) bool {
+    return switch (c.ts.kind(as_clause)) {
+        .template_literal_type, .string_mapping => true,
+        else => false,
+    };
 }
 
 /// T[K] with literal / index-signature keys (non-generic subset).
