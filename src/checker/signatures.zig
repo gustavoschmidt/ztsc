@@ -292,13 +292,26 @@ pub fn signatureOfProtoCtx(
         try implicit_any.reportMissingReturnType(c, node, proto);
     }
 
-    // TS 5.5 inferred type predicate: a boolean-returning single-param
-    // callback whose body narrows that param synthesizes an implicit
-    // `x is T` guard, so `arr.filter(x => x !== null)` picks the
-    // `filter<S extends T>(…): S[]` overload. Only when no explicit
-    // predicate was written and the param has a real (contextual) type.
+    // TS 5.5 inferred type predicate: a boolean-returning function whose body
+    // narrows one parameter synthesizes an implicit `x is T` guard, so
+    // `arr.filter(x => x !== null)` picks the `filter<S extends T>(…): S[]`
+    // overload and `if (isString(v))` narrows `v` at the call site.
+    //
+    // tsc's `getTypePredicateOfSignature` runs `getTypePredicateFromBody` for
+    // every `isFunctionLikeDeclaration` — a declared function and a class
+    // method as much as an arrow — and `getTypePredicateFromBody` itself only
+    // bails on a constructor/accessor or a non-Normal (async/generator)
+    // function. The declaration set below is exactly the one the inferred-
+    // RETURN arm above walks bodies for (an object-literal method's return is
+    // not inferred here, so it could never be `boolean` anyway), plus the
+    // accessor and async/generator screens. Only when no explicit predicate
+    // was written and the param has a real (contextual) type.
     if (pred == null and tps.items.len == 0 and
-        (c.nodeTag(node) == .arrow_fn or c.nodeTag(node) == .function_expr))
+        !is_async and !is_generator and
+        proto.flags & (ast.Flags.get | ast.Flags.set) == 0 and
+        node != 0 and c.tree.nodeData(node).rhs != 0 and
+        (c.nodeTag(node) == .arrow_fn or c.nodeTag(node) == .function_expr or
+            c.nodeTag(node) == .function_decl or c.nodeTag(node) == .class_method))
     {
         pred = try inferredPredicate(c, params.items, ret, c.tree.nodeData(node).rhs);
     }
@@ -342,11 +355,13 @@ fn inferredPredicate(c: *Checker, params: []const types.Param, ret: TypeId, body
         guard = expr;
     }
 
-    // Unwrap parens and leading `!` (each `!` flips the narrowing sense).
+    // Unwrap the wrappers tsc's `narrowType` sees through before it looks at
+    // the condition — parentheses, `satisfies`, `!`-non-null — plus a leading
+    // prefix `!` (each of which flips the narrowing sense).
     var sense = true;
     unwrap: while (guard != null_node) {
         switch (c.nodeTag(guard)) {
-            .paren_expr => guard = c.tree.nodeData(guard).lhs,
+            .paren_expr, .satisfies_expr, .non_null => guard = c.tree.nodeData(guard).lhs,
             .prefix_unary => {
                 if (c.tree.tokens.tag(c.tree.nodeMainToken(guard)) != .bang) break :unwrap;
                 sense = !sense;
@@ -424,7 +439,8 @@ fn narrowByGuardExpr(c: *Checker, t: TypeId, cond: Node, sense: bool, key: RefKe
     if (cond == null_node or depth > 8) return t;
     const d = c.tree.nodeData(cond);
     switch (c.nodeTag(cond)) {
-        .paren_expr => return narrowByGuardExpr(c, t, d.lhs, sense, key, depth + 1, decl),
+        // tsc's `narrowType` recurses through exactly these three wrappers.
+        .paren_expr, .satisfies_expr, .non_null => return narrowByGuardExpr(c, t, d.lhs, sense, key, depth + 1, decl),
         .prefix_unary => {
             if (c.tree.tokens.tag(c.tree.nodeMainToken(cond)) != .bang)
                 return t;
@@ -1586,7 +1602,13 @@ pub fn typeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
         if (c.spec_tainted.count() != 0 and c.spec_tainted.contains(sym)) c.spec_taint_reads += 1;
         return c.sym_types.items[sym];
     }
-    if (c.sym_state.items[sym] == .in_progress) return types.any_type; // circular
+    if (c.sym_state.items[sym] == .in_progress) {
+        // circular — tsc's `pushTypeResolution` returning false. Record the
+        // cut on every variable frame from the re-entered one up so the
+        // frame that owns the circle can name it (`reportVarCircularity`).
+        markVarCycle(c, sym);
+        return types.any_type;
+    }
     c.sym_state.items[sym] = .in_progress;
     const before = c.spec_taint_reads;
     const t = computeTypeOfSymbol(c, sym) catch |err| {
@@ -2297,6 +2319,15 @@ fn variableSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
     c.cur_scope = c.symScope(sym);
     const is_const = c.symFlags(sym).const_decl;
     const decls = c.declsOf(sym);
+    // tsc's `pushTypeResolution(symbol, TypeSystemPropertyName.Type)`, but only
+    // for a resolution entered through `typeOfSymbol` — that is what marks the
+    // symbol in progress, and without the mark there is no re-entry to catch
+    // (the merged-symbol arms below call this directly for a constituent).
+    const framed = c.sym_state.items[sym] == .in_progress;
+    if (framed) try c.sym_res_stack.append(c.cm(), .{ .sym = sym, .ok = true });
+    defer if (framed) {
+        _ = c.sym_res_stack.pop();
+    };
     for (decls) |decl| {
         // A symbol can merge a value declaration with a type-only one
         // (e.g. lib's `interface Object {}` + `declare var Object: {…}`).
@@ -2307,8 +2338,51 @@ fn variableSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
             else => continue,
         }
         const t = try declaratorType(c, sym, decl, is_const);
+        // tsc's `popTypeResolution()` answering false: something this
+        // declaration's own type demanded asked for this variable again.
+        if (framed and !c.sym_res_stack.items[c.sym_res_stack.items.len - 1].ok) {
+            if (try reportVarCircularity(c, sym, decl)) |any_t| return any_t;
+        }
         if (t != types.no_type) return t;
     }
+    return types.any_type;
+}
+
+/// Mark the cut that `typeOfSymbol` is about to take on an already in-progress
+/// `sym`: tsc's `pushTypeResolution` clears `resolutionResults` for every
+/// entry from the re-entered target to the top of the stack, so each variable
+/// on the circle — not just the one the traversal happened to demand first —
+/// reports and resolves to `any`. A symbol that is not on the stack is a cycle
+/// through something other than a variable's own type (a member, a signature
+/// return); those have their own reporting and are left alone here.
+fn markVarCycle(c: *Checker, sym: SymbolId) void {
+    // Under a lazily-materialized type node the self-reference is not part of
+    // the variable's own resolution at all (tsc resolves it later, to the real
+    // recursive type): `var g: { x: typeof g }` is legal.
+    if (c.type_defer_depth != 0) return;
+    var i = c.sym_res_stack.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (c.sym_res_stack.items[i].sym != sym) continue;
+        for (c.sym_res_stack.items[i..]) |*f| f.ok = false;
+        return;
+    }
+}
+
+/// tsc's `reportCircularityError` for a variable whose resolution re-entered
+/// itself. A variable with a type ANNOTATION can only be circular *through*
+/// that annotation, which is TS2502 — and tsc resolves it to `any`, so a
+/// later `var f: any` in the same declaration group agrees instead of
+/// reporting TS2403 against the half-built annotation type.
+///
+/// Returns null for an unannotated declarator: that circle runs through the
+/// INITIALIZER, which ztsc still resolves the old (silent) way.
+fn reportVarCircularity(c: *Checker, sym: SymbolId, decl: Node) Error!?TypeId {
+    if (c.nodeTag(decl) != .declarator_full) return null;
+    const d = c.tree.nodeData(decl);
+    const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
+    if (e.type_ann == 0) return null;
+    try c.diagFmt(2502, c.nodeSpan(d.lhs), "'{s}' is referenced directly or indirectly in its own type annotation.", .{c.symbolName(sym)});
     return types.any_type;
 }
 

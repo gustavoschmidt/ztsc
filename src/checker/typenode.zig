@@ -177,6 +177,21 @@ pub fn typeNodeCacheable(tag: ast.Tag) bool {
 
 fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
     const d = c.tree.nodeData(node);
+    // A type literal's members and a function/constructor type's signature are
+    // what tsc resolves lazily, so a self-reference under one is not part of
+    // the enclosing declaration's own resolution — see `type_defer_depth`.
+    switch (c.nodeTag(node)) {
+        .object_type, .function_type, .constructor_type => {
+            c.type_defer_depth += 1;
+        },
+        else => {},
+    }
+    defer switch (c.nodeTag(node)) {
+        .object_type, .function_type, .constructor_type => {
+            c.type_defer_depth -= 1;
+        },
+        else => {},
+    };
     switch (c.nodeTag(node)) {
         .identifier => return c.typeFromTypeName(node, &.{}),
         .type_ref => {
