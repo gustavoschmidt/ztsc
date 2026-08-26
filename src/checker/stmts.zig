@@ -644,6 +644,36 @@ fn headDeclarationsEmpty(c: *const Checker, head: Node) bool {
     };
 }
 
+/// Is this head node a DESTRUCTURING pattern — the shape `for…in` refuses?
+/// Both spellings, because a `for` head's target arrives as a binding pattern
+/// when it is declared and as the expression cover grammar when it is not.
+fn isBindingPattern(c: *const Checker, n: Node) bool {
+    return switch (c.nodeTag(n)) {
+        .array_pattern, .object_pattern, .array_literal, .object_literal => true,
+        else => false,
+    };
+}
+
+/// tsc's `getIndexTypeOrString`: the subject's own STRING-valued key set, or
+/// `string` when it has none — what a `for…in` binding will actually hold.
+///
+/// Consulted only after plain `string` has been refused by the target, which
+/// is where the approximation stops being good enough: `let k: "a" | "b"`
+/// really can hold every key of a `{ a; b }`, and `string` cannot say so.
+fn forInKeyType(c: *Checker, rt: TypeId) Error!TypeId {
+    const ks = try c.keyofType(rt);
+    if (try c.typeIsStringLike(ks)) {
+        if (c.ts.kind(ks) != .union_type) return ks;
+        var parts: std.ArrayList(TypeId) = .empty;
+        defer parts.deinit(c.scratch());
+        for (try c.memberList(ks)) |m| {
+            if (try c.typeIsStringLike(try c.resolveStructural(m))) try parts.append(c.scratch(), m);
+        }
+        if (parts.items.len != 0) return c.ts.makeUnion(c.scratch(), parts.items);
+    }
+    return types.string_type;
+}
+
 fn checkForInOf(c: *Checker, node: Node) Error!void {
     const d = c.tree.nodeData(node);
     const e = c.tree.extraData(ast.ForInOf, d.lhs);
@@ -663,6 +693,9 @@ fn checkForInOf(c: *Checker, node: Node) Error!void {
 
     const rt = try c.checkExprCached(e.right, types.no_type);
     var elem_t: TypeId = types.any_type;
+    // The `for…in` subject with its nullish half stripped (see below); the
+    // head's TS2405 needs it too, hence the outer binding.
+    var subject_nn: TypeId = rt;
     if (is_of) {
         // tsc's `checkRightHandSideOfForOf` reads the subject with
         // `checkNonNullExpression`, so a nullish subject is a TS18047-50 /
@@ -681,6 +714,7 @@ fn checkForInOf(c: *Checker, node: Node) Error!void {
         // the STRIPPED type in the diagnostic. (The body's own view of the
         // subject is `forInSubjectNarrows`, the flow half of the same rule.)
         const rt_nn = if (isNullishUnion(c, rt)) try c.nonNullable(rt) else rt;
+        subject_nn = rt_nn;
         const rk = c.ts.kind(try c.resolveStructural(rt_nn));
         if (!isNonPrimitiveKind(rk) and rk != .any and rk != .err and rk != .unknown and rk != .type_param) {
             try c.diagFmt(2407, c.nodeSpan(e.right), "The right-hand side of a 'for...in' statement must be of type 'any', an object type or a type parameter, but here has type '{s}'.", .{try c.typeToString(rt_nn)});
@@ -702,6 +736,14 @@ fn checkForInOf(c: *Checker, node: Node) Error!void {
             }
             if (decl != null_node) {
                 const dd = c.tree.nodeData(decl);
+                // A `for…in` head may not DESTRUCTURE — tsc's
+                // `checkForInStatement` reports TS2491 on the declaration's
+                // NAME and carries on typing it. (`for…of` destructures
+                // happily; the expression-head spelling of the same refusal
+                // is in the pattern arm below.)
+                if (!is_of and dd.lhs != null_node and isBindingPattern(c, dd.lhs)) {
+                    try c.diagFmt(2491, c.nodeSpan(dd.lhs), "The left-hand side of a 'for...in' statement cannot be a destructuring pattern.", .{});
+                }
                 switch (c.nodeTag(decl)) {
                     .declarator => {
                         if (c.nodeTag(dd.lhs) == .identifier) {
@@ -764,6 +806,10 @@ fn checkForInOf(c: *Checker, node: Node) Error!void {
                 try expr_zig.checkDestructuringPattern(c, e.left, elem_t);
             } else {
                 _ = try c.checkExprCached(e.left, types.no_type);
+                // tsc's `checkForInStatement` blames the whole varExpr here,
+                // and returns without the TS2405/TS2406 pair the `else` arm
+                // below runs — the destructuring refusal is the last word.
+                try c.diagFmt(2491, c.nodeSpan(e.left), "The left-hand side of a 'for...in' statement cannot be a destructuring pattern.", .{});
             }
         },
         else => {
@@ -800,6 +846,14 @@ fn checkForInOf(c: *Checker, node: Node) Error!void {
                 // `getIndexTypeOrString(rightType)`, approximated by `string`,
                 // which is exactly what a `for…in` binding may hold.
                 _ = try expr_zig.checkReferenceExpression(c, e.left, .for_in);
+            } else if (!try c.isAssignable(try forInKeyType(c, subject_nn), left_t)) {
+                // …and when it does NOT fit, that is tsc's other branch:
+                // TS2405 on the varExpr. Reached only once `string` has
+                // already been refused, so the subject's own key set is
+                // consulted before the refusal stands — `let k: "a" | "b"`
+                // over a `{ a; b }` is a target tsc accepts even though
+                // `string` is not assignable to it.
+                try c.diagFmt(2405, c.nodeSpan(e.left), "The left-hand side of a 'for...in' statement must be of type 'string' or 'any'.", .{});
             }
         },
     }
