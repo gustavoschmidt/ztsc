@@ -679,6 +679,20 @@ pub const InferCtx = struct {
     /// — whether ANY ONE of them still accepts the covariant answer — which the
     /// folded common subtype alone cannot answer.
     contra_sup: []TypeId = &.{},
+    /// The union of every covariant candidate the incremental
+    /// `getCommonSupertype` fold DISCARDED — the ones `combineCovariant` left
+    /// behind because neither they nor the incumbent was a subtype of the
+    /// other, so `reduceLeft` kept the leftmost.
+    ///
+    /// tsc keeps the covariant candidates as a LIST too, and `getInferredType`
+    /// asks `every(inference.candidates, t => isTypeSubtypeOf(t,
+    /// inferredCovariantType))` before it will prefer the covariant answer over
+    /// a contravariant one: a candidate set that does not agree with itself is
+    /// not evidence any parameter position can be trusted with. Since a folded
+    /// accumulator cannot answer that, the losers are kept here — as a union,
+    /// which is a subtype of the fold's answer exactly when every one of them
+    /// is.
+    cov_drop: []TypeId = &.{},
     /// The `InferencePriority.LiteralKeyof` candidate set, one entry per type
     /// parameter — the object types synthesized when a `keyof T` PATTERN met a
     /// literal argument (`unify`'s `.keyof_op` arm). Kept apart from `contra`
@@ -849,6 +863,9 @@ pub fn inferTypeArgs(
     // Its per-candidate half (see `InferCtx.contra_sup`).
     const contra_sup = try c.scratch().alloc(TypeId, tp_syms.len);
     for (contra_sup) |*x| x.* = types.no_type;
+    // The covariant candidates the fold walked past (see `InferCtx.cov_drop`).
+    const cov_drop = try c.scratch().alloc(TypeId, tp_syms.len);
+    for (cov_drop) |*x| x.* = types.no_type;
     // tsc's `InferencePriority.LiteralKeyof` set (see `InferCtx.keyof_contra`).
     const keyof_contra = try c.scratch().alloc(TypeId, tp_syms.len);
     for (keyof_contra) |*x| x.* = types.no_type;
@@ -882,6 +899,7 @@ pub fn inferTypeArgs(
         .owner = candidates.ptr,
         .contra = contra,
         .contra_sup = contra_sup,
+        .cov_drop = cov_drop,
         .keyof_contra = keyof_contra,
         .top_flags = top_flags,
         .implied_arity = arity,
@@ -1202,6 +1220,7 @@ pub fn inferTypeArgs(
             // must never land.
             const probe_contra = try c.scratch().alloc(TypeId, tp_syms.len);
             const probe_contra_sup = try c.scratch().alloc(TypeId, tp_syms.len);
+            const probe_drop = try c.scratch().alloc(TypeId, tp_syms.len);
             const probe_keyof = try c.scratch().alloc(TypeId, tp_syms.len);
             const probe_top = try c.scratch().alloc(bool, tp_syms.len);
             // What pass two FEEDS each parameter, plus the pre-pass state —
@@ -1262,6 +1281,7 @@ pub fn inferTypeArgs(
                     for (0..tp_syms.len) |i| {
                         probe_contra[i] = types.no_type;
                         probe_contra_sup[i] = types.no_type;
+                        probe_drop[i] = types.no_type;
                         probe_keyof[i] = types.no_type;
                         probe_top[i] = true;
                     }
@@ -1343,17 +1363,20 @@ pub fn inferTypeArgs(
                         const sv_owner = c.infer_ctx.owner;
                         const sv_contra = c.infer_ctx.contra;
                         const sv_sup = c.infer_ctx.contra_sup;
+                        const sv_drop = c.infer_ctx.cov_drop;
                         const sv_keyof = c.infer_ctx.keyof_contra;
                         const sv_top = c.infer_ctx.top_flags;
                         c.infer_ctx.owner = probe_cands.ptr;
                         c.infer_ctx.contra = probe_contra;
                         c.infer_ctx.contra_sup = probe_contra_sup;
+                        c.infer_ctx.cov_drop = probe_drop;
                         c.infer_ctx.keyof_contra = probe_keyof;
                         c.infer_ctx.top_flags = probe_top;
                         defer {
                             c.infer_ctx.owner = sv_owner;
                             c.infer_ctx.contra = sv_contra;
                             c.infer_ctx.contra_sup = sv_sup;
+                            c.infer_ctx.cov_drop = sv_drop;
                             c.infer_ctx.keyof_contra = sv_keyof;
                             c.infer_ctx.top_flags = sv_top;
                         }
@@ -1413,6 +1436,7 @@ pub fn inferTypeArgs(
                     // `unknown` default and reported TS2322 on the callback.
                     // Same choice as the authoritative fold below, including
                     // the `LiteralKeyof` fallback.
+                    const probe_raw = try c.scratch().dupe(TypeId, probe_cands);
                     for (0..tp_syms.len) |i| {
                         if (probe_cands[i] == types.no_type and probe_contra[i] == types.no_type and
                             probe_keyof[i] != types.no_type)
@@ -1420,7 +1444,16 @@ pub fn inferTypeArgs(
                             probe_cands[i] = probe_keyof[i];
                             continue;
                         }
-                        probe_cands[i] = try preferContravariant(c, probe_cands[i], probe_contra[i], probe_contra_sup[i]);
+                        const dep = probe_contra[i] != types.no_type and probe_cands[i] != types.no_type and
+                            try dependentConflict(c, tp_syms, probe_raw, i, probe_cands[i]);
+                        probe_cands[i] = try preferContravariant(
+                            c,
+                            probe_cands[i],
+                            probe_contra[i],
+                            probe_contra_sup[i],
+                            probe_drop[i],
+                            dep,
+                        );
                     }
                     // Every type parameter is FIXED for pass two: one the
                     // probe could not infer takes its default/constraint (tsc
@@ -2011,6 +2044,10 @@ pub fn inferTypeArgs(
     // covariant `string | null` that `() => hoveredItemSV.get()` supplies and
     // reported TS2322 on the FIRST argument. `contra_sup` is the union of the
     // candidates, standing in for the `some` (see `InferCtx.contra_sup`).
+    //
+    // The two remaining guards need the OTHER parameters' raw candidates, so
+    // they are read before this loop overwrites any of them.
+    const raw_cov = try c.scratch().dupe(TypeId, candidates);
     for (candidates, 0..) |*cd, i| {
         // The `LiteralKeyof` set is the lowest-priority evidence there is: it
         // only ever says "the argument was a key of this parameter", so tsc
@@ -2023,7 +2060,9 @@ pub fn inferTypeArgs(
             cd.* = keyof_contra[i];
             continue;
         }
-        cd.* = try preferContravariant(c, cd.*, contra[i], contra_sup[i]);
+        const dep = contra[i] != types.no_type and cd.* != types.no_type and
+            try dependentConflict(c, tp_syms, raw_cov, i, cd.*);
+        cd.* = try preferContravariant(c, cd.*, contra[i], contra_sup[i], cov_drop[i], dep);
     }
     // A provisional map over the raw candidates, so an inter-dependent
     // constraint (`K extends keyof T`) is checked with the *other*
@@ -2876,15 +2915,71 @@ pub fn covStripNullable(c: *Checker, t: TypeId) Error!TypeId {
 ///
 /// ```ts
 /// inferredType = inferredCovariantType && !(inferredCovariantType.flags & TypeFlags.Never) &&
-///     some(inference.contraCandidates, t => isTypeSubtypeOf(inferredCovariantType, t)) ?
+///     every(inference.candidates, t => isTypeSubtypeOf(t, inferredCovariantType)) &&
+///     some(inference.contraCandidates, t => isTypeSubtypeOf(inferredCovariantType, t)) &&
+///     every(context.inferences, other => other === inference ||
+///         getConstraintOfTypeParameter(other.typeParameter) !== inference.typeParameter ||
+///         every(other.candidates, t => isTypeSubtypeOf(t, inferredCovariantType))) ?
 ///     inferredCovariantType : getContravariantInference(inference);
 /// ```
 ///
+/// All three guards on the covariant answer say the same thing from different
+/// directions: the covariant reading is preferred only when it is a reading
+/// EVERY position agrees with. `cov_drop` carries the first (the candidates
+/// the fold walked past — `InferCtx.cov_drop`), `con`/`con_sup` the second,
+/// and `dep_conflict` the third (a sibling parameter constrained to this one
+/// whose own candidate the covariant answer does not cover). Oracle-pinned:
+/// `every<T, U extends T>(readonly T[], (e: T) => e is U)` fed
+/// `readonly Decorator[] | readonly Modifier[]` answers `T = Node` in tsgo —
+/// the contravariant candidate — where the covariant fold alone answers
+/// `Decorator` and reports the argument (`coAndContraVariantInferences2`/`4`).
+///
+/// Does a SIBLING type parameter constrained to `tp_syms[i]` carry a covariant
+/// candidate the covariant answer `cov` does not cover? tsc's third guard —
+/// `every(context.inferences, other => other === inference ||
+/// getConstraintOfTypeParameter(other.typeParameter) !== inference.typeParameter
+/// || every(other.candidates, t => isTypeSubtypeOf(t, inferredCovariantType)))`.
+///
+/// `every<T, U extends T>(array: readonly T[], cb: (e: T) => e is U)` is the
+/// shape: fed a `Decorator[]` and a `node is Modifier` guard, the covariant
+/// answer for `T` is `Decorator`, which `U`'s candidate `Modifier` contradicts —
+/// so `T` takes the contravariant `Node` and `U` keeps `Modifier`, instead of
+/// both collapsing onto `Decorator` and blaming the argument.
+///
+/// `cov` is only compared against the OTHER parameters' raw covariant
+/// candidates, which is what tsc reads: the sibling's own co-/contravariant
+/// choice has not been made yet and does not enter this test.
+fn dependentConflict(
+    c: *Checker,
+    tp_syms: []const u32,
+    raw_cov: []const TypeId,
+    i: usize,
+    cov: TypeId,
+) Error!bool {
+    for (tp_syms, 0..) |sym, j| {
+        if (j == i or raw_cov[j] == types.no_type) continue;
+        const con = try c.typeParamConstraint(sym);
+        if (con == types.no_type or c.ts.kind(con) != .type_param) continue;
+        if (c.ts.typeParamSymbol(con) != tp_syms[i]) continue;
+        if (!try c.covSubtypeOf(raw_cov[j], cov)) return true;
+    }
+    return false;
+}
+
 /// Shared by the outer resolution and the two-round object-literal probe,
 /// which runs the same choice over its own scratch candidate arrays.
-fn preferContravariant(c: *Checker, cov: TypeId, con: TypeId, con_sup: TypeId) Error!TypeId {
+fn preferContravariant(
+    c: *Checker,
+    cov: TypeId,
+    con: TypeId,
+    con_sup: TypeId,
+    cov_drop: TypeId,
+    dep_conflict: bool,
+) Error!TypeId {
     if (con == types.no_type) return cov;
     if (cov == types.no_type or c.ts.kind(cov) == .never) return con;
+    if (dep_conflict) return con;
+    if (cov_drop != types.no_type and !try c.covSubtypeOf(cov_drop, cov)) return con;
     if (try c.covSubtypeOf(cov, con)) return cov;
     if (con_sup != types.no_type and try c.covSubtypeOf(cov, con_sup)) return cov;
     return con;
@@ -2962,12 +3057,23 @@ pub fn covSubtypeOf(c: *Checker, a: TypeId, b: TypeId) Error!bool {
 /// after the fold has already taken a mismatched-base step (`f(1, "a", 2)`
 /// yields `1 | 2` where tsc yields `1`), since the accumulator no longer
 /// records that the run of same-base literals was already broken.
-pub fn combineCovariant(c: *Checker, prev: TypeId, cand: TypeId) Error!TypeId {
-    if (prev == cand) return prev;
+///
+/// `Fold.dropped` is the candidate `reduceLeft` walked past — set only on the
+/// one step that keeps the LEFTMOST of two unrelated candidates, which is the
+/// step tsc's `every(candidates, t => isTypeSubtypeOf(t, …))` exists to catch
+/// (see `InferCtx.cov_drop`). Every other arm answers a union or a supertype
+/// that both inputs are subtypes of, so nothing is lost there.
+pub const Fold = struct {
+    ty: TypeId,
+    dropped: TypeId = types.no_type,
+};
+
+pub fn combineCovariant(c: *Checker, prev: TypeId, cand: TypeId) Error!Fold {
+    if (prev == cand) return .{ .ty = prev };
     const s = &c.ts;
     // `any` is a supertype of everything and a subtype of nothing in tsc's
     // subtype relation, so it wins the fold from either side.
-    if (s.kind(prev) == .any or s.kind(cand) == .any) return types.any_type;
+    if (s.kind(prev) == .any or s.kind(cand) == .any) return .{ .ty = types.any_type };
     // A bare type variable as a candidate is the weakest evidence there is
     // — it says the argument's shape MENTIONS the variable, not that the
     // parameter is it. tsc files such an inference at a lower
@@ -3018,8 +3124,8 @@ pub fn combineCovariant(c: *Checker, prev: TypeId, cand: TypeId) Error!TypeId {
     // and with subtype-related as well as unrelated candidates) agrees with the
     // positional fold everywhere except which position is named.
     if (c.infer_ctx.sig_ctx == 0 and
-        (s.kind(prev) == .type_param) != (s.kind(cand) == .type_param)) return c.makeUnion2(prev, cand);
-    if (c.covLiteralShape(prev) and c.covLiteralShape(cand)) return c.makeUnion2(prev, cand);
+        (s.kind(prev) == .type_param) != (s.kind(cand) == .type_param)) return .{ .ty = try c.makeUnion2(prev, cand) };
+    if (c.covLiteralShape(prev) and c.covLiteralShape(cand)) return .{ .ty = try c.makeUnion2(prev, cand) };
     // The literal candidates' union is folded in LAST, so a literal never
     // sits on the left of the pair. Only a FRESH OBJECT triggers the
     // reorder: it is the one shape ztsc can positively identify as written
@@ -3036,6 +3142,7 @@ pub fn combineCovariant(c: *Checker, prev: TypeId, cand: TypeId) Error!TypeId {
         b = try c.covStripNullable(b);
     }
     var res: TypeId = undefined;
+    var dropped: TypeId = types.no_type;
     if (s.kind(a) == .never) {
         res = b;
     } else if (s.kind(b) == .never) {
@@ -3046,11 +3153,20 @@ pub fn combineCovariant(c: *Checker, prev: TypeId, cand: TypeId) Error!TypeId {
             res = try c.makeUnion2(a, b);
             break :blk;
         }
-        res = if (try c.covSubtypeOf(a, b)) b else a;
+        if (try c.covSubtypeOf(a, b)) {
+            res = b;
+        } else {
+            // `reduceLeft` walked past `b`. It is only a CONFLICT when `b` is
+            // not a subtype of the kept candidate either — the ordinary
+            // supertype step (`b` narrower than `a`) keeps a candidate every
+            // other one is a subtype of, which is what the `every` test wants.
+            res = a;
+            dropped = b;
+        }
     }
     if (nulls & 1 != 0) res = try c.makeUnion2(res, types.undefined_type);
     if (nulls & 2 != 0) res = try c.makeUnion2(res, types.null_type);
-    return res;
+    return .{ .ty = res, .dropped = dropped };
 }
 
 /// Combine two contravariant inference candidates: tsc's
@@ -3084,6 +3200,20 @@ pub fn noteContraCandidate(c: *Checker, candidates: []TypeId, i: usize, cand: Ty
         cand
     else
         try c.ts.makeUnion(c.scratch(), &.{ ctx.contra_sup[i], cand });
+}
+
+/// Record a covariant candidate the fold discarded (see `InferCtx.cov_drop`).
+/// Same ownership shape as `noteContraCandidate`; a foreign accumulator — a
+/// reverse-mapped element's, a speculative copy's — keeps no drop set, so its
+/// fold behaves exactly as it did before this rule existed.
+fn noteCovDrop(c: *Checker, candidates: []TypeId, i: usize, cand: TypeId) Error!void {
+    const ctx = &c.infer_ctx;
+    if (ctx.owner != candidates.ptr) return;
+    if (ctx.cov_drop.len != candidates.len) return;
+    ctx.cov_drop[i] = if (ctx.cov_drop[i] == types.no_type)
+        cand
+    else
+        try c.ts.makeUnion(c.scratch(), &.{ ctx.cov_drop[i], cand });
 }
 
 /// tsc's `impliedArity` bookkeeping in `inferTypeArguments`:
@@ -3582,7 +3712,11 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 if (candidates[i] == types.no_type) {
                     candidates[i] = cand;
                 } else {
-                    candidates[i] = try c.combineCovariant(candidates[i], cand);
+                    const fold = try c.combineCovariant(candidates[i], cand);
+                    candidates[i] = fold.ty;
+                    if (fold.dropped != types.no_type) {
+                        try noteCovDrop(c, candidates, i, fold.dropped);
+                    }
                 }
             }
         },
