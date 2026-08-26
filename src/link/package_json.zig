@@ -138,9 +138,23 @@ pub fn exportsOf(alloc: Allocator, text: []const u8) ?tsconfig.Value {
     if (std.mem.indexOfScalar(u8, text, '\\') == null and
         std.mem.indexOf(u8, text, "\"exports\"") == null) return null;
     const root = tsconfig.parseJsonc(alloc, text) catch return null;
-    return switch (root) {
+    const val = switch (root) {
         .object => |ro| ro.get("exports"),
         else => null,
+    } orelse return null;
+    // tsc's `loadModuleFromExports` opens with `if (!scope.contents.
+    // packageJsonContent.exports) return undefined` — a JavaScript truthiness
+    // test, so `"exports": null` (and `""`) is a package with NO map at all,
+    // not a map that publishes nothing. The difference is the whole rule:
+    // an absent map falls through to `"types"`/`"main"`, a present one is
+    // authoritative. `nodeNextImportModeImplicitIndexResolution2` writes both
+    // — `"exports": null` beside `"exports": "./asdfasdfasdf"` — and tsgo
+    // resolves the first through the legacy fields and reports TS2307 for the
+    // second. An empty OBJECT is truthy and stays authoritative.
+    return switch (val) {
+        .null => null,
+        .string => |s| if (s.len == 0) null else val,
+        else => val,
     };
 }
 

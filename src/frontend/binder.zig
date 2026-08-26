@@ -4250,6 +4250,83 @@ const Binder = struct {
         }
     }
 
+    /// The NAME a member-name token spells, quotes stripped — the text half of
+    /// `memberAtom`, for the one caller that must not intern.
+    fn nameTextOfToken(b: *Binder, tok: TokenIndex) []const u8 {
+        const text = b.tokenText(tok);
+        return switch (b.tree.tokens.tag(tok)) {
+            .string_literal, .no_substitution_template_literal => stripQuotes(text),
+            else => text,
+        };
+    }
+
+    /// TS2300, once per file: two or more export SPECIFIERS that publish the
+    /// same exported name.
+    ///
+    /// tsc gets this from `declareSymbol`: an export specifier declares an
+    /// `Alias` in the module's `exports` table, and `SymbolFlags.AliasExcludes`
+    /// excludes every meaning including another alias, so a repeat is an
+    /// ordinary duplicate — reported at every spelling, the newcomer and each
+    /// declaration already in the group. ztsc has no `exports` symbol table
+    /// (a file's exports are a record list), so the count stands in for it.
+    ///
+    /// Scope, measured shape by shape against tsgo 7.0.2:
+    ///
+    ///   * one clause or several (`export {x as n}; export {y as n}`), a local
+    ///     clause or a re-export one, a `type`-only specifier beside a value
+    ///     one, and `export * as ns` twice — all duplicates;
+    ///   * the anchor is the EXPORTED name (`z` in `x as z`), not the local;
+    ///   * three spellings earn three diagnostics, not two;
+    ///   * `export {q as r, q as s}` — one local, two names — is legal;
+    ///   * a specifier against an export DECLARATION of the same name
+    ///     (`export const p = 1; export {p}`) is NOT this: tsc words it
+    ///     TS2323/TS2484, so only specifier-vs-specifier counts here;
+    ///   * `as default` twice is TS2528's slot (`checkDefaultExportClashes`),
+    ///     and stays out of this rule rather than being worded TS2300.
+    ///
+    /// Only file-scope records take part, for `checkDefaultExportClashes`'s
+    /// reason: a `declare module "spec" { … }` block and a `namespace N { … }`
+    /// body are containers of their own.
+    fn checkDuplicateExportSpecifiers(b: *Binder) Error!void {
+        // Exported atom -> (first spelling's token, already reported?). Scratch
+        // only, and empty for every file whose exports are all declarations.
+        var seen: std.AutoHashMapUnmanaged(Atom, struct { tok: TokenIndex, reported: bool }) = .empty;
+        defer seen.deinit(b.scratch);
+        for (b.export_recs.items) |rec| {
+            if (rec.scope != file_scope or rec.exported == 0) continue;
+            const tok: TokenIndex = switch (rec.kind) {
+                // `export { local as exported }` / `export { … } from "m"`: the
+                // record's node IS the specifier, whose `lhs` holds the
+                // exported-name token (0 for the shorthand, where the local
+                // name — the specifier's own main token — is both).
+                .named, .reexport_named => blk: {
+                    if (b.nodeTag(rec.node) != .export_specifier) continue;
+                    const sd = b.tree.nodeData(rec.node);
+                    break :blk if (sd.lhs != 0) sd.lhs else b.tree.nodeMainToken(rec.node);
+                },
+                // `export * as ns from "m"`: the name is on the statement.
+                .reexport_ns => b.tree.extraData(ast.ExportAll, b.tree.nodeData(rec.node).lhs).name_token,
+                else => continue,
+            };
+            if (tok == 0) continue;
+            // `as default` belongs to TS2528's slot. Tested on the token's own
+            // text rather than against an interned `"default"`: interning at
+            // seal time would add an atom the file never touched, which is
+            // exactly what the atom-renumbering contract forbids.
+            if (std.mem.eql(u8, nameTextOfToken(b, tok), "default")) continue;
+            const gop = try seen.getOrPut(b.scratch, rec.exported);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .{ .tok = tok, .reported = false };
+                continue;
+            }
+            if (!gop.value_ptr.reported) {
+                try b.diag(.duplicate_identifier, gop.value_ptr.tok);
+                gop.value_ptr.reported = true;
+            }
+            try b.diag(.duplicate_identifier, tok);
+        }
+    }
+
     fn bindExportDefault(b: *Binder, node: Node) Error!void {
         const d = b.tree.nodeData(node);
         const inner = d.lhs;
@@ -5831,6 +5908,7 @@ const Binder = struct {
             }
         }
         try b.checkDefaultExportClashes();
+        try b.checkDuplicateExportSpecifiers();
         // tsc's *export context* (`setExportContextFlag` / `hasExportDeclarations`):
         // a declaration file whose top level contains no export DECLARATION
         // (`export { … }`, `export * from`, `export =`, `export default <expr>`)
