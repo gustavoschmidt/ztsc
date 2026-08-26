@@ -291,15 +291,77 @@ fn containsAnyFunctionType(c: *Checker, t: TypeId, depth: u32) Error!bool {
     }
 }
 
+/// The contextual type of element `i` of an ARRAY literal `len` elements long,
+/// given the structurally-resolved contextual type `rctx` — the array-literal
+/// twin of `ctxPropType`, for the two-round walks below.
+///
+/// tsc's `getContextualTypeForElementExpression`: an array constituent
+/// contributes its element type, a tuple constituent the element at that
+/// position (`tuple_relate.contextualElemType`, which counts back from the END
+/// once a variable element precedes `i`), and a union the union of whatever its
+/// constituents hold there. Returns `no_type` when nothing does.
+///
+/// Callers must have ruled a SPREAD element out first: a spread makes the
+/// positions unknowable, which is exactly why `contextualElemType` refuses to
+/// be asked then.
+fn ctxElemType(c: *Checker, rctx: TypeId, i: u32, len: u32) Error!TypeId {
+    switch (c.ts.kind(rctx)) {
+        .array => return c.ts.arrayElem(rctx),
+        .tuple => return (try tuple_relate.contextualElemType(c, rctx, i, len)) orelse types.no_type,
+        .union_type, .intersection => {
+            var parts: std.ArrayList(TypeId) = .empty;
+            defer parts.deinit(c.scratch());
+            const ms = try c.scratch().dupe(TypeId, try c.memberList(rctx));
+            defer c.scratch().free(ms);
+            for (ms) |m| {
+                const et = try ctxElemType(c, try c.resolveStructural(m), i, len);
+                if (et != types.no_type) try parts.append(c.scratch(), et);
+            }
+            if (parts.items.len == 0) return types.no_type;
+            return c.ts.makeUnion(c.scratch(), parts.items);
+        },
+        else => return types.no_type,
+    }
+}
+
+/// Does this literal's element list hold a SPREAD? A spread shifts every
+/// position after it by an amount only the spread's own type knows, so the
+/// positional walks below decline the whole literal rather than mis-pair one
+/// element (the same surrender `tuple_relate.contextualElemType` documents).
+fn litHasSpread(c: *Checker, node: Node) bool {
+    for (c.tree.nodeRange(node)) |el| {
+        if (el != null_node and c.nodeTag(el) == .spread_element) return true;
+    }
+    return false;
+}
+
 /// Would the pass-two contextual type `ctx2` leave one of `node`'s
 /// context-sensitive function properties with NO call signature? That is the
 /// one outcome the skipped round cannot be allowed to produce: the property's
 /// parameters would go implicit `any` in the AUTHORITATIVE pass, which is a
 /// diagnostic tsc does not report and the context-free reading did not
 /// produce either.
+///
+/// `node` is an object literal or an ARRAY literal; the two differ only in how
+/// a member is paired with its contextual type (by name, by position), which is
+/// what the two arms below do before handing the pair to the shared test.
 fn ctxSensitiveLosesSignature(c: *Checker, node: Node, ctx2: TypeId, depth: u8) Error!bool {
     if (depth > 4) return false;
     const rp = try c.resolveStructural(ctx2);
+    if (c.nodeTag(node) == .array_literal) {
+        switch (c.ts.kind(rp)) {
+            .array, .tuple, .union_type, .intersection => {},
+            else => return false,
+        }
+        if (litHasSpread(c, node)) return false;
+        const els = c.tree.nodeRange(node);
+        for (els, 0..) |el, i| {
+            if (el == null_node) continue;
+            const et = try ctxElemType(c, rp, @intCast(i), @intCast(els.len));
+            if (try valueLosesSignature(c, skipParens(c, el), et, depth)) return true;
+        }
+        return false;
+    }
     switch (c.ts.kind(rp)) {
         .object, .union_type, .intersection => {},
         else => return false,
@@ -319,20 +381,27 @@ fn ctxSensitiveLosesSignature(c: *Checker, node: Node, ctx2: TypeId, depth: u8) 
         if (val == null_node) continue;
         const key = try c.memberAtom(c.tree.nodeMainToken(m));
         const prop_ty = try c.ctxPropType(rp, ctx2, key);
-        switch (c.nodeTag(val)) {
-            .arrow_fn, .function_expr => {
-                if (!c.fnExprIsContextSensitive(val)) continue;
-                if (prop_ty == types.no_type) return true;
-                if (try c.contextualCallSig(prop_ty, val) == types.no_type) return true;
-            },
-            .object_literal => {
-                if (prop_ty == types.no_type) continue;
-                if (try ctxSensitiveLosesSignature(c, val, prop_ty, depth + 1)) return true;
-            },
-            else => {},
-        }
+        if (try valueLosesSignature(c, val, prop_ty, depth)) return true;
     }
     return false;
+}
+
+/// One member of the walk above: the value `val` is contextually typed by
+/// `member_ty` (`no_type` when the contextual type holds nothing there).
+fn valueLosesSignature(c: *Checker, val: Node, member_ty: TypeId, depth: u8) Error!bool {
+    if (val == null_node) return false;
+    switch (c.nodeTag(val)) {
+        .arrow_fn, .function_expr => {
+            if (!c.fnExprIsContextSensitive(val)) return false;
+            if (member_ty == types.no_type) return true;
+            return try c.contextualCallSig(member_ty, val) == types.no_type;
+        },
+        .object_literal, .array_literal => {
+            if (member_ty == types.no_type) return false;
+            return try ctxSensitiveLosesSignature(c, val, member_ty, depth + 1);
+        },
+        else => return false,
+    }
 }
 
 /// Mark every one of `tp_syms` that `t` mentions. The walk mirrors
@@ -445,6 +514,23 @@ fn markCtxSensitiveFixed(
 ) Error!void {
     if (depth > 4) return;
     const rp = try c.resolveStructural(pt);
+    // An ARRAY literal pairs its members with the contextual type by POSITION
+    // rather than by name; everything downstream of the pair is the same.
+    if (c.nodeTag(node) == .array_literal) {
+        switch (c.ts.kind(rp)) {
+            .array, .tuple, .union_type, .intersection => {},
+            else => return,
+        }
+        if (litHasSpread(c, node)) return;
+        const els = c.tree.nodeRange(node);
+        for (els, 0..) |el, i| {
+            if (el == null_node) continue;
+            const et = try ctxElemType(c, rp, @intCast(i), @intCast(els.len));
+            if (et == types.no_type) continue;
+            try markMemberCtxSensitiveFixed(c, skipParens(c, el), et, tp_syms, param_pos, ret_only, depth);
+        }
+        return;
+    }
     // Only a materialized member table can name a property. A parameter type
     // that is still a bare type variable or a generic mapped type has none,
     // and asking for one drags the key-domain walk through a self-referential
@@ -468,28 +554,57 @@ fn markCtxSensitiveFixed(
         const key = try c.memberAtom(c.tree.nodeMainToken(m));
         const prop_ty = try c.ctxPropType(rp, pt, key);
         if (prop_ty == types.no_type) continue;
-        switch (c.nodeTag(val)) {
-            .arrow_fn, .function_expr => {
-                if (!c.fnExprIsContextSensitive(val)) continue;
-                const sig = try c.contextualCallSig(prop_ty, val);
-                if (sig == types.no_type or c.ts.kind(sig) != .function) continue;
-                const mine = try c.scratch().alloc(bool, tp_syms.len);
-                defer c.scratch().free(mine);
-                for (mine) |*x| x.* = false;
-                const th = c.ts.fnThisType(sig);
-                if (th != 0) try markMentionedTps(c, th, tp_syms, mine, 0);
-                try markFixedByParams(c, val, sig, tp_syms, mine);
-                const rets = try c.scratch().alloc(bool, tp_syms.len);
-                defer c.scratch().free(rets);
-                for (rets) |*x| x.* = false;
-                try markMentionedTps(c, c.ts.fnReturn(sig), tp_syms, rets, 0);
-                for (0..tp_syms.len) |i| {
-                    if (mine[i]) param_pos[i] = true else if (rets[i]) ret_only[i] = true;
-                }
-            },
-            .object_literal => try markCtxSensitiveFixed(c, val, prop_ty, tp_syms, param_pos, ret_only, depth + 1),
-            else => {},
-        }
+        try markMemberCtxSensitiveFixed(c, val, prop_ty, tp_syms, param_pos, ret_only, depth);
+    }
+}
+
+/// One member of `markCtxSensitiveFixed`'s walk, already paired with the
+/// contextual type `member_ty` its position or name resolves to.
+fn markMemberCtxSensitiveFixed(
+    c: *Checker,
+    val: Node,
+    member_ty: TypeId,
+    tp_syms: []const u32,
+    param_pos: []bool,
+    ret_only: []bool,
+    depth: u8,
+) Error!void {
+    if (val == null_node) return;
+    switch (c.nodeTag(val)) {
+        .arrow_fn, .function_expr => {
+            if (!c.fnExprIsContextSensitive(val)) return;
+            const sig = try c.contextualCallSig(member_ty, val);
+            if (sig == types.no_type or c.ts.kind(sig) != .function) return;
+            const mine = try c.scratch().alloc(bool, tp_syms.len);
+            defer c.scratch().free(mine);
+            for (mine) |*x| x.* = false;
+            const th = c.ts.fnThisType(sig);
+            if (th != 0) try markMentionedTps(c, th, tp_syms, mine, 0);
+            try markFixedByParams(c, val, sig, tp_syms, mine);
+            const rets = try c.scratch().alloc(bool, tp_syms.len);
+            defer c.scratch().free(rets);
+            for (rets) |*x| x.* = false;
+            try markMentionedTps(c, c.ts.fnReturn(sig), tp_syms, rets, 0);
+            // A type PREDICATE is part of what the contextual return says, and
+            // `unify` infers from it (the `filter<S extends T>(p: (x: T) => x
+            // is S)` arm). `fnReturn` of a guard signature is `boolean`, so a
+            // parameter named only in the guard was invisible here: never
+            // marked `ret_only`, so the return-only re-read that would have
+            // found it never ran and it fell to its constraint.
+            // `branch({test: x, if: (t): t is "a" => …, then: u => …})` on
+            // `<T, U extends T>(_: {test: T, if: (t: T) => t is U, then: (u: U)
+            // => void})` gave `u` the whole `"a" | "b"`
+            // (`intraExpressionInferences`).
+            if (c.ts.fnHasPredicate(sig)) {
+                const pr = c.ts.fnPredicate(sig);
+                if (!pr.asserts and pr.ty != 0) try markMentionedTps(c, pr.ty, tp_syms, rets, 0);
+            }
+            for (0..tp_syms.len) |i| {
+                if (mine[i]) param_pos[i] = true else if (rets[i]) ret_only[i] = true;
+            }
+        },
+        .object_literal, .array_literal => try markCtxSensitiveFixed(c, val, member_ty, tp_syms, param_pos, ret_only, depth + 1),
+        else => {},
     }
 }
 
@@ -837,6 +952,94 @@ pub const InferCtx = struct {
         owner: ?[*]TypeId = null,
         flags: []bool = &.{},
     };
+};
+
+/// The scratch accumulator a SPECULATIVE inference round writes into — one
+/// covariant array plus the whole side-table set `InferCtx` keys on it.
+///
+/// Every side table checks `InferCtx.owner` and declines for a foreign array,
+/// so a probe that leaves `owner` pointed at the real accumulator does not run
+/// "without side tables" — it QUIETLY WIDENS: a candidate found in a PARAMETER
+/// position, which `contraSlot` should have caught, falls through into the
+/// probe's COVARIANT array instead, and a candidate tsc records at
+/// `NakedTypeVariable` priority lands at full priority. Registering the set is
+/// therefore part of running a probe at all, which is why it lives here rather
+/// than being spelled out at each call site.
+const ProbeTables = struct {
+    cands: []TypeId,
+    contra: []TypeId,
+    contra_sup: []TypeId,
+    cov_drop: []TypeId,
+    keyof: []TypeId,
+    top: []bool,
+    rev: []bool,
+
+    fn init(c: *Checker, n: usize) Error!ProbeTables {
+        return .{
+            .cands = try c.scratch().alloc(TypeId, n),
+            .contra = try c.scratch().alloc(TypeId, n),
+            .contra_sup = try c.scratch().alloc(TypeId, n),
+            .cov_drop = try c.scratch().alloc(TypeId, n),
+            .keyof = try c.scratch().alloc(TypeId, n),
+            .top = try c.scratch().alloc(bool, n),
+            .rev = try c.scratch().alloc(bool, n),
+        };
+    }
+
+    /// Start a fresh round: the covariant array carries what the call has
+    /// already committed, every side table starts empty.
+    fn reset(self: ProbeTables, committed: []const TypeId) void {
+        for (committed, 0..) |cd, i| {
+            self.cands[i] = cd;
+            self.contra[i] = types.no_type;
+            self.contra_sup[i] = types.no_type;
+            self.cov_drop[i] = types.no_type;
+            self.keyof[i] = types.no_type;
+            self.top[i] = true;
+            self.rev[i] = false;
+        }
+    }
+
+    /// What `push` displaced, for `pop` to put back.
+    const Saved = struct {
+        owner: ?[*]TypeId,
+        contra: []TypeId,
+        contra_sup: []TypeId,
+        cov_drop: []TypeId,
+        keyof_contra: []TypeId,
+        top_flags: []bool,
+        rev: InferCtx.Rev,
+    };
+
+    fn push(self: ProbeTables, c: *Checker) Saved {
+        const sv: Saved = .{
+            .owner = c.infer_ctx.owner,
+            .contra = c.infer_ctx.contra,
+            .contra_sup = c.infer_ctx.contra_sup,
+            .cov_drop = c.infer_ctx.cov_drop,
+            .keyof_contra = c.infer_ctx.keyof_contra,
+            .top_flags = c.infer_ctx.top_flags,
+            .rev = c.infer_ctx.rev,
+        };
+        c.infer_ctx.owner = self.cands.ptr;
+        c.infer_ctx.contra = self.contra;
+        c.infer_ctx.contra_sup = self.contra_sup;
+        c.infer_ctx.cov_drop = self.cov_drop;
+        c.infer_ctx.keyof_contra = self.keyof;
+        c.infer_ctx.top_flags = self.top;
+        c.infer_ctx.rev = .{ .owner = self.cands.ptr, .flags = self.rev };
+        return sv;
+    }
+
+    fn pop(c: *Checker, sv: Saved) void {
+        c.infer_ctx.owner = sv.owner;
+        c.infer_ctx.contra = sv.contra;
+        c.infer_ctx.contra_sup = sv.contra_sup;
+        c.infer_ctx.cov_drop = sv.cov_drop;
+        c.infer_ctx.keyof_contra = sv.keyof_contra;
+        c.infer_ctx.top_flags = sv.top_flags;
+        c.infer_ctx.rev = sv.rev;
+    }
 };
 
 /// Basic unification: gather candidates for each type parameter from
@@ -1205,24 +1408,51 @@ pub fn inferTypeArgs(
         // `slice.actions`' `{ [Type in keyof CaseReducers]: … }` to `{}`.
         // The two passes fix `State` between them, which is exactly the
         // missing step, so they run for a NESTED-only sensitivity.
-        if (tag == .object_literal and c.exprIsContextSensitive(an, 0) and
-            (arg_ctx == types.no_type or !c.objLitIsShallowContextSensitive(an)))
-        {
-            const probe_cands = try c.scratch().alloc(TypeId, tp_syms.len);
-            for (candidates, 0..) |cd, i| probe_cands[i] = cd;
-            // The probe's OWN co-/contravariant split. It is this call's
-            // inference run into a scratch accumulator, so it needs the whole
-            // side-table set, not just the priority tier: `contraSlot` and
-            // friends key on `InferCtx.owner`, and leaving that pointed at the
-            // real accumulator makes every side table decline for the probe —
-            // which quietly WIDENS a parameter-position candidate into the
-            // probe's covariant array, the one place a contravariant candidate
-            // must never land.
-            const probe_contra = try c.scratch().alloc(TypeId, tp_syms.len);
-            const probe_contra_sup = try c.scratch().alloc(TypeId, tp_syms.len);
-            const probe_drop = try c.scratch().alloc(TypeId, tp_syms.len);
-            const probe_keyof = try c.scratch().alloc(TypeId, tp_syms.len);
-            const probe_top = try c.scratch().alloc(bool, tp_syms.len);
+        //
+        // An ARRAY literal takes the same two rounds, and for the same reason.
+        // tsc's `isContextSensitive` carries the property up out of an array
+        // literal exactly as it does out of an object literal, so `resolveCall`
+        // sets `SkipContextSensitive` for `f([x => …])` too, and round one
+        // leaves the type parameters those elements would determine open.
+        // Read in ONE pass against a parameter with its variables still free,
+        // the elements are typed from those free variables and report against
+        // them:
+        //
+        //     interface Callback<T> {
+        //       (error: null, result: T): unknown
+        //       (error: Error, result: null): unknown
+        //     }
+        //     declare function series<T>(tasks: ((cb: Callback<T>) => unknown)[],
+        //                                done: Callback<T[]>): void;
+        //     series([cb => cb(null, 1)], (error, results) => { })
+        //
+        // `cb` was `Callback<T>` with `T` free, so neither overload accepted
+        // `(null, 1)` and every element got a TS2769 tsgo does not report
+        // (`contextualOverloadListFromArrayUnion`). Fixing `T` between the
+        // rounds — here at its `getInferredType` fallback, `unknown` — hands
+        // round two `Callback<unknown>`, which the first overload accepts.
+        //
+        // No shallow-sensitivity exemption on this side: an object literal
+        // gets one because a literal-keeping contextual type names each of its
+        // top-level callbacks by a PROPERTY of the parameter, so the single
+        // read is the better one. An array literal's elements are named only
+        // by the element type, which is a bare inference variable of this very
+        // call as often as not — the nested case, where the two rounds are the
+        // whole point.
+        //
+        // The tag is asked FIRST: `exprIsContextSensitive` is a tree walk, and
+        // every other argument shape answers the question by its tag alone.
+        if (switch (tag) {
+            .object_literal => c.exprIsContextSensitive(an, 0) and
+                (arg_ctx == types.no_type or !c.objLitIsShallowContextSensitive(an)),
+            .array_literal => c.exprIsContextSensitive(an, 0),
+            else => false,
+        }) {
+            // The probe's OWN co-/contravariant split — see `ProbeTables`. It
+            // is this call's inference run into a scratch accumulator, so it
+            // needs the whole side-table set, not just the priority tier.
+            const probe = try ProbeTables.init(c, tp_syms.len);
+            const probe_cands = probe.cands;
             // What pass two FEEDS each parameter, plus the pre-pass state —
             // read by the contravariant echo guard after the re-check.
             const fed2 = try c.scratch().alloc(TypeId, tp_syms.len);
@@ -1277,14 +1507,7 @@ pub fn inferTypeArgs(
                 // reached only when the faithful round yields nothing usable.
                 var attempt: u8 = 0;
                 while (true) : (attempt += 1) {
-                    for (candidates, 0..) |cd, i| probe_cands[i] = cd;
-                    for (0..tp_syms.len) |i| {
-                        probe_contra[i] = types.no_type;
-                        probe_contra_sup[i] = types.no_type;
-                        probe_drop[i] = types.no_type;
-                        probe_keyof[i] = types.no_type;
-                        probe_top[i] = true;
-                    }
+                    probe.reset(candidates);
                     map2.clearRetainingCapacity();
                     {
                         const saved_skip = c.skip_ctx_sensitive;
@@ -1355,33 +1578,10 @@ pub fn inferTypeArgs(
                         //     contravariant candidate must be `string |
                         //     undefined` rather than `string` or nothing is a
                         //     subtype of it.
-                        const probe_rev = try c.scratch().alloc(bool, tp_syms.len);
-                        for (probe_rev) |*x| x.* = false;
-                        const outer_rev = c.infer_ctx.rev;
-                        c.infer_ctx.rev = .{ .owner = probe_cands.ptr, .flags = probe_rev };
-                        defer c.infer_ctx.rev = outer_rev;
-                        const sv_owner = c.infer_ctx.owner;
-                        const sv_contra = c.infer_ctx.contra;
-                        const sv_sup = c.infer_ctx.contra_sup;
-                        const sv_drop = c.infer_ctx.cov_drop;
-                        const sv_keyof = c.infer_ctx.keyof_contra;
-                        const sv_top = c.infer_ctx.top_flags;
-                        c.infer_ctx.owner = probe_cands.ptr;
-                        c.infer_ctx.contra = probe_contra;
-                        c.infer_ctx.contra_sup = probe_contra_sup;
-                        c.infer_ctx.cov_drop = probe_drop;
-                        c.infer_ctx.keyof_contra = probe_keyof;
-                        c.infer_ctx.top_flags = probe_top;
-                        defer {
-                            c.infer_ctx.owner = sv_owner;
-                            c.infer_ctx.contra = sv_contra;
-                            c.infer_ctx.contra_sup = sv_sup;
-                            c.infer_ctx.cov_drop = sv_drop;
-                            c.infer_ctx.keyof_contra = sv_keyof;
-                            c.infer_ctx.top_flags = sv_top;
-                        }
-                        const probe = try c.checkExprCached(an, arg_ctx);
-                        try c.unify(pt, probe, tp_syms, probe_cands, 0);
+                        const sv = probe.push(c);
+                        defer ProbeTables.pop(c, sv);
+                        const probe_ty = try c.checkExprCached(an, arg_ctx);
+                        try c.unify(pt, probe_ty, tp_syms, probe_cands, 0);
                     }
                     // The properties EARLIER in the literal have already
                     // contributed by the time tsc instantiates a later
@@ -1403,26 +1603,73 @@ pub fn inferTypeArgs(
                     // So a parameter that some context-sensitive property
                     // determines through its return, and that round one left
                     // open, is re-derived from a second speculative read with
-                    // the skip OFF. Nothing else takes a candidate from it —
-                    // in particular not a parameter the callback names in its
-                    // own PARAMETERS, which is the placeholder echo round one
-                    // exists to refuse.
+                    // the skip OFF. Only its COVARIANT array is read: what the
+                    // re-read is asked for is the RETURN evidence round one
+                    // skipped, and a parameter the same callback names in its
+                    // own PARAMETERS hands back the free variable it was fed —
+                    // the placeholder echo round one exists to refuse.
+                    //
+                    // Which is why the re-read gets its OWN `ProbeTables`. With
+                    // the side tables still pointed at the real accumulator, a
+                    // parameter-position candidate has nowhere contravariant to
+                    // land and falls through into the covariant array instead,
+                    // so the echo comes back as an answer:
+                    // `callItT([_a => 0, n => n.toFixed()])` on
+                    // `<T>(obj: [(n: number) => T, (x: T) => void])` read
+                    // `T = number | T` — element 0's genuine `number` unioned
+                    // with element 1's echo — and reported TS2339 for
+                    // `toFixed` on `number | T` (`intraExpressionInferences`).
                     if (attempt == 0) {
                         var want_ret_only = false;
                         for (0..tp_syms.len) |i| {
                             if (cs_ret_only[i] and probe_cands[i] == types.no_type) want_ret_only = true;
                         }
                         if (want_ret_only) {
-                            const ro_cands = try c.scratch().alloc(TypeId, tp_syms.len);
-                            for (candidates, 0..) |cd, i| ro_cands[i] = cd;
+                            const ro = try ProbeTables.init(c, tp_syms.len);
+                            ro.reset(candidates);
                             const saved_aft2 = c.aft_seen;
                             c.aft_seen = false;
-                            const ro_probe = try c.checkExprCached(an, arg_ctx);
-                            try c.unify(pt, ro_probe, tp_syms, ro_cands, 0);
+                            // Read against the PARAMETER with attempt 0's
+                            // inferences substituted — tsc's round two, whose
+                            // contextual type is `instantiateType(paramType,
+                            // context.nonFixingMapper)`: what inference has
+                            // reached is in, and a parameter it has not reached
+                            // stays FREE. A context-free re-read cannot answer
+                            // the question at all: every un-annotated callback
+                            // parameter is then implicit `any`, and `unify`
+                            // refuses an `any` inside a speculative probe (it
+                            // is the artifact the probe exists to resolve), so
+                            // the return that names the wanted parameter yields
+                            // nothing. `test({a: () => 0, b: (a) => a, c: (b) =>
+                            // …})` on `{a(): R1, b(a: R1): R2, c(b: R2): void}`
+                            // is the shape: with `R1` substituted, `b` reads as
+                            // `(a: number) => number` and `R2` is `number`;
+                            // read context-free it was `(a: any) => any`, `R2`
+                            // fell to its `unknown` fallback, and `c`'s body
+                            // reported TS2322 in the authoritative pass
+                            // (`intraExpressionInferences`).
+                            const ro_ctx = try c.instantiateKnownParams(pt, tp_syms, probe_cands, ret_seed);
+                            {
+                                const sv = ro.push(c);
+                                defer ProbeTables.pop(c, sv);
+                                // The re-read was handed a contextual type
+                                // carrying this call's own still-free variables,
+                                // so a position that merely adopts one hands it
+                                // straight back — `InferCtx.ctx_echo`, the same
+                                // guard Phase 1 raises for every argument it
+                                // contextually types. `c: (b) => …` against
+                                // `c(b: R2): void` recorded `R2 := R2`, which
+                                // unioned with the real `number` from `b`'s
+                                // return and gave `c`'s body `number | R2`.
+                                c.infer_ctx.ctx_echo += 1;
+                                defer c.infer_ctx.ctx_echo -= 1;
+                                const ro_probe = try c.checkExprCached(an, ro_ctx);
+                                try c.unify(pt, ro_probe, tp_syms, ro.cands, 0);
+                            }
                             c.aft_seen = saved_aft2;
                             for (0..tp_syms.len) |i| {
                                 if (!cs_ret_only[i] or probe_cands[i] != types.no_type) continue;
-                                probe_cands[i] = ro_cands[i];
+                                probe_cands[i] = ro.cands[i];
                             }
                         }
                     }
@@ -1438,20 +1685,20 @@ pub fn inferTypeArgs(
                     // the `LiteralKeyof` fallback.
                     const probe_raw = try c.scratch().dupe(TypeId, probe_cands);
                     for (0..tp_syms.len) |i| {
-                        if (probe_cands[i] == types.no_type and probe_contra[i] == types.no_type and
-                            probe_keyof[i] != types.no_type)
+                        if (probe_cands[i] == types.no_type and probe.contra[i] == types.no_type and
+                            probe.keyof[i] != types.no_type)
                         {
-                            probe_cands[i] = probe_keyof[i];
+                            probe_cands[i] = probe.keyof[i];
                             continue;
                         }
-                        const dep = probe_contra[i] != types.no_type and probe_cands[i] != types.no_type and
+                        const dep = probe.contra[i] != types.no_type and probe_cands[i] != types.no_type and
                             try dependentConflict(c, tp_syms, probe_raw, i, probe_cands[i]);
                         probe_cands[i] = try preferContravariant(
                             c,
                             probe_cands[i],
-                            probe_contra[i],
-                            probe_contra_sup[i],
-                            probe_drop[i],
+                            probe.contra[i],
+                            probe.contra_sup[i],
+                            probe.cov_drop[i],
                             dep,
                         );
                     }
