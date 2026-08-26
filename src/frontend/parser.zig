@@ -5414,6 +5414,25 @@ const Parser = struct {
             p.jump = .{ .labels_base = p.labels.items.len, .in_function = true };
             p.fn_ctx = if (flags & ast.Flags.async != 0) .async_fn else .sync;
             p.yield_ctx = star != null;
+            // A `declare` METHOD is an ambient context of its own, exactly as
+            // `declare function f() {}` is at statement level — so a BODY
+            // behind it is TS1183 (`class C { declare Foo() {} }`, which also
+            // earns TS1031 for the `declare` itself: two passes, two answers).
+            //
+            // A `get`/`set`/`constructor` is NOT, even though it earns the very
+            // same TS1031: tsc reaches TS1183 for those three only through the
+            // grammar chain that `checkGrammarModifiers` has already
+            // short-circuited, while a method's arrives from
+            // `checkFunctionOrMethodDeclaration`, which runs regardless. Both
+            // halves measured on tsgo 7.0.2 — and note this is only about a
+            // member's OWN `declare`: inside a `declare class`, all four kinds
+            // are TS1183, which the INHERITED `p.ambient` already gives.
+            const declare_method = flags & ast.Flags.declare != 0 and
+                flags & (ast.Flags.get | ast.Flags.set) == 0 and
+                !(computed == null and p.tokTagAt(name_tok) == .keyword_constructor);
+            const was_ambient = p.ambient;
+            p.ambient = was_ambient or declare_method;
+            defer p.ambient = was_ambient;
             // The `<` of a type-parameter list, if there is one. Captured
             // BEFORE the prototype is read (afterwards the token is consumed
             // and the index is stable) so TS1092 can blame the list, which is
