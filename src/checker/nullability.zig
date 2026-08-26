@@ -17,6 +17,7 @@ const TypeId = types.TypeId;
 const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
+const simplifyMappedIndexAccessRead = @import("mapped.zig").simplifyMappedIndexAccessRead;
 
 pub fn removeUndefined(c: *Checker, t: TypeId) Error!TypeId {
     return c.filterUnion(t, struct {
@@ -98,8 +99,7 @@ fn nonNullableScalar(c: *Checker, t: TypeId) Error!TypeId {
     // used here: there is no `T` slot to stay assignable to.
     switch (c.ts.kind(t)) {
         .conditional, .index_access => {
-            const base = try c.transitiveBaseConstraint(t);
-            if (base != t and base != types.no_type and c.containsNullish(base)) {
+            if (try deferredAdmitsNullish(c, t)) {
                 return c.ts.makeIntersection(c.scratch(), &.{ t, types.empty_object_type });
             }
         },
@@ -111,6 +111,33 @@ fn nonNullableScalar(c: *Checker, t: TypeId) Error!TypeId {
             return k != .undefined and k != .null;
         }
     }.keep);
+}
+
+/// Does the DEFERRED type `t` — a conditional or an indexed access, neither of
+/// which has constituents of its own — stand for values that can be `null` or
+/// `undefined`? The question is answered where the answer lives: the BASE
+/// CONSTRAINT, which is what tsc's `getTypeFacts` reads for an instantiable
+/// type. `Partial<T>[K]` is the shape that matters — every instantiation of it
+/// admits `undefined`, and nothing about the access itself says so.
+///
+/// One predicate, two callers, and they MUST agree: `nonNullableScalar` builds
+/// the `t & {}` marker exactly when this is true, and `canBeNullish` decides
+/// exactly when that marker gets built at all. Were `canBeNullish` the looser
+/// of the two, `a ?? b` would form a union whose left arm is the bare deferred
+/// type, which no reduction can absorb.
+fn deferredAdmitsNullish(c: *Checker, t: TypeId) Error!bool {
+    // A MAPPED receiver answers through its SIMPLIFICATION, because that is
+    // the only place the map's own `+?` is spelled: `Partial<T>[K]` reads as
+    // `T[K] | undefined`, while its base constraint — all an unsimplified
+    // access has to go on — is `T[K]`'s and knows nothing about the optional
+    // modifier the map added. tsc has no such split: `getTypeFacts` runs on
+    // `getSimplifiedIndexedAccessType`'s result, which already carries the
+    // `undefined` (`getTemplateTypeFromMappedType`'s `addOptionality`).
+    if (c.ts.kind(t) == .index_access) {
+        if (try simplifyMappedIndexAccessRead(c, t)) |sim| return canBeNullish(c, sim, 0);
+    }
+    const base = try c.transitiveBaseConstraint(t);
+    return base != t and base != types.no_type and c.containsNullish(base);
 }
 
 /// `??`'s left operand. tsc's `getNonNullableType` is
@@ -316,6 +343,16 @@ pub fn canBeNullish(c: *Checker, t: TypeId, depth: u32) Error!bool {
             return c.canBeNullish(r, depth + 1);
         },
         .conditional, .infer_var, .mapped_param => return true,
+        // A deferred indexed access has no constituents to inspect, so the
+        // `else` arm's "no" was the answer for every one of them — and a "no"
+        // here short-circuits `??` to its left operand, which means the
+        // `t & {}` `nonNullableScalar` builds for exactly this shape was
+        // unreachable. `Partial<T>[K] ?? {}` is the case: `{ [P in keyof T]?:
+        // T[P] }[K]` admits `undefined` at every instantiation, and reading
+        // that off the constraint is what tsc's `getTypeFacts` does for an
+        // instantiable type. Unconstrained (or non-nullish-constrained)
+        // accesses keep the old answer.
+        .index_access => return deferredAdmitsNullish(c, t),
         else => return false,
     }
 }

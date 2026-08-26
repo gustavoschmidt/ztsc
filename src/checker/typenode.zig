@@ -1002,7 +1002,9 @@ pub fn reduceSubtypes(c: *Checker, t: TypeId) Error!TypeId {
         for (members, 0..) |o, j| {
             if (i == j) continue;
             if (c.ts.objectIsFresh(o)) continue; // a fresh literal never absorbs
-            if (isEmptyAnonObject(c, o)) continue; // `{}` never absorbs
+            // `{}` never absorbs — except the one sibling that carries `{}`
+            // inside itself (see `carriesEmptyObject`).
+            if (isEmptyAnonObject(c, o) and !try carriesEmptyObject(c, m)) continue;
             if (m_fresh and try freshHasExcessProp(c, m, o)) continue;
             if (!try c.isAssignable(m, o)) continue; // m not a subtype of o
             if (try strictArityWiderThan(c, m, o)) continue; // nor under StrictArity
@@ -1153,6 +1155,28 @@ fn freshHasExcessProp(c: *Checker, m: TypeId, o0: TypeId) Error!bool {
     for (0..s.objectPropCount(m)) |i| {
         if (s.objectPropByName(o, s.objectProp(m, @intCast(i)).name) == null) return true;
     }
+    return false;
+}
+
+/// Is `m` an intersection with `{}` as a LITERAL constituent — the marker
+/// `getNonNullableType` re-forms for a bare type parameter or a deferred
+/// conditional/indexed access whose constraint admits nullish?
+///
+/// `reduceSubtypes` otherwise refuses to let `{}` absorb anything, because
+/// assignability to `{}` is near-universal while tsc's SUBTYPE relation is
+/// not, and treating the two as the same would collapse unions tsc keeps.
+/// That reasoning does not reach a sibling that already has `{}` written into
+/// it: `X & {}` is a subtype of `{}` by construction, in tsc's relation as
+/// much as in ztsc's, so the `??` in
+///
+///     const obj: Record<string, V | undefined> = deleted[property] ?? {};
+///
+/// (`deleted: Partial<T>`, `property: K extends keyof T`) reduces
+/// `(Partial<T>[K] & {}) | {}` to `{}` — the type tsc gives it — instead of
+/// keeping a deferred arm that no target can accept.
+fn carriesEmptyObject(c: *Checker, m: TypeId) Error!bool {
+    if (c.ts.kind(m) != .intersection) return false;
+    for (try c.memberList(m)) |k| if (isEmptyAnonObject(c, k)) return true;
     return false;
 }
 
