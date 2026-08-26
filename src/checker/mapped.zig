@@ -1311,13 +1311,33 @@ pub fn reduceIndexedAccess(c: *Checker, obj: TypeId, idx: TypeId) Error!TypeId {
     return c.indexedAccessType(obj, idx);
 }
 
+/// How far past tsc's single `getSimplifiedIndexedAccessType` step
+/// `simplifyIndexAccess` is allowed to go. The two readings differ only in
+/// what they are asked ABOUT, which is why they share one implementation.
+pub const IndexSimplify = enum {
+    /// One mapped-object substitution on the WRITTEN object type. This is what
+    /// the RELATION and the property lookup want: they hold an interned access
+    /// and are asking "does this reduce to the other side's template?", so
+    /// resolving the object through aliases or distributing an intersection
+    /// would answer about a different type than the one being related.
+    mapped_only,
+    /// The inference-PATTERN reading: resolve the object structurally,
+    /// re-simplify the substituted value (which is how the intersection
+    /// underneath a `Readonly<A & E>` surfaces), and distribute an
+    /// INTERSECTION object — `(A & E)[K]` -> `A[K] & E[K]` — so the naked type
+    /// variable a candidate can pair with becomes visible.
+    pattern,
+};
+
 /// tsc's `getSimplifiedIndexedAccessType`, the generic-MAPPED-object arm:
 /// "If the object type is a mapped type `{ [P in K]: E }`, where `K` is
 /// generic, instantiate `E` using a mapper that substitutes the index type
-/// for `P`."
+/// for `P`." `mode` selects how much of tsc's surrounding `getSimplifiedType`
+/// recursion comes with it (see `IndexSimplify`).
 ///
-/// Null for anything else — a non-mapped object, or a map that REMAPS its
-/// keys (`as N<P>`), where the substitution is not the value at `idx`.
+/// Null when nothing applies — a non-mapped, non-intersection object, or a map
+/// that REMAPS its keys (`as N<P>`), where the substitution is not the value at
+/// `idx` — or when the simplification is the access itself.
 ///
 /// The map's OPTIONALITY is deliberately not folded in. tsc bakes `|
 /// undefined` into `getTemplateTypeFromMappedType` and therefore carries it
@@ -1330,17 +1350,44 @@ pub fn reduceIndexedAccess(c: *Checker, obj: TypeId, idx: TypeId) Error!TypeId {
 /// template is `Partial<T>[P]`, which is the target's `T[P]` only once the
 /// inner map is substituted through. Neither side's base-constraint route
 /// can answer it — `T` is a free parameter, so both accesses stay deferred.
-pub fn simplifyMappedIndexAccess(c: *Checker, acc: TypeId) Error!?TypeId {
+///
+/// Asked as a QUERY, never baked into the type's identity: the relation reads
+/// the same access structurally and wants it whole, and interning the
+/// simplification also drops `Partial<T>[K]`'s `| undefined`.
+pub fn simplifyIndexAccess(c: *Checker, acc: TypeId, mode: IndexSimplify) Error!?TypeId {
+    return simplifyIndexAccessAt(c, acc, mode, 0);
+}
+
+fn simplifyIndexAccessAt(c: *Checker, acc: TypeId, mode: IndexSimplify, depth: u32) Error!?TypeId {
+    if (depth > 4) return null;
     const s = &c.ts;
     if (s.kind(acc) != .index_access) return null;
-    const obj = s.indexAccessObj(acc);
-    if (s.kind(obj) != .mapped or s.mappedAs(obj) != 0) return null;
-    const val = try c.substMappedKey(
-        s.mappedValue(obj),
-        s.mappedParamId(s.mappedKeyParam(obj)),
-        s.indexAccessIndex(acc),
-    );
-    return if (val == acc) null else val;
+    const idx = s.indexAccessIndex(acc);
+    const obj = switch (mode) {
+        .mapped_only => s.indexAccessObj(acc),
+        .pattern => try c.resolveStructural(s.indexAccessObj(acc)),
+    };
+    if (s.kind(obj) == .mapped and s.mappedAs(obj) == 0) {
+        const val = try c.substMappedKey(s.mappedValue(obj), s.mappedParamId(s.mappedKeyParam(obj)), idx);
+        if (val == acc) return null;
+        if (mode == .mapped_only) return val;
+        return (try simplifyIndexAccessAt(c, val, mode, depth + 1)) orelse val;
+    }
+    if (mode == .mapped_only or s.kind(obj) != .intersection) return null;
+    var parts: std.ArrayList(TypeId) = .empty;
+    defer parts.deinit(c.scratch());
+    const ms = try c.scratch().dupe(TypeId, try c.memberList(obj));
+    defer c.scratch().free(ms);
+    for (ms) |mm| try parts.append(c.scratch(), try c.reduceIndexedAccess(mm, idx));
+    const out = try s.makeIntersection(c.scratch(), parts.items);
+    return if (out == acc) null else out;
+}
+
+/// `simplifyIndexAccess` in its `.mapped_only` reading — the relation and
+/// property-lookup entry point, kept under its own name because that is what
+/// its four call sites are asking for.
+pub fn simplifyMappedIndexAccess(c: *Checker, acc: TypeId) Error!?TypeId {
+    return simplifyIndexAccess(c, acc, .mapped_only);
 }
 
 /// Shallow analogue of tsc's `isGenericObjectType` for the object side of an

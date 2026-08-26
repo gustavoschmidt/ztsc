@@ -29,6 +29,7 @@ const TpMap = @import("enums.zig").TpMap;
 const calls = @import("calls.zig");
 const isUnitLikeKind = @import("assign.zig").isUnitLikeKind;
 const skipParens = @import("expr.zig").skipParens;
+const simplifyIndexAccess = @import("mapped.zig").simplifyIndexAccess;
 const template_zig = @import("template.zig");
 const tuple_relate = @import("tuple_relate.zig");
 const typenode = @import("typenode.zig");
@@ -3433,7 +3434,7 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
     // value template is where that lives, so substituting the key here keeps
     // it.
     if (s.kind(param) == .index_access) {
-        if (try simplifiedIndexPattern(c, param, 0)) |sp| {
+        if (try simplifyIndexAccess(c, param, .pattern)) |sp| {
             return c.unify(sp, arg, tp_syms, candidates, depth + 1);
         }
     }
@@ -5294,8 +5295,8 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
 /// operand (so the homomorphic rule declines), while `ExtraProps` keeps it from
 /// materializing at all. Its two LITERAL keys still name real members, and each
 /// one's type — `Readonly<FormikConfig<Values> & ExtraProps>["initialValues"]` —
-/// is exactly the pattern `simplifiedIndexPattern` distributes down to a naked
-/// `Values`. Without this walk `Values` took no candidate anywhere in the call
+/// is exactly the pattern `simplifyIndexAccess(.pattern)` distributes down to a
+/// naked `Values`. Without this walk `Values` took no candidate anywhere in the call
 /// and fell back to its `object` default, so the `validate` callback's parameter
 /// had no members at all.
 ///
@@ -5797,39 +5798,6 @@ pub fn constituentRelatesTo(c: *Checker, param: TypeId, m: TypeId) Error!bool {
     if (s.objectStringIndex(param) != 0 and s.objectStringIndex(rm) != 0) return true;
     if (s.objectNumberIndex(param) != 0 and s.objectNumberIndex(rm) != 0) return true;
     return false;
-}
-
-/// tsc's `getSimplifiedIndexedAccessType`, asked as a QUERY over an inference
-/// PATTERN rather than interned (see the call site for why the type's identity
-/// must keep the access whole):
-///
-///   * a deferred homomorphic map on the object side substitutes the key into
-///     the map's value template — `Readonly<X>[K]` -> `X[K]`, `Partial<X>[K]`
-///     -> `X[K] | undefined` — and the result is simplified again, because that
-///     is how the intersection underneath a `Readonly<A & E>` surfaces;
-///   * an INTERSECTION on the object side distributes — `(A & E)[K]` ->
-///     `A[K] & E[K]`.
-///
-/// Null when neither applies or the simplification is the access itself.
-fn simplifiedIndexPattern(c: *Checker, acc: TypeId, depth: u32) Error!?TypeId {
-    if (depth > 4) return null;
-    const s = &c.ts;
-    if (s.kind(acc) != .index_access) return null;
-    const idx = s.indexAccessIndex(acc);
-    const obj = try c.resolveStructural(s.indexAccessObj(acc));
-    if (s.kind(obj) == .mapped and s.mappedAs(obj) == 0) {
-        const val = try c.substMappedKey(s.mappedValue(obj), s.mappedParamId(s.mappedKeyParam(obj)), idx);
-        if (val == acc) return null;
-        return (try simplifiedIndexPattern(c, val, depth + 1)) orelse val;
-    }
-    if (s.kind(obj) != .intersection) return null;
-    var parts: std.ArrayList(TypeId) = .empty;
-    defer parts.deinit(c.scratch());
-    const ms = try c.scratch().dupe(TypeId, try c.memberList(obj));
-    defer c.scratch().free(ms);
-    for (ms) |mm| try parts.append(c.scratch(), try c.reduceIndexedAccess(mm, idx));
-    const out = try s.makeIntersection(c.scratch(), parts.items);
-    return if (out == acc) null else out;
 }
 
 /// One element of a reverse-mapped rebuild: match `src_ty` against the value
