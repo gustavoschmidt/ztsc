@@ -5360,6 +5360,22 @@ fn mappedChangesModifiers(c: *Checker, m: TypeId) bool {
     return c.ts.mappedFlags(m) & mods != 0;
 }
 
+/// The contextual type an element access gives its ARGUMENT: `keyof` the
+/// receiver, which is what tsc's `getContextualType` answers there.
+///
+/// Only a TEMPLATE expression reads it, and only to decide whether to keep its
+/// structure — `checkTemplateExpression`'s `someType(contextualType,
+/// isTemplateLiteralContextualType)`, which is `ctxWantsTemplate` here. A
+/// mapped type keyed `` `get${T}` `` can only be indexed by a template
+/// literal TYPE, so `foo[`get${t}`]` widening to `string` lost the whole
+/// access (`mappedTypeConstraints2`). Restricted to that one node shape: every
+/// other index expression keeps the context-free check it had.
+fn indexArgContext(c: *Checker, obj_t: TypeId, idx: Node) Error!TypeId {
+    if (idx == null_node or c.nodeTag(idx) != .template_expr) return types.no_type;
+    if (obj_t == types.no_type or obj_t == types.error_type) return types.no_type;
+    return c.keyofType(obj_t);
+}
+
 /// Element access as an optional-chain link (see `memberChainInner`).
 fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!ChainLink {
     const d = c.tree.nodeData(node);
@@ -5384,7 +5400,7 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
         const saved = c.chain_guards.items.len;
         defer c.chain_guards.shrinkRetainingCapacity(saved);
         try c.pushChainGuards(node);
-        break :idx try c.checkExprCached(d.rhs, types.no_type);
+        break :idx try c.checkExprCached(d.rhs, try indexArgContext(c, obj_t, d.rhs));
     };
     if (own_optional) {
         if (c.containsNullish(obj_t)) chained = true;
@@ -5680,10 +5696,24 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
             if (ia != types.no_type and ia != types.error_type) {
                 result = ia;
             } else if (try c.typeIsStringLike(ri)) {
-                result = if (rk == .object and props_zig.stringIndexForStringKey(c, r) != 0)
-                    props_zig.stringIndexForStringKey(c, r)
-                else
-                    types.any_type;
+                if (rk == .object and props_zig.stringIndexForStringKey(c, r) != 0) {
+                    result = props_zig.stringIndexForStringKey(c, r);
+                } else {
+                    // A PATTERN key (`` `get${string}` ``) that reduced to no
+                    // member and reaches no string index signature is the same
+                    // implicit-'any' element access the whole `string` domain
+                    // is — tsc's `getPropertyTypeForIndexType` fails the
+                    // `isApplicableIndexType` screen either way. Only the
+                    // pattern shape is reported: a BRANDED string key keeps
+                    // the silent `any` it has always had.
+                    if (c.ts.kind(ri) == .template_literal_type and rk == .object and
+                        c.ts.objectFlags(r) & types.obj_flag_global_this == 0 and
+                        !c.ts.objectIsLiteralOrigin(r))
+                    {
+                        try reportIndexImplicitAny(c, node, d.lhs, idx_t, obj_t);
+                    }
+                    result = types.any_type;
+                }
             } else if (try c.typeIsNumberLike(ri)) {
                 result = try c.numberIndexType(r);
             } else {
@@ -7904,6 +7934,12 @@ fn destructuringMemberType(c: *Checker, src: TypeId, key: ?DestructKey, has_defa
     // per-constituent union accessibility, the lazy single-member paths).
     const r = try c.resolveStructural(src);
     const rk = c.ts.kind(r);
+    // tsc's `getPropertyTypeForIndexType` hands an `any` or `never` object
+    // type straight back — indexing `never` is `never`, never a TS2339. That
+    // is what an array-pattern position past the end of an EMPTY source reads
+    // (`[{ [k]: b } = […]] = []`, `controlFlowAssignmentPatternOrder`), where
+    // an ordinary property ACCESS on `never` still reports.
+    if (rk == .never) return r;
     if (rk != .any and rk != .err and (try c.propOfType(r, k.name)) == null) {
         if (try numericNameIndexHit(c, r, rk, c.atomText(k.name))) |t| return t;
         if (has_default) return types.no_type;
