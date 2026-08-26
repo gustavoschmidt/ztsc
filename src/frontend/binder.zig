@@ -527,6 +527,15 @@ const Binder = struct {
     /// `saveState`, so a `return` inside a callback declared in the constructor
     /// does not join the constructor's exit.
     ctor_return: ?PendingId = null,
+    /// tsc's `inAssignmentPattern`: is the expression currently being bound
+    /// part of a destructuring assignment's TARGET? Walk state (like
+    /// `cur_flow`), saved and restored around the one place that sets it. It
+    /// decides the bind ORDER of a nested `pattern = default`, which is the
+    /// order JavaScript evaluates it in: the default is produced *before* the
+    /// computed key that selects the element it feeds, so
+    /// `[{ [(a = 1)]: b } = [9, a] as const] = []` reads the OLD `a` in the
+    /// default and the new one in the key.
+    in_assign_pattern: bool = false,
     /// True while binding the parameter list or body of a constructor whose
     /// class has an `extends` clause that is not `null` — the one region tsc's
     /// `checkThisBeforeSuper` covers. `getThisContainer` is asked with
@@ -4940,6 +4949,35 @@ const Binder = struct {
                 if (isNarrowableIndex(b, d.rhs)) try b.attachFlow(node);
             },
             .assign => {
+                // tsc's `bindDestructuringAssignmentFlow`, which is entered
+                // for `<array/object literal> = rhs` under a plain `=`. Its
+                // whole content is the bind ORDER: an outer destructuring
+                // assignment binds its target first (so the writes it records
+                // precede the value), while a NESTED one — an element default
+                // — binds its right-hand side first, because a default is
+                // evaluated before the computed key that selects its element.
+                if (b.tree.tokens.tag(b.tree.nodeMainToken(node)) == .eq and
+                    switch (b.nodeTag(d.lhs)) {
+                        .array_literal, .object_literal => true,
+                        else => false,
+                    })
+                {
+                    const saved = b.in_assign_pattern;
+                    defer b.in_assign_pattern = saved;
+                    if (saved) {
+                        b.in_assign_pattern = false;
+                        try b.bindExpr(d.rhs);
+                        b.in_assign_pattern = true;
+                        try b.bindExpr(d.lhs);
+                    } else {
+                        b.in_assign_pattern = true;
+                        try b.bindExpr(d.lhs);
+                        b.in_assign_pattern = false;
+                        try b.bindExpr(d.rhs);
+                    }
+                    b.cur_flow = try b.addFlow(.assign, b.cur_flow, node);
+                    return;
+                }
                 try b.bindExpr(d.lhs);
                 // `x = class { … }` / `o.x = class { … }` name the class too,
                 // but only a plain `=` does — a compound assignment is a read

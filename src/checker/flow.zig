@@ -2613,6 +2613,48 @@ pub fn identIsSym(c: *Checker, node: Node, sym: SymbolId) Error!bool {
     };
 }
 
+/// The member a destructuring target's property entry reads, or null when it
+/// names nothing pinnable. A plain key is its own token; a COMPUTED key
+/// (`({ [k]: target } = o)`) is tsc's `getLiteralTypeFromPropertyName` —
+/// the key expression's type, usable as a property name only when it is a
+/// literal or a `unique symbol`. Without this arm the `[` token itself was
+/// read as the member name and every computed-key destructuring assignment
+/// silently narrowed nothing.
+fn destructuredKeyAtom(c: *Checker, el: Node) Error!?Atom {
+    const key = c.tree.nodeData(el).lhs;
+    if (c.nodeTag(el) != .object_property or key == null_node or
+        c.nodeTag(key) != .computed_name)
+    {
+        return try c.memberAtom(c.tree.nodeMainToken(el));
+    }
+    const key_expr = c.tree.nodeData(key).lhs;
+    if (key_expr == null_node) return null;
+    const kt = c.nodeType(key_expr) orelse try c.checkExprCached(key_expr, types.no_type);
+    if (try c.uniqueSymAtom(kt)) |a| return a;
+    return try c.literalKeyAtom(kt);
+}
+
+/// The member `keyed` names on a destructuring target's receiver — tsc's
+/// `getTypeOfDestructuredProperty`, whose fall-throughs past
+/// `getTypeOfPropertyOfType` are the numeric and string index domains. ztsc
+/// does not materialize a tuple's positional members as named properties, so
+/// `({ 1: b } = tup)` misses on the name and reaches them through the numeric
+/// domain instead; a UNION receiver whose constituents only answer that way
+/// is distributed over (the whole-union property lookup has already failed).
+fn destructuredPropType(c: *Checker, r: TypeId, keyed: Atom) Error!?TypeId {
+    if (try c.propOfType(r, keyed)) |p| {
+        return if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
+    }
+    if (try c.numericNameIndexHit(r, c.ts.kind(r), c.atomText(keyed))) |t| return t;
+    if (c.ts.kind(r) != .union_type) return null;
+    var acc: TypeId = types.never_type;
+    for (try c.memberList(r)) |m| {
+        const mt = (try destructuredPropType(c, try c.resolveStructural(m), keyed)) orelse return null;
+        acc = try c.makeUnion2(acc, mt);
+    }
+    return acc;
+}
+
 /// The type a destructuring *assignment* target gives to the element named
 /// `name` (`[, width] = m`, `({ a: x } = o)`), or null when it cannot be
 /// pinned down exactly. This is the cover-grammar mirror of
@@ -2629,34 +2671,51 @@ fn destructuredAssignType(c: *Checker, pat: Node, name: Atom, whole: TypeId) Err
             if ((try c.atomOfToken(c.tree.nodeMainToken(pat))) != name) return null;
             return whole;
         },
-        // `[a] = xs` inside a target is a default (`[a = 1] = xs`), which
-        // strips `undefined` exactly as a binding default does.
+        // `[a] = xs` inside a target is a default (`[a = 1] = xs`). tsc's
+        // `getAssignedTypeOfBinaryExpression` applies the default at THIS
+        // element — `getTypeWithDefault(assignedType, right)` is
+        // `getUnionType([getNonUndefinedType(type), getTypeOfExpression(right)])`
+        // — and only then walks into the target. Applying it to the element
+        // (rather than stripping `undefined` off whatever the walk returned)
+        // is what lets a nested pattern read the DEFAULT's members when the
+        // right-hand side supplies nothing: `[{ [k]: b } = [9, 0] as const]
+        // = []` destructures the default tuple, not `never`.
         .assign, .binding_default => {
-            const inner = (try destructuredAssignType(c, d.lhs, name, whole)) orelse return null;
-            return try c.removeUndefined(inner);
+            const base = try c.removeUndefined(whole);
+            const dt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
+            const with_default = if (dt == types.no_type)
+                base
+            else
+                try c.makeUnion2(base, dt);
+            return destructuredAssignType(c, d.lhs, name, with_default);
         },
         .array_literal, .array_pattern => {
             const r = try c.resolveStructural(whole);
             // Every non-tuple position takes the iterated element type
             // (tsc's `checkIteratedTypeOrElementType`), which is how a
             // `RegExpMatchArray` — an interface over `Array<string>`, not an
-            // `.array` — yields `string` per position.
-            const iter: TypeId = if (c.ts.kind(r) == .tuple)
-                types.no_type
-            else
-                (try c.iterationElementType(r)) orelse types.no_type;
+            // `.array` — yields `string` per position. A tuple position PAST
+            // the fixed part takes it too: tsc's
+            // `getTypeOfDestructuredArrayElement` only reads a real tuple
+            // member and otherwise iterates, so `[a = 1] = [] as []`
+            // destructures `never` and the element's default supplies the
+            // type. Computed lazily — a tuple usually never asks.
+            var iter: ?TypeId = null;
             var i: u32 = 0;
             for (c.tree.nodeRange(pat)) |el| {
                 if (el == null_node) continue;
                 defer i += 1;
                 if (c.nodeTag(el) == .omitted) continue;
-                var et: TypeId = iter;
+                var et: TypeId = types.no_type;
                 if (c.ts.kind(r) == .tuple and i < c.ts.tupleLen(r)) {
                     const te = c.ts.tupleElem(r, i);
                     et = if (te.optional() or te.rest())
                         try c.makeUnion2(te.ty, types.undefined_type)
                     else
                         te.ty;
+                } else {
+                    if (iter == null) iter = (try c.iterationElementType(r)) orelse types.no_type;
+                    et = iter.?;
                 }
                 if (et == types.no_type) continue;
                 const tag = c.nodeTag(el);
@@ -2677,12 +2736,8 @@ fn destructuredAssignType(c: *Checker, pat: Node, name: Atom, whole: TypeId) Err
                 switch (c.nodeTag(el)) {
                     // `({ p: target } = o)` — key in main_token, target in rhs.
                     .object_property, .binding_property => {
-                        const keyed = try c.memberAtom(c.tree.nodeMainToken(el));
-                        const p = (try c.propOfType(r, keyed)) orelse continue;
-                        const pt = if (p.optional())
-                            try c.makeUnion2(p.ty, types.undefined_type)
-                        else
-                            p.ty;
+                        const keyed = (try destructuredKeyAtom(c, el)) orelse continue;
+                        const pt = (try destructuredPropType(c, r, keyed)) orelse continue;
                         const tgt = if (c.nodeTag(el) == .object_property) ed.rhs else ed.lhs;
                         if (try destructuredAssignType(c, tgt, name, pt)) |v| return v;
                     },
@@ -2726,7 +2781,13 @@ fn patternBindsSym(c: *Checker, pat: Node, sym: SymbolId) Error!bool {
             if (d.lhs != 0) return patternBindsSym(c, d.lhs, sym);
             return (try c.memberAtom(c.tree.nodeMainToken(pat))) == c.symNameAtom(sym);
         },
-        .binding_default, .rest_element, .spread_element => {
+        // `.assign` is the cover-grammar spelling of `.binding_default`: an
+        // assignment TARGET's `= init` parses as an ordinary assignment
+        // expression, so `[{ p: b } = d] = xs` hides its pattern one level
+        // below an `.assign`. Missing it made every defaulted element of a
+        // destructuring assignment "unrelated" to the variables it writes,
+        // and the flow walk sailed past the write to the declared type.
+        .assign, .paren_expr, .binding_default, .rest_element, .spread_element => {
             return patternBindsSym(c, c.tree.nodeData(pat).lhs, sym);
         },
         else => return false,

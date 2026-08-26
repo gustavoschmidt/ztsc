@@ -1647,6 +1647,14 @@ pub const JsxAttr = struct {
     value: Node,
     name_tok: TokenIndex,
     overwritten: bool = false, // shadowed by a later `{...spread}` (TS2783)
+    /// A hyphenated name (`data-*`, `aria-*`). tsc waives it in exactly two
+    /// places: `isKnownProperty` answers TRUE for it whatever the target
+    /// declares (so it is never EXCESS), and `generateJsxAttributes` skips it
+    /// (so it is never ELABORATED per attribute). It is still a member of the
+    /// attributes object, so a value the target's prop rejects still fails the
+    /// whole-object relation — and, with no elaboration to explain it, lands
+    /// as the plain TS2322 anchored at the tag.
+    hyphenated: bool = false,
 };
 
 /// Check a JSX element's attributes against its props type (`no_type` =
@@ -1779,15 +1787,22 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
         // attributes object tsc builds — `createJsxAttributesType` puts every
         // attribute in it — and it is only `isKnownProperty` that waives it
         // (`isComparingJsxAttributes && isHyphenatedJsxName(name)`), i.e. the
-        // EXCESS check. So it stays out of the per-attribute assignability
-        // walk below but counts as PROVIDED: `<ToolButton type="button"
+        // EXCESS check. So it counts as PROVIDED — `<ToolButton type="button"
         // aria-label={…} />` satisfies a required `"aria-label": string`, and
         // dropping it reported TS2322 on 38 excalidraw elements the moment
-        // discrimination narrowed their props union to the one arm.
-        // Its value expression was checked either way, just above.
+        // discrimination narrowed their props union to the one arm — AND it
+        // is related to the prop it lands on when the target declares one:
+        // `<test1 data-foo={32}/>` against `{ "data-foo"?: string }` is a
+        // TS2322, because `isKnownProperty` waives the excess verdict, not
+        // the relation.
         try provided.append(c.scratch(), .{ .name = name, .ty = vty });
-        if (c.tree.tokens.tag(name_tok) == .jsx_name) continue;
-        try built.append(c.scratch(), .{ .name = name, .ty = vty, .value = ad.lhs, .name_tok = name_tok });
+        try built.append(c.scratch(), .{
+            .name = name,
+            .ty = vty,
+            .value = ad.lhs,
+            .name_tok = name_tok,
+            .hyphenated = c.tree.tokens.tag(name_tok) == .jsx_name,
+        });
     }
 
     if (rt == types.no_type) return;
@@ -1850,18 +1865,32 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     // rejections are taken here, per expression, and stand on their own.
     var attr_failed = false;
     var attr_fresh_failed = false;
+    // A HYPHENATED attribute whose value the target's own prop rejects. It is
+    // kept apart from `attr_failed` because the elaboration below will not
+    // report it (tsc's `generateJsxAttributes` skips hyphenated names), so it
+    // has to be answered by the whole-object report instead.
+    var hyphen_failed = false;
     for (built.items) |b| {
         if (b.overwritten) continue; // shadowed by a later spread (TS2783)
         if (try jsxAttrTarget(c, rt, b)) |target| {
             // Mirrors the elaboration loop below: an attribute the elaboration
             // will skip cannot be the reason it runs.
             if (elaborate.skipsDeferredIndexAccess(c, target)) continue;
+            // tsc's `isIgnoredJsxProperty`: `membersRelatedToIndexInfo` skips
+            // a hyphenated attribute outright, so an INDEX SIGNATURE standing
+            // in for the name says nothing about its value —
+            // `<MyComponent data-bar='hello'/>` against
+            // `{ [s: string]: boolean }` is clean. Only a prop the target
+            // DECLARES relates it (`propertiesRelatedTo` has no such waiver).
+            if (b.hyphenated and !try jsxDeclaresName(c, rt, b.name)) continue;
             if (!try c.isAssignable(b.ty, target)) {
-                attr_failed = true;
-            } else if (b.value != null_node and try c.freshLiteralRejects(b.value, b.ty, target)) {
+                if (b.hyphenated) hyphen_failed = true else attr_failed = true;
+            } else if (!b.hyphenated and b.value != null_node and
+                try c.freshLiteralRejects(b.value, b.ty, target))
+            {
                 attr_fresh_failed = true;
             }
-        } else if (target_open and !containsAtom(ia_names.items, b.name)) {
+        } else if (target_open and !b.hyphenated and !containsAtom(ia_names.items, b.name)) {
             if (!have_excess) {
                 first_excess = c.tokSpan(b.name_tok);
                 have_excess = true;
@@ -1886,7 +1915,8 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     // a candidate, so tsc's silent first stage cannot change the outcome and
     // is not paid for. This is the overwhelmingly common path, and it is why
     // the split walk costs nothing on it.
-    if (!attr_failed and !attr_fresh_failed and !have_excess and !weak_hit and !missing_hit) return;
+    if (!attr_failed and !attr_fresh_failed and !hyphen_failed and
+        !have_excess and !weak_hit and !missing_hit) return;
 
     // tsc's silent first stage. The attributes object is built UNWIDENED (so
     // `variant="a"` still satisfies `"a" | "b"`) and NOT fresh. A target that
@@ -1906,7 +1936,10 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     // ------------------------------------------------------------ elaboration
     var attr_elaborated = false;
     for (built.items) |b| {
-        if (b.overwritten) continue;
+        // tsc's `generateJsxAttributes` yields neither a spread nor a
+        // hyphenated name, so neither is ever the subject of an elementwise
+        // elaboration; a hyphenated mismatch is answered at the tag below.
+        if (b.overwritten or b.hyphenated) continue;
         if (try jsxAttrTarget(c, rt, b)) |target| {
             if (elaborate.skipsDeferredIndexAccess(c, target)) continue;
             // tsc anchors a JSX attribute value mismatch at the attribute
@@ -1959,8 +1992,31 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
         return;
     }
 
-    if (!missing_hit) return;
     const span = if (e.tag != null_node) c.nodeSpan(e.tag) else c.nodeSpan(node);
+    if (!missing_hit) {
+        // A rejected HYPHENATED attribute is the one whole-object relation
+        // failure ztsc's per-attribute walk sees but cannot report where tsc
+        // reports it: `generateJsxAttributes` skipped it, so tsc's
+        // elaboration produced nothing and `checkTypeRelatedTo` printed its
+        // own message at the tag, with the property chain underneath.
+        // `<test1 data-foo={32}/>` against `{ "data-foo"?: string }`.
+        //
+        // Gated on `whole_object_checkable` for the reason every other
+        // whole-object verdict is: with an un-enumerable spread the source
+        // type ztsc can spell is not the one tsc relates (tsc keeps the
+        // spread's own type in the intersection), so the message would name a
+        // type the element does not have and the refinement machinery would
+        // read a "missing" prop the spread supplies.
+        if (hyphen_failed and whole_object_checkable) {
+            try c.reportNotAssignable(
+                2322,
+                try c.jsxAttrsObject(provided.items, .display),
+                props,
+                span,
+            );
+        }
+        return;
+    }
     if (spread_non_object) {
         // The attributes' source type is the primitive spread itself —
         // plain TS2322 (a primitive never gets the missing-prop codes).
@@ -1977,6 +2033,17 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     } else {
         try c.reportNotAssignable(2322, combined, props, span);
     }
+}
+
+/// Does the props target DECLARE `name` as a member, rather than merely
+/// covering it with an index signature? The distinction is what
+/// `isIgnoredJsxProperty` draws: it takes a hyphenated attribute out of
+/// `membersRelatedToIndexInfo` and out of nothing else, so an index signature
+/// says nothing about such a value while a declared prop still relates it.
+fn jsxDeclaresName(c: *Checker, rt: TypeId, name: Atom) Error!bool {
+    var via_index = false;
+    if ((try c.propOfTypeViaIndex(rt, name, &via_index)) != null and !via_index) return true;
+    return false;
 }
 
 /// tsc's `isHyphenatedJsxName`: an attribute name containing a `-` (`data-*`,

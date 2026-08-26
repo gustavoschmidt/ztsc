@@ -1048,7 +1048,27 @@ pub fn narrowByInProp(c: *Checker, t: TypeId, prop: Atom, sense: bool) Error!Typ
             return c.ts.makeIntersection(c.scratch(), &.{ t, rec });
         }
     }
-    if (c.ts.kind(t) != .union_type) return t;
+    if (c.ts.kind(t) != .union_type) {
+        // tsc's `filterType` on a non-union answers `never` when the
+        // predicate fails, but `narrowByInKeyword`'s outer guard only lets a
+        // non-union in for an INTERSECTION (unconditionally), a `this` type
+        // parameter, or an object type the reference has ALREADY been
+        // narrowed away from (`declaredType !== type`). The intersection arm
+        // is the one this entry point can answer without the declared type,
+        // and it is the one that matters: `'bar' in value` narrowing
+        // `Foo & { bar: string }` by a FALSE guard must reach `never`, which
+        // is how `getTypePredicateFromBody` proves the arrow in
+        // `list.filter(value => 'bar' in value)` is a `value is Bar`
+        // predicate. A plain object at its declared type stays put, exactly
+        // as tsc leaves it — `x: { a: string }` is still `{ a: string }` in
+        // the `else` of `if ("a" in x)`.
+        if (c.ts.kind(t) != .intersection) return t;
+        const found = try c.propDeclaredForIn(t, prop);
+        const has = found != null;
+        const optional = if (found) |p| p.optional() else false;
+        const kept = if (sense) has else (!has or optional);
+        return if (kept) t else types.never_type;
+    }
     var parts: std.ArrayList(TypeId) = .empty;
     defer parts.deinit(c.scratch());
     for (try c.memberList(t)) |m| {

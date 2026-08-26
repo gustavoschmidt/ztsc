@@ -5275,18 +5275,25 @@ const Parser = struct {
         // 1` declares `H`), and `checkGrammarModifiers` then rejects it on the
         // member NAME.
         var saw_const = false;
-        // The FIRST `in`/`out` of the run, which is TS1274 whatever else the
-        // run carries — a variance annotation belongs to a type PARAMETER of a
-        // class/interface/type alias and nowhere else. tsc's parser takes the
-        // word as a modifier (`nextTokenIsOnSameLineAndCanFollowModifier`), so
-        // `class C { in a = 0 }` still declares `a`; refusing it read `in` as
-        // the member's NAME and answered TS1005 at `a`, a syntactic error that
-        // took the whole file's semantic pass with it (varianceAnnotations).
-        var in_out: ?ModifierErr = null;
+        // The EARLIEST modifier of the run that `modifier_order` does not model
+        // because it carries no `ast.Flags` bit — nothing downstream of a class
+        // member ever asks whether it was written. tsc's parser takes all three
+        // as modifiers (`isModifierKind`), so the member behind them still
+        // parses; refusing them read the keyword as the member's NAME and
+        // answered a TS1005 cascade, a syntactic error that took the whole
+        // file's semantic pass with it (varianceAnnotations,
+        // parserMemberFunctionDeclaration4).
+        //
+        //   * `in`/`out` — TS1274/TS1273, a variance annotation belongs to a
+        //     type PARAMETER of a class/interface/type alias and nowhere else;
+        //   * `export` — TS1031, `checkGrammarModifiers`'s `ExportKeyword` arm
+        //     under `isClassLike(node.parent)`.
+        var off_list: ?ModifierErr = null;
         while (true) {
             const variance: ?Code = switch (p.curTag()) {
                 .keyword_in => .in_modifier_not_valid_here,
                 .keyword_out => .out_modifier_not_valid_here,
+                .keyword_export => .export_on_class_element,
                 else => null,
             };
             const is_const = p.curTag() == .keyword_const;
@@ -5300,7 +5307,7 @@ const Parser = struct {
             if (!name_follows) break;
             if (variance) |code| {
                 const tok = try p.bump();
-                if (in_out == null) in_out = .{ .code = code, .token = tok };
+                if (off_list == null) off_list = .{ .code = code, .token = tok };
                 continue;
             }
             if (is_const) {
@@ -5333,7 +5340,14 @@ const Parser = struct {
             .l_bracket => {
                 // Computed member name / index signature in class.
                 if (p.atIndexSignature()) {
-                    _ = try p.reportMemberGrammar(deco_at, .{ .kind = .other }, p.memberModErr(mods[0..n_mods], .other, 0, in_out));
+                    // The off-list modifiers are dropped here: an INDEX
+                    // SIGNATURE answers for every modifier it may not carry
+                    // with TS1071 (`parseIndexSignature`, tsc's per-modifier
+                    // arm ahead of the switch), and none of `in`/`out`/`export`
+                    // is one it may. Passing them through double-reported —
+                    // `class C { in [x: string]: string }` was TS1071 AND
+                    // TS1274 where tsgo says TS1071 alone.
+                    _ = try p.reportMemberGrammar(deco_at, .{ .kind = .other }, p.memberModErr(mods[0..n_mods], .other, 0, null));
                     return p.parseIndexSignatureAsClassMember(flags);
                 }
                 const cn = try p.parseComputedMemberName();
@@ -5367,7 +5381,7 @@ const Parser = struct {
                 } else {
                     // A CLASS member name: tsc's `parseClassElement` answers
                     // TS1068 here, not the object-literal TS1136.
-                    _ = try p.reportMemberGrammar(deco_at, .{ .kind = .other }, p.memberModErr(mods[0..n_mods], .other, 0, in_out));
+                    _ = try p.reportMemberGrammar(deco_at, .{ .kind = .other }, p.memberModErr(mods[0..n_mods], .other, 0, off_list));
                     try p.fail(.expected_class_member);
                     return p.errorNode();
                 }
@@ -5494,7 +5508,7 @@ const Parser = struct {
                 .in_class_decl = p.in_class_decl,
                 .second_accessor_of_modified_pair = is_accessor and computed == null and
                     p.isSecondAccessorOfModifiedPair(members_top, name_tok, flags),
-            }, p.memberModErr(mods[0..n_mods], mod_member, const_at, in_out));
+            }, p.memberModErr(mods[0..n_mods], mod_member, const_at, off_list));
             if (computed) |cn| {
                 // An accessor is judged by neither `checkGrammarProperty` nor
                 // `checkGrammarMethod`; a method is, and what it earns turns on
@@ -5546,7 +5560,7 @@ const Parser = struct {
             .abstract = flags & ast.Flags.abstract != 0,
             .declare = flags & ast.Flags.declare != 0,
             .in_class_decl = p.in_class_decl,
-        }, p.memberModErr(mods[0..n_mods], .property, const_at, in_out));
+        }, p.memberModErr(mods[0..n_mods], .property, const_at, off_list));
         if (computed) |cn| try p.finishComputedName(cn, member, .class_body, .property, grammar_err);
         // TS1276, tsc's `checkGrammarProperty`: an auto-accessor field stands
         // for a get/set pair, and there is no way to spell an optional one.
@@ -5570,18 +5584,18 @@ const Parser = struct {
         mods: []const modifier_order.Mod,
         member: modifier_order.Member,
         const_at: TokenIndex,
-        in_out: ?ModifierErr,
+        off_list: ?ModifierErr,
     ) ?ModifierErr {
         const found: ?ModifierErr = if (modifier_order.walk(mods, member, p.abstract_class)) |f|
             .{ .code = f.code, .token = f.token }
         else
             null;
-        // `in`/`out` is an ARM of tsc's walk, not a trailing check, and the
-        // walk returns at the first modifier that errors — so the EARLIER
-        // token wins. (`modifier_order` does not model the two: they carry no
+        // `in`/`out`/`export` are ARMS of tsc's walk, not trailing checks, and
+        // the walk returns at the first modifier that errors — so the EARLIER
+        // token wins. (`modifier_order` models none of the three: they carry no
         // `ast.Flags` bit, because nothing downstream of a class member ever
-        // asks about a variance annotation.)
-        if (in_out) |v| {
+        // asks whether one was written.)
+        if (off_list) |v| {
             if (found == null or v.token < found.?.token) return v;
         }
         if (found) |f| return f;
@@ -6319,7 +6333,7 @@ const Parser = struct {
         // TS1005 at the `with`, and the file's whole semantic pass with it.
         if (p.curTag() == .string_literal) {
             const mod = try p.bump();
-            try p.skipImportAttributes();
+            try p.skipImportAttributes(false); // `import "m" with {…}` — never type-only
             try p.expectSemicolon();
             if (export_kw) |m| try p.errAtToken(.import_cannot_have_modifiers, m);
             const extra = try p.addExtra(ast.ImportData{
@@ -6467,7 +6481,7 @@ const Parser = struct {
             // specifier names no module.
             if (canStartExpression(p.curTag()) and !p.nlBefore()) _ = try p.parseExpression(.{});
         }
-        try p.skipImportAttributes();
+        try p.skipImportAttributes(flags & ast.Flags.type_only != 0);
         try p.expectSemicolon();
         if (export_kw) |m| try p.errAtToken(.import_cannot_have_modifiers, m);
         // tsc's `checkImportClause`: a deferred import may only name a
@@ -6692,10 +6706,10 @@ const Parser = struct {
     /// Requiring it of `with` too left the clause to statement position, where
     /// it now parses as a `with` STATEMENT and costs three syntax errors tsgo
     /// does not report.
-    fn skipImportAttributes(p: *Parser) Error!void {
+    fn skipImportAttributes(p: *Parser, type_only: bool) Error!void {
         const tag = p.curTag();
         if (tag != .keyword_with and !(tag == .keyword_assert and !p.nlBefore())) return;
-        _ = try p.bump();
+        const kw = try p.bump();
         // tsc's `parseImportAttributes` opens with `parseExpected(
         // OpenBraceToken)`, so a keyword with no clause behind it is one "'{'
         // expected" on the token that is there — `import * as f from "./first"
@@ -6704,7 +6718,58 @@ const Parser = struct {
         // which answered "';' expected" at the `with` and then a second error
         // for the statement it is not.
         if (p.curTag() != .l_brace) return p.errAtCur(.expected_l_brace);
-        p.skipBalancedBraces();
+        const lb = p.curIdx();
+        // `parseImportAttributes` closes with `parseExpected(CloseBraceToken)`,
+        // so a clause that runs off the end of the file is one "'}' expected"
+        // there — `import x from "m" with {<eof>`.
+        const closed = p.skipBalancedBraces();
+        if (!closed) try p.errAtCur(.expected_r_brace);
+        // tsc's `checkImportAttributes`: a type-only import or export makes no
+        // runtime request, so there is nothing for an attributes clause to
+        // qualify — EXCEPT a `resolution-mode` override, which is a
+        // type-space instruction and is what the clause is for there. Blamed
+        // on the whole `ImportAttributes` node, whose first token is the
+        // `with`/`assert` keyword.
+        if (type_only and !(closed and p.isResolutionModeClause(lb, p.lastIdx()))) {
+            try p.errAtToken(.import_attributes_on_type_only, kw);
+        }
+    }
+
+    /// tsc's `getResolutionModeOverrideForClause`, reduced to the one question
+    /// `checkImportAttributes` asks of a TYPE-ONLY declaration: is this clause
+    /// the single `"resolution-mode": "import" | "require"` attribute that is
+    /// legal there? Read off the TOKENS between `lb` and `rb` — ztsc keeps no
+    /// node for an attributes clause — and deliberately strict: a second
+    /// attribute, another key, a non-literal value or a value outside the two
+    /// words all leave the clause unexcused, which is tsc's `return undefined`
+    /// falling through to TS2857.
+    ///
+    /// Only the QUOTED key spelling is accepted, and that is not a shortcut:
+    /// `resolution-mode` is not an identifier outside JSX name position, so an
+    /// unquoted one lexes as three tokens and is not the attribute at all.
+    fn isResolutionModeClause(p: *Parser, lb: TokenIndex, rb: TokenIndex) bool {
+        const tags = p.tok_tags.items;
+        var i = lb + 1;
+        if (i >= rb or tags[i] != .string_literal) return false;
+        if (!std.mem.eql(u8, unquoted(p.tokenTextAt(i)), "resolution-mode")) return false;
+        i += 1;
+        if (i >= rb or tags[i] != .colon) return false;
+        i += 1;
+        if (i >= rb or tags[i] != .string_literal) return false;
+        const v = unquoted(p.tokenTextAt(i));
+        if (!std.mem.eql(u8, v, "import") and !std.mem.eql(u8, v, "require")) return false;
+        i += 1;
+        // `parseDelimitedList` accepts a trailing comma and still counts one
+        // element.
+        if (i < rb and tags[i] == .comma) i += 1;
+        return i == rb;
+    }
+
+    /// A string literal's text without its quotes. No escape decoding: every
+    /// spelling this is compared against is plain ASCII.
+    fn unquoted(text: []const u8) []const u8 {
+        if (text.len >= 2) return text[1 .. text.len - 1];
+        return text;
     }
 
     /// `export export = x` / `export declare export = y`: an export ASSIGNMENT
@@ -6824,9 +6889,13 @@ const Parser = struct {
                 return p.addNode(.{ .tag = .export_default, .main_token = kw, .data = .{ .lhs = inner, .rhs = 0 } });
             },
             .eq => {
-                // `export = <entity>;` (CommonJS export assignment).
+                // `export = <entity>;` (CommonJS export assignment). tsc's
+                // `parseExportAssignment` reads the expression
+                // unconditionally, so a missing one is TS1109 — and, being a
+                // PARSE error, it suppresses the file's semantic pass
+                // (`export = ;` is TS1109 alone, never TS1203 as well).
                 _ = try p.bump();
-                const entity = if (canStartExpression(p.curTag())) try p.parseAssignExpr(.{}) else 0;
+                const entity = try p.parseAssignExpr(.{});
                 try p.expectSemicolon();
                 return p.addNode(.{ .tag = .export_assign, .main_token = kw, .data = .{ .lhs = entity, .rhs = assign_flags } });
             },
@@ -6842,7 +6911,7 @@ const Parser = struct {
                 if (try p.eat(.keyword_as) != null) ns_name = try p.expectModuleExportName();
                 _ = try p.expect(.keyword_from, .expected_from);
                 const mod = try p.parseModuleSpecifier();
-                try p.skipImportAttributes();
+                try p.skipImportAttributes(false); // plain `export * from`
                 try p.expectSemicolon();
                 const extra = try p.addExtra(ast.ExportAll{ .flags = badSpecifierFlag(mod), .name_token = ns_name });
                 return p.addNode(.{ .tag = .export_all, .main_token = kw, .data = .{ .lhs = extra, .rhs = mod orelse 0 } });
@@ -6874,7 +6943,7 @@ const Parser = struct {
                     if (try p.eat(.keyword_as) != null) ns_name = try p.expectModuleExportName();
                     _ = try p.expect(.keyword_from, .expected_from);
                     const mod = try p.parseModuleSpecifier();
-                    try p.skipImportAttributes();
+                    try p.skipImportAttributes(true); // `export type * from`
                     try p.expectSemicolon();
                     const extra = try p.addExtra(ast.ExportAll{ .flags = ast.Flags.type_only | badSpecifierFlag(mod), .name_token = ns_name });
                     return p.addNode(.{ .tag = .export_all, .main_token = kw, .data = .{ .lhs = extra, .rhs = mod orelse 0 } });
@@ -6971,7 +7040,7 @@ const Parser = struct {
             mod = spec orelse 0;
             spec_flags = badSpecifierFlag(spec);
         }
-        try p.skipImportAttributes();
+        try p.skipImportAttributes(flags & ast.Flags.type_only != 0);
         try p.expectSemicolon();
         const extra = try p.addExtra(ast.ExportNamed{ .flags = flags | spec_flags, .spec_start = specs.start, .spec_end = specs.end });
         return p.addNode(.{ .tag = .export_named, .main_token = kw, .data = .{ .lhs = extra, .rhs = mod } });
@@ -6990,7 +7059,7 @@ const Parser = struct {
                     return;
                 },
                 .l_brace => {
-                    p.skipBalancedBraces();
+                    _ = p.skipBalancedBraces();
                     return;
                 },
                 else => {
@@ -7002,19 +7071,23 @@ const Parser = struct {
     }
 
     /// Consume from a `{` through its matching `}` (token-level balance).
-    fn skipBalancedBraces(p: *Parser) void {
-        if (p.curTag() != .l_brace) return;
-        _ = p.bump() catch return;
+    /// Answers whether that `}` was actually reached — end of file inside the
+    /// braces is `false`, which is the one thing a caller standing in for a
+    /// `parseExpected(CloseBraceToken)` has to report.
+    fn skipBalancedBraces(p: *Parser) bool {
+        if (p.curTag() != .l_brace) return false;
+        _ = p.bump() catch return false;
         var depth: u32 = 1;
         while (depth > 0) {
             switch (p.curTag()) {
-                .eof => return,
+                .eof => return false,
                 .l_brace => depth += 1,
                 .r_brace => depth -= 1,
                 else => {},
             }
-            _ = p.bump() catch return;
+            _ = p.bump() catch return false;
         }
+        return true;
     }
 
     // =====================================================================
@@ -7270,7 +7343,19 @@ const Parser = struct {
                 .arrow, .colon, .l_brace => true,
                 else => false,
             };
-        const params = try p.parseParams();
+        // tsc's `parseParametersWorker` opens the signature's own contexts
+        // around the PARAMETER LIST — `setAwaitContext(!!(flags &
+        // SignatureFlags.Await))` — so an async arrow's parameter defaults are
+        // await context just as its body is: `async (a = await) => {}` parses
+        // `await` as the operator and reports TS1109 on the missing operand,
+        // not TS2304 on an identifier named `await`. Only the parameters:
+        // `fillSignature` reads the return type outside them.
+        const params = blk: {
+            const saved_fn_ctx = p.fn_ctx;
+            defer p.fn_ctx = saved_fn_ctx;
+            p.fn_ctx = if (flags & ast.Flags.async != 0) .async_fn else .sync;
+            break :blk try p.parseParams();
+        };
         var ret: Node = null_node;
         if (try p.eat(.colon) != null) {
             // An arrow's return-type annotation is a full type — including a
