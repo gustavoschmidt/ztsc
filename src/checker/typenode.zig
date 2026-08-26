@@ -445,11 +445,22 @@ fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
 ///
 /// A CONSTRUCTOR is a this-container that admits `this` only inside its BODY:
 /// the parameter list is evaluated against the class before any instance
-/// exists, so `constructor(x: this)` has no `this` to name. Every other clause
-/// of the rule (a static member, a top-level annotation, a member of a nested
-/// type literal, an object-literal method) needs the container walk itself and
-/// stays unreported for now — the safe half, since a missing report is not a
-/// false one.
+/// exists, so `constructor(x: this)` has no `this` to name.
+///
+/// An OBJECT-LITERAL METHOD is the second answerable clause: it IS a
+/// this-container, and its parent is an object literal — never a class or an
+/// interface — so every `this` TYPE it encloses is the error, wherever it
+/// sits. `{ m(x: this) {} }`, `{ m(): this {} }` and the `x is this` of
+/// `thisPredicateInObjectLiteral` all report; the `this` of a `this is T`
+/// predicate is the predicate's PARAMETER NAME, not a type node, and never
+/// reaches here. That stays true inside a class (`class K { m() { return {
+/// n(x: this) {} }; } }` is tsc's error too), which is why the container walk
+/// stopping at the object method settles it on its own.
+///
+/// Every other clause (a static member, a top-level annotation, a plain
+/// function's parameter, a member of a nested type literal) needs the PARENT
+/// walk the tree has no links for, and stays unreported — the safe half, since
+/// a missing report is not a false one.
 ///
 /// Two things make the constructor case answerable here. The binder's scope
 /// chain reaches tsc's container whenever that container is function-like, and
@@ -473,11 +484,32 @@ fn thisTypeInCtorParams(c: *Checker, node: Node) Error!bool {
         // A function/constructor TYPE is not one of tsc's this-containers, so
         // the walk passes straight through it — which is why the `this` in
         // `constructor(f: (x: this) => void)` is the constructor's and reports.
-        if (c.nodeTag(owner) == .function_type or c.nodeTag(owner) == .constructor_type) continue;
+        // Neither is an ARROW (`getThisContainer(node,
+        // /*includeArrowFunctions*/ false)`), so an arrow's `this` type is the
+        // enclosing member's: legal in a class method, the error in a plain
+        // function.
+        switch (c.nodeTag(owner)) {
+            .function_type, .constructor_type, .arrow_fn => continue,
+            else => {},
+        }
         fn_node = owner;
         break;
     }
-    if (fn_node == null_node or c.nodeTag(fn_node) != .class_method) return false;
+    if (fn_node == null_node) return false;
+    // A plain FUNCTION and an OBJECT-LITERAL METHOD are this-containers whose
+    // parent is never a class or interface, so every `this` type they enclose
+    // reports wherever it sits — no parameter-list test and no body test.
+    // (An object method's container is the `function_expr` the parser nests
+    // inside `object_method`; the `.object_method` arm is for the shapes that
+    // carry the proto directly.)
+    switch (c.nodeTag(fn_node)) {
+        .function_decl, .function_expr, .object_method => {
+            try c.diagFmt(2526, c.nodeSpan(node), "A 'this' type is available only in a non-static member of a class or interface.", .{});
+            return true;
+        },
+        else => {},
+    }
+    if (c.nodeTag(fn_node) != .class_method) return false;
     const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(fn_node).lhs);
     if (!c.isCtorMember(fn_node, proto.flags)) return false;
     if (!expr_zig.nodeInParameterList(c, fn_node, node)) return false;

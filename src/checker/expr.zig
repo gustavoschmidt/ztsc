@@ -5706,7 +5706,15 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
                     // `isApplicableIndexType` screen either way. Only the
                     // pattern shape is reported: a BRANDED string key keeps
                     // the silent `any` it has always had.
+                    //
+                    // And only where the receiver has members to have missed.
+                    // An EMPTY object is how a mapped type over an infinite
+                    // template key set comes out here (`Record<`${number}-…`,
+                    // string>` loses the pattern index tsc keeps), so
+                    // reporting on `{}` would blame the key for a receiver
+                    // ztsc failed to expand — `indexSignatures1`.
                     if (c.ts.kind(ri) == .template_literal_type and rk == .object and
+                        c.ts.objectPropCount(r) != 0 and
                         c.ts.objectFlags(r) & types.obj_flag_global_this == 0 and
                         !c.ts.objectIsLiteralOrigin(r))
                     {
