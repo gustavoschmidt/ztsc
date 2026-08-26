@@ -4262,7 +4262,7 @@ pub fn ctxPropType(c: *Checker, rctx: TypeId, ctx: TypeId, key: Atom) Error!Type
             // tsc's guard: the name must satisfy the map's key set, taken
             // through its base constraint (`keyof T` for `T extends
             // Record<string, …>` bottoms out at `string | number`).
-            const con = try c.transitiveBaseConstraint(c.ts.mappedConstraint(rctx));
+            const con = try mappedKeyBaseConstraint(c, c.ts.mappedConstraint(rctx));
             if (con != types.no_type and !try c.isAssignable(key_lit, con)) return types.no_type;
             return c.substMappedKey(
                 c.ts.mappedValue(rctx),
@@ -4299,6 +4299,45 @@ pub fn ctxPropType(c: *Checker, rctx: TypeId, ctx: TypeId, key: Atom) Error!Type
             return types.no_type;
         },
     }
+}
+
+/// The key domain a generic mapped type admits, as
+/// `getTypeOfPropertyOfContextualType` reads it:
+///
+///     const constraint = getConstraintTypeFromMappedType(t);
+///     const constraintOfConstraint = getBaseConstraintOfType(constraint) || constraint;
+///     if (isTypeAssignableTo(nameType, constraintOfConstraint)) …
+///
+/// `transitiveBaseConstraint` alone is not that walk. tsc's
+/// `computeBaseConstraint` answers `keyofConstraintType` — `string | number |
+/// symbol` — for an INDEX type and stops there, because the keys of an object
+/// known only by a constraint are known only to be property keys (a subtype may
+/// declare more). ztsc's `baseConstraintOf` instead SUBSTITUTES the operand's
+/// type parameters with their constraints and keeps going, so
+/// `K extends keyof T` with `T` unconstrained walked `K` → `keyof T` →
+/// `keyof unknown` = `never`, and every property name failed the test: the
+/// literal got no contextual type, its callback parameters fell to implicit
+/// `any`, and `mapped5({foo: s => 42})` reported TS7006 on `s`
+/// (`mappedTypeContextualTypesApplied`).
+///
+/// Deliberately local to this one reader rather than folded into
+/// `baseConstraintOf`: the whole-substitution answer is what the deferred
+/// indexed-access rules in `assign.zig` are tuned against, and swapping it
+/// there traded this case for false positives on `T[K]` property access
+/// (`mappedTypeRelationships` f50/f51) and lost six `keyof T` relation
+/// diagnostics (`conditionalTypes1` f7/f8). `assign.relationIndexKeyConstraint`
+/// and `narrowable.constraintOrSelf` carry the same rule for their own
+/// operands, each over a differently-resolved type.
+fn mappedKeyBaseConstraint(c: *Checker, t: TypeId) Error!TypeId {
+    var cur = t;
+    var i: u32 = 0;
+    while (i < 8) : (i += 1) {
+        if (c.ts.kind(cur) == .keyof_op) return c.propertyKeyType();
+        const next = try c.baseConstraintOf(cur);
+        if (next == cur) break;
+        cur = next;
+    }
+    return cur;
 }
 
 /// Does `node` denote an optional chain — i.e. does its object/callee
