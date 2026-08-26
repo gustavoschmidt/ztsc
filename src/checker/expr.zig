@@ -1243,30 +1243,7 @@ fn checkIdentifier(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // (`checkIdentifier`, right after the TS2454 `error()`).
             return if (unassigned) declared else narrowed;
         },
-        .wrong_space => |sym| {
-            const wf = c.symFlags(sym);
-            if (wf.import_binding and wf.type_only) {
-                // Not in a position that would be emitted (see
-                // `Checker.in_type_space_name`) — tsc's `markAliasReferenced`
-                // never runs there. (wave-10 A: one flagged guard.)
-                if (!c.in_type_space_name) {
-                    try c.diagFmt(1361, c.tokSpan(tok), "'{s}' cannot be used as a value because it was imported using 'import type'.", .{c.tokenText(tok)});
-                }
-                return types.error_type;
-            }
-            // The implicit `arguments` object outranks a declaration with no
-            // value meaning. tsc's `resolveNameHelper` answers `arguments` at
-            // the nearest function-like location, and it does so AFTER that
-            // location's own locals have been filtered by meaning — so an
-            // `interface arguments {}` is skipped at every level of the walk
-            // and never reaches the name
-            // (`functionDeclarationWithResolutionOfTypeNamedArguments01`).
-            if (std.mem.eql(u8, c.atomText(a), "arguments")) {
-                if (try c.implicitArgumentsType(c.nodeSpan(node))) |t| return t;
-            }
-            try c.diagFmt(2693, c.tokSpan(tok), "'{s}' only refers to a type, but is being used as a value here.", .{c.tokenText(tok)});
-            return types.error_type;
-        },
+        .wrong_space => |sym| return typeNameInValuePosition(c, sym, a, node, tok),
         .none => {
             // `globalThis` is always in scope: the global-scope object,
             // whose members are the program's global value declarations
@@ -1300,6 +1277,42 @@ fn checkIdentifier(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             return types.error_type;
         },
     }
+}
+
+/// A name that resolved only in TYPE space, reached from a VALUE position —
+/// tsc's `checkIdentifier` arm for a symbol whose meaning does not include
+/// `SymbolFlags.Value`. Answers a type so the caller can carry on, and reports
+/// whichever of the three verdicts fits.
+///
+/// Shared by the read path (`checkIdentifier`) and the WRITE path
+/// (`checkAssignmentTarget`), which used to answer `error_type` in silence:
+/// `interface I {}; I = x` earned nothing, where tsgo reports TS2693 for it and
+/// for every other assignment spelling (`I += 1`, `I++`, `[I] = [x]`,
+/// `({ p: I } = o)`). The two positions ask the identical question, so they
+/// read one answer rather than two that drift.
+fn typeNameInValuePosition(c: *Checker, sym: SymbolId, a: Atom, node: Node, tok: TokenIndex) Error!TypeId {
+    const wf = c.symFlags(sym);
+    if (wf.import_binding and wf.type_only) {
+        // Not in a position that would be emitted (see
+        // `Checker.in_type_space_name`) — tsc's `markAliasReferenced`
+        // never runs there. (wave-10 A: one flagged guard.)
+        if (!c.in_type_space_name) {
+            try c.diagFmt(1361, c.tokSpan(tok), "'{s}' cannot be used as a value because it was imported using 'import type'.", .{c.tokenText(tok)});
+        }
+        return types.error_type;
+    }
+    // The implicit `arguments` object outranks a declaration with no
+    // value meaning. tsc's `resolveNameHelper` answers `arguments` at
+    // the nearest function-like location, and it does so AFTER that
+    // location's own locals have been filtered by meaning — so an
+    // `interface arguments {}` is skipped at every level of the walk
+    // and never reaches the name
+    // (`functionDeclarationWithResolutionOfTypeNamedArguments01`).
+    if (std.mem.eql(u8, c.atomText(a), "arguments")) {
+        if (try c.implicitArgumentsType(c.nodeSpan(node))) |t| return t;
+    }
+    try c.diagFmt(2693, c.tokSpan(tok), "'{s}' only refers to a type, but is being used as a value here.", .{c.tokenText(tok)});
+    return types.error_type;
 }
 
 fn checkTdz(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex) Error!void {
@@ -7241,7 +7254,10 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
                     }
                     return c.typeOfSymbol(sym);
                 },
-                .wrong_space => return types.error_type,
+                // A name with no VALUE meaning is no more assignable than it is
+                // readable — `interface I {}; I = x` is TS2693, exactly as
+                // `const v = I` is. See `typeNameInValuePosition`.
+                .wrong_space => |sym| return typeNameInValuePosition(c, sym, a, node, tok),
                 .none => {
                     try c.reportNameNotFound(tok);
                     return types.error_type;
