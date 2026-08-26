@@ -652,16 +652,25 @@ fn headDeclarationsEmpty(c: *const Checker, head: Node) bool {
 /// really can hold every key of a `{ a; b }`, and `string` cannot say so.
 fn forInKeyType(c: *Checker, rt: TypeId) Error!TypeId {
     const ks = try c.keyofType(rt);
-    if (try c.typeIsStringLike(ks)) {
-        if (c.ts.kind(ks) != .union_type) return ks;
+    // tsc's `getExtractStringType` half, over a key set that actually IS a
+    // set: keep the string-valued constituents and fall back to `string` only
+    // when `Extract` would empty the union — the `never` case tsc names.
+    if (c.ts.kind(ks) == .union_type) {
         var parts: std.ArrayList(TypeId) = .empty;
         defer parts.deinit(c.scratch());
         for (try c.memberList(ks)) |m| {
             if (try c.typeIsStringLike(try c.resolveStructural(m))) try parts.append(c.scratch(), m);
         }
         if (parts.items.len != 0) return c.ts.makeUnion(c.scratch(), parts.items);
+        return types.string_type;
     }
-    return types.string_type;
+    if (c.ts.kind(ks) == .never) return types.string_type;
+    // Anything else is handed back AS WRITTEN, and a still-generic key set is
+    // the reason. `for (k1 in obj)` under `<K extends string>(obj: { [P in K]:
+    // T }, …)` with `let k1: K` has key set `K`, which is assignable to `K`
+    // and to nothing else — narrowing it to `string` first invented three
+    // TS2405s in `keyofAndForIn`.
+    return ks;
 }
 
 fn checkForInOf(c: *Checker, node: Node) Error!void {
