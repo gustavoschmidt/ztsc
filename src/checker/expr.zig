@@ -840,7 +840,7 @@ fn checkYieldImplicitAny(c: *Checker, node: Node, ctx: TypeId, delegate: bool) E
 /// The function-like that lexically contains the node now being checked —
 /// tsc's `getContainingFunction`, which an arrow is NOT transparent to.
 /// `null_node` at the top level of a file.
-fn enclosingFnNode(c: *const Checker) Node {
+pub fn enclosingFnNode(c: *const Checker) Node {
     var cur = c.cur_scope;
     while (cur != binder.file_scope) {
         if (c.bind.scope_kinds[cur] == .function) return c.bind.scope_owners[cur];
@@ -884,8 +884,20 @@ fn enclosingFnNode(c: *const Checker) Node {
 /// return-type inference probe reaches it first, and that expression's type
 /// then MEMOIZES, so a flag set on one path alone loses the diagnostic
 /// whenever the other path wins the race.
-fn inParameterList(c: *const Checker, node: Node) bool {
-    const fn_node = enclosingFnNode(c);
+///
+/// `typenode.zig`'s TS2526 asks the same question of a `this` TYPE node, where
+/// the containing function has to be a CONSTRUCTOR besides — hence `pub`, and
+/// hence `enclosingFnNode` beside it.
+pub fn inParameterList(c: *const Checker, node: Node) bool {
+    return nodeInParameterList(c, enclosingFnNode(c), node);
+}
+
+/// `inParameterList` against a container the caller picked. `typenode.zig`
+/// needs its own: tsc's `getThisContainer` does NOT list `FunctionType` or
+/// `ConstructorType`, so a `this` under `constructor(f: (x: this) => void)`
+/// belongs to the CONSTRUCTOR, while `enclosingFnNode` stops at the function
+/// type's own scope.
+pub fn nodeInParameterList(c: *const Checker, fn_node: Node, node: Node) bool {
     if (fn_node == null_node) return false;
     const proto = switch (c.tree.nodeTag(fn_node)) {
         .arrow_fn, .function_expr, .function_decl, .class_method, .function_type => c.tree.extraData(ast.FnProto, c.tree.nodeData(fn_node).lhs),
