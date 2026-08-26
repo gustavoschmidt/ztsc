@@ -22,6 +22,49 @@ const max_instantiation_depth = checker_zig.max_instantiation_depth;
 const EnumMemberCollect = @import("enums.zig").EnumMemberCollect;
 const symbolKeyAtom = @import("keyof.zig").symbolKeyAtom;
 
+/// A homomorphic map whose source variable is DECLARED with an all-array /
+/// all-tuple constraint, so that instantiating it with `any` yields an ARRAY
+/// rather than an index-signatured object — tsc's `instantiateMappedType`:
+///
+/// ```ts
+/// if (isArrayType(t) || t.flags & TypeFlags.Any && … &&
+///     (constraint = getConstraintOfTypeParameter(typeVariable)) &&
+///     everyType(constraint, isArrayOrTupleType)) {
+///     return instantiateMappedArrayType(t, type, …);
+/// }
+/// ```
+///
+/// A property of the map AS WRITTEN, not of whatever it is instantiated with:
+/// `getHomomorphicTypeVariable` reads the declared `keyof T`, so
+/// `Objectish<T> = { [K in keyof T]: T[K] }` stays object-flavoured even when
+/// reached through `IndirectArrayish<U extends unknown[]> = Objectish<U>`
+/// (`mappedTypeWithAny` pins exactly that). It is therefore recorded once, in
+/// `mappedTypeFromNode`, and only carried through instantiation — never
+/// recomputed from a substituted source.
+///
+/// Kept here rather than beside the syntactic `mapped_flag_*` bits in
+/// `ast.zig`: the parser cannot know it, and neither can anything outside this
+/// file, which is the only reader.
+const mapped_flag_any_is_array: u32 = 32;
+
+/// Does a homomorphic map over `src` turn an `any` instantiation into an
+/// array? True exactly when `src` is a type parameter whose constraint is
+/// present and is (a union of) array/tuple types.
+fn anyMapsToArray(c: *Checker, src: TypeId) Error!bool {
+    if (src == 0 or c.ts.kind(src) != .type_param) return false;
+    const con = try c.typeParamConstraint(c.ts.typeParamSymbol(src));
+    if (con == types.no_type) return false;
+    const rc = try c.resolveStructural(con);
+    if (c.ts.kind(rc) == .union_type) {
+        for (try c.memberList(rc)) |m| {
+            const rm = try c.resolveStructural(m);
+            if (c.ts.kind(rm) != .array and c.ts.kind(rm) != .tuple) return false;
+        }
+        return true;
+    }
+    return c.ts.kind(rc) == .array or c.ts.kind(rc) == .tuple;
+}
+
 /// Dense, stable id for a mapped type's key parameter `K`, keyed by the
 /// mapped-type nodeKey. Mapped nodes are excluded from the type-node memo,
 /// so the node may be re-evaluated — the id must be stable across calls.
@@ -51,6 +94,7 @@ pub fn mappedTypeFromNode(c: *Checker, node: Node) Error!TypeId {
     if (c.nodeTag(m.constraint) == .keyof_type) {
         flags |= types.mapped_flag_homomorphic;
         src_type = try c.typeFromTypeNode(c.tree.nodeData(m.constraint).lhs);
+        if (try anyMapsToArray(c, src_type)) flags |= mapped_flag_any_is_array;
     } else {
         constraint = try c.typeFromTypeNode(m.constraint);
     }
@@ -263,7 +307,58 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
         // `{ message?: unknown; ref?: unknown; … }`.
         if (isPrimitiveForHomomorphicMap(s.kind(src))) return src;
         switch (s.kind(src)) {
-            .any, .err => return types.any_type,
+            .err => return types.any_type,
+            // A homomorphic map over `any` is NOT `any`. tsc's
+            // `instantiateMappedType` sends `any` down the materializing arm
+            // (`AnyOrUnknown` is on the positive side of its test), so the map
+            // is resolved with the key set `keyof any` —
+            // `string | number | symbol` — and comes out as index signatures:
+            // `Own<any>` for `{ [P in keyof T]: number }` is
+            // `{ [x: string]: number; [x: number]: number }`, `Partial<any>` is
+            // `{ [x: string]: any }`. Collapsing to `any` erased every check
+            // through such a type — `const b: boolean = partialOfAny` passed,
+            // and `{ [P in keyof any]: TakeString }` offered an object literal
+            // no contextual property type at all, so its callback parameters
+            // went implicit-`any` (`mappedTypeContextualTypesApplied`).
+            //
+            // Built here rather than by re-entering the non-homomorphic tail
+            // with `keyof any` as the constraint: that tail would rediscover
+            // the same two index keys through `collectMappedKeys` and set up
+            // the modifiers-type and name-type machinery none of them use, and
+            // this arm is hot enough for that to show (drizzle). The value
+            // template has already had the source substituted, so a `T[P]`
+            // template reads `any[P]` and answers `any` per key, as it must.
+            // `symbol` is dropped for the same reason the tail drops it: ztsc
+            // has no symbol index signature.
+            //
+            // …unless the map's source variable was DECLARED with an
+            // array/tuple constraint, in which case tsc keeps the result a
+            // LIST (`mapped_flag_any_is_array`): `Promise.all`'s
+            // `{ -readonly [P in keyof T]: Awaited<T[P]> }` over
+            // `T extends readonly unknown[]` handed `any` must still be an
+            // array, or `Promise.all(anything as any)` reports a false TS2740
+            // for the missing `length`/`pop`/… . Routed through the `.array`
+            // arm below by handing it an `any[]` source, which is exactly
+            // tsc's `instantiateMappedArrayType(t, …)`: the element is the
+            // value template with the key bound to `number`, and `any` is
+            // never a `readonly` array so only `+readonly` can make one.
+            .any => {
+                if (flags & mapped_flag_any_is_array != 0) {
+                    return c.materializeMapped(key_param, constraint, value, as_clause, try s.makeArray(types.any_type), flags);
+                }
+                // An `as` clause computes each property's NAME from its key,
+                // and neither `string` nor `number` is a key it can name — the
+                // non-homomorphic tail drops such a key outright, so the map
+                // has no members at all.
+                if (as_clause != 0) return types.empty_object_type;
+                const sidx = try c.substMappedKey(value, key_id, types.string_type);
+                const nidx = try c.substMappedKey(value, key_id, types.number_type);
+                var obj_flags: u32 = types.obj_flag_mapped_keys;
+                if (flags & types.mapped_flag_readonly_add != 0) {
+                    obj_flags |= types.obj_flag_readonly_string_index | types.obj_flag_readonly_number_index;
+                }
+                return s.makeObject(&.{}, sidx, nidx, obj_flags);
+            },
             // `{ [P in keyof T]: … }` over a CLASS STATIC SIDE / namespace value
             // (`typeof C`). `.class_value` is a nominal shortcut that carries no
             // properties of its own — every reader materializes them through
