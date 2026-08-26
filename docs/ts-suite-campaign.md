@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-26, post wave 41)
+## Standings (2026-08-27, post wave 42)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7811 / 8641 (90.4%)** |
-| excess keys (false positives) | 3541 | 1108 |
-| missing keys (under-reports) | 8617 | 2125 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7838 / 8641 (90.7%)** |
+| excess keys (false positives) | 3541 | 1070 |
+| missing keys (under-reports) | 8617 | 2096 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Forty-one waves landed (3–41), every one with ZERO match→non-match regressions in
+Forty-two waves landed (3–42), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -729,7 +729,82 @@ rest gap. A's TS2574 attempt REVERTED with recipe (isAssignable-based
 isArrayLikeType cost +33 excess keys and a timeout; use kind tests +
 base-constraint, treat variadic infer as unknown[]-constrained).
 
-## Ranked next queue (wave 42) — distilled from wave-41 agent reports
+Wave 42 (+27 exact → 7838/8641 90.7%; accepted divergences 30→29): D
+landed the jsx THREE-STAGE ordering (silent verdict → whole-object gate
+→ elaboration; the gate SKIPS freshness verdicts — the memoized
+relation can't see freshness), get/set across line breaks (their
+modifier arm has no same-line test), unterminated-block-comment ASI,
+and C's flow handoff (evolving vars start at `undefined`
+unconditionally — the restriction to never-written vars was the bug).
+A landed TS2574 with the polarity finding (ask "is this a FINISHED
+non-array?" — deferred spread operands broke both positive predicates),
+class-expression static-field ctx (checkExprCached keys on (node,ctx) —
+the re-check was a second full read), for-of nullish TS18050,
+errored-index-key applicability (errorType carries Any), defaulted-param
+write targets, TS2491/TS2405/TS2463, and C's SkipGenericFunctions
+fallback recipe. B landed mapped-over-`any` materializing index
+signatures (with the declared-array-constraint carve-out for
+Promise.all), intersection-source-vs-union-target via someTypeRelatedTo
+(nullish carve-out — excalidraw's TS2345 is a TRUE positive),
+generic-mapped-vs-index-signature by template, combined mapped
+optionality. C landed whole-argument isContextSensitive and generalized
+template-hole pairing into unify. mergedDeclarations7 RE-ROUTED a
+FOURTH time with proof: tsgo prints import("passport").PassportStatic.
+Passport and the relation is ASYMMETRIC — combineValueAndTypeSymbols
+mints a fresh symbol with its own thisType; belongs in import/alias
+resolution (names/typespace). PERF: combined wave +1.79% drizzle CPU
+(bisect: mostly B's mapped work, semantic; the +4.3% wall reading was
+4-checker noise) — accepted under the 2% bar; watch drizzle next wave.
+
+## Ranked next queue (wave 43) — distilled from wave-42 agent reports
+
+1. mergedDeclarations7, the REAL fix (fourth diagnosis, proven):
+   combineValueAndTypeSymbols in import/alias resolution — a named
+   import through `export =` of a merged const/namespace mints a FRESH
+   symbol carrying the interface's declarations, giving a distinct
+   interface type with its own thisType (names.zig/typespace.zig +
+   link support for the specifier node).
+2. props.zig mapped reads: Partial<T>[K] carries `| undefined` at the
+   READ site (mappedTypeRelationships, 8 under); obj[key] on a generic
+   mapped type resolves `any` instead of staying deferred
+   (mappedTypeConstraints2, 5 under).
+3. Intersection reduction of DISJOINT constituents (tsc getReducedType)
+   in makeIntersection — types.zig, needs an owner (intersection
+   ReductionStrict, mappedTypeNotMistakenlyHomomorphic,
+   intersectionWithUnionConstraint:25).
+4. baseConstraintOf: `keyof T` answers stringNumberSymbolType for ANY
+   Index type, not keyof(constraint) (expr.zig;
+   mappedTypeContextualTypesApplied:21 + prior wave hits).
+5. literalWideningWithCompoundLikeAssignments (11 excess — expr/narrow
+   compound-assignment widening).
+6. tsxLibraryManagedAttributes (15 under, jsx).
+7. TS2595: link/modules must carry the import specifier's node onto
+   the deferred .export_equals_prop target (then modvalue reports
+   "can only be imported by using a default import").
+8. controlFlowBindingPatternOrder: binder must bind a binding
+   element's INITIALIZER before its name when the name is a pattern
+   (binder.zig).
+9. TS2688 twice: config-level diagnostics channel ((config):0:0 keys,
+   main.zig, must NOT suppress the semantic pass); exports-map
+   authority in resolve.zig (package.json exports present → never
+   consult "types"; app re-proof mandatory).
+10. const type-param freshness (typeParameterConstModifiersWith
+    Intersection:23:3): an object literal contextually typed by a
+    CONST type param must not be excess-checked in the constraint
+    probe — the clamp reads FreshLiteral, and a const-context literal
+    loses it via getRegularTypeOfLiteralType.
+11. Parser: reservedWords3's full recovery shape (reserved word left
+    UNCONSUMED, list ends, tokens re-parse at statement level);
+    jsxNamespacePrefixInName / jsxInvalidEsprimaTestSuite cascades
+    (24 keys); variadicTuples2's checker-side TS1265s.
+12. De-duplicate infer.simplifiedIndexPattern with
+    mapped.simplifyMappedIndexAccess into mapped.zig.
+13. Census pools: TS2411 ×3, TS2502 ×3, TS2523 ×2, TS2526 ×2, TS2677
+    ×2 (needs a declaration-walk reporting site), TS2675 ×2;
+    consistentAliasVsNonAliasRecordBehavior (alias variance for
+    mapped aliases); TS7023 (blocked).
+
+## Superseded queue (wave 42, kept for context)
 
 1. jsx.zig ordering: the per-attribute pass runs UNCONDITIONALLY; tsc's
    elaborateJsxComponents runs only after the whole-attributes-object
