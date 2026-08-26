@@ -845,6 +845,51 @@ pub fn reportVarianceMismatch(c: *Checker, tp_sym: SymbolId, src: TypeId, tgt: T
     });
 }
 
+/// TS2637 at one parameter's annotation, sited exactly like TS2636.
+fn reportVarianceUnsupported(c: *Checker, tp_sym: SymbolId) Error!void {
+    const saved = c.enterSymFile(tp_sym);
+    defer c.restoreCtx(saved);
+    const span = c.varianceAnnotationSpan(tp_sym) orelse return;
+    try c.diagFmt(2637, span, "Variance annotations are only supported in type aliases for object, function, constructor, and mapped types.", .{});
+}
+
+/// Does a type ALIAS body refuse a variance annotation outright (TS2637)?
+///
+/// tsc's `checkTypeParameterDeferred` decides it from the alias's declared
+/// type, and reports it INSTEAD of measuring TS2636:
+///
+/// ```ts
+/// if (isTypeAliasDeclaration(node.parent) && !(getObjectFlags(getDeclaredTypeOfSymbol(symbol)) & (ObjectFlags.Anonymous | ObjectFlags.Mapped))) {
+///     error(node, Diagnostics.Variance_annotations_are_only_supported_in_type_aliases_for_object_function_constructor_and_mapped_types);
+/// }
+/// ```
+///
+/// `ObjectFlags.Anonymous | Mapped` is a finer distinction than ztsc's type
+/// KIND draws: an alias to an interface (`type A<out T> = I<T>`) is a
+/// reference rather than an anonymous object, and tsc rejects it, but ztsc's
+/// `.ref` also covers bodies that merely have not resolved yet. So this
+/// answers only for the kinds that CANNOT be an anonymous object or a map,
+/// and declines for the rest. Declining under-reports; it never invents the
+/// diagnostic on a body that is in fact an object type — and `.ref` is
+/// exactly where an alias to an object type can still land.
+///
+/// Oracle-pinned against tsgo 7.0.2 over a shape matrix: `{x:T}`,
+/// `(x:T)=>void`, `new (x:T)=>void`, `{[P in keyof T]: T[P]}`, an alias to
+/// another alias, and `Readonly<{x:T}>` are accepted; `I<T>`, `K<T>`,
+/// intersections, unions, conditionals, `string`, `{x:T}[]` and `[T]` are
+/// all TS2637.
+fn aliasBodyRefusesVariance(k: types.Kind) bool {
+    return switch (k) {
+        // What tsc accepts: an anonymous object (`.overloads` is a type
+        // literal with several call signatures), a function or constructor
+        // type, a mapped type.
+        .object, .function, .overloads, .mapped => false,
+        // Not decidable from the kind alone, or not a body a user wrote.
+        .none, .err, .any, .unknown, .ref, .class_value, .infer_var, .mapped_param, .evolving_array => false,
+        else => true,
+    };
+}
+
 /// TS2636 — the DECLARATION-site half of TS 4.7 variance: does an `in`/`out`
 /// annotation match how the parameter is actually USED?
 ///
@@ -870,19 +915,30 @@ pub fn checkVarianceAnnotations(c: *Checker, owner: SymbolId) Error!void {
         try c.aliasGeneric(owner)
     else
         return;
-    switch (c.ts.kind(generic)) {
-        // An annotated ALIAS must resolve to an object/function shape: tsc
-        // rejects every other alias body outright, with a different
-        // diagnostic (TS2637) that ztsc does not implement. An interface or
-        // class-instance body is always one of these anyway; anything else
-        // here (a `ref`, an error) is a body that did not resolve.
-        .object, .function => {},
-        else => return,
-    }
     var tps: std.ArrayList(TypeParamInfo) = .empty;
     defer tps.deinit(c.scratch());
     try c.typeParamsOf(owner, &tps);
     if (tps.items.len == 0) return;
+
+    // TS2637 is tsc's ELSE-IF: an alias body that cannot carry a variance
+    // annotation is reported for that, and never also measured for TS2636.
+    if (f.type_alias and aliasBodyRefusesVariance(c.ts.kind(generic))) {
+        for (tps.items, 0..) |tp, i| {
+            if (i >= 16) break;
+            const v: Variance = @enumFromInt(@as(u2, @truncate(bits >> @intCast(2 * i))));
+            if (v == .none) continue;
+            try reportVarianceUnsupported(c, tp.sym);
+        }
+        return;
+    }
+    switch (c.ts.kind(generic)) {
+        // An annotated INTERFACE or CLASS body is always an object shape;
+        // anything else here (a `ref`, an error) is a body that did not
+        // resolve, and an alias body that reaches this point is one
+        // `aliasBodyRefusesVariance` declined to judge.
+        .object, .function => {},
+        else => return,
+    }
 
     // Instantiation and expansion are bookkeeping here: a depth/count trip
     // measuring a type the user never wrote must not spend the program's
