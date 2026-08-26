@@ -83,7 +83,69 @@ pub fn declaredVariances(c: *Checker, owner: SymbolId) Error!u32 {
         if (i >= 16) break;
         bits |= @as(u32, @intFromEnum(c.declaredVarianceOfTypeParam(tp.sym))) << @intCast(2 * i);
     }
+    bits = try mergedDeclaredVariances(c, owner, tps.items, bits);
     try c.variance_cache.put(c.cm(), owner, bits);
+    return bits;
+}
+
+/// OR in the annotations written by the merged owner's OTHER declaration
+/// blocks — tsc's `getVarianceModifiers`, which loops over every declaration
+/// of the parameter's SYMBOL:
+///
+/// ```ts
+/// for (const d of tp.symbol.declarations) {
+///     if (hasSyntacticModifier(d, ModifierFlags.In)) modifiers |= VarianceFlags.In;
+///     if (hasSyntacticModifier(d, ModifierFlags.Out)) modifiers |= VarianceFlags.Out;
+/// }
+/// ```
+///
+/// tsc binds a merged interface's type parameters into the interface SYMBOL's
+/// member table, so every block's same-named `T` IS one symbol and that loop
+/// spans the blocks. ztsc binds each block's list into that block's own scope
+/// and `typeParamsOf` keeps only the first block that declares one (see
+/// `typeparams.mergedTypeParamConstraint`, which reconstructs the same OR for
+/// constraints), so the sibling blocks' annotations have to be gathered by
+/// NAME here.
+///
+/// `interface Baz<out T> {}` beside `interface Baz<in T> {}` is INVARIANT, and
+/// both `baz1 = baz2` and `baz2 = baz1` are errors. Reading the first block
+/// alone called the covariant one legal (varianceAnnotations.ts:120).
+///
+/// Only the declaration forms whose type parameters tsc routes into the
+/// symbol's member table participate — the same list `mergedTypeParamConstraint`
+/// walks — so a function declaration merged with the interface donates nothing.
+fn mergedDeclaredVariances(c: *Checker, owner: SymbolId, tps: []const TypeParamInfo, bits0: u32) Error!u32 {
+    // Cheap gate: a symbol with one declaration block has no sibling to ask.
+    if (!c.prog.isMergedId(owner) and c.declsOf(owner).len < 2) return bits0;
+    var bits = bits0;
+    var one = [_]SymbolId{owner};
+    const parts: []const SymbolId = if (c.prog.isMergedId(owner)) c.prog.mergedSym(owner).parts else one[0..];
+    var buf: std.ArrayList(TypeParamInfo) = .empty;
+    defer buf.deinit(c.scratch());
+    for (parts) |csym| {
+        const saved = c.enterSymFile(csym);
+        defer c.restoreCtx(saved);
+        for (c.declsOf(csym)) |decl| {
+            switch (c.nodeTag(decl)) {
+                .interface_decl, .class_decl => {},
+                else => continue,
+            }
+            buf.clearRetainingCapacity();
+            try c.declTypeParams(decl, &buf);
+            for (buf.items) |sib| {
+                const sib_v = c.declaredVarianceOfTypeParam(sib.sym);
+                if (sib_v == .none) continue;
+                for (tps, 0..) |tp, i| {
+                    if (i >= 16) break;
+                    // The block the list came from is already folded into
+                    // `bits0`; only a SIBLING block adds anything.
+                    if (tp.sym == sib.sym) continue;
+                    if (!std.mem.eql(u8, c.symbolName(tp.sym), c.symbolName(sib.sym))) continue;
+                    bits |= @as(u32, @intFromEnum(sib_v)) << @intCast(2 * i);
+                }
+            }
+        }
+    }
     return bits;
 }
 
