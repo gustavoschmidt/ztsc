@@ -920,41 +920,42 @@ pub const LazyStat = enum(u8) {
 };
 
 pub const map_containers = [_][]const u8{
-    "node_types",             "sig_cache",            "node_scopes",
-    "reassigned_syms",        "reassigned_in_loop",   "member_written_syms",
-    "member_written_in_loop", "ns_types",             "ambient_ns_types",
-    "relation",               "expansions",           "overload_groups",
-    "construct_groups",       "origin",               "iface_generic",
-    "overload_group_pool",    "iface_stack",          "pending_class_decos",
-    "class_inst_generic",     "class_static_cache",   "class_static_owner",
-    "class_static_stack",     "class_ctor_cache",     "class_abstract_cache",
-    "enum_value_cache",       "enum_info_cache",      "enum_relation_cache",
-    "alias_generic",          "alias_state",          "alias_recursive",
-    "flow_same",              "flow_narrow",          "ref_keys",
-    "flow_loop_stack",        "flow_stack",           "flow_tmp",
-    "flow_reduce",            "da_cache",             "ctp_cache",
-    "cmp_cache",              "ctt_cache",            "ci_cache",
-    "infer_visited",          "subst_this_cache",     "mmp_cache",
-    "arrayish_elem_cache",    "tp_constraint_cache",  "erase_cache",
-    "erase_any_cache",        "inst_map_ids",         "fresh_tp_ids",
-    "this_tp_ids",            "fresh_tp_info",        "type_node_cache",
-    "atom_cache",             "infer_ids",            "infer_constraints",
-    "infer_scopes",           "mapped_key_ids",       "mapped_key_scopes",
-    "inst_diag_at",           "infer_active",         "lazy_member_active",
-    "this_bound_fns",         "chain_guards",         "never_isect",
-    "deep_path_list",         "deep_path_ids",        "flow_reach",
-    "member_type_stack",      "method_ret_cuts",      "lazy_index_objs",
-    "sym_res_stack",          "pending_type_args",    "pending_type_args_pool",
-    "pending_type_args_seen", "tp_constrained_cache", "nominal_bases",
-    "nominal_base_pool",      "keyof_mapped_active",  "ctp_syms_seen",
-    "weak_types",             "base_ref_active",      "lazy_member",
-    "trunc_lazy_member",      "lazy_map",             "pattern_root_decls",
-    "pattern_root_ids",       "pattern_narrow_busy",  "key_name_types",
-    "enum_members",           "keyof_obj_cache",      "sym_key_cache",
-    "trunc_expansions",       "inst_map_bytes",       "tp_mentions",
-    "smk_cache",              "rel_maybe",            "spec_sym_types",
-    "spec_tainted",           "last_assign_pos",      "definitely_assigned_syms",
-    "alias_stack",            "alias_self_recursive", "jsx_lma_cache",
+    "node_types",             "sig_cache",                "node_scopes",
+    "reassigned_syms",        "reassigned_in_loop",       "member_written_syms",
+    "member_written_in_loop", "ns_types",                 "ambient_ns_types",
+    "relation",               "expansions",               "overload_groups",
+    "construct_groups",       "origin",                   "iface_generic",
+    "overload_group_pool",    "iface_stack",              "pending_class_decos",
+    "class_inst_generic",     "class_static_cache",       "class_static_owner",
+    "class_static_stack",     "class_ctor_cache",         "class_abstract_cache",
+    "enum_value_cache",       "enum_info_cache",          "enum_relation_cache",
+    "alias_generic",          "alias_state",              "alias_recursive",
+    "flow_same",              "flow_narrow",              "ref_keys",
+    "flow_loop_stack",        "flow_stack",               "flow_tmp",
+    "flow_reduce",            "da_cache",                 "ctp_cache",
+    "cmp_cache",              "ctt_cache",                "ci_cache",
+    "cftp_cache",             "base_constraint_cache",    "infer_visited",
+    "subst_this_cache",       "mmp_cache",                "arrayish_elem_cache",
+    "tp_constraint_cache",    "erase_cache",              "erase_any_cache",
+    "inst_map_ids",           "fresh_tp_ids",             "this_tp_ids",
+    "fresh_tp_info",          "type_node_cache",          "atom_cache",
+    "infer_ids",              "infer_constraints",        "infer_scopes",
+    "mapped_key_ids",         "mapped_key_scopes",        "inst_diag_at",
+    "infer_active",           "lazy_member_active",       "this_bound_fns",
+    "chain_guards",           "never_isect",              "deep_path_list",
+    "deep_path_ids",          "flow_reach",               "member_type_stack",
+    "method_ret_cuts",        "lazy_index_objs",          "sym_res_stack",
+    "pending_type_args",      "pending_type_args_pool",   "pending_type_args_seen",
+    "tp_constrained_cache",   "nominal_bases",            "nominal_base_pool",
+    "keyof_mapped_active",    "ctp_syms_seen",            "weak_types",
+    "base_ref_active",        "lazy_member",              "trunc_lazy_member",
+    "lazy_map",               "pattern_root_decls",       "pattern_root_ids",
+    "pattern_narrow_busy",    "key_name_types",           "enum_members",
+    "keyof_obj_cache",        "sym_key_cache",            "trunc_expansions",
+    "inst_map_bytes",         "tp_mentions",              "smk_cache",
+    "rel_maybe",              "spec_sym_types",           "spec_tainted",
+    "last_assign_pos",        "definitely_assigned_syms", "alias_stack",
+    "alias_self_recursive",   "jsx_lma_cache",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -1663,6 +1664,27 @@ pub const Checker = struct {
     ctp_cache: std.ArrayList(u8) = .empty,
     /// containsMappedParam memo, dense like `ctp_cache`.
     cmp_cache: std.ArrayList(u8) = .empty,
+    /// `baseConstraintOf` memo — see the method. Sparse rather than dense:
+    /// only a constraint-sensitive question reaches it, so the asked set is a
+    /// small fraction of the type store.
+    base_constraint_cache: IntMap(TypeId, TypeId) = .empty,
+    /// `containsFreeTypeParam(t, &.{})` memo, dense like `ctp_cache`.
+    ///
+    /// Only the EMPTY-scope question is memoized, and that question is a pure
+    /// function of `t` alone — a non-empty `bound` is a different predicate and
+    /// never reads or writes this. `ctp_cache` already answers the cheap half
+    /// (a type mentioning no parameter at all), but the expensive half is a
+    /// CONCRETE type that carries signature-local parameters: `ctp_cache` says
+    /// "yes, somewhere", and the deep walk then has to prove every one of them
+    /// bound. That walk has no seen-set of its own, so a shared sub-DAG is
+    /// re-walked once per path into it.
+    ///
+    /// @types/react's component statics are exactly that shape, and
+    /// `generics.planConditional` asks the question about the check type of
+    /// every conditional it plans. On social-app with `jsx.jsx_lma` on it was
+    /// 10% of the single-threaded run (160 of 1615 samples, all under
+    /// `planConditional`) and 0.7% with it off.
+    cftp_cache: std.ArrayList(u8) = .empty,
     /// `(source << 32 | pattern) -> (generation << 1 | contra)`: the
     /// source/pattern pairs one `infer` match has already walked — tsc's
     /// `visited` map in `inferFromObjectTypes`. A repeat pair can only write
@@ -4389,7 +4411,26 @@ pub const Checker = struct {
     pub const jsxAttributeValueType = expr_zig.jsxAttributeValueType;
     pub const isInstantiableKind = expr_zig.isInstantiableKind;
     pub const deferredDefaultConstraint = expr_zig.deferredDefaultConstraint;
-    pub const baseConstraintOf = expr_zig.baseConstraintOf;
+    /// `expr.baseConstraintOf`, memoized on `base_constraint_cache`. The
+    /// wrapper lives here rather than in `expr.zig` so that EVERY caller —
+    /// including `expr.baseConstraintOf`'s own recursion, which goes through
+    /// this method — shares one memo.
+    ///
+    /// The answer is a function of `t` and of the declared constraints, both
+    /// immutable, so the memo only ever removes recomputation. A result
+    /// produced under a TRIPPED instantiation limit is depth-dependent rather
+    /// than a function of `t`, so it is not stored — the same rule
+    /// `inst_cache` and `jsx_lma_cache` follow, with the flag scoped so the
+    /// question asked is "was MY answer truncated".
+    pub fn baseConstraintOf(c: *Checker, t: TypeId) Error!TypeId {
+        if (c.base_constraint_cache.get(t)) |v| return v;
+        const outer_trip = c.inst_limit_tripped;
+        c.inst_limit_tripped = false;
+        defer c.inst_limit_tripped = c.inst_limit_tripped or outer_trip;
+        const r = try expr_zig.baseConstraintOf(c, t);
+        if (!c.inst_limit_tripped) try c.base_constraint_cache.put(c.cm(), t, r);
+        return r;
+    }
     pub const isPrimitiveLiteralish = expr_zig.isPrimitiveLiteralish;
     pub const exprIsContextSensitive = expr_zig.exprIsContextSensitive;
     pub const objLitIsShallowContextSensitive = expr_zig.objLitIsShallowContextSensitive;
