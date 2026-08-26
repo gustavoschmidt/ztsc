@@ -105,7 +105,7 @@ pub fn fileAt(f: Fs, alloc: Allocator, path: []const u8) Error!?[]u8 {
 }
 
 pub fn resolveStemFs(f: Fs, alloc: Allocator, stem: []const u8) Error!?[]u8 {
-    var buf: [6][]const u8 = undefined;
+    var buf: [7][]const u8 = undefined;
     var n: usize = 0;
     // Candidate paths are built with `alloc` (a scratch arena, freed after
     // the file's specifiers resolve). A previous fixed 256-byte buffer
@@ -170,6 +170,24 @@ pub fn resolveStemFs(f: Fs, alloc: Allocator, stem: []const u8) Error!?[]u8 {
     buf[4] = try std.fmt.allocPrint(alloc, "{s}/index.tsx", .{stem});
     buf[5] = try std.fmt.allocPrint(alloc, "{s}/index.d.ts", .{stem});
     n = 6;
+    // An arbitrary extension (`.html`, `.css`, `.json`, …) also names a
+    // declaration twin: tsc's `tryAddingExtensions` default arm splits
+    // `./component.html` into `./component` + `.html` and probes
+    // `./component.d.html.ts` (the `--allowArbitraryExtensions` file shape,
+    // which resolves regardless of the flag — the flag only decides whether
+    // a non-declaration importer additionally gets TS6263). Kept LAST rather
+    // than first: tsc prefers the twin over `component.html.ts`, but a
+    // project owning both spellings of one module does not exist in
+    // practice, and last-place can only rescue a specifier every other
+    // candidate missed. Requires a dot in the BASENAME, matching tsc's
+    // `getBaseFileName(candidate).includes(".")` guard, so `./a.b/c` is
+    // untouched.
+    const base_at = if (std.mem.lastIndexOfScalar(u8, stem, '/')) |s| s + 1 else 0;
+    if (std.mem.lastIndexOfScalar(u8, stem[base_at..], '.')) |dot| {
+        const cut = base_at + dot;
+        buf[6] = try std.fmt.allocPrint(alloc, "{s}.d{s}.ts", .{ stem[0..cut], stem[cut..] });
+        n = 7;
+    }
     return tryCandidates(f, alloc, buf[0..n]);
 }
 

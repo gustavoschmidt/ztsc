@@ -68,7 +68,14 @@ pub fn walk(mods: []const Mod, member: Member, in_abstract_class: bool) ?Finding
     var already: u32 = 0;
     for (mods) |m| {
         if (check(already, m.bit, member, in_abstract_class)) |code| {
-            return .{ .code = code, .token = m.token };
+            // tsc blames every one of these on the modifier its walk is
+            // standing on, with the single exception noted in the `abstract`
+            // arm: the async pair says `grammarErrorOnNode(lastAsync, …)`.
+            const at = if (code == .mod_pair_async_abstract)
+                lastToken(mods, F.async) orelse m.token
+            else
+                m.token;
+            return .{ .code = code, .token = at };
         }
         already |= m.bit;
     }
@@ -80,6 +87,20 @@ pub fn walk(mods: []const Mod, member: Member, in_abstract_class: bool) ?Finding
         if (lastToken(mods, F.static)) |t| return .{ .code = .ctor_mod_static, .token = t };
         if (lastToken(mods, F.override)) |t| return .{ .code = .ctor_mod_override, .token = t };
         if (lastToken(mods, F.async)) |t| return .{ .code = .ctor_mod_async, .token = t };
+        // tsc's block ends `return false` — a constructor never reaches the
+        // async check below.
+        return null;
+    }
+    // tsc's `checkGrammarAsyncModifier`, the last thing the pass asks:
+    // TS1042, because `async` describes a BODY and a member that has none —
+    // a field, an auto-accessor field, a `get`/`set` — cannot carry it. A
+    // method may; an index signature (`.other`) answered TS1071 before the
+    // walk began. Blamed on `lastAsync`, and a TRAILING check rather than an
+    // arm of the walk, so every pair rule above outranks it.
+    if (member == .accessor or member == .property) {
+        if (lastToken(mods, F.async)) |t| {
+            return .{ .code = .async_modifier_not_allowed_here, .token = t };
+        }
     }
     return null;
 }
@@ -106,8 +127,8 @@ pub fn check(already: u32, bit: u32, member: Member, in_abstract_class: bool) ?C
         F.public => accessCode(already, .mod_order_public_static, .mod_order_public_override, .mod_order_public_accessor, .mod_order_public_readonly, .mod_order_public_async, .mod_order_public_abstract),
         F.protected => accessCode(already, .mod_order_protected_static, .mod_order_protected_override, .mod_order_protected_accessor, .mod_order_protected_readonly, .mod_order_protected_async, .mod_order_protected_abstract),
         // `private abstract` is TS1243 ("cannot be used with"), not TS1029, so
-        // `private` passes null for the abstract arm rather than an order code.
-        F.private => accessCode(already, .mod_order_private_static, .mod_order_private_override, .mod_order_private_accessor, .mod_order_private_readonly, .mod_order_private_async, null),
+        // `private` passes the pair code where the other two pass an order one.
+        F.private => accessCode(already, .mod_order_private_static, .mod_order_private_override, .mod_order_private_accessor, .mod_order_private_readonly, .mod_order_private_async, .mod_pair_private_abstract),
 
         F.static => blk: {
             if (already & F.static != 0) break :blk .mod_seen_static;
@@ -118,15 +139,14 @@ pub fn check(already: u32, bit: u32, member: Member, in_abstract_class: bool) ?C
             // both are positions ztsc answers elsewhere. Then `static abstract`
             // is TS1243, which stops the walk — so an `abstract` already seen
             // must NOT fall through to the `override` arm below.
-            if (already & F.abstract != 0) break :blk null;
+            if (already & F.abstract != 0) break :blk .mod_pair_static_abstract;
             if (already & F.override != 0) break :blk .mod_order_static_override;
             break :blk null;
         },
 
         F.override => blk: {
             if (already & F.override != 0) break :blk .mod_seen_override;
-            // `declare override` is TS1243; it stops the walk.
-            if (already & F.declare != 0) break :blk null;
+            if (already & F.declare != 0) break :blk .mod_pair_override_declare;
             if (already & F.readonly != 0) break :blk .mod_order_override_readonly;
             if (already & F.accessor != 0) break :blk .mod_order_override_accessor;
             if (already & F.async != 0) break :blk .mod_order_override_async;
@@ -148,8 +168,16 @@ pub fn check(already: u32, bit: u32, member: Member, in_abstract_class: bool) ?C
                 .property => if (!in_abstract_class) break :blk .abstract_property_outside_abstract_class,
                 .method, .accessor => if (!in_abstract_class) break :blk .abstract_method_outside_abstract_class,
             }
-            if (already & (F.static | F.private) != 0) break :blk null; // TS1243
-            if (already & F.async != 0) break :blk null; // TS1243, and on the `async`
+            // The TS1243 pairs. tsc hard-codes each arm's two words, so they
+            // read the same whichever order they were written in and only the
+            // blamed token — this `abstract` — moves.
+            if (already & F.static != 0) break :blk .mod_pair_static_abstract;
+            if (already & F.private != 0) break :blk .mod_pair_private_abstract;
+            // The one pair tsc does NOT blame on the modifier its walk is
+            // standing on: its arm reads `grammarErrorOnNode(lastAsync, …)`,
+            // so `async abstract m()` and `abstract async m()` BOTH point at
+            // the `async`. `walk` re-anchors it.
+            if (already & F.async != 0) break :blk .mod_pair_async_abstract;
             if (already & F.override != 0) break :blk .mod_order_abstract_override;
             if (already & F.accessor != 0) break :blk .mod_order_abstract_accessor;
             break :blk null;
@@ -157,35 +185,60 @@ pub fn check(already: u32, bit: u32, member: Member, in_abstract_class: bool) ?C
 
         F.accessor => blk: {
             if (already & F.accessor != 0) break :blk .mod_seen_accessor;
-            // `readonly accessor` / `declare accessor` are TS1243; then TS1275
-            // ("can only appear on a property declaration") ends the chain.
-            break :blk null;
+            if (already & F.readonly != 0) break :blk .mod_pair_accessor_readonly;
+            if (already & F.declare != 0) break :blk .mod_pair_accessor_declare;
+            // TS1275 ends the chain: an auto-accessor is a PROPERTY and
+            // nothing else. `.other` is left out for the usual reason — an
+            // index signature answered TS1071 before the walk began, and a
+            // member whose name failed to parse has no kind to judge.
+            break :blk switch (member) {
+                .constructor, .method, .accessor => .accessor_modifier_not_valid_here,
+                .property, .other => null,
+            };
         },
 
-        F.readonly => if (already & F.readonly != 0) .mod_seen_readonly else null,
+        F.readonly => blk: {
+            if (already & F.readonly != 0) break :blk .mod_seen_readonly;
+            // The mirror of the `accessor` arm's first pair: both modifiers
+            // carry an arm that names itself first, so the two orders read
+            // differently.
+            if (already & F.accessor != 0) break :blk .mod_pair_readonly_accessor;
+            // TS1024, `readonly`'s own position rule, closes the arm. It has
+            // to be answered here and not left null: `readonly accessor m()`
+            // is this, and a null would hand the member to the `accessor` arm
+            // behind it and manufacture the TS1243 tsc never reaches.
+            break :blk switch (member) {
+                .constructor, .method, .accessor => .readonly_not_on_property,
+                // A property takes it; an index signature and a parameter are
+                // the other two kinds tsc exempts, and both land in `.other`.
+                .property, .other => null,
+            };
+        },
         F.async => blk: {
             if (already & F.async != 0) break :blk .mod_seen_async;
-            // TS1042: `async` describes a BODY, so a member that has none —
-            // a field, an auto-accessor field, a `get`/`set` — cannot carry
-            // it. A method may; a constructor takes `ctor_mod_async` from
-            // `walk`'s trailing block; an index signature (`.other`) answered
-            // TS1071 before the walk began. Measured against tsgo 7.0.2 for
-            // all four member kinds, in a class and in an object literal.
-            break :blk switch (member) {
-                .accessor, .property => .async_modifier_not_allowed_here,
-                .constructor, .method, .other => null,
-            };
+            // tsc reaches TS1040 (ambient) and TS1090 (parameter) here. TS1042
+            // is NOT part of this arm — it is `checkGrammarAsyncModifier`, a
+            // TRAILING check like the constructor block, which is why `async
+            // abstract p: number` answers the pair and not TS1042.
+            break :blk if (already & F.abstract != 0) .mod_pair_async_abstract else null;
         },
         // TS1031 after the repeat, as tsc's `case DeclareKeyword` chain has it:
         // a `declare` on a class element that is not a PROPERTY. `.other` is
         // left out — the kinds it covers (an index signature, a member whose
         // name failed to parse) answer their position rules elsewhere or not at
         // all, and guessing here could only invent a diagnostic.
-        F.declare => if (already & F.declare != 0)
-            .mod_seen_declare
-        else switch (member) {
-            .constructor, .method, .accessor => .declare_on_class_element,
-            .property, .other => null,
+        F.declare => blk: {
+            if (already & F.declare != 0) break :blk .mod_seen_declare;
+            break :blk switch (member) {
+                .constructor, .method, .accessor => .declare_on_class_element,
+                // `accessor declare x` — tsc's `case DeclareKeyword` reaches
+                // the accessor pair only PAST the TS1031 above, so a member
+                // that is not a property answers for its position first.
+                .property, .other => if (already & F.accessor != 0)
+                    .mod_pair_declare_accessor
+                else
+                    null,
+            };
         },
 
         else => null,
@@ -244,13 +297,64 @@ test "the walk stops at the first hit, in tsc's order" {
     try std.testing.expectEqual(@as(?Code, .mod_order_static_override), check(F.override, F.static, .method, false));
 }
 
-test "an unanswered rule yields null rather than the next arm's code" {
-    // `abstract static x` is TS1243, so the `override` arm must not fire.
-    try std.testing.expectEqual(@as(?Code, null), check(F.abstract | F.override, F.static, .property, true));
-    // `private abstract m()` is TS1243 too.
-    try std.testing.expectEqual(@as(?Code, null), check(F.abstract, F.private, .method, true));
-    // ...while `public abstract` and `protected abstract` are order errors.
+test "the pair rules stop the walk before the order rule behind them" {
+    // `abstract override static x` is the static/abstract PAIR, so the
+    // `override` order arm one line below it must not fire.
+    try std.testing.expectEqual(
+        @as(?Code, .mod_pair_static_abstract),
+        check(F.abstract | F.override, F.static, .property, true),
+    );
+    // `private abstract m()` is a pair too, and `public`/`protected` are not.
+    try std.testing.expectEqual(@as(?Code, .mod_pair_private_abstract), check(F.abstract, F.private, .method, true));
     try std.testing.expectEqual(@as(?Code, .mod_order_public_abstract), check(F.abstract, F.public, .method, true));
+}
+
+test "the accessor pairs name themselves first, in both directions" {
+    try std.testing.expectEqual(@as(?Code, .mod_pair_accessor_readonly), check(F.readonly, F.accessor, .property, false));
+    try std.testing.expectEqual(@as(?Code, .mod_pair_readonly_accessor), check(F.accessor, F.readonly, .property, false));
+    try std.testing.expectEqual(@as(?Code, .mod_pair_accessor_declare), check(F.declare, F.accessor, .property, false));
+    try std.testing.expectEqual(@as(?Code, .mod_pair_declare_accessor), check(F.accessor, F.declare, .property, false));
+    // Each arm asks its pair BEFORE its own position rule, exactly as tsc
+    // does, so `declare accessor m()` reaching the accessor arm is still the
+    // pair — but it never does reach it, because `declare`'s TS1031 stops the
+    // walk one modifier earlier.
+    try std.testing.expectEqual(@as(?Code, .mod_pair_accessor_declare), check(F.declare, F.accessor, .method, false));
+    try std.testing.expectEqual(@as(?Code, .declare_on_class_element), check(F.accessor, F.declare, .method, false));
+    // `readonly accessor m()` is the shape that PROVES the position rules
+    // cannot be left null: the `readonly` answers TS1024 and the accessor arm
+    // behind it is never reached (measured — tsgo reports the TS1024 alone).
+    try std.testing.expectEqual(
+        @as(?Finding, .{ .code = .readonly_not_on_property, .token = 3 }),
+        walk(&.{ .{ .bit = F.readonly, .token = 3 }, .{ .bit = F.accessor, .token = 4 } }, .method, false),
+    );
+    try std.testing.expectEqual(@as(?Code, null), check(0, F.readonly, .property, false));
+}
+
+test "TS1042 is a trailing check, so every pair rule outranks it" {
+    // `async abstract p: number` — the `async` alone would be TS1042, but the
+    // walk reaches the `abstract` first and the pair wins, blamed on the
+    // `async` (tsc's `lastAsync`).
+    try std.testing.expectEqual(
+        @as(?Finding, .{ .code = .mod_pair_async_abstract, .token = 3 }),
+        walk(&.{ .{ .bit = F.async, .token = 3 }, .{ .bit = F.abstract, .token = 4 } }, .property, true),
+    );
+    // The other order points at the same token.
+    try std.testing.expectEqual(
+        @as(?Finding, .{ .code = .mod_pair_async_abstract, .token = 4 }),
+        walk(&.{ .{ .bit = F.abstract, .token = 3 }, .{ .bit = F.async, .token = 4 } }, .property, true),
+    );
+    // With no `abstract` the trailing check speaks, and only for a member with
+    // no body of its own.
+    try std.testing.expectEqual(
+        @as(?Finding, .{ .code = .async_modifier_not_allowed_here, .token = 3 }),
+        walk(&.{.{ .bit = F.async, .token = 3 }}, .property, false),
+    );
+    try std.testing.expectEqual(@as(?Finding, null), walk(&.{.{ .bit = F.async, .token = 3 }}, .method, false));
+    // A constructor's own block answers instead and never falls through.
+    try std.testing.expectEqual(
+        @as(?Finding, .{ .code = .ctor_mod_async, .token = 3 }),
+        walk(&.{.{ .bit = F.async, .token = 3 }}, .constructor, false),
+    );
 }
 
 test "the abstract pairs need an abstract class; the abstract repeat does not" {

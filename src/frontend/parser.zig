@@ -1556,7 +1556,6 @@ const Parser = struct {
             .keyword_namespace,
             .keyword_type,
             .keyword_global,
-            .keyword_accessor,
             .keyword_abstract,
             // An unterminated block comment is TRIVIA to tsc: its scanner
             // reports TS1010 and hands the parser EOF, so nothing lands here.
@@ -1588,6 +1587,7 @@ const Parser = struct {
             .keyword_protected,
             .keyword_static,
             .keyword_readonly,
+            .keyword_accessor,
             => p.classMemberModifierStartsStatement(),
             // `export` is the one word of the lookahead group that a false
             // `true` demonstrably costs: `var export;` steps OVER the keyword
@@ -1624,7 +1624,13 @@ const Parser = struct {
     /// first `export` is a modifier and the second one is the export
     /// assignment (TS1120).
     fn exportStartsDeclaration(p: *Parser) bool {
-        var n: u32 = 0;
+        return p.exportStartsDeclarationAt(0);
+    }
+
+    /// The same walk started `n` tokens in, for a modifier run that has already
+    /// been counted and ends at an `export` (`accessor export { V1 }`).
+    fn exportStartsDeclarationAt(p: *Parser, start: u32) bool {
+        var n: u32 = start;
         while (n + 2 < max_la) : (n += 1) {
             if (p.peekTag(n) == .keyword_export) {
                 switch (p.peekTag(if (p.peekTag(n + 1) == .keyword_type) n + 2 else n + 1)) {
@@ -1657,12 +1663,13 @@ const Parser = struct {
     /// answers TS1128 on the WORD and drops it, which is what returning false
     /// here buys (`parseStatementList`'s not-a-statement arm).
     ///
-    /// `accessor` and `abstract` belong to the same tsc group but stay
-    /// unconditionally true above: ztsc's `startsDeclarationAt` does not walk
-    /// past them, so the answer here would be a false `false` for
-    /// `accessor class C {}` — and a false `false` manufactures a TS1128 tsc
-    /// does not report, while a false `true` only keeps ztsc's existing
-    /// recovery.
+    /// `accessor` is in the same tsc group and now answers the same way — it
+    /// is a `statementModifierCode` word, so a declaration behind it makes a
+    /// statement. `abstract` stays unconditionally true above: ztsc's
+    /// `startsDeclarationAt` does not walk past it, so the answer here would
+    /// be a false `false` for `abstract class C {}` — and a false `false`
+    /// manufactures a TS1128 tsc does not report, while a false `true` only
+    /// keeps ztsc's existing recovery.
     fn classMemberModifierStartsStatement(p: *Parser) bool {
         if (p.statementModifierRunLen() != 0) return true;
         if (p.peekNewline(1)) return true;
@@ -1884,6 +1891,13 @@ const Parser = struct {
     /// or namespace element" and `readonly` as "can only appear on a property
     /// declaration or index signature"; the message names the modifier, which a
     /// code-plus-span Diagnostic cannot interpolate, so there is one code each.
+    /// `accessor` is the one word here whose sentence does not turn on where
+    /// the declaration sits: tsc's `case AccessorKeyword` asks only
+    /// `node.kind !== PropertyDeclaration`, so a statement-position
+    /// `accessor class C {}` is TS1275 at the top level of a file, inside a
+    /// `namespace` body and inside a `declare module` block alike (all three
+    /// measured). It still becomes TS1184 in a FUNCTION body, because that is
+    /// `eatStatementModifiers`' own `element_home` split and not this table's.
     fn statementModifierCode(tag: TokTag) ?Code {
         return switch (tag) {
             .keyword_public => .public_not_on_module_element,
@@ -1891,6 +1905,7 @@ const Parser = struct {
             .keyword_protected => .protected_not_on_module_element,
             .keyword_static => .static_not_on_module_element,
             .keyword_readonly => .readonly_not_on_property,
+            .keyword_accessor => .accessor_modifier_not_valid_here,
             else => null,
         };
     }
@@ -1934,7 +1949,14 @@ const Parser = struct {
             n += 1;
             if (p.peekNewline(n)) return 0;
         }
-        if (n == 0 or !p.startsDeclarationAt(n)) return 0;
+        if (n == 0) return 0;
+        // `export` is a MODIFIER, not a declaration keyword, so
+        // `startsDeclarationAt` leaves it out on purpose — but tsc's
+        // `isDeclaration` loop walks THROUGH it (`accessor export { V1 }` and
+        // `accessor export default V1` are both declarations there), which is
+        // the one shape this run has to ask about separately.
+        if (p.peekTag(n) == .keyword_export) return if (p.exportStartsDeclarationAt(n)) n else 0;
+        if (!p.startsDeclarationAt(n)) return 0;
         return n;
     }
 
@@ -2153,6 +2175,7 @@ const Parser = struct {
             .keyword_protected,
             .keyword_static,
             .keyword_readonly,
+            .keyword_accessor,
             => {
                 if (p.statementModifierRunLen() == 0) return p.parseExpressionStatement();
                 try p.eatStatementModifiers();
@@ -3242,6 +3265,15 @@ const Parser = struct {
     /// first token is the same one).
     fn checkForInOfHead(p: *Parser, init: Node, is_of: bool) Error!void {
         if (p.spec != 0 or init == null_node) return;
+        // TS1106, and tsc's chain reaches it before every arm below (which all
+        // ask about a variable DECLARATION, so the two never compete). The
+        // left-hand side has to be the bare identifier `async`: a pattern that
+        // merely contains it is fine.
+        if (is_of and !p.fn_ctx.awaits() and p.nodeTagAt(init) == .identifier and
+            p.tokTagAt(p.nodeMainTokenAt(init)) == .keyword_async)
+        {
+            return p.errAtToken(.for_of_lhs_async, p.nodeMainTokenAt(init));
+        }
         switch (p.nodeTagAt(init)) {
             .var_decl => {
                 const data = p.nodeDataAt(init);
@@ -3756,35 +3788,65 @@ const Parser = struct {
             // `<out>`, `<out, T>` and `<out = X>` still declare a parameter
             // *named* `out`, as tsc parses them.
             var out_tok: ?u32 = null;
+            var in_tok: ?u32 = null;
             // tsc's `checkGrammarModifiers` reports the FIRST offending
             // modifier of a type parameter and stops, so `<const in out T>` on
             // a function is one TS1274 (at `in`), not two.
             var reported = false;
             while (true) {
                 const tag = p.curTag();
+                // tsc reads the run with `parseModifiers(allowDecorators=false,
+                // permitConstAsModifier=true)`, so EVERY modifier keyword is
+                // taken here and `checkGrammarModifiers` answers TS1273 for the
+                // ones a type parameter cannot carry — the parameter itself
+                // still parses, where refusing the word cost a TS1005 cascade
+                // that suppressed the whole file's semantic pass
+                // (varianceAnnotations). `in` and `const` are fully reserved,
+                // so no lookahead can mistake them for a name; every other word
+                // is a modifier exactly when a name follows it (tsc's
+                // `nextTokenCanFollowModifier`), which is what keeps
+                // `<out>`, `<out, T>` and `class D<public, private> {}`
+                // declaring parameters named `out`/`public`/`private`.
                 const is_modifier = switch (tag) {
                     .keyword_const, .keyword_in => true,
-                    .keyword_out => typeParamNameFollows(p.peekTag(1)),
-                    else => false,
+                    else => isModifierKind(tag) and typeParamNameFollows(p.peekTag(1)),
                 };
                 if (!is_modifier) break;
                 const tok = try p.bump();
                 // Diagnostics only — `errAtToken` does not backtrack, and a
                 // speculative parse that loses discards them with `restore`,
                 // so reporting here cannot cost us an arrow function.
-                const bad: ?diagnostics.Code = if (tag == .keyword_const)
-                    (if (owner.allowsConst()) null else .const_modifier_not_valid_here)
-                else if (!owner.allowsVariance())
-                    (if (tag == .keyword_in) .in_modifier_not_valid_here else .out_modifier_not_valid_here)
-                else if (tag == .keyword_in and out_tok != null)
-                    .in_must_precede_out
-                else
-                    null;
+                const bad: ?diagnostics.Code = switch (tag) {
+                    .keyword_const => if (owner.allowsConst()) null else .const_modifier_not_valid_here,
+                    // tsc's `in`/`out` arm, in its own order: position first,
+                    // then the repeat, then the pair.
+                    .keyword_in, .keyword_out => if (!owner.allowsVariance())
+                        (if (tag == .keyword_in) .in_modifier_not_valid_here else .out_modifier_not_valid_here)
+                    else if (tag == .keyword_in and in_tok != null)
+                        .mod_seen_in
+                    else if (tag == .keyword_out and out_tok != null)
+                        .mod_seen_out
+                    else if (tag == .keyword_in and out_tok != null)
+                        .in_must_precede_out
+                    else
+                        null,
+                    else => .type_param_modifier,
+                };
                 if (bad) |code| {
-                    if (!reported) try p.errAtToken(code, tok);
+                    if (!reported) {
+                        // TS1273 names the word it stands on, so it carries the
+                        // token's own text as `{0}`.
+                        if (code == .type_param_modifier) {
+                            const at = p.tokSpan(tok, tok);
+                            try p.errAtSpanArg(code, at, at);
+                        } else {
+                            try p.errAtToken(code, tok);
+                        }
+                    }
                     reported = true;
                 }
                 if (tag == .keyword_out) out_tok = tok;
+                if (tag == .keyword_in) in_tok = tok;
             }
             if (!isIdentLike(p.curTag())) {
                 try p.fail(.expected_identifier);
@@ -5213,16 +5275,34 @@ const Parser = struct {
         // 1` declares `H`), and `checkGrammarModifiers` then rejects it on the
         // member NAME.
         var saw_const = false;
+        // The FIRST `in`/`out` of the run, which is TS1274 whatever else the
+        // run carries — a variance annotation belongs to a type PARAMETER of a
+        // class/interface/type alias and nowhere else. tsc's parser takes the
+        // word as a modifier (`nextTokenIsOnSameLineAndCanFollowModifier`), so
+        // `class C { in a = 0 }` still declares `a`; refusing it read `in` as
+        // the member's NAME and answered TS1005 at `a`, a syntactic error that
+        // took the whole file's semantic pass with it (varianceAnnotations).
+        var in_out: ?ModifierErr = null;
         while (true) {
+            const variance: ?Code = switch (p.curTag()) {
+                .keyword_in => .in_modifier_not_valid_here,
+                .keyword_out => .out_modifier_not_valid_here,
+                else => null,
+            };
             const is_const = p.curTag() == .keyword_const;
             const bit = classMemberModifierBit(p.curTag());
-            if (bit == 0 and !is_const) break;
+            if (bit == 0 and !is_const and variance == null) break;
             // A modifier only if a member name (or `*`/`[`) follows on any
             // line (get/set/async additionally require same-line names).
             const t1 = p.peekTag(1);
             const name_follows = isNameLike(t1) or t1 == .string_literal or
                 t1 == .numeric_literal or t1 == .l_bracket or t1 == .asterisk;
             if (!name_follows) break;
+            if (variance) |code| {
+                const tok = try p.bump();
+                if (in_out == null) in_out = .{ .code = code, .token = tok };
+                continue;
+            }
             if (is_const) {
                 saw_const = true;
                 _ = try p.bump();
@@ -5253,7 +5333,7 @@ const Parser = struct {
             .l_bracket => {
                 // Computed member name / index signature in class.
                 if (p.atIndexSignature()) {
-                    _ = try p.reportMemberGrammar(deco_at, .{ .kind = .other }, p.memberModErr(mods[0..n_mods], .other, 0));
+                    _ = try p.reportMemberGrammar(deco_at, .{ .kind = .other }, p.memberModErr(mods[0..n_mods], .other, 0, in_out));
                     return p.parseIndexSignatureAsClassMember(flags);
                 }
                 const cn = try p.parseComputedMemberName();
@@ -5287,7 +5367,7 @@ const Parser = struct {
                 } else {
                     // A CLASS member name: tsc's `parseClassElement` answers
                     // TS1068 here, not the object-literal TS1136.
-                    _ = try p.reportMemberGrammar(deco_at, .{ .kind = .other }, p.memberModErr(mods[0..n_mods], .other, 0));
+                    _ = try p.reportMemberGrammar(deco_at, .{ .kind = .other }, p.memberModErr(mods[0..n_mods], .other, 0, in_out));
                     try p.fail(.expected_class_member);
                     return p.errorNode();
                 }
@@ -5334,6 +5414,25 @@ const Parser = struct {
             p.jump = .{ .labels_base = p.labels.items.len, .in_function = true };
             p.fn_ctx = if (flags & ast.Flags.async != 0) .async_fn else .sync;
             p.yield_ctx = star != null;
+            // A `declare` METHOD is an ambient context of its own, exactly as
+            // `declare function f() {}` is at statement level — so a BODY
+            // behind it is TS1183 (`class C { declare Foo() {} }`, which also
+            // earns TS1031 for the `declare` itself: two passes, two answers).
+            //
+            // A `get`/`set`/`constructor` is NOT, even though it earns the very
+            // same TS1031: tsc reaches TS1183 for those three only through the
+            // grammar chain that `checkGrammarModifiers` has already
+            // short-circuited, while a method's arrives from
+            // `checkFunctionOrMethodDeclaration`, which runs regardless. Both
+            // halves measured on tsgo 7.0.2 — and note this is only about a
+            // member's OWN `declare`: inside a `declare class`, all four kinds
+            // are TS1183, which the INHERITED `p.ambient` already gives.
+            const declare_method = flags & ast.Flags.declare != 0 and
+                flags & (ast.Flags.get | ast.Flags.set) == 0 and
+                !(computed == null and p.tokTagAt(name_tok) == .keyword_constructor);
+            const was_ambient = p.ambient;
+            p.ambient = was_ambient or declare_method;
+            defer p.ambient = was_ambient;
             // The `<` of a type-parameter list, if there is one. Captured
             // BEFORE the prototype is read (afterwards the token is consumed
             // and the index is stable) so TS1092 can blame the list, which is
@@ -5395,7 +5494,7 @@ const Parser = struct {
                 .in_class_decl = p.in_class_decl,
                 .second_accessor_of_modified_pair = is_accessor and computed == null and
                     p.isSecondAccessorOfModifiedPair(members_top, name_tok, flags),
-            }, p.memberModErr(mods[0..n_mods], mod_member, const_at));
+            }, p.memberModErr(mods[0..n_mods], mod_member, const_at, in_out));
             if (computed) |cn| {
                 // An accessor is judged by neither `checkGrammarProperty` nor
                 // `checkGrammarMethod`; a method is, and what it earns turns on
@@ -5412,8 +5511,9 @@ const Parser = struct {
         }
 
         // Field.
+        var question_at: TokenIndex = 0;
         if (p.curTag() == .question) {
-            _ = try p.bump();
+            question_at = try p.bump();
             flags |= ast.Flags.optional;
         } else if (p.curTag() == .bang and !p.nlBefore()) {
             _ = try p.bump();
@@ -5446,8 +5546,17 @@ const Parser = struct {
             .abstract = flags & ast.Flags.abstract != 0,
             .declare = flags & ast.Flags.declare != 0,
             .in_class_decl = p.in_class_decl,
-        }, p.memberModErr(mods[0..n_mods], .property, const_at));
+        }, p.memberModErr(mods[0..n_mods], .property, const_at, in_out));
         if (computed) |cn| try p.finishComputedName(cn, member, .class_body, .property, grammar_err);
+        // TS1276, tsc's `checkGrammarProperty`: an auto-accessor field stands
+        // for a get/set pair, and there is no way to spell an optional one.
+        // Reached only past `checkGrammarModifiers` (tsc's
+        // `!checkGrammarModifiers(node) && !checkGrammarProperty(node)`), so
+        // `accessor readonly m?: any` answers the TS1243 alone; blamed on the
+        // `?` rather than the name or the modifier.
+        if (!grammar_err and question_at != 0 and flags & ast.Flags.accessor != 0 and p.spec == 0) {
+            try p.errAtToken(.accessor_property_optional, question_at);
+        }
         return member;
     }
 
@@ -5461,10 +5570,21 @@ const Parser = struct {
         mods: []const modifier_order.Mod,
         member: modifier_order.Member,
         const_at: TokenIndex,
+        in_out: ?ModifierErr,
     ) ?ModifierErr {
-        if (modifier_order.walk(mods, member, p.abstract_class)) |f| {
-            return .{ .code = f.code, .token = f.token };
+        const found: ?ModifierErr = if (modifier_order.walk(mods, member, p.abstract_class)) |f|
+            .{ .code = f.code, .token = f.token }
+        else
+            null;
+        // `in`/`out` is an ARM of tsc's walk, not a trailing check, and the
+        // walk returns at the first modifier that errors — so the EARLIER
+        // token wins. (`modifier_order` does not model the two: they carry no
+        // `ast.Flags` bit, because nothing downstream of a class member ever
+        // asks about a variance annotation.)
+        if (in_out) |v| {
+            if (found == null or v.token < found.?.token) return v;
         }
+        if (found) |f| return f;
         if (const_at != 0) return .{ .code = .const_class_member, .token = const_at };
         return null;
     }
@@ -9427,8 +9547,27 @@ const Parser = struct {
                     // as `.this_expr` so the checker reads the enclosing
                     // declaration's `this`, not a name called "this".
                     try p.parseEntityNameFrom(try p.leaf(.this_expr))
-                else
-                    try p.parseEntityName();
+                else if (p.curTag() == .identifier or p.curTag().isKeyword())
+                    // tsc's `parseEntityName(/*allowReservedWords*/ true)`, so
+                    // EVERY keyword is a legal name here: `typeof null` and
+                    // `typeof function f() {}` both parse (the latter as the
+                    // entity `function`, leaving `f() { }` to the statement
+                    // list behind it).
+                    try p.parseEntityName()
+                else blk2: {
+                    // `typeof {}`, `typeof 1`, `typeof /re/` — tsc's
+                    // `createMissingNode(Identifier, reportAtCurrentPosition)`:
+                    // TS1003 where the name should have been, consuming
+                    // NOTHING, so the token is left to whoever comes next.
+                    // (The `;` the variable statement then wants lands on that
+                    // same character and the one-per-position rule drops it,
+                    // which is why tsgo answers these lines once.) An
+                    // unconditional `leaf` used to EAT the token instead —
+                    // silence for `typeof 1`, and a shifted cascade for the
+                    // rest.
+                    try p.fail(.expected_identifier);
+                    break :blk2 try p.parseEntityNameFrom(try p.errorNode());
+                };
                 // `typeof f<T>` — a type-position instantiation expression.
                 // A line break before the `<` ends the type query (tsc applies
                 // ASI here so the next line's `<` is not swallowed).
