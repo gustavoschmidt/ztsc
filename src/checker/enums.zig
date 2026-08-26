@@ -952,6 +952,48 @@ pub fn enumIsStringValued(c: *Checker, sym: SymbolId) Error!bool {
     return members.len > 0;
 }
 
+/// Which of tsc's `TypeFlags.DisjointDomains` an enum type belongs to, in
+/// `types.Store.disjointDomain`'s encoding (2 = StringLike, 4 = NumberLike,
+/// 0 = say nothing). The store cannot answer this — an enum's domain follows
+/// its members' VALUES, which only the checker can read — so this is the one
+/// classification `disjointDomain` leaves a hole for, filled in where the
+/// symbols are reachable (`assign.computeIntersectionIsNever`).
+///
+/// tsc needs no such function because a whole enum IS the union of its member
+/// types there, and each member carries `StringLiteral` or `NumberLiteral`
+/// alongside `EnumLiteral`; `TypeFlags.Enum` — the bare enum type it keeps for
+/// the member-less and computed cases — sits in `NumberLike`. So:
+///
+///   | enum                       | tsgo `string & E` | `number & E` |
+///   |----------------------------|-------------------|--------------|
+///   | `const enum E {}`          | `never`           | live         |
+///   | `const enum E { A }`       | `never`           | live         |
+///   | `enum E { S = "s" }`       | live              | `never`      |
+///   | `enum E { S = "s", N = 1 }`| live              | live         |
+///
+/// The mixed row is why this answers 0 rather than guessing: tsc distributes
+/// `string & (E.S | E.N)` into `E.S | never`, which is neither empty nor a
+/// single domain. `all_string`/`all_numeric` are exactly the two rows that
+/// distribute to one answer.
+///
+/// A MEMBER type (`E.A`) is asked about its own value and never about its
+/// enum's, which is what makes the mixed enum's members still classify.
+pub fn enumDisjointDomain(c: *Checker, t: TypeId) Error!u32 {
+    if (c.ts.kind(t) != .enum_type) return 0;
+    const sym = c.ts.enumSymbol(t);
+    if (c.ts.isEnumMember(t)) {
+        // A computed member has no value at all; tsc types it `number` there
+        // (`getTypeOfMember` falls back to the enum's numeric side), so it
+        // stays in the numeric domain.
+        const v = (try enumMemberValue(c, sym, c.ts.enumMemberAtom(t))) orelse return 4;
+        return if (c.ts.kind(v) == .string_literal) 2 else 4;
+    }
+    const info = try enumInfo(c, sym);
+    if (info.all_string) return 2;
+    if (info.all_numeric) return 4;
+    return 0;
+}
+
 /// The index into `enumMembersOf(sym)` at which declaration block `node`'s
 /// own members begin — the walk concatenates every block in declaration
 /// order, so this is just the count of members in the blocks before it.

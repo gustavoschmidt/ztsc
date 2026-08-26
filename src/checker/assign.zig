@@ -5629,6 +5629,34 @@ pub fn computeIntersectionIsNever(c: *Checker, t: TypeId) Error!bool {
         }
         if (nullish and other_domain) return true;
     }
+    // The same rule with the ENUM domains filled in. `types.Store.disjoint
+    // Domain` gives an enum no bit — a member's domain follows its VALUE,
+    // which the store cannot read — so the interning check leaves every
+    // enum-bearing intersection live, and `string & Tag` survived where tsc
+    // reduces it. tsc gets there for free: a whole enum IS the union of its
+    // member types there, each carrying `StringLiteral`/`NumberLiteral`
+    // alongside `EnumLiteral`, and the bare `TypeFlags.Enum` it keeps for the
+    // member-less case sits in `NumberLike`. `enums.enumDisjointDomain` is
+    // that classification, and it declines to answer for a MIXED enum, whose
+    // distribution is neither empty nor one domain.
+    //
+    // `intersectionReductionStrict`'s enums leg is the shape: `string & Tag1`
+    // and `string & Tag2` over two EMPTY const enums are both `never` in tsgo,
+    // so assigning either to the other is fine — four false TS2322s without
+    // this.
+    {
+        var mask: u32 = 0;
+        var empty = false;
+        for (try c.memberList(t)) |m| {
+            const rm = try c.resolveStructural(m);
+            var d = types.Store.disjointDomain(&c.ts, rm);
+            if (d == 0) d = try c.enumDisjointDomain(rm);
+            if (d == 0) continue;
+            if (mask != 0 and mask != d) empty = true;
+            mask |= d;
+        }
+        if (empty) return true;
+    }
     // tsc's disjoint-domain rule (`getIntersectionType`: *"a string-like type
     // and a type known to be non-string-like, a number-like type and a type
     // known to be non-number-like, …"*), one CONSTRAINT step further than the
