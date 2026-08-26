@@ -2055,7 +2055,19 @@ fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
                         const e = c.ts.tupleElem(st, @intCast(j));
                         try elem_types.append(c.scratch(), e.ty);
                         try raw_types.append(c.scratch(), e.ty);
-                        try tuple_elems.append(c.scratch(), e);
+                        // `readonly` belongs to the tuple the elements came
+                        // FROM, not to the fresh literal they are being copied
+                        // into: `const t = ['x'] as const; g([...t])` builds a
+                        // brand-new, writable array, so tsc's `checkArrayLiteral`
+                        // makes it `readonly` only `inConstContext` — which this
+                        // arm is not, `const_ctx` having taken its own path at
+                        // the top. Carrying `as const`'s per-element flag across
+                        // the spread made `[...t]` a `readonly ["x"]` and every
+                        // mutable-tuple target a false TS4104.
+                        try tuple_elems.append(c.scratch(), .{
+                            .ty = e.ty,
+                            .flags = e.flags & ~types.elem_flag_readonly,
+                        });
                     }
                 },
                 else => {
