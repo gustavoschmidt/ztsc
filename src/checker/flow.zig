@@ -171,18 +171,17 @@ pub fn flowTypeOfReference(c: *Checker, node: Node, sym: SymbolId, declared: Typ
     // arm of `flowTypeInner`'s `.start`, so testing the containers once here
     // is the whole of the distinction.
     //
-    // Restricted further, to a variable NOTHING in the file ever writes. That
-    // is the sub-case where "the flow answers `undefined`" needs no flow walk
-    // to be true, and it is deliberately narrower than tsc: a variable that IS
-    // written somewhere reads `undefined` only on the paths that miss the
-    // write, and ztsc's answer for those paths — the auto type itself — is an
-    // under-report rather than an invention. The narrower rule is what keeps
-    // the substitution out of the two shapes where the surrounding checker is
-    // not yet ready for a real type in place of `any`: an assignment TARGET
-    // (`for ([{ ...y }] of …)`, tsc's own `isSpreadDestructuringAssignment-
-    // Target` exemption), and a `{ …, k: v, ...maybeUndefined }` whose later
-    // spread makes `k` non-excess in tsc (`shouldCheckAsExcessProperty`) but
-    // not yet in ztsc.
+    // NOT restricted to a variable nothing writes. It used to be, on the
+    // theory that a written variable reads `undefined` only on the paths that
+    // miss the write and that starting from the auto type there was a mere
+    // under-report — but `any` ABSORBS the join, so those paths lost their
+    // `undefined` contribution entirely: `let a; if (c) a = 1; const p: string
+    // = a;` is `number | undefined` in tsgo and was `any` here, and
+    // `while (1) { bar = ~foo(...bar); }` never saw the `number | undefined`
+    // that earns TS2488 (`noImplicitAnyLoopCrash`). The join machinery was
+    // always ready for it: `reduceEvolvingJoin` holds nullish out of subtype
+    // reduction and the loop fixpoint handles a self-reading assignment. Only
+    // the initial type was wrong. (Diagnosed by wave-42 agent C.)
     //
     // And never for an AMBIENT variable. tsc's `getTypeForVariableLikeDeclaration`
     // hands out the auto type only when `!(declaration.flags & NodeFlags.Ambient)`
@@ -194,10 +193,7 @@ pub fn flowTypeOfReference(c: *Checker, node: Node, sym: SymbolId, declared: Typ
     if (declared == types.any_type and !c.symFlags(sym).ambient_var and c.isEvolvingVar(sym) and
         c.containerOf(c.bind.symbol_scopes[c.localOf(sym)]) == c.containerOf(c.cur_scope))
     {
-        try c.ensureReassignScan();
-        if (!c.reassigned_syms.contains(sym) and !c.definitely_assigned_syms.contains(sym)) {
-            return c.flowTypeOfKey(node, .{ .sym = sym }, types.undefined_type);
-        }
+        return c.flowTypeOfKey(node, .{ .sym = sym }, types.undefined_type);
     }
     return c.flowTypeOfKey(node, .{ .sym = sym }, declared);
 }
@@ -1820,12 +1816,29 @@ fn assignNarrows(c: *Checker, flow: FlowId, target: Node, key: RefKey, declared:
                 // `getAssignedType` walks the destructuring target). Falling
                 // back to `declared` here re-widened a `string | null` that
                 // an earlier `width = width || "50"` had already narrowed.
-                if (key.len == 0 and assignmentRefines(c, declared)) {
+                //
+                // An evolving (`auto`-typed) variable takes the destructured
+                // element's type OUTRIGHT, exactly as the plain-identifier arm
+                // above does: there is no declared type to reduce against.
+                // While such a variable started its walk at `any` this arm's
+                // `declared` fallback was harmless; starting at `undefined`
+                // (see `flowTypeOfReference`) it would leave `let roomId;`
+                // still `undefined` after `({ roomId } = data)` — three false
+                // positives on excalidraw's `Collab.tsx`.
+                const evolving = key.len == 0 and
+                    (c.isEvolvingVar(root_sym) or c.ts.kind(declared) == .evolving_array);
+                if (key.len == 0 and (evolving or assignmentRefines(c, declared))) {
                     const rt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
                     if (try destructuredAssignType(c, d.lhs, c.symNameAtom(root_sym), rt)) |vt| {
+                        if (evolving) return .{ .ty = try c.widenLiteral(vt) };
                         return .{ .ty = try assignmentReduced(c, declared, vt) };
                     }
                 }
+                // A pattern whose element type could not be read still WROTE
+                // the variable: an evolving one goes back to the auto type
+                // rather than keeping `undefined`, which would invent a
+                // diagnostic out of a gap in the pattern decode.
+                if (evolving) return .{ .ty = types.any_type };
                 return .{ .ty = declared };
             }
             // A destructuring assignment can write a `this` property —
