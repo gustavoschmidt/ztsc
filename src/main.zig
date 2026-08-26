@@ -97,6 +97,10 @@ const usage =
     \\                         (declaration unit, cost, demanding files) table
     \\                         the cross-checker duplication analysis reads;
     \\                         pair with --checkers=1
+    \\  --dump-partition=PATH  write the file->checker partition (one
+    \\                         `<checker> <file-id> <path>` line per file);
+    \\                         the read side of --partition-file, and how an
+    \\                         order-dependent diagnostic gets shrunk
     \\  --file-order=ORDER     permute the root file list before seeding:
     \\                         source (default), reverse, or shuffle=SEED.
     \\                         The result must not change (correctness axis;
@@ -206,6 +210,15 @@ const Cli = struct {
     /// `--checkers=1`; see the cross-checker duplication section of
     /// `checker/prof.zig`.
     dup_profile: bool = false,
+    /// `--dump-partition=<path>`: write the computed file->checker partition
+    /// as `<checker> <file-id> <path>` lines. The companion READ side of
+    /// `--partition-file`: a partition can only be replayed once its file
+    /// ids have been observed, and both are keyed on ids the root order
+    /// hands out, so the two are only useful together. That pair is how an
+    /// order-dependent diagnostic gets shrunk — pin one `--file-order`, dump
+    /// the partition, then bisect the owning checker's file list down to the
+    /// pair that decides it (wave 44's `UserList.tsx:285`).
+    dump_partition: ?[]const u8 = null,
     /// `--partition-file=<path>`: benchmark aid; override the file->checker
     /// partition with an externally computed one (see the read site).
     partition_file: ?[]const u8 = null,
@@ -643,6 +656,21 @@ pub fn main(init: std.process.Init) !void {
         else
             null;
         const owned = try schedule.partition(arena, check_work.items, n_checkers, file_owner, partition_text);
+        // BENCHMARK AID (`--dump-partition=<path>`): the READ side of
+        // `--partition-file`. One `<checker> <file-id> <path>` line per file,
+        // written to a FILE rather than a stream because the interesting
+        // programs are thousands of lines and every other channel here is
+        // shared with the diagnostics.
+        if (cli.dump_partition) |dp| {
+            var buf: std.ArrayList(u8) = .empty;
+            for (owned, 0..) |list, k| {
+                for (list) |f| try buf.print(arena, "{d} {d} {s}\n", .{ k, f, paths.items[f] });
+            }
+            Io.Dir.cwd().writeFile(io, .{ .sub_path = dp, .data = buf.items }) catch |e| {
+                std.debug.print("ztsc: cannot write --dump-partition '{s}': {s}\n", .{ dp, @errorName(e) });
+                std.process.exit(1);
+            };
+        }
 
         // Shared frozen base type store (frozen-base piece 2): built
         // once, single-threaded here before any checker spawns, then handed to
@@ -1297,6 +1325,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8) error{OutOfMe
                 return .reject(.bad_value, arg);
         } else if (std.mem.eql(u8, arg, "--dup-profile")) {
             cli.dup_profile = true;
+        } else if (std.mem.startsWith(u8, arg, "--dump-partition=")) {
+            cli.dump_partition = arg["--dump-partition=".len..];
         } else if (std.mem.startsWith(u8, arg, "--partition-file=")) {
             cli.partition_file = arg["--partition-file=".len..];
         } else if (std.mem.startsWith(u8, arg, "--file-order=")) {

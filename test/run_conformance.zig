@@ -1274,3 +1274,94 @@ test "inference: a `return []` fall-through is subtype-reduced away" {
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, rendered, "never[]"));
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Type '{ n: number; }[]' is not assignable to type 'number'") != null);
 }
+
+// The last order-dependent result on the app gate (wave 44), reduced to the
+// decision that carried it.
+//
+// A generic call whose FIRST argument is an ANNOTATED callback teaches its
+// type variables only through that callback's PARAMETER positions, so every
+// candidate it produces lands in the contravariant bucket and none at all in
+// the covariant one. Phase 2's feed-forward — "instantiate the contextual type
+// of the arguments to my right with what I just learned" — read only the
+// covariant bucket, so a context-sensitive argument to the right of such a
+// callback was handed the bare `any` placeholder:
+//
+//     memo((p: Props) => 1, (prev, next) => …)   // prev, next: any
+//
+// `P` itself came out right (an ANNOTATED second argument is checked against
+// `Props` and reports), so only the contextual half was missing — which is why
+// nothing but a callback BODY can see it.
+//
+// Order-dependent for a second reason, and that is what made it an app-gate
+// failure rather than a plain false positive: the arrow's body is memoized
+// under (node, contextual type), and a memo minted while checking a FOREIGN
+// file publishes no diagnostic. excalidraw's `LayerUI.tsx` renders
+// `<UserList />`, so whenever one checker instance owned both files the
+// `React.memo` call was walked for LayerUI first and `UserList.tsx:285`'s
+// TS2345 was never reported — while a partition that split them reported it.
+// Seventeen diagnostics under `--file-order=source` and eighteen under
+// `shuffle=1`, at --checkers 2/4/8.
+//
+// Both halves are asserted here: the message must name the real parameter type
+// (never `any`), and it must be the same message under either root order and
+// every partition.
+test "determinism: a context-sensitive argument sees the CONTRAVARIANT inferences" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+
+    try d.writeFile(io, .{ .sub_path = "memo.ts", .data =
+        \\export type Props = { o: { a: string } };
+        \\export declare function memo<P extends object>(
+        \\  render: (p: P) => number,
+        \\  eq?: (prev: P, next: P) => boolean,
+        \\): number;
+    });
+    // The definition. `prev` is only ever `Props` if the contravariant
+    // candidate `render` supplies reaches `eq`'s contextual type.
+    try d.writeFile(io, .{ .sub_path = "def.ts", .data =
+        \\import { memo, type Props } from "./memo";
+        \\export const X = memo(
+        \\  (p: Props) => 1,
+        \\  (prev, next) => {
+        \\    const probe: number = prev.o;
+        \\    return probe === 0 && next.o.a === "";
+        \\  },
+        \\);
+    });
+    // The foreign consumer: reading `X` forces `def.ts`'s initializer from
+    // ANOTHER file, which is what used to swallow the diagnostic below.
+    try d.writeFile(io, .{ .sub_path = "use.ts", .data =
+        \\import { X } from "./def";
+        \\export const y: number = X;
+    });
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var interner = Interner.init();
+    defer interner.deinit(gpa);
+    const alloc = arena.allocator();
+
+    const fwd = [_][]const u8{ "def.ts", "use.ts" };
+    const rev = [_][]const u8{ "use.ts", "def.ts" };
+    const br_fwd = try modules.buildProgram(alloc, io, gpa, &interner, d, &fwd, .none, .{}, .{}, null);
+    const br_rev = try modules.buildProgram(alloc, io, gpa, &interner, d, &rev, .none, .{}, .{}, null);
+
+    const ref = try sortedLines(alloc, try renderProgramDiags(alloc, io, gpa, &interner, &br_fwd.program, 1));
+    // Exactly one diagnostic, and it names the object type — `prev` reading as
+    // `any` produces no diagnostic at all here, which is the failure this
+    // guards.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ref, "TS2322"));
+    try std.testing.expect(std.mem.indexOf(u8, ref, "Type '{ a: string; }' is not assignable to type 'number'") != null);
+
+    // Same answer under the reversed root list, and under every partition —
+    // the half that made this an app-gate failure.
+    try std.testing.expectEqualStrings(ref, try sortedLines(alloc, try renderProgramDiags(alloc, io, gpa, &interner, &br_rev.program, 1)));
+    for ([_]usize{ 2, 4, 8 }) |n| {
+        try std.testing.expectEqualStrings(ref, try sortedLines(alloc, try renderProgramDiags(alloc, io, gpa, &interner, &br_fwd.program, n)));
+        try std.testing.expectEqualStrings(ref, try sortedLines(alloc, try renderProgramDiags(alloc, io, gpa, &interner, &br_rev.program, n)));
+    }
+}

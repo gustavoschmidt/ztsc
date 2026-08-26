@@ -1936,8 +1936,39 @@ pub fn inferTypeArgs(
         // arrow written for it got no contextual signature and every
         // parameter went implicit-`any`. Seeded params keep their seed (the
         // contextual return still owns those).
+        //
+        // The CONTRAVARIANT bucket counts here too. An argument written as an
+        // ANNOTATED callback teaches a type variable only through its
+        // parameter positions, so everything it taught lands in `contra` and
+        // nothing at all in `candidates` — and a call whose first argument is
+        // such a callback then handed every context-sensitive argument to its
+        // right the bare `any` placeholder:
+        //
+        //     declare function memo<P extends object>(
+        //       c: (p: P) => number,
+        //       eq?: (a: P, b: P) => boolean): number;
+        //     memo((p: Props) => 1, (prev, next) => …)   // prev, next: any
+        //
+        // `P` IS `Props` in the final answer (an annotated `eq` is checked
+        // against it and reports), so only the contextual half was missing.
+        // tsc has no such gap: `inferFromAnnotatedParameters` runs those
+        // positions into the inference context before the next argument's
+        // contextual type is instantiated, and `getInferredType` reads the
+        // contravariant candidate first. Covariant evidence still wins where
+        // there is any — this only FILLS a variable that would otherwise stay
+        // `any` — which keeps the placeholder-echo guards above meaningful.
+        //
+        // Found as excalidraw's `UserList.tsx:285` TS2345 (order-dependent at
+        // --checkers>1: whichever file demanded `UserList`'s type first got the
+        // arrow's memo, and a memo minted while checking a FOREIGN file drops
+        // the diagnostic).
         for (partial, 0..) |*p, i| {
-            if (!seeded[i] and candidates[i] != types.no_type) p.ty = candidates[i];
+            if (seeded[i]) continue;
+            if (candidates[i] != types.no_type) {
+                p.ty = candidates[i];
+            } else if (contra[i] != types.no_type) {
+                p.ty = contra[i];
+            }
         }
     }
     // Phase 2.5: the generic-function arguments Phase 1 held back (see
