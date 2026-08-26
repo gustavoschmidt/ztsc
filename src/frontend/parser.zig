@@ -3265,6 +3265,15 @@ const Parser = struct {
     /// first token is the same one).
     fn checkForInOfHead(p: *Parser, init: Node, is_of: bool) Error!void {
         if (p.spec != 0 or init == null_node) return;
+        // TS1106, and tsc's chain reaches it before every arm below (which all
+        // ask about a variable DECLARATION, so the two never compete). The
+        // left-hand side has to be the bare identifier `async`: a pattern that
+        // merely contains it is fine.
+        if (is_of and !p.fn_ctx.awaits() and p.nodeTagAt(init) == .identifier and
+            p.tokTagAt(p.nodeMainTokenAt(init)) == .keyword_async)
+        {
+            return p.errAtToken(.for_of_lhs_async, p.nodeMainTokenAt(init));
+        }
         switch (p.nodeTagAt(init)) {
             .var_decl => {
                 const data = p.nodeDataAt(init);
@@ -9519,8 +9528,27 @@ const Parser = struct {
                     // as `.this_expr` so the checker reads the enclosing
                     // declaration's `this`, not a name called "this".
                     try p.parseEntityNameFrom(try p.leaf(.this_expr))
-                else
-                    try p.parseEntityName();
+                else if (p.curTag() == .identifier or p.curTag().isKeyword())
+                    // tsc's `parseEntityName(/*allowReservedWords*/ true)`, so
+                    // EVERY keyword is a legal name here: `typeof null` and
+                    // `typeof function f() {}` both parse (the latter as the
+                    // entity `function`, leaving `f() { }` to the statement
+                    // list behind it).
+                    try p.parseEntityName()
+                else blk2: {
+                    // `typeof {}`, `typeof 1`, `typeof /re/` — tsc's
+                    // `createMissingNode(Identifier, reportAtCurrentPosition)`:
+                    // TS1003 where the name should have been, consuming
+                    // NOTHING, so the token is left to whoever comes next.
+                    // (The `;` the variable statement then wants lands on that
+                    // same character and the one-per-position rule drops it,
+                    // which is why tsgo answers these lines once.) An
+                    // unconditional `leaf` used to EAT the token instead —
+                    // silence for `typeof 1`, and a shifted cascade for the
+                    // rest.
+                    try p.fail(.expected_identifier);
+                    break :blk2 try p.parseEntityNameFrom(try p.errorNode());
+                };
                 // `typeof f<T>` — a type-position instantiation expression.
                 // A line break before the `<` ends the type query (tsc applies
                 // ASI here so the next line's `<` is not swallowed).

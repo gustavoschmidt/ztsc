@@ -480,6 +480,14 @@ pub const Code = enum(u16) {
     /// on the whole declaration, whose first token is the name.
     for_of_type_annotation,
     for_in_type_annotation,
+    /// TS1106: `for (async of xs)` — the identifier `async` alone on the left
+    /// of a `for…of` is ambiguous with `for await (…)`, so ES forbids it.
+    /// Only in a SYNC context: tsc's guard is `!(node.flags &
+    /// NodeFlags.AwaitContext)`, so an async function body and a class
+    /// `static { … }` block are both exempt while a module's top level is not
+    /// (all three measured). `for…in` never earns it, and neither does a
+    /// destructuring pattern that merely CONTAINS `async`.
+    for_of_lhs_async,
     /// TS17008: an opening tag whose element ran to end of file, or whose
     /// closing tag turned out to belong to an ENCLOSING element
     /// (`<div><span></div>` blames the `span`). tsc reports it on the OPENING
@@ -1357,6 +1365,7 @@ pub const Code = enum(u16) {
             .for_of_declaration_initializer,
             .for_in_declaration_initializer,
             .for_of_type_annotation,
+            .for_of_lhs_async,
             .for_in_type_annotation,
             .module_keyword_for_namespace,
             .quoted_module_name_needs_ambient,
@@ -1914,6 +1923,7 @@ pub const Code = enum(u16) {
             .for_of_declaration_initializer => "The variable declaration of a 'for...of' statement cannot have an initializer.",
             .for_in_declaration_initializer => "The variable declaration of a 'for...in' statement cannot have an initializer.",
             .for_of_type_annotation => "The left-hand side of a 'for...of' statement cannot use a type annotation.",
+            .for_of_lhs_async => "The left-hand side of a 'for...of' statement may not be 'async'.",
             .for_in_type_annotation => "The left-hand side of a 'for...in' statement cannot use a type annotation.",
             .jsx_element_unclosed => "JSX element '{0}' has no corresponding closing tag.",
             .jsx_expected_closing_tag => "Expected corresponding JSX closing tag for '{0}'.",
@@ -2363,6 +2373,7 @@ pub const Code = enum(u16) {
             .for_of_declaration_initializer => 1190,
             .for_in_declaration_initializer => 1189,
             .for_of_type_annotation => 2483,
+            .for_of_lhs_async => 1106,
             .for_in_type_annotation => 2404,
             .jsx_element_unclosed => 17008,
             .jsx_expected_closing_tag => 17002,
