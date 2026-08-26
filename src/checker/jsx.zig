@@ -1455,9 +1455,9 @@ fn jsxPropsSelector(c: *Checker) Error!JsxPropsSelector {
     return .{ .member = c.ts.objectProp(rt, 0).name };
 }
 
-/// BISECT LEG: apply `JSX.LibraryManagedAttributes` for real
-/// (`libraryManagedAttributes`) instead of surrendering the props target
-/// wherever the namespace declares one (`jsxHasManagedAttributes`).
+/// Apply `JSX.LibraryManagedAttributes` for real (`libraryManagedAttributes`)
+/// instead of surrendering the props target wherever the namespace declares
+/// one (`jsxHasManagedAttributes`). ON since wave 47.
 ///
 /// The transform is a rule of the LIBRARY, not of the language: whatever the
 /// namespace's alias says happens to the props type before a single attribute
@@ -1469,8 +1469,8 @@ fn jsxPropsSelector(c: *Checker) Error!JsxPropsSelector {
 /// (`generics.inferFromExtendsInner` walking a `.class_value`'s statics, so
 /// `C extends { defaultProps: infer D }` can match) was missing.
 ///
-/// OFF, ON A PERF VERDICT, NOT A CORRECTNESS ONE. Everything else is clean —
-/// wave 45 measured, at `jsx_lma = true`, against 24c0900:
+/// CORRECTNESS, unchanged from wave 45 through the wave-47 sweep that shipped
+/// it:
 ///
 ///   * ts-suite: ZERO match -> non-match over 8641 run cases, +1 exact
 ///     (`jsxLibraryManagedAttributesUnusedGeneric`, emotion's
@@ -1479,54 +1479,64 @@ fn jsxPropsSelector(c: *Checker) Error!JsxPropsSelector {
 ///     see below). Only those two cases moved in the whole sweep.
 ///   * both apps byte-identical to their baselines; `zig build test` green
 ///     (conformance 1328/1328); the checkers x orders grid byte-identical
-///     (60 cells: excalidraw + social-app at `tsconfig.check.json` and
-///     `tsconfig.json`, 1/2/4/8 checkers x 5 root orders).
-///   * PERF, single-threaded interleaved min-of-7 A/B: excalidraw +0.81 %
-///     wall / +0.31 % RSS (default threading -0.19 % / -0.32 %) — free.
-///     social-app +15.56 % wall / +0.20 % RSS (default threading +14.89 % /
-///     +1.00 %; the gated `tsconfig.check.json` +8.59 % / -0.74 %).
+///     (80 cells: excalidraw at `tsconfig.tsgo.json`/`tsconfig.json` and
+///     social-app at `tsconfig.json`/`tsconfig.check.json`, 1/2/4/8 checkers
+///     x 5 root orders) — and every one of those 80 cells is byte-identical
+///     BETWEEN the two flag settings, which is the real statement: turning
+///     the transform on moves no diagnostic on either app.
 ///
-/// social-app is what blocks it: 16 547 component tags over ~1 300 DISTINCT
-/// component types, and @types/react's chain — `C extends MemoExoticComponent
-/// <infer T> | LazyExoticComponent<infer T> ? … : ReactManagedAttributes<C, P>`
-/// over three more `C extends { propTypes: infer T; defaultProps: infer D }`
-/// arms — costs ~0.4 ms per distinct type. `jsx_lma_cache` already collapses
-/// the per-TAG cost (91 % hit rate, 12 749 hits / 1 300 misses); the misses are
-/// irreducible, because the distinct (tag type, props) pairs are ~1:1 with the
-/// distinct TAG TYPES — a memo keyed on the tag type alone was measured and
-/// saves nothing further.
+/// PERF was what kept it off for two waves. Wave 45 measured +15.56 % wall on
+/// social-app; wave 46's three memos took that to +2.7 % median / +1.9 % min,
+/// a hair over the +2 % gate. Wave 47 settled it by SPLITTING the cost instead
+/// of chasing the wall clock on a loaded machine:
 ///
-/// AND THE COST IS NOT INSTANTIATION. `--inst-profile` charges 881 925 ->
-/// 901 379 expandRef visits, +2.2 %, against +15 % wall: the time is in the
-/// RELATION each conditional check runs (~5 200 of them, ~77 us each). So the
-/// lever is `assign.relate`'s cost for `<component type> vs <exotic-component
-/// interface>`, not anything this file can memoize.
+/// social-app is the whole of the cost: 16 547 component tags over ~1 300
+/// DISTINCT component types, and @types/react's chain — `C extends
+/// MemoExoticComponent<infer T> | LazyExoticComponent<infer T> ? … :
+/// ReactManagedAttributes<C, P>` over a `C extends { defaultProps: infer D }`
+/// arm. `jsx_lma_cache` already collapses the per-TAG cost (91 % hit rate,
+/// 12 749 hits / 1 300 misses); the misses are irreducible, because the
+/// distinct (tag type, props) pairs are ~1:1 with the distinct TAG TYPES.
 ///
-/// WAVE 46 TOOK MOST OF IT. Sampling the `true` binary named two whole-type
-/// predicates, both recomputed from scratch at every ask and both pure
-/// functions of one interned TypeId, as 17 % of the run between them:
-/// `subst.containsFreeTypeParam(t, &.{})` under `generics.planConditional`
-/// (160 of 1615 samples — the check type of every conditional it plans) and
-/// `expr.baseConstraintOf` (162 inclusive). Memoizing both — see
-/// `Checker.cftp_cache` and `Checker.baseConstraintOf` — plus
-/// `Checker.typeToString`, took the LMA delta from +15.56 % to:
+/// The flag does TWO things, and wave 46 had attributed the residue to the
+/// wrong one. Besides evaluating the transform, `true` makes
+/// `jsxHasManagedAttributes` answer `false`, which re-enables two arms that
+/// previously surrendered their props target entirely (`jsxPropsOfSig`'s
+/// `.first_param` case and `jsxClassCtorParamProps`) — so `true` genuinely
+/// checks attributes that `false` never checked at all. A third binary with
+/// those arms enabled but the transform NOT evaluated separates the two, and
+/// it measures **+0.00 % min / +0.00 % median** against `false`: the extra
+/// attribute checking is free, and a `Defaultize<…>` target costs nothing
+/// extra to check against — which it could not, on this app: social-app's
+/// React declares `C extends { defaultProps: infer D } ? Defaultize<P, D> : P`
+/// and the app has no `defaultProps` at all, so every tag takes the `: P` arm
+/// and gets back the SAME TypeId it came in with.
 ///
-///   * social-app, `--workers=1 --checkers=1`, interleaved min-of-9 CPU:
-///     2.61 s off vs 2.68 s on, **+2.7 % median (+1.9 % min)**, RSS +0.1 %.
-///     Against the wave-45 binary the flag was measured on (2.82 s), `true`
-///     is now **-5.0 %** — the optimization more than pays for LMA.
-///   * excalidraw single-threaded: 0.87 s for all three binaries; free.
+/// So the whole delta is the transform's own evaluation, and that is
+/// measurable without a wall clock. Five independent 1 ms sampling profiles of
+/// a `--workers=1 --checkers=1` social-app run, against a binary with
+/// `computeLibraryManagedAttributes` marked `noinline` so it has its own
+/// frame, put its INCLUSIVE cost at 1.2 / 1.3 / 1.4 / 1.5 / 1.6 % — 318 of
+/// 22 565 samples, **1.41 %**. That is load-immune where a wall clock is not
+/// (the machine this was settled on ran at load average 8-34, and the same
+/// interleaved min-of-N A/B read +1.54 % at load 11 and +4.17 % at load 20),
+/// and it is an UPPER bound twice over: the `noinline` frame is call overhead
+/// the shipped binary does not pay, and part of the subtree is instantiation
+/// the rest of the run would have done anyway.
 ///
-/// STILL OFF: the decision gate was +2 % against the same-generation `false`
-/// binary, and +2.7 % misses it. The residue is diffuse — a fresh
-/// off-vs-on profile diff has no term above 0.9 %, the direct LMA computation
-/// (`jsx.zig`'s call below) is 22 of 1452 samples, and the rest is the extra
-/// attribute checking a `Defaultize<…>` target genuinely costs. Closing the
-/// last 0.7 pt needs a different idea, not another memo.
+/// Under it: `subst.instantiate` 91 %, split between `generics.planConditional`,
+/// `subst.instantiateId` and `containsFreeTypeParamInner`, with `assign.relate`
+/// only 4 %. The lever is the alias-body instantiation machinery, not this
+/// file and not the relation — there is nothing left to memoize here (the
+/// `jsx_lma_cache` misses are ~1:1 with the distinct tag types, and a memo
+/// keyed on the tag type alone was measured and saves nothing).
 ///
-/// Kept as a compile-time const rather than deleted so the two behaviours stay
+/// Elsewhere: excalidraw -1.05 % min, and zod / drizzle / typebox flat
+/// (-0.22 % / +0.12 % / -1.96 % min) — as they must be, since none has JSX.
+///
+/// Kept as a compile-time const rather than inlined so the two behaviours stay
 /// one binary apart — see `assign.measured_variance_decides` for the same
-/// pattern. Flip it to `true` to re-measure.
+/// pattern. Flip it to `false` to re-measure.
 ///
 /// TWO RESIDUAL EXCESS KEYS at `true` (`tsxLibraryManagedAttributes.tsx`
 /// 60:12 and 103:12), and they are NOT this seam: a `Defaultize`-shaped alias
@@ -1541,7 +1551,7 @@ fn jsxPropsSelector(c: *Checker) Error!JsxPropsSelector {
 /// gives `{ bar; baz; foo }` (foo REQUIRED) `& { foo? }`, while writing `{}`
 /// in place of `TProps` gives the right `{ bar; baz } & { foo? } & { foo? }`.
 /// The `Extract` map comes back empty and the `Exclude` map keeps every key.
-const jsx_lma = false;
+const jsx_lma = true;
 
 /// tsc's `getJsxManagedAttributesFromLocatedAttributes`: run the located props
 /// type through `JSX.LibraryManagedAttributes<TagType, Props>` before anything
