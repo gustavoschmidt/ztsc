@@ -3008,15 +3008,17 @@ pub fn contextAdmitsLiteral(c: *Checker, ctx: TypeId, lit: TypeId) Error!bool {
         // field-name literal so the type param infers to it rather than
         // widening to `string`.
         .template_literal_type, .string_mapping => return lk == .string_literal and try c.isAssignable(lit, r),
-        // No `.keyof_op` arm, even though tsc's `isLiteralOfContextualType`
-        // final mask lists `TypeFlags.Index` beside `StringLiteral`: every
-        // shape that reaches it here arrives as the type PARAMETER whose
-        // constraint is the `keyof` (`K extends readonly (keyof R)[]`), and
-        // the `.type_param` arm below already keeps the literal for those.
-        // Adding the arm changed no corpus or probe output, so it stays out
-        // rather than being carried unexercised. What still clamps —
-        // `...keys: [...K]` inferring `K` as its constraint instead of the
-        // argument tuple — is a variadic-tuple inference gap, not this test.
+        // tsc's `isLiteralOfContextualType` final mask lists `TypeFlags.Index`
+        // beside `StringLiteral`, and a `keyof X` therefore names the
+        // string-literal domain exactly as a string literal does — a fresh
+        // `"a"` read against it keeps its literal type instead of widening to
+        // `string`. (An earlier note here claimed the arm changed no corpus or
+        // probe output and left it out; that is no longer true — it is worth
+        // two cases, `keyofIsLiteralContexualType` and
+        // `twiceNestedKeyofIndexInference`. Wave-43 C measured it, wave-43 A
+        // landed it.) The sibling reader `literalOfContextualTypeAt` has
+        // carried the same arm all along.
+        .keyof_op => return clk == .string_literal,
         .index_access => return c.isConstTypeVar(r),
         .type_param => {
             if (c.isConstTypeParamSym(c.ts.typeParamSymbol(r))) return true;
