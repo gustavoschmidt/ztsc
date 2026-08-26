@@ -600,6 +600,13 @@ pub const Code = enum(u16) {
     /// tsc's `checkGrammarModifiers` (`isClassLike(node.parent) &&
     /// !isPropertyDeclaration(node)`), blamed on the `declare` keyword.
     declare_on_class_element,
+    /// TS1031 again, for `export` — `class C { export m() {} }`. tsc's
+    /// `checkGrammarModifiers` reaches it through the `ExportKeyword` arm's
+    /// `isClassLike(node.parent)` test, which (unlike `declare`'s) makes no
+    /// exception for a property, so `export bar = 1` earns it too. A separate
+    /// code rather than an argument because the family above is spelled one
+    /// arm per keyword.
+    export_on_class_element,
     /// `export export class C {}` — the one repeat a STATEMENT-level modifier
     /// run can spell. Reported by `parseExportStatement`, not by the class-member
     /// walk, because `export` is not a class-member modifier at all.
@@ -1100,6 +1107,14 @@ pub const Code = enum(u16) {
     /// inside a `with` block earns nothing.
     with_statement_not_supported,
 
+    /// TS2857, tsc's `checkImportAttributes`: a TYPE-ONLY import or export
+    /// carries no runtime request, so it may not carry an attributes clause
+    /// either. `grammarErrorOnNode(node, …)` blames the whole
+    /// `ImportAttributes` node, whose first token is the `with` / `assert`
+    /// keyword. GRAMMAR-class, like every other `grammarError*` of the
+    /// checker's.
+    import_attributes_on_type_only,
+
     /// TS1317, tsc's `checkGrammarModifiers`: a parameter PROPERTY
     /// (`public`/`private`/`protected`/`readonly`/`override`) may not also be a
     /// rest parameter. Reported on the parameter NODE, whose first token is the
@@ -1517,6 +1532,7 @@ pub const Code = enum(u16) {
             .class_decl_needs_name,
             .with_in_strict,
             .with_statement_not_supported,
+            .import_attributes_on_type_only,
             // Both are `checkGrammarModifiers`, the same checker pass that
             // already owns TS1090 and TS1242 below.
             .param_property_rest,
@@ -1551,6 +1567,7 @@ pub const Code = enum(u16) {
             .mod_seen_in,
             .mod_seen_out,
             .declare_on_class_element,
+            .export_on_class_element,
             .mod_seen_export,
             .export_assign_with_modifiers,
             .mod_order_public_static,
@@ -1856,6 +1873,7 @@ pub const Code = enum(u16) {
             .class_decl_needs_name => "A class declaration without the 'default' modifier must have a name.",
             .with_in_strict => "'with' statements are not allowed in strict mode.",
             .with_statement_not_supported => "The 'with' statement is not supported. All symbols in a 'with' block will have type 'any'.",
+            .import_attributes_on_type_only => "Import attributes cannot be used with type-only imports or exports.",
             .param_property_rest => "A parameter property cannot be declared using a rest parameter.",
             .async_modifier_in_ambient => "'async' modifier cannot be used in an ambient context.",
             .decorator_not_valid_here => "Decorators are not valid here.",
@@ -1958,6 +1976,7 @@ pub const Code = enum(u16) {
             .mod_seen_in => modSeenMessage("in"),
             .mod_seen_out => modSeenMessage("out"),
             .declare_on_class_element => "'declare' modifier cannot appear on class elements of this kind.",
+            .export_on_class_element => "'export' modifier cannot appear on class elements of this kind.",
             .mod_seen_export => modSeenMessage("export"),
             .export_assign_with_modifiers => "An export assignment cannot have modifiers.",
             .mod_order_public_static => modOrderMessage("public", "static"),
@@ -2270,6 +2289,7 @@ pub const Code = enum(u16) {
             .class_decl_needs_name => 1211,
             .with_in_strict => 1101,
             .with_statement_not_supported => 2410,
+            .import_attributes_on_type_only => 2857,
             .param_property_rest => 1317,
             .async_modifier_in_ambient => 1040,
 
@@ -2412,7 +2432,7 @@ pub const Code = enum(u16) {
             .mod_seen_out,
             .mod_seen_export,
             => 1030,
-            .declare_on_class_element => 1031,
+            .declare_on_class_element, .export_on_class_element => 1031,
             .export_assign_with_modifiers => 1120,
             .mod_order_public_static,
             .mod_order_private_static,
