@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-27, post wave 43)
+## Standings (2026-08-28, post wave 44)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7858 / 8641 (90.9%)** |
-| excess keys (false positives) | 3541 | 1055 |
-| missing keys (under-reports) | 8617 | 2077 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7867 / 8641 (91.0%)** |
+| excess keys (false positives) | 3541 | 1010 |
+| missing keys (under-reports) | 8617 | 2007 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Forty-three waves landed (3–43), every one with ZERO match→non-match regressions in
+Forty-four waves landed (3–44), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -782,7 +782,88 @@ excalidraw UserList.tsx:285:11 TS2345 is ORDER-DEPENDENT at checkers
 see it); the DEBUG binary panics on excalidraw (constEnumOnly at
 expr.zig:1333 reads a foreign-file decl node — masked by ReleaseFast).
 
-## Ranked next queue (wave 44) — distilled from wave-43 agent reports
+Wave 44 (+9 exact → 7867/8641 91.0%; DETERMINISM RESTORED — grid
+40/40 again; drizzle −3.4% CPU, repaying the wave-42 debt): D
+root-caused UserList.tsx:285 with a new --dump-partition tool (the
+read side --partition-file lacked): Phase 2's feed-forward read ONLY
+covariant candidates, so an annotated callback (all-contravariant
+evidence) left the next argument's contextual type at the `any`
+placeholder — and a body memo minted while checking a FOREIGN file
+publishes no diagnostic, making the FP surface only under partitions
+splitting UserList from LayerUI. Fix: feed-forward falls back to
+contra when covariant is empty; regression test guards both halves.
+Also `this is T` parseable anywhere a type is; TS1228 reclassified to
+grammar; the enums-leg framing DISPROVED (an empty const enum is NOT
+never — the rule is disjoint-domain: empty/numeric→NumberLike,
+all-string→StringLike, mixed declines). A fixed the debug-binary
+cross-file panic (constEnumOnly resolves the SYMBOL's file tree; both
+apps now run clean in Debug), TS2449 with the IIFE clause (new
+decorator_owner + iife_fn plumbing; 22/22 keys), union-key write
+intersection un-gated (it IS the write type), spread-readonly. B
+landed the mapped-defer chain properly: the naive whole-homomorphic
+deferral cost +22% drizzle CPU; screening on MODIFIER-CHANGING maps
+keeps every key at noise cost; canBeNullish answers deferred accesses
+via simplifyMappedIndexAccessRead; {} absorbs an `X & {}` sibling.
+C landed keyof-of-renaming-maps (named the RENAME half positively —
+substitution unbounds on self-recursive as-clauses where tsc's free P
+stops) and the .class_value infer fix (generics.zig
+inferFromExtendsInner bridged class values only for signature-bearing
+patterns — the LMA PREREQUISITE IS NOW IN). MERGE LESSON: B's and C's
+defer arms conflicted; the union regressed indexedAccessAndNullable
+Narrowing through the BASE-CONSTRAINT route — resolved by keeping
+modifier-changing deferral for DIRECT receivers only. Machine slept
+repeatedly; agents resumed; C's worktree was auto-removed (recreated
+as worktree-agent-w44c); D looped on stale waiters until TaskStop.
+
+## Ranked next queue (wave 45) — distilled from wave-44 agent reports
+
+1. The .d.<ext>.ts link one-key (READY, pinned): `export * as mod from
+   "./component.html"` must also try component.d.html.ts — one
+   candidate appended LAST in resolve.zig's fall-through (can only
+   remove TS2307s). declarationFileForHtmlFileWithinDeclarationFile.
+2. inferTypePredicates (12 excess, three pinned bugs): signatures.zig
+   :300 gates inferred predicates to arrow/function-expr — tsc runs
+   getTypePredicateFromBody for every function-like except ctors/
+   accessors (8 keys); :345 unwraps only parens and `!` — `satisfies
+   boolean` stops it; narrow.zig: narrowing a NON-UNION by a false
+   in-guard must reach never (union works).
+3. controlFlowAssignmentPatternOrder (18 excess, two bugs): an
+   array-pattern element DEFAULT isn't used when the RHS tuple lacks
+   the element (destructure.zig); `b` keeps its declared union
+   instead of narrowing to the destructured element type (flow.zig).
+4. TS2502+TS2403 same root (signatures.zig:2762): tsc reports TS2502
+   AND resolves the annotation to `any` (so the var-redeclaration
+   matches); ztsc does neither. recursiveTypesWithTypeof 11 keys +
+   implicitAnyFromCircularInference 8 + 3 one-keys.
+5. Parser concentrations: autoAccessorDisallowedModifiers (28 keys,
+   ONE modifier rule); regularExpressionScanning (17 TS1518 keys);
+   invalidTypeOfTarget (6+ keys).
+6. B's wave-41 simplifyIntersectionIndexAccess RETRY: the jsx-ordering
+   blocker landed in wave 42 — the written-and-verified fix
+   ((A & B)[K] keeps every conjunct, Instantiable guard) should now
+   be a clean +1 (indexedAccessRelation).
+7. typeArgumentDefaultUsesConstraintOnCircularDefault: a
+   self-referential default resolves to the ERROR type (tsc prints
+   Test<any>); tp_default_stack doesn't trip because it resolves
+   without re-entering fillDefaults (typeparams.zig).
+8. TS2411 type-literal hook (tsc checkTypeLiteral → checkIndex
+   Constraints; ztsc covers only class/interface decls) — typenode
+   .object_type arm; the computed propNameType machinery is separate
+   and bigger.
+9. Template-literal EXPRESSION in index position gets a
+   template-literal TYPE (mappedTypeConstraints2's last 2 keys).
+10. THE LMA WAVE (prerequisite landed): jsx.zig:212 seam behind a
+    flag → measure grid + both apps + perf (3-deep conditionals ×
+    2836/16547 tags) → remove flag if clean. Own-wave-sized, one
+    agent dedicated. 15+ keys.
+11. JSX TS2322 one-key unders ×9 (D); varianceAnnotations end-to-end
+    (in/out: TS1273/1274/2636/2637, parser+checker own slot).
+12. mappedTypeRelationships:109:9 (f50/f51 one-side-constrained);
+    deeplyNested both-sides guard (blocked: zod 2.5x cost measured).
+13. Census: 193 one-key cases (30 excess / 163 under; TS2322 under
+    ×15 with 9 JSX); build-stagger lesson for concurrent agents.
+
+## Superseded queue (wave 44, kept for context)
 
 1. DETERMINISM DEFECT: excalidraw UserList.tsx:285:11 TS2345
    order-dependent at checkers 2/4/8. Method that closed the prior
