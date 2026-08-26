@@ -790,9 +790,3 @@ test "a numeric index signature judges the names that spell their own number" {
         try t.expect(!isNumericIndexName(s));
     }
 }
-// Wave 46: `checkTypeLiteralIndexConstraints` has no in-tree consumer yet —
-// typenode.zig's `.object_type` arm is the one being wired. Keep it analyzed
-// until then; DELETE this block with the call site's landing.
-comptime {
-    _ = &checkTypeLiteralIndexConstraints;
-}

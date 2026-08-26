@@ -38,6 +38,7 @@ const Error = checker_zig.Error;
 
 const annTypeMaybeUnique = Checker.annTypeMaybeUnique;
 const computed_key = @import("computed_key.zig");
+const checkTypeLiteralIndexConstraints = @import("index_constraints.zig").checkTypeLiteralIndexConstraints;
 const implicit_any = @import("implicit_any.zig");
 const inferVarFromNode = @import("generics.zig").inferVarFromNode;
 const mergeBaseObjectPlain = @import("classes.zig").mergeBaseObjectPlain;
@@ -312,8 +313,16 @@ fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
             // No type parameters: a type literal never earns TS2467, not even
             // as a generic type alias's body (measured — see
             // `computed_key.reportTypeParamRefs`).
-            try computed_key.checkMemberNames(c, c.tree.nodeRange(node), .type_space, &.{}, null_node);
-            return c.objectTypeFromMembers(c.tree.nodeRange(node), 0);
+            const members = c.tree.nodeRange(node);
+            try computed_key.checkMemberNames(c, members, .type_space, &.{}, null_node);
+            const obj = try c.objectTypeFromMembers(members, 0);
+            // tsc's `checkTypeLiteral` -> `checkIndexConstraints`: TS2411 /
+            // TS2413 for the literal's own members against its own index
+            // signatures. Same once-per-literal position as the name check
+            // above — this arm is the single place a written `{ … }` becomes
+            // an object type. (wave-47 A: wires agent B's checker.)
+            try checkTypeLiteralIndexConstraints(c, members, obj);
+            return obj;
         },
         .function_type => return c.signatureOfProto(node, d.lhs, false, true),
         .constructor_type => {

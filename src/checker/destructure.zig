@@ -10,10 +10,12 @@ const std = @import("std");
 const ast = @import("../frontend/ast.zig");
 const binder = @import("../frontend/binder.zig");
 const intern = @import("../intern.zig");
+const source = @import("../frontend/source.zig");
 const types = @import("../types.zig");
 
 const Atom = intern.Atom;
 const Node = ast.Node;
+const Span = source.Span;
 const null_node = ast.null_node;
 const SymbolId = binder.SymbolId;
 const TypeId = types.TypeId;
@@ -581,10 +583,16 @@ fn patternElemNested(c: *Checker, el: Node, form: PatternForm) Node {
 /// there would fire once per bound name — and zero times for a symbol whose
 /// type an earlier demand already cached, which makes the report depend on
 /// the order demands arrive in. This runs once, from the declaration check.
-pub fn checkPatternProps(c: *Checker, pat: Node, whole: TypeId) Error!void {
+///
+/// `has_init` is tsc's `needCheckInitializer` — does the declaration this
+/// pattern names carry an initializer (a `var`'s `= x`, a parameter's or a
+/// binding element's default)? It decides one thing only, and only for an
+/// EMPTY array pattern: see `checkEmptyPatternSource`.
+pub fn checkPatternProps(c: *Checker, pat: Node, whole: TypeId, has_init: bool) Error!void {
     if (pat == null_node or whole == types.no_type) return;
     switch (c.nodeTag(pat)) {
-        .binding_default => try checkPatternProps(c, c.tree.nodeData(pat).lhs, whole),
+        // A default IS the initializer the rule asks about.
+        .binding_default => try checkPatternProps(c, c.tree.nodeData(pat).lhs, whole, true),
         // Anything still GENERIC is left alone by the PROPERTY walk. A bare
         // type parameter, because tsc narrows one by its constraint's
         // constituents (`value.kind === "a"` makes `T` read as `T & { a:
@@ -594,16 +602,95 @@ pub fn checkPatternProps(c: *Checker, pat: Node, whole: TypeId) Error!void {
         // it rather than answering: `correlatedUnions`' `{ letter, caller }:
         // LetterCaller<K>` destructures `{ [P in K]: … }[K]`, which has no
         // resolved member table to be missing a property from.
-        .object_pattern => if (c.ts.kind(whole) != .type_param and
-            !try subst.containsTypeParam(c, whole))
-            try checkObjectPatternProps(c, pat, whole),
+        .object_pattern => {
+            try checkEmptyPatternSource(c, pat, whole);
+            if (c.ts.kind(whole) != .type_param and !try subst.containsTypeParam(c, whole))
+                try checkObjectPatternProps(c, pat, whole);
+        },
         // The ITERABILITY walk has no such excuse: narrowing `T` to
         // `T & { kind: "a" }` cannot add a `[Symbol.iterator]` the constraint
         // did not have, so the answer for `T` is the answer for its apparent
         // type either way — which is exactly what tsc asks
         // (`checkIteratedTypeOrElementType` runs on `getApparentType`).
-        .array_pattern => try checkArrayPatternProps(c, pat, whole),
+        .array_pattern => {
+            // Before the iterability report, as tsc orders them.
+            if (has_init) try checkEmptyPatternSource(c, pat, whole);
+            try checkArrayPatternProps(c, pat, whole);
+        },
         else => {},
+    }
+}
+
+/// tsc's `checkVariableLikeDeclaration` tail for a binding pattern with NO
+/// elements: `checkNonNullNonVoidType(widenedType, node)`. `var { } = x` binds
+/// nothing, so no member walk ever touches `x` and nothing else would notice
+/// that it cannot be destructured at all — this is the one report the empty
+/// pattern earns (TS2571 / TS2531-3, `destructuringVoidStrictNullChecks`).
+///
+/// The site is the PATTERN, not the declaration: `getErrorSpanForNode` swaps a
+/// VariableDeclaration / Parameter / BindingElement for its `name`, and the
+/// name here is the pattern. Every caller of `checkPatternProps` is one of
+/// those three, so the site is right for all of them.
+///
+/// An empty ARRAY pattern takes the same report, but only when the declaration
+/// has an INITIALIZER: that branch is tsc's `needCheckInitializer` one, and the
+/// `needCheckWidenedType` branch below it sends an array pattern to
+/// `checkIteratedTypeOrElementType` instead. So `let [] = null` is the TS2488
+/// *and* the TS2531, while the annotation-only `function g([]: null) {}` is the
+/// TS2488 alone.
+fn checkEmptyPatternSource(c: *Checker, pat: Node, whole: TypeId) Error!void {
+    if (c.tree.nodeRange(pat).len != 0) return;
+    try reportNonNullDestructuringSource(c, c.nodeSpan(pat), whole, true);
+}
+
+/// tsc's `checkObjectLiteralAssignment` head: *"if (strictNullChecks &&
+/// properties.length === 0) return checkNonNullType(sourceType, node)"* — the
+/// ASSIGNMENT spelling of the rule above, for `({ } = x)`.
+///
+/// `checkNonNullType`, not `checkNonNullNonVoidType`: the assignment form says
+/// nothing about a bare `void` source, which is the one way the two spellings
+/// disagree (`({} = v)` is silent where `const {} = v` is TS2532).
+pub fn checkEmptyAssignPatternSource(c: *Checker, lit: Node, whole: TypeId) Error!void {
+    if (whole == types.no_type or c.tree.nodeRange(lit).len != 0) return;
+    try reportNonNullDestructuringSource(c, c.nodeSpan(lit), whole, false);
+}
+
+/// tsc's `checkNonNullType` / `checkNonNullNonVoidType` for a DESTRUCTURING
+/// site, which is never an entity-name expression (it is a binding pattern or
+/// an empty object literal) — so the object-shaped codes are the only ones
+/// reachable and there is no name to print.
+///
+/// tsc's steps, in order:
+///   1. `unknown` is rejected outright (TS2571) — `catch ({})` lands here.
+///   2. the NULLABLE flags (`null` / `undefined`, and NOT `void`) report
+///      TS2531-3. `void | null` is TS2531 alone, never also TS2532, because
+///      `getNonNullableType` filters `void` out along with the nullables and
+///      the `never` that leaves degrades to the error type.
+///   3. only `non_void` callers, and only then, report a bare `void` as
+///      TS2532. A union that merely CARRIES `void` (`void | { a: 1 }`) says
+///      nothing: `getFalsyFlags` finds nothing nullable in it and the union's
+///      own flags are not `Void`.
+///
+/// A type parameter is left alone, like the property walk leaves it alone:
+/// `getFalsyFlags` of one is empty and its flags are not `Void`, so tsc says
+/// nothing for `function f<T extends void>(t: T) { const {} = t; }` either.
+fn reportNonNullDestructuringSource(c: *Checker, span: Span, whole: TypeId, non_void: bool) Error!void {
+    if (c.ts.kind(try c.resolveStructural(whole)) == .unknown) {
+        try c.diagFmt(2571, span, "Object is of type 'unknown'.", .{});
+        return;
+    }
+    const has_null = c.containsNull(whole);
+    const has_undef = c.unionAnyMember(whole, struct {
+        fn f(ch: *Checker, m: TypeId) bool {
+            return ch.ts.kind(m) == .undefined;
+        }
+    }.f);
+    if (has_null and has_undef) {
+        try c.diagFmt(2533, span, "Object is possibly 'null' or 'undefined'.", .{});
+    } else if (has_null) {
+        try c.diagFmt(2531, span, "Object is possibly 'null'.", .{});
+    } else if (has_undef or (non_void and c.ts.kind(whole) == .void)) {
+        try c.diagFmt(2532, span, "Object is possibly 'undefined'.", .{});
     }
 }
 
@@ -690,7 +777,7 @@ fn checkObjectPatternProps(c: *Checker, pat: Node, whole: TypeId) Error!void {
         var pt = if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
         if (c.tree.nodeData(el).rhs != 0) pt = try defaultedElemType(c, c.tree.nodeData(el).rhs, pt);
         if (c.ts.kind(pt) == .never) continue;
-        try checkPatternProps(c, sub, pt);
+        try checkPatternProps(c, sub, pt, c.tree.nodeData(el).rhs != 0);
     }
 }
 
@@ -1056,7 +1143,7 @@ fn checkArrayPatternProps(c: *Checker, pat: Node, whole: TypeId) Error!void {
         if (c.nodeTag(el) == .rest_element) {
             // `[...{ 0: a, b }]` destructures the REST array, so the nested
             // pattern's source is `E[]`, not `E`.
-            try checkPatternProps(c, c.tree.nodeData(el).lhs, try c.ts.makeArray(elem));
+            try checkPatternProps(c, c.tree.nodeData(el).lhs, try c.ts.makeArray(elem), false);
             continue;
         }
         // Only a TUPLE source gives an element position its own exact type. An
@@ -1093,10 +1180,10 @@ fn checkArrayPatternProps(c: *Checker, pat: Node, whole: TypeId) Error!void {
             // `undefinedType`, which a NESTED pattern then destructures — so
             // `var [[a0]] = []` is the TS2493 *and* a TS2488 for `undefined`
             // at the inner pattern (`destructuringArrayBindingPatternAndAssignment2`).
-            try checkPatternProps(c, el, types.undefined_type);
+            try checkPatternProps(c, el, types.undefined_type, false);
             continue;
         }
-        try checkPatternProps(c, el, c.ts.tupleElem(r, i).ty);
+        try checkPatternProps(c, el, c.ts.tupleElem(r, i).ty, false);
     }
 }
 
@@ -1137,7 +1224,13 @@ pub fn checkDeclPattern(c: *Checker, decl: Node, fallback: TypeId) Error!void {
             break :blk try c.checkExprCached(e.init, try patternContextualType(c, pat));
         },
     };
-    try checkPatternProps(c, pat, src);
+    // tsc's `needCheckInitializer` is about the declaration CARRYING one, not
+    // about `src` having come from it: `const []: void = v` annotates and still
+    // takes the initializer branch. `.declarator_full` with an annotation is
+    // exactly that case, and it leaves `init_node` unset.
+    const has_init = init_node != null_node or (c.nodeTag(decl) == .declarator_full and
+        c.tree.extraData(ast.DeclaratorFull, d.rhs).init != 0);
+    try checkPatternProps(c, pat, src, has_init);
     // The excess half only applies when the PATTERN is the literal's
     // contextual type, i.e. when the declaration carries no annotation.
     if (init_node != null_node and src != types.no_type) try checkPatternExcessProps(c, pat, .binding, init_node);
