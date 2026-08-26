@@ -5629,6 +5629,51 @@ pub fn computeIntersectionIsNever(c: *Checker, t: TypeId) Error!bool {
         }
         if (nullish and other_domain) return true;
     }
+    // tsc's disjoint-domain rule (`getIntersectionType`: *"a string-like type
+    // and a type known to be non-string-like, a number-like type and a type
+    // known to be non-number-like, …"*), one CONSTRAINT step further than the
+    // store's syntactic `disjointDomainIntersectionIsEmpty`.
+    //
+    // A member that is still INSTANTIABLE has no domain of its own, but its
+    // base constraint can have nothing BUT domains the concrete members
+    // exclude. `T & object` under `<T extends string | number>` is the shape:
+    // `object` is `NonPrimitive`, every constituent of `T`'s constraint is
+    // string-like or number-like, and no value inhabits both. tsc gets there
+    // by cross-producting the constraint — `(string | number) & object` is
+    // `string & object | number & object` is `never` — which the store does
+    // only over what it can SEE at intern time, and a bare `T` shows it
+    // nothing (`intersectionWithUnionConstraint` f4).
+    //
+    // One domain only: two different CONCRETE domains never reach here (the
+    // store already reduced that pair), so `fixed` carrying more than one bit
+    // means a member resolved into something the store could not see, and the
+    // conservative answer is to say nothing.
+    {
+        var fixed: u32 = 0;
+        for (try c.memberList(t)) |m| fixed |= types.Store.disjointDomain(&c.ts, try c.resolveStructural(m));
+        if (@popCount(fixed) == 1) {
+            for (try c.memberList(t)) |m| {
+                switch (c.ts.kind(m)) {
+                    .type_param, .index_access, .conditional, .keyof_op => {},
+                    else => continue,
+                }
+                const bc = try c.transitiveBaseConstraint(m);
+                if (bc == m) continue;
+                const rbc = try c.resolveStructural(bc);
+                const parts: []const TypeId = if (c.ts.kind(rbc) == .union_type) try c.memberList(rbc) else &.{rbc};
+                if (parts.len == 0) continue;
+                var all_disjoint = true;
+                for (parts) |p| {
+                    const d = types.Store.disjointDomain(&c.ts, try c.resolveStructural(p));
+                    if (d == 0 or d == fixed) {
+                        all_disjoint = false;
+                        break;
+                    }
+                }
+                if (all_disjoint) return true;
+            }
+        }
+    }
     var mem: std.ArrayList(TypeId) = .empty;
     defer mem.deinit(c.scratch());
     var n_obj: usize = 0;
