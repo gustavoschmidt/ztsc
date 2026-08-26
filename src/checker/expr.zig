@@ -7336,7 +7336,18 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
             if (key) |name| {
                 if (try setterWriteType(c, obj_t, name, 0)) |wt| return wt;
             } else if (key_ty != types.no_type and c.ts.kind(key_ty) == .union_type) {
-                if (try unionKeyWriteType(c, obj_t, key_ty)) |wt| return wt;
+                if (try unionKeyWriteType(c, obj_t, key_ty, d.rhs)) |wt| {
+                    // A READONLY target is the error, ahead of whatever the
+                    // value would have been checked against — tsc reports the
+                    // access before it types the assignment. The union arm now
+                    // answers for every union key, not just a divergent-setter
+                    // one, so it has to run the same gate the fall-through
+                    // below does or a `readonly` write would silently become a
+                    // TS2322 about the intersected write type.
+                    const ro = try c.resolveStructural(obj_t);
+                    if (try readonlyIndexWriteAt(c, ro, node, d.rhs)) return types.error_type;
+                    return wt;
+                }
             }
             const r = try c.resolveStructural(obj_t);
             if (try readonlyIndexWriteAt(c, r, node, d.rhs)) return types.error_type;
@@ -7381,23 +7392,28 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
 /// `boolean` even though 42 is fine against the READ type of both
 /// (`divergentAccessorsTypes8`).
 ///
-/// Answers null unless SOME key declares a divergent setter, so an ordinary
-/// indexed write keeps the read-type path — and pays only the first pass,
-/// which is the same "look before you gather" split `setterWriteType`'s own
-/// union arm makes for the same reason.
-fn unionKeyWriteType(c: *Checker, obj_t: TypeId, key_ty: TypeId) Error!?TypeId {
+/// A DIVERGENT SETTER is not the only thing that makes the intersection
+/// visible: it is what the write type IS, whatever the properties declare, so
+/// two ordinary fields of different types make the write impossible. On
+/// `const x1 = { a: 'foo', b: 42 }` with `k: 'a' | 'b'`, `x1[k] = v` writes at
+/// `string & number` — `never` — and tsc rejects even an `any` there
+/// (`intersectionReductionStrict`'s repro from #31663). An OPTIONAL property
+/// contributes `T | undefined`, the same widening the `.member_expr` write arm
+/// applies, which is why `{ a?: string, b?: number }` accepts `undefined` and
+/// nothing else.
+///
+/// Answers null when some key names no property at all: the ACCESS is the
+/// error there (TS7053/TS2339), and the read-type path is what reports it.
+/// A key that names a READONLY property is TS2540 instead — the same verdict
+/// `o.a = v` gets, since `k` may well turn out to be `'a'` — reported on the
+/// index expression and answered as `error_type` to suppress the cascade.
+fn unionKeyWriteType(c: *Checker, obj_t: TypeId, key_ty: TypeId, idx_node: Node) Error!?TypeId {
     // `members` dangles as soon as the recursion interns anything.
     const ks = try c.scratch().dupe(TypeId, c.ts.members(key_ty));
     defer c.scratch().free(ks);
-    var any_divergent = false;
     for (ks) |k| {
         if (c.ts.kind(k) != .string_literal) return null;
-        if (try setterWriteType(c, obj_t, c.ts.literalAtom(k), 0)) |_| {
-            any_divergent = true;
-            break;
-        }
     }
-    if (!any_divergent) return null;
     var parts: std.ArrayList(TypeId) = .empty;
     defer parts.deinit(c.scratch());
     try parts.ensureTotalCapacityPrecise(c.scratch(), ks.len);
@@ -7410,7 +7426,14 @@ fn unionKeyWriteType(c: *Checker, obj_t: TypeId, key_ty: TypeId) Error!?TypeId {
         // A key the receiver does not have at all: the ACCESS is the error,
         // so leave the write type to the ordinary read-type path.
         const p = (try c.propOfType(obj_t, name)) orelse return null;
-        parts.appendAssumeCapacity(p.ty);
+        if (p.readonly()) {
+            try c.diagFmt(2540, c.nodeSpan(idx_node), "Cannot assign to '{s}' because it is a read-only property.", .{c.atomText(name)});
+            return types.error_type;
+        }
+        parts.appendAssumeCapacity(if (p.optional())
+            try c.makeUnion2(p.ty, types.undefined_type)
+        else
+            p.ty);
     }
     return try c.ts.makeIntersection(c.scratch(), parts.items);
 }
