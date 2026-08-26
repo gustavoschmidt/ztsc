@@ -29,6 +29,7 @@ const TpMap = @import("enums.zig").TpMap;
 const calls = @import("calls.zig");
 const isUnitLikeKind = @import("assign.zig").isUnitLikeKind;
 const skipParens = @import("expr.zig").skipParens;
+const template_zig = @import("template.zig");
 const tuple_relate = @import("tuple_relate.zig");
 const typenode = @import("typenode.zig");
 const variance = @import("variance.zig");
@@ -3366,6 +3367,42 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
     if (s.kind(param) == .index_access and s.kind(arg) == .index_access) {
         try c.unify(s.indexAccessObj(param), s.indexAccessObj(arg), tp_syms, candidates, depth + 1);
         try c.unify(s.indexAccessIndex(param), s.indexAccessIndex(arg), tp_syms, candidates, depth + 1);
+        return;
+    }
+    // tsc's `inferToTemplateLiteralType`, on the one pair
+    // `inferTypesFromTemplateLiteralType` answers without a text scan:
+    //
+    // ```ts
+    // source.flags & TypeFlags.TemplateLiteral ?
+    //     arraysEqual(source.texts, target.texts) ? map(source.types, getStringLikeTypeForType) :
+    //     inferFromLiteralPartsToTemplateLiteral(source.texts, source.types, target) : undefined
+    // ```
+    //
+    // Two patterns whose fixed text is identical have their placeholders paired
+    // one-to-one and each pair inferred straight through — no template wrapper
+    // around the match — so `` `${T2}` `` against the pattern `` `${T0}` ``
+    // binds `T0 := T2`, not `` T0 := `${T2}` ``. Without it a template-literal
+    // pattern binds NOTHING, and the silence is not merely a missed inference:
+    // it hands the decision to the RETURN position, whose candidates tsc runs
+    // at `InferencePriority.ReturnType` and discards wherever a parameter
+    // already spoke. `TypeMap[T0]` against ``TypeMap[`${T2}`]`` then bound
+    // `` T0 := `${T2}` `` from the return, made the instantiated return
+    // IDENTICAL to the target's, and accepted a pair tsc rejects
+    // (`templateLiteralTypes5`, where `T2` is not assignable to `` `${T2}` ``).
+    //
+    // `map(source.types, getStringLikeTypeForType)`: a SOURCE placeholder that
+    // is not already string-like is wrapped in its own `` `${t}` `` before it
+    // becomes the match, so `` `${number}` `` supplies `` `${number}` `` and
+    // not `number`. Those holes are left to the rest of the inference rather
+    // than paired wrongly.
+    if (s.kind(param) == .template_literal_type and s.kind(arg) == .template_literal_type and
+        template_zig.sameTemplateTexts(c, arg, param))
+    {
+        for (0..s.templateHoleCount(param)) |h| {
+            const hs = s.templateHole(arg, @intCast(h));
+            if (!template_zig.templateHolePairsDirectly(c, hs)) continue;
+            try c.unify(s.templateHole(param, @intCast(h)), hs, tp_syms, candidates, depth + 1);
+        }
         return;
     }
     // A PATTERN indexed access over an INTERSECTION, or over a deferred
