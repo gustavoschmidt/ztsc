@@ -39,6 +39,7 @@ const resolveStructural = @import("instantiate.zig").resolveStructural;
 const restUnionOptionalAt = @import("typenode.zig").restUnionOptionalAt;
 const sliceTuple = @import("typenode.zig").sliceTuple;
 const generics_zig = @import("generics.zig");
+const simplifyMappedIndexAccessRead = @import("mapped.zig").simplifyMappedIndexAccessRead;
 const infer_zig = @import("infer.zig");
 const tuple_zig = @import("tuple_relate.zig");
 const variance_zig = @import("variance.zig");
@@ -3116,7 +3117,12 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         // access whose object is a generic MAP is the map's template with
         // the key substituted, no constraint needed. `Readonly<Partial<T>>`'s
         // `Partial<T>[P]` is `T[P]`, which is what makes it a `Partial<T>`.
-        if (try c.simplifyMappedIndexAccess(s)) |sim| {
+        //
+        // The READ reading of the simplification: this is a VALUE of type
+        // `M[K]` being handed to a `T`, so the map's `+?` is part of what it
+        // may hold (`simplifyMappedIndexAccessRead`). `y: Partial<T>` makes
+        // `y[k]` a `T[k] | undefined`, which is not a `T[k]`.
+        if (try simplifyMappedIndexAccessRead(c, s)) |sim| {
             if (try c.isAssignable(sim, t)) return true;
         }
         // An access whose OBJECT is a conditional distributes over the two
@@ -3214,6 +3220,33 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         for (c.ts.members(s)) |m| {
             if (m == t) return true;
             if (unionHasMember(tms, m)) return true;
+        }
+        // tsc's `getNormalizedUnionOrIntersectionType`, whose own comment names
+        // this exact shape:
+        //
+        // ```ts
+        // if (type.flags & TypeFlags.Intersection && shouldNormalizeIntersection(type as IntersectionType)) {
+        //     // Normalization handles cases like Partial<T>[K] & ({} | null) ==> Partial<T>[K] & {} | Partial<T>[K] & null
+        //     return getIntersectionType(sameMap((type as IntersectionType).types, t => getNormalizedType(t, writing)));
+        // }
+        // ```
+        //
+        // ztsc interns `Partial<T>[K] & ({} | null)` already distributed, so
+        // what arrives here is `{} & Partial<T>[K]`. The `undefined` that
+        // access CARRIES (`simplifyMappedIndexAccessRead`) is invisible until
+        // the access is simplified, and once it is, re-forming the
+        // intersection lets the `{}` cancel it: `{} & (T[K] | undefined)`
+        // distributes to `({} & T[K]) | ({} & undefined)`, whose second half
+        // is an empty intersection. That is the whole of why
+        // `NonNullable<Partial<T>[K]>` is a `T[K]`
+        // (`indexedAccessAndNullableNarrowing` f3).
+        //
+        // Gated exactly as `shouldNormalizeIntersection` gates it — an
+        // instantiable constituent AND a nullable-or-empty-object one — so an
+        // ordinary branded intersection pays one scan of a short member list
+        // and nothing else. Purely additive.
+        if (try normalizedIntersection(c, s)) |ns| {
+            if (try c.isAssignable(ns, t)) return true;
         }
     }
     if (tk == .union_type) {
@@ -3390,8 +3423,14 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
             try c.isAssignable(c.ts.indexAccessObj(s), c.ts.indexAccessObj(t)) and
             try c.isAssignable(c.ts.indexAccessIndex(s), c.ts.indexAccessIndex(t))) return true;
         // The mirror of the source rule above: a TARGET access over a
-        // generic map is the map's substituted template.
-        if (try c.simplifyMappedIndexAccess(t)) |sim| return c.isAssignable(s, sim);
+        // generic map is the map's substituted template, and it is the READ
+        // reading on this side too — tsc's `getNormalizedType` runs
+        // `getSimplifiedType` on both operands of a relation, and the
+        // simplification of `Partial<T>[P]` carries the `?` either way.
+        // `Readonly<Partial<T>>`'s template IS a `Partial<T>[P]`, so a
+        // `Partial<T>` source only fits it because both sides admit
+        // `undefined` (`mappedTypes5` `d1`).
+        if (try simplifyMappedIndexAccessRead(c, t)) |sim| return c.isAssignable(s, sim);
         if (try c.indexAccessTargetConstraint(t)) |bc| return c.isAssignable(s, bc);
         // An INTERSECTION source still gets tsc's "some constituent is
         // immediately related to the target" test
@@ -4252,6 +4291,66 @@ fn mappedCombinedOptionality(c: *Checker, m: TypeId) Error!i32 {
     return 0;
 }
 
+/// tsc's `shouldNormalizeIntersection` + the re-forming step that follows it:
+/// an intersection that mixes an INSTANTIABLE constituent with a nullable or
+/// empty-anonymous-object one, re-interned out of its constituents' SIMPLIFIED
+/// forms. Null when the gate does not fire or nothing actually simplified —
+/// see the caller for what it is for.
+///
+/// Only `.index_access` constituents are simplified, because
+/// `simplifyMappedIndexAccessRead` is the only simplification ztsc has that
+/// can introduce the `undefined` this exists to cancel; every other
+/// constituent goes through unchanged, which is what keeps the re-intern equal
+/// to `s` (and so `null`) in the common case.
+fn normalizedIntersection(c: *Checker, s: TypeId) Error!?TypeId {
+    var instantiable = false;
+    var nullable_or_empty = false;
+    for (c.ts.members(s)) |m| {
+        switch (c.ts.kind(m)) {
+            .index_access => instantiable = true,
+            .null, .undefined => nullable_or_empty = true,
+            .object => nullable_or_empty = nullable_or_empty or isEmptyObjectType(c, m),
+            else => {},
+        }
+    }
+    if (!instantiable or !nullable_or_empty) return null;
+    var parts: std.ArrayList(TypeId) = .empty;
+    defer parts.deinit(c.scratch());
+    var changed = false;
+    for (try c.memberList(s)) |m| {
+        const n = if (c.ts.kind(m) == .index_access)
+            (try simplifyMappedIndexAccessRead(c, m)) orelse m
+        else
+            m;
+        if (n != m) changed = true;
+        try parts.append(c.scratch(), n);
+    }
+    if (!changed) return null;
+    const ns = try c.ts.makeIntersection(c.scratch(), parts.items);
+    return if (ns == s) null else ns;
+}
+
+/// tsc's `getTemplateTypeFromMappedType`, the `addOptionality` half: a map's
+/// template carries the map's OWN `+?` as a `| undefined`.
+///
+/// ztsc keeps `mappedValue` the template AS WRITTEN and judges `?` separately
+/// (`mappedCombinedOptionality`), which is enough while both sides of a
+/// template comparison are written the same way. They are not once one side's
+/// template is itself an access into a `+?` map: `Readonly<Partial<T>>`'s
+/// template is `Partial<T>[P]`, whose READ value is `T[P] | undefined`
+/// (`mapped.simplifyMappedIndexAccessRead`), and `Partial<T>`'s written
+/// template is a bare `T[P]`. Spelling each side's own `+?` back onto its
+/// template is what lines the two up — it is what tsc compares, and it is the
+/// only reason the two are interchangeable (`mappedTypes5` a4/c4).
+///
+/// The map's OWN flag, not the combined one: the modifiers CHAIN is already
+/// compared by `mappedCombinedOptionality` above, and an inherited `?` is
+/// spelled out by the template's own simplification rather than here.
+fn mappedTemplateOptionality(c: *Checker, m: TypeId, tmpl: TypeId) Error!TypeId {
+    if (c.ts.mappedFlags(m) & types.mapped_flag_optional_add == 0) return tmpl;
+    return c.makeUnion2(tmpl, types.undefined_type);
+}
+
 /// The keys a mapped TARGET actually produces, which is what a source has to
 /// supply — tsc's
 ///
@@ -4391,12 +4490,13 @@ pub fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
             c.ts.mappedFlags(s) & types.mapped_flag_optional_remove != 0,
         );
         if (!try c.isAssignable(try c.mappedKeySet(t), s_keys)) return null;
-        const sv = try c.substMappedKey(
+        const sv = try mappedTemplateOptionality(c, s, try c.substMappedKey(
             c.ts.mappedValue(s),
             c.ts.mappedParamId(c.ts.mappedKeyParam(s)),
             c.ts.mappedKeyParam(t),
-        );
-        return if (try c.isAssignable(sv, c.ts.mappedValue(t))) true else null;
+        ));
+        const tv = try mappedTemplateOptionality(c, t, c.ts.mappedValue(t));
+        return if (try c.isAssignable(sv, tv)) true else null;
     }
     if (tk == .mapped) {
         // tsc `structuredTypeRelatedTo`, verbatim: a homomorphic map whose

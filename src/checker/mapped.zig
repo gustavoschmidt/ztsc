@@ -1343,6 +1343,42 @@ pub fn simplifyMappedIndexAccess(c: *Checker, acc: TypeId) Error!?TypeId {
     return if (val == acc) null else val;
 }
 
+/// The same simplification a READER of `M[K]` sees, which is the written
+/// template plus the map's own `+?` spelled as `| undefined`.
+///
+/// tsc has only one simplification, but it bakes the optionality into the
+/// template itself:
+///
+/// ```ts
+/// function getTemplateTypeFromMappedType(type: MappedType) {
+///     return type.templateType || (type.templateType = type.declaration.type ?
+///         instantiateType(addOptionality(getTypeFromTypeNode(type.declaration.type), /*isProperty*/ true,
+///             !!(getMappedTypeModifiers(type) & MappedTypeModifiers.IncludeOptional)), type.mapper) :
+///         errorType);
+/// }
+/// ```
+///
+/// ztsc cannot do that, for the reason `simplifyMappedIndexAccess` states:
+/// `mappedValue` is compared template-to-template by `mappedTypeRelatedTo`,
+/// where both sides judge `?` separately (`mappedCombinedOptionality`), so an
+/// `undefined` folded into one side's template is an `undefined` the other
+/// side never has. So the two readings are separate functions, and only the
+/// places that ask "what does this access EVALUATE to" call this one.
+///
+/// `Partial<T>[K]` is the shape it exists for: reading one yields `T[K] |
+/// undefined`, so `x[k] = y[k]` with `y: Partial<T>` is an error
+/// (`mappedTypeRelationships` `f10`…`f13`) even though `Partial<T>` and `T`
+/// share a template.
+///
+/// The map's OWN `+?` only, exactly as `getMappedTypeModifiers` reads it — a
+/// `Readonly<Partial<T>>` adds nothing here and picks the `undefined` up from
+/// simplifying its template's inner `Partial<T>[P]` instead.
+pub fn simplifyMappedIndexAccessRead(c: *Checker, acc: TypeId) Error!?TypeId {
+    const sim = (try simplifyMappedIndexAccess(c, acc)) orelse return null;
+    if (c.ts.mappedFlags(c.ts.indexAccessObj(acc)) & types.mapped_flag_optional_add == 0) return sim;
+    return try c.makeUnion2(sim, types.undefined_type);
+}
+
 /// Shallow analogue of tsc's `isGenericObjectType` for the object side of an
 /// indexed access: is `t` (or a union/intersection constituent of it) an
 /// *instantiable* type whose indexed property genuinely depends on later
