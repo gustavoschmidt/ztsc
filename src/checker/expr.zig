@@ -4563,7 +4563,7 @@ fn memberChainInner(c: *Checker, node: Node, ctx: TypeId) Error!ChainLink {
 /// flags with `TypeFlags.Nullable`, which is `Undefined | Null` only, so
 /// `v.toString()` on a `void` receiver reports the missing property rather
 /// than "possibly 'undefined'".
-fn checkNonNullType(c: *Checker, t: TypeId, obj_node: Node) Error!TypeId {
+pub fn checkNonNullType(c: *Checker, t: TypeId, obj_node: Node) Error!TypeId {
     if (try reportUnknownOperand(c, t, obj_node)) return types.error_type;
     return checkNullishOperand(c, t, obj_node);
 }

@@ -664,7 +664,14 @@ fn checkForInOf(c: *Checker, node: Node) Error!void {
     const rt = try c.checkExprCached(e.right, types.no_type);
     var elem_t: TypeId = types.any_type;
     if (is_of) {
-        elem_t = try c.forOfElementType(rt, e.right, e.is_await != 0);
+        // tsc's `checkRightHandSideOfForOf` reads the subject with
+        // `checkNonNullExpression`, so a nullish subject is a TS18047-50 /
+        // TS2531-3 about the SUBJECT and the iteration protocol then runs on
+        // what is left. Iterating it directly instead reported the stripped
+        // question — `for (const x of maybeUndefined)` was a TS2488 "must
+        // have a [Symbol.iterator] method" about a union half of which is an
+        // array, which is the wrong complaint about the wrong thing.
+        elem_t = try c.forOfElementType(try expr_zig.checkNonNullType(c, rt, e.right), e.right, e.is_await != 0);
     } else {
         elem_t = types.string_type; // for..in keys
         // `for (const k in maybeUndefined)` is legal JS — enumerating
