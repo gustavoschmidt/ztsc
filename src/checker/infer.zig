@@ -1813,8 +1813,21 @@ pub fn inferTypeArgs(
         //
         // The node's own cached type is untouched: only the evidence this
         // call infers from is regularized, which is where tsc applies it too.
-        if (c.ts.isFreshLiteral(at) and try c.literalOfContextualType(at, pt)) {
-            at = try c.ts.regularLiteral(at);
+        //
+        // The contextual type is the parameter as `instantiateContextualType`
+        // hands it over — the Phase-0 return-context seed and the arguments
+        // inferred to the left substituted in, exactly as `arg_ctx` above gets
+        // them. A parameter that IS the bare type variable names no literal
+        // domain by itself, so the whole #5487 family widened: `wrap<T>(value:
+        // T): Wrap<T>` returned from a `Wrap<'foo'>` position seeds `T =
+        // 'foo'`, and it is that seeded reading — not the bare `T` — that
+        // admits the fresh `'foo'` and keeps it (`truePromise`'s
+        // `Promise.resolve(true)` against `Promise<true>` is the same shape one
+        // union constituent in). With no contextual return there is nothing to
+        // substitute and the test is the parameter as before.
+        if (c.ts.isFreshLiteral(at)) {
+            const lit_ctx = try c.instantiateKnownParams(pt, tp_syms, candidates, ret_seed);
+            if (try c.literalOfContextualType(at, lit_ctx)) at = try c.ts.regularLiteral(at);
         }
         // An EMPTY array literal is the accumulator seed of a fold
         // (`arr.reduce((acc: T[], el) => …, [])`). It carries no element
