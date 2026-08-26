@@ -622,7 +622,7 @@ fn genericRemappedKeys(c: *Checker, m: TypeId, as_clause: TypeId, key_id: u32, c
 /// conditional or another `keyof` — keeps the deferral. See
 /// `genericRemappedKeys` for why the bar is "expandable", not tsc's
 /// "not a filter".
-fn isKeyRename(c: *const Checker, as_clause: TypeId) bool {
+pub fn isKeyRename(c: *const Checker, as_clause: TypeId) bool {
     return switch (c.ts.kind(as_clause)) {
         .template_literal_type, .string_mapping => true,
         else => false,
