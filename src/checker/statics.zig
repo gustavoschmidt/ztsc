@@ -111,17 +111,10 @@ fn staticPropFlags(c: *Checker, msym: SymbolId) u32 {
 /// carrying an initializer and no annotation can be contextually typed at all.
 pub fn seedStaticFieldContext(c: *Checker, node: Node, cls: SymbolId, ctx: TypeId) Error!void {
     if (ctx == types.no_type or ctx == types.any_type or ctx == types.error_type) return;
-    const ss = c.bind.staticsScopeOf(c.localOf(cls)) orelse return;
-    const kscope = c.symScope(cls);
     const data = c.tree.extraData(ast.ClassData, c.tree.nodeData(node).lhs);
     for (c.tree.extraRange(data.members_start, data.members_end)) |member| {
-        if (member == null_node or c.nodeTag(member) != .class_field) continue;
+        const sc = try staticFieldContext(c, cls, member, ctx) orelse continue;
         const f = c.tree.extraData(ast.Field, c.tree.nodeData(member).lhs);
-        if (f.flags & ast.Flags.static == 0) continue;
-        if (f.type_ann != 0 or f.init == 0) continue;
-        const m = staticMemberOfDecl(c, ss, member) orelse continue;
-        const name = try c.nominalizeComputedKey(m.name, kscope);
-        const p = try c.propOfTypeEx(ctx, name, false) orelse continue;
         // Same guard the on-demand path uses: a function body inside the
         // initializer must not be walked while the class's own type is still
         // being built (see `DeferredBody`).
@@ -130,8 +123,37 @@ pub fn seedStaticFieldContext(c: *Checker, node: Node, cls: SymbolId, ctx: TypeI
         const saved_this = c.this_type;
         defer c.this_type = saved_this;
         c.this_type = try c.ts.makeClassValue(cls);
-        c.setTypeOfSymbol(m.sym, try c.widenLiteral(try c.checkExprCached(f.init, p.ty)));
+        c.setTypeOfSymbol(sc.sym, try c.widenLiteral(try c.checkExprCached(f.init, sc.ty)));
     }
+}
+
+/// The contextual type one class-expression member gets from `ctx`, and the
+/// symbol it belongs to — tsc's `getContextualTypeForStaticPropertyDeclaration`
+/// for a single declaration.
+///
+/// Both halves of the contextual-static story ask this: `seedStaticFieldContext`
+/// to write the answer onto the symbol, and `stmts.checkClass`'s member walk to
+/// check the initializer under the SAME contextual type. That sharing is the
+/// point. The walk re-checks every initializer, and `checkExprCached` is keyed
+/// by `(node, ctx)` — so checking it a second time under `no_type` was not a
+/// cache hit but a whole second, context-FREE reading, which is where the four
+/// false TS7006s in `contextuallyTypedClassExpressionMethodDeclaration01` came
+/// from: `static method1 = (arg) => …` had already been typed by `Foo`'s
+/// `method1`, and then had its `arg` re-read as an implicit `any`.
+pub const StaticFieldContext = struct { sym: SymbolId, ty: TypeId };
+
+pub fn staticFieldContext(c: *Checker, cls: SymbolId, member: Node, ctx: TypeId) Error!?StaticFieldContext {
+    if (ctx == types.no_type or ctx == types.any_type or ctx == types.error_type) return null;
+    if (cls == binder.no_symbol) return null;
+    if (member == null_node or c.nodeTag(member) != .class_field) return null;
+    const f = c.tree.extraData(ast.Field, c.tree.nodeData(member).lhs);
+    if (f.flags & ast.Flags.static == 0) return null;
+    if (f.type_ann != 0 or f.init == 0) return null;
+    const ss = c.bind.staticsScopeOf(c.localOf(cls)) orelse return null;
+    const m = staticMemberOfDecl(c, ss, member) orelse return null;
+    const name = try c.nominalizeComputedKey(m.name, c.symScope(cls));
+    const p = try c.propOfTypeEx(ctx, name, false) orelse return null;
+    return .{ .sym = m.sym, .ty = p.ty };
 }
 
 /// The static-scope entry a class member DECLARATION declares, or null when

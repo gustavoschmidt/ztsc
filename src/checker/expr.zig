@@ -705,14 +705,14 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // there was one, every class expression was `any`.
             const sym = try c.classSymbolOf(node, c.cur_scope);
             if (sym == binder.no_symbol) {
-                try c.checkClass(node);
+                try c.checkClass(node, ctx);
                 return types.any_type;
             }
             // Static fields are contextually typed by this expression's own
             // contextual type, and the seeding has to happen before anything
             // demands them — see `statics.seedStaticFieldContext`.
             try c.seedStaticFieldContext(node, sym, ctx);
-            try c.checkClass(node);
+            try c.checkClass(node, ctx);
             return c.typeOfSymbol(sym);
         },
         .yield_expr => {
@@ -4518,7 +4518,7 @@ fn memberChainInner(c: *Checker, node: Node, ctx: TypeId) Error!ChainLink {
 /// flags with `TypeFlags.Nullable`, which is `Undefined | Null` only, so
 /// `v.toString()` on a `void` receiver reports the missing property rather
 /// than "possibly 'undefined'".
-fn checkNonNullType(c: *Checker, t: TypeId, obj_node: Node) Error!TypeId {
+pub fn checkNonNullType(c: *Checker, t: TypeId, obj_node: Node) Error!TypeId {
     if (try reportUnknownOperand(c, t, obj_node)) return types.error_type;
     return checkNullishOperand(c, t, obj_node);
 }
@@ -5371,6 +5371,21 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
             }
         },
         .number => result = try c.numberIndexType(r),
+        // An `any` key — or an already-ERRORED one, `t[this._name]` where
+        // `_name` was itself a TS2339 — is applicable to EVERY index
+        // signature: tsc's `isApplicableIndexType` is an assignability test,
+        // and `errorType` carries `TypeFlags.Any`, so `findApplicableIndexInfo`
+        // answers the number signature first and the string one as its last
+        // resort. That is exactly `numberIndexType`'s own fallback order.
+        //
+        // Answering `any` outright instead threw the WRITE check away with
+        // the read: `storage.sources[this._name] = value` on a
+        // `{ [name: string]: string }` never compared `value` to `string`
+        // (crashRegressionTest). tsc's TS7053 for a receiver with no index
+        // signature at all is deliberately NOT added here — that is a
+        // separate, much wider family (`this[k]` inside any class), and the
+        // `any` fallback under-reports it as it always has.
+        .any, .err => result = try c.numberIndexType(r),
         .string => {
             if (rk == .object and props_zig.stringIndexForStringKey(c, r) != 0) {
                 result = props_zig.stringIndexForStringKey(c, r);
@@ -7045,6 +7060,13 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
                         } else .{ .code = 2630, .text = "a function" };
                         try c.diagFmt(what.code, c.tokSpan(tok), "Cannot assign to '{s}' because it is {s}.", .{ c.tokenText(tok), what.text });
                         return types.error_type;
+                    }
+                    // A parameter written `x: string | undefined = "s"` is
+                    // `string` inside the body and `string | undefined` as a
+                    // write target — see `signatures.paramWriteAnnType`.
+                    if (sf.param) {
+                        const ann = try sig_zig.paramWriteAnnType(c, sym);
+                        if (ann != types.no_type) return ann;
                     }
                     return c.typeOfSymbol(sym);
                 },

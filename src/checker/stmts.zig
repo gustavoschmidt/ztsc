@@ -193,7 +193,7 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
         .labeled_stmt => try c.checkStatement(d.lhs),
         .function_decl => try checkFunctionDecl(c, node),
         .decorator => try c.pending_class_decos.append(c.cm(), node),
-        .class_decl => try c.checkClass(node),
+        .class_decl => try c.checkClass(node, types.no_type),
         .interface_decl => try checkInterfaceDecl(c, node),
         .type_alias => try checkTypeAliasDecl(c, node),
         .enum_decl => try c.checkEnum(node),
@@ -644,6 +644,35 @@ fn headDeclarationsEmpty(c: *const Checker, head: Node) bool {
     };
 }
 
+/// tsc's `getIndexTypeOrString`: the subject's own STRING-valued key set, or
+/// `string` when it has none — what a `for…in` binding will actually hold.
+///
+/// Consulted only after plain `string` has been refused by the target, which
+/// is where the approximation stops being good enough: `let k: "a" | "b"`
+/// really can hold every key of a `{ a; b }`, and `string` cannot say so.
+fn forInKeyType(c: *Checker, rt: TypeId) Error!TypeId {
+    const ks = try c.keyofType(rt);
+    // tsc's `getExtractStringType` half, over a key set that actually IS a
+    // set: keep the string-valued constituents and fall back to `string` only
+    // when `Extract` would empty the union — the `never` case tsc names.
+    if (c.ts.kind(ks) == .union_type) {
+        var parts: std.ArrayList(TypeId) = .empty;
+        defer parts.deinit(c.scratch());
+        for (try c.memberList(ks)) |m| {
+            if (try c.typeIsStringLike(try c.resolveStructural(m))) try parts.append(c.scratch(), m);
+        }
+        if (parts.items.len != 0) return c.ts.makeUnion(c.scratch(), parts.items);
+        return types.string_type;
+    }
+    if (c.ts.kind(ks) == .never) return types.string_type;
+    // Anything else is handed back AS WRITTEN, and a still-generic key set is
+    // the reason. `for (k1 in obj)` under `<K extends string>(obj: { [P in K]:
+    // T }, …)` with `let k1: K` has key set `K`, which is assignable to `K`
+    // and to nothing else — narrowing it to `string` first invented three
+    // TS2405s in `keyofAndForIn`.
+    return ks;
+}
+
 fn checkForInOf(c: *Checker, node: Node) Error!void {
     const d = c.tree.nodeData(node);
     const e = c.tree.extraData(ast.ForInOf, d.lhs);
@@ -663,8 +692,18 @@ fn checkForInOf(c: *Checker, node: Node) Error!void {
 
     const rt = try c.checkExprCached(e.right, types.no_type);
     var elem_t: TypeId = types.any_type;
+    // The `for…in` subject with its nullish half stripped (see below); the
+    // head's TS2405 needs it too, hence the outer binding.
+    var subject_nn: TypeId = rt;
     if (is_of) {
-        elem_t = try c.forOfElementType(rt, e.right, e.is_await != 0);
+        // tsc's `checkRightHandSideOfForOf` reads the subject with
+        // `checkNonNullExpression`, so a nullish subject is a TS18047-50 /
+        // TS2531-3 about the SUBJECT and the iteration protocol then runs on
+        // what is left. Iterating it directly instead reported the stripped
+        // question — `for (const x of maybeUndefined)` was a TS2488 "must
+        // have a [Symbol.iterator] method" about a union half of which is an
+        // array, which is the wrong complaint about the wrong thing.
+        elem_t = try c.forOfElementType(try expr_zig.checkNonNullType(c, rt, e.right), e.right, e.is_await != 0);
     } else {
         elem_t = types.string_type; // for..in keys
         // `for (const k in maybeUndefined)` is legal JS — enumerating
@@ -674,6 +713,7 @@ fn checkForInOf(c: *Checker, node: Node) Error!void {
         // the STRIPPED type in the diagnostic. (The body's own view of the
         // subject is `forInSubjectNarrows`, the flow half of the same rule.)
         const rt_nn = if (isNullishUnion(c, rt)) try c.nonNullable(rt) else rt;
+        subject_nn = rt_nn;
         const rk = c.ts.kind(try c.resolveStructural(rt_nn));
         if (!isNonPrimitiveKind(rk) and rk != .any and rk != .err and rk != .unknown and rk != .type_param) {
             try c.diagFmt(2407, c.nodeSpan(e.right), "The right-hand side of a 'for...in' statement must be of type 'any', an object type or a type parameter, but here has type '{s}'.", .{try c.typeToString(rt_nn)});
@@ -695,6 +735,14 @@ fn checkForInOf(c: *Checker, node: Node) Error!void {
             }
             if (decl != null_node) {
                 const dd = c.tree.nodeData(decl);
+                // A `for…in` head may not DESTRUCTURE — tsc's
+                // `checkForInStatement` reports TS2491 on the declaration's
+                // NAME and carries on typing it. (`for…of` destructures
+                // happily; the expression-head spelling of the same refusal
+                // is in the pattern arm below.)
+                if (!is_of and implicit_any.isBindingPattern(c, dd.lhs)) {
+                    try c.diagFmt(2491, c.nodeSpan(dd.lhs), "The left-hand side of a 'for...in' statement cannot be a destructuring pattern.", .{});
+                }
                 switch (c.nodeTag(decl)) {
                     .declarator => {
                         if (c.nodeTag(dd.lhs) == .identifier) {
@@ -757,6 +805,10 @@ fn checkForInOf(c: *Checker, node: Node) Error!void {
                 try expr_zig.checkDestructuringPattern(c, e.left, elem_t);
             } else {
                 _ = try c.checkExprCached(e.left, types.no_type);
+                // tsc's `checkForInStatement` blames the whole varExpr here,
+                // and returns without the TS2405/TS2406 pair the `else` arm
+                // below runs — the destructuring refusal is the last word.
+                try c.diagFmt(2491, c.nodeSpan(e.left), "The left-hand side of a 'for...in' statement cannot be a destructuring pattern.", .{});
             }
         },
         else => {
@@ -793,6 +845,14 @@ fn checkForInOf(c: *Checker, node: Node) Error!void {
                 // `getIndexTypeOrString(rightType)`, approximated by `string`,
                 // which is exactly what a `for…in` binding may hold.
                 _ = try expr_zig.checkReferenceExpression(c, e.left, .for_in);
+            } else if (!try c.isAssignable(try forInKeyType(c, subject_nn), left_t)) {
+                // …and when it does NOT fit, that is tsc's other branch:
+                // TS2405 on the varExpr. Reached only once `string` has
+                // already been refused, so the subject's own key set is
+                // consulted before the refusal stands — `let k: "a" | "b"`
+                // over a `{ a; b }` is a target tsc accepts even though
+                // `string` is not assignable to it.
+                try c.diagFmt(2405, c.nodeSpan(e.left), "The left-hand side of a 'for...in' statement must be of type 'string' or 'any'.", .{});
             }
         },
     }
@@ -1468,14 +1528,24 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
         // `.param` is the plain spelling (`x`, `x: T`) and carries its
         // annotation directly; `.param_full` is everything with a default,
         // a modifier or a `?`.
-        const name: Node, const type_ann: Node, const init: Node = switch (c.nodeTag(pn)) {
-            .param => .{ pd.lhs, pd.rhs, null_node },
+        const name: Node, const type_ann: Node, const init: Node, const pflags: u32 = switch (c.nodeTag(pn)) {
+            .param => .{ pd.lhs, pd.rhs, null_node, 0 },
             .param_full => blk: {
                 const e = c.tree.extraData(ast.ParamFull, pd.rhs);
-                break :blk .{ pd.lhs, e.type_ann, e.init };
+                break :blk .{ pd.lhs, e.type_ann, e.init, e.flags };
             },
             else => continue,
         };
+        // TS2463, tsc's `checkParameter`: `node.questionToken &&
+        // isBindingPattern(node.name) && func.body`. A destructured parameter
+        // may be declared optional in an OVERLOAD or an ambient signature —
+        // there is nothing to destructure there — but not in one that runs.
+        // The body is this function's precondition, so the rule is complete
+        // where it stands. Blamed on the whole PARAMETER, which for a pattern
+        // carrying no modifier starts at the pattern itself.
+        if (pflags & ast.Flags.optional != 0 and implicit_any.isBindingPattern(c, name)) {
+            try c.diagFmt(2463, c.nodeSpan(pn), "A binding pattern parameter cannot be optional in an implementation signature.", .{});
+        }
         // A DESTRUCTURED parameter's own elements each carry a declaration of
         // their own (tsc's `checkVariableLikeDeclaration` runs on every
         // `BindingElement`), so each default inside the pattern is checked and
@@ -2532,7 +2602,12 @@ fn heritageNotConstructor(c: *Checker, t: TypeId) Error!bool {
     };
 }
 
-pub fn checkClass(c: *Checker, node: Node) Error!void {
+/// `ctx` is the class EXPRESSION's own contextual type (`no_type` for a class
+/// declaration, which has none). It is threaded rather than looked up because
+/// ztsc pushes contextual types down; its one consumer is the static-field arm
+/// of the member walk below, which must check an initializer under the same
+/// context `statics.seedStaticFieldContext` typed the member's symbol with.
+pub fn checkClass(c: *Checker, node: Node, ctx: TypeId) Error!void {
     const d = c.tree.nodeData(node);
     const data = c.tree.extraData(ast.ClassData, d.lhs);
     const saved_scope = c.cur_scope;
@@ -2790,7 +2865,22 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
                     // shares (see `field_init_depth`).
                     c.field_init_depth += 1;
                     defer c.field_init_depth -= 1;
-                    const it = try c.checkExprCached(e.init, ann);
+                    // An un-annotated STATIC field of a class EXPRESSION is
+                    // contextually typed by the same property of the class's
+                    // own contextual type that `seedStaticFieldContext` typed
+                    // its symbol with. Re-reading it under `no_type` here is
+                    // not a cache hit but a second, context-free reading —
+                    // which is how `static method1 = (arg) => …` earned a
+                    // TS7006 after `Foo`'s `method1` had already supplied
+                    // `arg`'s type. No TS2322 follows from it: a contextual
+                    // type is not a declared one, and the class-to-interface
+                    // relation is what reports a real mismatch.
+                    const init_ctx: TypeId = if (ann != types.no_type) ann else blk: {
+                        const sc = try statics.staticFieldContext(c, class_sym, member, ctx) orelse
+                            break :blk types.no_type;
+                        break :blk sc.ty;
+                    };
+                    const it = try c.checkExprCached(e.init, init_ctx);
                     if (ann != types.no_type and ann != types.error_type) {
                         _ = try c.checkAssignable(it, ann, e.init, c.tokSpan(c.tree.nodeMainToken(member)));
                     }
