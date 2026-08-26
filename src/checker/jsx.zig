@@ -1097,10 +1097,20 @@ pub fn inferJsxTargs(c: *Checker, sig: TypeId, tps: []const u32, e: ast.JsxEleme
             const cd = c.tree.nodeData(ad.lhs);
             if (cd.lhs != null_node and (c.nodeTag(cd.lhs) == .arrow_fn or c.nodeTag(cd.lhs) == .function_expr)) {
                 // The naked-parameter object still needs the NAME (or the
-                // attribute reads as excess against the inferred `P`); `any`
-                // stands in for the type it would have got from a contextual
-                // pass that has not happened yet.
-                if (naked != null) try attrs_obj.append(c.scratch(), .{ .name = try c.memberAtom(name_tok), .ty = types.any_type });
+                // attribute reads as excess against the inferred `P`), but not
+                // a type: `unknown` stands in for what a contextual pass that
+                // has not happened yet would have produced.
+                //
+                // `unknown` and not `any`, because the inferred `P` lands in an
+                // INTERSECTION with the props the tag declares outright
+                // (`props: P & { children? }` over `Component<Props &
+                // BaseProps<Values>>`), and `makeIntersection` collapses a whole
+                // intersection containing `any` to `any` while it simply drops
+                // `unknown`. With `any` the attribute's own contextual lookup
+                // then found `any` instead of `(cur: Values) => Values` and
+                // every `nextValues={a => a}` went implicit-any
+                // (checkJsxGenericTagHasCorrectInferences).
+                if (naked != null) try attrs_obj.append(c.scratch(), .{ .name = try c.memberAtom(name_tok), .ty = types.unknown_type });
                 continue;
             }
         }
@@ -1158,7 +1168,7 @@ pub fn inferJsxTargs(c: *Checker, sig: TypeId, tps: []const u32, e: ast.JsxEleme
     // number}` WAS formed and then clamped to the constraint, which is exactly
     // the resolution loop below.
     if (naked) |idx| {
-        if (candidates[idx] == types.no_type) candidates[idx] = try jsxAttrsObject(c, attrs_obj.items);
+        if (candidates[idx] == types.no_type) candidates[idx] = try jsxAttrsObject(c, attrs_obj.items, .display);
     }
     // Resolve each param: inferred candidate (clamped to its constraint when
     // it violates it), else default, else constraint, else `unknown`. Mirrors
@@ -1564,7 +1574,14 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
             has_spread = true;
             const sd = c.tree.nodeData(attr);
             if (sd.lhs == null_node) continue;
-            const sty = try c.resolveStructural(try c.checkExprCached(sd.lhs, types.no_type));
+            // tsc's `getContextualTypeForJsxAttribute` gives a SPREAD the
+            // contextual type of the whole attributes object — the props
+            // target itself (`return getContextualType(attribute.parent)`),
+            // not a per-name lookup as a written attribute gets. Without it
+            // `<test1 {...{x: (n) => n.len}} />` types the spread's object
+            // literal context-free and `n` goes implicit-any
+            // (tsxAttributeResolution4).
+            const sty = try c.resolveStructural(try c.checkExprCached(sd.lhs, props));
             last_spread_ty = sty;
             if (c.ts.kind(sty) == .any or c.ts.kind(sty) == .err) spread_any = true;
             switch (try c.jsxSpreadInfo(sty, &provided)) {
@@ -1659,49 +1676,41 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
         try provided.append(c.scratch(), .{ .name = try c.jsxChildrenAttrName(), .ty = types.any_type });
     }
 
-    // Per-attribute value assignability + excess, for explicit attrs.
+    // ---------------------------------------------------------------- verdicts
+    // tsc's `checkTypeRelatedToAndOptionallyElaborate` is a THREE-stage
+    // pipeline, and the stages are ordered:
+    //
+    //     if (isTypeRelatedTo(source, target, relation)) return true;  // silent
+    //     if (!elaborateError(expr, ...)) return checkTypeRelatedTo(..., errorNode);
+    //
+    // The whole ATTRIBUTES OBJECT is related first, silently; only when that
+    // relation FAILS does `elaborateJsxComponents` → `elaborateElementwise`
+    // run and report per attribute; and only when the elaboration reported
+    // NOTHING does the whole-object diagnostic (excess property, missing
+    // required prop, weak type) land. So the per-attribute walk below runs
+    // twice: once to reach a verdict in silence, and — only past the
+    // whole-object gate — once more to report.
     var first_excess: Span = .{ .start = 0, .end = 0 };
     var have_excess = false;
-    // tsc's `checkTypeRelatedToAndOptionallyElaborate`: when the ELABORATION
-    // (`elaborateJsxComponents` → `elaborateElementwise`) reported at least one
-    // per-attribute error, the top-level `checkTypeRelatedTo` is never run at
-    // all — so the whole-attributes-object diagnostics (excess property,
-    // missing required prop, weak type) are suppressed by any attribute-level
-    // failure. `elaborateElementwise` `continue`s over an attribute the target
-    // does not know, so an EXCESS attribute never sets this; only a known prop
+    // Some attribute's value was rejected by the prop it lands on. tsc's
+    // `elaborateElementwise` `continue`s over an attribute the target does
+    // not know, so an EXCESS attribute never sets this; only a known prop
     // whose value mismatches does.
-    var attr_elaborated = false;
+    //
+    // Split by WHY, because the whole-object gate below can only re-decide one
+    // of the two: ztsc's relation is memoized on type pairs and so cannot see
+    // freshness (see assign_report.zig's header), which is why the fresh-literal
+    // rejections are taken here, per expression, and stand on their own.
+    var attr_failed = false;
+    var attr_fresh_failed = false;
     for (built.items) |b| {
         if (b.overwritten) continue; // shadowed by a later spread (TS2783)
-        if (try c.propOfType(rt, b.name)) |p| {
-            // tsc anchors a JSX attribute value mismatch at the attribute
-            // NAME node (not the value), matching the excess-property anchor
-            // above. Per-member elaboration for object/array-literal values
-            // still points at the offending member via `b.value` below.
-            const vspan = c.tokSpan(b.name_tok);
-            // An optional prop (`date?: Date`) admits `undefined`, so an
-            // explicit `date={maybeUndefined}` is not an error — mirrors the
-            // structural object relation and the optional indexed-access path
-            // (src/checker.zig:2864). Widen the target to `p.ty | undefined`
-            // ONLY when the value can actually be undefined: a value that
-            // never yields `undefined` (e.g. a fresh object literal) gets the
-            // identical verdict from bare `p.ty`, and keeping it off the
-            // object-to-union path avoids a distinct union-relation gap. A
-            // required prop keeps `p.ty`, so an explicit `undefined` on it
-            // still rejects.
-            const target = if (p.optional() and c.containsUndefinedish(try c.resolveStructural(b.ty)))
-                try c.makeUnion2(p.ty, types.undefined_type)
-            else
-                p.ty;
-            if (!try c.checkAssignable(b.ty, target, b.value, vspan)) attr_elaborated = true;
-        } else if (try c.unionNestedPropType(rt, b.name)) |nested| {
-            // A prop that lives in a UNION member of an intersection props
-            // type (`Base & (VariantA | VariantB)`) is not found by
-            // `propOfType`, so its value used to go unchecked — and, since
-            // the excess arm below only fires for an open target, silently.
-            // Check it against the union of the arms that declare it, the
-            // same type the attribute's contextual lookup above uses.
-            if (!try c.checkAssignable(b.ty, nested, b.value, c.tokSpan(b.name_tok))) attr_elaborated = true;
+        if (try jsxAttrTarget(c, rt, b)) |target| {
+            if (!try c.isAssignable(b.ty, target)) {
+                attr_failed = true;
+            } else if (b.value != null_node and try c.freshLiteralRejects(b.value, b.ty, target)) {
+                attr_fresh_failed = true;
+            }
         } else if (target_open and !containsAtom(ia_names.items, b.name)) {
             if (!have_excess) {
                 first_excess = c.tokSpan(b.name_tok);
@@ -1710,15 +1719,63 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
         }
     }
 
+    // Missing required props, and the weak-type check. Both are whole-object
+    // verdicts, and both are skipped when a spread's contents are opaque —
+    // any required prop might come from it, and a false positive there is
+    // worse than the under-report.
+    const whole_object_checkable = is_obj_target and !(has_spread and spread_opaque);
+    const weak_hit = whole_object_checkable and has_spread and target_open and
+        try jsxWeakTypeHit(c, rt, target_props.items, provided.items, ia_names.items, spread_non_object);
+    // A prop the tag's own `defaultProps` supplies is never missing (see
+    // `jsxMissingRequiredProp`); not evaluated at all when the weak-type
+    // verdict already stands, since that report wins.
+    const missing_hit = whole_object_checkable and !weak_hit and
+        try jsxMissingRequiredProp(c, e, target_props.items, provided.items, is_component);
+
+    // Nothing to say: neither the elaboration nor the whole-object report has
+    // a candidate, so tsc's silent first stage cannot change the outcome and
+    // is not paid for. This is the overwhelmingly common path, and it is why
+    // the split walk costs nothing on it.
+    if (!attr_failed and !attr_fresh_failed and !have_excess and !weak_hit and !missing_hit) return;
+
+    // tsc's silent first stage. The attributes object is built UNWIDENED (so
+    // `variant="a"` still satisfies `"a" | "b"`) and NOT fresh. A target that
+    // reads its props as a UNIT — a union of variants, an intersection under a
+    // mapped type — can accept the object whole where the per-property walk,
+    // which picks a target for each name independently, cannot; and a required
+    // prop "missing" from one union arm is not missing from the object.
+    //
+    // Skipped when the rejection is a FRESHNESS one (an excess attribute name,
+    // or an attribute value that is a fresh literal carrying a name its prop
+    // does not know). Those verdicts were reached from the expressions, which
+    // is the only place ztsc can see freshness at all — a non-fresh probe
+    // object cannot restate them, so it must not be allowed to overturn them.
+    if (!have_excess and !attr_fresh_failed and
+        try c.isAssignable(try c.jsxAttrsObject(provided.items, .relate), props)) return;
+
+    // ------------------------------------------------------------ elaboration
+    var attr_elaborated = false;
+    for (built.items) |b| {
+        if (b.overwritten) continue;
+        if (try jsxAttrTarget(c, rt, b)) |target| {
+            // tsc anchors a JSX attribute value mismatch at the attribute
+            // NAME node (not the value), matching the excess-property anchor
+            // above. Per-member elaboration for object/array-literal values
+            // still points at the offending member via `b.value`.
+            if (!try c.checkAssignable(b.ty, target, b.value, c.tokSpan(b.name_tok))) attr_elaborated = true;
+        }
+    }
+
     if (!is_obj_target) return; // lenient target: value checks only
 
-    // An attribute-level elaboration already reported: tsc stops here (see
-    // `attr_elaborated`). This is a real suppression, not a cosmetic one —
-    // tsc's error lands on the narrow attribute node, where a `@ts-expect-error`
-    // written above that attribute absorbs it, while the whole-object error
-    // would land on a line no directive covers.
+    // An attribute-level elaboration already reported: tsc stops here. This is
+    // a real suppression, not a cosmetic one — tsc's error lands on the narrow
+    // attribute node, where a `@ts-expect-error` written above that attribute
+    // absorbs it, while the whole-object error would land on a line no
+    // directive covers.
     if (attr_elaborated) return;
 
+    // ------------------------------------------------------- whole-object report
     // When `JSX.IntrinsicAttributes` exists, a component's effective props
     // target is the intersection `IntrinsicAttributes & Props`, for which
     // tsgo reports missing props as plain TS2322 — UNLESS the namespace
@@ -1733,77 +1790,25 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
         // Excess wins over missing and is never refined to a
         // missing-property code (tsc's message is the excess flavor).
         try c.diagFmt(2322, first_excess, "Type '{s}' is not assignable to type '{s}'.", .{
-            try c.typeToString(try c.jsxAttrsObject(provided.items)),
+            try c.typeToString(try c.jsxAttrsObject(provided.items, .display)),
             try c.jsxTargetString(props, has_intrinsic_attrs),
         });
         return;
     }
 
-    // Missing required props. When a spread's contents are opaque, any
-    // required prop might come from it — skip to avoid a false positive.
-    if (has_spread and spread_opaque) return;
-
-    // Weak-type check (TS2559): the target has only optional props and the
-    // (spread-provided) attributes share none of them. Fires only for
-    // fully-enumerated spread sources — explicit-attr mismatches are excess
-    // (TS2322, above), and opaque spreads were already skipped.
-    if (has_spread and target_open) {
-        var target_weak = target_props.items.len > 0 or ia_names.items.len > 0;
-        for (target_props.items) |tp| {
-            if (!tp.optional()) {
-                target_weak = false;
-                break;
-            }
-        }
-        if (target_weak and (spread_non_object or provided.items.len > 0)) {
-            var common = false;
-            for (provided.items) |pp| {
-                if (isHyphenatedJsxName(c, pp.name) or
-                    (try c.propOfType(rt, pp.name)) != null or
-                    containsAtom(ia_names.items, pp.name))
-                {
-                    common = true;
-                    break;
-                }
-            }
-            if (!common) {
-                const span = if (e.tag != null_node) c.nodeSpan(e.tag) else c.nodeSpan(node);
-                const src_ty = if (last_spread_ty != types.no_type) last_spread_ty else try c.jsxAttrsObject(provided.items);
-                try c.diagFmt(2559, span, "Type '{s}' has no properties in common with type '{s}'.", .{
-                    try c.typeToString(src_ty), try c.jsxTargetString(props, has_intrinsic_attrs),
-                });
-                return;
-            }
-        }
+    if (weak_hit) {
+        const span = if (e.tag != null_node) c.nodeSpan(e.tag) else c.nodeSpan(node);
+        const src_ty = if (last_spread_ty != types.no_type)
+            last_spread_ty
+        else
+            try c.jsxAttrsObject(provided.items, .display);
+        try c.diagFmt(2559, span, "Type '{s}' has no properties in common with type '{s}'.", .{
+            try c.typeToString(src_ty), try c.jsxTargetString(props, has_intrinsic_attrs),
+        });
+        return;
     }
 
-    // A prop the tag's own `defaultProps` supplies is never missing: tsc's
-    // `getJsxManagedAttributesFromLocatedAttributes` runs the props type
-    // through `Defaultize<P, typeof C.defaultProps>` BEFORE anything checks a
-    // required prop, which turns exactly those names optional. ztsc does not
-    // apply the transform (see `jsxHasManagedAttributes`), so the same names
-    // are excused here instead — `BackButton.defaultProps = { text: … }` is
-    // what makes `<BackButton />` legal against a required `text`.
-    //
-    // Resolved LAZILY — `jsxNamespaceMember` re-walks the factory and runtime
-    // modules on every call, and an element that supplies all its required
-    // props must not pay for that. `null` means "not looked up yet"; the
-    // lookup happens at most once, on the first prop that would be reported.
-    var defaults: ?TypeId = null;
-    var any_missing = false;
-    for (target_props.items) |tp| {
-        if (tp.optional()) continue;
-        if (providedHas(provided.items, tp.name)) continue;
-        const d = defaults orelse blk: {
-            const t = try jsxDefaultPropsType(c, e.tag, is_component);
-            defaults = t;
-            break :blk t;
-        };
-        if (d != types.no_type and (try c.propOfType(d, tp.name)) != null) continue;
-        any_missing = true;
-        break;
-    }
-    if (!any_missing) return;
+    if (!missing_hit) return;
     const span = if (e.tag != null_node) c.nodeSpan(e.tag) else c.nodeSpan(node);
     if (spread_non_object) {
         // The attributes' source type is the primitive spread itself —
@@ -1813,7 +1818,7 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
         });
         return;
     }
-    const combined = try c.jsxAttrsObject(provided.items);
+    const combined = try c.jsxAttrsObject(provided.items, .display);
     if (raw_2322) {
         try c.diagFmt(2322, span, "Type '{s}' is not assignable to type '{s}'.", .{
             try c.typeToString(combined), try c.jsxTargetString(props, true),
@@ -1836,27 +1841,127 @@ fn isHyphenatedJsxName(c: *Checker, name: Atom) bool {
     return std.mem.indexOfScalar(u8, c.atomText(name), '-') != null;
 }
 
-/// Build the fresh object type standing in for the written attributes — the
+/// What `jsxAttrsObject` is being built for.
+pub const JsxAttrsUse = enum {
+    /// The source type of a whole-object TS2322/2741/2739/2559 message, and
+    /// the inference candidate for a naked type-parameter props target:
+    /// literals widened (`label="x"` prints as `label: string`, matching
+    /// tsc's messages) and flagged fresh.
+    display,
+    /// The source of the silent whole-object relation: literals KEPT (so
+    /// `variant="a"` still satisfies `"a" | "b"`) and not fresh — the
+    /// excess-property verdict is taken by name, with the hyphenated-name
+    /// waiver `isKnownProperty` applies.
+    relate,
+};
+
+/// Build the object type standing in for the written attributes — the
 /// combined explicit + spread-provided props, later occurrence winning.
-/// Source type of the whole-object TS2322/2741/2739 messages.
-pub fn jsxAttrsObject(c: *Checker, provided: []const types.Prop) Error!TypeId {
+pub fn jsxAttrsObject(c: *Checker, provided: []const types.Prop, use: JsxAttrsUse) Error!TypeId {
     var out: std.ArrayList(types.Prop) = .empty;
     defer out.deinit(c.scratch());
     for (provided) |p| {
-        // Widened for display (`label="x"` prints as `label: string`,
-        // matching tsc's messages); assignability used the fresh types.
-        const wty = try c.widenLiteral(p.ty);
+        const ty = if (use == .display) try c.widenLiteral(p.ty) else p.ty;
         var replaced = false;
         for (out.items) |*o| {
             if (o.name == p.name) {
-                o.ty = wty; // later wins
+                o.ty = ty; // later wins
                 replaced = true;
                 break;
             }
         }
-        if (!replaced) try out.append(c.scratch(), .{ .name = p.name, .ty = wty });
+        if (!replaced) try out.append(c.scratch(), .{ .name = p.name, .ty = ty });
     }
-    return c.ts.makeObject(out.items, 0, 0, types.obj_flag_fresh);
+    return c.ts.makeObject(out.items, 0, 0, if (use == .display) types.obj_flag_fresh else 0);
+}
+
+/// The type one written attribute's value is checked against, or `null` when
+/// the props target declares no home for that name (an EXCESS attribute, or
+/// one on a target with an index signature).
+///
+/// Shared by the silent verdict pass and the reporting elaboration so the two
+/// cannot disagree about what an attribute is compared to.
+fn jsxAttrTarget(c: *Checker, rt: TypeId, b: JsxAttr) Error!?TypeId {
+    if (try c.propOfType(rt, b.name)) |p| {
+        // An optional prop (`date?: Date`) admits `undefined`, so an explicit
+        // `date={maybeUndefined}` is not an error — mirrors the structural
+        // object relation and the optional indexed-access path
+        // (src/checker.zig:2864). Widen the target to `p.ty | undefined` ONLY
+        // when the value can actually be undefined: a value that never yields
+        // `undefined` (e.g. a fresh object literal) gets the identical verdict
+        // from bare `p.ty`, and keeping it off the object-to-union path avoids
+        // a distinct union-relation gap. A required prop keeps `p.ty`, so an
+        // explicit `undefined` on it still rejects.
+        if (p.optional() and c.containsUndefinedish(try c.resolveStructural(b.ty))) {
+            return try c.makeUnion2(p.ty, types.undefined_type);
+        }
+        return p.ty;
+    }
+    // A prop that lives in a UNION member of an intersection props type
+    // (`Base & (VariantA | VariantB)`) is not found by `propOfType`, so its
+    // value used to go unchecked — and, since the excess arm only fires for an
+    // open target, silently. Check it against the union of the arms that
+    // declare it, the same type the attribute's contextual lookup uses.
+    return try c.unionNestedPropType(rt, b.name);
+}
+
+/// tsc's weak-type check for a JSX element (TS2559): the target has only
+/// optional props and the (spread-provided) attributes share none of them.
+/// Fires only for fully-enumerated spread sources — explicit-attr mismatches
+/// are excess (TS2322), and opaque spreads are skipped by the caller.
+fn jsxWeakTypeHit(
+    c: *Checker,
+    rt: TypeId,
+    target_props: []const types.Prop,
+    provided: []const types.Prop,
+    ia_names: []const Atom,
+    spread_non_object: bool,
+) Error!bool {
+    if (target_props.len == 0 and ia_names.len == 0) return false;
+    for (target_props) |tp| if (!tp.optional()) return false;
+    if (!spread_non_object and provided.len == 0) return false;
+    for (provided) |pp| {
+        if (isHyphenatedJsxName(c, pp.name) or
+            (try c.propOfType(rt, pp.name)) != null or
+            containsAtom(ia_names, pp.name)) return false;
+    }
+    return true;
+}
+
+/// Does the element leave a required prop unprovided?
+///
+/// A prop the tag's own `defaultProps` supplies is never missing: tsc's
+/// `getJsxManagedAttributesFromLocatedAttributes` runs the props type through
+/// `Defaultize<P, typeof C.defaultProps>` BEFORE anything checks a required
+/// prop, which turns exactly those names optional. ztsc does not apply the
+/// transform (see `jsxHasManagedAttributes`), so the same names are excused
+/// here instead — `BackButton.defaultProps = { text: … }` is what makes
+/// `<BackButton />` legal against a required `text`.
+///
+/// `defaultProps` is resolved LAZILY: `jsxNamespaceMember` re-walks the
+/// factory and runtime modules on every call, and an element that supplies all
+/// its required props must not pay for that. `null` means "not looked up yet";
+/// the lookup happens at most once, on the first prop that would be reported.
+fn jsxMissingRequiredProp(
+    c: *Checker,
+    e: ast.JsxElementData,
+    target_props: []const types.Prop,
+    provided: []const types.Prop,
+    is_component: bool,
+) Error!bool {
+    var defaults: ?TypeId = null;
+    for (target_props) |tp| {
+        if (tp.optional()) continue;
+        if (providedHas(provided, tp.name)) continue;
+        const d = defaults orelse blk: {
+            const t = try jsxDefaultPropsType(c, e.tag, is_component);
+            defaults = t;
+            break :blk t;
+        };
+        if (d != types.no_type and (try c.propOfType(d, tp.name)) != null) continue;
+        return true;
+    }
+    return false;
 }
 
 /// Display string for the props target: `IntrinsicAttributes & <Props>`

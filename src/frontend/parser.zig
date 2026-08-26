@@ -1957,15 +1957,32 @@ const Parser = struct {
             .keyword_function,
             .keyword_class,
             .keyword_enum,
-            .keyword_interface,
-            .keyword_type,
-            .keyword_namespace,
-            .keyword_module,
             .keyword_import,
             .keyword_declare,
             .keyword_abstract,
             .keyword_async,
             => true,
+            // tsc's `isDeclaration` looks one token further for these four:
+            //
+            //     case InterfaceKeyword: case TypeKeyword:
+            //         return nextTokenIsIdentifierOnSameLine();
+            //     case ModuleKeyword: case NamespaceKeyword:
+            //         return nextTokenIsIdentifierOrStringLiteralOnSameLine();
+            //
+            // Without the peek `export namespace 100 {}` reads as an exported
+            // namespace, where tsc refuses the whole thing as a statement,
+            // reports TS1128 on the `export` and re-parses from `namespace`
+            // (`parseInvalidNames`). The word alone still starts a STATEMENT
+            // (`atStartOfStatement` answers those tags true unconditionally,
+            // as tsc's `isStartOfStatement` does) — this is only about whether
+            // a preceding modifier run has a declaration to modify.
+            .keyword_interface,
+            .keyword_type,
+            => !p.peekNewline(n + 1) and isIdentLike(p.peekTag(n + 1)),
+            .keyword_namespace,
+            .keyword_module,
+            => !p.peekNewline(n + 1) and
+                (isIdentLike(p.peekTag(n + 1)) or p.peekTag(n + 1) == .string_literal),
             else => false,
         };
     }
@@ -2579,10 +2596,21 @@ const Parser = struct {
     /// tsc additionally offers a spelling suggestion (TS1435) when the word is
     /// close to a keyword; ztsc reports the plain TS1434 there, which is the
     /// same one-wrong-key cost as the TS1005 it replaces.
+    /// Does the token under the cursor end a statement without a `;`? tsc's
+    /// `canParseSemicolon`, whose EOF arm covers ztsc's `unterminated_comment`
+    /// too: that token spans to the end of the file by construction, and tsc's
+    /// scanner — which reports TS1010 and hands the parser EndOfFile — never
+    /// shows it to the parser at all. Reading it as an ordinary token earned a
+    /// TS1005 tsgo does not have on `a.public /*`
+    /// (`parserKeywordsAsIdentifierName2`).
+    fn atStatementEnd(tag: TokTag) bool {
+        return tag == .r_brace or tag == .eof or tag == .unterminated_comment;
+    }
+
     fn expectSemicolonAfterExpression(p: *Parser, expr: Node) PE!void {
+        if (atStatementEnd(p.curTag())) return;
         switch (p.curTag()) {
             .semicolon => _ = try p.bump(),
-            .r_brace, .eof => {},
             else => {
                 if (p.nlBefore()) return;
                 if (p.spec > 0) return error.Backtrack;
@@ -2699,9 +2727,9 @@ const Parser = struct {
     /// tsc's `parseBlock` finds no `{`, consumes nothing, and the declaration
     /// ends with no body.
     fn expectBodyOrSemicolon(p: *Parser) PE!void {
+        if (atStatementEnd(p.curTag())) return;
         switch (p.curTag()) {
             .semicolon => _ = try p.bump(),
-            .r_brace, .eof => {},
             else => {
                 if (p.nlBefore()) return;
                 try p.fail(.expected_brace_or_semi);
@@ -2710,9 +2738,9 @@ const Parser = struct {
     }
 
     fn expectSemicolon(p: *Parser) PE!void {
+        if (atStatementEnd(p.curTag())) return;
         switch (p.curTag()) {
             .semicolon => _ = try p.bump(),
-            .r_brace, .eof => {},
             else => {
                 if (p.nlBefore()) return;
                 try p.fail(.expected_semicolon);
@@ -5169,7 +5197,13 @@ const Parser = struct {
                 _ = try p.bump();
                 continue;
             }
-            if ((bit == ast.Flags.get or bit == ast.Flags.set or bit == ast.Flags.async) and p.peekNewline(1)) break;
+            // `get`/`set` are the two words tsc's `nextTokenCanFollowModifier`
+            // gives their OWN arm — `nextToken(); return canFollowModifier();`
+            // — with no same-line requirement, unlike `static`/`async`, which
+            // fall to `nextTokenIsOnSameLineAndCanFollowModifier`. So
+            // `get\nx() {}` is a getter named `x`, not a field `get` plus a
+            // method `x` (accessorWithLineTerminator).
+            if (bit == ast.Flags.async and p.peekNewline(1)) break;
             if (n_mods < mods.len) {
                 mods[n_mods] = .{ .bit = bit, .token = p.curIdx() };
                 n_mods += 1;
@@ -5244,6 +5278,19 @@ const Parser = struct {
                 },
                 else => {},
             }
+        }
+        // A class member NAMED `constructor` is a constructor whatever follows
+        // it: tsc's `parseClassElement` reaches `tryParseConstructorDeclaration`
+        // (which consumes the keyword and then `parseParameters`) before it ever
+        // considers a property, so `public constructor;` is TS1005 "'(' expected"
+        // at the `;` (parserConstructorDeclaration8). Only the bare keyword —
+        // a computed or string name takes the ordinary member route, and
+        // `get constructor()` is an accessor (get/set are tested first there).
+        if (computed == null and flags & (ast.Flags.get | ast.Flags.set) == 0 and
+            p.tokTagAt(name_tok) == .keyword_constructor and
+            p.curTag() != .l_paren and !p.atLt())
+        {
+            try p.errAtCur(.expected_l_paren);
         }
         if (p.curTag() == .l_paren or p.atLt()) {
             // Method / constructor / accessor.
@@ -8719,7 +8766,10 @@ const Parser = struct {
             const t1 = p.peekTag(1);
             const name_follows = isNameLike(t1) or t1 == .string_literal or
                 t1 == .numeric_literal or t1 == .l_bracket or t1 == .asterisk;
-            if (!name_follows or p.peekNewline(1)) break;
+            // Only `async` is same-line-gated here: tsc's
+            // `nextTokenCanFollowModifier` gives `get`/`set` an arm with no
+            // line-break test (see the class-member walk).
+            if (!name_follows or (bit == ast.Flags.async and p.peekNewline(1))) break;
             _ = try p.bump();
             flags |= bit;
         }
