@@ -1478,8 +1478,27 @@ pub fn resolveSignatureCall(
             c.sigTargArityOk(sigs[0], explicit_targs.len);
         const inst = try c.instantiateSigForCall(sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
         if (instance_ret == types.no_type) try checkThisArg(c, node, inst);
+        const before_args = c.diags.items.len;
         try checkCallArguments(c, node, inst, arg_nodes, targ_count_ok);
-        return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst);
+        if (instance_ret != types.no_type) return instance_ret;
+        // tsc's `getCandidateForOverloadFailure` runs for a LONE candidate
+        // too: the signature the arguments were REPORTED against is not the
+        // one the call is TYPED by. `pickLongestCandidateSignature` re-infers
+        // through `inferSignatureInstantiationForOverloadFailure`, whose
+        // `SkipGenericFunctions` drops a generic-function argument's
+        // contribution — so the parameter it would have decided falls to
+        // `unknown` rather than to the fold that failed.
+        //
+        // Only when the arguments actually failed AND one of them is a
+        // generic function, which is the only pair the two inferences differ
+        // on: `bar("one", 1, g)` over `bar<T, U, V>(x: T, y: U, cb: (x: T, y:
+        // U) => V)` is `unknown`, and ztsc's `V := string` had poisoned every
+        // later read of the variable it initialized
+        // (`contextualSignatureInstantiation`, wave-42 C's handover).
+        if (c.diags.items.len != before_args and hasGenericFnArg(c, arg_nodes)) {
+            return c.ts.fnReturn(try instantiateFallbackSig(c, sigs[0], explicit_targs, arg_nodes, node, ret_ctx));
+        }
+        return c.ts.fnReturn(inst);
     }
     // Overloads: first signature whose arity fits and whose args check.
     //
@@ -1812,6 +1831,19 @@ fn targArityMismatch(tps: []const TypeParamInfo, written: usize) ?struct { min: 
 /// does have is reported from the candidate list — the lone-candidate arm of
 /// `resolveSignatureCall`, or `instantiateSigForCall` on the report signature —
 /// before this ever runs.
+/// Does some argument of this call denote a GENERIC function? That is the one
+/// shape `SkipGenericFunctions` changes, so it is the only one worth paying a
+/// second instantiation for. Reads the node memo the argument walk just
+/// filled — no argument is re-checked.
+fn hasGenericFnArg(c: *Checker, arg_nodes: []const Node) bool {
+    for (arg_nodes) |an| {
+        if (an == null_node) continue;
+        const t = c.nodeType(an) orelse continue;
+        if (c.ts.kind(t) == .function and c.ts.fnTypeParamCount(t) > 0) return true;
+    }
+    return false;
+}
+
 fn instantiateFallbackSig(
     c: *Checker,
     sig: TypeId,
@@ -1821,6 +1853,17 @@ fn instantiateFallbackSig(
     ret_ctx: TypeId,
 ) Error!TypeId {
     const saved = c.diags.items.len;
+    // tsc's `inferSignatureInstantiationForOverloadFailure` re-infers with
+    // `checkMode | CheckMode.SkipGenericFunctions`. There is no second round
+    // behind this one, so a GENERIC-function argument contributes nothing and
+    // whatever it would have decided falls to `unknown` — which is the whole
+    // point: `bar("one", 1, g)` over `bar<T, U, V>(x, y, cb: (x: T, y: U) =>
+    // V)` is `unknown`, not the `V := string` the folded inference leaves,
+    // and the fold poisoned every later read of the variable it initialized
+    // (`contextualSignatureInstantiation`, handed over by wave-42 C).
+    const saved_skip = c.skip_generic_fn_args;
+    c.skip_generic_fn_args = true;
+    defer c.skip_generic_fn_args = saved_skip;
     const inst = try c.instantiateSigForCall(sig, explicit_targs, arg_nodes, node, ret_ctx);
     c.rollbackDiags(saved, .{ .file = c.cur_file, .lo = 0, .hi = 0, .codes = &targ_arity_code });
     return inst;

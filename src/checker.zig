@@ -2652,6 +2652,18 @@ pub const Checker = struct {
     /// so a nested call's own arguments and a function BODY are checked
     /// normally. `checkExprCached` is the single place that maintains it.
     skip_ctx_sensitive: bool = false,
+    /// tsc's `CheckMode.SkipGenericFunctions`, the OTHER skip its inference
+    /// rounds carry: a GENERIC-function argument handed to a non-generic
+    /// function parameter answers `anyFunctionType` and contributes no
+    /// candidate (`instantiateTypeWithSingleGenericCallSignature`'s
+    /// `skippedGenericFunction` arm). ztsc models tsc's round-one/round-two
+    /// pair by argument ORDER instead (see `inferTypeArgs`), so this is set
+    /// only where tsc has no second round to fall back on: the
+    /// overload-FAILURE fallback (`inferSignatureInstantiationForOverload-
+    /// Failure`), which infers once, with the skip, and lets whatever the
+    /// generic argument would have decided fall to `unknown`.
+    /// `calls.instantiateFallbackSig` is the single place that sets it.
+    skip_generic_fn_args: bool = false,
     /// Did the walk under `skip_ctx_sensitive` actually produce a
     /// `types.any_function_type`? tsc propagates
     /// `ObjectFlags.NonInferrableType` up through every type built out of one

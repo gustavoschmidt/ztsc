@@ -1574,6 +1574,19 @@ pub fn inferTypeArgs(
                 }
             }
         }
+        // tsc's `CheckMode.SkipGenericFunctions` (see
+        // `Checker.skip_generic_fn_args`): a generic-function argument met by
+        // a non-generic function parameter answers `anyFunctionType` and
+        // decides nothing. Same pair `instantiateTypeWithSingleGenericCall-
+        // Signature` tests, and `unify` returns immediately on
+        // `any_function_type`, so handing it that is the whole skip.
+        var at_eff = at;
+        if (c.skip_generic_fn_args and c.ts.kind(at) == .function and c.ts.fnTypeParamCount(at) > 0) {
+            const rp = try c.resolveStructural(pt);
+            if (c.ts.kind(rp) == .function and c.ts.fnTypeParamCount(rp) == 0) {
+                at_eff = types.any_function_type;
+            }
+        }
         // This argument was checked against a contextual type built out of this
         // call's own parameters, so what it hands back may be that type coming
         // home — see `InferCtx.ctx_echo`.
@@ -1582,7 +1595,7 @@ pub fn inferTypeArgs(
             for (candidates, 0..) |cd, i| before_ctx[i] = cd;
             c.infer_ctx.ctx_echo += 1;
         }
-        try c.unify(pt, at, tp_syms, candidates, 0);
+        try c.unify(pt, at_eff, tp_syms, candidates, 0);
         if (echo_live) {
             c.infer_ctx.ctx_echo -= 1;
             for (candidates, 0..) |cd, i| {
