@@ -3279,7 +3279,28 @@ fn distributableSpreads(c: *Checker, node: Node, out: *std.ArrayList(DistSpread)
     var product: usize = 1;
     for (c.tree.nodeRange(node)) |prop| {
         if (prop == null_node or c.nodeTag(prop) != .spread_element) continue;
-        const st = try c.resolveStructural(try c.checkExprCached(c.tree.nodeData(prop).lhs, types.no_type));
+        // WAVE-48 AGENT-C FLAGGED ARM (expr.zig is agent A's this wave).
+        //
+        // This scan runs BEFORE the literal's own walk and asks each operand
+        // for its type CONTEXT-FREE. That is a speculative check, and tsc
+        // guards every speculative check it makes with a syntactic whitelist
+        // (`isPossiblyDiscriminantValue`, whose whole purpose is to keep a
+        // callback or a nested literal off the speculative path). This one had
+        // no guard: `Foo({ ...{ a: (x) => 10, b: (arg) => … } })` type-checked
+        // the inner literal with NO contextual type, so both callbacks'
+        // parameters went implicit `any` — and the TS7006/TS7031 those file are
+        // filed for good, whatever the authoritative contextual pass then says.
+        //
+        // An object or array LITERAL operand can never have a union type, so
+        // the answer was never going to distribute anything: asking was pure
+        // cost even before it was harmful. Skipping it is what makes
+        // `intraExpressionInferences`' spread repros (#52786) type-check.
+        const operand = c.tree.nodeData(prop).lhs;
+        switch (c.nodeTag(operand)) {
+            .object_literal, .array_literal => continue,
+            else => {},
+        }
+        const st = try c.resolveStructural(try c.checkExprCached(operand, types.no_type));
         if (c.ts.kind(st) != .union_type) continue;
         const ms = try c.memberList(st);
         if (ms.len < 2 or ms.len > max_spread_distribution) continue;
@@ -8693,6 +8714,20 @@ pub fn exprIsContextSensitive(c: *Checker, node: Node, depth: u8) bool {
         // key), so the proto is one hop further down.
         .object_property => exprIsContextSensitive(c, c.tree.nodeData(node).rhs, depth + 1),
         .object_method => exprIsContextSensitive(c, c.tree.nodeData(node).rhs, depth + 1),
+        // WAVE-48 AGENT-C FLAGGED ARM (expr.zig is agent A's this wave).
+        //
+        // A SPREAD carries the property up out of its operand. `getContextual-
+        // Type` steps STRAIGHT THROUGH a `SpreadAssignment` (the arm
+        // `checkObjectLiteral` already spells), so a callback written inside
+        // `{ ...{ b: arg => … } }` is contextually typed by the containing
+        // literal's context exactly as a callback written `{ b: arg => … }` is
+        // — and is therefore just as context sensitive. Without this arm the
+        // literal looked insensitive, so a generic call took the SINGLE
+        // contextual read instead of the two rounds: `Foo({ ...{ a: x => 10, b:
+        // arg => arg.toString() } })` read `b` against `(arg: T) => void` with
+        // `T` still free and reported TS2339 on the bare type variable
+        // (`intraExpressionInferences`, microsoft/TypeScript#52786).
+        .spread_element => exprIsContextSensitive(c, c.tree.nodeData(node).lhs, depth + 1),
         .cond_expr => blk: {
             const e = c.tree.extraData(ast.CondExpr, c.tree.nodeData(node).rhs);
             break :blk exprIsContextSensitive(c, e.then_expr, depth + 1) or

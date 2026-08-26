@@ -324,6 +324,27 @@ fn ctxElemType(c: *Checker, rctx: TypeId, i: u32, len: u32) Error!TypeId {
     }
 }
 
+/// An object-literal member that is a SPREAD of an object LITERAL, unwrapped
+/// to that operand — `null` for anything else.
+///
+/// tsc's `getContextualType` steps straight through a `SpreadAssignment`
+/// (`return getContextualType(parent.parent, contextFlags)`), so the operand's
+/// members are contextually typed by the CONTAINING literal's context under
+/// their own names: `{ ...{ b: arg => … } }` pairs `b` with the same property
+/// type `{ b: arg => … }` would have. Both two-round walks below therefore
+/// recurse through it with the contextual type UNCHANGED — no re-pairing, no
+/// index shift, which is what separates this from an array literal's spread
+/// (`litHasSpread`, where a spread makes the POSITIONS unknowable).
+///
+/// Only a literal operand: a spread of a variable or a call result holds no
+/// syntax for these walks to visit, and its type is already whatever it is.
+fn spreadOperandLiteral(c: *const Checker, m: Node) ?Node {
+    if (c.nodeTag(m) != .spread_element) return null;
+    const inner = skipParens(c, c.tree.nodeData(m).lhs);
+    if (inner == null_node or c.nodeTag(inner) != .object_literal) return null;
+    return inner;
+}
+
 /// Does this literal's element list hold a SPREAD? A spread shifts every
 /// position after it by an amount only the spread's own type knows, so the
 /// positional walks below decline the whole literal rather than mis-pair one
@@ -368,6 +389,13 @@ fn ctxSensitiveLosesSignature(c: *Checker, node: Node, ctx2: TypeId, depth: u8) 
     }
     for (c.tree.nodeRange(node)) |m| {
         if (m == null_node) continue;
+        // A SPREAD's operand is contextually typed by the CONTAINING literal's
+        // context, so its members pair with `ctx2` under their own names — the
+        // same walk, one level down. See `spreadOperandLiteral`.
+        if (spreadOperandLiteral(c, m)) |inner| {
+            if (try ctxSensitiveLosesSignature(c, inner, ctx2, depth + 1)) return true;
+            continue;
+        }
         switch (c.nodeTag(m)) {
             .object_property, .object_method => {},
             else => continue,
@@ -542,6 +570,13 @@ fn markCtxSensitiveFixed(
     }
     for (c.tree.nodeRange(node)) |m| {
         if (m == null_node) continue;
+        // The spread's operand is contextually typed by this same `pt` (see
+        // `spreadOperandLiteral`), so whatever its members would fix, they fix
+        // here.
+        if (spreadOperandLiteral(c, m)) |inner| {
+            try markCtxSensitiveFixed(c, inner, pt, tp_syms, param_pos, ret_only, depth + 1);
+            continue;
+        }
         switch (c.nodeTag(m)) {
             .object_property, .object_method => {},
             else => continue,
