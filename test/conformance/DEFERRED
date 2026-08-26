@@ -114,19 +114,6 @@ indexed/032_cast_to_deferred_indexed_access_negatives.ts  -TS2352 8
 # Nothing about the structural arm (open since B1) bears on it.
 instantiation/052_type_arg_constraint_structural.ts  -TS2344 26
 
-# `unify` has no rule that infers a type parameter out of a MAPPED TYPE
-# source into an index-signature parameter (`{ [s: string]: V }`), so
-# `pick(d)` with `d: Rec<keyof T & string, string | string[]>` leaves `V`
-# unbound, the generic overload is rejected on its argument, and the call
-# falls to `pick(o: {}): number` — where tsc infers `V = string | string[]`
-# from the map's template and reports the assignment to `number`. An
-# under-report, and the point of the case is that it is now the SAME
-# under-report at every `--checkers=N` and in every file order: the relation
-# used to answer that argument test from the `origin` tag on the interned
-# `{ [s: string]: unknown }`, which exists only once some earlier file in the
-# partition has expanded `Rec<string, unknown>` (`seed.ts` here).
-assignability/mapped_index_origin  -TS2322 use.ts 15
-
 # A REVERSE MAPPED TYPE. tsc's `inferToMappedType` has two branches. ztsc
 # models the one keyed on a type-parameter key set (`Record<infer N, V>`; see
 # `mappedInferShape` and case 047) and declines the HOMOMORPHIC one,

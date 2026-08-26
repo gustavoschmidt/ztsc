@@ -321,12 +321,15 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
             // no contextual property type at all, so its callback parameters
             // went implicit-`any` (`mappedTypeContextualTypesApplied`).
             //
-            // Delegated to the non-homomorphic tail with the key set spelled
-            // out: there is no source member list to iterate (that is the whole
-            // difference), and `keyof any` is exactly the constraint tsc
-            // resolves the members from. The value template has already had the
-            // source substituted, so a `T[P]` template reads `any[P]` and
-            // answers `any` per key, as it must.
+            // Built here rather than by re-entering the non-homomorphic tail
+            // with `keyof any` as the constraint: that tail would rediscover
+            // the same two index keys through `collectMappedKeys` and set up
+            // the modifiers-type and name-type machinery none of them use, and
+            // this arm is hot enough for that to show (drizzle). The value
+            // template has already had the source substituted, so a `T[P]`
+            // template reads `any[P]` and answers `any` per key, as it must.
+            // `symbol` is dropped for the same reason the tail drops it: ztsc
+            // has no symbol index signature.
             //
             // …unless the map's source variable was DECLARED with an
             // array/tuple constraint, in which case tsc keeps the result a
@@ -343,14 +346,18 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
                 if (flags & mapped_flag_any_is_array != 0) {
                     return c.materializeMapped(key_param, constraint, value, as_clause, try s.makeArray(types.any_type), flags);
                 }
-                return c.materializeMapped(
-                    key_param,
-                    try c.keyofType(src),
-                    value,
-                    as_clause,
-                    src_type,
-                    flags & ~types.mapped_flag_homomorphic,
-                );
+                // An `as` clause computes each property's NAME from its key,
+                // and neither `string` nor `number` is a key it can name — the
+                // non-homomorphic tail drops such a key outright, so the map
+                // has no members at all.
+                if (as_clause != 0) return types.empty_object_type;
+                const sidx = try c.substMappedKey(value, key_id, types.string_type);
+                const nidx = try c.substMappedKey(value, key_id, types.number_type);
+                var obj_flags: u32 = types.obj_flag_mapped_keys;
+                if (flags & types.mapped_flag_readonly_add != 0) {
+                    obj_flags |= types.obj_flag_readonly_string_index | types.obj_flag_readonly_number_index;
+                }
+                return s.makeObject(&.{}, sidx, nidx, obj_flags);
             },
             // `{ [P in keyof T]: … }` over a CLASS STATIC SIDE / namespace value
             // (`typeof C`). `.class_value` is a nominal shortcut that carries no

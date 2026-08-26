@@ -3284,13 +3284,20 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         // `target` of `Event & { target: T }` is `(EventTarget | null) & T`,
         // whose `null` half is what tsc's TS2345 is about.
         if (sk == .intersection and !try c.hasNullishMember(s)) {
-            var instantiable = false;
+            var bare_param = false;
             for (try c.memberList(s)) |m| {
-                if (!isInstantiableForUnionSpan(c.ts.kind(m))) continue;
-                instantiable = true;
+                const mk = c.ts.kind(m);
+                if (mk == .type_param) bare_param = true;
+                if (!isInstantiableForUnionSpan(mk)) continue;
                 if (try c.isAssignable(m, t)) return true;
             }
-            if (instantiable) {
+            // The cross product is only built for an intersection that names a
+            // BARE type parameter — the shape whose constraint is a union in
+            // the first place. A deferred access/conditional/map constituent
+            // reduces to a constraint the per-constituent pass above has
+            // already asked about, and drizzle's intersections are all of that
+            // second kind (measured: the unrestricted call cost it ~1%).
+            if (bare_param) {
                 const bc = try c.baseConstraintOf(s);
                 if (bc != s and try c.isAssignable(bc, t)) return true;
             }
@@ -4203,6 +4210,48 @@ pub fn mappedAddsOptional(c: *Checker, m: TypeId) bool {
     return c.ts.mappedFlags(m) & types.mapped_flag_optional_add != 0;
 }
 
+/// tsc's `getCombinedMappedTypeOptionality`: `+?` is 1, `-?` is -1, and a map
+/// that says NOTHING about optionality inherits the answer from its modifiers
+/// type — the source a homomorphic map is written over.
+///
+/// ```ts
+/// function getCombinedMappedTypeOptionality(type: MappedType): number {
+///     const optionality = getMappedTypeOptionality(type);
+///     const modifiersType = getModifiersTypeFromMappedType(type);
+///     return optionality || (isGenericMappedType(modifiersType) ? getCombinedMappedTypeOptionality(modifiersType as MappedType) : 0);
+/// }
+/// ```
+///
+/// This is the whole of what `mappedTypeRelatedTo` checks about modifiers
+/// (`readonly` is not compared at all), and reading only the map's OWN flag
+/// got `Readonly<Partial<T>>` wrong in both directions: `Partial<T>` was
+/// refused as one (the outer map adds nothing, the inner adds `?`), and it was
+/// accepted as a `Readonly<T>`, which it is not (`mappedTypes5`).
+///
+/// Iterative with a depth cap rather than recursive: the modifiers chain is a
+/// `Readonly<Partial<…>>` nesting, a handful deep at most, and a source that
+/// somehow cycled would otherwise not terminate.
+fn mappedCombinedOptionality(c: *Checker, m: TypeId) Error!i32 {
+    var cur = m;
+    var depth: u32 = 0;
+    while (depth < 8) : (depth += 1) {
+        const f = c.ts.mappedFlags(cur);
+        if (f & types.mapped_flag_optional_remove != 0) return -1;
+        if (f & types.mapped_flag_optional_add != 0) return 1;
+        // Only a HOMOMORPHIC map has a modifiers type ztsc can name: it is the
+        // `T` of `keyof T`, which `mappedSource` stores. tsc reaches one for
+        // `{ [P in K]: T[P] }` too, through `K`'s constraint; that shape says
+        // nothing about optionality here that the template comparison does not.
+        if (!c.ts.mappedHomomorphic(cur)) return 0;
+        const src = c.ts.mappedSource(cur);
+        if (src == 0) return 0;
+        const rs = try c.resolveStructural(src);
+        if (c.ts.kind(rs) != .mapped) return 0;
+        cur = rs;
+    }
+    return 0;
+}
+
 /// The keys a mapped TARGET actually produces, which is what a source has to
 /// supply — tsc's
 ///
@@ -4280,6 +4329,16 @@ pub fn mappedApparentStringIndex(c: *Checker, m: TypeId) Error!?TypeId {
         }
     }
     if (!covers_string) return null;
+    return mappedTemplateAtString(c, m);
+}
+
+/// The map's value template with its key bound to `string` — tsc's
+/// `getTemplateTypeFromMappedType`, which is what an index signature's value
+/// type is compared against and does not depend on the map's key set at all.
+/// Null for a REMAPPED map, whose produced key is not `P`.
+fn mappedTemplateAtString(c: *Checker, m: TypeId) Error!?TypeId {
+    const s = &c.ts;
+    if (s.mappedAs(m) != 0) return null;
     return try c.substMappedKey(s.mappedValue(m), s.mappedParamId(s.mappedKeyParam(m)), types.string_type);
 }
 
@@ -4316,7 +4375,7 @@ pub fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
         // the TARGET's key set must be related to the source's (contra-
         // variant — the target iterates no more keys than the source), and
         // the templates must relate with the two key parameters identified.
-        if (c.mappedAddsOptional(s) and !c.mappedAddsOptional(t)) return null;
+        if (try mappedCombinedOptionality(c, s) > try mappedCombinedOptionality(c, t)) return null;
         if (c.ts.mappedAs(s) != 0 or c.ts.mappedAs(t) != 0) return null; // key remapping: not modelled
         const s_keys = try c.mappedKeySet(s);
         // tsc's `mappedTypeRelatedTo` instantiates the SOURCE's constraint
@@ -4472,11 +4531,10 @@ pub fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
         const access = try c.reduceIndexedAccess(s, idx);
         return if (try c.isAssignable(access, try mappedTargetTemplate(c, t))) true else null;
     }
-    // A still-generic map whose key set covers the string key space has an
-    // apparent INDEX SIGNATURE (`mappedApparentStringIndex`), so it relates to
-    // a pure index-signature target — `Object.entries`' `{[s: string]: V}`.
-    // Restricted to a target with no NAMED members: a deferred map declares no
-    // property this side could satisfy one with.
+    // A still-generic map relates to a pure index-signature target when its
+    // TEMPLATE relates to the index value — `Object.entries`' `{[s: string]:
+    // V}`. Restricted to a target with no NAMED members: a deferred map
+    // declares no property this side could satisfy one with.
     if (sk == .mapped) {
         const rt = try c.resolveStructural(t);
         if (c.ts.kind(rt) == .object and
@@ -4485,11 +4543,32 @@ pub fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
             c.ts.objectConstructSigCount(rt) == 0 and
             c.ts.objectStringIndex(rt) != 0)
         {
-            if (try c.mappedApparentStringIndex(s)) |tmpl| {
-                if (!try c.isAssignable(tmpl, c.ts.objectStringIndex(rt))) return null;
-                const nidx = c.ts.objectNumberIndex(rt);
-                if (nidx != 0 and !try c.isAssignable(tmpl, nidx)) return null;
-                return true;
+            // The map's own key set is NOT consulted: tsc's
+            // `indexSignaturesRelatedTo` reads
+            //
+            //     isGenericMappedType(source) && targetHasStringIndex
+            //         ? isRelatedTo(getTemplateTypeFromMappedType(source), targetInfo.type)
+            //         : typeRelatedToIndexInfo(source, targetInfo, …)
+            //
+            // — for a still-generic map the TEMPLATE alone answers, whatever
+            // keys the map will end up producing. `WeakValidationMap<P>` over
+            // an unconstrained `P` produces no keys this side can name, and
+            // refusing it made every React `ComponentClass<P>` fail its
+            // `ComponentClass<any>` constraint once `WeakValidationMap<any>`
+            // stopped being `any` (`propTypes?: WeakValidationMap<P>` is the
+            // member that carries it).
+            //
+            // A template that does NOT relate falls through to the arms below
+            // rather than answering `null` for the whole function: with the
+            // key-set guard gone this arm is reached by maps it used to skip
+            // outright, and swallowing them cost the ones a later arm answers
+            // (`spuriousCircularityOnTypeImport`, whose `FuncMap extends
+            // SelectorMap<FuncMap>` is decided by the identity-map rule).
+            if (try mappedTemplateAtString(c, s)) |tmpl| {
+                if (try c.isAssignable(tmpl, c.ts.objectStringIndex(rt))) {
+                    const nidx = c.ts.objectNumberIndex(rt);
+                    if (nidx == 0 or try c.isAssignable(tmpl, nidx)) return true;
+                }
             }
         }
     }
