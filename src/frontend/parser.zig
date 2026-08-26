@@ -1556,7 +1556,6 @@ const Parser = struct {
             .keyword_namespace,
             .keyword_type,
             .keyword_global,
-            .keyword_accessor,
             .keyword_abstract,
             // An unterminated block comment is TRIVIA to tsc: its scanner
             // reports TS1010 and hands the parser EOF, so nothing lands here.
@@ -1588,6 +1587,7 @@ const Parser = struct {
             .keyword_protected,
             .keyword_static,
             .keyword_readonly,
+            .keyword_accessor,
             => p.classMemberModifierStartsStatement(),
             // `export` is the one word of the lookahead group that a false
             // `true` demonstrably costs: `var export;` steps OVER the keyword
@@ -1624,7 +1624,13 @@ const Parser = struct {
     /// first `export` is a modifier and the second one is the export
     /// assignment (TS1120).
     fn exportStartsDeclaration(p: *Parser) bool {
-        var n: u32 = 0;
+        return p.exportStartsDeclarationAt(0);
+    }
+
+    /// The same walk started `n` tokens in, for a modifier run that has already
+    /// been counted and ends at an `export` (`accessor export { V1 }`).
+    fn exportStartsDeclarationAt(p: *Parser, start: u32) bool {
+        var n: u32 = start;
         while (n + 2 < max_la) : (n += 1) {
             if (p.peekTag(n) == .keyword_export) {
                 switch (p.peekTag(if (p.peekTag(n + 1) == .keyword_type) n + 2 else n + 1)) {
@@ -1657,12 +1663,13 @@ const Parser = struct {
     /// answers TS1128 on the WORD and drops it, which is what returning false
     /// here buys (`parseStatementList`'s not-a-statement arm).
     ///
-    /// `accessor` and `abstract` belong to the same tsc group but stay
-    /// unconditionally true above: ztsc's `startsDeclarationAt` does not walk
-    /// past them, so the answer here would be a false `false` for
-    /// `accessor class C {}` — and a false `false` manufactures a TS1128 tsc
-    /// does not report, while a false `true` only keeps ztsc's existing
-    /// recovery.
+    /// `accessor` is in the same tsc group and now answers the same way — it
+    /// is a `statementModifierCode` word, so a declaration behind it makes a
+    /// statement. `abstract` stays unconditionally true above: ztsc's
+    /// `startsDeclarationAt` does not walk past it, so the answer here would
+    /// be a false `false` for `abstract class C {}` — and a false `false`
+    /// manufactures a TS1128 tsc does not report, while a false `true` only
+    /// keeps ztsc's existing recovery.
     fn classMemberModifierStartsStatement(p: *Parser) bool {
         if (p.statementModifierRunLen() != 0) return true;
         if (p.peekNewline(1)) return true;
@@ -1884,6 +1891,13 @@ const Parser = struct {
     /// or namespace element" and `readonly` as "can only appear on a property
     /// declaration or index signature"; the message names the modifier, which a
     /// code-plus-span Diagnostic cannot interpolate, so there is one code each.
+    /// `accessor` is the one word here whose sentence does not turn on where
+    /// the declaration sits: tsc's `case AccessorKeyword` asks only
+    /// `node.kind !== PropertyDeclaration`, so a statement-position
+    /// `accessor class C {}` is TS1275 at the top level of a file, inside a
+    /// `namespace` body and inside a `declare module` block alike (all three
+    /// measured). It still becomes TS1184 in a FUNCTION body, because that is
+    /// `eatStatementModifiers`' own `element_home` split and not this table's.
     fn statementModifierCode(tag: TokTag) ?Code {
         return switch (tag) {
             .keyword_public => .public_not_on_module_element,
@@ -1891,6 +1905,7 @@ const Parser = struct {
             .keyword_protected => .protected_not_on_module_element,
             .keyword_static => .static_not_on_module_element,
             .keyword_readonly => .readonly_not_on_property,
+            .keyword_accessor => .accessor_modifier_not_valid_here,
             else => null,
         };
     }
@@ -1934,7 +1949,14 @@ const Parser = struct {
             n += 1;
             if (p.peekNewline(n)) return 0;
         }
-        if (n == 0 or !p.startsDeclarationAt(n)) return 0;
+        if (n == 0) return 0;
+        // `export` is a MODIFIER, not a declaration keyword, so
+        // `startsDeclarationAt` leaves it out on purpose — but tsc's
+        // `isDeclaration` loop walks THROUGH it (`accessor export { V1 }` and
+        // `accessor export default V1` are both declarations there), which is
+        // the one shape this run has to ask about separately.
+        if (p.peekTag(n) == .keyword_export) return if (p.exportStartsDeclarationAt(n)) n else 0;
+        if (!p.startsDeclarationAt(n)) return 0;
         return n;
     }
 
@@ -2153,6 +2175,7 @@ const Parser = struct {
             .keyword_protected,
             .keyword_static,
             .keyword_readonly,
+            .keyword_accessor,
             => {
                 if (p.statementModifierRunLen() == 0) return p.parseExpressionStatement();
                 try p.eatStatementModifiers();
@@ -5412,8 +5435,9 @@ const Parser = struct {
         }
 
         // Field.
+        var question_at: TokenIndex = 0;
         if (p.curTag() == .question) {
-            _ = try p.bump();
+            question_at = try p.bump();
             flags |= ast.Flags.optional;
         } else if (p.curTag() == .bang and !p.nlBefore()) {
             _ = try p.bump();
@@ -5448,6 +5472,15 @@ const Parser = struct {
             .in_class_decl = p.in_class_decl,
         }, p.memberModErr(mods[0..n_mods], .property, const_at));
         if (computed) |cn| try p.finishComputedName(cn, member, .class_body, .property, grammar_err);
+        // TS1276, tsc's `checkGrammarProperty`: an auto-accessor field stands
+        // for a get/set pair, and there is no way to spell an optional one.
+        // Reached only past `checkGrammarModifiers` (tsc's
+        // `!checkGrammarModifiers(node) && !checkGrammarProperty(node)`), so
+        // `accessor readonly m?: any` answers the TS1243 alone; blamed on the
+        // `?` rather than the name or the modifier.
+        if (!grammar_err and question_at != 0 and flags & ast.Flags.accessor != 0 and p.spec == 0) {
+            try p.errAtToken(.accessor_property_optional, question_at);
+        }
         return member;
     }
 

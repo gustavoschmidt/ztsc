@@ -641,6 +641,30 @@ pub const Code = enum(u16) {
     /// an `accessor` field as a property.
     abstract_method_outside_abstract_class,
     abstract_property_outside_abstract_class,
+    /// TS1243 `'{0}' modifier cannot be used with '{1}' modifier.` — the pairs
+    /// `checkGrammarModifiers` rejects OUTRIGHT rather than asking to reorder
+    /// (which is what the TS1029 family above does). One comptime template per
+    /// pair, same reason as TS1030/TS1029: the vocabulary is fixed.
+    ///
+    /// The two words are NOT the source order. tsc hard-codes them per arm, so
+    /// `static abstract` and `abstract static` both read "'static' … with
+    /// 'abstract'" and only the blamed TOKEN moves (always the modifier the
+    /// walk is standing on, i.e. the LATER of the two). The `accessor` pairs
+    /// are the exception: both modifiers carry an arm that names itself first,
+    /// so `accessor readonly` and `readonly accessor` really do read
+    /// differently — hence four arms for two pairs. All measured on tsgo 7.0.2.
+    mod_pair_static_abstract,
+    mod_pair_private_abstract,
+    mod_pair_async_abstract,
+    mod_pair_override_declare,
+    mod_pair_accessor_readonly,
+    mod_pair_accessor_declare,
+    mod_pair_readonly_accessor,
+    mod_pair_declare_accessor,
+    /// TS1276 `An 'accessor' property cannot be declared optional.` — tsc's
+    /// `checkGrammarProperty`, which runs only when `checkGrammarModifiers`
+    /// found nothing. Blamed on the `?`, not on the name or the modifier.
+    accessor_property_optional,
 
     /// TS1385/TS1386/TS1387/TS1388: `type U = string | () => void` — a function
     /// or constructor type written bare as a union or intersection CONSTITUENT,
@@ -1535,6 +1559,15 @@ pub const Code = enum(u16) {
             .ctor_mod_async,
             .abstract_method_outside_abstract_class,
             .abstract_property_outside_abstract_class,
+            .mod_pair_static_abstract,
+            .mod_pair_private_abstract,
+            .mod_pair_async_abstract,
+            .mod_pair_override_declare,
+            .mod_pair_accessor_readonly,
+            .mod_pair_accessor_declare,
+            .mod_pair_readonly_accessor,
+            .mod_pair_declare_accessor,
+            .accessor_property_optional,
             .ctor_may_not_be_accessor,
             .accessor_type_parameters,
             .get_accessor_parameters,
@@ -1929,6 +1962,15 @@ pub const Code = enum(u16) {
             .abstract_method_outside_abstract_class => "Abstract methods can only appear within an abstract class.",
             .abstract_property_outside_abstract_class => "Abstract properties can only appear within an abstract class.",
             .mod_order_export_declare => modOrderMessage("export", "declare"),
+            .mod_pair_static_abstract => modPairMessage("static", "abstract"),
+            .mod_pair_private_abstract => modPairMessage("private", "abstract"),
+            .mod_pair_async_abstract => modPairMessage("async", "abstract"),
+            .mod_pair_override_declare => modPairMessage("override", "declare"),
+            .mod_pair_accessor_readonly => modPairMessage("accessor", "readonly"),
+            .mod_pair_accessor_declare => modPairMessage("accessor", "declare"),
+            .mod_pair_readonly_accessor => modPairMessage("readonly", "accessor"),
+            .mod_pair_declare_accessor => modPairMessage("declare", "accessor"),
+            .accessor_property_optional => "An 'accessor' property cannot be declared optional.",
             .fn_type_in_union => "Function type notation must be parenthesized when used in a union type.",
             .ctor_type_in_union => "Constructor type notation must be parenthesized when used in a union type.",
             .fn_type_in_intersection => "Function type notation must be parenthesized when used in an intersection type.",
@@ -2369,6 +2411,16 @@ pub const Code = enum(u16) {
             .ctor_mod_static, .ctor_mod_override, .ctor_mod_async => 1089,
             .abstract_method_outside_abstract_class => 1244,
             .abstract_property_outside_abstract_class => 1253,
+            .mod_pair_static_abstract,
+            .mod_pair_private_abstract,
+            .mod_pair_async_abstract,
+            .mod_pair_override_declare,
+            .mod_pair_accessor_readonly,
+            .mod_pair_accessor_declare,
+            .mod_pair_readonly_accessor,
+            .mod_pair_declare_accessor,
+            => 1243,
+            .accessor_property_optional => 1276,
             .fn_type_in_union => 1385,
             .ctor_type_in_union => 1386,
             .fn_type_in_intersection => 1387,
@@ -2431,6 +2483,12 @@ fn modSeenMessage(comptime word: []const u8) []const u8 {
 
 fn modOrderMessage(comptime first: []const u8, comptime second: []const u8) []const u8 {
     return "'" ++ first ++ "' modifier must precede '" ++ second ++ "' modifier.";
+}
+
+/// TS1243's sentence. The two words are tsc's own per-arm literals, not the
+/// source order — see the `mod_pair_*` block in `Code`.
+fn modPairMessage(comptime first: []const u8, comptime second: []const u8) []const u8 {
+    return "'" ++ first ++ "' modifier cannot be used with '" ++ second ++ "' modifier.";
 }
 
 /// TS1089's sentence, for the three words tsc's constructor block can name.
