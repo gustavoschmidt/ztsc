@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-28, post wave 45)
+## Standings (2026-08-28, post wave 46)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7880 / 8641 (91.2%)** |
-| excess keys (false positives) | 3541 | 962 |
-| missing keys (under-reports) | 8617 | 1904 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7903 / 8641 (91.5%)** |
+| excess keys (false positives) | 3541 | 899 |
+| missing keys (under-reports) | 8617 | 1870 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Forty-five waves landed (3–45), every one with ZERO match→non-match regressions in
+Forty-six waves landed (3–46), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -846,7 +846,80 @@ variance parser half (TS1273/1274/1030 — the file's semantic pass now
 runs), typeof entity names, TS1183. PERF FLAG: drizzle +2.7% CPU
 cumulative this wave (B +1.3% semantic + A +0.6%); recovery on watch.
 
-## Ranked next queue (wave 46) — distilled from wave-45 agent reports
+Wave 46 (+23 exact → 7903/8641 91.5%; PERF LEDGER FLIPPED: social-app
+−7.9% CPU, drizzle −2.1% — the debt repaid): B's profile found the
+LMA cost was NOT assign.relate's internals but two unmemoized
+whole-type predicates recomputed per path (containsFreeTypeParam —
+160/1615 samples under planConditional; baseConstraintOf) plus
+typeToString re-printing per derivation level (10% of the run for 31
+diagnostics). Three memos: social-app 2.82→2.61s at jsx_lma=false;
+LMA delta +15.6%→+2.7% med/+1.9% min — flag stays OFF by a hair (gate
+≤2% vs same-generation false), but `true` is now 5% FASTER than what
+shipped before this wave; the residue is diffuse (no term >0.9%).
+Also varianceAnnotations 31/31 minus 2 (mergedDeclaredVariances ORs
+in/out across merged blocks; varianceMeasurable no longer re-expands
+the generic being measured — growing self-recursion minted fresh
+TypeIds past `seen`), distributionDependent guard (narrowed to
+both-sides-conditional after the sweep caught recursiveReverseMapped
+Type — ztsc's tuple-vs-variadic rule gap made the {} branch carry the
+tuple), TS2411 entry point provided. A landed the 20-key spread-tuple
+family EXACT (tsc's real rule from ~90 probes: naive index before the
+first spread; no-variable-element tuples answer the UN-REDUCED union
+FROM THE FIRST SPREAD; variable-element tuples align the fixed tail
+from the END) and the single-return predicate widening. C landed
+tsc's full three-guard co/contra rule (cov_drop records what the
+incremental fold walked past; dependentConflict) and mapped key-set
+priority (MappedTypeConstraint tier = the existing Rev tier). D
+landed the destructuring-assignment flow family (four bugs in one
+shape; nested pattern-default binds its RIGHT side first), false
+in-guards on intersections reaching never, hyphenated JSX attributes
+(tsc waives in exactly THREE places — never a fourth; index
+signatures say nothing about them), five parser shapes. D also
+RE-RANKED the generic-JSX-spread item: reactReadonlyHOC already
+matches; the guards are tsc-faithful and permanent; the spread gap is
+a quality item worth 0 keys.
+
+## Ranked next queue (wave 47) — distilled from wave-46 agent reports
+
+1. LMA FINAL SHAVE + FLIP: +2.7% med / +1.9% min vs same-gen false —
+   one more diffuse shave (or a quiet-machine re-measure) clears the
+   ≤2% gate; everything else is proven. Then the Defaultize-with-
+   type-param-keyset reduction (2 residual keys, repro in jsx_lma doc).
+2. TS2411 wiring: B's checkTypeLiteralIndexConstraints is IN (with a
+   marked comptime keeper to delete) — A wires typenode's
+   .object_type arm (site pinned at typenode.zig:305). The class
+   computed-key propNameType machinery is separate.
+3. contextualOverloadListFromArrayUnion (ready-to-implement, 3-line
+   witness recorded): context-sensitive ARRAY literals must route
+   through Phase 2's fixing pass like function arguments — an
+   inferTypeArgs phase-split restructure (infer.zig).
+4. staticAnonymousTypeNotReferencingTypeParameter +
+   genericClassExpressionInFunction (SAME root, 2 cases/4 keys):
+   tsc's outerTypeParameters on an anonymous class inside a generic —
+   needs instantiate.zig/subst.zig ownership (dedicate next wave's
+   core-files slot).
+5. crashDeclareGlobalTypeofExport: UMD `export as namespace` merges
+   with a global-augmentation const into ONE symbol (typeOfSymbol
+   returns their intersection, never re-enters); tsc keeps two
+   colliding globals (2×TS2451) and still types the const
+   (link/umd.zig + binder).
+6. varianceAnnotations residuals: 75:11 TS2636 rides out on
+   rel_guard_tripped; 176:9 TS2741 (named class EXPRESSION
+   self-reference).
+7. recursiveReverseMappedType: the tuple-vs-variadic-tuple relation
+   rule (B's finding — the reason the distribution guard had to
+   narrow).
+8. String-literal escape cooking (atoms.zig memberAtom; third
+   recording — stringLiteralPropertyNameWithLineContinuation1 +
+   literal-type printing; dedicated slot).
+9. Small pinned: TS2532 on void destructuring (destructure.zig);
+   TS1039 pair (declare-field initializers in non-ambient class);
+   castOfYield; escaped `def\u0061ult` switch; interfaceDeclaration4;
+   noCrashOnImportShadowing (dual export-table).
+10. Census: 183 one-key cases; TS2322 whole-case pools (UN×32/EX×23);
+    TS2339 UN×11; TS2769 UN×8.
+
+## Superseded queue (wave 46, kept for context)
 
 1. RELATION CHEAPENING for conditional checks — the LMA blocker and a
    general win: ~77µs per conditional-branch relation on social-app's
