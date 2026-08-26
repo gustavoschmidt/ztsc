@@ -79,6 +79,51 @@ pub fn emitBaseCycle(c: *Checker, sym: SymbolId) Error!void {
     }
 }
 
+/// tsc lexical scoping for a NOMINAL declaration's body, the counterpart of
+/// what `aliasGeneric` does for an alias body (`Checker.tp_shadow`): an
+/// interface's or class's own type parameter is the innermost binding of its
+/// name inside that body, so it shadows a same-named `infer` binder or mapped
+/// key belonging to whatever OTHER declaration happened to reference it first.
+///
+/// An interface body can never LEXICALLY see an `infer` binder — it is a
+/// top-level (or namespace-level) declaration — so this is unconditionally
+/// right; it was simply missing, and the miss is memoized. `interfaceGeneric`
+/// and `classInstanceGeneric` cache the generic table under the symbol, so the
+/// FIRST reference decides the table every later reader sees. Materialize
+///
+///     type Cond<P> = P extends Box<infer T, infer U> ? Box<T, U>["m"] : {};
+///     interface Box<U, R = false> { m: U }
+///
+/// in that order and `Box`'s own `U` binds to the conditional's `infer U`:
+/// `Box<number, string>["m"]` answers `infer U` for the rest of the run, from
+/// every site, whatever asks. `tsxLibraryManagedAttributes` is written exactly
+/// that way round — `InferredPropTypes<P>` names `PropTypeChecker<infer T,
+/// infer U>` above the `interface PropTypeChecker<U, TRequired>` it refers to —
+/// so every checked prop type came back as the checker's `TRequired` (`false` /
+/// `true`) instead of its `U`.
+///
+/// Only COLLIDING names are hidden, matching `tp_shadow`'s existing rule.
+const TpShadow = struct {
+    saved: []const Atom,
+    names: std.ArrayList(Atom),
+
+    fn pop(self: *TpShadow, c: *Checker) void {
+        c.tp_shadow = self.saved;
+        self.names.deinit(c.scratch());
+    }
+};
+
+fn pushTpShadow(c: *Checker, sym: SymbolId) Error!TpShadow {
+    var names: std.ArrayList(Atom) = .empty;
+    var tps: std.ArrayList(TypeParamInfo) = .empty;
+    defer tps.deinit(c.scratch());
+    try c.typeParamsOf(sym, &tps);
+    for (tps.items) |tp| try names.append(c.scratch(), c.symNameAtom(tp.sym));
+    const saved = c.tp_shadow;
+    c.tp_shadow = names.items;
+    return .{ .saved = saved, .names = names };
+}
+
 /// Generic (type-params-as-themselves) instance shape of an interface,
 /// with `extends` bases merged (derived members win).
 pub fn interfaceGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
@@ -100,6 +145,8 @@ pub fn interfaceGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
     try c.iface_generic.put(c.cm(), sym, types.no_type);
     try c.iface_stack.append(c.cm(), .{ .sym = sym });
     defer _ = c.iface_stack.pop();
+    var shadow = try pushTpShadow(c, sym);
+    defer shadow.pop(c);
     const dwin = prof_zig.declEnter(c, sym, .iface, prof_zig.dupKey(.iface, sym));
     defer prof_zig.declExit(c, dwin);
 
@@ -699,6 +746,8 @@ pub fn classInstanceGeneric(c: *Checker, sym0: SymbolId) Error!TypeId {
         return t;
     }
     try c.class_inst_generic.put(c.cm(), sym, types.no_type);
+    var shadow = try pushTpShadow(c, sym);
+    defer shadow.pop(c);
     const dwin = prof_zig.declEnter(c, sym, .class, prof_zig.dupKey(.class, sym));
     defer prof_zig.declExit(c, dwin);
     const saved_ctx = c.enterSymFile(sym);

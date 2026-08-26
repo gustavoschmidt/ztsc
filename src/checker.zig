@@ -954,7 +954,7 @@ pub const map_containers = [_][]const u8{
     "trunc_expansions",       "inst_map_bytes",       "tp_mentions",
     "smk_cache",              "rel_maybe",            "spec_sym_types",
     "spec_tainted",           "last_assign_pos",      "definitely_assigned_syms",
-    "alias_stack",            "alias_self_recursive",
+    "alias_stack",            "alias_self_recursive", "jsx_lma_cache",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -1016,6 +1016,16 @@ pub fn IntCtx(comptime K: type) type {
 pub fn IntMap(comptime K: type, comptime V: type) type {
     return std.HashMapUnmanaged(K, V, IntCtx(K), std.hash_map.default_max_load_percentage);
 }
+
+/// What one `JSX.LibraryManagedAttributes` application is a function of — see
+/// `Checker.jsx_lma_cache`. The namespace MEMBER is part of the key because
+/// which declaration `JSX.LibraryManagedAttributes` names is a per-file
+/// question (the automatic-runtime fallback), not a per-program one.
+pub const JsxLmaKey = struct {
+    sym: SymbolId,
+    ctor: TypeId,
+    props: TypeId,
+};
 
 /// Where one symbol's declared heritage lives in `Checker.nominal_base_pool`.
 /// Eight bytes per symbol ever asked, and the pool holds four bytes per
@@ -2894,9 +2904,31 @@ pub const Checker = struct {
     /// bound on the tag type itself. See `jsx.zig`'s `checkJsxTagBound`.
     atom_ElementClass: Atom = 0,
     atom_ElementType: Atom = 0,
-    /// `JSX.LibraryManagedAttributes` — not applied, only DETECTED: see
-    /// `jsx.zig`'s `jsxHasManagedAttributes`.
+    /// `JSX.LibraryManagedAttributes` — see `jsx.zig`'s
+    /// `libraryManagedAttributes` (and `jsxHasManagedAttributes` for the
+    /// `!jsx_lma` leg, which only DETECTS it).
     atom_LibraryManagedAttributes: Atom = 0,
+    /// `JSX.LibraryManagedAttributes<Tag, Props>` per (namespace member, tag
+    /// type, props type) — `jsx.zig`'s `libraryManagedAttributes`.
+    ///
+    /// MEASURED, and the reason the transform can ship at all: it is one
+    /// conditional-alias instantiation per COMPONENT TAG, and social-app writes
+    /// 16 547 of them. Un-memoized that is **+20 % single-threaded wall** on
+    /// social-app (3.376 s -> 4.056 s, base 24c0900). The distinct arguments
+    /// are per COMPONENT, not per tag — a `<Button>` written two hundred times
+    /// asks the same question two hundred times — so the memo collapses the
+    /// work to the component count.
+    ///
+    /// Keyed on the namespace member too, not just the pair: `jsxNamespaceMember`
+    /// answers per FILE (the automatic-runtime fallback reads
+    /// `Program.jsxRuntimeFile(cur_file)`), so two files in one program can
+    /// resolve DIFFERENT `LibraryManagedAttributes` declarations, and
+    /// @emotion/react is exactly that shape.
+    ///
+    /// Never populated for a result whose instantiation tripped the depth/count
+    /// limit — a truncated answer is a function of the live depth, not of the
+    /// key (same rule as `erase_cache`).
+    jsx_lma_cache: std.AutoHashMapUnmanaged(JsxLmaKey, TypeId) = .empty,
     atom_children: Atom = 0,
     /// `Program.jsx_factory_ns` interned (0 when no `jsxFactory` is set): the
     /// container tsc reads the `JSX` namespace out of before the global one.

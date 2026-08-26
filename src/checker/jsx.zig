@@ -211,6 +211,9 @@ pub fn checkJsxElement(c: *Checker, node: Node) Error!TypeId {
             .no_namespace => .{ .props = null },
         } else try c.jsxComponentProps(tag_ty, targs.items, node);
         props = chosen.props orelse types.no_type;
+        if (jsx_lma and props != types.no_type) {
+            props = try libraryManagedAttributes(c, tag_ty, props);
+        }
         overloads_exhausted = chosen.overloads_exhausted;
         // TS2604, tsc's `resolveJsxOpeningLikeElement`: with no signature to
         // resolve against there is no component here at all. Blamed on the TAG
@@ -1452,19 +1455,140 @@ fn jsxPropsSelector(c: *Checker) Error!JsxPropsSelector {
     return .{ .member = c.ts.objectProp(rt, 0).name };
 }
 
-/// Does the JSX namespace declare `LibraryManagedAttributes`? ztsc does not
-/// apply it (tsc's `getJsxManagedAttributesFromLocatedAttributes` runs the
-/// resolved props type through it before anything checks an attribute), and the
-/// transform's whole job is to make props OPTIONAL — `Defaultize<P, typeof
-/// C.defaultProps>` and the `propTypes` widening both only ever loosen the
-/// target. So a namespace that declares one is a namespace where ztsc's
-/// un-managed props type is known to be too strict, and every missing/excess
-/// complaint against it is a false positive: `tsxLibraryManagedAttributes` grew
-/// 18 of them the moment the first-parameter arm below started answering.
+/// BISECT LEG: apply `JSX.LibraryManagedAttributes` for real
+/// (`libraryManagedAttributes`) instead of surrendering the props target
+/// wherever the namespace declares one (`jsxHasManagedAttributes`).
+///
+/// The transform is a rule of the LIBRARY, not of the language: whatever the
+/// namespace's alias says happens to the props type before a single attribute
+/// is checked. React's is `Defaultize<P, typeof C.defaultProps>` plus the
+/// `propTypes` widening — both of which only LOOSEN — but emotion's is
+/// `P & { css: string }`, which tightens nothing and adds a name, and a
+/// hand-rolled one can say anything at all. So "declares one" was never a
+/// verdict; it was a stand-in for evaluating it, kept while the prerequisite
+/// (`generics.inferFromExtendsInner` walking a `.class_value`'s statics, so
+/// `C extends { defaultProps: infer D }` can match) was missing.
+///
+/// OFF, ON A PERF VERDICT, NOT A CORRECTNESS ONE. Everything else is clean —
+/// wave 45 measured, at `jsx_lma = true`, against 24c0900:
+///
+///   * ts-suite: ZERO match -> non-match over 8641 run cases, +1 exact
+///     (`jsxLibraryManagedAttributesUnusedGeneric`, emotion's
+///     `WithCSSProp<P> = P & { css: string }`), -15 missing keys / +2 excess
+///     (`tsxLibraryManagedAttributes` 15/15 tsgo keys, two residual excess —
+///     see below). Only those two cases moved in the whole sweep.
+///   * both apps byte-identical to their baselines; `zig build test` green
+///     (conformance 1328/1328); the checkers x orders grid byte-identical
+///     (60 cells: excalidraw + social-app at `tsconfig.check.json` and
+///     `tsconfig.json`, 1/2/4/8 checkers x 5 root orders).
+///   * PERF, single-threaded interleaved min-of-7 A/B: excalidraw +0.81 %
+///     wall / +0.31 % RSS (default threading -0.19 % / -0.32 %) — free.
+///     social-app +15.56 % wall / +0.20 % RSS (default threading +14.89 % /
+///     +1.00 %; the gated `tsconfig.check.json` +8.59 % / -0.74 %).
+///
+/// social-app is what blocks it: 16 547 component tags over ~1 300 DISTINCT
+/// component types, and @types/react's chain — `C extends MemoExoticComponent
+/// <infer T> | LazyExoticComponent<infer T> ? … : ReactManagedAttributes<C, P>`
+/// over three more `C extends { propTypes: infer T; defaultProps: infer D }`
+/// arms — costs ~0.4 ms per distinct type. `jsx_lma_cache` already collapses
+/// the per-TAG cost (91 % hit rate, 12 749 hits / 1 300 misses); the misses are
+/// irreducible, because the distinct (tag type, props) pairs are ~1:1 with the
+/// distinct TAG TYPES — a memo keyed on the tag type alone was measured and
+/// saves nothing further.
+///
+/// AND THE COST IS NOT INSTANTIATION. `--inst-profile` charges 881 925 ->
+/// 901 379 expandRef visits, +2.2 %, against +15 % wall: the time is in the
+/// RELATION each conditional check runs (~5 200 of them, ~77 us each). So the
+/// lever is `assign.relate`'s cost for `<component type> vs <exotic-component
+/// interface>`, not anything this file can memoize.
+///
+/// Kept as a compile-time const rather than deleted so the two behaviours stay
+/// one binary apart — see `assign.measured_variance_decides` for the same
+/// pattern. Flip it to `true` to re-measure.
+///
+/// TWO RESIDUAL EXCESS KEYS at `true` (`tsxLibraryManagedAttributes.tsx`
+/// 60:12 and 103:12), and they are NOT this seam: a `Defaultize`-shaped alias
+/// instantiated with a TYPE PARAMETER in its key set and an `infer` binder
+/// supplying the excluded keys loses the split. Minimal repro — the first is
+/// correct, the second is not, and they differ only in `TProps`:
+///
+///     Lma<Ctor, {}>            where Lma<C, TProps> = C extends
+///       { defaultProps: infer D; propTypes: infer P }
+///         ? Defaultize<TProps & InferredPropTypes<P>, D> : TProps
+///
+/// gives `{ bar; baz; foo }` (foo REQUIRED) `& { foo? }`, while writing `{}`
+/// in place of `TProps` gives the right `{ bar; baz } & { foo? } & { foo? }`.
+/// The `Extract` map comes back empty and the `Exclude` map keeps every key.
+const jsx_lma = false;
+
+/// tsc's `getJsxManagedAttributesFromLocatedAttributes`: run the located props
+/// type through `JSX.LibraryManagedAttributes<TagType, Props>` before anything
+/// checks an attribute against it.
+///
+/// `ctor` is `getStaticTypeOfReferencedJsxConstructor`'s answer — for a
+/// component tag, the type of the tag expression itself (the class's STATIC
+/// side, which is what carries `defaultProps`/`propTypes`).
+///
+/// Both of tsc's arms are covered by `namedTypeFromSymbol`, which instantiates
+/// an alias and an interface alike; the shared precondition is tsc's
+/// `length(params) >= 2`. Two arguments are supplied and the rest are left to
+/// `fixTypeArgs` to fill from their DEFAULTS, which is `fillMissingTypeArguments`
+/// with `minTypeArgumentCount = 2`. A declaration whose third parameter has no
+/// default is where the two part ways — tsc fills `unknown`, `fixTypeArgs` would
+/// report a TS2314 against a synthetic span — so that shape declines instead.
+///
+/// Memoized on `Checker.jsx_lma_cache`: this runs once per COMPONENT TAG, and
+/// leaving it un-memoized is +20% single-threaded wall on social-app. See the
+/// field for the measurement and for why the namespace member is part of the
+/// key.
+fn libraryManagedAttributes(c: *Checker, ctor: TypeId, props: TypeId) Error!TypeId {
+    const sym = (try c.jsxNamespaceMember(c.atom_LibraryManagedAttributes)) orelse return props;
+    const key: checker_zig.JsxLmaKey = .{ .sym = sym, .ctor = ctor, .props = props };
+    if (c.jsx_lma_cache.get(key)) |t| return t;
+    // Scope the truncation flag exactly as `eraseParamsOf` does: the memo must
+    // ask "was MY result truncated", not "did anything earlier trip".
+    const outer_trip = c.inst_limit_tripped;
+    c.inst_limit_tripped = false;
+    defer c.inst_limit_tripped = c.inst_limit_tripped or outer_trip;
+    const managed = try computeLibraryManagedAttributes(c, sym, ctor, props);
+    if (!c.inst_limit_tripped) try c.jsx_lma_cache.put(c.cm(), key, managed);
+    return managed;
+}
+
+/// The pure half of `libraryManagedAttributes`: `sym` is the already-resolved
+/// `JSX.LibraryManagedAttributes` declaration, and the answer is a function of
+/// (`sym`, `ctor`, `props`) alone.
+fn computeLibraryManagedAttributes(c: *Checker, sym: SymbolId, ctor: TypeId, props: TypeId) Error!TypeId {
+    var tps: std.ArrayList(TypeParamInfo) = .empty;
+    defer tps.deinit(c.scratch());
+    try c.typeParamsOf(sym, &tps);
+    if (tps.items.len < 2) return props;
+    var required: usize = 0;
+    for (tps.items) |tp| {
+        if (tp.default == 0) required += 1;
+    }
+    if (required > 2) return props;
+    const managed = try c.namedTypeFromSymbol(sym, &.{ ctor, props }, 0);
+    // A declaration that is neither alias nor interface answers `any_type`
+    // here; an arity/cycle failure answers `error_type`. Neither is a props
+    // target, and tsc reaches neither, so keep the located type.
+    if (managed == types.error_type or managed == types.any_type) return props;
+    return managed;
+}
+
+/// Does the JSX namespace declare `LibraryManagedAttributes`? The `!jsx_lma`
+/// leg's stand-in for evaluating it (see `jsx_lma`): the transform's whole job
+/// in React is to make props OPTIONAL — `Defaultize<P, typeof C.defaultProps>`
+/// and the `propTypes` widening both only ever loosen the target — so a
+/// namespace that declares one is a namespace where an un-managed props type is
+/// known to be too strict, and every missing/excess complaint against it is a
+/// false positive: `tsxLibraryManagedAttributes` grew 18 of them the moment the
+/// first-parameter arm below started answering.
 ///
 /// Consulted only by the arms that had NO target at all before, so this cannot
 /// take a check away from anything that already worked.
 fn jsxHasManagedAttributes(c: *Checker) Error!bool {
+    if (jsx_lma) return false;
     return (try c.jsxNamespaceMember(c.atom_LibraryManagedAttributes)) != null;
 }
 
