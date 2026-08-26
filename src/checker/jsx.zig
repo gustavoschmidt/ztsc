@@ -1468,10 +1468,57 @@ fn jsxPropsSelector(c: *Checker) Error!JsxPropsSelector {
 /// (`generics.inferFromExtendsInner` walking a `.class_value`'s statics, so
 /// `C extends { defaultProps: infer D }` can match) was missing.
 ///
+/// OFF, ON A PERF VERDICT, NOT A CORRECTNESS ONE. Everything else is clean —
+/// wave 45 measured, at `jsx_lma = true`, against 24c0900:
+///
+///   * ts-suite: ZERO match -> non-match over 8641 run cases, +1 exact
+///     (`jsxLibraryManagedAttributesUnusedGeneric`, emotion's
+///     `WithCSSProp<P> = P & { css: string }`), -15 missing keys / +2 excess
+///     (`tsxLibraryManagedAttributes` 15/15 tsgo keys, two residual excess —
+///     see below). Only those two cases moved in the whole sweep.
+///   * both apps byte-identical to their baselines; `zig build test` green
+///     (conformance 1328/1328); the checkers x orders grid byte-identical
+///     (60 cells: excalidraw + social-app at `tsconfig.check.json` and
+///     `tsconfig.json`, 1/2/4/8 checkers x 5 root orders).
+///   * PERF, single-threaded interleaved min-of-7 A/B: excalidraw +0.81 %
+///     wall / +0.31 % RSS (default threading -0.19 % / -0.32 %) — free.
+///     social-app +15.56 % wall / +0.20 % RSS (default threading +14.89 % /
+///     +1.00 %; the gated `tsconfig.check.json` +8.59 % / -0.74 %).
+///
+/// social-app is what blocks it: 16 547 component tags over ~1 300 DISTINCT
+/// component types, and @types/react's chain — `C extends MemoExoticComponent
+/// <infer T> | LazyExoticComponent<infer T> ? … : ReactManagedAttributes<C, P>`
+/// over three more `C extends { propTypes: infer T; defaultProps: infer D }`
+/// arms — costs ~0.4 ms per distinct type. `jsx_lma_cache` already collapses
+/// the per-TAG cost (91 % hit rate, 12 749 hits / 1 300 misses); the misses are
+/// irreducible, because the distinct (tag type, props) pairs are ~1:1 with the
+/// distinct TAG TYPES — a memo keyed on the tag type alone was measured and
+/// saves nothing further.
+///
+/// AND THE COST IS NOT INSTANTIATION. `--inst-profile` charges 881 925 ->
+/// 901 379 expandRef visits, +2.2 %, against +15 % wall: the time is in the
+/// RELATION each conditional check runs (~5 200 of them, ~77 us each). So the
+/// lever is `assign.relate`'s cost for `<component type> vs <exotic-component
+/// interface>`, not anything this file can memoize.
+///
 /// Kept as a compile-time const rather than deleted so the two behaviours stay
 /// one binary apart — see `assign.measured_variance_decides` for the same
-/// pattern.
-const jsx_lma = true;
+/// pattern. Flip it to `true` to re-measure.
+///
+/// TWO RESIDUAL EXCESS KEYS at `true` (`tsxLibraryManagedAttributes.tsx`
+/// 60:12 and 103:12), and they are NOT this seam: a `Defaultize`-shaped alias
+/// instantiated with a TYPE PARAMETER in its key set and an `infer` binder
+/// supplying the excluded keys loses the split. Minimal repro — the first is
+/// correct, the second is not, and they differ only in `TProps`:
+///
+///     Lma<Ctor, {}>            where Lma<C, TProps> = C extends
+///       { defaultProps: infer D; propTypes: infer P }
+///         ? Defaultize<TProps & InferredPropTypes<P>, D> : TProps
+///
+/// gives `{ bar; baz; foo }` (foo REQUIRED) `& { foo? }`, while writing `{}`
+/// in place of `TProps` gives the right `{ bar; baz } & { foo? } & { foo? }`.
+/// The `Extract` map comes back empty and the `Exclude` map keeps every key.
+const jsx_lma = false;
 
 /// tsc's `getJsxManagedAttributesFromLocatedAttributes`: run the located props
 /// type through `JSX.LibraryManagedAttributes<TagType, Props>` before anything
@@ -1488,8 +1535,29 @@ const jsx_lma = true;
 /// with `minTypeArgumentCount = 2`. A declaration whose third parameter has no
 /// default is where the two part ways — tsc fills `unknown`, `fixTypeArgs` would
 /// report a TS2314 against a synthetic span — so that shape declines instead.
+///
+/// Memoized on `Checker.jsx_lma_cache`: this runs once per COMPONENT TAG, and
+/// leaving it un-memoized is +20% single-threaded wall on social-app. See the
+/// field for the measurement and for why the namespace member is part of the
+/// key.
 fn libraryManagedAttributes(c: *Checker, ctor: TypeId, props: TypeId) Error!TypeId {
     const sym = (try c.jsxNamespaceMember(c.atom_LibraryManagedAttributes)) orelse return props;
+    const key: checker_zig.JsxLmaKey = .{ .sym = sym, .ctor = ctor, .props = props };
+    if (c.jsx_lma_cache.get(key)) |t| return t;
+    // Scope the truncation flag exactly as `eraseParamsOf` does: the memo must
+    // ask "was MY result truncated", not "did anything earlier trip".
+    const outer_trip = c.inst_limit_tripped;
+    c.inst_limit_tripped = false;
+    defer c.inst_limit_tripped = c.inst_limit_tripped or outer_trip;
+    const managed = try computeLibraryManagedAttributes(c, sym, ctor, props);
+    if (!c.inst_limit_tripped) try c.jsx_lma_cache.put(c.cm(), key, managed);
+    return managed;
+}
+
+/// The pure half of `libraryManagedAttributes`: `sym` is the already-resolved
+/// `JSX.LibraryManagedAttributes` declaration, and the answer is a function of
+/// (`sym`, `ctor`, `props`) alone.
+fn computeLibraryManagedAttributes(c: *Checker, sym: SymbolId, ctor: TypeId, props: TypeId) Error!TypeId {
     var tps: std.ArrayList(TypeParamInfo) = .empty;
     defer tps.deinit(c.scratch());
     try c.typeParamsOf(sym, &tps);
