@@ -5416,6 +5416,21 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool, ctx: TypeId) Error!Cha
             }
         },
         .number => result = try c.numberIndexType(r),
+        // An `any` key — or an already-ERRORED one, `t[this._name]` where
+        // `_name` was itself a TS2339 — is applicable to EVERY index
+        // signature: tsc's `isApplicableIndexType` is an assignability test,
+        // and `errorType` carries `TypeFlags.Any`, so `findApplicableIndexInfo`
+        // answers the number signature first and the string one as its last
+        // resort. That is exactly `numberIndexType`'s own fallback order.
+        //
+        // Answering `any` outright instead threw the WRITE check away with
+        // the read: `storage.sources[this._name] = value` on a
+        // `{ [name: string]: string }` never compared `value` to `string`
+        // (crashRegressionTest). tsc's TS7053 for a receiver with no index
+        // signature at all is deliberately NOT added here — that is a
+        // separate, much wider family (`this[k]` inside any class), and the
+        // `any` fallback under-reports it as it always has.
+        .any, .err => result = try c.numberIndexType(r),
         .string => {
             if (rk == .object and props_zig.stringIndexForStringKey(c, r) != 0) {
                 result = props_zig.stringIndexForStringKey(c, r);
