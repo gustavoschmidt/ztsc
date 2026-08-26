@@ -3245,6 +3245,56 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
             const constraint = try relationConstraintOf(c, s);
             if (constraint != types.no_type and try c.isAssignable(constraint, t)) return true;
         }
+        // An INTERSECTION source whose constituent spans the union the same
+        // way — tsc's `someTypeRelatedToType(source, target, …,
+        // IntersectionState.Source)`, "any constituent of the intersection is
+        // immediately related to the TARGET". The general intersection-source
+        // arm below is never reached for a union target (this arm ends in
+        // `return false`), and the per-member loop above asks the whole
+        // intersection against one member at a time, which is a different
+        // question: `<T extends string | number, U extends string | number>`
+        // gives `x: T & U` a constituent constrained to exactly the target
+        // union, and neither `T & U → string` nor `T & U → number` holds
+        // (`intersectionWithUnionConstraint`, five false TS2322).
+        //
+        // Sound for any constituent — `A & B` is a subtype of `A` — but
+        // restricted to INSTANTIABLE ones, which is where the gap actually is:
+        // a concrete constituent spanning a union without fitting a member
+        // would itself have to be a union, and `makeIntersection` distributes
+        // those away. Keeping it narrow also keeps the failure path cheap; the
+        // per-member loop above is already the expensive half of a union
+        // target (see the identity-case hoist further up).
+        //
+        // …and failing that, the intersection's COMBINED constraint, which is
+        // the `sk == .type_param` fallback above one kind out: tsc's
+        // `getBaseConstraintOfType` of an intersection intersects the
+        // constituents' constraints, and `getIntersectionType` distributes the
+        // unions among them into their cross product, so
+        // `T & U` for `T extends string | number | undefined` and
+        // `U extends string | null | undefined` is constrained to exactly
+        // `string | undefined` — a target no single constituent's constraint
+        // fits. `baseConstraintOf` builds that same cross product through
+        // `makeIntersection`.
+        //
+        // An intersection that still carries a `null`/`undefined` constituent
+        // is excluded, exactly as the intersection-TARGET arm below excludes
+        // it: `null & T` contributes no members and tsc refuses it, so
+        // reaching `T`'s constraint through it would accept a value that has
+        // none of them. excalidraw's `useOutsideClick` is the live case — the
+        // `target` of `Event & { target: T }` is `(EventTarget | null) & T`,
+        // whose `null` half is what tsc's TS2345 is about.
+        if (sk == .intersection and !try c.hasNullishMember(s)) {
+            var instantiable = false;
+            for (try c.memberList(s)) |m| {
+                if (!isInstantiableForUnionSpan(c.ts.kind(m))) continue;
+                instantiable = true;
+                if (try c.isAssignable(m, t)) return true;
+            }
+            if (instantiable) {
+                const bc = try c.baseConstraintOf(s);
+                if (bc != s and try c.isAssignable(bc, t)) return true;
+            }
+        }
         // Discriminated-union normalization: a source object whose
         // discriminant property is a union may still be assignable to a
         // union target that splits that discriminant across members, even
@@ -4887,6 +4937,17 @@ fn intersectionMemberBaseConstraint(c: *Checker, m: TypeId, depth: u32) Error!?T
 /// `baseConstraintOf` substitutes each type param in `t` with its
 /// *immediate* constraint from a fixed map, so `U extends T extends Base`
 /// only reaches `T`; re-running it to a fixpoint reaches `Base`.
+/// Kinds whose relation to a UNION target may need the target taken whole —
+/// tsc's `TypeFlags.Instantiable`. A type variable and the deferred operators
+/// over one all answer from a constraint that can itself be a union, so asking
+/// them against one union member at a time can only under-answer.
+fn isInstantiableForUnionSpan(k: types.Kind) bool {
+    return switch (k) {
+        .type_param, .this_type, .index_access, .conditional, .keyof_op, .mapped, .string_mapping, .template_literal_type => true,
+        else => false,
+    };
+}
+
 pub fn transitiveBaseConstraint(c: *Checker, t: TypeId) Error!TypeId {
     var cur = t;
     var i: u32 = 0;
