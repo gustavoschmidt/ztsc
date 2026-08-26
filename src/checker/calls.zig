@@ -618,10 +618,20 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
         const link = try c.chainObjType(shape.callee);
         if (link.chained) chained = true;
         break :blk link.ty;
-    } else try c.checkExprCached(shape.callee, if (is_new)
-        types.no_type
-    else
-        try iifeContextualSig(c, shape));
+    } else blk: {
+        // `getImmediatelyInvokedFunctionExpression` is a question about a
+        // function's PARENT, which ztsc's AST cannot answer; record the answer
+        // here, where both halves are in hand, for the body walk to read. Only
+        // a plain call invokes its callee immediately — `new (function(){})`
+        // constructs it instead, which is not what tsc's helper matches.
+        const saved_iife = c.iife_fn;
+        defer c.iife_fn = saved_iife;
+        c.iife_fn = if (is_new) 0 else iifeCallee(c, shape.callee);
+        break :blk try c.checkExprCached(shape.callee, if (is_new)
+            types.no_type
+        else
+            try iifeContextualSig(c, shape));
+    };
     if (shape.optional) {
         if (c.containsNullish(callee_t)) chained = true;
         callee_t = try c.nonNullableChain(callee_t);

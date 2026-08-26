@@ -1914,6 +1914,39 @@ pub const Checker = struct {
     /// isComputedPropertyName(n) && n.parent.parent === declaration)`. Read by
     /// `checkTdz`; set only around `checkMemberNames`. (wave-41 A.)
     computed_key_owner: Node = 0,
+    /// The CLASS whose DECORATOR expression is being checked — its own
+    /// (`@dec class C {}`) or one on any of its members (`class C { @dec m() {} }`)
+    /// — or 0 outside one. A decorator runs while the class binding is still
+    /// uninitialized, so a reference to *that* class from inside it is in a
+    /// temporal dead zone however the positions read: `@dec(C) class C {}` and
+    /// `class C { @dec(C) m() {} }` are both TS2449, even though the member
+    /// decorator is written textually AFTER the `class` keyword.
+    ///
+    /// It is the decorator counterpart of `computed_key_owner`, with one
+    /// difference the oracle insists on: a decorator's dead zone IS deferred by
+    /// an enclosing function, because tsc reaches this through
+    /// `isUsedInFunctionOrInstanceProperty`, whose function-like clause is
+    ///
+    ///     if (isFunctionLike(current)) return !getImmediatelyInvokedFunctionExpression(current);
+    ///
+    /// — so `@dec(() => C)` is clean while `@dec((() => C)())` is not: an
+    /// IMMEDIATELY INVOKED function defers nothing, it runs right there.
+    /// `checkFunctionBody` implements that by clearing this field for every
+    /// body it walks except `iife_fn`'s.
+    ///
+    /// Set only around `decorators.checkClassDecorator` /
+    /// `decorators.checkMemberDecorator`, and restored after — which is what
+    /// keeps a nested class's decorator (`@dec(class I { @dec(C) n() {} })`)
+    /// pointing at `I` rather than at `C`, the shape tsc leaves clean.
+    /// (wave-44 A.)
+    decorator_owner: Node = 0,
+    /// The function expression the call currently being checked IMMEDIATELY
+    /// INVOKES — tsc's `getImmediatelyInvokedFunctionExpression`, recorded on the
+    /// way in because ztsc's AST carries no parent links to ask for it later.
+    /// Set by `calls.checkCallExprInner` around the callee walk (0 when the
+    /// callee is not a function expression), read by `checkFunctionBody`.
+    /// (wave-44 A.)
+    iife_fn: Node = 0,
     /// The bare identifier being checked is the operand of `export = X`. tsc's
     /// `isBlockScopedNameDeclaredBeforeUse` exempts it by name — "inside a TS
     /// export= declaration (since we will move the export statement during emit

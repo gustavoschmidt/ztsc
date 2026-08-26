@@ -1398,9 +1398,19 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
     // …and the `super` container a DECORATOR steps out of its class for: a
     // function written inside the decorator is a container of its own.
     const saved_in_deco = c.in_decorator;
+    // …and a function written inside a DECORATOR defers what it reads to call
+    // time, so the decorator's temporal dead zone (`Checker.decorator_owner`)
+    // stops at its boundary — unless the function is IMMEDIATELY INVOKED, which
+    // runs it right where it is written and defers nothing. That is tsc's
+    // `isUsedInFunctionOrInstanceProperty` clause `if (isFunctionLike(current))
+    // return !getImmediatelyInvokedFunctionExpression(current)`, and it is the
+    // whole difference between `@dec(() => C)` (clean) and `@dec((() => C)())`
+    // (TS2449). See `Checker.iife_fn` for how the IIFE question is answered.
+    const saved_deco_owner = c.decorator_owner;
     c.in_ctor_body = c.nodeTag(node) == .class_method and c.isCtorMember(node, proto.flags);
     c.in_computed_key = false;
     c.in_decorator = false;
+    if (node != c.iife_fn) c.decorator_owner = 0;
     defer {
         c.cur_scope = saved_scope;
         c.fn_ctx = saved_ctx;
@@ -1409,6 +1419,7 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
         c.in_ctor_body = saved_in_ctor;
         c.in_computed_key = saved_in_key;
         c.in_decorator = saved_in_deco;
+        c.decorator_owner = saved_deco_owner;
     }
     if (try c.scopeOf(node)) |s| c.cur_scope = s;
     // An explicit `this` parameter types `this` inside the body.
@@ -2663,6 +2674,11 @@ pub fn checkClass(c: *Checker, node: Node, ctx: TypeId) Error!void {
             try c.ts.makeClassValue(class_sym)
         else
             types.any_type;
+        // The decorator runs before the class binding exists, so the class is
+        // in a temporal dead zone throughout it — see `Checker.decorator_owner`.
+        const saved_deco_owner = c.decorator_owner;
+        defer c.decorator_owner = saved_deco_owner;
+        c.decorator_owner = node;
         for (decos) |deco| {
             try decorators.checkClassDecorator(c, deco, class_val);
         }
@@ -2940,8 +2956,19 @@ pub fn checkClass(c: *Checker, node: Node, ctx: TypeId) Error!void {
                 // every decorator function of TS2454 in
                 // `decoratorUsedBeforeDeclaration`.
                 const saved_deco = c.in_decorator;
-                defer c.in_decorator = saved_deco;
+                // A MEMBER decorator runs at class-definition time too, before
+                // the class binding is initialized, so the class is in a
+                // temporal dead zone inside it however the positions read —
+                // `class C { @dec(C) m() {} }` is TS2449 even though the
+                // decorator is written after the `class` keyword. See
+                // `Checker.decorator_owner`.
+                const saved_deco_owner = c.decorator_owner;
+                defer {
+                    c.in_decorator = saved_deco;
+                    c.decorator_owner = saved_deco_owner;
+                }
                 c.in_decorator = true;
+                c.decorator_owner = node;
                 c.this_type = saved_this;
                 // The decorated member is the next non-decorator member. It
                 // is needed BEFORE the decorator expression is checked: the

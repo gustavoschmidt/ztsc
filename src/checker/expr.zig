@@ -1346,6 +1346,21 @@ fn checkTdz(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex) Error!void 
             return;
         }
     }
+    // …and so is a class named inside one of its OWN DECORATORS, or inside a
+    // decorator on one of its members: both run at class-definition time,
+    // before the binding is assigned. `@dec(C) class C {}` and
+    // `class C { @dec(C) m() {} }` are TS2449 alike, and the second is the
+    // reason this cannot wait for the position test below — the decorator sits
+    // after the `class` keyword, so the positions say "declared first".
+    // `Checker.decorator_owner` carries the boundary, and has already been
+    // cleared by any enclosing non-IIFE function, which defers the use.
+    if (c.symFlags(sym).class and c.decorator_owner != 0) {
+        for (decls) |d| {
+            if (d != c.decorator_owner) continue;
+            try c.diagFmt(2449, c.tokSpan(tok), "Class '{s}' used before its declaration.", .{c.tokenText(tok)});
+            return;
+        }
+    }
     const decl_start = c.nodeSpanStart(decls[0]);
     const use_start = c.tree.tokens.start(tok);
     if (use_start >= decl_start) return;
@@ -8390,6 +8405,16 @@ fn checkFunctionLikeExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     const prev_cc = c.const_ctx;
     c.const_ctx = false;
     defer c.const_ctx = prev_cc;
+    // A function written inside a DECORATOR defers what it reads to call time,
+    // ending the decorator's temporal dead zone — unless it is IMMEDIATELY
+    // INVOKED (`Checker.decorator_owner`, `Checker.iife_fn`). The boundary is
+    // here rather than only in `checkFunctionBody` because the return-type
+    // PROBE inside `signatureOfProtoCtx` types the same body expressions first,
+    // and a `@dec(() => C)` reported from the probe is a TS2449 tsc never
+    // issues.
+    const saved_deco_owner = c.decorator_owner;
+    defer c.decorator_owner = saved_deco_owner;
+    if (node != c.iife_fn) c.decorator_owner = 0;
     const d = c.tree.nodeData(node);
     const ctx_sig = try c.contextualCallSig(ctx, node);
     // tsc's `getContextualThisParameterType`: a contextually typed function
