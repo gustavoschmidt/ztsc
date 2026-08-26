@@ -2471,7 +2471,11 @@ pub const Store = struct {
     ///
     /// An enum has no bit either: a member's domain follows its VALUE, which
     /// the store cannot read, so an enum-bearing intersection is left alone.
-    fn disjointDomain(s: *const Store, t: TypeId) u32 {
+    /// `pub` for `assign.computeIntersectionIsNever`, which runs the same
+    /// classification one CONSTRAINT step further than the store can — see
+    /// there. The classification itself must have exactly one definition:
+    /// two copies of "which primitive domains are disjoint" would drift.
+    pub fn disjointDomain(s: *const Store, t: TypeId) u32 {
         return switch (s.kind(t)) {
             .object_keyword => 1, // NonPrimitive
             .string, .string_literal, .template_literal_type, .string_mapping => 2,
