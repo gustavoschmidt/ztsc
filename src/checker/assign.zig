@@ -3153,10 +3153,10 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         // Same two guards as the target rule: neither side may still be
         // generic after taking base constraints.
         const idx_bc = try relationIndexKeyConstraint(c, c.ts.indexAccessIndex(s));
-        if (!try c.isGenericObjectForIndex(obj_bc) and !try c.containsFreeTypeParam(idx_bc, &.{}) and
-            try keyDomainAnswerable(c, obj_bc, c.ts.indexAccessIndex(s)))
+        if (!try c.isGenericObjectForIndex(obj_bc) and !try c.containsFreeTypeParam(idx_bc.ty, &.{}) and
+            try keyDomainAnswerable(c, obj_bc, idx_bc.from_keyof))
         {
-            const bc = try c.reduceIndexedAccess(obj_bc, idx_bc);
+            const bc = try c.reduceIndexedAccess(obj_bc, idx_bc.ty);
             if (bc != s and c.ts.kind(bc) != .unknown and try c.isAssignable(bc, t)) return true;
         }
         if (c.ts.kind(c.ts.indexAccessObj(s)) == .conditional) {
@@ -5006,9 +5006,40 @@ fn relationIndexObjConstraint(c: *Checker, t: TypeId) Error!TypeId {
 /// this is the relation's copy of it, over the one operand the relation asks
 /// about (extracting a shared helper would mean exporting one of the two
 /// modules' notion of "resolved for inspection", which differs).
-fn relationIndexKeyConstraint(c: *Checker, idx: TypeId) Error!TypeId {
-    if (c.ts.kind(idx) == .keyof_op) return c.propertyKeyType();
-    return c.baseConstraintOf(idx);
+///
+/// TRANSITIVE, as `getBaseConstraint` is — and the `keyof` rule applies at
+/// every step, not only the first. `K extends keyof T` takes two: `K` to the
+/// deferred `keyof T`, and that to the property-key domain. Stopping after one
+/// left `keyof T` — still generic — and the caller's free-parameter guard then
+/// declined every `T[K]` written that way, so `obj[key]` under
+/// `<T extends ItemMap, K extends keyof T>` had no constraint at all and could
+/// not be read as an `Item` (`mappedTypeRelationships` `f51`, which is exactly
+/// `f50`'s `T[keyof T]` one alias further out).
+///
+/// The extra step is not the collapse the TARGET rule refuses
+/// (`indexAccessTargetConstraint`): that one is about iterating
+/// `baseConstraintOf`, which instantiates `T := unknown` and reduces
+/// `keyof unknown` to `never`. Answering the property-key DOMAIN is the
+/// opposite move — the widest key set, not the narrowest — and it is guarded
+/// by `keyDomainAnswerable`, which is why it cannot make an unresolvable
+/// access accept everything.
+const IndexKeyConstraint = struct {
+    ty: TypeId,
+    /// The chain ended in the property-key domain, so the object side has to
+    /// be able to answer that whole domain for the reduction to stand.
+    from_keyof: bool,
+};
+
+fn relationIndexKeyConstraint(c: *Checker, idx: TypeId) Error!IndexKeyConstraint {
+    var cur = idx;
+    var i: u32 = 0;
+    while (i < 8) : (i += 1) {
+        if (c.ts.kind(cur) == .keyof_op) return .{ .ty = try c.propertyKeyType(), .from_keyof = true };
+        const next = try c.baseConstraintOf(cur);
+        if (next == cur) break;
+        cur = next;
+    }
+    return .{ .ty = cur, .from_keyof = false };
 }
 
 /// tsc's `getIndexedAccessTypeOrUndefined` answering UNDEFINED — the other
@@ -5032,15 +5063,17 @@ fn relationIndexKeyConstraint(c: *Checker, idx: TypeId) Error!TypeId {
 /// changed nothing: `object[string | number | symbol]` came back `any` where
 /// it used to come back `never`, and both accept every target.
 ///
-/// So the domain question is asked separately, and only for a `keyof` index —
-/// every other key shape reduces to a concrete member and keeps its existing
-/// answer. A string index signature is the one thing that answers a key known
-/// only to be a property key; a table of NAMED members does not, which is
-/// exactly why tsc still errors under `T extends { a: number; b: number }`
-/// (oracle-pinned, `indexedAccessConstraints`). An `any`/error object answers
-/// everything by definition.
-fn keyDomainAnswerable(c: *Checker, obj_bc: TypeId, idx: TypeId) Error!bool {
-    if (c.ts.kind(idx) != .keyof_op) return true;
+/// So the domain question is asked separately, and only when the key's
+/// constraint chain BOTTOMED OUT in the property-key domain
+/// (`IndexKeyConstraint.from_keyof`) — every other key shape reduces to a
+/// concrete member and keeps its existing answer. A string index signature is
+/// the one thing that answers a key known only to be a property key; a table
+/// of NAMED members does not, which is exactly why tsc still errors under
+/// `T extends { a: number; b: number }` (oracle-pinned,
+/// `indexedAccessConstraints`). An `any`/error object answers everything by
+/// definition.
+fn keyDomainAnswerable(c: *Checker, obj_bc: TypeId, from_keyof: bool) Error!bool {
+    if (!from_keyof) return true;
     const r = try c.resolveStructural(obj_bc);
     return switch (c.ts.kind(r)) {
         .any, .err => true,
