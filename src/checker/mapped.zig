@@ -161,9 +161,35 @@ pub fn reduceMapped(c: *Checker, key_param: TypeId, constraint: TypeId, value: T
     // unresolvable source and collapsed to `{}` before `K` was ever bound.
     // Deferring here parks it until `substMappedKey`'s `.mapped` arm binds
     // `K` and re-enters with a concrete source.
+    // …and while `keyof src` only LOOKS concrete because it distributed. The
+    // test above reads the key set, which is the right thing to read for an
+    // object source; for a UNION or INTERSECTION source it is not, because
+    // `keyof` distributes across one — `keyof (A | B)` is `keyof A & keyof B`,
+    // `keyof (A & B)` is `keyof A | keyof B` — and the distribution can drop
+    // every mention of the free parameter the source still carries.
+    //
+    //     type Gen<T extends ABC> = { v: T } &
+    //         ({ v: ABC.A, a: string } | { v: ABC.B, b: string })
+    //     type Gen2<T extends ABC> = { [P in keyof Gen<T>]: string }
+    //
+    // (`mappedTypeNotMistakenlyHomomorphic`): `keyof Gen<T>` collapses to the
+    // one key both arms share, `"v"`, so the map materialized AT DECLARATION
+    // against a source that is still a union — distributing into
+    // `{ v; a } | { v; b }` and freezing both arms before `T` could pick one.
+    // Each `Gen2<ABC.A>` / `Gen2<ABC.B>` then instantiated that frozen union,
+    // and the two came out mutually assignable, so the pair of TS2741s tsc
+    // reports for `a = b; b = a;` went missing. tsc never gets here: its
+    // deferral test is `isGenericIndexType(constraintType)` on the WRITTEN
+    // `keyof Gen<T>`, which is generic whatever `keyof` would distribute to.
+    //
+    // Scoped to a union/intersection source, which is the only shape `keyof`
+    // distributes over. An OBJECT source whose free params live in its VALUES
+    // must still materialize — that is the case the key-set test exists for
+    // (react-hook-form's `Partial<Impl<T>>`, see above).
     const key_generic = try c.containsFreeTypeParam(key_src, &.{}) or
         try c.containsInfer(key_src) or
-        try c.containsMappedParam(key_src);
+        try c.containsMappedParam(key_src) or
+        (homomorphic and try distributedKeyofHidGeneric(c, src_type));
     // …and while the `as` REMAP cannot be decided. The key set is only half of
     // what materialization needs: `remapKey` evaluates the remap once per key
     // and DROPS any key whose remap does not reduce to a literal or `never`,
@@ -189,6 +215,18 @@ pub fn reduceMapped(c: *Checker, key_param: TypeId, constraint: TypeId, value: T
         return c.ts.makeMapped(key_param, constraint, value, as_clause, src_type, flags);
     }
     return c.materializeMapped(key_param, constraint, value, as_clause, src_type, flags);
+}
+
+/// Did `keyof src` hide a free type parameter by DISTRIBUTING over `src`? True
+/// for a union or intersection source that still mentions one — see the
+/// `key_generic` comment for the shape and for why no other source kind counts.
+fn distributedKeyofHidGeneric(c: *Checker, src_type: TypeId) Error!bool {
+    if (src_type == 0) return false;
+    const r = try c.resolveStructural(src_type);
+    return switch (c.ts.kind(r)) {
+        .union_type, .intersection => c.containsFreeTypeParam(r, &.{}),
+        else => false,
+    };
 }
 
 pub fn applyPropModifiers(base: u32, flags: u32) u32 {

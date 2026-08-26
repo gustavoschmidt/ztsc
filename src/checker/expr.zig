@@ -5267,24 +5267,68 @@ fn checkDeferredIndexType(c: *Checker, acc: TypeId, node: Node) Error!bool {
 ///     (`keyofAndIndexedAccess2` f50/f51's callers). tsc constrains ONE side
 ///     at a time and keeps the other; ztsc does not, so the eager answer —
 ///     which is what a concrete receiver has always given — stays.
-///   * a MAPPED object, or a type parameter CONSTRAINED by a generic mapped
-///     type. `Partial<T>[K]` and `Record<keyof T, number>[K]` are exactly the
-///     accesses whose meaning lives in `getSimplifiedIndexedAccessType`, and
-///     the relation reaches that simplification only when the map is the
-///     access's own object — never through a constraint. A generic mapped
-///     receiver still gets its write-side TS2542 (`readonlyIndexWriteAt`),
-///     which needs the receiver, not the deferred type.
+///   * a type parameter CONSTRAINED by a generic mapped type.
+///     `Record<keyof T, number>[K]` is an access whose meaning lives in
+///     `getSimplifiedIndexedAccessType`, and the relation reaches that
+///     simplification only when the map is the access's own object — never
+///     through a constraint.
 ///
 /// Both are UNDER-deferrals: the access falls back to the eager answer it gave
 /// before deferral existed, so nothing that reports today stops reporting.
+///
+/// A HOMOMORPHIC map that IS the access's own object is the one shape the
+/// exclusion above does not cover, and it used to be excluded with it. It is
+/// the shape whose eager answer is worst — `Partial<T>[keyof T]` resolved
+/// through no arm at all and came back `any`, which is silence at every read
+/// of it — and it is also the shape the relation reads back best:
+/// `simplifyMappedIndexAccessRead` is `getSimplifiedIndexedAccessType` on it,
+/// on the source side (`assign.zig`'s `.index_access` source arm) and on the
+/// target side alike. So the receiver defers, and `y[k]` with `y: Partial<T>`
+/// is `T[k] | undefined` rather than `any` — which is the whole of
+/// `mappedTypeRelationships` f10–f13.
+///
+/// Homomorphic only, i.e. a map written `[P in keyof S]`, and for the reason
+/// the first exclusion gives: the deferred access has to be READABLE BACK, and
+/// what makes it readable is that `S` names the modifiers the simplification
+/// carries. A `{ [P in K]: … }` over a bare parameter has no such source; two
+/// of them measured as new false positives (`Record<keyof PublicSpec, any>`
+/// standing in for a narrowed type parameter in `controlFlowGenericTypes`,
+/// and `{ [x in K]?: Lower<T>[] }` in
+/// `paramsOnlyHaveLiteralTypesWhenAppropriatelyContextualized`, whose template
+/// the apparent-type route cannot resolve past). Deferring those buys keys in
+/// cases that diverge anyway and costs keys in cases that do not.
+///
+/// …and only a map that CHANGES A MODIFIER (`+?`/`-?`/`+readonly`/`-readonly`).
+/// That is the whole of what the deferral buys: `simplifyMappedIndexAccessRead`
+/// differs from the eager answer exactly where the map's own modifiers do, so
+/// an identity map — `{ [P in keyof T]: F<T[P]> }`, the shape a generic library
+/// writes by the hundred — would defer every element access through it to earn
+/// nothing. Deferring those is not wrong, but it is not free: drizzle-orm's
+/// column/select builders index such maps everywhere, and deferring them cost
+/// **+22% relation CPU** (zod +7%) for zero keys. The modifier screen brings
+/// that back to noise while keeping every key the deferral was for — `Partial`
+/// (`+?`, `mappedTypeRelationships` f10–f13, excalidraw's `Delta.diffObjects`)
+/// and `Readonly` (`+readonly`, f22/f23) both carry one.
+///
+/// A generic mapped receiver still gets its write-side TS2542
+/// (`readonlyIndexWriteAt`), which needs the receiver, not the deferred type.
 fn indexDeferrableObject(c: *Checker, obj: TypeId) Error!bool {
     if (!try c.isGenericObjectForIndex(obj)) return false;
     const ro = try c.resolveStructural(obj);
-    if (c.ts.kind(ro) == .mapped) return renamingMap(c, ro);
+    if (c.ts.kind(ro) == .mapped) {
+        // Two independent shapes earn the deferral (waves 44 B and C):
+        // a RENAMING map (eager answer is `any` — no member to find) and a
+        // homomorphic MODIFIER-CHANGING map (the simplification carries the
+        // `+?`/`+readonly` the eager answer drops).
+        return renamingMap(c, ro) or
+            (c.ts.mappedHomomorphic(ro) and mappedChangesModifiers(c, ro));
+    }
     const bc = try c.indexObjBaseConstraint(obj);
     if (bc == obj) return true;
     const rb = try c.resolveStructural(bc);
-    return c.ts.kind(rb) != .mapped or renamingMap(c, rb);
+    if (c.ts.kind(rb) != .mapped) return true;
+    return renamingMap(c, rb) or
+        (c.ts.mappedHomomorphic(rb) and mappedChangesModifiers(c, rb));
 }
 
 /// A mapped receiver whose keys are RENAMED (`{ [P in K as `get${P}`]: … }`),
@@ -5300,6 +5344,17 @@ fn indexDeferrableObject(c: *Checker, obj: TypeId) Error!bool {
 fn renamingMap(c: *const Checker, m: TypeId) bool {
     const as_clause = c.ts.mappedAs(m);
     return as_clause != 0 and keyof_zig.isKeyRename(c, as_clause);
+}
+
+/// Does this mapped type write a modifier of its own (`+?`, `-?`, `+readonly`,
+/// `-readonly`)? tsc's `getMappedTypeModifiers` being non-zero — the only part
+/// of a map that `simplifyMappedIndexAccessRead` adds on top of substituting
+/// the template, and so the only reason deferring a read through it can change
+/// an answer.
+fn mappedChangesModifiers(c: *Checker, m: TypeId) bool {
+    const mods = types.mapped_flag_optional_add | types.mapped_flag_optional_remove |
+        types.mapped_flag_readonly_add | types.mapped_flag_readonly_remove;
+    return c.ts.mappedFlags(m) & mods != 0;
 }
 
 /// Element access as an optional-chain link (see `memberChainInner`).
