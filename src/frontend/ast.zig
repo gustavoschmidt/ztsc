@@ -110,6 +110,19 @@ pub const Flags = struct {
 /// by `member` and `Ast.computedKey` can binary-search it.
 pub const ComputedKey = struct { member: Node, key: Node };
 
+/// A parameter's retained decorators: `param` is the `.param`/`.param_full`
+/// node, `decos` the `extra_data` range holding its `.decorator` nodes in
+/// source order.
+///
+/// A side table for the same reason `ComputedKey` is one: a decorated
+/// PARAMETER exists only under `experimentalDecorators` and is rare even
+/// there, while `ast.ParamFull` is per parameter of every function in the
+/// program — two extra words on it would be paid by every file to serve
+/// almost none. The parser appends one entry as it finishes each decorated
+/// parameter and node indices grow with creation order, so the table is
+/// sorted by `param` and `Ast.paramDecorators` can binary-search it.
+pub const ParamDecos = struct { param: Node, decos: SubRange };
+
 /// Maps a well-known `Symbol` property name (the `iterator` in
 /// `[Symbol.iterator]`) to the synthetic member key the binder and checker
 /// share for it. The `__@` prefix cannot appear in a real identifier, so a
@@ -753,6 +766,26 @@ pub const Ast = struct {
     /// Retained computed member names, sorted by member node (see
     /// `ComputedKey`). Empty for the overwhelming majority of files.
     computed_keys: []const ComputedKey = &.{},
+    /// Retained parameter decorators, sorted by parameter node (see
+    /// `ParamDecos`). Empty for every file that does not decorate a parameter.
+    param_decos: []const ParamDecos = &.{},
+
+    /// The `.decorator` nodes written on a parameter, in source order, or an
+    /// empty slice for the overwhelming majority of parameters that carry
+    /// none. Only populated under `experimentalDecorators` — the dialect that
+    /// gives a parameter decorator a meaning; under standard decorators the
+    /// parser reports TS1206 and keeps nothing.
+    pub fn paramDecorators(a: *const Ast, param: Node) []const Node {
+        var lo: usize = 0;
+        var hi: usize = a.param_decos.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const e = a.param_decos[mid];
+            if (e.param == param) return a.extra_data[e.decos.start..e.decos.end];
+            if (e.param < param) lo = mid + 1 else hi = mid;
+        }
+        return &.{};
+    }
 
     /// The `[…]` key node a class/type member's computed name was parsed from,
     /// or null when the member's name is not computed. Only the members whose

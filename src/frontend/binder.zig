@@ -3077,6 +3077,20 @@ const Binder = struct {
         }
     };
 
+    /// Bind the decorator expressions written on the parameters of the method
+    /// whose proto is `proto_idx`, in the caller's scope and flow. A no-op for
+    /// every parameter list without one, which is all of them outside
+    /// `experimentalDecorators` (`ast.Ast.paramDecorators`).
+    fn bindParamDecorators(b: *Binder, proto_idx: u32) Error!void {
+        if (b.tree.param_decos.len == 0) return;
+        const proto = b.tree.extraData(ast.FnProto, proto_idx);
+        for (b.tree.extraRange(proto.params_start, proto.params_end)) |param| {
+            for (b.tree.paramDecorators(param)) |deco| {
+                try b.bindExpr(b.tree.nodeData(deco).lhs);
+            }
+        }
+    }
+
     /// Shared by function declarations/expressions, arrows, methods, and
     /// function types. Creates the function scope (params + body top-level
     /// share it, so `function f(x) { let x }` clashes) and a fresh `start`
@@ -3621,6 +3635,14 @@ const Binder = struct {
                         .derived_ctor
                     else
                         .base_ctor;
+                    // A PARAMETER decorator (`m(@dec x: T) {}`) is bound here
+                    // rather than in `bindParam`, for the same reason a member
+                    // decorator is bound from this walk: the expression is
+                    // evaluated at class-definition time, in the scope and the
+                    // control flow surrounding the class, not inside the
+                    // method it is written in. Binding it in the method's own
+                    // scope would let it see the parameters it sits beside.
+                    try bindParamDecorators(b, md.lhs);
                     try b.bindFunctionLike(member, md.lhs, md.rhs, ctor);
                 },
                 // `static { … }` — the parser's only `.block` class member.

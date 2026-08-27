@@ -297,6 +297,10 @@ const Parser = struct {
     /// keeps `ast.Ast.computed_keys` sorted by member node for the binary
     /// search `Ast.computedKey` does. Empty for almost every file.
     computed_keys: std.ArrayList(ast.ComputedKey) = .empty,
+    /// Retained parameter decorators, appended as each decorated parameter is
+    /// finished. Accumulator, sorted by construction for the same reason
+    /// `computed_keys` is (`ast.ParamDecos`). Empty for almost every file.
+    param_decos: std.ArrayList(ast.ParamDecos) = .empty,
 
     /// Is the type-member list being parsed an INTERFACE body rather than an
     /// object type literal? The two share `parseTypeMember` and differ in one
@@ -475,6 +479,7 @@ const Parser = struct {
             // (parallel) worker as the parse itself.
             .comment_directives = try directives.scan(out, p.src),
             .computed_keys = try out.dupe(ast.ComputedKey, p.computed_keys.items),
+            .param_decos = try out.dupe(ast.ParamDecos, p.param_decos.items),
         };
     }
 
@@ -1233,6 +1238,7 @@ const Parser = struct {
         n_scratch: usize,
         n_diags: usize,
         n_computed_keys: usize,
+        n_param_decos: usize,
         last_syntactic_start: ?u32,
         last_junk_start: ?u32,
     };
@@ -1248,6 +1254,7 @@ const Parser = struct {
             .n_scratch = p.scratch.items.len,
             .n_diags = p.diags.items.len,
             .n_computed_keys = p.computed_keys.items.len,
+            .n_param_decos = p.param_decos.items.len,
             .last_syntactic_start = p.last_syntactic_start,
             .last_junk_start = p.last_junk_start,
         };
@@ -1264,6 +1271,7 @@ const Parser = struct {
         p.scratch.shrinkRetainingCapacity(s.n_scratch);
         p.diags.shrinkRetainingCapacity(s.n_diags);
         p.computed_keys.shrinkRetainingCapacity(s.n_computed_keys);
+        p.param_decos.shrinkRetainingCapacity(s.n_param_decos);
         p.last_syntactic_start = s.last_syntactic_start;
         p.last_junk_start = s.last_junk_start;
     }
@@ -4182,15 +4190,17 @@ const Parser = struct {
         // parses cleanly, no cascade) and report ONCE on the run's first `@`,
         // which is where tsc's `checkGrammarModifiers` stops.
         //
-        // Under `experimentalDecorators` they are legal, so the diagnostic is
-        // dropped. The expression is still consumed and then DISCARDED rather
-        // than hung off the parameter: a legacy parameter decorator is only
-        // ever a value read from the enclosing scope, so the sole check it
-        // could contribute is on names ztsc would have to bind through a new
-        // AST edge. Skipping it under-reports (an undefined name inside
-        // `@Inject(Nope)` goes unnamed) and can never invent a diagnostic —
-        // the trade the flag is documented to make.
+        // Under `experimentalDecorators` they are legal, and there they are
+        // RETAINED — hung off the parameter through `ast.ParamDecos`, the side
+        // table `Ast.paramDecorators` reads. That edge is what lets the binder
+        // resolve the names in `@Inject(Nope)` and the checker resolve the
+        // decorator's own signature (TS1239). Under the standard dialect the
+        // run is consumed and dropped: it is TS1206 either way, tsc's own
+        // parameter-decorator checks do not exist in that dialect, and keeping
+        // the nodes could only add diagnostics tsc does not have.
         var deco_at: ?u32 = null;
+        const deco_top = p.scratchTop();
+        defer p.scratch.shrinkRetainingCapacity(deco_top);
         // The parameter's FULL start — the offset just past the previous token,
         // leading trivia and all. TS1433 is blamed there where TS1206 is blamed
         // on the `@` itself; measured against tsgo 7.0.2 on
@@ -4202,7 +4212,16 @@ const Parser = struct {
             if (deco_at == null) deco_start = p.lastTokEnd();
             const at = try p.bump(); // `@`
             if (deco_at == null) deco_at = at;
-            if (canStartExpression(p.curTag())) _ = try p.parseLhsExpression(.{});
+            if (canStartExpression(p.curTag())) {
+                const expr = try p.parseLhsExpression(.{ .in_decorator = true });
+                if (p.experimental_decorators) {
+                    try p.pushScratch(try p.addNode(.{
+                        .tag = .decorator,
+                        .main_token = at,
+                        .data = .{ .lhs = expr, .rhs = 0 },
+                    }));
+                }
+            }
         }
         if (deco_at) |at| {
             // A `this` parameter is TS1433 whichever dialect is in force, and it
@@ -4344,11 +4363,19 @@ const Parser = struct {
             try p.errAtToken(.param_question_and_initializer, p.nodeMainTokenAt(name));
         }
 
-        if (flags == 0 and init == null_node) {
-            return p.addNode(.{ .tag = .param, .main_token = start_tok, .data = .{ .lhs = name, .rhs = type_ann } });
+        const param = if (flags == 0 and init == null_node)
+            try p.addNode(.{ .tag = .param, .main_token = start_tok, .data = .{ .lhs = name, .rhs = type_ann } })
+        else blk: {
+            const extra = try p.addExtra(ast.ParamFull{ .flags = flags, .type_ann = type_ann, .init = init });
+            break :blk try p.addNode(.{ .tag = .param_full, .main_token = start_tok, .data = .{ .lhs = name, .rhs = extra } });
+        };
+        // The retained run, keyed on the parameter node — which is created
+        // last, so the table stays sorted by construction (`ast.ParamDecos`).
+        if (p.scratch.items.len > deco_top) {
+            const decos = try p.scratchToSpan(deco_top);
+            try p.param_decos.append(p.gpa, .{ .param = param, .decos = decos });
         }
-        const extra = try p.addExtra(ast.ParamFull{ .flags = flags, .type_ann = type_ann, .init = init });
-        return p.addNode(.{ .tag = .param_full, .main_token = start_tok, .data = .{ .lhs = name, .rhs = extra } });
+        return param;
     }
 
     // --- binding patterns ---------------------------------------------------
