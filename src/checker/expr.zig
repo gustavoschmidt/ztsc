@@ -4358,6 +4358,7 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
     else
         0;
     const obj = try c.ts.makeObject(props.items, sidx, nidx, types.obj_flag_fresh | types.obj_flag_literal_origin);
+    try recordNumericMemberNames(c, node, obj);
     // A type-parameter spread (`{ ...data, extra }`, `data: T`) yields
     // `T & { extra }` so the literal stays assignable to `T`.
     if (generic_spreads.items.len > 0) {
@@ -4365,6 +4366,61 @@ fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) 
         return c.ts.makeIntersection(c.scratch(), generic_spreads.items);
     }
     return obj;
+}
+
+/// WAVE-48 AGENT-C FLAGGED ARM (expr.zig is agent A's this wave; this and its
+/// one call site are self-contained).
+///
+/// tsc's `getLiteralTypeFromPropertyName`: a member written with a NUMERIC
+/// literal name is keyed by that NUMBER literal type — `keyof { 0() {} }` is
+/// `0`, never `"0"`. The distinction is SYNTACTIC (`keyof { "0"() {} }` *is*
+/// `"0"`, oracle-confirmed), so the member atom cannot carry it; tsc keeps it
+/// on the symbol as `links.nameType` and ztsc keeps it in
+/// `Checker.key_name_types`, which `keyof.keyofObjectTable` consults ahead of
+/// its string-literal default.
+///
+/// Type literals already record it (`typenode.zig`'s `name_types`); an object
+/// literal did not, so `Extract<keyof typeof o, number>` came back `never` for
+/// `{ 0(…) {}, 1(…) {} }` and every mapped type keyed by it collapsed to `{}`.
+/// That is the whole of `coAndContraVariantInferences3`: the overload-builder
+/// chain's `OverloadBinders<T>` had no members, so each binder callback was
+/// contextually typed by nothing and its destructured parameters were TS7031.
+///
+/// A TUPLE's positional keys stay STRING literals in tsc (its element symbols
+/// have no declaration, so `getLiteralTypeFromProperty` falls through to
+/// `getStringLiteralType(symbolName(prop))`) — which is why this is recorded
+/// per DECLARATION here rather than derived from the atom text in `keyof`.
+fn recordNumericMemberNames(c: *Checker, node: Node, obj: TypeId) Error!void {
+    for (c.tree.nodeRange(node)) |prop| {
+        if (prop == null_node) continue;
+        const pd = c.tree.nodeData(prop);
+        switch (c.nodeTag(prop)) {
+            // A COMPUTED key is named by what its expression evaluates to,
+            // which the walk above has already turned into either a member
+            // atom or an index signature; `memberNameType`'s own computed arm
+            // wants the declaration flags this node does not carry, so a
+            // computed numeric key keeps the behaviour it has.
+            .object_property, .object_method => {
+                if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) continue;
+            },
+            .object_shorthand => {},
+            else => continue,
+        }
+        const tok = c.tree.nodeMainToken(prop);
+        const nt = try c.memberNameType(tok, 0);
+        if (nt == types.no_type) continue;
+        const name = try c.memberAtom(tok);
+        // `key_name_types` is keyed by the INTERNED object, and shedding
+        // freshness re-interns: `typeof o` is `widenedObject(obj)`, a different
+        // TypeId than the fresh literal this walk built. Both derived forms are
+        // recorded here rather than carried at the shedding site (`ts.regular` /
+        // `ts.widenedObject` are pure store operations with no checker to call
+        // `classes.carryKeyNameTypes` from). Only ever reached for a literal
+        // that actually writes a numeric member name.
+        try c.putKeyNameType(obj, name, nt);
+        try c.putKeyNameType(try c.ts.regular(obj), name, nt);
+        try c.putKeyNameType(try c.ts.widenedObject(obj), name, nt);
+    }
 }
 
 /// The type of a property that `propOfType` cannot see because it lives in
