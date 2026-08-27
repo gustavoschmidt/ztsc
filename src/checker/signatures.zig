@@ -1704,7 +1704,7 @@ fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
     if (c.prog.isMergedId(sym)) {
         const m = c.prog.mergedSym(sym);
         if (m.flags.namespace_decl) {
-            var ns_val = try c.ts.makeClassValue(sym);
+            var ns_val = try c.classValueOf(sym);
             // Intersect the first value-space constituent (a function/class/
             // enum callable base, *or* a `var console: Console`-style
             // variable) so a namespace merged onto a typed global keeps that
@@ -1744,7 +1744,7 @@ fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
             var fnv: TypeId = types.no_type;
             for (m.parts) |p| {
                 const pf = c.symFlags(p);
-                if (pf.class and cls == types.no_type) cls = try c.ts.makeClassValue(p);
+                if (pf.class and cls == types.no_type) cls = try c.classValueOf(p);
                 if (pf.function and fnv == types.no_type) fnv = try functionSymbolType(c, p);
             }
             if (cls != types.no_type and fnv != types.no_type)
@@ -1771,7 +1771,7 @@ fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
     // with a function/enum the callable/base value is intersected with
     // the namespace object.
     if (f.namespace_decl) {
-        const ns_val = try c.ts.makeClassValue(sym);
+        const ns_val = try c.classValueOf(sym);
         if (f.class) {
             // `class_value` already carries the namespace's static members;
             // a callable class still needs its call signatures folded in.
@@ -1864,7 +1864,7 @@ fn varHasTypeAnnotation(c: *Checker, sym: SymbolId) bool {
 /// signatures come first so overload resolution sees them in declaration
 /// order.
 fn callableClassValue(c: *Checker, sym: SymbolId, f: binder.SymbolFlags) Error!TypeId {
-    const cls0 = try c.ts.makeClassValue(sym);
+    const cls0 = try c.classValueOf(sym);
     // tsc's `getTypeOfFuncClassEnumModule`: a class whose base CONSTRUCTOR
     // type is a type variable has that variable intersected into its own
     // static type (`getBaseTypeVariableOfClass`), so a mixin class is

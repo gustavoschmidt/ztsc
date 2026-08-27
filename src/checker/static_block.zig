@@ -55,7 +55,7 @@ pub fn checkStaticBlock(
     }
     if (try c.scopeOf(member)) |s| c.cur_scope = s;
     c.this_type = if (class_sym != binder.no_symbol)
-        try c.ts.makeClassValue(class_sym)
+        try c.classValueOf(class_sym)
     else
         fallback_this;
     // A static block is neither async nor a generator, and nothing it returns

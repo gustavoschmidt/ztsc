@@ -72,8 +72,10 @@ pub fn typesIdentical(c: *Checker, a: TypeId, b: TypeId) Error!bool {
     if (a == b) return true;
     // Two `class_value`s are the one pair this module can judge WITHOUT the
     // structural relation, and judge exactly: the store hash-conses a
-    // `class_value` on its symbol alone, so two different ids are two different
-    // symbols — `typeof M` beside `typeof M.A` is a difference the program
+    // `class_value` on its symbol and its outer type arguments, so two
+    // different ids are two different (symbol, arguments) pairs — and either
+    // half differing is a real difference. `typeof M` beside `typeof M.A` is
+    // the symbol half, and it is a difference the program
     // wrote, not an approximation to forgive. The screens below (and
     // `identity.identical`, which refuses the family for the same nominal
     // reason) would both answer "identical" and swallow the TS2403 tsgo makes

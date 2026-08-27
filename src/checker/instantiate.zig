@@ -880,6 +880,7 @@ pub const ctorClassOwnsMember = classes.ctorClassOwnsMember;
 pub const keyofInProgressRef = classes.keyofInProgressRef;
 pub const declaredKeyUnion = classes.declaredKeyUnion;
 pub const baseClassRef = classes.baseClassRef;
+pub const baseAsInherited = classes.baseAsInherited;
 pub const hasUnresolvedBase = classes.hasUnresolvedBase;
 pub const baseClassSym = classes.baseClassSym;
 pub const classBaseEntitySym = classes.classBaseEntitySym;

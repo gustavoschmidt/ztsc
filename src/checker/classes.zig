@@ -830,7 +830,7 @@ pub fn classInstanceGeneric(c: *Checker, sym0: SymbolId) Error!TypeId {
     // the incomplete table it produced is marked provisional so it is never
     // memoized. `baseRefCut` decides; see there for the three ways a base cuts.
     if (try c.baseClassRef(sym)) |base_ref| {
-        const bstruct = try c.resolveStructural(base_ref);
+        const bstruct = try c.resolveStructural(try baseAsInherited(c, sym, base_ref));
         result = try c.mergeBaseObject(result, bstruct, false);
         if (c.baseRefProvisional(base_ref)) provisional = true;
         if (c.ts.kind(bstruct) == .err and c.baseRefCut(base_ref)) provisional = true;
@@ -1872,6 +1872,58 @@ pub fn baseClassRef(c: *Checker, sym: SymbolId) Error!?TypeId {
         };
         const fixed = try c.fixTypeArgs(base_sym, targs.items, name_tok) orelse return null;
         return try c.ts.makeRef(base_sym, fixed);
+    }
+    return null;
+}
+
+/// `base_ref`'s members as the derived class `sym` actually INHERITS them.
+///
+/// Identical to `resolveStructural(base_ref)` for every base whose class is
+/// not nested in a generic — which is the gate `baseOuterValue` applies, at
+/// the cost of one memo probe. Past it, the enclosing generic's arguments
+/// (which live on the base's class VALUE, not on the ref) are substituted
+/// into the resolved table.
+///
+/// Shared by the two readers of a base's instance side — the derived class's
+/// own table (`classInstanceGeneric`) and the TS2415/TS2416 relation
+/// (`checkInstanceSideExtends`) — because they must agree: a table folded
+/// under the substitution and a base related without it disagree about every
+/// inherited member.
+pub fn baseAsInherited(c: *Checker, sym: SymbolId, base_ref: TypeId) Error!TypeId {
+    // The ref itself when there is no outer half — NOT its expansion. A ref
+    // carries the base's nominal identity, which the private/protected member
+    // rules read off it (`nominal_private_protected_members`); handing the
+    // relation a resolved table instead loses that.
+    const bcv = (try baseOuterValue(c, sym, base_ref)) orelse return base_ref;
+    return c.instantiateOuter(bcv, try c.resolveStructural(base_ref));
+}
+
+/// The `extends` base of `sym` as a class VALUE, but only when that value
+/// carries OUTER type arguments — the case `baseClassRef`'s ref cannot
+/// express, because a ref's arguments fill the base class's own parameters
+/// and these fill the parameters of whatever generic the base is nested in.
+///
+/// Null, at the cost of one memo probe, for every base that is not a local or
+/// anonymous class of an enclosing generic — which is every base in every
+/// program that does not write one. Only past that gate is the heritage
+/// expression re-read (cached on its node by `checkExprCached`).
+fn baseOuterValue(c: *Checker, sym: SymbolId, base_ref: TypeId) Error!?TypeId {
+    if (c.ts.kind(base_ref) != .ref) return null;
+    const base_sym = c.ts.refSymbol(base_ref);
+    if ((try c.classOuterTypeParams(base_sym)).len == 0) return null;
+    const saved_ctx = c.enterSymFile(sym);
+    defer c.restoreCtx(saved_ctx);
+    for (c.declsOf(sym)) |decl| {
+        if (c.nodeTag(decl) != .class_decl) continue;
+        const data = c.tree.extraData(ast.ClassData, c.tree.nodeData(decl).lhs);
+        if (data.extends == 0) continue;
+        const saved = c.cur_scope;
+        defer c.cur_scope = saved;
+        if (try c.scopeOf(decl)) |s| c.cur_scope = s;
+        const bt = try c.checkExprCached(c.tree.nodeData(data.extends).lhs, types.no_type);
+        if (c.ts.kind(bt) != .class_value) return null;
+        if (c.ts.classSymbol(bt) != base_sym) return null;
+        return if (c.ts.classValueArgs(bt).len == 0) null else bt;
     }
     return null;
 }

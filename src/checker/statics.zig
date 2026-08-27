@@ -61,7 +61,7 @@ pub fn ownStaticMemberProp(c: *Checker, cls: SymbolId, name: Atom) Error!?types.
         // exactly as `classStaticType` sets it before resolving one.
         const saved_this = c.this_type;
         defer c.this_type = saved_this;
-        c.this_type = try c.ts.makeClassValue(cls);
+        c.this_type = try c.classValueOf(cls);
         return .{ .name = name, .ty = try c.typeOfSymbol(msym), .flags = flags };
     }
     return null;
@@ -122,7 +122,7 @@ pub fn seedStaticFieldContext(c: *Checker, node: Node, cls: SymbolId, ctx: TypeI
         defer c.defer_bodies -= 1;
         const saved_this = c.this_type;
         defer c.this_type = saved_this;
-        c.this_type = try c.ts.makeClassValue(cls);
+        c.this_type = try c.classValueOf(cls);
         c.setTypeOfSymbol(sc.sym, try c.widenLiteral(try c.checkExprCached(f.init, sc.ty)));
     }
 }
@@ -319,7 +319,7 @@ pub fn classStaticType(c: *Checker, sym0: SymbolId) Error!TypeId {
     // pull in another's).
     const saved_this = c.this_type;
     defer c.this_type = saved_this;
-    c.this_type = try c.ts.makeClassValue(sym);
+    c.this_type = try c.classValueOf(sym);
     var props: std.ArrayList(types.Prop) = .empty;
     defer props.deinit(c.scratch());
     if (c.bind.staticsScopeOf(c.localOf(sym))) |ss| {
