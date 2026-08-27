@@ -1728,6 +1728,13 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     // combined "attributes object" from it (later wins on duplicates).
     var provided: std.ArrayList(types.Prop) = .empty;
     defer provided.deinit(c.scratch());
+    // Aligned with `provided`: did this entry come from a `{...spread}` rather
+    // than a written attribute? tsc's `generateJsxAttributes` yields no spread,
+    // so a spread-contributed property is invisible to the elementwise
+    // elaboration and can only be answered by the whole-object report — the
+    // same split `JsxAttr.hyphenated` draws for the other unelaborated name.
+    var from_spread: std.ArrayList(bool) = .empty;
+    defer from_spread.deinit(c.scratch());
     var has_spread = false;
     var spread_opaque = false; // a spread whose props we could not enumerate
     var spread_any = false; // saw a spread of `any` (tsc's `hasSpreadAnyType`)
@@ -1767,6 +1774,7 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
                     }
                 },
             }
+            while (from_spread.items.len < provided.items.len) try from_spread.append(c.scratch(), true);
             continue;
         }
         const ad = c.tree.nodeData(attr);
@@ -1806,6 +1814,7 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
         // TS2322, because `isKnownProperty` waives the excess verdict, not
         // the relation.
         try provided.append(c.scratch(), .{ .name = name, .ty = vty });
+        try from_spread.append(c.scratch(), false);
         try built.append(c.scratch(), .{
             .name = name,
             .ty = vty,
@@ -1846,6 +1855,7 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     // `children` a false TS2741 — the children were right there in the tag.
     if (has_children) {
         try provided.append(c.scratch(), .{ .name = try c.jsxChildrenAttrName(), .ty = types.any_type });
+        try from_spread.append(c.scratch(), false);
     }
 
     // ---------------------------------------------------------------- verdicts
@@ -1881,8 +1891,19 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     // has to be answered by the whole-object report instead.
     var hyphen_failed = false;
     for (built.items) |b| {
-        if (b.overwritten) continue; // shadowed by a later spread (TS2783)
-        if (try jsxAttrTarget(c, rt, b)) |target| {
+        // The type the ATTRIBUTES OBJECT carries for this name, which is the
+        // written value's unless a later spread overwrote it (TS2783). tsc's
+        // `elaborateElementwise` reads `getIndexedAccessType(source, name)` —
+        // the object's member — while anchoring at the written attribute's
+        // NAME node, so an overwritten attribute is still elaborated, and
+        // with the SPREAD's type: `<test1 x="ok" {...{x: 32}} />` against
+        // `{ x: string }` is a TS2322 at the `x`, not at the tag
+        // (`tsxAttributeResolution3`).
+        const sty = if (b.overwritten)
+            (providedType(provided.items, b.name) orelse continue)
+        else
+            b.ty;
+        if (try jsxAttrTarget(c, rt, b.name, sty)) |target| {
             // Mirrors the elaboration loop below: an attribute the elaboration
             // will skip cannot be the reason it runs.
             if (elaborate.skipsDeferredIndexAccess(c, target)) continue;
@@ -1893,14 +1914,16 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
             // `{ [s: string]: boolean }` is clean. Only a prop the target
             // DECLARES relates it (`propertiesRelatedTo` has no such waiver).
             if (b.hyphenated and !try jsxDeclaresName(c, rt, b.name)) continue;
-            if (!try c.isAssignable(b.ty, target)) {
+            if (!try c.isAssignable(sty, target)) {
                 if (b.hyphenated) hyphen_failed = true else attr_failed = true;
-            } else if (!b.hyphenated and b.value != null_node and
+            } else if (!b.hyphenated and !b.overwritten and b.value != null_node and
                 try c.freshLiteralRejects(b.value, b.ty, target))
             {
+                // Freshness belongs to the WRITTEN expression, so an
+                // overwritten attribute has none to contribute.
                 attr_fresh_failed = true;
             }
-        } else if (target_open and !b.hyphenated and !containsAtom(ia_names.items, b.name)) {
+        } else if (!b.overwritten and target_open and !b.hyphenated and !containsAtom(ia_names.items, b.name)) {
             if (!have_excess) {
                 first_excess = c.tokSpan(b.name_tok);
                 have_excess = true;
@@ -1913,6 +1936,7 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     // any required prop might come from it, and a false positive there is
     // worse than the under-report.
     const whole_object_checkable = is_obj_target and !(has_spread and spread_opaque);
+
     const weak_hit = whole_object_checkable and has_spread and target_open and
         try jsxWeakTypeHit(c, rt, target_props.items, provided.items, ia_names.items, spread_non_object);
     // A prop the tag's own `defaultProps` supplies is never missing (see
@@ -1921,11 +1945,55 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     const missing_hit = whole_object_checkable and !weak_hit and
         try jsxMissingRequiredProp(c, e, target_props.items, provided.items, is_component);
 
+    // A property the attributes object gets from a `{...spread}`, whose value
+    // the target's own prop rejects. tsc's `generateJsxAttributes` skips
+    // spreads, so `elaborateElementwise` produces nothing for it and
+    // `checkTypeRelatedTo` prints its own TS2322 at the tag with the property
+    // chain underneath — exactly the `hyphen_failed` shape, and reported
+    // through the same arm. `<div {...{text: 42}} />` against
+    // `{ text?: string }`.
+    //
+    // Reached only when nothing ELSE has a verdict, and only past tsc's silent
+    // first stage — which is both the faithful order (`isTypeRelatedTo` before
+    // `elaborateError`) and the cheap one. The per-property walk it guards is
+    // quadratic in the attribute count and asks the relation once per name; a
+    // react-native `{...props}` spreads a ~250-property type, so running it on
+    // every clean element would have cost more than the whole check. The
+    // whole-object query costs ONE relation, is memoized on the type pair, and
+    // is the same one the reporting path below re-asks.
+    //
+    // Inside it: only the LAST contributor of a name is in the object (later
+    // wins), and a name some WRITTEN attribute also carries is the
+    // elaboration's to report — it has a name node to anchor at, and the walk
+    // above already took that name's verdict from the object's member type.
+    //
+    // Gated on `whole_object_checkable` for the reason every other
+    // whole-object verdict is: with an un-enumerable spread the source type
+    // ztsc can spell is not the one tsc relates.
+    var spread_failed = false;
+    if (whole_object_checkable and has_spread and
+        !attr_failed and !attr_fresh_failed and !hyphen_failed and
+        !have_excess and !weak_hit and !missing_hit and
+        !try c.isAssignable(try c.jsxAttrsObject(provided.items, .relate), props))
+    {
+        for (provided.items, 0..) |p, i| {
+            if (!from_spread.items[i]) continue;
+            if (lastProvidedIndex(provided.items, p.name) != i) continue;
+            if (namedAttr(built.items, p.name)) continue;
+            const target = (try jsxAttrTarget(c, rt, p.name, p.ty)) orelse continue;
+            if (elaborate.skipsDeferredIndexAccess(c, target)) continue;
+            if (!try c.isAssignable(p.ty, target)) {
+                spread_failed = true;
+                break;
+            }
+        }
+    }
+
     // Nothing to say: neither the elaboration nor the whole-object report has
     // a candidate, so tsc's silent first stage cannot change the outcome and
     // is not paid for. This is the overwhelmingly common path, and it is why
     // the split walk costs nothing on it.
-    if (!attr_failed and !attr_fresh_failed and !hyphen_failed and
+    if (!attr_failed and !attr_fresh_failed and !hyphen_failed and !spread_failed and
         !have_excess and !weak_hit and !missing_hit) return;
 
     // tsc's silent first stage. The attributes object is built UNWIDENED (so
@@ -1949,14 +2017,22 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
         // tsc's `generateJsxAttributes` yields neither a spread nor a
         // hyphenated name, so neither is ever the subject of an elementwise
         // elaboration; a hyphenated mismatch is answered at the tag below.
-        if (b.overwritten or b.hyphenated) continue;
-        if (try jsxAttrTarget(c, rt, b)) |target| {
+        if (b.hyphenated) continue;
+        // Same source type the verdict walk used (see there): the attributes
+        // object's member, not necessarily this attribute's written value.
+        const sty = if (b.overwritten)
+            (providedType(provided.items, b.name) orelse continue)
+        else
+            b.ty;
+        if (try jsxAttrTarget(c, rt, b.name, sty)) |target| {
             if (elaborate.skipsDeferredIndexAccess(c, target)) continue;
             // tsc anchors a JSX attribute value mismatch at the attribute
             // NAME node (not the value), matching the excess-property anchor
             // above. Per-member elaboration for object/array-literal values
-            // still points at the offending member via `b.value`.
-            if (!try c.checkAssignable(b.ty, target, b.value, c.tokSpan(b.name_tok))) attr_elaborated = true;
+            // still points at the offending member via `b.value` — which an
+            // overwritten attribute does not own, so it elaborates bare.
+            const val = if (b.overwritten) null_node else b.value;
+            if (!try c.checkAssignable(sty, target, val, c.tokSpan(b.name_tok))) attr_elaborated = true;
         }
     }
 
@@ -2010,6 +2086,9 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
         // elaboration produced nothing and `checkTypeRelatedTo` printed its
         // own message at the tag, with the property chain underneath.
         // `<test1 data-foo={32}/>` against `{ "data-foo"?: string }`.
+        // A SPREAD-contributed property is the other one, for the identical
+        // reason (`generateJsxAttributes` skips spreads too) — `spread_failed`
+        // is already gated on `whole_object_checkable` where it is computed.
         //
         // Gated on `whole_object_checkable` for the reason every other
         // whole-object verdict is: with an un-enumerable spread the source
@@ -2017,7 +2096,7 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
         // spread's own type in the intersection), so the message would name a
         // type the element does not have and the refinement machinery would
         // read a "missing" prop the spread supplies.
-        if (hyphen_failed and whole_object_checkable) {
+        if (spread_failed or (hyphen_failed and whole_object_checkable)) {
             try c.reportNotAssignable(
                 2322,
                 try c.jsxAttrsObject(provided.items, .display),
@@ -2103,14 +2182,43 @@ pub fn jsxAttrsObject(c: *Checker, provided: []const types.Prop, use: JsxAttrsUs
     return c.ts.makeObject(out.items, 0, 0, if (use == .display) types.obj_flag_fresh else 0);
 }
 
+/// Index of the LAST entry naming `name` — the one whose value the combined
+/// attributes object actually carries (`jsxAttrsObject`'s "later wins").
+fn lastProvidedIndex(provided: []const types.Prop, name: Atom) usize {
+    var found: usize = 0;
+    for (provided, 0..) |p, i| {
+        if (p.name == name) found = i;
+    }
+    return found;
+}
+
+/// The type the combined attributes object carries for `name`, or `null` when
+/// no contributor named it.
+fn providedType(provided: []const types.Prop, name: Atom) ?TypeId {
+    var found: ?TypeId = null;
+    for (provided) |p| {
+        if (p.name == name) found = p.ty;
+    }
+    return found;
+}
+
+/// Is `name` written as an attribute (so an elementwise elaboration can anchor
+/// at its name node), rather than reaching the object only through a spread?
+fn namedAttr(built: []const JsxAttr, name: Atom) bool {
+    for (built) |b| {
+        if (b.name == name and !b.hyphenated) return true;
+    }
+    return false;
+}
+
 /// The type one written attribute's value is checked against, or `null` when
 /// the props target declares no home for that name (an EXCESS attribute, or
 /// one on a target with an index signature).
 ///
 /// Shared by the silent verdict pass and the reporting elaboration so the two
 /// cannot disagree about what an attribute is compared to.
-fn jsxAttrTarget(c: *Checker, rt: TypeId, b: JsxAttr) Error!?TypeId {
-    if (try c.propOfType(rt, b.name)) |p| {
+fn jsxAttrTarget(c: *Checker, rt: TypeId, name: Atom, ty: TypeId) Error!?TypeId {
+    if (try c.propOfType(rt, name)) |p| {
         // An optional prop (`date?: Date`) admits `undefined`, so an explicit
         // `date={maybeUndefined}` is not an error — mirrors the structural
         // object relation and the optional indexed-access path
@@ -2120,7 +2228,7 @@ fn jsxAttrTarget(c: *Checker, rt: TypeId, b: JsxAttr) Error!?TypeId {
         // from bare `p.ty`, and keeping it off the object-to-union path avoids
         // a distinct union-relation gap. A required prop keeps `p.ty`, so an
         // explicit `undefined` on it still rejects.
-        if (p.optional() and c.containsUndefinedish(try c.resolveStructural(b.ty))) {
+        if (p.optional() and c.containsUndefinedish(try c.resolveStructural(ty))) {
             return try c.makeUnion2(p.ty, types.undefined_type);
         }
         return p.ty;
@@ -2130,7 +2238,7 @@ fn jsxAttrTarget(c: *Checker, rt: TypeId, b: JsxAttr) Error!?TypeId {
     // value used to go unchecked — and, since the excess arm only fires for an
     // open target, silently. Check it against the union of the arms that
     // declare it, the same type the attribute's contextual lookup uses.
-    return try c.unionNestedPropType(rt, b.name);
+    return try c.unionNestedPropType(rt, name);
 }
 
 /// tsc's weak-type check for a JSX element (TS2559): the target has only
@@ -2231,6 +2339,19 @@ pub fn jsxSpreadInfo(c: *Checker, rst: TypeId, provided: *std.ArrayList(types.Pr
         },
         .intersection => {
             var names: std.ArrayList(Atom) = .empty;
+            // A name two constituents both declare is ONE property of the
+            // spread, and its type is their INTERSECTION — that is what
+            // `getPropertiesOfType` synthesizes and what `propOfType`'s
+            // intersection arm already computes. Appending each constituent's
+            // props separately would leave `provided`'s "later wins" to pick
+            // an arbitrary arm instead: social-app's
+            // `Omit<ButtonProps, 'hitSlop'> & { color?: string }` spread onto
+            // a `color?: "primary" | …` prop then reads as bare `string` and
+            // rejects, where tsc relates `("primary" | …) & string` and
+            // accepts. Same shape in excalidraw's `Omit<SidebarTriggerProps,
+            // "name"> & React.HTMLAttributes<HTMLDivElement>` (`onToggle`).
+            var seen: std.ArrayList(Atom) = .empty;
+            defer seen.deinit(c.scratch());
             for (try c.memberList(rst)) |m| {
                 const r = try c.resolveStructural(m);
                 if (c.ts.kind(r) != .object or c.ts.objectStringIndex(r) != 0 or c.ts.objectNumberIndex(r) != 0) {
@@ -2240,7 +2361,9 @@ pub fn jsxSpreadInfo(c: *Checker, rst: TypeId, provided: *std.ArrayList(types.Pr
                 for (0..c.ts.objectPropCount(r)) |i| {
                     const p = c.ts.objectProp(r, @intCast(i));
                     if (!p.optional()) try names.append(c.scratch(), p.name);
-                    try provided.append(c.scratch(), p);
+                    if (containsAtom(seen.items, p.name)) continue;
+                    try seen.append(c.scratch(), p.name);
+                    try provided.append(c.scratch(), (try c.propOfType(rst, p.name)) orelse p);
                 }
             }
             return .{ .names = try names.toOwnedSlice(c.scratch()) };
