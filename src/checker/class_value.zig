@@ -68,7 +68,7 @@ pub fn classValueOf(c: *Checker, cls: SymbolId) Error!TypeId {
 /// class value with no outer parameters at all, and one whose arguments are
 /// still the parameters themselves (the shape `classValueOf` mints, which is
 /// what every reference inside the generic reads).
-pub fn outerArgMap(c: *Checker, cv: TypeId, buf: *std.ArrayList(TpMap)) Error!void {
+fn outerArgMap(c: *Checker, cv: TypeId, buf: *std.ArrayList(TpMap)) Error!void {
     const n = c.ts.classValueArgs(cv).len;
     if (n == 0) return;
     const tps = try outerTypeParams(c, c.ts.classSymbol(cv));

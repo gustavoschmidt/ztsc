@@ -4188,7 +4188,6 @@ pub const Checker = struct {
     const class_value_zig = @import("checker/class_value.zig");
     pub const classValueOf = class_value_zig.classValueOf;
     pub const classOuterTypeParams = class_value_zig.outerTypeParams;
-    pub const classValueOuterMap = class_value_zig.outerArgMap;
     pub const instantiateOuter = class_value_zig.instantiateOuter;
 
     const generics_zig = @import("checker/generics.zig");
