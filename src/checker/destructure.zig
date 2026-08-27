@@ -911,37 +911,60 @@ pub fn patternContextualType(c: *Checker, pat: Node) Error!TypeId {
 }
 
 /// The contextual type a binding pattern offers its OWN initializer — which is
-/// `patternContextualType`, except that a CALL gets none.
+/// `patternContextualType`, except that an UNINFORMATIVE pattern offers a CALL
+/// nothing.
 ///
-/// tsc's `getContextualTypeForVariableLikeDeclaration` answers a variable
-/// declaration from its type ANNOTATION alone. The pattern is used to TYPE a
-/// parameter that has nothing else (`patternDeclaredType`), never to
-/// contextually type an initializer whose type arguments are still being
-/// inferred — "a binding pattern cannot be the only inference source". So
+/// "A binding pattern cannot be the only inference source": tsc will type an
+/// initializer from a pattern that says something — a default, a nested
+/// annotation — but a pattern of plain names says only WHERE, and every
+/// position it implies is `any`. Feeding that tuple into a generic call's
+/// inference answers the call with the pattern's own shape:
 ///
 ///     declare function f<T>(): T;
 ///     const [e1, e2] = f();   // T = unknown  ->  TS2488
 ///
-/// leaves `T` at `unknown`, where feeding the pattern's `[any, any]` into the
-/// inference made it a two-tuple that destructures cleanly and reported
-/// nothing (`bindingPatternCannotBeOnlyInferenceSource`; the EMPTY pattern
-/// already agreed, because it offers no tuple to infer from).
+/// where `[any, any]` made `T` a two-tuple that destructures cleanly and
+/// reported nothing (`bindingPatternCannotBeOnlyInferenceSource`; the EMPTY
+/// and OBJECT patterns already agreed — `objectPatternContextualType` has
+/// carried the same gate all along).
 ///
-/// Only a call is withheld, not every initializer: the pattern's tuple is what
-/// makes `const [a, b] = [1, "x"]` two separate types instead of one union,
-/// and an array literal infers nothing from it.
+/// Both halves of the gate are load-bearing. An INFORMATIVE pattern still
+/// types a call: `const { f = (x: string) => x.length } = id({ f: x => x.charAt })`
+/// needs the default to reach `id`'s argument, or `x` is an implicit any
+/// (`objectBindingPatternContextuallyTypesArgument`). And a non-call
+/// initializer still gets the all-`any` tuple: it infers nothing from it, and
+/// the tuple is what makes `const [a, b] = [1, "x"]` two separate types rather
+/// than one union.
 pub fn patternInitContextualType(c: *Checker, pat: Node, init: Node) Error!TypeId {
-    if (init != null_node) switch (c.nodeTag(skipParens(c, init))) {
+    const t = try patternContextualType(c, pat);
+    if (t == types.no_type or init == null_node) return t;
+    switch (c.nodeTag(skipParens(c, init))) {
         .call_expr,
         .call_expr_targs,
         .optional_call,
         .new_expr,
         .new_expr_targs,
         .new_expr_bare,
-        => return types.no_type,
-        else => {},
-    };
-    return patternContextualType(c, pat);
+        => {},
+        else => return t,
+    }
+    return if (impliesOnlyAny(c, t)) types.no_type else t;
+}
+
+/// Does the tuple `patternContextualType` built carry nothing but the `any` a
+/// plain name contributes? (The object arm never returns an uninformative type
+/// at all, so anything not a tuple counts as informative.)
+fn impliesOnlyAny(c: *Checker, t: TypeId) bool {
+    if (c.ts.kind(t) != .tuple) return false;
+    for (0..c.ts.tupleLen(t)) |i| {
+        const e = c.ts.tupleElem(t, @intCast(i));
+        const ty = if (e.flags & types.elem_flag_rest != 0 and c.ts.kind(e.ty) == .array)
+            c.ts.arrayElem(e.ty)
+        else
+            e.ty;
+        if (ty != types.any_type) return false;
+    }
+    return true;
 }
 
 /// The type a BINDING PATTERN declares for the thing it destructures, when
