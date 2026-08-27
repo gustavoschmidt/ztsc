@@ -694,6 +694,46 @@ pub const Code = enum(u16) {
     /// `checkGrammarProperty`, which runs only when `checkGrammarModifiers`
     /// found nothing. Blamed on the `?`, not on the name or the modifier.
     accessor_property_optional,
+    /// TS18006 `Classes may not have a field named 'constructor'.` — a class
+    /// FIELD whose name is the string literal `"constructor"` (either quote
+    /// style; `static` makes no difference, measured). tsc's
+    /// `checkGrammarProperty`, so a modifier diagnostic on the same member
+    /// swallows it. Blamed on the NAME.
+    ///
+    /// The IDENTIFIER spelling is not this: `constructor` unquoted names the
+    /// constructor slot, and a `constructor = 3` field is a different rule.
+    class_field_named_constructor,
+    /// TS1255/TS1263/TS1264, the three wordings of tsc's one
+    /// definite-assignment-assertion guard — see
+    /// `src/frontend/definite_assertion.zig`, which decides which fires.
+    /// Reported on the `!`. Grammar checks, behind `checkGrammarModifiers`.
+    definite_assertion_not_permitted,
+    definite_assertion_with_initializer,
+    definite_assertion_needs_type,
+    /// TS1267 `Property '{0}' cannot have an initializer because it is marked
+    /// abstract.` — tsc's `checkPropertyDeclaration`, NOT a grammar check, so
+    /// it survives a modifier diagnostic on the same member (`public public
+    /// abstract p = 1` reports TS1028 AND this, measured). Blamed on the NAME,
+    /// which is also the `{0}`.
+    abstract_property_initializer,
+    /// TS2668 `'export' modifier cannot be applied to ambient modules and
+    /// module augmentations since they are always visible.` — tsc's
+    /// `checkGrammarModifiers` for a ModuleDeclaration that `isAmbientModule`:
+    /// a STRING-named module or a `global` augmentation, `declare` or not. A
+    /// NAMESPACE is exempt. Blamed on the `export` keyword.
+    export_on_ambient_module,
+    /// TS2435 `Ambient modules cannot be nested in other modules or
+    /// namespaces.` — tsc's `checkModuleDeclaration`: a STRING-named module
+    /// inside a NAMESPACE body. Blamed on the name literal, and independent of
+    /// the TS1035 an undeclared quoted name earns (both fire on `namespace M {
+    /// module "A" { } }`, measured). One nested directly inside another AMBIENT
+    /// module is exempt — tsc reads that as a module augmentation.
+    ambient_module_nested,
+    /// TS18012 `'#constructor' is a reserved word.` — a class member named
+    /// `#constructor`, field or method alike. tsc reports it beside whatever
+    /// the modifiers earn (`public public #constructor = 1` answers TS18010
+    /// AND this, measured), so it is judged on its own.
+    private_name_constructor_reserved,
 
     /// TS1385/TS1386/TS1387/TS1388: `type U = string | () => void` — a function
     /// or constructor type written bare as a union or intersection CONSTITUENT,
@@ -1611,6 +1651,17 @@ pub const Code = enum(u16) {
             .mod_pair_readonly_accessor,
             .mod_pair_declare_accessor,
             .accessor_property_optional,
+            // `checkGrammarProperty` / `checkPropertyDeclaration` / the
+            // private-name reserved word: all three let a sibling's TS2322
+            // through (measured, `w48d/bang/c.ts`).
+            .class_field_named_constructor,
+            .definite_assertion_not_permitted,
+            .definite_assertion_with_initializer,
+            .definite_assertion_needs_type,
+            .abstract_property_initializer,
+            .export_on_ambient_module,
+            .ambient_module_nested,
+            .private_name_constructor_reserved,
             .ctor_may_not_be_accessor,
             .accessor_type_parameters,
             .get_accessor_parameters,
@@ -2020,6 +2071,14 @@ pub const Code = enum(u16) {
             .mod_pair_readonly_accessor => modPairMessage("readonly", "accessor"),
             .mod_pair_declare_accessor => modPairMessage("declare", "accessor"),
             .accessor_property_optional => "An 'accessor' property cannot be declared optional.",
+            .class_field_named_constructor => "Classes may not have a field named 'constructor'.",
+            .definite_assertion_not_permitted => "A definite assignment assertion '!' is not permitted in this context.",
+            .definite_assertion_with_initializer => "Declarations with initializers cannot also have definite assignment assertions.",
+            .definite_assertion_needs_type => "Declarations with definite assignment assertions must also have type annotations.",
+            .abstract_property_initializer => "Property '{0}' cannot have an initializer because it is marked abstract.",
+            .export_on_ambient_module => "'export' modifier cannot be applied to ambient modules and module augmentations since they are always visible.",
+            .ambient_module_nested => "Ambient modules cannot be nested in other modules or namespaces.",
+            .private_name_constructor_reserved => "'#constructor' is a reserved word.",
             .fn_type_in_union => "Function type notation must be parenthesized when used in a union type.",
             .ctor_type_in_union => "Constructor type notation must be parenthesized when used in a union type.",
             .fn_type_in_intersection => "Function type notation must be parenthesized when used in an intersection type.",
@@ -2475,6 +2534,14 @@ pub const Code = enum(u16) {
             .mod_pair_declare_accessor,
             => 1243,
             .accessor_property_optional => 1276,
+            .class_field_named_constructor => 18006,
+            .definite_assertion_not_permitted => 1255,
+            .definite_assertion_with_initializer => 1263,
+            .definite_assertion_needs_type => 1264,
+            .abstract_property_initializer => 1267,
+            .export_on_ambient_module => 2668,
+            .ambient_module_nested => 2435,
+            .private_name_constructor_reserved => 18012,
             .fn_type_in_union => 1385,
             .ctor_type_in_union => 1386,
             .fn_type_in_intersection => 1387,
