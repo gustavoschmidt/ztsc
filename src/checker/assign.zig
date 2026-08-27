@@ -1556,14 +1556,11 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!RelAnswer {
     //     the position only has to be a `base`; demanding the constraint too
     //     would reject the very values the guard supplies.
     //
-    // Two kind reads on a pair that already failed the identity test; the
-    // wrapper exists only inside a conditional's true branch, so on ordinary
-    // code both are a load and a compare.
-    if (c.ts.kind(s) == .substitution or c.ts.kind(t) == .substitution) {
-        s = try c.substitutionIntersection(s);
-        t = c.ts.substitutionBase(t);
-        if (s == t) return .yes;
-    }
+    // Folded into the `sk`/`tk` reads below rather than run here, so a program
+    // that writes no conditional true branch pays NOTHING for it: the kinds
+    // are read once either way, and the rewrite only re-reads them on the pair
+    // that actually carries a wrapper. Placed after the `this` block because
+    // that block may delegate the whole frame.
     // The same simplification, one level down: a `this` NESTED inside a
     // deferred operator (`this extends {_zod:…} ? this["_zod"]["output"] :
     // unknown`, zod's `output<this>`) relates through its apparent instance
@@ -1587,8 +1584,15 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!RelAnswer {
             return receiverBoundRetry(c, s, t, answer);
         }
     }
-    const sk = c.ts.kind(s);
-    const tk = c.ts.kind(t);
+    var sk = c.ts.kind(s);
+    var tk = c.ts.kind(t);
+    if (sk == .substitution or tk == .substitution) {
+        s = try c.substitutionIntersection(s);
+        t = c.ts.substitutionBase(t);
+        if (s == t) return .yes;
+        sk = c.ts.kind(s);
+        tk = c.ts.kind(t);
+    }
     // The generic reference each side denotes (`refFacetOf`), read ONCE: the
     // origin fast-paths, the variance probe and the relation memo key all
     // want it, and each used to pay its own `origin` lookup.
