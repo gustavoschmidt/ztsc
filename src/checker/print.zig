@@ -30,8 +30,12 @@ const scratch = Checker.scratch;
 pub fn typeToString(c: *Checker, t: TypeId) Error![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(c.out);
     defer aw.deinit();
-    printType(c, &aw.writer, t, 0) catch |err| switch (err) {
+    printType(c, &aw.writer, t, 0, max_type_string) catch |err| switch (err) {
         error.WriteFailed => return error.OutOfMemory,
+        // The rendering ran past what the truncation below keeps; the bytes
+        // already on the writer are exactly the ones an unbudgeted render
+        // would have produced (see `budget`).
+        error.BudgetSpent => {},
     };
     var s = aw.written();
     if (s.len > max_type_string) {
@@ -44,9 +48,35 @@ pub fn typeToString(c: *Checker, t: TypeId) Error![]const u8 {
 /// `Error!` (interning) function is reachable from it with `try` — which is
 /// why the printers may hold borrowed `members`/`refArgs`/`fnTypeParams`
 /// slices across their recursion. Keep it that way.
-pub const PrintErr = std.Io.Writer.Error;
+///
+/// `BudgetSpent` is not a failure: it is how a render that has already
+/// produced every byte `typeToString` keeps unwinds out of the recursion
+/// instead of walking the rest of the type (see `budget`).
+pub const PrintErr = std.Io.Writer.Error || error{BudgetSpent};
 
-fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!void {
+/// A `budget` meaning "render the whole thing" — for the structural sort keys,
+/// which are compared, not displayed.
+const no_budget = std.math.maxInt(usize);
+
+/// Renders `t` into `w`, stopping once `w` holds `budget` bytes.
+///
+/// `typeToString` truncates its result to `max_type_string`, and the printers
+/// only ever APPEND, so every byte a render produces past that offset is
+/// discarded — as is every type-store read, member-table walk and structural
+/// sort that produced it. On social-app the same @types/react props types are
+/// spelled by 31 diagnostics whose headline shows ~160 characters of an object
+/// running to tens of kilobytes, so the discarded part was the bulk of the
+/// work: a union nested inside it was still `sortMembersStructural`-sorted,
+/// which renders a full key per member.
+///
+/// Stopping is byte-exact rather than approximate. The first `budget` bytes
+/// are already final when the check trips, so the truncated string is
+/// identical to the one an unbudgeted render would have produced — including
+/// its display ORDER, because the sort keys that fix that order are rendered
+/// unbudgeted (`writeSortKey`).
+fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32, budget: usize) PrintErr!void {
+    // `Allocating` never drains, so `end` is the total byte count.
+    if (w.end >= budget) return error.BudgetSpent;
     if (t == types.no_type) return w.writeAll("any");
     if (depth > 6) return w.writeAll("...");
     const s = &c.ts;
@@ -94,7 +124,7 @@ fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!voi
             for (sorted) |x| {
                 if (!first) try w.writeAll(" | ");
                 first = false;
-                try printTypeParen(c, w, x, depth + 1, .union_member);
+                try printTypeParen(c, w, x, depth + 1, .union_member, budget);
             }
             for (all) |x| {
                 if (s.kind(x) != .null) continue;
@@ -113,12 +143,12 @@ fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!voi
             const sorted = try sortMembersStructural(c, s.members(t), depth + 1);
             for (sorted, 0..) |x, i| {
                 if (i > 0) try w.writeAll(" & ");
-                try printTypeParen(c, w, x, depth + 1, .isect_member);
+                try printTypeParen(c, w, x, depth + 1, .isect_member, budget);
             }
         },
         .array => {
             if (s.arrayIsReadonly(t)) try w.writeAll("readonly ");
-            try printTypeParen(c, w, s.arrayElem(t), depth + 1, .array_elem);
+            try printTypeParen(c, w, s.arrayElem(t), depth + 1, .array_elem, budget);
             try w.writeAll("[]");
         },
         // An evolving array never leaves the flow walk (see
@@ -128,7 +158,7 @@ fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!voi
         .evolving_array => {
             const elem = s.arrayElem(t);
             if (elem == types.never_type) return w.writeAll("any[]");
-            try printTypeParen(c, w, elem, depth + 1, .array_elem);
+            try printTypeParen(c, w, elem, depth + 1, .array_elem, budget);
             try w.writeAll("[]");
         },
         .tuple => {
@@ -142,11 +172,11 @@ fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!voi
                 const e = s.tupleElem(t, @intCast(i));
                 if (e.rest()) try w.writeAll("...");
                 if (e.optional() and !e.rest()) {
-                    try printOptionalElem(c, w, e.ty, depth + 1);
+                    try printOptionalElem(c, w, e.ty, depth + 1, budget);
                     try w.writeAll("?");
                     continue;
                 }
-                try printType(c, w, e.ty, depth + 1);
+                try printType(c, w, e.ty, depth + 1, budget);
             }
             try w.writeAll("]");
         },
@@ -167,7 +197,7 @@ fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!voi
             if (objectPrintsAsSignature(c, t)) {
                 const is_construct = nconstruct == 1;
                 const sig = if (is_construct) s.objectConstructSig(t, 0) else s.objectCallSig(t, 0);
-                return printSig(c, w, sig, is_construct, .arrow, depth);
+                return printSig(c, w, sig, is_construct, .arrow, depth, budget);
             }
             try w.writeAll("{ ");
             var first = true;
@@ -175,12 +205,12 @@ fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!voi
             for (0..ncall) |i| {
                 if (!first) try w.writeAll(" ");
                 first = false;
-                try printSig(c, w, s.objectCallSig(t, @intCast(i)), false, .member, depth + 1);
+                try printSig(c, w, s.objectCallSig(t, @intCast(i)), false, .member, depth + 1, budget);
             }
             for (0..nconstruct) |i| {
                 if (!first) try w.writeAll(" ");
                 first = false;
-                try printSig(c, w, s.objectConstructSig(t, @intCast(i)), true, .member, depth + 1);
+                try printSig(c, w, s.objectConstructSig(t, @intCast(i)), true, .member, depth + 1, budget);
             }
             // Properties are *stored* sorted by name atom (canonical for
             // interning), but atom ids depend on the parallel intern order,
@@ -196,7 +226,7 @@ fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!voi
                 first = false;
                 try writeMemberName(c, w, p.name);
                 try w.print("{s}: ", .{if (p.optional()) "?" else ""});
-                try printType(c, w, p.ty, depth + 1);
+                try printType(c, w, p.ty, depth + 1, budget);
                 try w.writeAll(";");
             }
             if (sidx != 0) {
@@ -210,13 +240,13 @@ fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!voi
                     "[x: symbol]: "
                 else
                     "[x: string]: ");
-                try printType(c, w, sidx, depth + 1);
+                try printType(c, w, sidx, depth + 1, budget);
                 try w.writeAll(";");
             }
             if (nidx != 0) {
                 if (!first) try w.writeAll(" ");
                 try w.writeAll("[x: number]: ");
-                try printType(c, w, nidx, depth + 1);
+                try printType(c, w, nidx, depth + 1, budget);
                 try w.writeAll(";");
             }
             try w.writeAll(" }");
@@ -238,7 +268,7 @@ fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!voi
             const this_ty = s.fnThisType(t);
             if (this_ty != 0) {
                 try w.writeAll("this: ");
-                try printType(c, w, this_ty, depth + 1);
+                try printType(c, w, this_ty, depth + 1, budget);
                 if (s.fnParamCount(t) > 0) try w.writeAll(", ");
             }
             for (0..s.fnParamCount(t)) |i| {
@@ -248,16 +278,16 @@ fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!voi
                 if (p.name != 0) {
                     try w.print("{s}{s}: ", .{ c.atomText(p.name), if (p.flags & types.param_flag_optional != 0) "?" else "" });
                 }
-                try printType(c, w, p.ty, depth + 1);
+                try printType(c, w, p.ty, depth + 1, budget);
             }
             try w.writeAll(") => ");
-            try printType(c, w, s.fnReturn(t), depth + 1);
+            try printType(c, w, s.fnReturn(t), depth + 1, budget);
         },
         .overloads => {
             try w.writeAll("{ ");
             for (s.members(t), 0..) |m, i| {
                 if (i > 0) try w.writeAll(" ");
-                try printType(c, w, m, depth + 1);
+                try printType(c, w, m, depth + 1, budget);
                 try w.writeAll(";");
             }
             try w.writeAll(" }");
@@ -269,7 +299,7 @@ fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!voi
                 try w.writeAll("<");
                 for (args, 0..) |a, i| {
                     if (i > 0) try w.writeAll(", ");
-                    try printType(c, w, a, depth + 1);
+                    try printType(c, w, a, depth + 1, budget);
                 }
                 try w.writeAll(">");
             }
@@ -284,40 +314,40 @@ fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!voi
         .infer_var => try w.print("infer {s}", .{c.atomText(s.inferVarName(t))}),
         .mapped_param => try w.print("{s}", .{c.atomText(s.mappedParamName(t))}),
         .index_access => {
-            try printTypeParen(c, w, s.indexAccessObj(t), depth + 1, .operand);
+            try printTypeParen(c, w, s.indexAccessObj(t), depth + 1, .operand, budget);
             try w.writeAll("[");
-            try printType(c, w, s.indexAccessIndex(t), depth + 1);
+            try printType(c, w, s.indexAccessIndex(t), depth + 1, budget);
             try w.writeAll("]");
         },
         .mapped => {
             try w.writeAll("{ [");
-            try printType(c, w, s.mappedKeyParam(t), depth + 1);
+            try printType(c, w, s.mappedKeyParam(t), depth + 1, budget);
             try w.writeAll(" in ");
             if (s.mappedHomomorphic(t)) {
                 try w.writeAll("keyof ");
-                try printType(c, w, s.mappedSource(t), depth + 1);
+                try printType(c, w, s.mappedSource(t), depth + 1, budget);
             } else {
-                try printType(c, w, s.mappedConstraint(t), depth + 1);
+                try printType(c, w, s.mappedConstraint(t), depth + 1, budget);
             }
             try w.writeAll("]: ");
-            try printType(c, w, s.mappedValue(t), depth + 1);
+            try printType(c, w, s.mappedValue(t), depth + 1, budget);
             try w.writeAll(" }");
         },
         .conditional => {
-            try printTypeParen(c, w, s.condCheck(t), depth + 1, .operand);
+            try printTypeParen(c, w, s.condCheck(t), depth + 1, .operand, budget);
             try w.writeAll(" extends ");
-            try printTypeParen(c, w, s.condExtends(t), depth + 1, .operand);
+            try printTypeParen(c, w, s.condExtends(t), depth + 1, .operand, budget);
             try w.writeAll(" ? ");
-            try printType(c, w, s.condTrue(t), depth + 1);
+            try printType(c, w, s.condTrue(t), depth + 1, budget);
             try w.writeAll(" : ");
-            try printType(c, w, s.condFalse(t), depth + 1);
+            try printType(c, w, s.condFalse(t), depth + 1, budget);
         },
         .template_literal_type => {
             try w.writeAll("`");
             try w.writeAll(c.atomText(s.templateHead(t)));
             for (0..s.templateHoleCount(t)) |i| {
                 try w.writeAll("${");
-                try printType(c, w, s.templateHole(t, @intCast(i)), depth + 1);
+                try printType(c, w, s.templateHole(t, @intCast(i)), depth + 1, budget);
                 try w.writeAll("}");
                 try w.writeAll(c.atomText(s.templateChunk(t, @intCast(i))));
             }
@@ -325,12 +355,12 @@ fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!voi
         },
         .string_mapping => {
             try w.print("{s}<", .{stringMappingName(s.stringMappingKind(t))});
-            try printType(c, w, s.stringMappingArg(t), depth + 1);
+            try printType(c, w, s.stringMappingArg(t), depth + 1, budget);
             try w.writeAll(">");
         },
         .keyof_op => {
             try w.writeAll("keyof ");
-            try printTypeParen(c, w, s.keyofOperand(t), depth + 1, .operand);
+            try printTypeParen(c, w, s.keyofOperand(t), depth + 1, .operand, budget);
         },
     }
 }
@@ -407,7 +437,7 @@ fn objectPrintsAsSignature(c: *Checker, t: TypeId) bool {
     return (ncall == 1 and nconstruct == 0) or (nconstruct == 1 and ncall == 0);
 }
 
-fn printSig(c: *Checker, w: *std.Io.Writer, sig: TypeId, is_construct: bool, form: SigForm, depth: u32) PrintErr!void {
+fn printSig(c: *Checker, w: *std.Io.Writer, sig: TypeId, is_construct: bool, form: SigForm, depth: u32, budget: usize) PrintErr!void {
     const s = c.ts;
     if (is_construct) try w.writeAll("new ");
     const tps = s.fnTypeParams(sig);
@@ -427,10 +457,10 @@ fn printSig(c: *Checker, w: *std.Io.Writer, sig: TypeId, is_construct: bool, for
         if (p.name != 0) {
             try w.print("{s}{s}: ", .{ c.atomText(p.name), if (p.flags & types.param_flag_optional != 0) "?" else "" });
         }
-        try printType(c, w, p.ty, depth + 1);
+        try printType(c, w, p.ty, depth + 1, budget);
     }
     try w.writeAll(if (form == .arrow) ") => " else "): ");
-    try printType(c, w, s.fnReturn(sig), depth + 1);
+    try printType(c, w, s.fnReturn(sig), depth + 1, budget);
     if (form == .member) try w.writeAll(";");
 }
 
@@ -459,11 +489,11 @@ const PrintPos = enum { union_member, isect_member, operand, array_elem };
 ///
 ///     [any?]     -> [any?]        [unknown?] -> [unknown?]
 ///     [undefined?] -> [undefined?]  [never?] -> [undefined?]
-fn printOptionalElem(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!void {
+fn printOptionalElem(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32, budget: usize) PrintErr!void {
     const s = &c.ts;
     switch (s.kind(t)) {
         // `T | undefined` is `T` for these three: no union, so no parentheses.
-        .any, .unknown, .undefined => return printType(c, w, t, depth),
+        .any, .unknown, .undefined => return printType(c, w, t, depth, budget),
         // `never | undefined` reduces to `undefined` (tsc prints `[undefined?]`
         // for `[never?]`).
         .never => return w.writeAll("undefined"),
@@ -473,7 +503,7 @@ fn printOptionalElem(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) Prin
                 if (s.kind(s.memberAt(t, @intCast(i))) == .undefined) has_undef = true;
             }
             try w.writeAll("(");
-            try printType(c, w, t, depth);
+            try printType(c, w, t, depth, budget);
             if (!has_undef) try w.writeAll(" | undefined");
             try w.writeAll(")");
         },
@@ -482,13 +512,13 @@ fn printOptionalElem(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) Prin
             // As a union member: a function or an intersection takes its own
             // parentheses inside the pair this adds — tsc's
             // `[((() => void) | undefined)?]`.
-            try printTypeParen(c, w, t, depth, .union_member);
+            try printTypeParen(c, w, t, depth, .union_member, budget);
             try w.writeAll(" | undefined)");
         },
     }
 }
 
-fn printTypeParen(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32, pos: PrintPos) PrintErr!void {
+fn printTypeParen(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32, pos: PrintPos, budget: usize) PrintErr!void {
     const needs = switch (c.ts.kind(t)) {
         .function => true,
         // A lone call/construct signature prints as `(…) => R` / `new (…) => R`
@@ -508,7 +538,7 @@ fn printTypeParen(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32, pos: Pr
         else => false,
     };
     if (needs) try w.writeAll("(");
-    try printType(c, w, t, depth);
+    try printType(c, w, t, depth, budget);
     if (needs) try w.writeAll(")");
 }
 
@@ -550,7 +580,12 @@ fn writeSortKey(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!
         // partitions (a deep-union member-order divergence across
         // --checkers). Matching the depth makes the key equal iff the two
         // members render identically, so order is TypeId-independent.
-        else => try printType(c, w, t, depth),
+        // A sort key is rendered UNBUDGETED. It is not display text: two
+        // members that agree on the first `max_type_string` bytes and diverge
+        // after would tie, and an unstable sort would then order them by
+        // `makeUnion`'s TypeId order — the very cross-partition divergence
+        // this key exists to remove.
+        else => try printType(c, w, t, depth, no_budget),
     }
 }
 
