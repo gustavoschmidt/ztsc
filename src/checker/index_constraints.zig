@@ -281,12 +281,15 @@ pub fn checkInterfaceIndexConstraints(
 /// declaration and the site is always the member itself. That makes this the
 /// simplest of the three entry points — no merged blocks, no static half.
 ///
-/// Deliberately NOT `checkIndexGrammar`: the grammar rules about an index
-/// signature's own syntax are `checkSourceElement`'s business and run for the
-/// signature node wherever it appears, while the two entry points above call
-/// them only because their own index-info screen would otherwise hide a
-/// signature that never became an index info.
+/// `checkIndexGrammar` runs here for the reason it runs from the two entry
+/// points above: the index-info screen below would otherwise hide a signature
+/// that never BECAME an index info, and a key type ztsc cannot make an info
+/// out of is precisely what TS1268 is about. This arm is `typeFromTypeNode`'s
+/// single `.object_type` case, memoized by `(file, node)`, so a written
+/// `{ [index: RegExp]; }` is judged exactly once wherever its materialization
+/// starts — the same once-per-literal position TS2411 already occupies.
 pub fn checkTypeLiteralIndexConstraints(c: *Checker, members: []const Node, obj: TypeId) Error!void {
+    try checkIndexGrammar(c, members);
     const t = try c.resolveStructural(obj);
     if (c.ts.kind(t) != .object) return;
     const infos = Infos.of(c, t);
