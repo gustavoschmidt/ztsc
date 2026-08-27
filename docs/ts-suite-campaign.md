@@ -972,7 +972,49 @@ keyof outer-args. SUBSTITUTION TYPES confirmed as a real missing
 feature (the conditional-call fix swaps TS7006 for TS2345 without
 them — number relates as number & T inside the true branch).
 
-## Ranked next queue (wave 50) — distilled from wave-49 agent reports
+WAVE 50 STATUS (all four branches MERGED to main; per-branch gates all
+green — 0 regressions each, conformance 1330/1330, apps byte-empty,
+grids clean; THE COMBINED SWEEP WAS INTERRUPTED BY A SHUTDOWN AND MUST
+RE-RUN BEFORE WAVE 51 LAUNCHES — expected ~7970/8641 ≈92.2% from the
+per-branch sweeps: B +2, C +1, D +8, A suite-neutral):
+A landed the SUBSTITUTION-TYPES FOUNDATION: types.Kind.substitution
+(base, constraint) with degenerate wrappers dropped at intern; full
+transparency arms (print shows base; instantiate maps both;
+containsTypeParam descends; relation reads tsc's getNormalizedType —
+source→constraint&base [CONSTRAINT FIRST, oracle-verified], target→
+base); creation frames around conditional TRUE branches riding
+SavedCtx; SCOPED to concrete bases — each excluded family's breakage
+measured (indexed-access broke ajv's mapped/050; mapped-key broke 142
+social-app keys via reanimated; TYPE-PARAM is the big win but needs
+three arms first). WAVE-51 STEP IS ONE LINE (admit .type_param in
+generics.substitutable) after: a .substitution arm in
+props.propOfTypeIdx, the cond_true_depth screen in
+typeparams.undecidableTypeArg, branch-identity peeling in
+assign.condBranchwiseRelated (probes p5/p9 in A's scratchpad).
+drizzle +1.06% CPU consistent (machinery, not substitutions) —
+accepted. B landed instantiateOuter in the four class_value relation
+sites (+1 typeArgumentInferenceWithClassExpression1), the readonly
+single-element variadic bridge, the FULL shouldReportUnmatchedProperty
+Error port. C landed keyof's class_value outer arm (honest 0 delta)
++ TS2767 iterator-protocol methods (slow path only). D landed
+PARAMETER DECORATORS end-to-end (ast.ParamDecos side table; binder
+binds from the class-body walk; ctor param gets class VALUE +
+undefined key — oracle-confirmed; +5), TS2661 identity-resolved
+globals (shared primitive_type_names.zig), bind.is_module =
+isFileProbablyExternalModule (workaround retired, byte-neutral).
+KEY FINDINGS: TS7022 initializer-circle pool (13 cases) blocked on
+cycle-detector granularity — needs function-body nesting depth
+(expr.zig); A's attempt was +1/−4 and reverted. crashDeclareGlobal
+TypeofExport's TS2502 is NAME RESOLUTION (typeof zap resolves to the
+UMD namespace, not the global const — typespace.typeofEntity/linker).
+callOfConditionalTypeWithConcreteBranches is NOT substitution — it's
+contextual typing through a deferred-conditional callee (calls/infer).
+TS2454-in-decorators FP mechanism pinned (getControlFlowContainer
+stops at PropertyDeclaration; in_decorator gate written, unlanded).
+Ref-level outer args for class INSTANCE types heads the wave-51 queue
+(types.zig payload mirroring class_value's).
+
+## Ranked next queue (wave 50) — SUPERSEDED by the status block above; original queue kept for context
 
 1. instantiateOuter in assign.zig's class_value arms (LAST blocker for
    typeArgumentInferenceWithClassExpression1/3; sites pinned:
