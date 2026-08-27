@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-29, post wave 48)
+## Standings (2026-08-30, post wave 49)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7940 / 8641 (91.9%)** |
-| excess keys (false positives) | 3541 | 850 |
-| missing keys (under-reports) | 8617 | 1797 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7959 / 8641 (92.1%)** |
+| excess keys (false positives) | 3541 | 836 |
+| missing keys (under-reports) | 8617 | 1776 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Forty-eight waves landed (3–48), every one with ZERO match→non-match regressions in
+Forty-nine waves landed (3–49), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -941,7 +941,72 @@ crashDeclareGlobalTypeofExport DOUBLE-diagnosed: the binder is fine;
 mergeGlobals' umdMergeTarget redirects the augmentation's const to
 the module namespace — fix needs the TS2454 interaction solved.
 
-## Ranked next queue (wave 49) — distilled from wave-48 agent reports
+Wave 49 (+19 exact → 7959/8641 92.1%; PERF: social-app RSS −22.1%,
+CPU −2%; excalidraw RSS recovered −3.35%): D's printer budget was the
+headline — typeToString truncates at 160 bytes but printers rendered
+EVERYTHING (incl. structural sort keys of unions nested in the
+discarded part), and every string dupes into the never-released
+diagnostic arena; printType now unwinds on BudgetSpent, byte-exact,
+sort keys unbudgeted (a capped key would tie and fall back to
+TypeId order — the divergence the key exists to prevent). D also
+landed JSX two-round inference (three tsc mechanisms: skip only
+context-SENSITIVE attributes; re-read deferred sites in source order
+feeding each other; substituting a parameter FIXES it), TS2499,
+TS2669 (finding: bind.is_module is HALF of tsc's external-module test
+— import.meta anywhere also qualifies; patched locally, unification
+queued). B recovered the wave-48 RSS (the combined-attributes gate
+now interns only after a spread property REJECTS — a reorder,
+equivalent by construction), landed TS1329 (tsgo rule not in tsc
+source: only identifier/dotted decorators), TS1268 for type literals,
+the tuple REST-element read (two readers took .ty straight — a live
+FP on number-index relation), and tsc's four-rung tuple-arity ladder
+(20 shapes verified). A landed the TS7024 circular-return mechanism
+(ret_res_stack; two oracle-measured exclusions: whole-return direct
+self-call answers silentNever; generic/block-arrows stay out),
+TS2315's safe half, new-C() outer args, and both C handoffs WITH
+corrections (ctxPropType's intersection arm let an any-index swallow
+the declaring sibling — fixed declared-only and gated). C landed
+intersection reverse-mapping (reverseMappedSourceProps merges
+constituent names via collectPropNames), the class_value unify arm,
+keyof outer-args. SUBSTITUTION TYPES confirmed as a real missing
+feature (the conditional-call fix swaps TS7006 for TS2345 without
+them — number relates as number & T inside the true branch).
+
+## Ranked next queue (wave 50) — distilled from wave-49 agent reports
+
+1. instantiateOuter in assign.zig's class_value arms (LAST blocker for
+   typeArgumentInferenceWithClassExpression1/3; sites pinned:
+   assign.zig:3954/3956 target, :797/:801/:6336 source,
+   assign_report.zig:1081-2). B.
+2. keyof.zig's classStaticType reads without outer substitution
+   (:377/:1302/:1399 — the keyof typeof C arm). C.
+3. SUBSTITUTION TYPES (dedicated-wave candidate, now twice-confirmed):
+   inside `number extends T ? …` the true branch's number must relate
+   as number & T (tsc's SubstitutionType). Unblocks
+   callOfConditionalTypeWithConcreteBranches + the wave-31-era
+   deferred-conditional items.
+4. TS7023 object-literal-method / accessor `this` circularity (5+
+   one-keys: checkingObjectWithThisInNamePositionNoCrash,
+   trivialSubtypeReduction…, thisInObjectLiterals, for-of33/34/35) —
+   a DIFFERENT mechanism from the landed TS7024.
+5. Instance side of outer type params: a .ref carries only local args;
+   tsc models outerTypeParameters ++ localTypeParameters on the
+   declared type (bigger; design against the class_value work).
+6. bind.is_module unification (import.meta as an external-module
+   indicator — moves module scoping; own sweep).
+7. jsxChildWrongType (children relation — dedicated wave; deliberate
+   leniency documented at jsx.zig:1852).
+8. Small pinned: crashDeclareGlobalTypeofExport's last TS2502
+   (signatures.zig — B); TS2661 (globalThisGlobalExportAsGlobal);
+   parameter decorators DISCARDED at parse (parser AST edge + TS1239
+   ×7/TS1308 — D parser + decorator checker); tuple per-position FLAG
+   ladder (startCount shift — B, own sweep); TS5108; TS1039 arrow
+   span.
+9. STRIKE from queue: TS1315 (zero corpus cases).
+10. Census: 166 one-key (−TS2322 ×10, −TS2339 ×6, −TS7023 ×5,
+    +TS2322 ×5, −TS2304/−TS2741 ×4).
+
+## Superseded queue (wave 49, kept for context)
 
 1. Excalidraw RSS lead: arena-scope the JSX combined-attributes object
    per element (or avoid interning it) — recover the +3MB (B/D).
