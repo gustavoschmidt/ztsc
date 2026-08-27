@@ -2981,6 +2981,35 @@ fn primitiveOnlyTarget(k: types.Kind) bool {
 }
 
 pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: types.Kind) Error!bool {
+    // A TARGET that is a lazy alias self-reference, the twin of the `.ref`
+    // SOURCE rule further down. `aliasInstance`'s cycle cut leaves `ref(A, args)` for every
+    // reference taken while `A`'s body was still materializing, so a MUTUALLY
+    // recursive pair spells one type two ways: the reference the user writes
+    // expands to the union, the one inside the partner alias's body stays the
+    // ref. The two must still meet.
+    //
+    //     type Cond<T> = T extends unknown[] ? never : { q: T };
+    //     type R2<T>   = Cond<T> | Tup<T>;
+    //     type Tup<T>  = ["marker", ...R2<T>[]];
+    //
+    // `Tup<T>`'s rest element is `ref(R2, [T])`, so relating a written
+    // `["marker", ...R2<T>[]]` to `Tup<T>` compares the EXPANSION of `R2<T>`
+    // against that ref element-wise, and the target-union branch below — the
+    // one that would have found the matching constituent — never runs because
+    // the target's kind is `.ref` (`recursiveReverseMappedType`, and the b1 /
+    // b4 / b6 shapes of the wave-48 repro).
+    //
+    // Scoped to a ref whose symbol is a type ALIAS ON A CYCLE, which is
+    // exactly the set the cut produces: an interface or class instance is an
+    // object for every argument list and can never be the union this is
+    // looking for, and a non-cyclic alias reference was already materialized
+    // by `aliasInstance` rather than left as a ref.
+    if (tk == .ref and c.symFlags(c.ts.refSymbol(t)).type_alias and
+        c.alias_recursive.contains(c.ts.refSymbol(t)))
+    {
+        const rt = try c.resolveStructural(t);
+        if (rt != t and c.ts.kind(rt) == .union_type) return c.isAssignable(s, rt);
+    }
     // Deferred conditional *source* is handled first (before union
     // distribution): it resolves to one of its branches, so it is
     // assignable to `t` exactly when *both* branches are — even when `t`
