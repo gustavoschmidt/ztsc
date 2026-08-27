@@ -140,6 +140,14 @@ pub fn signatureOfProtoCtx(
     // installs it (`signatureOfProtoCtx`).
     const saved_this = c.this_type;
     defer c.this_type = saved_this;
+    // A parameter's annotation sits one PARAMETER deeper than the signature
+    // itself, which is the only thing tsc's `getConditionalFlowTypeOfType`
+    // counts when it decides whether an occurrence of a conditional's check
+    // type is covariant there. Flipped around the whole list (the return type
+    // and a `this` annotation are read outside it, at the signature's own
+    // parity) — see `Checker.subst_parity`.
+    c.subst_parity ^= 1;
+    defer c.subst_parity ^= 1;
     for (param_nodes) |pn| {
         if (pn == null_node) continue;
         if (!seen_param) {

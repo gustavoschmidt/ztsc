@@ -1002,9 +1002,43 @@ pub fn mintThisTp(c: *Checker, orig: SymbolId, repl: TypeId, constraint: TypeId,
 pub fn substitutionIntersection(c: *Checker, t: TypeId) Error!TypeId {
     if (c.ts.kind(t) != .substitution) return t;
     if (c.subst_isect_cache.get(t)) |v| return v;
-    const isect = try c.ts.makeIntersection(c.scratch(), &.{ c.ts.substBase(t), c.ts.substConstraint(t) });
+    // CONSTRAINT FIRST — tsc's `getIntersectionType([constraint, baseType])`.
+    // ztsc's intersections keep the order they were built from, and that
+    // order is what a diagnostic prints: tsgo says `string & T`, not
+    // `T & string` (oracle-verified on `T extends string ? { v: T } : never`
+    // and on an object-typed constraint).
+    const isect = try c.ts.makeIntersection(c.scratch(), &.{ c.ts.substConstraint(t), c.ts.substBase(t) });
     try c.subst_isect_cache.put(c.cm(), t, isect);
     return isect;
+}
+
+/// What a substitution BECOMES once its two halves have been substituted —
+/// tsc's `instantiateType` substitution arm, which is not a plain re-wrap.
+/// Every walk that rewrites a type has to run it, or a wrapper outlives the
+/// question it was asked to answer: `Extract<"a" | "b", "a">`'s true branch IS
+/// the substituted check, so without the resolve every constituent comes back
+/// wrapped forever.
+///
+///   * an `any`/`unknown` constraint, or one equal to the base, says nothing;
+///   * base still a type variable AND constraint still generic -> nothing has
+///     been decided yet, keep the wrapper;
+///   * the base already satisfies the constraint -> no news, drop it;
+///   * base still a type variable -> keep the wrapper;
+///   * otherwise -> `constraint & base`, tsc's last arm: the conditional
+///     promised both and the base alone no longer says so.
+///
+/// tsc measures the third test under `getRestrictiveInstantiation` (which
+/// erases constraints, so a bounded `T` does NOT satisfy its own bound);
+/// ztsc asks the plain relation, which can only DROP a wrapper tsc keeps —
+/// i.e. fall back to the pre-substitution behaviour, never past it.
+pub fn resolveSubstitution(c: *Checker, base: TypeId, con: TypeId) Error!TypeId {
+    const s = &c.ts;
+    if (con == base or con == types.any_type or con == types.unknown_type) return base;
+    const base_var = isTypeVariableKind(s.kind(base));
+    if (base_var and try c.containsTypeParam(con)) return s.makeSubstitution(base, con);
+    if (try c.isAssignable(base, con)) return base;
+    if (base_var) return s.makeSubstitution(base, con);
+    return s.makeIntersection(c.scratch(), &.{ con, base });
 }
 
 /// Substitute the type parameters in `map` throughout `t`. Public entry:
@@ -1137,6 +1171,17 @@ pub fn chainRepeats(c: *const Checker, t: TypeId) bool {
 /// Shallow by construction — one level into a union/intersection, exactly as
 /// tsc's `getGenericObjectFlags` folds its constituents — so it costs a kind
 /// switch per parameter per instantiation.
+/// tsc's `TypeFlags.TypeVariable` — the kinds a substitution may keep
+/// wrapping after instantiation, because they can still become anything.
+/// `this_type` and `infer_var` are here because tsc models both AS type
+/// parameters; ztsc spells them separately.
+fn isTypeVariableKind(k: types.Kind) bool {
+    return switch (k) {
+        .type_param, .index_access, .this_type, .infer_var => true,
+        else => false,
+    };
+}
+
 fn declaredInstantiable(s: *const types.Store, t: TypeId) bool {
     return switch (s.kind(t)) {
         .type_param,
@@ -1710,16 +1755,24 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
             const op = try c.instantiateId(s.keyofOperand(t), map, map_id);
             break :blk try c.keyofType(op);
         },
-        // tsc's `instantiateType` substitution arm: map BOTH halves and
-        // re-wrap through `makeSubstitution`, which drops the wrapper when
-        // the substituted constraint stops saying anything (the usual
-        // outcome once the check type is concrete — `Q<number>` leaves a
-        // plain `number`, so nothing downstream ever meets a stale wrapper).
-        .substitution => blk: {
-            const base = try c.instantiateId(s.substBase(t), map, map_id);
-            const con = try c.instantiateId(s.substConstraint(t), map, map_id);
-            break :blk try s.makeSubstitution(base, con);
-        },
+        // tsc's `instantiateType` substitution arm, which is not a plain
+        // re-wrap: once the check type goes concrete the wrapper has to
+        // RESOLVE, or `Extract<"a" | "b", "a">` — whose true branch is the
+        // substituted `T` — would hand back a wrapper per constituent
+        // forever.
+        //
+        //   * base still a type variable AND constraint still generic
+        //     -> keep the substitution; nothing has been decided.
+        //   * base already satisfies the constraint -> the wrapper carries no
+        //     news; drop it. (`"a"` under `"a" | "b"`.)
+        //   * base still a type variable -> keep the substitution.
+        //   * otherwise -> `constraint & base`, tsc's last arm: the
+        //     conditional promised both and the base alone no longer says so.
+        .substitution => try resolveSubstitution(
+            c,
+            try c.instantiateId(s.substBase(t), map, map_id),
+            try c.instantiateId(s.substConstraint(t), map, map_id),
+        ),
         else => t,
     };
     // Memoize only when nothing below tripped the limit (a truncated result
@@ -1958,7 +2011,8 @@ fn substThisInner(c: *Checker, t: TypeId, repl: TypeId) Error!TypeId {
             return c.reduceConditional(chk, ext, tru, fls, s.condDistributive(t));
         },
         .keyof_op => return c.keyofType(try c.substThis(s.keyofOperand(t), repl)),
-        .substitution => return s.makeSubstitution(
+        .substitution => return resolveSubstitution(
+            c,
             try c.substThis(s.substBase(t), repl),
             try c.substThis(s.substConstraint(t), repl),
         ),
