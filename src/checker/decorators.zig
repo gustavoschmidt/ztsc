@@ -593,11 +593,10 @@ fn checkLegacyDecoratorSig(c: *Checker, deco: Node, dt: TypeId, pos: DecoPos, ar
     const params = c.ts.fnParamCount(sig);
     const min = try c.requiredParams(sig);
     const max = try c.paramTotal(sig);
-    // tsc's `signatureHasRestParameter` (the declared `...`) versus its
-    // `hasEffectiveRestParameter` (a rest that does NOT expand to a fixed
-    // parameter list): the first decides whether the decorator merely looks
-    // uncalled, the second which arity wording applies.
-    const has_rest = params > 0 and c.ts.fnParam(sig, params - 1).rest();
+    // tsc's `hasEffectiveRestParameter` (a rest that does NOT expand to a
+    // fixed parameter list) decides which arity wording applies;
+    // `signatureHasRestParameter` (the declared `...`) decides whether the
+    // decorator merely looks uncalled, and lives in `uncalledFactory`.
     const unbounded = max == std.math.maxInt(u32);
     // How many arguments tsc counts against THIS signature
     // (`getDecoratorArgumentCount`) — the method family drops the
@@ -606,11 +605,11 @@ fn checkLegacyDecoratorSig(c: *Checker, deco: Node, dt: TypeId, pos: DecoPos, ar
 
     // tsc's `isPotentiallyUncalledDecorator`: a signature that takes no
     // required argument and cannot absorb the ones the runtime passes is
-    // reported as a decorator FACTORY someone forgot to call (TS1329,
-    // "Did you mean to call it first"), not as a broken decorator. ztsc
-    // under-reports that family — and must not report the arity failure in
-    // its place.
-    if (min == 0 and !has_rest and params < argc) return;
+    // reported as a decorator FACTORY someone forgot to call (TS1329, "Did
+    // you mean to call it first"), not as a broken decorator. Only where the
+    // decorator is written as a NAME, though — see `reportUncalledFactory`;
+    // otherwise the arity failure below IS the answer.
+    if (try uncalledFactory(c, sig, argc) and try reportUncalledFactory(c, deco)) return;
 
     if (argc < min or argc > max) {
         // "expects N" / "N-M" / "at least N", over the same three cases as
@@ -653,6 +652,53 @@ fn checkLegacyDecoratorSig(c: *Checker, deco: Node, dt: TypeId, pos: DecoPos, ar
         });
         return; // tsc reports the first failing argument only
     }
+}
+
+/// tsc's `isPotentiallyUncalledDecorator`, for ONE signature: it takes no
+/// required argument, declares no rest parameter, and still has fewer
+/// parameters than the runtime will hand it. Such a signature can never
+/// resolve, but the reason is not a broken decorator — it is a decorator
+/// FACTORY someone forgot to call.
+///
+/// `argc` is the caller's `getDecoratorArgumentCount`, which is the only
+/// thing the two dialects disagree about here.
+fn uncalledFactory(c: *Checker, sig: TypeId, argc: u32) Error!bool {
+    if (try c.requiredParams(sig) != 0) return false;
+    const params = c.ts.fnParamCount(sig);
+    if (params > 0 and c.ts.fnParam(sig, params - 1).rest()) return false;
+    return params < argc;
+}
+
+/// TS1329, tsc's answer for `uncalledFactory` — reported in place of the
+/// arity failure it stands for. Returns false when the shape earns no TS1329
+/// and the arity report is the right answer after all.
+///
+/// The suggestion needs a NAME to put a `()` after, and tsgo answers TS1329
+/// only where the decorator expression IS one: an identifier or a dotted name.
+/// `@(dec)`, `@(mk())` and `@(() => {})` all take the arity message instead,
+/// measured in BOTH dialects — `@dec` is TS1329 while the parenthesized `@(dec)`
+/// on the same declaration is TS1238 "expects 0".
+///
+/// The whole decorator NODE is blamed (`createDiagnosticForNode(node)`, so the
+/// `@` is included), while the name quoted twice is the raw source text of its
+/// EXPRESSION (`getTextOfNode`), not the type it resolved to — `@o.f` suggests
+/// `@o.f()`.
+fn reportUncalledFactory(c: *Checker, deco: Node) Error!bool {
+    const expr = c.tree.nodeData(deco).lhs;
+    if (expr == null_node) return false;
+    switch (c.nodeTag(expr)) {
+        .identifier, .member_expr => {},
+        else => return false,
+    }
+    const s = c.nodeSpan(expr);
+    const text = c.src[s.start..s.end];
+    try c.diagFmt(
+        1329,
+        c.nodeSpan(deco),
+        "'{s}' accepts too few arguments to be used as a decorator here. Did you mean to call it first and write '@{s}()'?",
+        .{ text, text },
+    );
+    return true;
 }
 
 /// The span of a decorator's expression (`Field` in `@Field`) — where every
@@ -711,6 +757,25 @@ fn checkDecoratorSig(c: *Checker, deco: Node, dt: TypeId, pos: DecoPos, value: T
         else => return, // not callable in a shape we model: under-report
     }
     if (sigs.items.len == 0) return;
+
+    // tsc's `isPotentiallyUncalledDecorator` runs over EVERY signature, ahead
+    // of any relation: a decorator none of whose signatures can absorb the
+    // arguments the runtime passes is a factory someone forgot to call
+    // (TS1329), whatever its parameters would have accepted. In the standard
+    // dialect `getDecoratorArgumentCount` is `min(max(paramCount, 1), 2)`, so
+    // only a signature with NO parameters at all is short.
+    var uncalled = true;
+    for (sigs.items) |sig| {
+        const argc = @min(@max(c.ts.fnParamCount(sig), 1), 2);
+        if (!try uncalledFactory(c, sig, argc)) {
+            uncalled = false;
+            break;
+        }
+    }
+    // Only a decorator written as a NAME earns TS1329; the standard dialect's
+    // own arity report is not modelled here, so any other spelling falls
+    // through to the relation below and stays the under-report it was.
+    if (uncalled and try reportUncalledFactory(c, deco)) return;
 
     // Expected context interface for this position (null under --noLib →
     // context relation is skipped, value/arity relation still applies).

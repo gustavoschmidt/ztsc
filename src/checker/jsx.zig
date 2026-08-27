@@ -1973,8 +1973,7 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     var spread_failed = false;
     if (whole_object_checkable and has_spread and
         !attr_failed and !attr_fresh_failed and !hyphen_failed and
-        !have_excess and !weak_hit and !missing_hit and
-        !try c.isAssignable(try c.jsxAttrsObject(provided.items, .relate), props))
+        !have_excess and !weak_hit and !missing_hit)
     {
         for (provided.items, 0..) |p, i| {
             if (!from_spread.items[i]) continue;
@@ -1983,7 +1982,7 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
             const target = (try jsxAttrTarget(c, rt, p.name, p.ty)) orelse continue;
             if (elaborate.skipsDeferredIndexAccess(c, target)) continue;
             if (!try c.isAssignable(p.ty, target)) {
-                spread_failed = true;
+                spread_failed = !try c.isAssignable(try c.jsxAttrsObject(provided.items, .relate), props);
                 break;
             }
         }

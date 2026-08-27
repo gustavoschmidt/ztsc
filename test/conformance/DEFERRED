@@ -189,12 +189,10 @@ assignability/096_alternating_instantiation_spine.ts  -TS2322 64
 #     Its guard is `isUntypedFunctionCall`, i.e. assignability to the global
 #     `Function`, so a `Function`-typed decorator must stay silent while a
 #     plain object must not; the distinction is not modelled.
-#   * TS1329, a decorator FACTORY left uncalled (54). This one is not just
-#     skipped but explicitly suppressed: the arity failure ztsc would
-#     otherwise report is the WRONG diagnostic for the shape (tsc's
-#     `isPotentiallyUncalledDecorator` runs ahead of the arity check), so the
-#     guard is in `checkLegacyDecoratorSig` and the missing report is the
-#     price of not inventing a different one.
+#   (TS1329 on line 54 — a decorator FACTORY left uncalled — WAS listed here.
+#   The guard that suppressed the wrong arity diagnostic now answers tsc's own
+#   message from the same place, in both dialects; wave 49.)
+#
 #   * a UNION-typed decorator (55), whose call signature is the union's
 #     combined one (parameters intersected).
 #   * the decorator's RETURN type (56) — TS1270/TS1271, a separate family from
@@ -210,7 +208,6 @@ assignability/096_alternating_instantiation_spine.ts  -TS2322 64
 decorators/011_legacy_signature_gaps  -TS1240 entry.ts 51
 decorators/011_legacy_signature_gaps  -TS1240 entry.ts 52
 decorators/011_legacy_signature_gaps  -TS1240 entry.ts 53
-decorators/011_legacy_signature_gaps  -TS1329 entry.ts 54
 decorators/011_legacy_signature_gaps  -TS1240 entry.ts 55
 decorators/011_legacy_signature_gaps  -TS1271 entry.ts 56
 decorators/011_legacy_signature_gaps  -TS1239 entry.ts 58
