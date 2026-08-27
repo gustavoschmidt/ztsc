@@ -362,6 +362,14 @@ fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32, budget: usiz
             try w.writeAll("keyof ");
             try printTypeParen(c, w, s.keyofOperand(t), depth + 1, .operand, budget);
         },
+        // A substitution prints as its BASE — tsc's `typeToTypeNode` maps
+        // `TypeFlags.Substitution` straight to `(type as SubstitutionType)
+        // .baseType`. The implied constraint is knowledge the checker uses,
+        // never something the user wrote, so `number extends T ? … : …`'s
+        // guarded `T` still reports as `T` and not as `T & number`.
+        // Not depth+1: the wrapper is invisible, so it must not consume a
+        // level of the print budget either.
+        .substitution => try printType(c, w, s.dataA(t), depth, budget),
     }
 }
 

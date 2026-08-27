@@ -351,6 +351,14 @@ pub fn containsTypeParamInner(c: *Checker, t: TypeId) Error!bool {
         },
         .string_mapping => return c.containsTypeParam(s.stringMappingArg(t)),
         .keyof_op => return c.containsTypeParam(s.keyofOperand(t)),
+        // BOTH halves: a substitution's base can be concrete while its
+        // constraint is the generic thing (`number` guarded by `T` in
+        // `number extends T ? …`), and instantiation has to reach the
+        // constraint to keep the wrapper meaningful — or drop it.
+        .substitution => {
+            if (try c.containsTypeParam(s.substBase(t))) return true;
+            return c.containsTypeParam(s.substConstraint(t));
+        },
         else => return false,
     }
 }
@@ -514,6 +522,10 @@ fn tpMentionsInto(c: *Checker, t: TypeId, out: *std.ArrayList(u32), use_cache: b
         },
         .string_mapping => return tpMentionsInto(c, s.stringMappingArg(t), out, true),
         .keyof_op => return tpMentionsInto(c, s.keyofOperand(t), out, true),
+        .substitution => {
+            if (try tpMentionsInto(c, s.substBase(t), out, true)) return true;
+            return tpMentionsInto(c, s.substConstraint(t), out, true);
+        },
         // `containsTypeParam` said yes and this arm cannot say where from.
         else => return true,
     }
@@ -650,6 +662,10 @@ fn containsFreeTypeParamInner(c: *Checker, t: TypeId, bound: []const u32) Error!
         },
         .string_mapping => return c.containsFreeTypeParam(s.stringMappingArg(t), bound),
         .keyof_op => return c.containsFreeTypeParam(s.keyofOperand(t), bound),
+        .substitution => {
+            if (try c.containsFreeTypeParam(s.substBase(t), bound)) return true;
+            return c.containsFreeTypeParam(s.substConstraint(t), bound);
+        },
         else => return false,
     }
 }
@@ -975,6 +991,22 @@ pub fn mintThisTp(c: *Checker, orig: SymbolId, repl: TypeId, constraint: TypeId,
     return gop.value_ptr.*;
 }
 
+/// tsc's `getSubstitutionIntersection`: what a substitution stands for where
+/// its extra knowledge is sound to use — `base & constraint`. Any other type
+/// is returned untouched, so callers can hand it whatever they hold.
+///
+/// This is the ONLY reader of a substitution's constraint outside
+/// instantiation, and it is deliberately narrow: a relation's SOURCE side and
+/// the apparent-type/constraint chain. Everywhere else a substitution IS its
+/// base (`Store.substitutionBase`).
+pub fn substitutionIntersection(c: *Checker, t: TypeId) Error!TypeId {
+    if (c.ts.kind(t) != .substitution) return t;
+    if (c.subst_isect_cache.get(t)) |v| return v;
+    const isect = try c.ts.makeIntersection(c.scratch(), &.{ c.ts.substBase(t), c.ts.substConstraint(t) });
+    try c.subst_isect_cache.put(c.cm(), t, isect);
+    return isect;
+}
+
 /// Substitute the type parameters in `map` throughout `t`. Public entry:
 /// canonicalizes the map (when caching is on) and dispatches to the
 /// memoized recursive walk.
@@ -1117,6 +1149,7 @@ fn declaredInstantiable(s: *const types.Store, t: TypeId) bool {
         .this_type,
         .template_literal_type,
         .string_mapping,
+        .substitution,
         => true,
         .union_type, .intersection => {
             for (0..s.memberCount(t)) |i| {
@@ -1677,6 +1710,16 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
             const op = try c.instantiateId(s.keyofOperand(t), map, map_id);
             break :blk try c.keyofType(op);
         },
+        // tsc's `instantiateType` substitution arm: map BOTH halves and
+        // re-wrap through `makeSubstitution`, which drops the wrapper when
+        // the substituted constraint stops saying anything (the usual
+        // outcome once the check type is concrete — `Q<number>` leaves a
+        // plain `number`, so nothing downstream ever meets a stale wrapper).
+        .substitution => blk: {
+            const base = try c.instantiateId(s.substBase(t), map, map_id);
+            const con = try c.instantiateId(s.substConstraint(t), map, map_id);
+            break :blk try s.makeSubstitution(base, con);
+        },
         else => t,
     };
     // Memoize only when nothing below tripped the limit (a truncated result
@@ -1915,6 +1958,10 @@ fn substThisInner(c: *Checker, t: TypeId, repl: TypeId) Error!TypeId {
             return c.reduceConditional(chk, ext, tru, fls, s.condDistributive(t));
         },
         .keyof_op => return c.keyofType(try c.substThis(s.keyofOperand(t), repl)),
+        .substitution => return s.makeSubstitution(
+            try c.substThis(s.substBase(t), repl),
+            try c.substThis(s.substConstraint(t), repl),
+        ),
         .mapped => return c.reduceMapped(
             s.mappedKeyParam(t),
             try c.substThis(s.mappedConstraint(t), repl),
@@ -2018,6 +2065,10 @@ fn containsThisTypeInner(c: *Checker, t: TypeId) Error!bool {
             (try c.containsThisType(s.condTrue(t))) or
             (try c.containsThisType(s.condFalse(t))),
         .keyof_op => return c.containsThisType(s.keyofOperand(t)),
+        .substitution => {
+            if (try c.containsThisType(s.substBase(t))) return true;
+            return c.containsThisType(s.substConstraint(t));
+        },
         .mapped => {
             if (try c.containsThisType(s.mappedConstraint(t))) return true;
             if (try c.containsThisType(s.mappedValue(t))) return true;

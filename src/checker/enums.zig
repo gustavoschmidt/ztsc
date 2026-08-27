@@ -1156,6 +1156,7 @@ pub const mintFreshTpDeferred = subst.mintFreshTpDeferred;
 pub const resolveFreshBound = subst.resolveFreshBound;
 pub const mintThisTp = subst.mintThisTp;
 pub const instantiate = subst.instantiate;
+pub const substitutionIntersection = subst.substitutionIntersection;
 pub const tagInstantiatedOrigin = subst.tagInstantiatedOrigin;
 pub const chainRepeats = subst.chainRepeats;
 pub const instantiateId = subst.instantiateId;

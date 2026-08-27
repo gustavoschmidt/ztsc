@@ -920,43 +920,43 @@ pub const LazyStat = enum(u8) {
 };
 
 pub const map_containers = [_][]const u8{
-    "node_types",               "sig_cache",              "node_scopes",
-    "reassigned_syms",          "reassigned_in_loop",     "member_written_syms",
-    "member_written_in_loop",   "ns_types",               "ambient_ns_types",
-    "relation",                 "expansions",             "overload_groups",
-    "construct_groups",         "origin",                 "iface_generic",
-    "overload_group_pool",      "iface_stack",            "pending_class_decos",
-    "class_inst_generic",       "class_static_cache",     "class_static_owner",
-    "class_static_stack",       "class_ctor_cache",       "class_abstract_cache",
-    "enum_value_cache",         "enum_info_cache",        "enum_relation_cache",
-    "alias_generic",            "alias_state",            "alias_recursive",
-    "flow_same",                "flow_narrow",            "ref_keys",
-    "flow_loop_stack",          "flow_stack",             "flow_tmp",
-    "flow_reduce",              "da_cache",               "ctp_cache",
-    "cmp_cache",                "ctt_cache",              "ci_cache",
-    "cftp_cache",               "base_constraint_cache",  "type_string_cache",
-    "infer_visited",            "subst_this_cache",       "mmp_cache",
-    "arrayish_elem_cache",      "tp_constraint_cache",    "erase_cache",
-    "erase_any_cache",          "inst_map_ids",           "fresh_tp_ids",
-    "this_tp_ids",              "fresh_tp_info",          "type_node_cache",
-    "atom_cache",               "infer_ids",              "infer_constraints",
-    "infer_scopes",             "mapped_key_ids",         "mapped_key_scopes",
-    "inst_diag_at",             "infer_active",           "lazy_member_active",
-    "this_bound_fns",           "chain_guards",           "never_isect",
-    "deep_path_list",           "deep_path_ids",          "flow_reach",
-    "member_type_stack",        "method_ret_cuts",        "lazy_index_objs",
-    "sym_res_stack",            "ret_res_stack",          "pending_type_args",
-    "pending_type_args_pool",   "pending_type_args_seen", "tp_constrained_cache",
-    "nominal_bases",            "nominal_base_pool",      "keyof_mapped_active",
-    "ctp_syms_seen",            "weak_types",             "base_ref_active",
-    "lazy_member",              "trunc_lazy_member",      "lazy_map",
-    "pattern_root_decls",       "pattern_root_ids",       "pattern_narrow_busy",
-    "key_name_types",           "enum_members",           "keyof_obj_cache",
-    "sym_key_cache",            "trunc_expansions",       "inst_map_bytes",
-    "tp_mentions",              "smk_cache",              "rel_maybe",
-    "spec_sym_types",           "spec_tainted",           "last_assign_pos",
-    "definitely_assigned_syms", "alias_stack",            "alias_self_recursive",
-    "jsx_lma_cache",            "class_outer_tps",
+    "node_types",             "sig_cache",                "node_scopes",
+    "reassigned_syms",        "reassigned_in_loop",       "member_written_syms",
+    "member_written_in_loop", "ns_types",                 "ambient_ns_types",
+    "relation",               "expansions",               "overload_groups",
+    "construct_groups",       "origin",                   "iface_generic",
+    "overload_group_pool",    "iface_stack",              "pending_class_decos",
+    "class_inst_generic",     "class_static_cache",       "class_static_owner",
+    "class_static_stack",     "class_ctor_cache",         "class_abstract_cache",
+    "enum_value_cache",       "enum_info_cache",          "enum_relation_cache",
+    "alias_generic",          "alias_state",              "alias_recursive",
+    "flow_same",              "flow_narrow",              "ref_keys",
+    "flow_loop_stack",        "flow_stack",               "flow_tmp",
+    "flow_reduce",            "da_cache",                 "ctp_cache",
+    "cmp_cache",              "ctt_cache",                "ci_cache",
+    "cftp_cache",             "base_constraint_cache",    "type_string_cache",
+    "infer_visited",          "subst_this_cache",         "mmp_cache",
+    "arrayish_elem_cache",    "tp_constraint_cache",      "erase_cache",
+    "erase_any_cache",        "inst_map_ids",             "fresh_tp_ids",
+    "this_tp_ids",            "fresh_tp_info",            "type_node_cache",
+    "atom_cache",             "infer_ids",                "infer_constraints",
+    "infer_scopes",           "mapped_key_ids",           "mapped_key_scopes",
+    "inst_diag_at",           "infer_active",             "lazy_member_active",
+    "this_bound_fns",         "chain_guards",             "never_isect",
+    "deep_path_list",         "deep_path_ids",            "flow_reach",
+    "member_type_stack",      "method_ret_cuts",          "lazy_index_objs",
+    "sym_res_stack",          "ret_res_stack",            "pending_type_args",
+    "pending_type_args_pool", "pending_type_args_seen",   "tp_constrained_cache",
+    "nominal_bases",          "nominal_base_pool",        "keyof_mapped_active",
+    "ctp_syms_seen",          "weak_types",               "base_ref_active",
+    "subst_isect_cache",      "lazy_member",              "trunc_lazy_member",
+    "lazy_map",               "pattern_root_decls",       "pattern_root_ids",
+    "pattern_narrow_busy",    "key_name_types",           "enum_members",
+    "keyof_obj_cache",        "sym_key_cache",            "trunc_expansions",
+    "inst_map_bytes",         "tp_mentions",              "smk_cache",
+    "rel_maybe",              "spec_sym_types",           "spec_tainted",
+    "last_assign_pos",        "definitely_assigned_syms", "alias_stack",
+    "alias_self_recursive",   "jsx_lma_cache",            "class_outer_tps",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -2505,6 +2505,12 @@ pub const Checker = struct {
     /// runs on every relation frame with an object-ish target, and answering
     /// it means resolving the target's members, so the answer is kept.
     weak_types: IntMap(TypeId, u8) = .empty,
+    /// tsc's `SubstitutionType.resolvedSubstitutionIntersection`: substitution
+    /// TypeId -> `base & constraint`. Kept because the relation asks for it on
+    /// the SOURCE side of every frame whose source is a substitution, and
+    /// building the intersection is a flatten + dedup + reduce + intern, not
+    /// a field read.
+    subst_isect_cache: IntMap(TypeId, TypeId) = .empty,
     /// **Symbols eagerly, types lazily** (tsc's `createInstantiatedSymbolTable`
     /// / `getTypeOfSymbol` split) — see `lazyTableOf`.
     ///
@@ -4200,6 +4206,7 @@ pub const Checker = struct {
     pub const mintFreshTp = enums_zig.mintFreshTp;
     pub const mintThisTp = enums_zig.mintThisTp;
     pub const instantiate = enums_zig.instantiate;
+    pub const substitutionIntersection = enums_zig.substitutionIntersection;
     pub const tagInstantiatedOrigin = enums_zig.tagInstantiatedOrigin;
     pub const chainRepeats = enums_zig.chainRepeats;
     pub const instantiateId = enums_zig.instantiateId;
@@ -4485,6 +4492,14 @@ pub const Checker = struct {
     /// question asked is "was MY answer truncated".
     pub fn baseConstraintOf(c: *Checker, t: TypeId) Error!TypeId {
         if (c.base_constraint_cache.get(t)) |v| return v;
+        // tsc's `computeBaseConstraint`: a substitution's constraint is its
+        // INTERSECTION's. This is the seam the implied knowledge reaches
+        // every apparent-type consumer through — property access, indexed
+        // access, `keyof` — so `"k" extends keyof T ? T["k"] : never` can
+        // index `T` with a key the branch has already proved is one of its.
+        if (c.ts.kind(t) == .substitution) {
+            return c.baseConstraintOf(try c.substitutionIntersection(t));
+        }
         const outer_trip = c.inst_limit_tripped;
         c.inst_limit_tripped = false;
         defer c.inst_limit_tripped = c.inst_limit_tripped or outer_trip;

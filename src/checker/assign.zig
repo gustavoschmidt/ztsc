@@ -1543,6 +1543,27 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!RelAnswer {
     s = c.simplifyConditional(s);
     t = c.simplifyConditional(t);
     if (s == t) return .yes;
+    // The substitution arm of the same `getNormalizedType`, and the ONE place
+    // a substitution's implied constraint enters a relation. tsc runs the two
+    // operands through it with opposite `writing` flags:
+    //
+    //   * SOURCE (`writing = false`) -> `getSubstitutionIntersection`, i.e.
+    //     `base & constraint`. A value PRODUCED at a guarded position really
+    //     is both, which is what lets the `n` of `number extends T ?
+    //     (cb: (n: number) => void) => void : never` be handed to a
+    //     `(x: T) => void`.
+    //   * TARGET (`writing = true`) -> the BASE alone. A value flowing INTO
+    //     the position only has to be a `base`; demanding the constraint too
+    //     would reject the very values the guard supplies.
+    //
+    // Two kind reads on a pair that already failed the identity test; the
+    // wrapper exists only inside a conditional's true branch, so on ordinary
+    // code both are a load and a compare.
+    if (c.ts.kind(s) == .substitution or c.ts.kind(t) == .substitution) {
+        s = try c.substitutionIntersection(s);
+        t = c.ts.substitutionBase(t);
+        if (s == t) return .yes;
+    }
     // The same simplification, one level down: a `this` NESTED inside a
     // deferred operator (`this extends {_zod:…} ? this["_zod"]["output"] :
     // unknown`, zod's `output<this>`) relates through its apparent instance
