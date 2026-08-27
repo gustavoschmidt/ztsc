@@ -6369,6 +6369,41 @@ fn shortCallbackParams(
     }
 }
 
+/// Every constituent of intersection `t` resolves to a plain object. The
+/// reverse-mapping walk reads the intersection through `getPropertiesOfType`,
+/// which is only faithful when there is nothing else in there — a type
+/// parameter, a primitive or a mapped constituent contributes members the
+/// merged read would silently drop, and a rebuild missing members is worse
+/// than no rebuild.
+fn allObjectMembers(c: *Checker, t: TypeId) Error!bool {
+    for (try c.memberList(t)) |mm| {
+        if (c.ts.kind(try c.resolveStructural(mm)) != .object) return false;
+    }
+    return true;
+}
+
+/// The source property list `createReverseMappedType` walks — tsc's
+/// `getPropertiesOfType(source)`. For a lone object that is its own member
+/// table; for an INTERSECTION it is the union of the constituents' names, each
+/// resolved through `getUnionOrIntersectionProperty` so a name two constituents
+/// declare arrives already intersected (and with its flags merged).
+fn reverseMappedSourceProps(c: *Checker, ra: TypeId, out: *std.ArrayList(types.Prop)) Error!void {
+    const s = &c.ts;
+    if (s.kind(ra) != .intersection) {
+        for (0..s.objectPropCount(ra)) |i| try out.append(c.scratch(), s.objectProp(ra, @intCast(i)));
+        return;
+    }
+    var names: std.ArrayList(Atom) = .empty;
+    defer names.deinit(c.scratch());
+    try c.collectPropNames(ra, &names, 0);
+    for (names.items) |n| {
+        // `allow_index = false`: an index signature or an apparent
+        // `Object`/`Function` member is not a declared property, matching the
+        // lone-object read above.
+        if (try c.propOfTypeEx(ra, n, false)) |p| try out.append(c.scratch(), p);
+    }
+}
+
 /// tsc's `createReverseMappedType` precondition: a string index signature, or
 /// at least one property AND `isPartiallyInferableType`. A source built entirely
 /// out of `anyFunctionType` placeholders is not evidence about anything.
@@ -6403,6 +6438,15 @@ fn partiallyInferable(c: *Checker, t: TypeId, depth: u32) Error!bool {
         .tuple => {
             for (0..s.tupleLen(t)) |i| {
                 if (try partiallyInferable(c, s.tupleElem(t, @intCast(i)).ty, depth + 1)) return true;
+            }
+            return false;
+        },
+        // An intersection is read as its merged member table (see
+        // `reverseMappedSourceProps`), so one constituent carrying real
+        // evidence makes the whole partially inferable.
+        .intersection => {
+            for (try c.memberList(t)) |mm| {
+                if (try partiallyInferable(c, try c.resolveStructural(mm), depth + 1)) return true;
             }
             return false;
         },
@@ -6546,8 +6590,17 @@ fn inferReverseMappedFrom(
     // `isPartiallyInferableType` guard below is what made the composite key set
     // safe); this one is not, and its witness is Composer.tsx's
     // `useInfiniteQuery`, not the corpus.
+    // An INTERSECTION source is not a third shape, it is the same object shape
+    // read through `getPropertiesOfType`, which MERGES the constituents
+    // (`getUnionOrIntersectionProperty` per name) — `createReverseMappedType`
+    // never sees the `&` at all. Switching on the resolved argument and
+    // accepting only `.object` left `f2<T, K extends keyof T>(obj: {[K in keyof
+    // T]: T[K]}, key: K)` unable to infer `T` from a `{ a: string } & { b:
+    // string }` argument: `T` fell to `unknown`, `keyof unknown` is `never`,
+    // and both calls reported TS2345 on their key.
     switch (s.kind(ra)) {
         .object => {},
+        .intersection => if (!try allObjectMembers(c, ra)) return,
         else => return,
     }
     // tsc's `createReverseMappedType` head, the gate the rebuild below never
@@ -6590,10 +6643,12 @@ fn inferReverseMappedFrom(
     var keep_mask: u32 = types.prop_flag_optional | types.prop_flag_readonly;
     if (mflags & types.mapped_flag_optional_add != 0) keep_mask &= ~types.prop_flag_optional;
     if (mflags & types.mapped_flag_readonly_add != 0) keep_mask &= ~types.prop_flag_readonly;
+    var src_props: std.ArrayList(types.Prop) = .empty;
+    defer src_props.deinit(c.scratch());
+    try reverseMappedSourceProps(c, ra, &src_props);
     var props: std.ArrayList(types.Prop) = .empty;
     defer props.deinit(c.scratch());
-    for (0..s.objectPropCount(ra)) |i| {
-        const p = s.objectProp(ra, @intCast(i));
+    for (src_props.items) |p| {
         try props.append(c.scratch(), .{
             .name = p.name,
             .ty = try reverseMappedElem(c, template, p.ty, fp_sym, src_sym, depth),
