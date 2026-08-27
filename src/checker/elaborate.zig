@@ -70,6 +70,68 @@ const accessibility = @import("accessibility.zig");
 const heritage = @import("heritage.zig");
 const nominal_members = @import("nominal_members.zig");
 
+/// Which of tsc's four tuple-arity verdicts a pair earns, or `null` when the
+/// arities are compatible and the walk moves on to the positions.
+///
+/// A transcription of the ladder that opens `structuredTypeRelatedTo`'s tuple
+/// branch, in its order — each rung `return`s, so the first that fires is the
+/// whole answer:
+///
+/// ```ts
+/// if (!sourceRestFlag && sourceArity < targetMinLength)              // Source_has_0_element_s_but_target_requires_1
+/// if (!targetRestFlag && targetArity < sourceMinLength)              // Source_has_0_element_s_but_target_allows_only_1
+/// if (!targetRestFlag && (sourceRestFlag || targetArity < sourceArity))
+///     sourceMinLength < targetMinLength                              // Target_requires_0_element_s_but_source_may_have_fewer
+///                                                                    // else Target_allows_only_0_element_s_but_source_may_have_more
+/// ```
+///
+/// `minLength` is the count of REQUIRED elements — neither optional nor rest —
+/// and the "rest flag" is the presence of any variable-length element, which is
+/// what a `rest()` element is here (a variadic is normalized into one).
+///
+/// Pure: nothing but the two list shapes decides it, so it is separable from
+/// the walk and testable on its own.
+fn tupleArity(store: *const types.Store, s: TypeId, t: TypeId) ?TupleArity {
+    const sa = Arity.of(store, s) orelse return null;
+    const ta = Arity.of(store, t) orelse return null;
+    if (!sa.rest and sa.len < ta.min) return .{ .source_short = .{ .have = sa.len, .need = ta.min } };
+    if (!ta.rest and ta.len < sa.min) return .{ .source_long = .{ .have = sa.min, .allows = ta.len } };
+    if (!ta.rest and (sa.rest or ta.len < sa.len)) {
+        return if (sa.min < ta.min) .{ .may_have_fewer = ta.min } else .{ .may_have_more = ta.len };
+    }
+    return null;
+}
+
+/// The three numbers tsc's arity ladder reads off one side of the comparison:
+/// how many elements the list spells, how many of those are REQUIRED (neither
+/// optional nor rest), and whether its length is variable at all.
+///
+/// An ARRAY counts as `[...T[]]` — arity 1, no required prefix, variable — the
+/// shape tsc's tuple branch gives an array source. That is why `string[]`
+/// against `[string, string]` is an arity verdict ("source may have fewer")
+/// rather than an element one, and why against `[string?]` it is the opposite
+/// ("source may have more").
+const Arity = struct {
+    len: u32,
+    min: u32,
+    rest: bool,
+
+    fn of(store: *const types.Store, t: TypeId) ?Arity {
+        switch (store.kind(t)) {
+            .array => return .{ .len = 1, .min = 0, .rest = true },
+            .tuple => {
+                var a: Arity = .{ .len = store.tupleLen(t), .min = 0, .rest = false };
+                for (0..a.len) |i| {
+                    const e = store.tupleElem(t, @intCast(i));
+                    if (e.rest()) a.rest = true else if (!e.optional()) a.min += 1;
+                }
+                return a;
+            },
+            else => return null,
+        }
+    }
+};
+
 /// Deepest chain rendered. tsgo has no cutoff; this is a resource bound so a
 /// pathological (or cyclic-but-unequal) type pair cannot produce an unbounded
 /// message. Well past anything a real program produces.
@@ -131,9 +193,9 @@ const Tail = union(enum) {
     /// Required target properties absent from the source. REPLACES the last
     /// level's relation line (tsc suppresses it).
     missing: []const Atom,
-    /// A tuple too short for its target. Prints BELOW the last level's
+    /// A tuple whose ARITY its target rejects. Prints BELOW the last level's
     /// relation line (tsc does not suppress that one).
-    tuple_arity: struct { have: u32, need: u32 },
+    tuple_arity: TupleArity,
     /// tsc's terminal `private`/`protected` message out of
     /// `propertiesRelatedTo` (see `nominal_members.zig`), already rendered:
     /// which of the four sentences applies is the relation's own decision, so
@@ -157,6 +219,25 @@ const Tail = union(enum) {
 
 /// The two modifier words `Tail.ctor_visibility` interpolates, in tsc's order.
 const CtorVisibility = struct { src: []const u8, tgt: []const u8 };
+
+/// tsc's four tuple-arity sentences, one per `return Ternary.False` in the
+/// tuple branch of `structuredTypeRelatedTo`. Which one applies is decided by
+/// `tupleArity`; each carries only the counts its own sentence interpolates.
+const TupleArity = union(enum) {
+    /// `Source_has_0_element_s_but_target_requires_1`: a source that cannot
+    /// grow (no rest) is shorter than the target's required prefix.
+    source_short: struct { have: u32, need: u32 },
+    /// `Source_has_0_element_s_but_target_allows_only_1`: a target that cannot
+    /// grow is shorter than the source's required prefix.
+    source_long: struct { have: u32, allows: u32 },
+    /// `Target_requires_0_element_s_but_source_may_have_fewer`: neither of the
+    /// above is certain, but the source's length is variable and its FLOOR is
+    /// below the target's requirement.
+    may_have_fewer: u32,
+    /// `Target_allows_only_0_element_s_but_source_may_have_more`: the same
+    /// uncertainty in the other direction.
+    may_have_more: u32,
+};
 
 const Found = union(enum) { step: Level, tail: Tail };
 
@@ -396,25 +477,27 @@ fn findStep(c: *Checker, s0: TypeId, t0: TypeId, missing_ok: bool) Error!?Found 
         return null;
     }
 
+    // tsc decides a LIST pair by ARITY before it ever looks at an element, and
+    // every one of those verdicts `return`s — so an arity answer REPLACES the
+    // positional walk rather than preceding it. The source may be an array
+    // (`Arity.of` gives it tsc's `[...T[]]` shape); the target must be a tuple,
+    // since an array target has no arity to require.
+    if (store.kind(t) == .tuple) {
+        if (tupleArity(store, s, t)) |a| return .{ .tail = .{ .tuple_arity = a } };
+    }
+
     if (store.kind(s) == .tuple and store.kind(t) == .tuple) {
         const sl = store.tupleLen(s);
         const tl = store.tupleLen(t);
-        var need: u32 = 0;
-        var fixed = true;
-        for (0..tl) |i| {
-            const e = store.tupleElem(t, @intCast(i));
-            if (e.rest()) fixed = false else if (!e.optional()) need += 1;
-        }
-        for (0..sl) |i| {
-            if (store.tupleElem(s, @intCast(i)).rest()) fixed = false;
-        }
-        if (fixed and sl < need) {
-            return .{ .tail = .{ .tuple_arity = .{ .have = sl, .need = need } } };
-        }
         var i: u32 = 0;
         while (i < @min(sl, tl)) : (i += 1) {
-            const se = store.tupleElem(s, i).ty;
-            const te = store.tupleElem(t, i).ty;
+            // The element types as the POSITIONS carry them: a rest element
+            // stores its array type, and comparing `number[]` against the
+            // target's `number` invented a mismatch at a position tsc relates
+            // element-to-element (`tupleElemTypeAt` is the same rule the
+            // relation uses).
+            const se = (try c.tupleElemTypeAt(s, i)) orelse store.tupleElem(s, i).ty;
+            const te = (try c.tupleElemTypeAt(t, i)) orelse store.tupleElem(t, i).ty;
             if (!try c.isAssignable(se, te)) {
                 return .{ .step = .{
                     .step = .{ .kind = .tuple_pos, .pos = i },
@@ -764,11 +847,12 @@ fn render(c: *Checker, levels: []const Level, tail: Tail) Error![]const u8 {
         }
         i += 1;
     }
-    if (tail == .tuple_arity) {
-        try line(&out.writer, &indent, "Source has {d} element(s) but target requires {d}.", .{
-            tail.tuple_arity.have, tail.tuple_arity.need,
-        });
-    }
+    if (tail == .tuple_arity) switch (tail.tuple_arity) {
+        .source_short => |a| try line(&out.writer, &indent, "Source has {d} element(s) but target requires {d}.", .{ a.have, a.need }),
+        .source_long => |a| try line(&out.writer, &indent, "Source has {d} element(s) but target allows only {d}.", .{ a.have, a.allows }),
+        .may_have_fewer => |n| try line(&out.writer, &indent, "Target requires {d} element(s) but source may have fewer.", .{n}),
+        .may_have_more => |n| try line(&out.writer, &indent, "Target allows only {d} element(s) but source may have more.", .{n}),
+    };
     if (tail == .nominal) try line(&out.writer, &indent, "{s}", .{tail.nominal});
     if (tail == .abstract_ctor) try line(&out.writer, &indent, "Cannot assign an abstract constructor type to a non-abstract constructor type.", .{});
     if (tail == .ctor_visibility) try line(&out.writer, &indent, "Cannot assign a '{s}' constructor type to a '{s}' constructor type.", .{
