@@ -5737,6 +5737,58 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
             }
         },
         .keyof_op => try inferToKeyof(c, param, arg, tp_syms, candidates),
+        // A CLASS VALUE on BOTH sides. tsc has no nominal class value: `typeof
+        // C` is an anonymous object type carrying the statics as properties
+        // and the constructor as a construct signature, so `inferFromTypes`
+        // pairs two of them like any other object pair. ztsc's `.class_value`
+        // is nominal — its members are derived from the class SYMBOL, not
+        // stored — so this arm did not exist and the walk recorded nothing:
+        // `function foo<T>(x = class { static prop: T })` called with
+        // `class { static prop = "hello" }` left `T` at `unknown`, and
+        // `.length` on the result was TS2571
+        // (`typeArgumentInferenceWithClassExpression1`/`3`).
+        .class_value => {
+            const ra = try c.resolveStructural(arg);
+            if (s.kind(ra) != .class_value) return;
+            // The SAME class under different OUTER arguments (`typeof Inner`
+            // out of two instantiations of its enclosing generic): pair the
+            // arguments positionally, as the same-reference rule does for a
+            // generic instance. Reading both through their member tables would
+            // answer the same and costs a materialization per pair.
+            if (s.classSymbol(ra) == s.classSymbol(param)) {
+                const pa = try c.scratch().dupe(TypeId, s.classValueArgs(param));
+                defer c.scratch().free(pa);
+                const aa = try c.scratch().dupe(TypeId, s.classValueArgs(ra));
+                defer c.scratch().free(aa);
+                for (0..@min(pa.len, aa.len)) |i| {
+                    try c.unify(pa[i], aa[i], tp_syms, candidates, depth + 1);
+                }
+                return;
+            }
+            // Two DIFFERENT classes: bridge each to the constructor object tsc
+            // reads it as — statics as properties, the constructor as a
+            // construct signature whose return is the instance side — and let
+            // the `.object` arm pair them.
+            const pobj = try c.instantiateOuter(param, try c.classConstructType(s.classSymbol(param)));
+            const aobj = try c.instantiateOuter(ra, try c.classConstructType(s.classSymbol(ra)));
+            try c.unify(pobj, aobj, tp_syms, candidates, depth + 1);
+            // …and the INSTANCE sides, explicitly. The construct signatures
+            // paired above return the class's own `.ref`, and a ref carries
+            // only its OWN type arguments — an anonymous class inside a
+            // generic has none — so `unify`'s `couldContainTypeVariables`
+            // gate answers false for it and the walk stops before it ever
+            // reaches `prop: T`. Resolving both refs to their member tables
+            // is what decides `class { prop: T }` against
+            // `class { prop = "hello" }`.
+            if (try c.instanceofInstanceType(param)) |pi| {
+                if (try c.instanceofInstanceType(ra)) |ai| {
+                    const pir = try c.instantiateOuter(param, try c.resolveStructural(pi));
+                    const air = try c.instantiateOuter(ra, try c.resolveStructural(ai));
+                    try c.unify(pir, air, tp_syms, candidates, depth + 1);
+                }
+            }
+            return;
+        },
         else => {},
     }
 }
