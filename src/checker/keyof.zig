@@ -372,9 +372,16 @@ pub fn keyofType(c: *Checker, t: TypeId) Error!TypeId {
         // `declare namespace X; export = X` package is. An empty key set
         // silently empties every constraint built on it (vitest's `spyOn`
         // rejects `"useRef"`). Members come from the same place property
-        // access reads them, `classStaticType`.
+        // access reads them, `classStaticType` — and, like every other
+        // consumer of a class value's members, read under the value's OUTER
+        // arguments (`instantiateOuter`, a pass-through for the overwhelming
+        // majority of classes, which are not nested in a generic). A key set
+        // is mostly names, which substitution leaves alone; a GENERIC index
+        // signature (`class N { static [k: K]: V }` inside `function
+        // outer<K extends string>`) is the shape that does not survive
+        // reading the declaration's free `K` back out.
         .class_value => {
-            const statics = try c.classStaticType(c.ts.classSymbol(r));
+            const statics = try c.instantiateOuter(r, try c.classStaticType(c.ts.classSymbol(r)));
             if (statics == r) return types.never_type; // self-referential: no members
             return c.keyofType(statics);
         },

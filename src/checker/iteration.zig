@@ -256,7 +256,7 @@ pub fn forOfElementType(c: *Checker, rt: TypeId, right_node: Node, is_await: boo
         }
         return types.any_type;
     }
-    switch (try iterationOutcome(c, rt)) {
+    switch (try iterationOutcome(c, rt, right_node)) {
         .element => |e| return e,
         // tsc's `getIterationTypesOfMethod` splits the two failures: a type
         // with no `[Symbol.iterator]()` at all is TS2488, but one that HAS the
@@ -311,7 +311,7 @@ pub fn contextualIterationElementType(c: *Checker, rt: TypeId) Error!?TypeId {
 /// refs, and the general `[Symbol.iterator]() -> { next(): { value } }`
 /// protocol (so `Map`/`Set` and user-defined iterables work).
 pub fn iterationElementType(c: *Checker, rt: TypeId) Error!?TypeId {
-    return switch (try iterationOutcome(c, rt)) {
+    return switch (try iterationOutcome(c, rt, 0)) {
         .element => |e| e,
         // A caller with no diagnostic site of its own (contextual typing, a
         // spread) keeps the pre-TS2490 answer: "not iterable". tsc would
@@ -333,7 +333,11 @@ pub const IterationOutcome = union(enum) {
     next_result_lacks_value,
 };
 
-fn iterationOutcome(c: *Checker, rt: TypeId) Error!IterationOutcome {
+/// `err_node` is tsc's `errorNode`: the syntax the iteration is reported
+/// against, or 0 for a caller that only wants the element type. It carries
+/// exactly one diagnostic — TS2767, which is reported *alongside* a successful
+/// element type rather than instead of one (see `nonMethodIteratorMembers`).
+fn iterationOutcome(c: *Checker, rt: TypeId, err_node: Node) Error!IterationOutcome {
     const r = try c.resolveStructural(rt);
     switch (c.ts.kind(r)) {
         .array => return .{ .element = c.ts.arrayElem(r) },
@@ -344,7 +348,7 @@ fn iterationOutcome(c: *Checker, rt: TypeId) Error!IterationOutcome {
             var parts: std.ArrayList(TypeId) = .empty;
             defer parts.deinit(c.scratch());
             for (try c.memberList(r)) |m| {
-                switch (try iterationOutcome(c, m)) {
+                switch (try iterationOutcome(c, m, err_node)) {
                     .element => |e| try parts.append(c.scratch(), e),
                     // One bad constituent decides the whole union, and its
                     // reason is the one worth reporting.
@@ -367,7 +371,7 @@ fn iterationOutcome(c: *Checker, rt: TypeId) Error!IterationOutcome {
             defer parts.deinit(c.scratch());
             var why: IterationOutcome = .not_iterable;
             for (try c.memberList(r)) |m| {
-                switch (try iterationOutcome(c, m)) {
+                switch (try iterationOutcome(c, m, err_node)) {
                     .element => |e| try parts.append(c.scratch(), e),
                     else => |w| why = w,
                 }
@@ -396,6 +400,7 @@ fn iterationOutcome(c: *Checker, rt: TypeId) Error!IterationOutcome {
             const y2 = c.generatorYieldType(ret);
             if (y2 != 0) return .{ .element = y2 };
             // General protocol: the iterator's `next()` result `value`.
+            if (err_node != 0) try reportNonMethodIteratorMembers(c, ret, err_node);
             switch (try iteratorNextOutcome(c, ret, false)) {
                 .value => |v| return .{ .element = v },
                 .no_value => return .next_result_lacks_value,
@@ -408,6 +413,52 @@ fn iterationOutcome(c: *Checker, rt: TypeId) Error!IterationOutcome {
 
 fn isAnyLike(c: *const Checker, t: TypeId) bool {
     return c.ts.kind(t) == .any or c.ts.kind(t) == .err;
+}
+
+/// tsc's `getIterationTypesOfMethod` for the two OPTIONAL protocol methods,
+/// `return` and `throw`: an iterator that HAS one but whose member is not
+/// callable earns TS2767 — `class I { next() {…} return = 0 }` (`for-of30`).
+///
+/// Reported ALONGSIDE a working element type, never instead of one:
+/// `getIterationTypesOfIteratorSlow` runs the three method probes through
+/// `combineIterationTypes`, which skips an `undefined` entry, so a bad
+/// `return` costs the diagnostic and nothing else. `next` is not asked here —
+/// its failures are the caller's TS2488/TS2490.
+///
+/// Only the SLOW path reaches this. A `[Symbol.iterator]()` that answers one
+/// of the lib's named iterator interfaces takes `generatorYieldType`'s
+/// shortcut above, exactly as tsc takes `getIterationTypesOfIteratorFast`, so
+/// no `Array`/`Map`/`Set`/generator iteration pays for the two lookups.
+fn reportNonMethodIteratorMembers(c: *Checker, iter: TypeId, err_node: Node) Error!void {
+    const r = try c.resolveStructural(iter);
+    for ([_][]const u8{ "return", "throw" }) |name| {
+        const p = (try c.propOfType(r, try c.atom(name))) orelse continue;
+        // tsc reads the member `getTypeWithFacts(…, NEUndefinedOrNull)`, so an
+        // OPTIONAL `return?(): X` is judged on the callable half alone.
+        const t = try c.resolveStructural(try c.nonNullable(p.ty));
+        if (isAnyLike(c, t)) continue;
+        if (try hasCallSignature(c, t)) continue;
+        try c.diagFmt(2767, c.nodeSpan(err_node), "The '{s}' property of an iterator must be a method.", .{name});
+    }
+}
+
+/// tsc's `getSignaturesOfType(t, SignatureKind.Call).length !== 0`, for the
+/// shapes a member type can arrive in. Not `assign.isCallableSource`, which
+/// additionally demands the type carry NO properties of its own — a callable
+/// object with members is still a method here.
+fn hasCallSignature(c: *Checker, t: TypeId) Error!bool {
+    return switch (c.ts.kind(t)) {
+        .function => true,
+        .overloads => (try c.memberList(t)).len != 0,
+        .object => c.ts.objectCallSigCount(t) != 0,
+        .intersection => blk: {
+            for (try c.memberList(t)) |m| {
+                if (try hasCallSignature(c, try c.resolveStructural(m))) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
 }
 
 /// The type produced by `for await (x of rt)`: the
