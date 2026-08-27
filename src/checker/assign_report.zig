@@ -1010,6 +1010,53 @@ pub fn callbackParamsCompatible(c: *Checker, s: TypeId, t: TypeId) Error!bool {
     return true;
 }
 
+/// How many call (or construct) signatures a resolved type carries. A bare
+/// `.function` IS one call signature; an `.overloads` set is one per member.
+fn sigCount(c: *Checker, t: TypeId, is_construct: bool) Error!u32 {
+    return switch (c.ts.kind(t)) {
+        .function => if (is_construct) 0 else 1,
+        .overloads => if (is_construct) 0 else @as(u32, @intCast((try c.memberList(t)).len)),
+        .object => if (is_construct) c.ts.objectConstructSigCount(t) else c.ts.objectCallSigCount(t),
+        else => 0,
+    };
+}
+
+/// tsc's `shouldReportUnmatchedPropertyError` — the gate in front of TS2741 /
+/// TS2739 / TS2740:
+///
+/// ```ts
+/// const typeCallSignatures = getSignaturesOfStructuredType(source, SignatureKind.Call);
+/// const typeConstructSignatures = getSignaturesOfStructuredType(source, SignatureKind.Construct);
+/// const typeProperties = getPropertiesOfObjectType(source);
+/// if ((typeCallSignatures.length || typeConstructSignatures.length) && !typeProperties.length) {
+///     if ((getSignaturesOfType(target, SignatureKind.Call).length && typeCallSignatures.length) ||
+///         (getSignaturesOfType(target, SignatureKind.Construct).length && typeConstructSignatures.length)) {
+///         return true;
+///     }
+///     return false;
+/// }
+/// return true;
+/// ```
+///
+/// The rule is NOT "a function source never reports a missing property": a
+/// source that is all signature declines only when the TARGET offers no
+/// signature of a kind the source has. When it does, the pair is two callables
+/// being compared and the missing STATICS are the interesting part —
+/// `Array = function (n: number, s: string) { return n; }` is tsc's TS2739 on
+/// `isArray, from, of, [Symbol.species]`, not a bare TS2322 (`redefineArray`).
+fn shouldReportUnmatchedProperty(c: *Checker, rs: TypeId, rt: TypeId) Error!bool {
+    const s_call = try sigCount(c, rs, false);
+    const s_ctor = try sigCount(c, rs, true);
+    if (s_call == 0 and s_ctor == 0) return true;
+    // `getPropertiesOfObjectType` reads the type's OWN table — the apparent
+    // `Function`/`Object` members `relationSrcProp` lends the walk are not
+    // properties of the source for this test.
+    if (c.ts.kind(rs) == .object and c.ts.objectPropCount(rs) != 0) return true;
+    if (s_call != 0 and (try sigCount(c, rt, false)) != 0) return true;
+    if (s_ctor != 0 and (try sigCount(c, rt, true)) != 0) return true;
+    return false;
+}
+
 /// Required properties of the object `rt` that `rs` has not got, appended to
 /// `out` in the target's stored order (the caller sorts).
 fn collectMissingProps(c: *Checker, rs: TypeId, rt: TypeId, out: *std.ArrayList(Atom)) Error!void {
@@ -1081,18 +1128,16 @@ pub fn tryReportMissingProps(c: *Checker, src_t: TypeId, target: TypeId, span: S
         rt = try c.instantiateOuter(target, try c.classConstructType(c.ts.classSymbol(target)));
         if (c.ts.kind(rs) == .class_value) rs = try c.instantiateOuter(rs, try c.classConstructType(c.ts.classSymbol(rs)));
     }
-    // tsc's `shouldReportUnmatchedPropertyError` turns this off only for a
-    // source that is all SIGNATURE and no property; an array or a tuple has
-    // plenty of properties, so `number[]` against `{ x: number }` is TS2741 on
-    // `x`, and against `interface Ext extends Array<number> { extra: string }`
-    // TS2741 on `extra`.
-    //
-    // Kept to an OBJECT target: a list target is decided by ARITY first
-    // (`tupleTypesRelatedTo`), and "Target requires 2 element(s) but source may
-    // have fewer" REPLACES this report rather than following it.
+    // An ARRAY or TUPLE source has plenty of properties, so `number[]` against
+    // `{ x: number }` is TS2741 on `x` — but kept to an OBJECT target, because
+    // a list target is decided by ARITY first (`tupleTypesRelatedTo`) and
+    // "Target requires 2 element(s) but source may have fewer" REPLACES this
+    // report rather than following it. Which of the remaining sources actually
+    // report is `shouldReportUnmatchedProperty`'s call.
     const sk = c.ts.kind(rs);
-    if (!isSourceObjecty(sk) and
+    if (!isSourceObjecty(sk) and sk != .function and sk != .overloads and
         !((sk == .array or sk == .tuple) and c.ts.kind(rt) == .object)) return false;
+    if (!try shouldReportUnmatchedProperty(c, rs, rt)) return false;
     var missing: std.ArrayList(Atom) = .empty;
     defer missing.deinit(c.scratch());
     switch (c.ts.kind(rt)) {
@@ -1100,9 +1145,8 @@ pub fn tryReportMissingProps(c: *Checker, src_t: TypeId, target: TypeId, span: S
         // tsc relates an ARRAY-LIKE target through its apparent type, the
         // global `Array<T>` interface, so a plain object source is missing
         // every one of its members: `let a: any[] = {x: 1}` is TS2740, not a
-        // bare TS2322. (A FUNCTION source is not — `isSourceObjecty` already
-        // excludes it, which is tsc's `shouldReportUnmatchedPropertyError`
-        // bailing on a source that is all signature and no property.)
+        // bare TS2322. (A FUNCTION source is not — a list carries no signature,
+        // so `shouldReportUnmatchedProperty` declines the pair.)
         //
         // A TUPLE requires each fixed element position by NAME on top of
         // those, and for an array-like source that is the whole story:
