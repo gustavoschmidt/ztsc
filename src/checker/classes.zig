@@ -1712,6 +1712,22 @@ fn declKeysOfInterfaceBlocks(c: *Checker, sym: SymbolId, w: *DeclKeyWalk) Error!
 /// Null unless the written type-argument arity is one this base accepts:
 /// falling back to the construct-signature route keeps the pre-existing
 /// (lenient) answer rather than adding a TS2314/TS2707 `fixTypeArgs` reports.
+///
+/// The leniency has ONE exception, and it is the half of tsc's arity check
+/// that cannot be a false positive: a base whose class declares NO type
+/// parameters at all, written with a type-argument list anyway, is TS2315 —
+/// "not generic", not "wrong count". There is no construct-signature route
+/// that could rescue it (a class with no parameters has no generic
+/// constructors either) and no under-modelled base it could be blaming, so it
+/// is reported here rather than dropped with the rest.
+///
+///     function getSomething() { return class D { } }
+///     class C extends getSomething()<number, string> { }
+///
+/// `declarationEmitExpressionInExtends4`. The count MISmatches (TS2314/TS2707)
+/// stay lenient: those need `fixTypeArgs`' defaults-and-minimum arithmetic to
+/// agree with tsc's on a base ztsc reached through a value, and the sweep has
+/// no evidence for that yet.
 fn baseCtorClassSym(c: *Checker, expr: Node, targ_count: usize) Error!?SymbolId {
     const bt = try c.checkExprCached(expr, types.no_type);
     if (c.ts.kind(bt) != .class_value) return null;
@@ -1719,6 +1735,10 @@ fn baseCtorClassSym(c: *Checker, expr: Node, targ_count: usize) Error!?SymbolId 
     var tps: std.ArrayList(TypeParamInfo) = .empty;
     defer tps.deinit(c.scratch());
     try c.typeParamsOf(bsym, &tps);
+    if (tps.items.len == 0 and targ_count > 0) {
+        try c.diagFmt(2315, c.nodeSpan(expr), "Type '{s}' is not generic.", .{c.symbolName(bsym)});
+        return null;
+    }
     if (targ_count > tps.items.len) return null;
     var min: usize = 0;
     for (tps.items) |tp| {

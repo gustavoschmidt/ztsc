@@ -276,7 +276,17 @@ pub fn signatureOfProtoCtx(
         // unannotated functions infer any, TS7023-adjacent).
         const reserved = try c.ts.makeFunction(params.items, types.any_type, tps.items, if (is_method) types.fn_flag_method else 0);
         try c.sig_cache.put(c.cm(), c.nodeKey(node), .{ .ty = reserved, .ctx = ctx_sig });
-        ret = try inferReturnType(c, node, c.tree.nodeData(node).rhs, ret_ctx);
+        // …and record the same reservation as a RESOLUTION, so a call that
+        // reads it back knows it read a return type still being computed
+        // (`markReturnCycle`). The cache slot alone cannot say that: it stays
+        // in place, holding the finished signature, long after this frame.
+        const track = returnCycleTracked(c, node, tps.items.len);
+        if (track) try c.ret_res_stack.append(c.cm(), .{ .key = c.nodeKey(node), .ok = true });
+        ret = inferReturnType(c, node, c.tree.nodeData(node).rhs, ret_ctx) catch |e| {
+            if (track) _ = c.ret_res_stack.pop();
+            return e;
+        };
+        if (track and !c.ret_res_stack.pop().?.ok) try reportReturnCycle(c, node, proto);
         // A member circle `memberTypeOf` cut without reporting is this frame's
         // to judge: inferring exactly the reserved signature back means the
         // body returned the METHOD, whose type tsc resolves without ever
@@ -1387,8 +1397,17 @@ fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) Erro
     // block's locals), not the ambient scope of this type probe.
     const saved_scope = c.cur_scope;
     defer c.cur_scope = saved_scope;
+    const saved_self_call = c.self_ret_call;
+    defer c.self_ret_call = saved_self_call;
     for (rets.exprs.items, rets.scopes.items) |r, sc| {
         c.cur_scope = sc;
+        // A DIRECT self-call closes no circle (`directSelfCall`): tsc answers
+        // it out of `checkCallExpression` without ever demanding the return
+        // type, so it earns no TS7023. The expression is still CHECKED, and
+        // still contributes whatever the reserved signature gives it — only
+        // the circle is withheld.
+        const self_call = directSelfCall(c, r, fn_node);
+        c.self_ret_call = if (self_call == null_node) 0 else c.nodeKey(self_call);
         try parts.append(c.scratch(), try c.checkExprCached(r, ret_ctx));
     }
     if (rets.bare or !c.stmtListTerminal(c.tree.nodeRange(body))) {
@@ -2619,7 +2638,7 @@ pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Er
         },
         .declarator_init => {
             if (try freshSymbolConstType(c, decl, d.lhs, d.rhs, is_const)) |u| return u;
-            const init_t = try c.checkExprCached(d.rhs, try destructure.patternContextualType(c, d.lhs));
+            const init_t = try c.checkExprCached(d.rhs, try destructure.patternInitContextualType(c, d.lhs, d.rhs));
             if (try inferredUniqueSymbol(c, decl, d.lhs, d.rhs, is_const, init_t)) |u| return u;
             const vt = try c.widenInitializer(init_t, is_const);
             if (c.nodeTag(d.lhs) == .identifier) return evolvingArrayOverride(c, sym, vt);
@@ -2632,7 +2651,7 @@ pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Er
                 vt = try c.annTypeMaybeUnique(e.type_ann, is_const, 1332, c.nodeSpan(d.lhs));
             } else if (e.init != 0) {
                 if (try freshSymbolConstType(c, decl, d.lhs, e.init, is_const)) |u| return u;
-                const init_t = try c.checkExprCached(e.init, try destructure.patternContextualType(c, d.lhs));
+                const init_t = try c.checkExprCached(e.init, try destructure.patternInitContextualType(c, d.lhs, e.init));
                 if (try inferredUniqueSymbol(c, decl, d.lhs, e.init, is_const, init_t)) |u| return u;
                 vt = try c.widenInitializer(init_t, is_const);
             }
@@ -2986,6 +3005,193 @@ fn takeMethodRetCut(c: *Checker, node: Node) bool {
 fn reportDeferredReturnCycle(c: *Checker, node: Node) Error!void {
     if (!c.prog.no_implicit_any) return;
     const tok = c.tree.nodeMainToken(node);
+    try c.diagFmt(7023, c.tokSpan(tok), "'{s}' implicitly has return type 'any' because it does not have a return type annotation and is referenced directly or indirectly in one of its return expressions.", .{c.tokenText(tok)});
+}
+
+// =====================================================================
+// inferred-return circularity (TS7023 / TS7024)
+// =====================================================================
+
+/// The function-like declaration a CALLEE statically names, or `null_node`.
+///
+/// tsc reaches the same fact through `getReturnTypeOfSignature`, which knows
+/// the signature it was handed; ztsc's signature types carry no declaration, so
+/// the question is answered from the callee's SYNTAX instead. Only the two
+/// spellings that put a whole function-like behind a single name are answered:
+///
+///   * a name bound to a `function` declaration, and
+///   * a name bound to a variable whose initializer IS a function expression or
+///     arrow (`var f = function () { … }`), which is how the anonymous forms
+///     become reachable by name at all.
+///
+/// Anything else — a property access (`o.m()`), a call on a call, a name whose
+/// value flows through a parameter — answers `null_node`, so its circle simply
+/// goes unreported, which is what it did before this existed.
+pub fn calleeFnDecl(c: *Checker, callee: Node) Node {
+    const e = expr_zig.skipParens(c, callee);
+    if (e == null_node or c.nodeTag(e) != .identifier) return null_node;
+    const atom = c.atomOfToken(c.tree.nodeMainToken(e)) catch return null_node;
+    const sym = switch (c.resolveSpace(atom, c.cur_scope, true)) {
+        .sym => |s| s,
+        else => return null_node,
+    };
+    // `declsOf` yields nodes of the SYMBOL's file; a self-call never leaves the
+    // file it is written in, so an out-of-file symbol is simply not this
+    // question's answer (and comparing its nodes against `nodeKey`s of the
+    // current file would be a category error).
+    if (c.symFile(c.reprSym(sym)) != c.cur_file) return null_node;
+    for (c.declsOf(sym)) |d| {
+        switch (c.nodeTag(d)) {
+            .function_decl => return d,
+            .declarator_init => {
+                const init = c.tree.nodeData(d).rhs;
+                if (init != null_node and isFnLikeExpr(c, init)) return init;
+            },
+            .declarator_full => {
+                const e2 = c.tree.extraData(ast.DeclaratorFull, c.tree.nodeData(d).rhs);
+                // An ANNOTATED variable takes its type from the annotation, so
+                // its initializer's return type is never demanded through the
+                // name — no circle to record.
+                if (e2.type_ann == 0 and e2.init != null_node and isFnLikeExpr(c, e2.init)) return e2.init;
+            },
+            else => {},
+        }
+    }
+    return null_node;
+}
+
+fn isFnLikeExpr(c: *const Checker, node: Node) bool {
+    return switch (c.nodeTag(node)) {
+        .function_expr, .arrow_fn => true,
+        else => false,
+    };
+}
+
+/// Is a re-entrant demand for THIS function's inferred return type a circle
+/// tsc would report? Only a tracked function-like gets a `ret_res_stack` frame,
+/// so an untracked one is silent exactly as it was before TS7023 existed.
+///
+/// Two shapes are excluded, because ztsc's frame — keyed on the DECLARATION —
+/// is coarser than tsc's, which is keyed on a `Signature` object:
+///
+///   * a GENERIC function-like. tsc resolves `foo<typeof y>()` inside `foo`'s
+///     own body against an INSTANTIATED signature, a different resolution
+///     target from the one `foo` pushed, so the self-call is not the circle a
+///     declaration-keyed frame makes it look like
+///     (`cyclicGenericTypeInstantiation`, `conditionalTypeDoesntSpinForever`,
+///     `genericCallWithinOwnBodyCastTypeParameterIdentity`).
+///   * a BLOCK-bodied ARROW. Measured against the oracle rather than derived:
+///     `const f = () => { return f(); }` earns nothing there while the same
+///     body written as a function EXPRESSION, or the same arrow written
+///     CONCISELY (`const f = () => f()`), earns TS7023 — and the block arrow
+///     flips to reporting once it is `export`ed, which is a resolution-order
+///     difference no rule of ztsc's could track. Excluded in the silent
+///     direction, which is the pre-existing behaviour.
+fn returnCycleTracked(c: *const Checker, node: Node, tp_count: usize) bool {
+    if (tp_count > 0) return false;
+    return switch (c.nodeTag(node)) {
+        .arrow_fn => c.nodeTag(c.tree.nodeData(node).rhs) != .block,
+        .function_decl, .function_expr, .class_method => true,
+        else => false,
+    };
+}
+
+/// Record that a call demanded the return type of `fn_node`, which is still
+/// being inferred — tsc's failed `pushTypeResolution`, which clears the
+/// resolution bit of every frame from the re-entered one to the top so that the
+/// whole circle reports, not just the frame the traversal happened to reach
+/// first.
+pub fn markReturnCycle(c: *Checker, fn_node: Node) void {
+    const key = c.nodeKey(fn_node);
+    for (c.ret_res_stack.items, 0..) |f, i| {
+        if (f.key != key) continue;
+        for (c.ret_res_stack.items[i..]) |*g| g.ok = false;
+        return;
+    }
+}
+
+/// Is `expr` — the whole of one `return` in `fn_node`'s body — a DIRECT
+/// self-call: the bare name of `fn_node` itself, invoked?
+///
+/// tsc answers that one shape `silentNeverType` without ever demanding the
+/// return type, so `function f() { return f(); }` is not a circle it reports.
+/// The shape is narrow and every neighbour of it is a real circle tsc DOES —
+/// `(f)()`, `f!()`, `(0, f)()`, `[f()][0]`, a call to a DIFFERENT function that
+/// calls back — so the test is syntactic and unforgiving:
+///
+///   * parentheses around the whole `return` expression are transparent
+///     (`return (f());`), parentheses around the CALLEE are not (`return (f)();`);
+///   * the callee must be a bare identifier resolving to `fn_node` itself — a
+///     name bound to the VARIABLE a function expression is assigned to
+///     (`var f = function () { return f(); }`) resolves to the variable, not to
+///     the function, and is a real circle.
+fn directSelfCall(c: *Checker, expr: Node, fn_node: Node) Node {
+    const e = expr_zig.skipParens(c, expr);
+    if (e == null_node) return null_node;
+    switch (c.nodeTag(e)) {
+        .call_expr, .call_expr_targs, .optional_call => {},
+        else => return null_node,
+    }
+    const callee = c.tree.nodeData(e).lhs;
+    if (callee == null_node or c.nodeTag(callee) != .identifier) return null_node;
+    const atom = c.atomOfToken(c.tree.nodeMainToken(callee)) catch return null_node;
+    const sym = switch (c.resolveSpace(atom, c.cur_scope, true)) {
+        .sym => |s| s,
+        else => return null_node,
+    };
+    if (c.symFile(c.reprSym(sym)) != c.cur_file) return null_node;
+    for (c.declsOf(sym)) |d| {
+        if (d == fn_node) return e;
+    }
+    return null_node;
+}
+
+/// The name tsc's `getNameOfDeclaration` prints for a function-like, or 0 when
+/// the syntax gives it none.
+///
+/// A `function` declaration and a class/object method carry their own; an
+/// anonymous function expression or arrow borrows the name it is ASSIGNED to
+/// (tsc's `getAssignedName`, which walks to the parent declarator). ztsc's AST
+/// has no parent links, so the walk runs the other way: the declarator is a
+/// member of the scope ENCLOSING the function's own scope, and it is the one
+/// whose initializer is this very node. Only the error path pays for the scan.
+fn declarationNameToken(c: *Checker, node: Node, proto: ast.FnProto) ast.TokenIndex {
+    if (proto.name_token != 0) return proto.name_token;
+    if (c.nodeTag(node) == .class_method) return c.tree.nodeMainToken(node);
+    if (!isFnLikeExpr(c, node)) return 0;
+    const own = (c.scopeOf(node) catch return 0) orelse return 0;
+    const parent = c.bind.scope_parents[own];
+    const lo = c.bind.scope_members_start[parent];
+    const hi = c.bind.scope_members_start[parent + 1];
+    for (lo..hi) |i| {
+        for (c.bind.declsOf(c.bind.member_syms[i])) |d| {
+            const init: Node, const name: Node = switch (c.nodeTag(d)) {
+                .declarator_init => .{ c.tree.nodeData(d).rhs, c.tree.nodeData(d).lhs },
+                .declarator_full => blk: {
+                    const e = c.tree.extraData(ast.DeclaratorFull, c.tree.nodeData(d).rhs);
+                    break :blk .{ e.init, c.tree.nodeData(d).lhs };
+                },
+                else => continue,
+            };
+            if (init != node or name == null_node or c.nodeTag(name) != .identifier) continue;
+            return c.tree.nodeMainToken(name);
+        }
+    }
+    return 0;
+}
+
+/// tsc's `getReturnTypeOfSignature` circularity report, for the frame that
+/// popped a cleared resolution bit: TS7023 when the declaration has a name to
+/// print, TS7024 when it has none. Follows `noImplicitAny` like the rest of the
+/// implicit-`any` family (the return type IS `any` either way — the report is
+/// what names the circle).
+fn reportReturnCycle(c: *Checker, node: Node, proto: ast.FnProto) Error!void {
+    if (!c.prog.no_implicit_any) return;
+    const tok = declarationNameToken(c, node, proto);
+    if (tok == 0) {
+        try c.diagFmt(7024, c.nodeSpan(node), "Function implicitly has return type 'any' because it does not have a return type annotation and is referenced directly or indirectly in one of its return expressions.", .{});
+        return;
+    }
     try c.diagFmt(7023, c.tokSpan(tok), "'{s}' implicitly has return type 'any' because it does not have a return type annotation and is referenced directly or indirectly in one of its return expressions.", .{c.tokenText(tok)});
 }
 

@@ -33,6 +33,7 @@ const tuple_relate = @import("tuple_relate.zig");
 const accessibility = @import("accessibility.zig");
 const classes = @import("classes.zig");
 const ambientNamespaceType = @import("signatures.zig").ambientNamespaceType;
+const signatures = @import("signatures.zig");
 const ChainLink = @import("expr.zig").ChainLink;
 const checkExprCached = @import("expr.zig").checkExprCached;
 const expr_zig = @import("expr.zig");
@@ -605,6 +606,15 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
     if (!is_new and c.nodeTag(shape.callee) == .import_expr) {
         return .{ .ty = try importCallType(c, shape.arg_nodes), .chained = chained };
     }
+    // A call NAMES the function whose return type it is about to read. When
+    // that function is still inferring its own return type, this is tsc's
+    // failed `pushTypeResolution(signature, ResolvedReturnType)` and the whole
+    // circle is due a TS7023 — unless this very call is the direct self-call
+    // tsc answers `silentNeverType` without asking (`Checker.self_ret_call`).
+    if (!is_new and c.ret_res_stack.items.len > 0 and c.nodeKey(node) != c.self_ret_call) {
+        const fnode = signatures.calleeFnDecl(c, shape.callee);
+        if (fnode != null_node) signatures.markReturnCycle(c, fnode);
+    }
     // A super CALL's callee is never typed as a value (tsc's
     // `resolveCallExpression` resolves against the base's construct signatures
     // instead — see below), and `checkExpr`'s `.super_expr` arm — which would
@@ -894,6 +904,14 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
             var ctor_sigs: std.ArrayList(TypeId) = .empty;
             defer ctor_sigs.deinit(c.scratch());
             try c.ctorSignatures(cls, &ctor_sigs);
+            // A class value carrying OUTER type arguments is an INSTANTIATION
+            // of `typeof C` (see `class_value.zig`), and its constructors are
+            // read under that substitution exactly as its static members are
+            // (`props.classValueProp`). Without this, `new C(5)` on the
+            // `outer(5)`-returned class checked its argument against the
+            // enclosing `T` itself — a TS2345 on the very call the arguments
+            // were inferred from, and no TS2345 on the one that is wrong.
+            for (ctor_sigs.items) |*s| s.* = try c.instantiateOuter(r, s.*);
             // Class type params (not the ctor's own).
             var tps: std.ArrayList(TypeParamInfo) = .empty;
             defer tps.deinit(c.scratch());

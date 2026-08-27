@@ -28,6 +28,7 @@ const accessibility = @import("accessibility.zig");
 const PathElem = @import("flow.zig").PathElem;
 const RefKey = @import("flow.zig").RefKey;
 const containsAtom = @import("expr.zig").containsAtom;
+const skipParens = @import("expr.zig").skipParens;
 const keyof = @import("keyof.zig");
 const markSpeculativePin = @import("signatures.zig").markSpeculativePin;
 const max_deep_ref_depth = @import("flow.zig").max_deep_ref_depth;
@@ -909,6 +910,40 @@ pub fn patternContextualType(c: *Checker, pat: Node) Error!TypeId {
     };
 }
 
+/// The contextual type a binding pattern offers its OWN initializer — which is
+/// `patternContextualType`, except that a CALL gets none.
+///
+/// tsc's `getContextualTypeForVariableLikeDeclaration` answers a variable
+/// declaration from its type ANNOTATION alone. The pattern is used to TYPE a
+/// parameter that has nothing else (`patternDeclaredType`), never to
+/// contextually type an initializer whose type arguments are still being
+/// inferred — "a binding pattern cannot be the only inference source". So
+///
+///     declare function f<T>(): T;
+///     const [e1, e2] = f();   // T = unknown  ->  TS2488
+///
+/// leaves `T` at `unknown`, where feeding the pattern's `[any, any]` into the
+/// inference made it a two-tuple that destructures cleanly and reported
+/// nothing (`bindingPatternCannotBeOnlyInferenceSource`; the EMPTY pattern
+/// already agreed, because it offers no tuple to infer from).
+///
+/// Only a call is withheld, not every initializer: the pattern's tuple is what
+/// makes `const [a, b] = [1, "x"]` two separate types instead of one union,
+/// and an array literal infers nothing from it.
+pub fn patternInitContextualType(c: *Checker, pat: Node, init: Node) Error!TypeId {
+    if (init != null_node) switch (c.nodeTag(skipParens(c, init))) {
+        .call_expr,
+        .call_expr_targs,
+        .optional_call,
+        .new_expr,
+        .new_expr_targs,
+        .new_expr_bare,
+        => return types.no_type,
+        else => {},
+    };
+    return patternContextualType(c, pat);
+}
+
 /// The type a BINDING PATTERN declares for the thing it destructures, when
 /// nothing else does — tsc's `getTypeFromBindingPattern(name,
 /// /*includePatternInType*/ false, /*reportErrors*/ true)`, the last arm of
@@ -1223,14 +1258,14 @@ pub fn checkDeclPattern(c: *Checker, decl: Node, fallback: TypeId) Error!void {
         .declarator => fallback,
         .declarator_init => blk: {
             init_node = d.rhs;
-            break :blk try c.checkExprCached(d.rhs, try patternContextualType(c, pat));
+            break :blk try c.checkExprCached(d.rhs, try patternInitContextualType(c, pat, d.rhs));
         },
         else => blk: {
             const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
             if (e.type_ann != 0) break :blk try c.typeFromTypeNode(e.type_ann);
             if (e.init == 0) break :blk fallback;
             init_node = e.init;
-            break :blk try c.checkExprCached(e.init, try patternContextualType(c, pat));
+            break :blk try c.checkExprCached(e.init, try patternInitContextualType(c, pat, e.init));
         },
     };
     // tsc's `needCheckInitializer` is about the declaration CARRYING one, not

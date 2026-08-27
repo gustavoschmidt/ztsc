@@ -920,43 +920,43 @@ pub const LazyStat = enum(u8) {
 };
 
 pub const map_containers = [_][]const u8{
-    "node_types",             "sig_cache",             "node_scopes",
-    "reassigned_syms",        "reassigned_in_loop",    "member_written_syms",
-    "member_written_in_loop", "ns_types",              "ambient_ns_types",
-    "relation",               "expansions",            "overload_groups",
-    "construct_groups",       "origin",                "iface_generic",
-    "overload_group_pool",    "iface_stack",           "pending_class_decos",
-    "class_inst_generic",     "class_static_cache",    "class_static_owner",
-    "class_static_stack",     "class_ctor_cache",      "class_abstract_cache",
-    "enum_value_cache",       "enum_info_cache",       "enum_relation_cache",
-    "alias_generic",          "alias_state",           "alias_recursive",
-    "flow_same",              "flow_narrow",           "ref_keys",
-    "flow_loop_stack",        "flow_stack",            "flow_tmp",
-    "flow_reduce",            "da_cache",              "ctp_cache",
-    "cmp_cache",              "ctt_cache",             "ci_cache",
-    "cftp_cache",             "base_constraint_cache", "type_string_cache",
-    "infer_visited",          "subst_this_cache",      "mmp_cache",
-    "arrayish_elem_cache",    "tp_constraint_cache",   "erase_cache",
-    "erase_any_cache",        "inst_map_ids",          "fresh_tp_ids",
-    "this_tp_ids",            "fresh_tp_info",         "type_node_cache",
-    "atom_cache",             "infer_ids",             "infer_constraints",
-    "infer_scopes",           "mapped_key_ids",        "mapped_key_scopes",
-    "inst_diag_at",           "infer_active",          "lazy_member_active",
-    "this_bound_fns",         "chain_guards",          "never_isect",
-    "deep_path_list",         "deep_path_ids",         "flow_reach",
-    "member_type_stack",      "method_ret_cuts",       "lazy_index_objs",
-    "sym_res_stack",          "pending_type_args",     "pending_type_args_pool",
-    "pending_type_args_seen", "tp_constrained_cache",  "nominal_bases",
-    "nominal_base_pool",      "keyof_mapped_active",   "ctp_syms_seen",
-    "weak_types",             "base_ref_active",       "lazy_member",
-    "trunc_lazy_member",      "lazy_map",              "pattern_root_decls",
-    "pattern_root_ids",       "pattern_narrow_busy",   "key_name_types",
-    "enum_members",           "keyof_obj_cache",       "sym_key_cache",
-    "trunc_expansions",       "inst_map_bytes",        "tp_mentions",
-    "smk_cache",              "rel_maybe",             "spec_sym_types",
-    "spec_tainted",           "last_assign_pos",       "definitely_assigned_syms",
-    "alias_stack",            "alias_self_recursive",  "jsx_lma_cache",
-    "class_outer_tps",
+    "node_types",               "sig_cache",              "node_scopes",
+    "reassigned_syms",          "reassigned_in_loop",     "member_written_syms",
+    "member_written_in_loop",   "ns_types",               "ambient_ns_types",
+    "relation",                 "expansions",             "overload_groups",
+    "construct_groups",         "origin",                 "iface_generic",
+    "overload_group_pool",      "iface_stack",            "pending_class_decos",
+    "class_inst_generic",       "class_static_cache",     "class_static_owner",
+    "class_static_stack",       "class_ctor_cache",       "class_abstract_cache",
+    "enum_value_cache",         "enum_info_cache",        "enum_relation_cache",
+    "alias_generic",            "alias_state",            "alias_recursive",
+    "flow_same",                "flow_narrow",            "ref_keys",
+    "flow_loop_stack",          "flow_stack",             "flow_tmp",
+    "flow_reduce",              "da_cache",               "ctp_cache",
+    "cmp_cache",                "ctt_cache",              "ci_cache",
+    "cftp_cache",               "base_constraint_cache",  "type_string_cache",
+    "infer_visited",            "subst_this_cache",       "mmp_cache",
+    "arrayish_elem_cache",      "tp_constraint_cache",    "erase_cache",
+    "erase_any_cache",          "inst_map_ids",           "fresh_tp_ids",
+    "this_tp_ids",              "fresh_tp_info",          "type_node_cache",
+    "atom_cache",               "infer_ids",              "infer_constraints",
+    "infer_scopes",             "mapped_key_ids",         "mapped_key_scopes",
+    "inst_diag_at",             "infer_active",           "lazy_member_active",
+    "this_bound_fns",           "chain_guards",           "never_isect",
+    "deep_path_list",           "deep_path_ids",          "flow_reach",
+    "member_type_stack",        "method_ret_cuts",        "lazy_index_objs",
+    "sym_res_stack",            "ret_res_stack",          "pending_type_args",
+    "pending_type_args_pool",   "pending_type_args_seen", "tp_constrained_cache",
+    "nominal_bases",            "nominal_base_pool",      "keyof_mapped_active",
+    "ctp_syms_seen",            "weak_types",             "base_ref_active",
+    "lazy_member",              "trunc_lazy_member",      "lazy_map",
+    "pattern_root_decls",       "pattern_root_ids",       "pattern_narrow_busy",
+    "key_name_types",           "enum_members",           "keyof_obj_cache",
+    "sym_key_cache",            "trunc_expansions",       "inst_map_bytes",
+    "tp_mentions",              "smk_cache",              "rel_maybe",
+    "spec_sym_types",           "spec_tainted",           "last_assign_pos",
+    "definitely_assigned_syms", "alias_stack",            "alias_self_recursive",
+    "jsx_lma_cache",            "class_outer_tps",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -970,6 +970,10 @@ pub const EnumMemberEntry = struct { name: Atom, value: TypeId, computed: bool =
 /// and tsc's `resolutionResults` bit for it (`ok = false` once something
 /// inside its own resolution asked for it again).
 pub const SymResolution = struct { sym: SymbolId, ok: bool };
+/// One frame of `Checker.ret_res_stack`: the `nodeKey` of a function-like whose
+/// inferred return type is being resolved, and tsc's `resolutionResults` bit
+/// for it (`ok = false` once a call asked for that return type again).
+pub const RetResolution = struct { key: u64, ok: bool };
 /// A memoized `keyof <object table>`, tagged with the `key_name_types`
 /// generation it was computed under — see `Checker.keyof_obj_cache`.
 const KeyofEntry = struct { ty: TypeId, gen: u32 };
@@ -1453,6 +1457,16 @@ pub const Checker = struct {
     /// variable is TS2502 and resolves to `any`, which is what makes a later
     /// `var f: any` redeclaration agree instead of reporting TS2403.
     sym_res_stack: std.ArrayListUnmanaged(SymResolution) = .empty,
+    /// Function-like declarations whose INFERRED return type is being resolved,
+    /// innermost last — the same `pushTypeResolution`/`popTypeResolution` pair
+    /// as `sym_res_stack`, for tsc's `TypeSystemPropertyName.ResolvedReturnType`.
+    ///
+    /// A CALL that names a function already on this stack demands a return type
+    /// that is still being computed, so it clears the `ok` bit of every frame
+    /// from that one to the top — the whole circle, which is why
+    /// `function m1() { return m2(); }` / `function m2() { return m1(); }`
+    /// names BOTH. A frame that pops a cleared bit is tsc's TS7023/TS7024.
+    ret_res_stack: std.ArrayListUnmanaged(RetResolution) = .empty,
     /// `nodeKey`s of the unannotated METHODS in a member circle that
     /// `memberTypeOf` cut WITHOUT reporting, because the circle is not one in
     /// tsc: a method's type is a signature object whose RETURN stays deferred
@@ -2002,6 +2016,18 @@ pub const Checker = struct {
     /// callee is not a function expression), read by `checkFunctionBody`.
     /// (wave-44 A.)
     iife_fn: Node = 0,
+    /// `nodeKey` of the call expression currently being checked as a DIRECT
+    /// SELF-CALL — a `return f(…)` whose callee is the bare name of the very
+    /// function whose inferred return type that `return` feeds. Recorded on the
+    /// way in for the same reason `iife_fn` is: the fact is positional, and the
+    /// call itself cannot ask what statement it is the whole of.
+    ///
+    /// tsc answers such a call `silentNeverType` straight out of
+    /// `checkCallExpression`, without ever demanding the signature's return
+    /// type — so it neither contributes to the inferred union nor closes a
+    /// resolution circle. `inferReturnType` supplies the `never`; this key is
+    /// what tells `calls` not to record the circle (see `ret_res_stack`).
+    self_ret_call: u64 = 0,
     /// The bare identifier being checked is the operand of `export = X`. tsc's
     /// `isBlockScopedNameDeclaredBeforeUse` exempts it by name — "inside a TS
     /// export= declaration (since we will move the export statement during emit

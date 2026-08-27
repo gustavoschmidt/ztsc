@@ -4523,6 +4523,39 @@ fn propCtxKeepsLiteral(c: *Checker, rctx: TypeId, ctx: TypeId, key: Atom, cand: 
     return keepLiteral(c, cand, try ctxPropType(c, rctx, ctx, key));
 }
 
+/// The contextual type an INTERSECTION's constituents give `key` through a
+/// DECLARED property — no index-signature tail, and `no_type` when none of them
+/// declares it.
+///
+/// tsc's `getTypeOfPropertyOfContextualType` runs `mapType` over the contextual
+/// type, and `mapType` distributes over a UNION but not over an INTERSECTION:
+/// the intersection is looked up whole, so `getPropertyOfType` answers from the
+/// constituents that declare the name and the `findApplicableIndexInfo` tail
+/// only runs when NONE of them does. Intersecting the per-member answers
+/// instead lets an `any`-valued index signature swallow its siblings —
+/// `{ [others: string]: any } & { as?: "select" | "input" }` offered `any` for
+/// `as`, so `styled(Flex).attrs({ as: "select" })` widened its literal to
+/// `string` and failed the very parameter it was written for
+/// (`contextualTypeBasedOnIntersectionWithAnyInTheMix1`).
+fn ctxDeclaredPropType(c: *Checker, rctx: TypeId, ctx: TypeId, key: Atom) Error!TypeId {
+    var parts: std.ArrayList(TypeId) = .empty;
+    defer parts.deinit(c.scratch());
+    for (try c.memberList(rctx)) |m| {
+        const rm = try c.resolveStructural(m);
+        // A union or intersection nested in the intersection keeps its own
+        // rule: `ctxPropType` unions a union's per-member answers, and the
+        // arm above re-enters this one for a nested intersection.
+        const pt = switch (c.ts.kind(rm)) {
+            .union_type, .intersection => try c.ctxPropType(rm, ctx, key),
+            else => if (try props_zig.ctxDeclaredPropOfType(c, rm, key)) |p| p.ty else types.no_type,
+        };
+        if (pt != types.no_type) try parts.append(c.scratch(), pt);
+    }
+    if (parts.items.len == 0) return types.no_type;
+    if (parts.items.len == 1) return parts.items[0];
+    return c.ts.makeIntersection(c.scratch(), parts.items);
+}
+
 pub fn ctxPropType(c: *Checker, rctx: TypeId, ctx: TypeId, key: Atom) Error!TypeId {
     if (ctx == types.no_type) return types.no_type;
     switch (c.ts.kind(rctx)) {
@@ -4587,6 +4620,12 @@ pub fn ctxPropType(c: *Checker, rctx: TypeId, ctx: TypeId, key: Atom) Error!Type
         // intersect the per-member contextual types, mirroring tsc's
         // `getTypeOfPropertyOfContextualType` over an intersection.
         .intersection => {
+            // …but the constituents that DECLARE the name answer alone when
+            // there are any (`ctxDeclaredPropType`): an intersection is looked
+            // up whole in tsc, so its index signatures are the fallback for a
+            // name no constituent declares, never a co-contributor.
+            const declared = try ctxDeclaredPropType(c, rctx, ctx, key);
+            if (declared != types.no_type) return declared;
             var parts: std.ArrayList(TypeId) = .empty;
             defer parts.deinit(c.scratch());
             for (try c.memberList(rctx)) |m| {

@@ -80,6 +80,15 @@ pub fn propOfTypeNoAugment(c: *Checker, t: TypeId, name: Atom) Error!?types.Prop
 /// `propOfTypeNoAugment` under the name its contextual-typing caller uses.
 pub const ctxPropOfType = propOfTypeNoAugment;
 
+/// `ctxPropOfType` for a DECLARED member only — a string index signature does
+/// NOT stand in. The intersection arm of `expr.ctxPropType` is the one caller:
+/// tsc looks an intersection's contextual property up WHOLE, so its index
+/// signatures answer only for a name no constituent declares, and an
+/// `any`-valued one must not swallow a sibling that does declare it.
+pub fn ctxDeclaredPropOfType(c: *Checker, t: TypeId, name: Atom) Error!?types.Prop {
+    return propOfTypeIdx(c, t, name, .{ .allow_index = false, .skip_augment = true });
+}
+
 /// What a property lookup should answer beyond the name itself.
 const PropLookup = struct {
     /// `true` (the member-access default) lets a string index signature stand
