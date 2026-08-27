@@ -1078,8 +1078,8 @@ pub fn tryReportMissingProps(c: *Checker, src_t: TypeId, target: TypeId, span: S
     // Base` is TS2741 on `extraStatic`, not the TS2322 wrapper.
     var rt = try c.resolveStructural(target);
     if (c.ts.kind(target) == .class_value) {
-        rt = try c.classConstructType(c.ts.classSymbol(target));
-        if (c.ts.kind(rs) == .class_value) rs = try c.classConstructType(c.ts.classSymbol(rs));
+        rt = try c.instantiateOuter(target, try c.classConstructType(c.ts.classSymbol(target)));
+        if (c.ts.kind(rs) == .class_value) rs = try c.instantiateOuter(rs, try c.classConstructType(c.ts.classSymbol(rs)));
     }
     // tsc's `shouldReportUnmatchedPropertyError` turns this off only for a
     // source that is all SIGNATURE and no property; an array or a tuple has

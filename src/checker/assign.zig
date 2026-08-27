@@ -793,12 +793,15 @@ pub fn sigListOverlap(c: *Checker, s0: TypeId, t0: TypeId, is_construct: bool, d
     // `sourceSatisfiesSigs` does for assignability, or `typeof C` offers the
     // overlap walk no constructor at all and every `x === SomeClass` against
     // a `{ new (…): …ic }`-typed operand reads as a non-overlapping TS2367.
+    // `instantiateOuter` for the same reason the `.class_value` arm of
+    // `isAssignableInner` needs it: the materialized table is generic in the
+    // class's OUTER parameters, and the class value holds the arguments.
     const s = if (is_construct and c.ts.kind(s0) == .class_value)
-        try c.classConstructType(c.ts.classSymbol(s0))
+        try c.instantiateOuter(s0, try c.classConstructType(c.ts.classSymbol(s0)))
     else
         s0;
     const t = if (is_construct and c.ts.kind(t0) == .class_value)
-        try c.classConstructType(c.ts.classSymbol(t0))
+        try c.instantiateOuter(t0, try c.classConstructType(c.ts.classSymbol(t0)))
     else
         t0;
     const t_count = overlapSigCount(c, t, is_construct);
@@ -3951,9 +3954,19 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
             // them (ztsc's signatures carry no accessibility bit).
             if (sk == .class_value and
                 !try nominal_members.ctorVisibilityCompatible(c, c.ts.classSymbol(s), c.ts.classSymbol(t))) return false;
-            const tgt_static = try c.classConstructType(c.ts.classSymbol(t));
+            // `classConstructType` reads the class's members GENERICALLY —
+            // an anonymous `class { static prop: T }` written inside a generic
+            // function keeps `T` in its static table. The class VALUE carries
+            // the outer arguments that stand in for those parameters (see
+            // `class_value.instantiateOuter`, which every other consumer of a
+            // class value's members already calls), so the materialization
+            // owes them the substitution too: without it `foo(class { static
+            // prop = "hello" })` compares `prop: string` against `prop: T` and
+            // reports a spurious TS2345
+            // (`typeArgumentInferenceWithClassExpression1`/`3`).
+            const tgt_static = try c.instantiateOuter(t, try c.classConstructType(c.ts.classSymbol(t)));
             if (sk != .class_value) return c.structuralAssignable(s, tgt_static);
-            return c.structuralAssignable(try c.classConstructType(c.ts.classSymbol(s)), tgt_static);
+            return c.structuralAssignable(try c.instantiateOuter(s, try c.classConstructType(c.ts.classSymbol(s))), tgt_static);
         },
         else => return false,
     }
@@ -6339,7 +6352,7 @@ pub fn sourceSatisfiesSigs(c: *Checker, s: TypeId, t: TypeId, is_construct: bool
             for (try c.memberList(s)) |m| try src.append(c.scratch(), m);
         },
         .class_value => if (is_construct) {
-            const mat = try c.classConstructType(c.ts.classSymbol(s));
+            const mat = try c.instantiateOuter(s, try c.classConstructType(c.ts.classSymbol(s)));
             for (0..c.ts.objectConstructSigCount(mat)) |i| {
                 try src.append(c.scratch(), c.ts.objectConstructSig(mat, @intCast(i)));
             }
