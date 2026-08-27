@@ -956,6 +956,7 @@ pub const map_containers = [_][]const u8{
     "smk_cache",              "rel_maybe",             "spec_sym_types",
     "spec_tainted",           "last_assign_pos",       "definitely_assigned_syms",
     "alias_stack",            "alias_self_recursive",  "jsx_lma_cache",
+    "class_outer_tps",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -1513,6 +1514,12 @@ pub const Checker = struct {
     /// Class symbol -> its *structural* constructor object (statics + construct
     /// signatures returning the instance). See `classConstructType`.
     class_ctor_cache: IntMap(SymbolId, TypeId) = .empty,
+    /// Class symbol -> the type parameters in lexical scope at its declaration
+    /// (tsc's `outerTypeParameters`), memoized. See `class_value.zig`: the
+    /// answer is empty for every class not nested in a generic, and computing
+    /// it costs a file-context switch plus a scope-chain walk, so the common
+    /// path must be one probe.
+    class_outer_tps: IntMap(SymbolId, []const SymbolId) = .empty,
     /// Class symbol -> `abstract`, memoized. The answer is one modifier bit on
     /// one declaration, but reading it costs a file-context switch
     /// (`classes.classIsAbstract` brackets the walk in
@@ -4106,6 +4113,7 @@ pub const Checker = struct {
     pub const lazyThisProp = instantiate_zig.lazyThisProp;
     pub const ctorClassOwnsMember = instantiate_zig.ctorClassOwnsMember;
     pub const baseClassRef = instantiate_zig.baseClassRef;
+    pub const baseAsInherited = instantiate_zig.baseAsInherited;
     pub const baseClassSym = instantiate_zig.baseClassSym;
     pub const hasUnresolvedBase = instantiate_zig.hasUnresolvedBase;
     pub const classBaseEntitySym = instantiate_zig.classBaseEntitySym;
@@ -4176,6 +4184,11 @@ pub const Checker = struct {
     pub const TpMap = enums_zig.TpMap;
     pub const InferKey = enums_zig.InferKey;
     pub const InferConstraint = enums_zig.InferConstraint;
+
+    const class_value_zig = @import("checker/class_value.zig");
+    pub const classValueOf = class_value_zig.classValueOf;
+    pub const classOuterTypeParams = class_value_zig.outerTypeParams;
+    pub const instantiateOuter = class_value_zig.instantiateOuter;
 
     const generics_zig = @import("checker/generics.zig");
     pub const mapWith = generics_zig.mapWith;

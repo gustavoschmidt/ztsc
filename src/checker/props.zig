@@ -459,7 +459,15 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, o: PropLookup) Error!?types
             return propOfTypeIdx(c, try c.resolveStructural(bc), name, o);
         },
         .ref => return propOfTypeIdx(c, try c.resolveStructural(t), name, o),
-        .class_value => return classValueProp(c, s.classSymbol(t), name, o),
+        .class_value => {
+            var p = (try classValueProp(c, s.classSymbol(t), name, o)) orelse return null;
+            // …read under the class's OUTER type arguments, so a static
+            // declared in terms of an enclosing generic's parameter comes
+            // back filled in: `outer(5).y` is `number`, not `T`. A
+            // pass-through for every class value with no outer arguments.
+            p.ty = try c.instantiateOuter(t, p.ty);
+            return p;
+        },
         .enum_type => {
             // A value of enum type borrows its base primitive's members.
             const info = try c.enumInfo(s.enumSymbol(t));

@@ -299,6 +299,17 @@ pub fn containsTypeParamInner(c: *Checker, t: TypeId) Error!bool {
             }
             return false;
         },
+        // A class value is generic exactly when one of its OUTER type
+        // arguments is (`typeof Inner` inside `function outer<T>()`). The
+        // list is empty for every class declared outside a generic scope, so
+        // this arm costs a `dataB` read on the hot path — `ctp_cache` then
+        // remembers the `false` for the id.
+        .class_value => {
+            for (s.classValueArgs(t)) |a| {
+                if (try c.containsTypeParam(a)) return true;
+            }
+            return false;
+        },
         // `this@I<T…>` is generic exactly when its home instance is (see
         // the `.this_type` arm of `instantiateId`).
         .this_type => return c.containsTypeParam(s.thisTypeInstance(t)),
@@ -468,6 +479,13 @@ fn tpMentionsInto(c: *Checker, t: TypeId, out: *std.ArrayList(u32), use_cache: b
             }
             return false;
         },
+        // See the `.class_value` arm of `containsTypeParamInner`.
+        .class_value => {
+            for (s.classValueArgs(t)) |a| {
+                if (try tpMentionsInto(c, a, out, true)) return true;
+            }
+            return false;
+        },
         .this_type => return tpMentionsInto(c, s.thisTypeInstance(t), out, true),
         .conditional => {
             if (try tpMentionsInto(c, s.condCheck(t), out, true)) return true;
@@ -595,6 +613,13 @@ fn containsFreeTypeParamInner(c: *Checker, t: TypeId, bound: []const u32) Error!
         .ref => {
             for (0..s.refArgCount(t)) |i| {
                 if (try c.containsFreeTypeParam(s.refArgAt(t, i), bound)) return true;
+            }
+            return false;
+        },
+        // See the `.class_value` arm of `containsTypeParamInner`.
+        .class_value => {
+            for (s.classValueArgs(t)) |a| {
+                if (try c.containsFreeTypeParam(a, bound)) return true;
             }
             return false;
         },
@@ -1472,6 +1497,19 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
             defer c.scratch().free(args);
             for (args, 0..) |*a, i| a.* = try c.instantiateId(s.refArgAt(t, i), map, map_id);
             break :blk try s.makeRef(s.refSymbol(t), args);
+        },
+        // The OUTER type arguments of a local/anonymous class travel with the
+        // class value, exactly as a `.ref`'s arguments do — that is how
+        // `outer<T>() { class Inner { static y: T } return Inner }` returns a
+        // `typeof Inner` the CALL can fill in. Only reached when one of them
+        // is generic (the `containsTypeParam` early-out above), so an
+        // argument-free class value never enters this arm.
+        .class_value => blk: {
+            const n = s.classValueArgs(t).len;
+            const args = try c.scratch().alloc(TypeId, n);
+            defer c.scratch().free(args);
+            for (args, 0..) |*a, i| a.* = try c.instantiateId(s.classValueArgs(t)[i], map, map_id);
+            break :blk try s.makeClassValueArgs(s.classSymbol(t), args);
         },
         // A polymorphic `this` marker carries the home instance it was
         // declared against (`I<T…>`); substituting the interface's type

@@ -1838,13 +1838,19 @@ fn checkInstanceSideExtends(c: *Checker, class_sym: SymbolId, members: []const N
     const base_ref = try c.baseClassRef(class_sym) orelse return true;
     if (base_ref == types.error_type or base_ref == types.any_type or base_ref == this_t) return true;
     if (try c.hasUnresolvedBase(class_sym)) return true;
+    // The base as this class INHERITS it. A base nested in a generic carries
+    // that generic's arguments on its class value, and `classInstanceGeneric`
+    // folded the members under them — so relating against the bare ref would
+    // compare an inherited `number` with the base's own `U`. A pass-through
+    // (one memo probe) for every other base.
+    const base_t = try c.baseAsInherited(class_sym, base_ref);
     // Windowed and bounded — see `relatesToBase`.
-    if (try relatesToBase(c, this_t, base_ref)) return true;
-    if (try privateShadowNeutralized(c, this_t, base_ref)) |neutral| {
-        if (try relatesToBase(c, neutral, base_ref)) return true;
+    if (try relatesToBase(c, this_t, base_t)) return true;
+    if (try privateShadowNeutralized(c, this_t, base_t)) |neutral| {
+        if (try relatesToBase(c, neutral, base_t)) return true;
     }
 
-    const issued = try issueMemberSpecificError(c, members, this_t, base_ref);
+    const issued = try issueMemberSpecificError(c, members, this_t, base_t);
     if (!issued and name_token != 0) {
         try c.diagFmt(2415, c.tokSpan(name_token), "Class '{s}' incorrectly extends base class '{s}'.{s}", .{
             c.symbolName(class_sym),
@@ -2683,7 +2689,7 @@ pub fn checkClass(c: *Checker, node: Node, ctx: TypeId) Error!void {
         c.cur_scope = saved_scope;
         c.this_type = saved_this;
         const class_val: TypeId = if (class_sym != binder.no_symbol)
-            try c.ts.makeClassValue(class_sym)
+            try c.classValueOf(class_sym)
         else
             types.any_type;
         // The decorator runs before the class binding exists, so the class is
@@ -2888,7 +2894,7 @@ pub fn checkClass(c: *Checker, node: Node, ctx: TypeId) Error!void {
                     try reportAmbientInitializer(c, e.init, e.type_ann != 0, e.flags & ast.Flags.readonly != 0);
                 }
                 c.this_type = if (is_static and class_sym != binder.no_symbol)
-                    try c.ts.makeClassValue(class_sym)
+                    try c.classValueOf(class_sym)
                 else
                     this_t;
                 var ann: TypeId = types.no_type;
@@ -2969,7 +2975,7 @@ pub fn checkClass(c: *Checker, node: Node, ctx: TypeId) Error!void {
                 }
                 if (c.isCtorMember(member, proto.flags)) try checkCtorParamPropertyPatterns(c, proto);
                 c.this_type = if (is_static and class_sym != binder.no_symbol)
-                    try c.ts.makeClassValue(class_sym)
+                    try c.classValueOf(class_sym)
                 else
                     this_t;
                 const sig = try c.signatureOfProto(member, md.lhs, true, true);
