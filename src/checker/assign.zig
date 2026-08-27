@@ -5573,7 +5573,13 @@ pub fn structuralAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
             },
             .tuple => {
                 for (0..c.ts.tupleLen(s)) |i| {
-                    if (!try c.isAssignable(c.ts.tupleElem(s, @intCast(i)).ty, nidx)) return false;
+                    // Through `tupleElemTypeAt`, because a REST element stores
+                    // its ARRAY type: `[string, ...number[]]` reaches a
+                    // `[k: number]` signature with `number`, not `number[]`.
+                    // Reading `.ty` straight rejected every rest tuple against
+                    // every number index signature it actually satisfies.
+                    const et = (try tupleElemTypeAt(c, s, @intCast(i))) orelse continue;
+                    if (!try c.isAssignable(et, nidx)) return false;
                 }
             },
             .object => {

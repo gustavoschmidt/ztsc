@@ -219,12 +219,25 @@ pub fn inferredNextType(it: ?IterationCtx) TypeId {
 
 /// Union of a tuple's element types (the element type used when a tuple
 /// borrows `Array<T>` members).
+///
+/// A REST element stores its ARRAY type — `[string, ...number[]]` holds
+/// `number[]` at index 1 — so its contribution to the union is that array's
+/// ELEMENT. tsc keeps the element type in the tuple target's type arguments
+/// and unions those, which is why `[string, ...number[]].slice(1)` is
+/// `(string | number)[]` there and why `[string, ...any[]]` borrows
+/// `Array<any>` (`string | any` collapses). Reading `.ty` straight gave
+/// `(string | number[])[]`, and wrongly through every `Array<T>` member a
+/// rest tuple borrows: `slice`, `map`, `concat`, `indexOf`, a spread of it
+/// into an array literal. `tupleElemTypeAt` is the one place that rule lives.
 pub fn tupleElementUnion(c: *Checker, t: TypeId) Error!TypeId {
     const s = &c.ts;
     const n = s.tupleLen(t);
     var parts: std.ArrayList(TypeId) = .empty;
     defer parts.deinit(c.scratch());
-    for (0..n) |i| try parts.append(c.scratch(), s.tupleElem(t, @intCast(i)).ty);
+    for (0..n) |i| {
+        const e = s.tupleElem(t, @intCast(i));
+        try parts.append(c.scratch(), (try c.tupleElemTypeAt(t, @intCast(i))) orelse e.ty);
+    }
     return s.makeUnion(c.scratch(), parts.items);
 }
 
