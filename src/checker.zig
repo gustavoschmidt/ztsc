@@ -920,43 +920,43 @@ pub const LazyStat = enum(u8) {
 };
 
 pub const map_containers = [_][]const u8{
-    "node_types",               "sig_cache",              "node_scopes",
-    "reassigned_syms",          "reassigned_in_loop",     "member_written_syms",
-    "member_written_in_loop",   "ns_types",               "ambient_ns_types",
-    "relation",                 "expansions",             "overload_groups",
-    "construct_groups",         "origin",                 "iface_generic",
-    "overload_group_pool",      "iface_stack",            "pending_class_decos",
-    "class_inst_generic",       "class_static_cache",     "class_static_owner",
-    "class_static_stack",       "class_ctor_cache",       "class_abstract_cache",
-    "enum_value_cache",         "enum_info_cache",        "enum_relation_cache",
-    "alias_generic",            "alias_state",            "alias_recursive",
-    "flow_same",                "flow_narrow",            "ref_keys",
-    "flow_loop_stack",          "flow_stack",             "flow_tmp",
-    "flow_reduce",              "da_cache",               "ctp_cache",
-    "cmp_cache",                "ctt_cache",              "ci_cache",
-    "cftp_cache",               "base_constraint_cache",  "type_string_cache",
-    "infer_visited",            "subst_this_cache",       "mmp_cache",
-    "arrayish_elem_cache",      "tp_constraint_cache",    "erase_cache",
-    "erase_any_cache",          "inst_map_ids",           "fresh_tp_ids",
-    "this_tp_ids",              "fresh_tp_info",          "type_node_cache",
-    "atom_cache",               "infer_ids",              "infer_constraints",
-    "infer_scopes",             "mapped_key_ids",         "mapped_key_scopes",
-    "inst_diag_at",             "infer_active",           "lazy_member_active",
-    "this_bound_fns",           "chain_guards",           "never_isect",
-    "deep_path_list",           "deep_path_ids",          "flow_reach",
-    "member_type_stack",        "method_ret_cuts",        "lazy_index_objs",
-    "sym_res_stack",            "ret_res_stack",          "pending_type_args",
-    "pending_type_args_pool",   "pending_type_args_seen", "tp_constrained_cache",
-    "nominal_bases",            "nominal_base_pool",      "keyof_mapped_active",
-    "ctp_syms_seen",            "weak_types",             "base_ref_active",
-    "lazy_member",              "trunc_lazy_member",      "lazy_map",
-    "pattern_root_decls",       "pattern_root_ids",       "pattern_narrow_busy",
-    "key_name_types",           "enum_members",           "keyof_obj_cache",
-    "sym_key_cache",            "trunc_expansions",       "inst_map_bytes",
-    "tp_mentions",              "smk_cache",              "rel_maybe",
-    "spec_sym_types",           "spec_tainted",           "last_assign_pos",
-    "definitely_assigned_syms", "alias_stack",            "alias_self_recursive",
-    "jsx_lma_cache",            "class_outer_tps",
+    "node_types",             "sig_cache",                "node_scopes",
+    "reassigned_syms",        "reassigned_in_loop",       "member_written_syms",
+    "member_written_in_loop", "ns_types",                 "ambient_ns_types",
+    "relation",               "expansions",               "overload_groups",
+    "construct_groups",       "origin",                   "iface_generic",
+    "overload_group_pool",    "iface_stack",              "pending_class_decos",
+    "class_inst_generic",     "class_static_cache",       "class_static_owner",
+    "class_static_stack",     "class_ctor_cache",         "class_abstract_cache",
+    "enum_value_cache",       "enum_info_cache",          "enum_relation_cache",
+    "alias_generic",          "alias_state",              "alias_recursive",
+    "flow_same",              "flow_narrow",              "ref_keys",
+    "flow_loop_stack",        "flow_stack",               "flow_tmp",
+    "flow_reduce",            "da_cache",                 "ctp_cache",
+    "cmp_cache",              "ctt_cache",                "ci_cache",
+    "cftp_cache",             "base_constraint_cache",    "type_string_cache",
+    "infer_visited",          "subst_this_cache",         "mmp_cache",
+    "arrayish_elem_cache",    "tp_constraint_cache",      "erase_cache",
+    "erase_any_cache",        "inst_map_ids",             "fresh_tp_ids",
+    "this_tp_ids",            "fresh_tp_info",            "type_node_cache",
+    "atom_cache",             "infer_ids",                "infer_constraints",
+    "infer_scopes",           "mapped_key_ids",           "mapped_key_scopes",
+    "inst_diag_at",           "infer_active",             "lazy_member_active",
+    "this_bound_fns",         "chain_guards",             "never_isect",
+    "deep_path_list",         "deep_path_ids",            "flow_reach",
+    "member_type_stack",      "method_ret_cuts",          "lazy_index_objs",
+    "sym_res_stack",          "ret_res_stack",            "pending_type_args",
+    "pending_type_args_pool", "pending_type_args_seen",   "tp_constrained_cache",
+    "nominal_bases",          "nominal_base_pool",        "keyof_mapped_active",
+    "ctp_syms_seen",          "weak_types",               "base_ref_active",
+    "subst_isect_cache",      "lazy_member",              "trunc_lazy_member",
+    "lazy_map",               "pattern_root_decls",       "pattern_root_ids",
+    "pattern_narrow_busy",    "key_name_types",           "enum_members",
+    "keyof_obj_cache",        "sym_key_cache",            "trunc_expansions",
+    "inst_map_bytes",         "tp_mentions",              "smk_cache",
+    "rel_maybe",              "spec_sym_types",           "spec_tainted",
+    "last_assign_pos",        "definitely_assigned_syms", "alias_stack",
+    "alias_self_recursive",   "jsx_lma_cache",            "class_outer_tps",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -970,6 +970,14 @@ pub const EnumMemberEntry = struct { name: Atom, value: TypeId, computed: bool =
 /// and tsc's `resolutionResults` bit for it (`ok = false` once something
 /// inside its own resolution asked for it again).
 pub const SymResolution = struct { sym: SymbolId, ok: bool };
+/// One frame of `Checker.subst_frames`: a conditional type whose TRUE branch
+/// the type-node walk is inside. `check`/`extends_ty` are that conditional's
+/// two clauses, already lowered through the unary-tuple unwrapping tsc's
+/// `getImpliedConstraint` does (`[T] extends [U]`, the non-distributive
+/// idiom, implies exactly what `T extends U` does). `parity` is the
+/// parameter-nesting parity at the branch itself, so the covariance of a node
+/// under it is a single comparison against `Checker.subst_parity`.
+pub const SubstFrame = struct { check: TypeId, extends_ty: TypeId, parity: u32 };
 /// One frame of `Checker.ret_res_stack`: the `nodeKey` of a function-like whose
 /// inferred return type is being resolved, and tsc's `resolutionResults` bit
 /// for it (`ok = false` once a call asked for that return type again).
@@ -2505,6 +2513,12 @@ pub const Checker = struct {
     /// runs on every relation frame with an object-ish target, and answering
     /// it means resolving the target's members, so the answer is kept.
     weak_types: IntMap(TypeId, u8) = .empty,
+    /// tsc's `SubstitutionType.resolvedSubstitutionIntersection`: substitution
+    /// TypeId -> `base & constraint`. Kept because the relation asks for it on
+    /// the SOURCE side of every frame whose source is a substitution, and
+    /// building the intersection is a flatten + dedup + reduce + intern, not
+    /// a field read.
+    subst_isect_cache: IntMap(TypeId, TypeId) = .empty,
     /// **Symbols eagerly, types lazily** (tsc's `createInstantiatedSymbolTable`
     /// / `getTypeOfSymbol` split) — see `lazyTableOf`.
     ///
@@ -2754,6 +2768,34 @@ pub const Checker = struct {
     /// is `checkIndexedAccessIndexType`, which stays silent while this is
     /// non-zero.
     cond_true_depth: u32 = 0,
+    /// The conditionals whose TRUE branch the type-node walk is presently
+    /// inside, outermost first — tsc's `getConditionalFlowTypeOfType`, which
+    /// reads the same information off parent pointers ztsc's tree does not
+    /// carry. Pushed by `conditionalTypeFromNode` around the true branch and
+    /// popped on the way out, so a frame lives exactly as long as the subtree
+    /// it governs.
+    ///
+    /// Walk state, not a memo: `Checker.typeFromTypeNode` consults it to
+    /// decide whether the type it just synthesized stands for `check &
+    /// extends` here (see `conditionalFlowType`).
+    subst_frames: std.ArrayListUnmanaged(SubstFrame) = .empty,
+    /// Index below which `subst_frames` belongs to an ENCLOSING declaration
+    /// and is invisible. tsc's walk stops at the syntactic parent chain, so a
+    /// type node reached by resolving a NAME — an alias body, an interface
+    /// member, a type parameter's constraint — is not inside any true branch
+    /// the referring site happened to be in. Every such crossing already goes
+    /// through `enterSymFile`/`saveCtx`, so the base rides in `SavedCtx` and
+    /// no crossing has to remember to reset it.
+    ///
+    /// A base rather than a truncation because the outer frames must survive
+    /// the excursion intact: the walk returns to them.
+    subst_frame_base: u32 = 0,
+    /// Parity of the PARAMETER positions the type-node walk is currently
+    /// inside (tsc's `covariant`, which flips at every `Parameter` ancestor).
+    /// Only the parity DIFFERENCE against a frame's own matters, which is
+    /// what makes one counter enough for a whole stack of conditionals.
+    /// Flipped by `signatureOfProtoCtx` around its parameter list.
+    subst_parity: u32 = 0,
     /// Depth of an in-flight *trial* check: the expression is checked exactly
     /// as the authoritative pass would — same relations, same inference, same
     /// diagnostics — but its answer must not be written to the `node_types`
@@ -3457,6 +3499,8 @@ pub const Checker = struct {
         budget_epoch: u64,
         epoch_sym: SymbolId,
         const_ctx: bool,
+        subst_frame_base: u32,
+        subst_parity: u32,
     };
 
     pub fn saveCtx(c: *const Checker) SavedCtx {
@@ -3469,6 +3513,8 @@ pub const Checker = struct {
             .budget_epoch = c.budget_epoch,
             .epoch_sym = c.epoch_sym,
             .const_ctx = c.const_ctx,
+            .subst_frame_base = c.subst_frame_base,
+            .subst_parity = c.subst_parity,
         };
     }
 
@@ -3481,6 +3527,8 @@ pub const Checker = struct {
         c.budget_epoch = s.budget_epoch;
         c.epoch_sym = s.epoch_sym;
         c.const_ctx = s.const_ctx;
+        c.subst_frame_base = s.subst_frame_base;
+        c.subst_parity = s.subst_parity;
     }
 
     /// Open a fresh instantiation-budget window (see `budget_epoch`). Called
@@ -3553,6 +3601,10 @@ pub const Checker = struct {
         c.const_ctx = false;
         c.inst_count = 0;
         c.inst_budget = max_decl_instantiation_count;
+        // `sym`'s declaration is not inside any conditional true branch the
+        // referring site was in — see `subst_frame_base`.
+        c.subst_frame_base = @intCast(c.subst_frames.items.len);
+        c.subst_parity = 0;
         c.newBudgetWindow();
         return saved;
     }
@@ -3947,7 +3999,26 @@ pub const Checker = struct {
     pub const PrintErr = print_zig.PrintErr;
 
     const typenode_zig = @import("checker/typenode.zig");
-    pub const typeFromTypeNode = typenode_zig.typeFromTypeNode;
+    /// tsc's `getTypeFromTypeNode` = `getConditionalFlowTypeOfType(
+    /// getTypeFromTypeNodeWorker(node), node)`: the SYNTHESIS is
+    /// `typenode.typeFromTypeNode`, and this wrapper is the second half —
+    /// a type node written inside a conditional's TRUE branch whose type IS
+    /// that conditional's check type stands for `check & extends` there.
+    ///
+    /// Wrapping the method rather than the synthesis is what keeps
+    /// `type_node_cache` honest: the memo stores the node's OWN unwrapped
+    /// answer (every recursive descent goes through this method, so a
+    /// compound node's children are already wrapped when it is built), and
+    /// the node's own wrap is re-applied per read. A node's enclosing
+    /// conditionals are a property of where it is WRITTEN, so the two agree.
+    ///
+    /// Costs one load and one compare when no conditional true branch is
+    /// open, which is every type node in a program that writes none.
+    pub fn typeFromTypeNode(c: *Checker, node: Node) Error!TypeId {
+        const t = try typenode_zig.typeFromTypeNode(c, node);
+        if (c.subst_frames.items.len == c.subst_frame_base) return t;
+        return generics_zig.conditionalFlowType(c, t);
+    }
     pub const typeNodeCacheable = typenode_zig.typeNodeCacheable;
     pub const typeFromTypeName = typenode_zig.typeFromTypeName;
     pub const typeFromTypeNameEx = typenode_zig.typeFromTypeNameEx;
@@ -3990,7 +4061,9 @@ pub const Checker = struct {
     pub const checkTypeArgConstraints = typenode_zig.checkTypeArgConstraints;
     pub const undecidableType = typenode_zig.undecidableType;
     pub const decidableConstraintSet = typenode_zig.decidableConstraintSet;
-    pub const keyofType = typenode_zig.keyofType;
+    pub fn keyofType(c: *Checker, t: TypeId) Error!TypeId {
+        return typenode_zig.keyofType(c, c.ts.substitutionBase(t));
+    }
     pub const intersectKeySets = typenode_zig.intersectKeySets;
     pub const keySetMembers = typenode_zig.keySetMembers;
     pub const keySetEnumerable = typenode_zig.keySetEnumerable;
@@ -3999,7 +4072,9 @@ pub const Checker = struct {
     pub const isKeyLiteral = typenode_zig.isKeyLiteral;
     pub const isKeyAtom = typenode_zig.isKeyAtom;
     pub const keyofMapped = typenode_zig.keyofMapped;
-    pub const indexedAccessType = typenode_zig.indexedAccessType;
+    pub fn indexedAccessType(c: *Checker, obj: TypeId, idx: TypeId) Error!TypeId {
+        return typenode_zig.indexedAccessType(c, c.ts.substitutionBase(obj), c.ts.substitutionBase(idx));
+    }
     pub const typeIsNumberLike = typenode_zig.typeIsNumberLike;
     pub const numberIndexType = typenode_zig.numberIndexType;
     pub const unionIndexElemType = typenode_zig.unionIndexElemType;
@@ -4200,6 +4275,8 @@ pub const Checker = struct {
     pub const mintFreshTp = enums_zig.mintFreshTp;
     pub const mintThisTp = enums_zig.mintThisTp;
     pub const instantiate = enums_zig.instantiate;
+    pub const substitutionIntersection = enums_zig.substitutionIntersection;
+    pub const resolveSubstitution = enums_zig.resolveSubstitution;
     pub const tagInstantiatedOrigin = enums_zig.tagInstantiatedOrigin;
     pub const chainRepeats = enums_zig.chainRepeats;
     pub const instantiateId = enums_zig.instantiateId;
@@ -4238,7 +4315,22 @@ pub const Checker = struct {
     pub const containsInfer = generics_zig.containsInfer;
     pub const mappedKeyId = generics_zig.mappedKeyId;
     pub const mappedTypeFromNode = generics_zig.mappedTypeFromNode;
-    pub const reduceMapped = generics_zig.reduceMapped;
+    /// `mapped.reduceMapped`, with a substitution peeled off each KEY-DOMAIN
+    /// operand. The mapped machinery reads its constraint, `as` clause and
+    /// homomorphic source structurally (see `generics.substitutionOpaque`);
+    /// the VALUE is left alone, because that is the half a relation reads and
+    /// the half the implied constraint is worth something in.
+    pub fn reduceMapped(c: *Checker, key_param: TypeId, constraint: TypeId, value: TypeId, as_clause: TypeId, src_type: TypeId, flags: u32) Error!TypeId {
+        return generics_zig.reduceMapped(
+            c,
+            key_param,
+            c.ts.substitutionBase(constraint),
+            value,
+            c.ts.substitutionBase(as_clause),
+            c.ts.substitutionBase(src_type),
+            flags,
+        );
+    }
     pub const applyPropModifiers = generics_zig.applyPropModifiers;
     pub const applyElemModifiers = generics_zig.applyElemModifiers;
     pub const isPrimitiveForHomomorphicMap = generics_zig.isPrimitiveForHomomorphicMap;
@@ -4251,7 +4343,9 @@ pub const Checker = struct {
     pub const objectFromPropsFlags = generics_zig.objectFromPropsFlags;
     pub const remapKey = generics_zig.remapKey;
     pub const numberLiteralAtom = generics_zig.numberLiteralAtom;
-    pub const reduceIndexedAccess = generics_zig.reduceIndexedAccess;
+    pub fn reduceIndexedAccess(c: *Checker, obj: TypeId, idx: TypeId) Error!TypeId {
+        return generics_zig.reduceIndexedAccess(c, c.ts.substitutionBase(obj), c.ts.substitutionBase(idx));
+    }
     pub const simplifyMappedIndexAccess = generics_zig.simplifyMappedIndexAccess;
     pub const isGenericObjectForIndex = generics_zig.isGenericObjectForIndex;
     pub const containsMappedParam = generics_zig.containsMappedParam;
@@ -4485,6 +4579,14 @@ pub const Checker = struct {
     /// question asked is "was MY answer truncated".
     pub fn baseConstraintOf(c: *Checker, t: TypeId) Error!TypeId {
         if (c.base_constraint_cache.get(t)) |v| return v;
+        // tsc's `computeBaseConstraint`: a substitution's constraint is its
+        // INTERSECTION's. This is the seam the implied knowledge reaches
+        // every apparent-type consumer through — property access, indexed
+        // access, `keyof` — so `"k" extends keyof T ? T["k"] : never` can
+        // index `T` with a key the branch has already proved is one of its.
+        if (c.ts.kind(t) == .substitution) {
+            return c.baseConstraintOf(try c.substitutionIntersection(t));
+        }
         const outer_trip = c.inst_limit_tripped;
         c.inst_limit_tripped = false;
         defer c.inst_limit_tripped = c.inst_limit_tripped or outer_trip;

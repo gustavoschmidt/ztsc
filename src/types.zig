@@ -249,6 +249,29 @@ pub const Kind = enum(u8) {
     /// arm re-runs `keyofType` on the substituted operand). Its apparent
     /// constraint is `string | number | symbol`.
     keyof_op,
+    /// tsc's `SubstitutionType`. a = the base type, b = the implied
+    /// constraint. Created for a type node written inside a conditional
+    /// type's TRUE branch whose type IS the conditional's check type: inside
+    /// `C extends E ? … : …` every occurrence of `C` in the true branch is
+    /// known to also satisfy `E`, so it stands for `C & E` — which is what
+    /// lets `"k" extends keyof T ? T["k"] : never` index `T`, and what lets
+    /// `number extends T ? (cb: (n: number) => void) => void : never`'s `n`
+    /// be handed to a `(x: T) => void`.
+    ///
+    /// The wrapper is TRANSPARENT almost everywhere: it prints as its base,
+    /// instantiates by mapping both halves and re-wrapping, and descends to
+    /// its base for identity/inference/`keyof`. It is read as the
+    /// INTERSECTION (`substitutionIntersection`) only where the extra
+    /// knowledge is sound to use — the SOURCE side of a relation and the
+    /// apparent-type/constraint chain — and as the BASE alone on a relation's
+    /// TARGET side (tsc's `getNormalizedType(…, /*writing*/ true)`), because
+    /// a value flowing INTO the position only has to be a `C`.
+    ///
+    /// Built only through `Store.makeSubstitution`, which drops the wrapper
+    /// whenever it carries nothing (`any`/`unknown` constraint, constraint
+    /// equal to the base, or an `any` base) — so a substitution in the store
+    /// always means something.
+    substitution,
 };
 
 pub const cond_flag_distributive: u32 = 1;
@@ -1202,6 +1225,13 @@ pub const Store = struct {
         return s.dataA(id);
     }
 
+    pub fn substBase(s: *const Store, id: TypeId) TypeId {
+        return s.dataA(id);
+    }
+    pub fn substConstraint(s: *const Store, id: TypeId) TypeId {
+        return s.dataB(id);
+    }
+
     pub fn typeParamSymbol(s: *const Store, id: TypeId) u32 {
         return s.dataA(id);
     }
@@ -1976,6 +2006,28 @@ pub const Store = struct {
 
     pub fn makeKeyof(s: *Store, operand: TypeId) Error!TypeId {
         return s.internType(.keyof_op, &.{ operand, 0 }, 0);
+    }
+
+    /// tsc's `getSubstitutionType`: wrap `base` with the extra knowledge that
+    /// it also satisfies `constraint` — but only when that is knowledge at
+    /// all. A constraint of `any`/`unknown` says nothing, a constraint equal
+    /// to the base says nothing, and an `any` base cannot be narrowed. In all
+    /// three the base is returned unwrapped, which is what keeps a
+    /// substitution's mere PRESENCE meaningful (and keeps the store free of
+    /// wrappers that every consumer would have to see through for nothing).
+    pub fn makeSubstitution(s: *Store, base: TypeId, constraint: TypeId) Error!TypeId {
+        if (constraint == any_type or constraint == unknown_type) return base;
+        if (constraint == base or base == any_type) return base;
+        return s.internType(.substitution, &.{ base, constraint }, 0);
+    }
+
+    /// The base of a substitution — the type it stands for on a relation's
+    /// TARGET side, in a diagnostic, and for identity. Any other type is its
+    /// own base, so this is the safe way to peel a possible wrapper.
+    pub fn substitutionBase(s: *const Store, t: TypeId) TypeId {
+        var cur = t;
+        while (s.kind(cur) == .substitution) cur = s.substBase(cur);
+        return cur;
     }
 
     /// Intern a deferred mapped type. `flags` carries the modifier bits and the

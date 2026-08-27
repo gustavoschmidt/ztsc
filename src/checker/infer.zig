@@ -3789,6 +3789,18 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
     // reach a candidate slot without passing through that check.
     if (arg == types.any_function_type) return;
     const s = &c.ts;
+    // tsc's `inferFromTypes` substitution arm: inference descends to the BASE
+    // on both sides and never looks at the implied constraint. The wrapper is
+    // knowledge the CHECKER has about a position, not a shape a caller wrote,
+    // so it must not be part of the pattern being matched — a `K` guarded by
+    // `K extends readonly (keyof T)[]` still has to be the inference position
+    // it was before the guard, or nothing binds it and the conditional falls
+    // to its error branch (excalidraw's `isShallowEqual` comparator list).
+    {
+        const pb = s.substitutionBase(param);
+        const ab = s.substitutionBase(arg);
+        if (pb != param or ab != arg) return c.unify(pb, ab, tp_syms, candidates, depth);
+    }
     // An `any` source infers `any` for every inference position in the
     // pattern (tsc's inferFromTypes). Without this, `any` slips past the
     // structural cases (it matches nothing and everything), leaving params

@@ -1546,6 +1546,24 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!RelAnswer {
     s = c.simplifyConditional(s);
     t = c.simplifyConditional(t);
     if (s == t) return .yes;
+    // The substitution arm of the same `getNormalizedType`, and the ONE place
+    // a substitution's implied constraint enters a relation. tsc runs the two
+    // operands through it with opposite `writing` flags:
+    //
+    //   * SOURCE (`writing = false`) -> `getSubstitutionIntersection`, i.e.
+    //     `base & constraint`. A value PRODUCED at a guarded position really
+    //     is both, which is what lets the `n` of `number extends T ?
+    //     (cb: (n: number) => void) => void : never` be handed to a
+    //     `(x: T) => void`.
+    //   * TARGET (`writing = true`) -> the BASE alone. A value flowing INTO
+    //     the position only has to be a `base`; demanding the constraint too
+    //     would reject the very values the guard supplies.
+    //
+    // Folded into the `sk`/`tk` reads below rather than run here, so a program
+    // that writes no conditional true branch pays NOTHING for it: the kinds
+    // are read once either way, and the rewrite only re-reads them on the pair
+    // that actually carries a wrapper. Placed after the `this` block because
+    // that block may delegate the whole frame.
     // The same simplification, one level down: a `this` NESTED inside a
     // deferred operator (`this extends {_zod:…} ? this["_zod"]["output"] :
     // unknown`, zod's `output<this>`) relates through its apparent instance
@@ -1569,8 +1587,15 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!RelAnswer {
             return receiverBoundRetry(c, s, t, answer);
         }
     }
-    const sk = c.ts.kind(s);
-    const tk = c.ts.kind(t);
+    var sk = c.ts.kind(s);
+    var tk = c.ts.kind(t);
+    if (sk == .substitution or tk == .substitution) {
+        s = try c.substitutionIntersection(s);
+        t = c.ts.substitutionBase(t);
+        if (s == t) return .yes;
+        sk = c.ts.kind(s);
+        tk = c.ts.kind(t);
+    }
     // The generic reference each side denotes (`refFacetOf`), read ONCE: the
     // origin fast-paths, the variance probe and the relation memo key all
     // want it, and each used to pay its own `origin` lookup.

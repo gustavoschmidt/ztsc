@@ -87,12 +87,13 @@ pub fn conditionalTypeFromNode(c: *Checker, node: Node) Error!TypeId {
     // enclosing scopes only.
     try c.infer_scopes.append(c.cm(), c.nodeKey(node));
     const extends_ty = try c.typeFromTypeNode(e.extends_type);
-    // The true branch is read under tsc's substitution-type narrowing (the
-    // check type is a subtype of `extends` there); ztsc models none, so the
-    // "can this key index that object" check stays quiet inside it — see
-    // `Checker.cond_true_depth`.
+    // The true branch is read under tsc's substitution-type narrowing: every
+    // occurrence of the CHECK type there also satisfies `extends`, so it is
+    // synthesized as `check & extends` (see `conditionalFlowType`).
     c.cond_true_depth += 1;
+    try pushSubstFrame(c, chk, extends_ty);
     const true_ty0 = try c.typeFromTypeNode(e.true_type);
+    _ = c.subst_frames.pop();
     c.cond_true_depth -= 1;
     _ = c.infer_scopes.pop();
     const false_ty = try c.typeFromTypeNode(e.false_type);
@@ -105,6 +106,131 @@ pub fn conditionalTypeFromNode(c: *Checker, node: Node) Error!TypeId {
     const chk_k = c.ts.kind(chk);
     const distributive = chk_k == .type_param or chk_k == .infer_var;
     return c.reduceConditional(chk, extends_ty, true_ty, false_ty, distributive);
+}
+
+/// Open a substitution frame for the true branch of `chk extends ext ? … : …`
+/// (tsc's `getConditionalFlowTypeOfType`, seen from the conditional's end).
+///
+/// The unary-tuple unwrapping is `getImpliedConstraint`'s: `[C] extends [E]`
+/// is the standard way to write a NON-distributive conditional, and it implies
+/// about `C` exactly what `C extends E` does — without it every
+/// `[T] extends [never] ? …` in the ecosystem would substitute nothing.
+fn pushSubstFrame(c: *Checker, chk: TypeId, ext: TypeId) Error!void {
+    const s = &c.ts;
+    var check = chk;
+    var extends_ty = ext;
+    var guard: u8 = 0;
+    while (guard < 8 and isUnaryTuple(s, check) and isUnaryTuple(s, extends_ty)) : (guard += 1) {
+        check = s.tupleElem(check, 0).ty;
+        extends_ty = s.tupleElem(extends_ty, 0).ty;
+    }
+    try c.subst_frames.append(c.cm(), .{
+        // tsc compares against `getActualTypeVariable(checkType)`, which sees
+        // through a substitution the enclosing conditional already put there
+        // (`T extends A ? T extends B ? … : … : …` nests them).
+        .check = s.substitutionBase(check),
+        .extends_ty = extends_ty,
+        .parity = c.subst_parity,
+    });
+}
+
+/// A type ztsc may put a substitution wrapper around — everything that is NOT
+/// a type VARIABLE or a deferred type OPERATOR. See `conditionalFlowType`, the
+/// only caller.
+///
+/// tsc wraps both families too; ztsc does not YET, and the reason is uniform:
+/// each of them is consumed somewhere by a walk that dispatches on KIND and
+/// has no substitution arm, so the wrapper reads to that walk as "not one of
+/// these at all" and empties whatever it was feeding. Measured, one family at
+/// a time, against the app grid and the conformance suite:
+///
+///   * an INDEXED ACCESS or `keyof` operand is read structurally by the
+///     key-domain machinery — ajv's `T[K] extends string ? { mapping: { [M in
+///     T[K] & string]: … } } : never` lost its inner map (`mapped/050`);
+///   * a mapped type's KEY parameter is rebound to each concrete key by
+///     `substMappedKey`, again by kind — reanimated's `{ [Key in keyof
+///     Props]-?: Key extends `${string}Style` | 'style' ? Key : never }` lost
+///     every style prop of every animated component (142 fresh social-app
+///     TS2322);
+///   * a TYPE PARAMETER is the case with the most to gain (it is what makes
+///     `T extends string ? { v: T } : never`'s `v` a `string`), and the case
+///     ztsc is furthest from: property access (`props.propOfTypeIdx`), the
+///     TS2344 type-argument queue and the conditional-vs-conditional relation
+///     all read it by kind, and enabling it left six social-app diagnostics
+///     tsgo does not report. Wave 51's step, with the arms enumerated.
+///
+/// Nothing is lost meanwhile that ztsc could have used: the implied constraint
+/// of an operand it cannot see through is knowledge with no reader. What is
+/// KEPT is the family tsc's own comment calls out as the interesting one — a
+/// concrete type standing where the check type stood, `number extends T ?
+/// (cb: (n: number) => void) => void : never`'s `n` — which flows into the
+/// RELATION, and the relation does have the arm.
+fn substitutable(k: types.Kind) bool {
+    return switch (k) {
+        .index_access,
+        .keyof_op,
+        .conditional,
+        .mapped,
+        .template_literal_type,
+        .string_mapping,
+        .mapped_param,
+        .type_param,
+        .this_type,
+        .infer_var,
+        => false,
+        else => true,
+    };
+}
+
+/// tsc's `isUnaryTupleTypeNode`, at the type level: a one-element tuple with
+/// no optional/rest marker on that element.
+fn isUnaryTuple(s: *const types.Store, t: TypeId) bool {
+    if (s.kind(t) != .tuple or s.tupleLen(t) != 1) return false;
+    return s.tupleElem(t, 0).flags == 0;
+}
+
+/// tsc's `getConditionalFlowTypeOfType`, for the type `t` just synthesized
+/// from a type node: collect the implied constraint of every open conditional
+/// true branch this node sits in, and wrap `t` in a substitution carrying
+/// their intersection.
+///
+/// A frame contributes when the node's type IS that conditional's check type
+/// and the node sits at a covariant depth under the branch (tsc's `covariant`,
+/// which flips at every PARAMETER ancestor). tsc's second clause — a type
+/// VARIABLE substitutes at any variance — has nothing to admit yet, because
+/// no type variable is `substitutable`.
+///
+/// Called only with at least one open frame — the caller
+/// (`Checker.typeFromTypeNode`) checks that first, so the empty case costs a
+/// compare and never reaches here.
+pub fn conditionalFlowType(c: *Checker, t: TypeId) Error!TypeId {
+    const s = &c.ts;
+    const actual = s.substitutionBase(t);
+    const ak = s.kind(actual);
+    // Only a base ztsc can carry a wrapper through is wrapped — see
+    // `substitutable`.
+    if (!substitutable(ak)) return t;
+    // Innermost frame first, which is the order tsc's upward walk appends in.
+    var cons: std.ArrayList(TypeId) = .empty;
+    defer cons.deinit(c.scratch());
+    var i = c.subst_frames.items.len;
+    while (i > c.subst_frame_base) {
+        i -= 1;
+        const f = c.subst_frames.items[i];
+        if (f.check != actual) continue;
+        // Covariance decides for everything `substitutable` admits: tsc's
+        // "always substitute on type parameters, regardless of variance"
+        // carve-out applies only to a type VARIABLE, and none of those are
+        // wrapped yet.
+        if (f.parity != c.subst_parity) continue;
+        try cons.append(c.scratch(), f.extends_ty);
+    }
+    if (cons.items.len == 0) return t;
+    const con = if (cons.items.len == 1)
+        cons.items[0]
+    else
+        try s.makeIntersection(c.scratch(), cons.items);
+    return s.makeSubstitution(t, con);
 }
 
 /// What a conditional's check/extends pair decides — computed WITHOUT
@@ -1090,6 +1216,13 @@ fn collectInferVars(c: *Checker, t: TypeId, out: *std.ArrayList(u32), refs: ?*st
         },
         .string_mapping => try collectInferVars(c, s.stringMappingArg(t), out, refs),
         .keyof_op => try collectInferVars(c, s.keyofOperand(t), out, refs),
+        // A substitution created by an INNER conditional carries its binder in
+        // the base (`V extends object ? Wrap<V> : V` wraps the `V` inside
+        // `Wrap<V>`), and its constraint can name one too.
+        .substitution => {
+            try collectInferVars(c, s.substBase(t), out, refs);
+            try collectInferVars(c, s.substConstraint(t), out, refs);
+        },
         // A mapped type parked by `reduceMapped` because its key set is still
         // an `infer` var: `Record<infer K, V>` is `{ [P in K]: V }`, so the
         // binder `K` lives in the mapped node, not in any arm above. Missing it
@@ -2282,6 +2415,10 @@ fn containsInferInner(c: *Checker, t: TypeId) Error!bool {
         },
         .string_mapping => c.containsInfer(s.stringMappingArg(t)),
         .keyof_op => c.containsInfer(s.keyofOperand(t)),
+        .substitution => blk: {
+            if (try c.containsInfer(s.substBase(t))) break :blk true;
+            break :blk try c.containsInfer(s.substConstraint(t));
+        },
         // A deferred mapped type / indexed access may carry an `infer` var in
         // its key source or value; `substInfer` descends into both (their
         // `.mapped` / `.index_access` arms), so this predicate must see them.
@@ -2459,6 +2596,14 @@ pub fn substInfer(c: *Checker, t: TypeId, ids: []const u32, vals: []const TypeId
         },
         .string_mapping => return c.applyStringMapping(s.stringMappingKind(t), try substInfer(c, s.stringMappingArg(t), ids, vals)),
         .keyof_op => return c.keyofType(try substInfer(c, s.keyofOperand(t), ids, vals)),
+        // Bind through BOTH halves and re-wrap: an inner conditional's true
+        // branch wraps its own check, so `V extends object ? Wrap<V> : V`
+        // hands `Wrap<subst(V, object)>` to the binder — leaving it unbound
+        // left the whole branch symbolic (`conditional/013`).
+        .substitution => return c.resolveSubstitution(
+            try substInfer(c, s.substBase(t), ids, vals),
+            try substInfer(c, s.substConstraint(t), ids, vals),
+        ),
         // Re-enter `reduceMapped` with the branches' `infer` vars bound: a
         // mapped alias deferred while its key source was still an `infer` var
         // (see `reduceMapped`) now materializes its key set. Without this arm
