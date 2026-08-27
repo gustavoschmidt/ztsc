@@ -4523,6 +4523,43 @@ fn propCtxKeepsLiteral(c: *Checker, rctx: TypeId, ctx: TypeId, key: Atom, cand: 
     return keepLiteral(c, cand, try ctxPropType(c, rctx, ctx, key));
 }
 
+/// The contextual type an INTERSECTION's constituents give `key` through a
+/// DECLARED property — no index-signature tail, and `no_type` when none of them
+/// declares it.
+///
+/// tsc's `getTypeOfPropertyOfContextualType` looks an intersection up WHOLE
+/// (`mapType` distributes over a union, not an intersection), so
+/// `getPropertyOfType` answers from the constituents that DECLARE the name and
+/// the `findApplicableIndexInfo` tail only runs when none of them does.
+///
+/// Asked only when intersecting the per-member answers produced `any`, which is
+/// the one reading that loses information rather than adding it:
+/// `{ [others: string]: any } & { as?: "select" | "input" }` offered `any` for
+/// `as`, so `styled(Flex).attrs({ as: "select" })` widened its literal to
+/// `string` and failed the very parameter it was written for
+/// (`contextualTypeBasedOnIntersectionWithAnyInTheMix1`/`4`). Where the
+/// per-member intersection is a real type, it stays: an index signature whose
+/// value is a SIGNATURE contributes the call the declared sibling does not have
+/// (`contextualTypeFunctionObjectPropertyIntersection`).
+fn ctxDeclaredPropType(c: *Checker, rctx: TypeId, ctx: TypeId, key: Atom) Error!TypeId {
+    var parts: std.ArrayList(TypeId) = .empty;
+    defer parts.deinit(c.scratch());
+    for (try c.memberList(rctx)) |m| {
+        const rm = try c.resolveStructural(m);
+        // A union or intersection nested in the intersection keeps its own
+        // rule: `ctxPropType` unions a union's per-member answers, and the
+        // arm above re-enters this one for a nested intersection.
+        const pt = switch (c.ts.kind(rm)) {
+            .union_type, .intersection => try c.ctxPropType(rm, ctx, key),
+            else => if (try props_zig.ctxDeclaredPropOfType(c, rm, key)) |p| p.ty else types.no_type,
+        };
+        if (pt != types.no_type) try parts.append(c.scratch(), pt);
+    }
+    if (parts.items.len == 0) return types.no_type;
+    if (parts.items.len == 1) return parts.items[0];
+    return c.ts.makeIntersection(c.scratch(), parts.items);
+}
+
 pub fn ctxPropType(c: *Checker, rctx: TypeId, ctx: TypeId, key: Atom) Error!TypeId {
     if (ctx == types.no_type) return types.no_type;
     switch (c.ts.kind(rctx)) {
@@ -4594,8 +4631,19 @@ pub fn ctxPropType(c: *Checker, rctx: TypeId, ctx: TypeId, key: Atom) Error!Type
                 if (pt != types.no_type) try parts.append(c.scratch(), pt);
             }
             if (parts.items.len == 0) return types.no_type;
-            if (parts.items.len == 1) return parts.items[0];
-            return c.ts.makeIntersection(c.scratch(), parts.items);
+            const all = if (parts.items.len == 1)
+                parts.items[0]
+            else
+                try c.ts.makeIntersection(c.scratch(), parts.items);
+            // An `any` from one constituent's INDEX SIGNATURE absorbs the
+            // intersection and every sibling with it. When some constituent
+            // DECLARES the name, its declaration is the answer instead —
+            // tsc looks an intersection's contextual property up WHOLE
+            // (`ctxDeclaredPropType`), so an index signature is the fallback
+            // for a name nothing declares, never a co-contributor.
+            if (c.ts.kind(all) != .any) return all;
+            const declared = try ctxDeclaredPropType(c, rctx, ctx, key);
+            return if (declared != types.no_type) declared else all;
         },
         else => {
             // `ctxPropOfType`, not `propOfType`: tsc looks a contextual

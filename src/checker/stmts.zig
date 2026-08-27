@@ -473,7 +473,7 @@ fn checkDeclarator(c: *Checker, decl: Node, is_const: bool, ambient: bool) Error
             try implicit_any.reportVarImplicitAny(c, d.lhs, ambient);
         },
         .declarator_init => {
-            const it = try c.checkExprCached(d.rhs, try destructure.patternContextualType(c, d.lhs));
+            const it = try c.checkExprCached(d.rhs, try destructure.patternInitContextualType(c, d.lhs, d.rhs));
             // Materialize the symbol's type (infers + caches). The
             // initializer's type is what the pattern destructures, so it is
             // also what contextually types the pattern's defaults.
@@ -490,7 +490,7 @@ fn checkDeclarator(c: *Checker, decl: Node, is_const: bool, ambient: bool) Error
             // there is one; otherwise an array binding pattern's implied tuple
             // (`patternContextualType`), which is a contextual type only — the
             // assignability check below stays on `ann`.
-            const init_ctx: TypeId = if (ann != types.no_type) ann else try destructure.patternContextualType(c, d.lhs);
+            const init_ctx: TypeId = if (ann != types.no_type) ann else try destructure.patternInitContextualType(c, d.lhs, e.init);
             // A `unique symbol` const accepts only a fresh `Symbol()` /
             // `Symbol.for()` initializer; the assignability check (a plain
             // `symbol` is not assignable to `unique symbol`) is skipped for
