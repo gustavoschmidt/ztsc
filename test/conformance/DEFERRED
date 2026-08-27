@@ -197,10 +197,10 @@ assignability/096_alternating_instantiation_spine.ts  -TS2322 64
 #     combined one (parameters intersected).
 #   * the decorator's RETURN type (56) — TS1270/TS1271, a separate family from
 #     the signature codes and a separate check.
-#   * PARAMETER decorators (58, 59): TS1239 is unreachable because the parser
-#     DISCARDS a legacy parameter decorator's expression rather than hanging it
-#     off the parameter (`parseParam`), so there is no node to resolve. This is
-#     a frontend gap, not a checker one.
+#
+#   (PARAMETER decorators, 58/59, were here too — TS1239 was unreachable while
+#   the parser discarded a legacy parameter decorator's expression. Wave 50
+#   retained it: `ast.ParamDecos` + `decorators.checkParamDecorators`.)
 #
 # Every entry is a missed error on a shape the oracle rejects; none of them can
 # turn into a false positive, which is why the resolution landed without them.
@@ -210,8 +210,6 @@ decorators/011_legacy_signature_gaps  -TS1240 entry.ts 52
 decorators/011_legacy_signature_gaps  -TS1240 entry.ts 53
 decorators/011_legacy_signature_gaps  -TS1240 entry.ts 55
 decorators/011_legacy_signature_gaps  -TS1271 entry.ts 56
-decorators/011_legacy_signature_gaps  -TS1239 entry.ts 58
-decorators/011_legacy_signature_gaps  -TS1239 entry.ts 59
 
 # TS2716, "Type parameter '<T>' has a circular default", and the TS2313 /
 # TS2536 pair a circular CONSTRAINT draws. Both cases exist because the cut

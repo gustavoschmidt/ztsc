@@ -244,6 +244,29 @@ const DeclKind = enum {
 /// returning. `interner`/`io`/`gpa` follow the shared-interner contract
 /// (gpa must be thread-safe when binding files in parallel).
 /// Total on arbitrary parser output: never fails except on OOM.
+/// Does this file hold an `import.meta` anywhere? — the second half of tsc's
+/// `isFileProbablyExternalModule` (see `bind`).
+///
+/// Answered off the TOKENS rather than by a tree walk, which is what makes it
+/// affordable to ask of every file that is not already a module: `import` is a
+/// reserved word, so the sequence `import` `.` `meta` cannot be produced by
+/// anything but the meta-property — bar the one shape `x.import.meta`, where
+/// `import` is a property NAME. Overshooting there would call a script a
+/// module; a member named `import` is not a shape any measured file has, and
+/// the alternative (a full expression walk of every script) costs more than the
+/// hazard.
+fn holdsImportMeta(tree: *const Ast, src: []const u8) bool {
+    const toks = &tree.tokens;
+    const n = toks.len();
+    if (n < 3) return false;
+    for (0..n - 2) |i| {
+        if (toks.tag(i) != .keyword_import) continue;
+        if (toks.tag(i + 1) != .dot) continue;
+        if (std.mem.eql(u8, tree.tokenSlice(src, @intCast(i + 2)), "meta")) return true;
+    }
+    return false;
+}
+
 pub fn bind(
     arena: Allocator,
     io: Io,
@@ -301,6 +324,19 @@ pub fn bind(
     for (tree.nodeRange(0)) |stmt| {
         if (stmt != null_node) try b.bindStatement(stmt);
     }
+
+    // tsc's external-module indicator is `isFileProbablyExternalModule`, which
+    // is TWO tests: a top-level import/export — the walk above, through
+    // `saw_module_syntax` — or an `import.meta` ANYWHERE in the tree
+    // (`getImportMetaIfNecessary` / `walkTreeForImportMeta`). A file whose only
+    // module marker is `import.meta` is an external module to tsc, with a
+    // module's scoping, and `bind.is_module` is what every consumer asks.
+    //
+    // Answered here rather than during the walk because every reader of
+    // `saw_module_syntax` is one of the post-bind passes below or `seal`, so
+    // the second half only has to be in before they run — which lets it be
+    // skipped outright for a file the first half already settled.
+    if (!b.saw_module_syntax and holdsImportMeta(tree, src)) b.saw_module_syntax = true;
 
     // Post-bind checks over a name's whole declaration SET: each one is a
     // property of the set rather than of any single declaration, so each runs
@@ -3077,6 +3113,20 @@ const Binder = struct {
         }
     };
 
+    /// Bind the decorator expressions written on the parameters of the method
+    /// whose proto is `proto_idx`, in the caller's scope and flow. A no-op for
+    /// every parameter list without one, which is all of them outside
+    /// `experimentalDecorators` (`ast.Ast.paramDecorators`).
+    fn bindParamDecorators(b: *Binder, proto_idx: u32) Error!void {
+        if (b.tree.param_decos.len == 0) return;
+        const proto = b.tree.extraData(ast.FnProto, proto_idx);
+        for (b.tree.extraRange(proto.params_start, proto.params_end)) |param| {
+            for (b.tree.paramDecorators(param)) |deco| {
+                try b.bindExpr(b.tree.nodeData(deco).lhs);
+            }
+        }
+    }
+
     /// Shared by function declarations/expressions, arrows, methods, and
     /// function types. Creates the function scope (params + body top-level
     /// share it, so `function f(x) { let x }` clashes) and a fresh `start`
@@ -3621,6 +3671,14 @@ const Binder = struct {
                         .derived_ctor
                     else
                         .base_ctor;
+                    // A PARAMETER decorator (`m(@dec x: T) {}`) is bound here
+                    // rather than in `bindParam`, for the same reason a member
+                    // decorator is bound from this walk: the expression is
+                    // evaluated at class-definition time, in the scope and the
+                    // control flow surrounding the class, not inside the
+                    // method it is written in. Binding it in the method's own
+                    // scope would let it see the parameters it sits beside.
+                    try bindParamDecorators(b, md.lhs);
                     try b.bindFunctionLike(member, md.lhs, md.rhs, ctor);
                 },
                 // `static { … }` — the parser's only `.block` class member.

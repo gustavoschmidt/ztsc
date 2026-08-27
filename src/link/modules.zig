@@ -56,6 +56,7 @@ const decl_spaces = @import("../frontend/decl_spaces.zig");
 const diagnostics = @import("../frontend/diagnostics.zig");
 const intern = @import("../intern.zig");
 const literals = @import("../frontend/literals.zig");
+const primitive_type_names = @import("../frontend/primitive_type_names.zig");
 const source = @import("../frontend/source.zig");
 const libs = @import("../libs.zig");
 const alias_cycle = @import("alias_cycle.zig");
@@ -2479,6 +2480,27 @@ const Linker = struct {
     /// also how `export var x` is recorded, and tsc's check is on the
     /// specifier syntax alone. Reported at the specifier's own name token,
     /// which is `propertyName || name` — `export { x, x as y }` answers twice.
+    /// A name the global scope answers that no declaration in any file backs,
+    /// and so that `indexGlobals` never sees. Two groups, and tsc's
+    /// `checkExportSpecifier` names both:
+    ///
+    ///   * `undefined` and `globalThis`, the two symbols the checker
+    ///     synthesizes rather than binds (tsc tests them by identity —
+    ///     `symbol === undefinedSymbol || symbol === globalThisSymbol` —
+    ///     ahead of the `isGlobalSourceFile` test the declared globals take);
+    ///   * the six primitive TYPE names, which resolve in the type space
+    ///     alone (`primitive_type_names.zig`, shared with TS2693).
+    ///
+    /// Measured against tsgo 7.0.2 one name per line: `string`, `number`,
+    /// `boolean`, `any`, `unknown`, `never`, `undefined` and `globalThis` each
+    /// answer TS2661, while `bigint`, `symbol` and `object` — which spell
+    /// types too — answer the spelling-suggestion TS2552 instead, because
+    /// nothing resolves them.
+    fn builtinGlobalName(text: []const u8) bool {
+        if (std.mem.eql(u8, text, "undefined") or std.mem.eql(u8, text, "globalThis")) return true;
+        return primitive_type_names.isPrimitiveTypeName(text);
+    }
+
     fn reportGlobalExportSpecifier(l: *Linker, file: FileId, rec: binder.ExportRec, is_global: bool) Error!void {
         if (!is_global or rec.module != 0) return;
         const tree = l.files[file].tree;
@@ -2510,6 +2532,15 @@ const Linker = struct {
                         if (l.global_decls.get(rec.local)) |tgt| {
                             try l.reportGlobalExportSpecifier(file, rec, true);
                             try l.put(t, rec.exported, tgt);
+                        } else if (builtinGlobalName(l.atomText(rec.local))) {
+                            // …and a name the global scope answers with no
+                            // DECLARATION behind it, which `global_decls`
+                            // therefore cannot hold. Global by construction,
+                            // so the export specifier naming one is TS2661 and
+                            // not "cannot find name" (`builtinGlobalName`).
+                            // Nothing is put: the name is not a target any
+                            // importer can be handed.
+                            try l.reportGlobalExportSpecifier(file, rec, true);
                         } else {
                             try l.diag(file, 2304, l.nodeSpan(file, rec.node), "Cannot find name '{s}'.", .{l.atomText(rec.local)});
                         }
@@ -2583,8 +2614,24 @@ const Linker = struct {
                     }
                 },
                 // A namespace's own `export { … }` is a member of that
-                // namespace, never an export of the module around it.
-                .ns_named => {},
+                // namespace, never an export of the module around it — so it
+                // contributes nothing to this table. tsc's
+                // `checkExportSpecifier` still runs on the SPECIFIER though,
+                // and its TS2661 does not care which container the specifier
+                // sits in: `declare global { export { globalThis as global } }`
+                // and `namespace N { export { Array } }` each answer it (on top
+                // of the TS2666 / TS1194 the container itself earns), measured
+                // against tsgo 7.0.2.
+                //
+                // Only the GLOBAL verdict is answered here. A name the binder
+                // could not resolve and the global table does not hold is left
+                // silent rather than given the TS2304 tsc has for it — the
+                // standing under-report for this record kind, and the arm that
+                // could invent a diagnostic if the resolution were incomplete.
+                .ns_named => if (rec.sym == binder.no_symbol and rec.local != 0 and rec.module == 0) {
+                    if (l.global_decls.contains(rec.local) or builtinGlobalName(l.atomText(rec.local)))
+                        try l.reportGlobalExportSpecifier(file, rec, true);
+                },
                 .reexport_all => {},
                 .equals => {
                     // `export = <entity>`: resolve the named local and store it
@@ -3808,34 +3855,6 @@ const Linker = struct {
         return std.mem.eql(u8, f.tree.tokenSlice(f.src, e.name_token), "global");
     }
 
-    /// Does this file hold an `import.meta` anywhere?
-    ///
-    /// tsc's external-module test is `isFileProbablyExternalModule`, which is
-    /// "a top-level import/export … or an `import.meta` ANYWHERE in the tree"
-    /// (`getImportMetaIfNecessary` / `walkTreeForImportMeta`). ztsc's
-    /// `bind.is_module` is only the first half — a gap that is invisible
-    /// everywhere else and decides TS2669 outright, because a file whose only
-    /// module marker is `import.meta` is exactly where a `declare global { … }`
-    /// is legal and looks illegal (`importMetaNarrowing`).
-    ///
-    /// Answered off the TOKENS rather than by a tree walk: `import` is a
-    /// reserved word, so the sequence `import` `.` `meta` cannot be produced by
-    /// anything but the meta-property — bar the one shape `x.import.meta`,
-    /// where `import` is a property NAME, and there the answer merely suppresses
-    /// a diagnostic. Costs one linear token pass, and only for a file that both
-    /// carries a global augmentation and is not already a module.
-    fn tokensHoldImportMeta(f: *const ProgFile) bool {
-        const toks = &f.tree.tokens;
-        const n = toks.len();
-        if (n < 3) return false;
-        for (0..n - 2) |i| {
-            if (toks.tag(i) != .keyword_import) continue;
-            if (toks.tag(i + 1) != .dot) continue;
-            if (std.mem.eql(u8, f.tree.tokenSlice(f.src, @intCast(i + 2)), "meta")) return true;
-        }
-        return false;
-    }
-
     /// TS2669, tsc's `checkModuleDeclaration`: a `global { … }` block is an
     /// ambient module declaration, and one is only a legal AUGMENTATION where
     /// `isModuleAugmentationExternal` says so — at the top level of an external
@@ -3859,11 +3878,12 @@ const Linker = struct {
         name_token: ast.TokenIndex,
         top_level: bool,
     ) Error!void {
-        // "External module" is tsc's, not `bind.is_module`'s — see
-        // `tokensHoldImportMeta`. Asked only when the cheap half already
-        // disagrees with the position, which is the rare path.
-        const is_module = f.bind.is_module or tokensHoldImportMeta(f);
-        if (top_level == is_module) return;
+        // `bind.is_module` IS tsc's `isFileProbablyExternalModule` — both
+        // halves, `import.meta` included (`binder.holdsImportMeta`), which is
+        // what this rule needs: a file whose only module marker is
+        // `import.meta` is exactly where a `declare global { … }` is legal and
+        // looks illegal (`importMetaNarrowing`).
+        if (top_level == f.bind.is_module) return;
         try l.diag(file, 2669, l.tokSpan(file, name_token), "Augmentations for the global scope can only be " ++
             "directly nested in external modules or ambient module declarations.", .{});
     }

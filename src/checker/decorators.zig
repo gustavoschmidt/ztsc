@@ -104,7 +104,7 @@ pub fn checkMemberDecorator(c: *Checker, deco: Node, target: Node, this_t: TypeI
     }
     if (c.prog.experimental_decorators) {
         const shape = try legacyMemberShape(c, target, this_t, class_sym);
-        const ctx = if (shape) |s| try legacyDecoCallSignature(c, s.args) else types.no_type;
+        const ctx = if (shape) |s| try legacyDecoCallSignature(c, s.pos, s.args) else types.no_type;
         const dt = try checkDecorator(c, deco, ctx);
         if (shape) |s| try checkLegacyDecoratorSig(c, deco, dt, s.pos, s.args);
         return;
@@ -115,13 +115,68 @@ pub fn checkMemberDecorator(c: *Checker, deco: Node, target: Node, this_t: TypeI
     if (shape) |s| try checkDecoratorSig(c, deco, dt, s.pos, s.value);
 }
 
+/// Check every decorator written on the PARAMETERS of one class method or
+/// constructor (`m(@dec x: T) {}`), in source order.
+///
+/// Parameter decorators exist in the LEGACY dialect only, so the whole walk is
+/// gated on it: under standard decorators the parser reports TS1206 and
+/// retains nothing (`ast.ParamDecos`), and there is no `(value, context)`
+/// shape for the position to relate against.
+///
+/// tsc's `getLegacyDecoratorCallSignature` for a Parameter:
+///
+/// ```ts
+/// const targetType = isConstructorDeclaration(node.parent) ?
+///     getTypeOfSymbol(classSymbol) : getParentTypeOfClassElement(node.parent);
+/// const keyType = isConstructorDeclaration(node.parent) ?
+///     undefinedType : getClassElementPropertyKeyType(node.parent);
+/// return createCallSignature(undefined,
+///     [target: targetType, propertyKey: keyType, parameterIndex: numberType], voidType);
+/// ```
+///
+/// A constructor's parameter decorator is therefore handed the CLASS VALUE and
+/// `undefined` — the two facts `decoratorOnClassConstructorParameter1`'s
+/// TS1239 ("Argument of type 'undefined' is not assignable to parameter of
+/// type 'string | symbol'") rests on — while a method's gets the same
+/// static/instance target and name-literal key a method decorator gets.
+pub fn checkParamDecorators(c: *Checker, member: Node, this_t: TypeId, class_sym: SymbolId) Error!void {
+    if (c.tree.param_decos.len == 0 or !c.prog.experimental_decorators) return;
+    const proto_idx = c.tree.nodeData(member).lhs;
+    const proto = c.tree.extraData(ast.FnProto, proto_idx);
+    const is_ctor = c.isCtorMember(member, proto.flags);
+    var args: LegacyDecoArgs = .{ .count = 3 };
+    args.a[2] = types.number_type;
+    var built = false;
+    for (c.tree.extraRange(proto.params_start, proto.params_end)) |param| {
+        const decos = c.tree.paramDecorators(param);
+        if (decos.len == 0) continue;
+        if (!built) {
+            built = true;
+            args.a[0] = legacyDecoTarget(c, is_ctor or proto.flags & ast.Flags.static != 0, this_t, class_sym);
+            args.a[1] = if (is_ctor)
+                types.undefined_type
+            else
+                try legacyDecoKeyType(c, try memberKeyAtom(c, member, proto.flags));
+        }
+        const ctx = try legacyDecoCallSignature(c, .parameter, args);
+        for (decos) |deco| {
+            const dt = try checkDecorator(c, deco, ctx);
+            try checkLegacyDecoratorSig(c, deco, dt, .parameter, args);
+        }
+    }
+}
+
 /// The position a decorator is applied to. Drives which TS12xx code and
 /// which `Class*DecoratorContext` shape apply (tsc §checkDecorators).
-const DecoPos = enum { class, method, getter, setter, field, accessor };
+/// `.parameter` exists in the LEGACY dialect only — the standard one has no
+/// parameter decorators at all (the parser answers TS1206 and keeps nothing),
+/// so it never reaches `esMemberShape`, `decoContextName` or `checkDecoratorSig`.
+const DecoPos = enum { class, method, getter, setter, field, accessor, parameter };
 
 fn decoCode(pos: DecoPos) u16 {
     return switch (pos) {
         .class => 1238, // class decorator
+        .parameter => 1239, // parameter decorator
         .field, .accessor => 1240, // property decorator
         .method, .getter, .setter => 1241, // method decorator
     };
@@ -129,6 +184,7 @@ fn decoCode(pos: DecoPos) u16 {
 
 fn decoContextName(pos: DecoPos) []const u8 {
     return switch (pos) {
+        .parameter => unreachable, // legacy-only position; see `DecoPos`
         .class => "ClassDecoratorContext",
         .method => "ClassMethodDecoratorContext",
         .getter => "ClassGetterDecoratorContext",
@@ -332,6 +388,7 @@ fn esDecoContextType(c: *Checker, s: EsShape) Error!TypeId {
 /// CONTEXTUAL half, which is what an inline decorator's body is checked with.
 fn esDecoReturnType(c: *Checker, s: EsShape) Error!TypeId {
     const r: TypeId = switch (s.pos) {
+        .parameter => unreachable, // legacy-only position; see `DecoPos`
         .method, .getter, .setter, .class => s.value,
         .accessor => decoFamilyRef(c, "ClassAccessorDecoratorResult", &.{ s.this_side, s.ctx_value }),
         .field => try c.ts.makeFunctionThis(
@@ -375,14 +432,23 @@ fn classDecoCallSignature(c: *Checker, class_val: TypeId) Error!TypeId {
 /// (`LegacyDecoArgs.method_shape`): that narrowing is about which signatures
 /// resolve, while contextual typing hands a three-parameter decorator all
 /// three types — as tsgo does.
-fn legacyDecoCallSignature(c: *Checker, args: LegacyDecoArgs) Error!TypeId {
+///
+/// A PARAMETER decorator is the one three-argument position whose third
+/// argument is not a descriptor: tsc names it `parameterIndex`, types it
+/// `number`, and the signature returns plain `void` — nothing a parameter
+/// decorator returns is used.
+fn legacyDecoCallSignature(c: *Checker, pos: DecoPos, args: LegacyDecoArgs) Error!TypeId {
+    const third: []const u8 = if (pos == .parameter) "parameterIndex" else "descriptor";
     const params: [3]types.Param = .{
         .{ .name = try c.atom("target"), .ty = args.a[0] },
         .{ .name = try c.atom("propertyKey"), .ty = args.a[1] },
-        .{ .name = try c.atom("descriptor"), .ty = args.a[2] },
+        .{ .name = try c.atom(third), .ty = args.a[2] },
     };
     const n = @min(args.count, params.len);
-    const ret = if (n == 3) try c.makeUnion2(args.a[2], types.void_type) else types.void_type;
+    const ret = if (n == 3 and pos != .parameter)
+        try c.makeUnion2(args.a[2], types.void_type)
+    else
+        types.void_type;
     return c.ts.makeFunction(params[0..n], ret, &.{}, 0);
 }
 
@@ -716,6 +782,7 @@ fn decoExprSpan(c: *Checker, deco: Node) source.Span {
 fn decoPosWord(pos: DecoPos) []const u8 {
     return switch (pos) {
         .class => "class",
+        .parameter => "parameter",
         .field, .accessor => "property",
         .method, .getter, .setter => "method",
     };
@@ -787,11 +854,7 @@ fn checkDecoratorSig(c: *Checker, deco: Node, dt: TypeId, pos: DecoPos, value: T
     }
     const expr = c.tree.nodeData(deco).lhs;
     const span = if (expr != null_node) c.nodeSpan(expr) else c.nodeSpan(deco);
-    try c.diagFmt(decoCode(pos), span, "Unable to resolve signature of {s} decorator when called as an expression.", .{switch (pos) {
-        .class => "class",
-        .field, .accessor => "property",
-        .method, .getter, .setter => "method",
-    }});
+    try c.diagFmt(decoCode(pos), span, "Unable to resolve signature of {s} decorator when called as an expression.", .{decoPosWord(pos)});
 }
 
 /// Does one decorator call signature accept the runtime `(value, context)`

@@ -2979,6 +2979,29 @@ pub fn checkClass(c: *Checker, node: Node, ctx: TypeId) Error!void {
                 else
                     this_t;
                 const sig = try c.signatureOfProto(member, md.lhs, true, true);
+                // PARAMETER decorators (`m(@dec x: T) {}`, legacy dialect
+                // only). Like a member decorator they are evaluated at
+                // class-definition time, so they run with the ENCLOSING `this`
+                // (never the instance the method is about to be installed on)
+                // and inside the class's temporal dead zone — the same three
+                // saves the `.decorator` arm below makes, for the same
+                // reasons. After `signatureOfProto`, which is what gives the
+                // decorated parameter's own type; before the body, so a
+                // diagnostic inside the decorator precedes one inside it.
+                if (c.tree.param_decos.len > 0) {
+                    const saved_pd = c.in_decorator;
+                    const saved_pd_owner = c.decorator_owner;
+                    const saved_pd_this = c.this_type;
+                    defer {
+                        c.in_decorator = saved_pd;
+                        c.decorator_owner = saved_pd_owner;
+                        c.this_type = saved_pd_this;
+                    }
+                    c.in_decorator = true;
+                    c.decorator_owner = node;
+                    c.this_type = saved_this;
+                    try decorators.checkParamDecorators(c, member, this_t, class_sym);
+                }
                 if (md.rhs != 0) {
                     const is_ctor = c.isCtorMember(member, proto.flags);
                     // TS2394 for a CONSTRUCTOR overload set. Same rule and

@@ -8,6 +8,7 @@ const intern = @import("../intern.zig");
 const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
 const paths = @import("../link/paths.zig");
+const primitive_type_names = @import("../frontend/primitive_type_names.zig");
 
 const Atom = intern.Atom;
 const SymbolId = binder.SymbolId;
@@ -351,15 +352,9 @@ pub fn suggestName(c: *Checker, a: Atom, from: ScopeId, want_value: bool) ?Atom 
 /// are never values, and a value-position use of one is TS2693 rather than
 /// any not-found message — checked before the spelling suggestion, so
 /// `var x = number` is "'number' only refers to a type" and not "did you mean
-/// 'Number'". The list is tsc's, verbatim; `bigint`, `symbol`, `object`,
-/// `void` and `undefined` are deliberately NOT on it.
-pub fn primitiveTypeNameUsedAsValue(text: []const u8) bool {
-    const names = [_][]const u8{ "any", "string", "number", "boolean", "never", "unknown" };
-    for (names) |n| {
-        if (std.mem.eql(u8, text, n)) return true;
-    }
-    return false;
-}
+/// 'Number'". The list itself is `frontend/primitive_type_names.zig`, shared
+/// with the linker's TS2661.
+pub const primitiveTypeNameUsedAsValue = primitive_type_names.isPrimitiveTypeName;
 
 /// tsc's `checkAndReportErrorForMissingPrefix`: an unqualified name that no
 /// scope declares, but which an enclosing CLASS declares as a member, gets the
