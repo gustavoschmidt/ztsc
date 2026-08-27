@@ -3139,7 +3139,7 @@ const Linker = struct {
         // need, alongside `mergeAmbientBlocks`), but a specifier only
         // augmentations name stays unknown, and an import of it is TS2307
         // (`ambientExternalModuleInAnotherExternalModule`) — while the
-        // augmentation itself earns TS2664 from `reportAugmentationName`.
+        // augmentation itself earns TS2664 from `reportAmbientModuleName`.
         for (l.files) |*f| {
             if (f.bind.is_module) continue;
             for (f.bind.ambient_modules) |am| {
@@ -3828,7 +3828,7 @@ const Linker = struct {
             if (tag == .namespace_decl) {
                 const e = tree.extraData(ast.NamespaceData, tree.nodeData(stmt).lhs);
                 if (e.flags & ast.Flags.ambient_module != 0) {
-                    if (top_level) try l.reportAugmentationName(file, f, e.name_token);
+                    if (top_level) try l.reportAmbientModuleName(file, f, e.name_token);
                     try l.reportUnresolvedIn(file, tree.extraRange(e.body_start, e.body_end), false);
                 }
                 continue;
@@ -3870,7 +3870,7 @@ const Linker = struct {
             //
             // Only when the file is a SCRIPT, which is what makes the block an
             // ambient module DECLARATION rather than an AUGMENTATION — the same
-            // distinction `reportAugmentationName` draws, and the reason it is
+            // distinction `reportAmbientModuleName` draws, and the reason it is
             // drawn here too: tsgo answers TS2667/TS2666 (imports and exports
             // are not permitted in a module augmentation) for the identical
             // body in a module file, never this, and `declare module "./f1" {
@@ -3915,6 +3915,20 @@ const Linker = struct {
     ) Error!void {
         const text = f.tree.tokenSlice(f.src, mod_tok);
         const stripped = literals.stripQuotes(text);
+        // TS6137, the first thing tsc's `resolveExternalModule` does and the
+        // one arm that does not care whether the module is there: a specifier
+        // under `@types/` names a DECLARATION package, which is auto-included
+        // and never imported by that name. It joins whatever the resolution
+        // says at the same anchor (`@types/foo` that resolves answers this
+        // alone; `@types/node` that does not answers this AND its TS2307 —
+        // measured, both), and every syntactic form gets it because they all
+        // reach `resolveExternalModuleName`. `export {} from "@types/x"` is the
+        // exception, and it never reaches here: tsc resolves nothing for it.
+        const types_prefix = "@types/";
+        if (std.mem.startsWith(u8, stripped, types_prefix)) {
+            try l.diag(file, 6137, l.tokSpan(file, mod_tok), "Cannot import type declaration files. " ++
+                "Consider importing '{s}' instead of '{s}'.", .{ stripped[types_prefix.len..], stripped });
+        }
         // `import * as A from ""` resolves to nothing and is TS2307 like
         // any other miss; it just has no atom to look anything up by (the
         // empty string is not a name the interner hands out).
@@ -3939,10 +3953,18 @@ const Linker = struct {
         }
     }
 
-    /// TS2664 for a module AUGMENTATION whose target does not exist —
-    /// tsc's `mergeModuleAugmentation`, whose `resolveExternalModuleNameWorker`
-    /// is handed `Invalid_module_name_in_augmentation_module_0_cannot_be_found`
-    /// as its not-found message.
+    /// The two things a top-level `declare module "spec"` NAME can earn, which
+    /// tsc asks as one `if`/`else` on whether the file is a module:
+    ///
+    ///   * a SCRIPT declares the module, and a relative name declares nothing
+    ///     anybody could import — TS2436;
+    ///   * a MODULE augments one, and the target has to exist — TS2664, tsc's
+    ///     `mergeModuleAugmentation`, whose `resolveExternalModuleNameWorker`
+    ///     is handed `Invalid_module_name_in_augmentation_module_0_cannot_be
+    ///     _found` as its not-found message.
+    ///
+    /// The TS2436 half is NOT suppressed in a `.d.ts` (measured); the TS2664
+    /// half is, for the reason below.
     ///
     /// A top-level `declare module "spec" { … }` is an augmentation exactly
     /// when its file is a MODULE (tsc's `isExternalModuleAugmentation`); in a
@@ -3958,7 +3980,7 @@ const Linker = struct {
     /// `skipLibCheck` off, on a `.d.ts` that augments a module that does not
     /// exist. Nested blocks are skipped for the same reason (their container IS
     /// ambient), which is what `top_level` carries.
-    fn reportAugmentationName(l: *Linker, file: FileId, f: *const ProgFile, name_tok: ast.TokenIndex) Error!void {
+    fn reportAmbientModuleName(l: *Linker, file: FileId, f: *const ProgFile, name_tok: ast.TokenIndex) Error!void {
         if (name_tok == 0) return;
         const text = f.tree.tokenSlice(f.src, name_tok);
         const stripped = literals.stripQuotes(text);
