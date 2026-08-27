@@ -992,16 +992,27 @@ pub fn classInterfaceHalfBases(c: *Checker, sym: SymbolId, acc: TypeId) Error!Ha
 /// Asking only the enclosing scope answered `no_symbol` for every class
 /// expression, named ones included: no `this` type inside the body, no member
 /// checks, and `any` for the expression itself.
+///
+/// The class's OWN scope is asked FIRST, and that order is load-bearing: a
+/// class expression's self-name SHADOWS a same-named outer declaration, and
+/// asking the enclosing scope first bound `let OuterE = class E { foo(): E {
+/// return this } }` to the file's `class E`, so `this` and the annotation named
+/// two different classes ("Property 'foo' is missing in type 'E' but required
+/// in type 'E'"). Reversing costs a class DECLARATION nothing: only
+/// `bindClass`'s self-name lands in the class scope, and it is minted only when
+/// the class did not name itself outside — a declaration's own scope holds its
+/// type parameters and nothing `.class`-flagged.
 pub fn classSymbolOf(c: *Checker, node: Node, outer_scope: binder.ScopeId) Error!SymbolId {
     const data = c.tree.extraData(ast.ClassData, c.tree.nodeData(node).lhs);
     if (data.name_token != 0) {
         const a = try c.atomOfToken(data.name_token);
+        if (try c.scopeOf(node)) |cs| {
+            if (c.bind.lookupInScope(cs, a)) |sym| {
+                if (c.bind.symbol_flags[sym].class) return classExprSym(c, c.toGlobal(sym));
+            }
+        }
         if (c.bind.lookupInScope(outer_scope, a)) |sym| {
             if (c.bind.symbol_flags[sym].class) return c.toGlobal(sym);
-        }
-        const cs = try c.scopeOf(node) orelse return binder.no_symbol;
-        if (c.bind.lookupInScope(cs, a)) |sym| {
-            if (c.bind.symbol_flags[sym].class) return classExprSym(c, c.toGlobal(sym));
         }
         return binder.no_symbol;
     }

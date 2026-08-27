@@ -65,6 +65,7 @@ const param_modifiers = @import("param_modifiers.zig");
 const index_signature = @import("index_signature.zig");
 const computed_member = @import("computed_member.zig");
 const decorator_target = @import("decorator_target.zig");
+const definite_assertion = @import("definite_assertion.zig");
 const regexp = @import("regexp.zig");
 
 const TokTag = scanner.Tag;
@@ -3141,8 +3142,9 @@ const Parser = struct {
         const name_tok = p.curIdx();
         const name = try p.parseBindingName(.private_name_in_var_decl);
         var flags: u32 = 0;
+        var bang_at: TokenIndex = 0;
         if (p.curTag() == .bang and !p.nlBefore()) {
-            _ = try p.bump();
+            bang_at = try p.bump();
             flags |= ast.Flags.definite;
         }
         var type_ann: Node = null_node;
@@ -3162,6 +3164,22 @@ const Parser = struct {
             // PATTERN (`catch ({ a = 1 })`) is a binding element's default and
             // never reaches here, which is also where tsc draws the line.
             if (home == .catch_clause) try p.errAtToken(.catch_variable_initializer, initializerBlame(p, eq_tok));
+        }
+        // TS1255/TS1263/TS1264, the declarator half of tsc's
+        // definite-assignment-assertion guard. `p.ambient` is exactly tsc's
+        // `NodeFlags.Ambient` here: `declare let z!: string` sets it around
+        // `parseVarStatement`, and so does every `.d.ts` / `declare namespace`
+        // body. The "not in a VariableStatement" arm of tsc's condition has no
+        // reachable spelling — `for (let q!: number = 1;;)` and `for (const q!
+        // of xs)` are both parse errors in tsgo (measured) — so it is not
+        // modelled.
+        if (p.spec == 0) {
+            if (definite_assertion.check(.{
+                .bang = bang_at != 0,
+                .type_annotation = type_ann != null_node,
+                .initializer = init != null_node,
+                .ambient = p.ambient,
+            })) |code| try p.errAtToken(code, bang_at);
         }
 
         if (flags == 0 and type_ann == null_node) {
@@ -5434,6 +5452,17 @@ const Parser = struct {
         // out-of-order one ahead of the `const` gets there first.
         const const_at: TokenIndex = if (saw_const) name_tok else 0;
 
+        // TS18012: `#constructor` is spelled out of the private-name space
+        // whatever the member turns out to be — field or method, decorated,
+        // modified or bare. tsc judges it on its own rather than through
+        // `checkGrammarModifiers`: `public public #constructor = 1` answers
+        // TS18010 AND this (measured).
+        if (p.spec == 0 and p.tokTagAt(name_tok) == .private_identifier and
+            std.mem.eql(u8, p.tokenTextAt(name_tok), "#constructor"))
+        {
+            try p.errAtToken(.private_name_constructor_reserved, name_tok);
+        }
+
         // Optional method `m?(): T` / `m?<K>(): T` (ambient/overload members).
         if (p.curTag() == .question) {
             switch (p.peekTag(1)) {
@@ -5566,11 +5595,12 @@ const Parser = struct {
 
         // Field.
         var question_at: TokenIndex = 0;
+        var bang_at: TokenIndex = 0;
         if (p.curTag() == .question) {
             question_at = try p.bump();
             flags |= ast.Flags.optional;
         } else if (p.curTag() == .bang and !p.nlBefore()) {
-            _ = try p.bump();
+            bang_at = try p.bump();
             flags |= ast.Flags.definite;
         }
         var type_ann: Node = null_node;
@@ -5610,6 +5640,39 @@ const Parser = struct {
         // `?` rather than the name or the modifier.
         if (!grammar_err and question_at != 0 and flags & ast.Flags.accessor != 0 and p.spec == 0) {
             try p.errAtToken(.accessor_property_optional, question_at);
+        }
+        if (!grammar_err and p.spec == 0) {
+            // TS18006, the first arm of `checkGrammarProperty` for a class
+            // member: a field named by the STRING LITERAL `"constructor"`.
+            // `static` makes no difference and either quote style counts
+            // (measured). The escaped spellings (`"constructor"`) stay an
+            // under-report — the parser has no cooked value here, and tsc's
+            // `node.name.text` would see through them.
+            if (computed == null and p.tokTagAt(name_tok) == .string_literal and
+                isConstructorStringLiteral(p.tokenTextAt(name_tok)))
+            {
+                try p.errAtToken(.class_field_named_constructor, name_tok);
+            } else if (definite_assertion.check(.{
+                // TS1255/TS1263/TS1264, the property half of the same guard the
+                // declarator runs. `declare` on the field IS tsc's
+                // `NodeFlags.Ambient`; `p.ambient` covers a `declare class`
+                // body and a `.d.ts`.
+                .bang = bang_at != 0,
+                .type_annotation = type_ann != null_node,
+                .initializer = init != null_node,
+                .ambient = p.ambient or flags & ast.Flags.declare != 0,
+                .static_member = flags & ast.Flags.static != 0,
+                .abstract_member = flags & ast.Flags.abstract != 0,
+            })) |code| {
+                try p.errAtToken(code, bang_at);
+            }
+        }
+        // TS1267 is tsc's `checkPropertyDeclaration`, NOT a grammar check, so
+        // it survives a modifier diagnostic on the same member: `public public
+        // abstract p = 1` answers TS1028 AND this (measured). Blamed on the
+        // NAME, which is also the name the message interpolates.
+        if (p.spec == 0 and init != null_node and flags & ast.Flags.abstract != 0) {
+            try p.errAtToken(.abstract_property_initializer, name_tok);
         }
         return member;
     }
@@ -5709,6 +5772,16 @@ const Parser = struct {
     /// A modifier-order diagnostic held back until the member's whole modifier
     /// list has been judged. See `reportMemberGrammar`.
     const ModifierErr = struct { code: Code, token: u32 };
+
+    /// Is this string-literal token's RAW text `"constructor"`, in either quote
+    /// style? tsc asks the cooked `node.name.text`, so the escaped spellings
+    /// (`"constructor"`) are an under-report here; no cooked value exists
+    /// at this point in the parse, and an escaped member name of that one word
+    /// appears nowhere in the corpus or in either app.
+    fn isConstructorStringLiteral(text: []const u8) bool {
+        return std.mem.eql(u8, text, "\"constructor\"") or
+            std.mem.eql(u8, text, "'constructor'");
+    }
 
     fn parseIndexSignatureAsClassMember(p: *Parser, flags: u32) PE!Node {
         return p.parseIndexSignature(flags, true);
@@ -6294,6 +6367,21 @@ const Parser = struct {
             if (!declared and !p.ambient and p.spec == 0) {
                 try p.errAtToken(.quoted_module_name_needs_ambient, spec_tok);
             }
+        }
+        // TS2435, tsc's `checkModuleDeclaration`: a string-named (external)
+        // module declared inside a NAMESPACE body. Blamed on the name, and
+        // independent of TS1035 — `namespace M { module "A" { } }` answers both
+        // (measured).
+        //
+        // An ambient module nested directly in another one is NOT this: tsc
+        // reads `declare module "C" { module "D" { } }` as a module
+        // AUGMENTATION (`isExternalModuleAugmentation`'s ModuleBlock arm) and
+        // says nothing at all, which is why the test is on the NAMESPACE home
+        // alone. A statement position that is no module element at all
+        // (`function f() { declare module "G" {} }`) answered TS1234 already
+        // and `checkGrammarModuleElementContext` returns before this.
+        if (p.element_home == .namespace_block and p.spec == 0) {
+            try p.errAtToken(.ambient_module_nested, spec_tok);
         }
         if (p.curTag() != .l_brace) {
             _ = try p.eat(.semicolon);
@@ -7006,6 +7094,7 @@ const Parser = struct {
             .keyword_module,
             => {
                 const decl = try p.parseStatementUnchecked();
+                try p.reportExportOnAmbientModule(kw, decl);
                 return p.addNode(.{ .tag = .export_decl, .main_token = kw, .data = .{ .lhs = decl, .rhs = 0 } });
             },
             .at => {
@@ -7029,6 +7118,23 @@ const Parser = struct {
                 return p.errorNode();
             },
         }
+    }
+
+    /// TS2668, tsc's `checkGrammarModifiers` arm for an `export` on a
+    /// ModuleDeclaration that `isAmbientModule`: a STRING-named module
+    /// (`export declare module "M"`, and `export module "M2"` without the
+    /// `declare` too) or a global augmentation (`export declare global`). A
+    /// namespace is exempt — `export namespace N {}` and `export declare
+    /// namespace N {}` are both silent (measured). Blamed on the `export`.
+    fn reportExportOnAmbientModule(p: *Parser, kw: u32, decl: Node) Error!void {
+        if (p.spec != 0 or decl == null_node) return;
+        if (p.nodes.items(.tag)[decl] != .namespace_decl) return;
+        // `flags` is `ast.NamespaceData`'s first field, so it is the first word
+        // of the declaration's extra data — the parser writes extras and never
+        // builds an `Ast` to read them back through.
+        const flags = p.extra.items[p.nodes.items(.data)[decl].lhs];
+        if (flags & (ast.Flags.ambient_module | ast.Flags.global_aug) == 0) return;
+        try p.errAtToken(.export_on_ambient_module, kw);
     }
 
     fn parseExportNamed(p: *Parser, kw: u32, flags: u32) PE!Node {

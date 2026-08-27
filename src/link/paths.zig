@@ -32,6 +32,42 @@ pub fn isDeclarationPath(path: []const u8) bool {
     return std.mem.indexOf(u8, basenamePart(path), ".d.") != null;
 }
 
+/// tsc's `isExternalModuleNameRelative` = `pathIsRelative(name) ||
+/// isRootedDiskPath(name)`: the specifiers module resolution refuses to look
+/// for in `node_modules` and refuses to treat as an ambient module name.
+///
+/// `pathIsRelative` is `/^\.\.?($|[\\/])/` — the BACKSLASH counts, which is
+/// what makes `".\\relativeModule"` an error (`ambientExternalModuleWith
+/// RelativeModuleName`). `isRootedDiskPath` adds a leading `/` or `\`, a UNC
+/// share, and the DOS volume forms `c:`, `c:/`, `c:\` — `"b:/block"` is an
+/// error where `"b:block"` is not (`declarationEmitRelativeModuleError`).
+///
+/// The URL arm of tsc's `getEncodedRootLength` is deliberately NOT modelled:
+/// tsgo 7.0.2 answers no diagnostic for `declare module "http://example.com/x"`
+/// (measured), so copying tsc's source there would report a key the oracle
+/// does not.
+pub fn isExternalModuleNameRelative(name: []const u8) bool {
+    if (name.len == 0) return false;
+    const c0 = name[0];
+    if (c0 == '/' or c0 == '\\') return true;
+    if (c0 == '.') {
+        // `.` / `..`, alone or followed by a separator.
+        if (name.len == 1) return true;
+        if (isPathSeparator(name[1])) return true;
+        if (name[1] != '.') return false;
+        return name.len == 2 or isPathSeparator(name[2]);
+    }
+    // DOS volume: `c:`, `c:/`, `c:\` — but not `c:d`.
+    if (std.ascii.isAlphabetic(c0) and name.len >= 2 and name[1] == ':') {
+        return name.len == 2 or isPathSeparator(name[2]);
+    }
+    return false;
+}
+
+fn isPathSeparator(c: u8) bool {
+    return c == '/' or c == '\\';
+}
+
 /// File-name part of a path (the whole path when it has no separator).
 /// Forward slashes only, matching the rest of this module.
 fn basenamePart(path: []const u8) []const u8 {
@@ -336,6 +372,26 @@ test "isNodeCoreModule: exactly tsc's list, bare and node:-prefixed" {
     try testing.expect(!isNodeCoreModule("bun:sqlite"));
     try testing.expect(!isNodeCoreModule("react"));
     try testing.expect(!isNodeCoreModule("./local"));
+}
+
+// The relative/rooted specifier shapes, each measured against tsgo 7.0.2 as a
+// `declare module "…"` name (TS2436 fires exactly for the true ones).
+test "isExternalModuleNameRelative: dot forms, both separators, DOS volumes" {
+    for ([_][]const u8{
+        ".",     "..",    "./x",  "../x",
+        ".\\x",  "..\\x", "/r",   "\\r",
+        "//s/h", "c:",    "c:/x", "c:\\x",
+        "C:/x",
+    }) |s| {
+        try testing.expect(isExternalModuleNameRelative(s));
+    }
+    for ([_][]const u8{
+        "react", "b:block", "@scope/pkg",
+        ".foo",  "..foo",   "node:fs",
+        "",      "1:/x",    "http://example.com/x",
+    }) |s| {
+        try testing.expect(!isExternalModuleNameRelative(s));
+    }
 }
 
 // (b3) The five globals that carry the "install @types/node" wording.
