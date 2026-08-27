@@ -1299,7 +1299,14 @@ fn applicableIndexSignature(c: *Checker, r0: TypeId, idx: TypeId) Error!bool {
         // its static-side object (`class B { static [s: string]: number }`
         // makes `(typeof B)[string]` legal), exactly as `numberIndexType`
         // reads them.
-        .class_value => try c.classStaticType(s.classSymbol(r0)),
+        //
+        // Read under the class value's OUTER arguments, like every other
+        // consumer of its members: `classStaticType` answers off the class
+        // SYMBOL, so a class declared inside a generic hands back the
+        // declaration's free `T`. `function outer<T>(x: T) { class N { static
+        // [k: number]: T } return N }` then made `outer("s")[0]` a bare `T`
+        // instead of `string`.
+        .class_value => try c.instantiateOuter(r0, try c.classStaticType(s.classSymbol(r0))),
         else => r0,
     };
     // tsc's `isApplicableIndexType` also admits a NUMERICALLY NAMED string
@@ -1396,7 +1403,9 @@ pub fn numberIndexType(c: *Checker, r: TypeId) Error!TypeId {
         // A class VALUE's index signatures are declared `static` and live on
         // its static-side object, which `resolveStructural` does not unwrap to:
         // `class C { static [s: number]: 42 }` makes `C[2]` a `42`, not `any`.
-        .class_value => return c.numberIndexType(try c.classStaticType(c.ts.classSymbol(r))),
+        // Under the class value's OUTER arguments — see the twin arm in
+        // `indexedAccessTypeInner`.
+        .class_value => return c.numberIndexType(try c.instantiateOuter(r, try c.classStaticType(c.ts.classSymbol(r)))),
         else => return types.any_type,
     }
 }
