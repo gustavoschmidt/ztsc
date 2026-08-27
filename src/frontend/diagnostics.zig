@@ -1328,6 +1328,16 @@ pub const Code = enum(u16) {
     /// `new` twin of `import_meta_property` — same code, same grammar class,
     /// different suggestion.
     new_meta_property,
+    /// TS2499: `interface I extends color() {}` / `extends (typeof A)` /
+    /// `extends Foo?.Bar`. A heritage clause parses an EXPRESSION (the grammar
+    /// is shared with `class C extends <expr>`), and only an entity name — an
+    /// identifier or a dotted chain of them, optional type arguments aside —
+    /// can name a type. tsc's `checkInterfaceDeclaration` refuses the rest
+    /// (`!isEntityNameExpression(expr) || isOptionalChain(expr)`), at the
+    /// expression, and keeps checking: this is not a parse failure, the
+    /// interface still has its members, and the file still gets its semantic
+    /// pass.
+    interface_extends_non_entity_name,
 
     /// How tsc surfaces the condition — which decides both what a diagnostic
     /// suppresses and what suppresses it. Established empirically against tsgo
@@ -1713,6 +1723,8 @@ pub const Code = enum(u16) {
             .class_extends_single_class,
             .implements_clause_already_seen,
             .heritage_list_empty,
+            // `checkInterfaceDeclaration` proper, not even the grammar pass.
+            .interface_extends_non_entity_name,
             .interface_property_initializer,
             .type_literal_property_initializer,
             .empty_type_param_list,
@@ -2165,6 +2177,7 @@ pub const Code = enum(u16) {
             .class_extends_single_class => "Classes can only extend a single class.",
             .implements_clause_already_seen => "'implements' clause already seen.",
             .heritage_list_empty => "'{0}' list cannot be empty.",
+            .interface_extends_non_entity_name => "An interface can only extend an identifier/qualified-name with optional type arguments.",
             .interface_property_initializer => "An interface property cannot have an initializer.",
             .type_literal_property_initializer => "A type literal property cannot have an initializer.",
             .empty_type_param_list => "Type parameter list cannot be empty.",
@@ -2553,6 +2566,7 @@ pub const Code = enum(u16) {
             .class_extends_single_class => 1174,
             .implements_clause_already_seen => 1175,
             .heritage_list_empty => 1097,
+            .interface_extends_non_entity_name => 2499,
             .interface_property_initializer => 1246,
             .type_literal_property_initializer => 1247,
             .empty_type_param_list => 1098,

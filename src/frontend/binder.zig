@@ -353,6 +353,28 @@ pub fn narrowableOperandIdent(tree: *const Ast, expr: Node) Node {
     return null_node;
 }
 
+/// tsc's `isEntityNameExpression`: an identifier, or a dotted chain of them
+/// (`A.B.C`). Those are the expressions that can also be read as a TYPE name,
+/// which is what a heritage clause needs of the expression it parses.
+///
+/// An OPTIONAL member access (`A?.B`) is excluded — tsc spells that as the
+/// separate `isOptionalChain` half of the same test, because its AST puts the
+/// `?.` on an ordinary property access; ztsc parses it to its own tag, so
+/// leaving it off this list is the whole exclusion. Parentheses are NOT
+/// transparent here either: `(typeof A)` is a parenthesized expression, and
+/// tsc's predicate takes the node as written.
+fn isEntityNameExpr(tree: *const Ast, expr: Node) bool {
+    var e = expr;
+    while (e != null_node) {
+        switch (tree.nodeTag(e)) {
+            .identifier => return true,
+            .member_expr => e = tree.nodeData(e).lhs,
+            else => return false,
+        }
+    }
+    return false;
+}
+
 /// Where one declaration of a symbol was bound: which `cur_block` it sat in,
 /// whether it carried an `export` modifier, and whether it was in an AMBIENT
 /// context. Packed into one word because there is one per declaration of every
@@ -3656,6 +3678,25 @@ const Binder = struct {
         if (static_exit) |f| b.cur_flow = f;
     }
 
+    /// TS2499, tsc's `checkInterfaceDeclaration`: an interface's `extends`
+    /// entry parses as an EXPRESSION — the grammar is shared with a class's,
+    /// where `class C extends f()` is legal — but only an ENTITY NAME can name
+    /// a type. `interface I extends color()`, `extends (typeof A)` and
+    /// `extends Foo?.Bar` all parse and all mean nothing.
+    ///
+    /// Reported from the binder rather than the checker because the rule is a
+    /// property of the written syntax alone: nothing is resolved to decide it,
+    /// and the entry it refuses is one `bindTypeName` finds no name in either.
+    /// It is a `.semantic` diagnostic (see `Class`) — the interface keeps its
+    /// members and the file keeps its check pass, exactly as under tsc.
+    ///
+    /// Anchored at the entry's first token, which is where the expression
+    /// starts and where tsc's `error(heritageElement.expression, …)` lands.
+    fn checkInterfaceHeritageName(b: *Binder, h: Node) Error!void {
+        if (isEntityNameExpr(b.tree, b.tree.nodeData(h).lhs)) return;
+        try b.diag(.interface_extends_non_entity_name, b.tree.nodeMainToken(h));
+    }
+
     /// `extends`/`implements` entry: `extends` is a value read (with flow),
     /// `implements` is a type reference; type arguments are types either way.
     fn bindHeritage(b: *Binder, node: Node, is_value: bool) Error!void {
@@ -3967,7 +4008,9 @@ const Binder = struct {
         const is = try b.pushScope(.interface, node);
         try b.bindTypeParams(data.tp_start, data.tp_end);
         for (b.tree.extraRange(data.extends_start, data.extends_end)) |h| {
-            if (h != null_node) try b.bindHeritage(h, false);
+            if (h == null_node) continue;
+            try b.checkInterfaceHeritageName(h);
+            try b.bindHeritage(h, false);
         }
 
         // Interface-interface merge within a file shares one members scope.
