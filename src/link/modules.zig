@@ -3794,6 +3794,80 @@ const Linker = struct {
         }
     }
 
+    /// Is this `namespace_decl` a `global { … }` block?
+    ///
+    /// `Flags.global_aug` alone does not say so: the parser reuses the flag for
+    /// an ANONYMOUS namespace (`declare module { … }`, TS1437), which "declares
+    /// no symbol and contributes its body outward" for the same reason and is
+    /// not a global augmentation at all. The two differ in their name token —
+    /// the `global` keyword against the `module`/`namespace` one — and a
+    /// namespace actually NAMED `global` takes the named path, so the text is
+    /// the discriminator.
+    fn isGlobalAugmentation(f: *const ProgFile, e: ast.NamespaceData) bool {
+        if (e.flags & ast.Flags.global_aug == 0) return false;
+        return std.mem.eql(u8, f.tree.tokenSlice(f.src, e.name_token), "global");
+    }
+
+    /// Does this file hold an `import.meta` anywhere?
+    ///
+    /// tsc's external-module test is `isFileProbablyExternalModule`, which is
+    /// "a top-level import/export … or an `import.meta` ANYWHERE in the tree"
+    /// (`getImportMetaIfNecessary` / `walkTreeForImportMeta`). ztsc's
+    /// `bind.is_module` is only the first half — a gap that is invisible
+    /// everywhere else and decides TS2669 outright, because a file whose only
+    /// module marker is `import.meta` is exactly where a `declare global { … }`
+    /// is legal and looks illegal (`importMetaNarrowing`).
+    ///
+    /// Answered off the TOKENS rather than by a tree walk: `import` is a
+    /// reserved word, so the sequence `import` `.` `meta` cannot be produced by
+    /// anything but the meta-property — bar the one shape `x.import.meta`,
+    /// where `import` is a property NAME, and there the answer merely suppresses
+    /// a diagnostic. Costs one linear token pass, and only for a file that both
+    /// carries a global augmentation and is not already a module.
+    fn tokensHoldImportMeta(f: *const ProgFile) bool {
+        const toks = &f.tree.tokens;
+        const n = toks.len();
+        if (n < 3) return false;
+        for (0..n - 2) |i| {
+            if (toks.tag(i) != .keyword_import) continue;
+            if (toks.tag(i + 1) != .dot) continue;
+            if (std.mem.eql(u8, f.tree.tokenSlice(f.src, @intCast(i + 2)), "meta")) return true;
+        }
+        return false;
+    }
+
+    /// TS2669, tsc's `checkModuleDeclaration`: a `global { … }` block is an
+    /// ambient module declaration, and one is only a legal AUGMENTATION where
+    /// `isModuleAugmentationExternal` says so — at the top level of an external
+    /// module, or directly inside an ambient module declaration that is itself
+    /// at the top level of a file that is NOT one. Anywhere else the block
+    /// augments nothing and tsc names the position.
+    ///
+    /// So the test reduces to `top_level == is_module`, and both halves are
+    /// real: `declare global { }` in a SCRIPT `.d.ts` is the shape
+    /// `duplicatePackage_globalMerge`'s `@types/react/index.d.ts` has (the
+    /// package's only statement, so the file never became a module), while
+    /// `declare module "m" { global { } }` inside a module file is the
+    /// nested half.
+    ///
+    /// Anchored at the `global` keyword, which is the declaration's NAME
+    /// (`parseGlobalAugmentation`) and where tsc's `error(node.name, …)` lands.
+    fn reportGlobalAugmentationPosition(
+        l: *Linker,
+        file: FileId,
+        f: *const ProgFile,
+        name_token: ast.TokenIndex,
+        top_level: bool,
+    ) Error!void {
+        // "External module" is tsc's, not `bind.is_module`'s — see
+        // `tokensHoldImportMeta`. Asked only when the cheap half already
+        // disagrees with the position, which is the rare path.
+        const is_module = f.bind.is_module or tokensHoldImportMeta(f);
+        if (top_level == is_module) return;
+        try l.diag(file, 2669, l.tokSpan(file, name_token), "Augmentations for the global scope can only be " ++
+            "directly nested in external modules or ambient module declarations.", .{});
+    }
+
     /// `reportUnresolvedModules` over one statement list, recursing into the
     /// AMBIENT MODULE bodies that may hold further import/export declarations.
     ///
@@ -3814,7 +3888,9 @@ const Linker = struct {
     ///
     /// `top_level` distinguishes the file's own statement list from an ambient
     /// module BODY, which is the one thing an `declare module "spec"` block
-    /// needs to know about itself before it can be judged an augmentation.
+    /// needs to know about itself before it can be judged an augmentation —
+    /// and the one thing a `global { … }` block needs to know about itself
+    /// before `reportGlobalAugmentationPosition` can judge IT.
     fn reportUnresolvedIn(l: *Linker, file: FileId, stmts: []const ast.Node, top_level: bool) Error!void {
         const f = &l.files[file];
         const tree = f.tree;
@@ -3827,6 +3903,10 @@ const Linker = struct {
             const tag = tree.nodeTag(stmt);
             if (tag == .namespace_decl) {
                 const e = tree.extraData(ast.NamespaceData, tree.nodeData(stmt).lhs);
+                if (isGlobalAugmentation(f, e)) {
+                    try l.reportGlobalAugmentationPosition(file, f, e.name_token, top_level);
+                    continue;
+                }
                 if (e.flags & ast.Flags.ambient_module != 0) {
                     if (top_level) try l.reportAmbientModuleName(file, f, e.name_token);
                     try l.reportUnresolvedIn(file, tree.extraRange(e.body_start, e.body_end), false);

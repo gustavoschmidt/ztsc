@@ -1077,6 +1077,144 @@ fn nakedTypeParamTarget(c: *Checker, p0: TypeId, tps: []const u32, e: ast.JsxEle
     return found;
 }
 
+/// One attribute `inferJsxTargs`' round one deferred because its value is
+/// context sensitive, paired with the target prop type it is read against.
+/// Source order is the whole point (see `inferFromDeferredAttrs`), so these
+/// are appended as the round-one walk meets them.
+const DeferredAttr = struct { value: Node, target: TypeId };
+
+/// Records one round-two site, unless its target has nothing for round two to
+/// decide.
+///
+/// tsc's `inferTypeArguments` only re-checks an argument under the round's
+/// check mode when `couldContainTypeVariables(paramType)`, and the gate is
+/// what keeps this pass off the hot path of a React codebase: the callbacks a
+/// generic tag carries are overwhelmingly aimed at a CONCRETE prop
+/// (`onPress?: () => void` on a component generic in something else), and
+/// re-reading one costs a whole second walk of its body for an inference that
+/// `unify` would refuse on the same test anyway.
+fn appendSite(c: *Checker, out: *std.ArrayList(DeferredAttr), value: Node, target: TypeId) Error!void {
+    if (!try c.containsTypeParam(target)) return;
+    try out.append(c.scratch(), .{ .value = value, .target = target });
+}
+
+/// The properties a SPREAD attribute's object literal offers as round-two
+/// inference sites, appended in source order.
+///
+/// tsc hands a `JsxSpreadAttribute`'s expression the whole attributes object's
+/// contextual type (`getContextualTypeForJsxAttribute`'s else arm), so a
+/// literal written in place under the spread is contextually typed by the
+/// target props exactly as attributes written outright are — intra-expression
+/// ordering between its properties included, since `checkObjectLiteral`
+/// records an inference site per context-sensitive member just as
+/// `createJsxAttributesTypeFromAttributesProperty` does per attribute.
+/// `<Foo {...{a: x => 10, b: arg => …}}/>` is the shape
+/// (`intraExpressionInferencesJsx`, microsoft/TypeScript#52786).
+///
+/// Only a literal written IN PLACE is walked: any other spread operand is a
+/// value whose properties come off its own type, with no attribute expression
+/// left for a target-directed re-read to ask anything of. A computed key names
+/// no target prop, and a nested spread has no key of its own, so both are
+/// passed over rather than guessed at.
+///
+/// Every site goes to round TWO even when its value is context INSENSITIVE:
+/// round two walks in source order and feeds each site what the ones before it
+/// inferred, which is the ordering these need, and it is speculative — a
+/// spread contributed nothing to this inference before, so reading one must
+/// not start reporting from expressions the authoritative `checkJsxAttributes`
+/// pass reports from too.
+fn collectSpreadSites(
+    c: *Checker,
+    rp0: TypeId,
+    operand: Node,
+    out: *std.ArrayList(DeferredAttr),
+) Error!void {
+    if (operand == null_node or c.nodeTag(operand) != .object_literal) return;
+    for (c.tree.nodeRange(operand)) |prop| {
+        if (prop == null_node) continue;
+        const pd = c.tree.nodeData(prop);
+        const value: Node = switch (c.nodeTag(prop)) {
+            .object_property => if (pd.lhs != null_node and c.nodeTag(pd.lhs) == .computed_name) continue else pd.rhs,
+            .object_shorthand => pd.lhs,
+            .object_method => pd.rhs,
+            else => continue,
+        };
+        if (value == null_node) continue;
+        const p = (try c.propOfType(rp0, try c.memberAtom(c.tree.nodeMainToken(prop)))) orelse continue;
+        try appendSite(c, out, value, p.ty);
+    }
+}
+
+/// Round two of a generic JSX tag's type-argument inference: tsc's second
+/// `inferTypeArguments` pass over the attributes object, which `chooseOverload`
+/// runs with `CheckMode.SkipContextSensitive` cleared.
+///
+/// Each deferred attribute is re-read IN SOURCE ORDER against its target prop
+/// with everything inferred so far — round one's candidates *and* every
+/// earlier round-two attribute's — substituted in, and what it hands back
+/// feeds the attributes that follow. That ordering is tsc's
+/// `inferFromIntraExpressionSites`: fixing a type parameter so a
+/// context-sensitive attribute can be contextually typed first infers from
+/// every site recorded before it. `<Foo a={x => 10} b={arg => …}/>` over
+/// `Props<T> { a: (x: string) => T; b: (arg: T) => void }` is the shape —
+/// `a` fixes `T = number`, so `b`'s `arg` is `number` and not the `unknown`
+/// a type parameter with no candidate falls back to
+/// (`intraExpressionInferencesJsx`, microsoft/TypeScript#52786).
+///
+/// A parameter round one and the earlier attributes left open stays FREE in
+/// the contextual type (`instantiateKnownParams`), exactly as tsc's
+/// non-fixing mapper leaves it: substituting its `unknown` fallback here is
+/// what produced the diagnostic this pass exists to remove.
+///
+/// SPECULATIVE. The props type is not resolved yet, so the re-read must
+/// neither publish its answer to `node_types` nor report from the body it
+/// walks — `checkJsxAttributes`, against the INSTANTIATED props, is the
+/// authoritative walk. Same footing as `inferTypeArgs`' probe.
+fn inferFromDeferredAttrs(
+    c: *Checker,
+    tps: []const u32,
+    candidates: []TypeId,
+    deferred: []const DeferredAttr,
+) Error!void {
+    if (deferred.len == 0) return;
+    // No return-type seed on this path: a JSX tag's "call" has no contextual
+    // return type to seed from (`checkJsxElement` wants `JSX.Element`), so the
+    // only evidence is the attributes themselves.
+    const no_seed = try c.scratch().alloc(TypeId, tps.len);
+    @memset(no_seed, types.no_type);
+    const fixed = try c.scratch().alloc(TypeId, tps.len);
+    c.side_query_depth += 1;
+    defer c.side_query_depth -= 1;
+    for (deferred) |d| {
+        // Substituting a parameter into this site's contextual type is what
+        // tsc's FIXING mapper does, and fixing is one-way: `inferFromTypes`
+        // records nothing into an `inference.isFixed` slot afterwards. So the
+        // candidates that built `vctx` are restored over whatever this site's
+        // own `unify` writes; only the parameters left FREE in it may take one.
+        //
+        // Without that, `<GenericComponent initialValues={{x: "y"}}
+        // nextValues={a => a.x} />` re-read `nextValues` against `(cur: {x:
+        // string}) => {x: string}` and then let the callback's `string` RETURN
+        // overwrite the `{x: string}` `initialValues` had already settled —
+        // reporting against `Values = string` where tsc reports the callback's
+        // return against `{x: string}` (`checkJsxGenericTagHasCorrectInferences`).
+        @memcpy(fixed, candidates);
+        const vctx = try c.instantiateKnownParams(d.target, tps, candidates, no_seed);
+        const vty = try c.checkExprCached(d.value, vctx);
+        // The re-read was handed a contextual type that still carries this
+        // element's own free variables, so a parameter position that merely
+        // adopts one hands it straight back — `InferCtx.ctx_echo`, the same
+        // guard `inferTypeArgs` raises around every contextually typed
+        // argument's `unify`.
+        c.infer_ctx.ctx_echo += 1;
+        defer c.infer_ctx.ctx_echo -= 1;
+        try c.unify(d.target, vty, tps, candidates, 0);
+        for (candidates, fixed) |*cd, f| {
+            if (f != types.no_type) cd.* = f;
+        }
+    }
+}
+
 pub fn inferJsxTargs(c: *Checker, sig: TypeId, tps: []const u32, e: ast.JsxElementData) Error!TypeId {
     if (c.ts.fnParamCount(sig) == 0) return sig;
     const p0 = c.ts.fnParam(sig, 0).ty;
@@ -1088,18 +1226,38 @@ pub fn inferJsxTargs(c: *Checker, sig: TypeId, tps: []const u32, e: ast.JsxEleme
     var attrs_obj: std.ArrayList(types.Prop) = .empty;
     defer attrs_obj.deinit(c.scratch());
     const naked = try nakedTypeParamTarget(c, p0, tps, e);
-    // Phase 1: unify each non-function attribute value against its target prop.
+    // Round two's sites, in source order — see the loop below.
+    var deferred: std.ArrayList(DeferredAttr) = .empty;
+    defer deferred.deinit(c.scratch());
+    // Phase 1: unify each attribute value that round one may read against its
+    // target prop; defer the CONTEXT-SENSITIVE ones to round two.
     for (c.tree.extraRange(e.attrs_start, e.attrs_end)) |attr| {
-        if (c.nodeTag(attr) == .jsx_spread_attribute) continue;
+        if (c.nodeTag(attr) == .jsx_spread_attribute) {
+            try collectSpreadSites(c, rp0, c.tree.nodeData(attr).lhs, &deferred);
+            continue;
+        }
         const name_tok = c.tree.nodeMainToken(attr);
         if (c.tree.tokens.tag(name_tok) == .jsx_name) continue; // hyphenated data-*/aria-*
         const ad = c.tree.nodeData(attr);
-        // Skip a function-valued attribute (`render={() => …}`): a callback is
-        // contextually typed, not a raw inference source, and typing it here
-        // context-free would pollute the candidates.
+        // Defer a CONTEXT-SENSITIVE function-valued attribute (`b={arg => …}`):
+        // its type depends on the contextual type this very inference is
+        // computing, so tsc's round one — `CheckMode.SkipContextSensitive`,
+        // which `resolveCall` sets over the whole attributes object — reads it
+        // as `anyFunctionType` and it contributes nothing. Round two below
+        // re-reads it once the variables it does not itself determine are
+        // fixed.
+        //
+        // The test is CONTEXT SENSITIVITY (`hasContextSensitiveParameters`),
+        // not "is a function": `a={() => 10}` declares no un-annotated
+        // parameter, so tsc types it in round ONE and takes `T = number` off
+        // its return — which is the whole reason the `b={arg => …}` beside it
+        // gets an `arg: number` rather than the type parameter's `unknown`
+        // fallback (`intraExpressionInferencesJsx`, microsoft/TypeScript#52798).
         if (ad.lhs != null_node and c.nodeTag(ad.lhs) == .jsx_expr_container) {
             const cd = c.tree.nodeData(ad.lhs);
-            if (cd.lhs != null_node and (c.nodeTag(cd.lhs) == .arrow_fn or c.nodeTag(cd.lhs) == .function_expr)) {
+            const fn_tag = cd.lhs != null_node and
+                (c.nodeTag(cd.lhs) == .arrow_fn or c.nodeTag(cd.lhs) == .function_expr);
+            if (fn_tag and c.fnExprIsContextSensitive(cd.lhs)) {
                 // The naked-parameter object still needs the NAME (or the
                 // attribute reads as excess against the inferred `P`), but not
                 // a type: `unknown` stands in for what a contextual pass that
@@ -1115,6 +1273,9 @@ pub fn inferJsxTargs(c: *Checker, sig: TypeId, tps: []const u32, e: ast.JsxEleme
                 // every `nextValues={a => a}` went implicit-any
                 // (checkJsxGenericTagHasCorrectInferences).
                 if (naked != null) try attrs_obj.append(c.scratch(), .{ .name = try c.memberAtom(name_tok), .ty = types.unknown_type });
+                if (try c.propOfType(rp0, try c.memberAtom(name_tok))) |p| {
+                    try appendSite(c, &deferred, cd.lhs, p.ty);
+                }
                 continue;
             }
         }
@@ -1156,6 +1317,7 @@ pub fn inferJsxTargs(c: *Checker, sig: TypeId, tps: []const u32, e: ast.JsxEleme
         if (naked != null) try attrs_obj.append(c.scratch(), .{ .name = try c.memberAtom(name_tok), .ty = vty });
         try c.unify(pt.ty, vty, tps, candidates, 0);
     }
+    try inferFromDeferredAttrs(c, tps, candidates, deferred.items);
     // Phase 1b, tsc's `InferencePriority.NakedTypeVariable`: when the target
     // is a bare type parameter — on its own or as a constituent of an
     // intersection — the WHOLE attributes object is its candidate. That is the
