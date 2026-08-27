@@ -348,9 +348,18 @@ pub fn singleElementBridge(c: *Checker, s: TypeId, t: TypeId) Error!bool {
         if (!isReadonlyArrayOrTuple(c, s) and try c.isAssignable(arg, t)) return true;
     }
     if (soleVariadicElem(c, t)) |arg| {
-        // anything → `[...T]`: legal only when the source is (constrained to)
-        // a MUTABLE array or tuple — a `readonly` one would gain `push`.
-        if (isMutableArrayOrTuple(c, try c.transitiveBaseConstraint(s))) {
+        // anything → `[...T]`: legal when the source is (constrained to) a
+        // MUTABLE array or tuple — a `readonly` one would gain `push` — OR
+        // when the TARGET is itself `readonly`, in which case there is no
+        // mutating member to gain and tsc bridges unconditionally
+        // (`target.target.readonly || isMutableArrayOrTuple(…)`). The missing
+        // disjunct made `r = t` inside `<T extends readonly unknown[]>(t: T, r:
+        // readonly [...T])` a spurious TS2322: `T`'s constraint is a READONLY
+        // array, so the mutability test declined, and no arm below relates a
+        // type parameter to the tuple spelling of itself (`variadicTuples1`).
+        if (isReadonlyArrayOrTuple(c, t) or
+            isMutableArrayOrTuple(c, try c.transitiveBaseConstraint(s)))
+        {
             if (try c.isAssignable(s, arg)) return true;
         }
     }
