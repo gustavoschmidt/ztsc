@@ -5,17 +5,17 @@ suite**, excluding unsupported configurations (strict:false, JS cases,
 unsupported compiler options). Campaign runs in waves of 4 parallel opus
 worktree subagents, one per area, merged sequentially with gates.
 
-## Standings (2026-08-29, post wave 47)
+## Standings (2026-08-29, post wave 48)
 
 | metric | start (wave 3 kickoff) | now |
 |---|---:|---:|
-| exact-match cases | 4902 / 7815 (62.7%) | **7920 / 8641 (91.7%)** |
-| excess keys (false positives) | 3541 | 872 |
-| missing keys (under-reports) | 8617 | 1828 |
+| exact-match cases | 4902 / 7815 (62.7%) | **7940 / 8641 (91.9%)** |
+| excess keys (false positives) | 3541 | 850 |
+| missing keys (under-reports) | 8617 | 1797 |
 | bucketed (ztsc parse error, incomparable) | 825 | 9 |
 | crashes / hard timeouts | 0 / 1 | 0 / 0 |
 
-Forty-seven waves landed (3–47), every one with ZERO match→non-match regressions in
+Forty-eight waves landed (3–48), every one with ZERO match→non-match regressions in
 the combined sweep (4 accepted, documented, later-fixed flips in wave 9),
 conformance green after every merge, perf within the tsgo bars, and the two
 parity apps (excalidraw, social-app) diagnostic-identical or tsgo-proven
@@ -909,7 +909,83 @@ social-app +3.0% this wave (LMA transform + inference work) but −5%
 NET vs wave-45 — watch continues; next shave target is
 subst.instantiate's alias-body machinery.
 
-## Ranked next queue (wave 48) — distilled from wave-47 agent reports
+Wave 48 (+20 exact → 7940/8641 91.9%): A landed the CLASS_VALUE ARGS
+feature — two spellings discriminated by payload (inline symbol when
+no outer args = byte-identical interned ids; extra[] otherwise), a new
+class_value.zig with outerTypeParams memoized per class symbol
+(reproducing isTypeParameterPossiblyReferenced's filter), and the key
+design point: outer args ride the class VALUE, a ref's args still fill
+only the class's OWN params — arity/TS2314/printing untouched. Both
+witnesses exact. Also found Tokens.starts packs the ASI bit in the top
+bit (raw lowerBound silently skips line-initial tokens) and landed B's
+recursive-alias handoff via the narrow route: isAssignableInner had a
+.ref-SOURCE resolve rule but no TARGET twin (no origin side table —
+B's +32 regression route avoided). B landed the JSX SPREAD pool (+4):
+per-entry spread provenance; elaborate reads the COMBINED object's
+member anchored at the written attribute; intersection spreads
+contribute per-name intersections — and fixed the same last-arm-wins
+bug pre-existing in destructure.objectRestType (social-app
+PostControlButton shape). C made all three targets EXACT: numeric
+names reach [k: number] index signatures (findApplicableIndexInfo
+tail); a spread of an object literal is PART of the literal (the
+context-free speculative distributableSpreads walk was filing TS7006s
+for good); getLiteralTypeFromPropertyName reads the name NODE not the
+atom (keyof {0(){}} is 0; {"0"(){}} is "0"). D landed the
+class-expression self-name shadow (classSymbolOf asked the enclosing
+scope FIRST — 5-line reorder), the definite-assertion family
+(TS1255/1263/1264 via new definite_assertion.zig), four
+ambient-module rules, TS6137. PERF: excalidraw RSS +3.1% bisected to
+B's combined-attributes object — semantically required, ~3MB retained
+by interning; ACCEPTED FLAGGED with an arena-scoping lead queued.
+crashDeclareGlobalTypeofExport DOUBLE-diagnosed: the binder is fine;
+mergeGlobals' umdMergeTarget redirects the augmentation's const to
+the module namespace — fix needs the TS2454 interaction solved.
+
+## Ranked next queue (wave 49) — distilled from wave-48 agent reports
+
+1. Excalidraw RSS lead: arena-scope the JSX combined-attributes object
+   per element (or avoid interning it) — recover the +3MB (B/D).
+2. JSX intra-expression inference (3 keys): jsx.zig's generic
+   inference is a separate SINGLE-round pass — Phase 1 skips every
+   function-valued attribute, so `<Foo a={() => 10} b={arg => …}/>`
+   never learns T from a. Needs the two-round pass infer.zig has (D).
+3. Reverse-mapped INTERSECTION source: inferReverseMappedFrom accepts
+   only .object; tsc's getPropertiesOfType merges constituents. Needs
+   a shared intersection→merged-member-table helper (props.zig logic;
+   intersectionTypeInference2 would be exact).
+4. typeArgumentInferenceWithClassExpression1/3 — NOW FEASIBLE with
+   class_value args: unify needs a class_value-vs-class_value arm and
+   the relation a rule for distinct anonymous class values.
+5. class_value consumers still ignoring outer args (A's list, no
+   regressions, under-behaviour): new C() on a filled-in value,
+   classStaticType/classConstructType, keyof typeof C.
+6. implicitAnyFromCircularInference function half (4 keys): scoped —
+   per-signature return-resolution stack at sig_cache read
+   (signatures.zig:67), report after inferReturnType (:279); BLOCKED
+   only on naming a nameless function expression (tsc getAssignedName
+   walks to the parent declarator; ztsc has no parent pointer).
+7. Printer wins: propDisplayOrder is 3% of social-app CPU (sorting
+   hundreds of props for 31 truncated messages — cap or lazy-sort);
+   quote rule + method bit need declaration info on types.Prop.
+8. jsxChildWrongType (children elaboration: generateJsxChildren +
+   array-like target split; jsx.zig); jsxIntrinsicDeclaredUsing
+   TemplateLiteralTypeSignatures (needs TWO pattern-keyed index
+   signatures — types.zig single-slot limitation).
+9. mergeGlobals UMD-target choice (decline when a real global clashes)
+   + the TS2454 interaction (crashDeclareGlobalTypeofExport).
+10. Small pinned: "constructor"() string-named ctor (member_names.
+    isCtorMethod requires the keyword token — costs a false TS2300 +
+    missing TS1093); TS1315 (export-as-namespace outside .d.ts);
+    TS2669 (rule measured, needs spare app cycle); TS1039 arrow-span
+    (FnProto start token — broad); decorator call-signature codes
+    TS1238/1239/1308/1329 (calls/signatures).
+11. declarationEmitExpressionInExtends4: TS2315 at the base expression
+    on arity mismatch — the leniency is deliberate; revisit with own
+    sweep.
+12. Census: 39 parser/link/flow one-keys; TS2322 pools (10 under /
+    6 excess one-key after this wave); TS1021/TS1268 index-key items.
+
+## Superseded queue (wave 48, kept for context)
 
 1. JSX SPREAD ATTRIBUTE relation pool (B's re-rank: the densest single
    remaining pool now that LMA landed the props target): tsxAttribute
